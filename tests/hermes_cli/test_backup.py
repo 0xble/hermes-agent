@@ -1772,6 +1772,119 @@ class TestSafeCopyDb:
         conn.close()
         assert rows == [(42,)]
 
+    def test_wal_copy_finishes_from_one_snapshot_while_writers_continue(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import backup as backup_mod
+
+        src = tmp_path / "hot.db"
+        dst = tmp_path / "copy.db"
+        initial = b"snapshot" * 400
+        with sqlite3.connect(src) as setup:
+            assert setup.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            setup.execute("CREATE TABLE payload (id INTEGER PRIMARY KEY, value BLOB)")
+            setup.executemany(
+                "INSERT INTO payload(value) VALUES (?)",
+                [(initial,) for _ in range(3000)],
+            )
+
+        real_connect = backup_mod.sqlite3.connect
+        writer = real_connect(src, timeout=1.0)
+        remaining_values = []
+        writes = 0
+
+        class SourceConnection:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def execute(self, *args, **kwargs):
+                return self._connection.execute(*args, **kwargs)
+
+            def backup(self, target, *, pages, progress, sleep):
+                def write_between_steps(status, remaining, total):
+                    nonlocal writes
+                    progress(status, remaining, total)
+                    remaining_values.append(remaining)
+                    if remaining:
+                        writer.execute(
+                            "UPDATE payload SET value = ? WHERE id = 1",
+                            (f"write-{writes}".encode() * 400,),
+                        )
+                        writer.commit()
+                        writes += 1
+                    if len(remaining_values) >= 32 and remaining:
+                        raise TimeoutError("backup kept restarting under WAL writes")
+
+                return self._connection.backup(
+                    target,
+                    pages=pages,
+                    progress=write_between_steps,
+                    sleep=sleep,
+                )
+
+            def close(self):
+                self._connection.close()
+
+        def connect(path, *args, **kwargs):
+            connection = real_connect(path, *args, **kwargs)
+            if isinstance(path, str) and path.startswith("file:"):
+                return SourceConnection(connection)
+            return connection
+
+        monkeypatch.setattr(backup_mod.sqlite3, "connect", connect)
+        try:
+            assert backup_mod._safe_copy_db(src, dst) is True
+        finally:
+            writer.close()
+
+        assert writes > 0, "the writer must commit while the snapshot is being copied"
+        assert remaining_values[-1] == 0
+        with sqlite3.connect(dst) as copied:
+            assert copied.execute("SELECT value FROM payload WHERE id = 1").fetchone() == (initial,)
+        with sqlite3.connect(src) as live:
+            assert live.execute("SELECT value FROM payload WHERE id = 1").fetchone() != (initial,)
+
+    def test_transient_rollback_writer_does_not_abort_snapshot_setup(self, tmp_path):
+        import subprocess
+        import sys
+
+        from hermes_cli.backup import _safe_copy_db
+
+        src = tmp_path / "rollback.db"
+        dst = tmp_path / "copy.db"
+        with sqlite3.connect(src) as setup:
+            setup.execute("CREATE TABLE payload (value INTEGER)")
+            setup.execute("INSERT INTO payload VALUES (1)")
+
+        holder = (
+            "import sqlite3, time\n"
+            f"c = sqlite3.connect({str(src)!r})\n"
+            "c.execute('BEGIN EXCLUSIVE')\n"
+            "c.execute('INSERT INTO payload VALUES (2)')\n"
+            "print('LOCKED', flush=True)\n"
+            "time.sleep(0.5)\n"
+            "c.commit()\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", holder],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "LOCKED"
+            assert _safe_copy_db(src, dst, timeout_seconds=3.0) is True
+            assert proc.wait(timeout=3.0) == 0, proc.stderr.read() if proc.stderr else ""
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        with sqlite3.connect(dst) as copied:
+            rows = copied.execute("SELECT value FROM payload ORDER BY value").fetchall()
+        assert rows == [(1,), (2,)]
+
     def test_aborts_when_source_remains_busy_past_deadline(
         self, tmp_path, monkeypatch
     ):
@@ -1782,9 +1895,19 @@ class TestSafeCopyDb:
         src.touch()
         dst.write_bytes(b"partial")
 
-        clock = iter((100.0, 100.5, 101.1))
+        clock = iter((99.0, 100.0, 100.5, 101.1))
 
         class FakeSourceConnection:
+            def execute(self, query):
+                assert query == "PRAGMA journal_mode"
+
+                class Result:
+                    @staticmethod
+                    def fetchone():
+                        return ("delete",)
+
+                return Result()
+
             def backup(self, _destination, *, pages, progress, sleep):
                 assert pages > 0
                 assert sleep > 0
@@ -1855,13 +1978,11 @@ class TestSafeCopyDb:
             assert proc.stdout is not None
             assert proc.stdout.readline().strip() == "LOCKED"
             started = time.monotonic()
-            result = _safe_copy_db(src, dst)
+            result = _safe_copy_db(src, dst, timeout_seconds=0.25)
             elapsed = time.monotonic() - started
             assert result is False
-            # The busy timeout is 5s, so a fast failure lands around there.
-            # The regression this guards against is backup() retrying
-            # SQLITE_BUSY forever, which would never return at all.
-            assert elapsed < 30
+            # The regression this guards against is backup() retrying SQLITE_BUSY forever.
+            assert elapsed < 5
         finally:
             proc.kill()
             proc.wait()

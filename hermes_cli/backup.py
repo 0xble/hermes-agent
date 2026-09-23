@@ -355,7 +355,38 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
         # full locked-source deadline instead of adding the default timeout before each callback.
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.0)
         backup_conn = sqlite3.connect(str(dst))
-        busy_deadline = time.monotonic() + max(0.0, timeout_seconds)
+        timeout_seconds = max(0.0, timeout_seconds)
+        setup_deadline = time.monotonic() + timeout_seconds
+
+        def _snapshot_setup(query: str, *, fetchone: bool = False):
+            """Run snapshot initialization without restoring sqlite3's per-call busy timeout."""
+            while True:
+                try:
+                    cursor = conn.execute(query)
+                    return cursor.fetchone() if fetchone else cursor
+                except sqlite3.OperationalError as exc:
+                    error_code = getattr(exc, "sqlite_errorcode", None)
+                    primary_code = error_code & 0xFF if isinstance(error_code, int) else None
+                    if primary_code not in (
+                        sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED,
+                    ):
+                        raise
+                    remaining = setup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _SQLiteBackupTimeout(
+                            f"database remained locked for {timeout_seconds:g} seconds"
+                        ) from exc
+                    time.sleep(min(0.1, remaining))
+
+        journal_mode = _snapshot_setup("PRAGMA journal_mode", fetchone=True)
+        if journal_mode and str(journal_mode[0]).lower() == "wal":
+            # Incremental backup releases its per-step read lock, so an external WAL writer
+            # otherwise restarts the copy from page zero on every commit. Pin one WAL snapshot
+            # for the whole copy: WAL writers may continue, while rollback-journal databases
+            # retain the existing short per-step locks instead of blocking writers for minutes.
+            _snapshot_setup("BEGIN")
+            _snapshot_setup("SELECT 1 FROM sqlite_schema LIMIT 1", fetchone=True)
+        busy_deadline = time.monotonic() + timeout_seconds
 
         def _check_backup_progress(status: int, _remaining: int, _total: int) -> None:
             nonlocal busy_deadline
@@ -364,7 +395,7 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
                 if now >= busy_deadline:
                     raise _SQLiteBackupTimeout(f"database remained locked for {timeout_seconds:g} seconds")
             else:
-                busy_deadline = now + max(0.0, timeout_seconds)
+                busy_deadline = now + timeout_seconds
 
         conn.backup(backup_conn, pages=256, progress=_check_backup_progress, sleep=0.1)
         return True
