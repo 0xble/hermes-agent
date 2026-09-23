@@ -1,6 +1,13 @@
 import { configure } from '@testing-library/react'
+import { afterAll } from 'vitest'
 
 import { stubResizeObserver } from './src/test/jsdom'
+
+// Radix defers unmount focus work to a timer. Drain it before Vitest replaces
+// jsdom's globals with Node's realm: https://github.com/radix-ui/primitives/issues/4148
+// Capture the real timer before individual tests can install fake timers.
+const realSetTimeout = setTimeout
+afterAll(() => new Promise<void>(resolve => realSetTimeout(resolve, 0)))
 
 // Shared tooltips now measure their arrow through Radix's useSize hook.
 // Geometry assertions still belong in a real browser, not this inert observer.
