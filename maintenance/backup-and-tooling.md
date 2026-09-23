@@ -32,7 +32,8 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
   `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
-  `full-zip-failure-accounting`, `evidence` (records, not patches).
+  `full-zip-failure-accounting`, `sqlite-backup-wal-snapshot`, `evidence`
+  (records, not patches).
   `maintenance-contract` is owned by the root contract.
 - `HERMES-123` (`0cac0f8432`) stops `_run_full_backup` reporting a held backup slot as a
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
@@ -127,6 +128,20 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   automatic home-only archives with real files and ZIP readback. Retire when the
   selected upstream release passes this contract. Rollback only this logical patch,
   not adjacent backup safety fixes, through the runtime owner's supported update path.
+- `sqlite-backup-wal-snapshot`: an incremental online backup of a WAL database pins one
+  read snapshot before copying pages, so commits from another connection cannot restart
+  a large copy indefinitely. WAL writers remain live; non-WAL databases retain short
+  per-step read locks instead of blocking writers for the whole copy. Snapshot setup retries
+  only `SQLITE_BUSY`/`SQLITE_LOCKED` within one bounded deadline, preserving transient
+  rollback-writer and WAL-recovery availability without hiding other operational errors.
+  A pinned WAL reader can delay checkpoint frame reclamation, so the WAL may grow while a
+  long snapshot runs; that bounded storage tradeoff prevents unbounded backup restarts.
+  Owner-only destination creation, fail-closed cleanup, and copy verification remain
+  unchanged. Upstream main `c80d12b9b98e36178aa41d496e8dd555399fc286` still has the
+  restartable copy. Upstream issue #86630 and merged PR #86680 bound consecutive
+  `SQLITE_BUSY`/`SQLITE_LOCKED` statuses but did not cover successful page copies repeatedly
+  restarted by concurrent WAL commits. Retire when a selected upstream release passes the
+  concurrent-writer snapshot contract.
 
 ## Verification
 
