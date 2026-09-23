@@ -830,6 +830,10 @@ class GatewayBusySessionMixin:
             if adapter is None or not hasattr(adapter, "defer_command_until_idle"):
                 return f"⚠️ `/{name}` could not be scheduled because this session has no deferred-command queue."
             depth = adapter.defer_command_until_idle(quick_key, event)
+            if depth is None:
+                limit = getattr(adapter, "_MAX_DEFERRED_COMMANDS_PER_SESSION", "the configured limit")
+                return (f"⚠️ `/{name}` was not scheduled — the deferred-command queue for this "
+                        f"session is full ({limit}). Wait for the current turn or `/stop` first.")
             suffix = f" ({depth} deferred)" if depth > 1 else ""
             return f"⏳ `/{name}` scheduled after the current turn commits{suffix}."
         if policy in ("dispatch", "interrupt_then_dispatch"):
