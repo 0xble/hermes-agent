@@ -1059,16 +1059,16 @@ class TestMemoryArchive:
         assert _read_archive(tmp_path) == []
         assert "Keep me" in store.memory_entries
 
-    def test_archive_write_failure_degrades_by_default(self, store, tmp_path, monkeypatch):
+    def test_archive_write_failure_refuses_and_stages_by_default(self, store, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.archive_entries", lambda *a, **k: ([], "disk full"))
         store.add("memory", "Doomed entry")
 
         result = store.remove("memory", "Doomed entry")
 
-        assert result["success"] is True
-        assert result["archive_status"] == "degraded"
-        assert "archived" not in result
-        assert "Doomed entry" not in store.memory_entries  # the removal itself still landed
+        assert result["success"] is False
+        assert result["proposal_staged"] is True
+        assert result["pending_id"]
+        assert "Doomed entry" in store.memory_entries
         assert _read_archive(tmp_path) == []
 
     def test_archive_write_failure_aborts_when_configured(self, store, tmp_path, monkeypatch):
@@ -1080,7 +1080,9 @@ class TestMemoryArchive:
         result = store.remove("memory", "Precious entry")
 
         assert result["success"] is False
-        assert "abort" in result["error"]
+        assert "refused" in result["error"]
+        assert result["proposal_staged"] is True
+        assert result["pending_id"]
         assert "Precious entry" in store.memory_entries  # refused -- file untouched
 
     def test_batch_abort_never_leaves_partial_archive(self, store, tmp_path, monkeypatch):
@@ -1101,15 +1103,16 @@ class TestMemoryArchive:
         ])
 
         assert result["success"] is False
-        assert "abort" in result["error"]
+        assert "refused" in result["error"]
+        assert result["proposal_staged"] is True
+        assert result["pending_id"]
         assert _read_archive(tmp_path) == []
         assert "Entry one" in store.memory_entries
         assert "Entry two" in store.memory_entries
 
-    def test_batch_archive_failure_degrades_atomically(self, store, tmp_path, monkeypatch):
-        """Default warn mode: a failed archive write for a two-entry batch
-        leaves NO records behind (the single combined write never partially
-        lands), the mutation still proceeds, and the result says degraded."""
+    def test_batch_archive_failure_refuses_and_stages_atomically(self, store, tmp_path, monkeypatch):
+        """A failed archive write for a mixed batch leaves the whole original
+        store untouched and stages the complete proposal."""
         monkeypatch.setattr("tools.memory_tool.archive_entries", lambda *a, **k: ([], "disk full"))
         store.add("memory", "Entry one")
         store.add("memory", "Entry two")
@@ -1120,10 +1123,11 @@ class TestMemoryArchive:
             {"action": "remove", "old_text": "Entry two"},
         ])
 
-        assert result["success"] is True
-        assert result["archive_status"] == "degraded"
+        assert result["success"] is False
+        assert result["proposal_staged"] is True
+        assert result["pending_id"]
         assert _read_archive(tmp_path) == []
-        assert store.memory_entries == ["Entry to keep"]
+        assert store.memory_entries == ["Entry one", "Entry two", "Entry to keep"]
 
     def test_archive_append_rolls_back_on_write_failure(self, tmp_path, monkeypatch):
         """`_archive_append_lines` itself: when the underlying write fails, the
