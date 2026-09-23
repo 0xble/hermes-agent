@@ -184,6 +184,7 @@ try {
             # The direct shell runner also needs writable scratch when the
             # sandbox's default disk-backed temporary directory is read-only.
             interactive_env['HERMES_TEST_SCRATCH_ROOT'] = str(root / 'interactive-scratch')
+            interactive_env['HERMES_PYTHON'] = sys.executable
             result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', str(test_file)],
                                     cwd=ci.ROOT, env=interactive_env,
                                     capture_output=True, text=True, encoding='utf-8', errors='replace')

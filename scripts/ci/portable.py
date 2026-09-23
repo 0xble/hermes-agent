@@ -207,9 +207,10 @@ def static(env: dict[str, str]) -> None:
 
 def python_tests(env: dict[str, str], roots: list[str], workers: int,
                  pytest_args: list[str] | None = None) -> None:
-    python(env)  # No fallback to a personal runtime environment.
+    py = python(env)
     require_tools(('rg',), env)
     env = dict(env)
+    env['HERMES_PYTHON'] = py
     command = ['bash', 'scripts/run_tests.sh', '-j', str(workers), '--file-retries', '0',
                *roots, *(pytest_args or [])]
     # The runner provides a disk-backed original HOME outside the checkout.
