@@ -219,6 +219,18 @@ def test_check_gateway_lifecycle_python_path_charges_masker(monkeypatch, tmp_pat
 # --- no regression on realistic benign graphs ------------------------------
 
 
+def test_default_budget_admits_large_benign_python_cli(tmp_path):
+    """A sub-1 MiB Python CLI may legitimately exceed 16K short lines."""
+    cli = tmp_path / "review-helper"
+    cli.write_text("#!/usr/bin/env python3\n" + "value = 1\n" * 18_500, encoding="utf-8")
+    cli.chmod(0o755)
+
+    assert guard(f"{cli} --preflight") is False
+
+    cli.write_text(cli.read_text(encoding="utf-8") + "hermes gateway restart\n", encoding="utf-8")
+    assert guard(f"{cli} --preflight") is True
+
+
 def test_default_budget_admits_a_wide_benign_wrapper_graph(tmp_path):
     """Issue #78398's shape: one wrapper invoking 200 small legitimate scripts
     must still be allowed under the DEFAULT limits (an earlier fail-closed
