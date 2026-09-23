@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
-"""Slice 6 curation stage: turn skill observations into a reviewable change to the canonical library.
+"""Index and disposition Markdown skill observations in a local SQLite store.
 
-During work the agent never edits the canonical skill library (the runtime guard refuses it and
-points at ``$HERMES_HOME/observations/<skill>.md``). This job is the other half: it runs on a
-schedule from a dedicated worktree of the dotfiles repository and, for every observation file,
-
-1. checks the skill exists in the canonical source (``agents/skills/<skill>/SKILL.md``);
-2. deduplicates observations by normalized text and drops ones already processed;
-3. stages the surviving observations into the skill's ``MAINTENANCE.md`` under a dated
-   "Observations awaiting curation" section (the skill owner's own file, so the change is small,
-   reviewable, and never rewrites the skill body unattended);
-4. runs the repository's ``scripts/check-skills`` gate;
-5. with ``--publish``: commits on a branch named from the observation digest, pushes, and opens a
-   pull request (idempotent: an existing branch or PR for the same digest is reused, never
-   duplicated);
-6. moves processed observation files under ``observations/processed/<date>/``.
-
-It deliberately does not rewrite skill instructions itself. Condensing an observation into
-canonical guidance is judgment; the pull request is where that judgment is exercised and reviewed.
-Exit 0 with nothing to do, 0 on a staged/published change, 1 on a failed gate.
+Supported commands are intentionally small: ``index`` imports top-level
+``<skill>.md`` files, ``disposition`` records an explicit decision, ``archive``
+moves only dispositioned files, and ``list`` reports indexed rows. The former
+worktree/PR curation interface is not supported by this command.
 """
 
 from __future__ import annotations
@@ -29,188 +15,242 @@ import json
 import os
 import re
 import shutil
-import subprocess
+import sqlite3
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
+
+DISPOSITIONS = ("pending", "accepted", "rejected", "deferred")
+_SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip().lower())
+@dataclass(frozen=True)
+class IndexResult:
+    imported: int = 0
+    existing: int = 0
+    skipped: int = 0
 
 
-def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], check=check, capture_output=True, text=True, encoding="utf-8", errors="replace")
+@dataclass(frozen=True)
+class ArchiveResult:
+    archived: int = 0
+    pending: int = 0
+    missing: int = 0
 
 
-def read_observations(obs_dir: Path) -> dict[str, list[str]]:
-    """{skill: [observation blocks]} from every top-level ``<skill>.md``; blocks are separated by blank lines."""
-    out: dict[str, list[str]] = {}
-    for path in sorted(obs_dir.glob("*.md")):
-        blocks = [b.strip() for b in re.split(r"\n\s*\n", path.read_text(encoding="utf-8")) if b.strip()]
-        if blocks:
-            out[path.stem] = blocks
-    return out
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def restore(dotfiles: Path, staged: list[str]) -> None:
-    """Undo staging: revert tracked files and remove ones that did not exist before."""
-    for rel in staged:
-        tracked = _git(dotfiles, "ls-files", "--error-unmatch", rel, check=False).returncode == 0
-        if tracked:
-            _git(dotfiles, "checkout", "--", rel)
-        else:
-            (dotfiles / rel).unlink(missing_ok=True)
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
-def stage(dotfiles: Path, skill: str, blocks: list[str], today: str) -> Path:
-    maint = dotfiles / "agents" / "skills" / skill / "MAINTENANCE.md"
-    existing = maint.read_text(encoding="utf-8") if maint.exists() else f"# {skill} maintenance\n"
-    section = f"\n## Observations awaiting curation ({today})\n\n" + "\n\n".join(f"- {b}" for b in blocks) + "\n"
-    maint.write_text(existing.rstrip("\n") + "\n" + section, encoding="utf-8")
-    return maint
+def sha256_text(value: str) -> str:
+    return sha256_bytes(value.encode("utf-8"))
+
+
+def observation_id(skill: str, payload: str) -> str:
+    """Return the stable ID for one skill/payload pair."""
+    return sha256_text(f"{skill}\0{payload}")
+
+
+def default_observations() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "observations"
+
+
+def default_db() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "state" / "skill-observations.sqlite3"
+
+
+def _connect(db: Path) -> sqlite3.Connection:
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS observations (
+            id TEXT PRIMARY KEY,
+            skill TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_mtime TEXT,
+            provenance TEXT,
+            disposition TEXT NOT NULL DEFAULT 'pending'
+                CHECK (disposition IN ('pending', 'accepted', 'rejected', 'deferred')),
+            disposition_reason TEXT,
+            imported_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            disposition_at TEXT,
+            archive_path TEXT,
+            archived_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS observations_skill_idx ON observations(skill)")
+    conn.execute("CREATE INDEX IF NOT EXISTS observations_disposition_idx ON observations(disposition)")
+    conn.commit()
+    return conn
+
+
+def _provenance(payload: str) -> str | None:
+    """Read a simple optional front-matter provenance value without changing payload."""
+    if not payload.startswith("---\n"):
+        return None
+    end = payload.find("\n---", 4)
+    if end < 0:
+        return None
+    for line in payload[4:end].splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() in {"provenance", "source", "origin"}:
+            value = value.strip().strip('"\'')
+            return value or None
+    return None
+
+
+def _files(observations: Path) -> Iterable[Path]:
+    return sorted(path for path in observations.glob("*.md") if path.is_file())
+
+
+def index_observations(observations: Path, db: Path) -> IndexResult:
+    """Index source Markdown files idempotently, leaving them in place."""
+    observations = observations.expanduser().resolve()
+    observations.mkdir(parents=True, exist_ok=True)
+    result = IndexResult()
+    with _connect(db) as conn:
+        for source in _files(observations):
+            skill = source.stem
+            if not _SKILL_NAME.fullmatch(skill):
+                result = IndexResult(result.imported, result.existing, result.skipped + 1)
+                continue
+            raw = source.read_bytes()
+            payload = raw.decode("utf-8")
+            oid = observation_id(skill, payload)
+            now = _now()
+            mtime = datetime.fromtimestamp(source.stat().st_mtime, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            existing = conn.execute("SELECT id FROM observations WHERE id = ?", (oid,)).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE observations
+                    SET source_path = ?, source_mtime = ?, file_hash = ?, provenance = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (str(source), mtime, sha256_bytes(raw), _provenance(payload), now, oid),
+                )
+                result = IndexResult(result.imported, result.existing + 1, result.skipped)
+                continue
+            conn.execute(
+                """
+                INSERT INTO observations
+                (id, skill, payload, content_hash, file_hash, source_path, source_mtime,
+                 provenance, disposition, imported_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (oid, skill, payload, sha256_text(payload), sha256_bytes(raw), str(source), mtime, _provenance(payload), now, now),
+            )
+            result = IndexResult(result.imported + 1, result.existing, result.skipped)
+    return result
+
+
+def set_disposition(db: Path, record_id: str, disposition: str, *, reason: str | None = None) -> bool:
+    """Set one explicit disposition; pending is allowed to reset a prior decision."""
+    if disposition not in DISPOSITIONS:
+        raise ValueError(f"unsupported disposition: {disposition}")
+    with _connect(db) as conn:
+        changed = conn.execute(
+            """
+            UPDATE observations
+            SET disposition = ?, disposition_reason = ?, disposition_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (disposition, reason, _now(), _now(), record_id),
+        ).rowcount
+    return bool(changed)
+
+
+def _archive_path(observations: Path, row: sqlite3.Row) -> Path:
+    stamp = (row["disposition_at"] or _now()).replace(":", "").replace("-", "")[:8]
+    return observations / "archive" / row["disposition"] / stamp / f"{row['skill']}-{row['id']}.md"
+
+
+def archive_dispositioned(observations: Path, db: Path, record_id: str | None = None) -> ArchiveResult:
+    """Archive only non-pending source files, preserving their exact payload."""
+    observations = observations.expanduser().resolve()
+    with _connect(db) as conn:
+        query = "SELECT * FROM observations WHERE disposition != 'pending' AND archive_path IS NULL"
+        args: tuple[str, ...] = ()
+        if record_id:
+            query += " AND id = ?"
+            args = (record_id,)
+        rows = conn.execute(query, args).fetchall()
+        pending = int(conn.execute("SELECT COUNT(*) FROM observations WHERE disposition = 'pending'").fetchone()[0])
+        result = ArchiveResult(pending=pending)
+        for row in rows:
+            source = Path(row["source_path"])
+            if not source.is_file():
+                result = ArchiveResult(result.archived, result.pending, result.missing + 1)
+                continue
+            raw = source.read_bytes()
+            if sha256_bytes(raw) != row["file_hash"] or raw.decode("utf-8") != row["payload"]:
+                raise ValueError(f"source changed since indexing: {source}")
+            target = _archive_path(observations, row)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+            now = _now()
+            conn.execute(
+                "UPDATE observations SET archive_path = ?, archived_at = ?, updated_at = ? WHERE id = ?",
+                (str(target), now, now, row["id"]),
+            )
+            result = ArchiveResult(result.archived + 1, result.pending, result.missing)
+    return result
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--observations", type=Path, default=default_observations())
+    parser.add_argument("--db", type=Path, default=default_db())
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("index", help="index top-level observation Markdown files")
+    disposition = commands.add_parser("disposition", help="set an explicit disposition for an indexed observation")
+    disposition.add_argument("id")
+    disposition.add_argument("disposition", choices=DISPOSITIONS)
+    disposition.add_argument("--reason")
+    archive = commands.add_parser("archive", help="archive dispositioned source files")
+    archive.add_argument("--id")
+    listing = commands.add_parser("list", help="list indexed observations as JSON")
+    listing.add_argument("--disposition", choices=DISPOSITIONS)
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--observations", type=Path, default=Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "observations")
-    ap.add_argument("--dotfiles", type=Path, required=True, help="a dedicated worktree of the dotfiles repository")
-    ap.add_argument("--check", default="scripts/check-skills", help="validation command, relative to --dotfiles")
-    ap.add_argument("--publish", action="store_true", help="commit, push and open a PR (needs gh auth)")
-    ap.add_argument("--base", default="main")
-    ap.add_argument("--result", type=Path)
-    args = ap.parse_args(argv)
-    dotfiles = args.dotfiles.resolve()
-    result: dict = {"started_at": datetime.now(timezone.utc).isoformat(), "status": "nothing_to_do"}
-
-    def finish(code: int) -> int:
-        text = json.dumps(result, indent=2, sort_keys=True)
-        if code:
-            print("[CRON_FAILURE] skill curation: " + result["status"])
-        print(text)
-        if args.result:
-            args.result.write_text(text + "\n", encoding="utf-8")
-        return code
-
-    if not (dotfiles / "agents" / "skills").is_dir():
-        result.update(status="error", error=f"{dotfiles} is not a dotfiles checkout")
-        return finish(1)
-    if _git(dotfiles, "status", "--porcelain").stdout.strip():
-        result.update(status="error", error="dotfiles worktree is dirty; refusing")
-        return finish(1)
-    observations = read_observations(args.observations)
-    if not observations:
-        return finish(0)
-
-    processed_dir = args.observations / "processed"
-    seen: set[str] = set()
-    for old in processed_dir.rglob("*.md"):
-        for block in re.split(r"\n\s*\n", old.read_text(encoding="utf-8")):
-            seen.add(_norm(block))
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    accepted: dict[str, list[str]] = {}
-    rejected: dict[str, list[dict]] = {}
-    for skill, blocks in observations.items():
-        if not (dotfiles / "agents" / "skills" / skill / "SKILL.md").is_file():
-            rejected[skill] = [{"observation": b[:120], "reason": "no such canonical skill"} for b in blocks]
-            continue
-        kept: list[str] = []
-        for block in blocks:
-            key = _norm(block)
-            if key in seen:
-                rejected.setdefault(skill, []).append({"observation": block[:120], "reason": "duplicate of a processed observation"})
-                continue
-            if len(key) < 40:
-                rejected.setdefault(skill, []).append({"observation": block[:120], "reason": "too short to act on"})
-                continue
-            seen.add(key)
-            kept.append(block)
-        if kept:
-            accepted[skill] = kept
-    result.update(accepted={k: len(v) for k, v in accepted.items()}, rejected=rejected)
-    if not accepted:
-        result["status"] = "all_rejected"
-        return finish(0)
-
-    digest = hashlib.sha256(json.dumps(accepted, sort_keys=True).encode()).hexdigest()[:12]
-    branch = f"skills/curate-{digest}"
-    result.update(branch=branch, digest=digest)
-    if args.publish:
-        existing = _git(dotfiles, "ls-remote", "--heads", "origin", branch).stdout.strip()
-        if existing:
-            # A previous run pushed this branch. It is only published once a PR exists for it;
-            # otherwise recover by opening the PR now, then retire the observations exactly as a
-            # first-time publication would.
-            pr_url = _existing_pr(dotfiles, branch) or _create_pr(dotfiles, branch, args.base, sorted(accepted), "")
-            result.update(remote=existing.split()[0], pr=pr_url or "")
-            if not pr_url:
-                result["status"] = "publish_failed"
-                return finish(1)
-            _retire_observations(args.observations, processed_dir / today, accepted)
-            result["status"] = "already_published"
-            return finish(0)
-        _git(dotfiles, "checkout", "-q", "-b", branch, args.base)
-    staged = [str(stage(dotfiles, skill, blocks, today).relative_to(dotfiles)) for skill, blocks in accepted.items()]
-    result["staged_files"] = staged
-
-    check = subprocess.run([sys.executable, str(dotfiles / args.check)], cwd=str(dotfiles), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800)
-    result["check"] = {"exit": check.returncode, "tail": (check.stdout + check.stderr).strip()[-600:]}
-    if check.returncode != 0:
-        restore(dotfiles, staged)
-        if args.publish:
-            _git(dotfiles, "checkout", "-q", args.base)
-            _git(dotfiles, "branch", "-D", branch, check=False)
-        result["status"] = "check_failed"
-        return finish(1)
-
-    if not args.publish:
-        result["status"] = "staged"
-        restore(dotfiles, staged)
-        return finish(0)
-    _git(dotfiles, "add", "--", *staged)
-    skills = ", ".join(sorted(accepted))
-    message = (f"skills: stage observations for curation ({skills})\n\n"
-               f"{sum(len(v) for v in accepted.values())} observation(s) from agent work, deduplicated against "
-               f"processed history, staged into MAINTENANCE.md for reviewed incorporation. Digest {digest}.\n")
-    _git(dotfiles, "-c", "user.name=Brian Le", "-c", "user.email=brian@brianle.xyz", "commit", "-q", "-m", message)
-    _git(dotfiles, "push", "-q", "-u", "origin", branch)
-    pr_url = _create_pr(dotfiles, branch, args.base, sorted(accepted), message)
-    result["pr"] = pr_url or ""
-    _git(dotfiles, "checkout", "-q", args.base)
-    if not pr_url:
-        # The branch is pushed but nobody was asked to review it. Leave the observations in place
-        # so the next run finds the remote branch and opens the PR instead of reporting success.
-        result["status"] = "publish_failed"
-        return finish(1)
-    _retire_observations(args.observations, processed_dir / today, accepted)
-    result["status"] = "published"
-    return finish(0)
-
-
-def _existing_pr(dotfiles: Path, branch: str) -> str:
-    run = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url"],
-                         cwd=str(dotfiles), capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "GH_REPO": ""})
-    return run.stdout.strip() if run.returncode == 0 else ""
-
-
-def _create_pr(dotfiles: Path, branch: str, base: str, skills: list[str], body: str) -> str:
-    """Open the review request and return its URL only when gh reports success."""
-    run = subprocess.run(["gh", "pr", "create", "--base", base, "--head", branch, "--title",
-                          f"skills: curate observations ({', '.join(skills)})", "--body",
-                          body or f"Staged skill observations for reviewed incorporation ({', '.join(skills)})."],
-                         cwd=str(dotfiles), capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "GH_REPO": ""})
-    if run.returncode != 0:
-        return ""
-    url = run.stdout.strip().splitlines()[-1].strip() if run.stdout.strip() else ""
-    return url if url.startswith("https://") else ""
-
-
-def _retire_observations(observations: Path, stamp: Path, accepted: dict[str, list[str]]) -> None:
-    stamp.mkdir(parents=True, exist_ok=True)
-    for skill in accepted:
-        source = observations / f"{skill}.md"
-        if source.is_file():
-            shutil.move(str(source), str(stamp / f"{skill}.md"))
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.command == "index":
+        print(json.dumps(index_observations(args.observations, args.db).__dict__, sort_keys=True))
+        return 0
+    if args.command == "disposition":
+        if not set_disposition(args.db, args.id, args.disposition, reason=args.reason):
+            parser.error(f"unknown observation id: {args.id}")
+        return 0
+    if args.command == "archive":
+        print(json.dumps(archive_dispositioned(args.observations, args.db, args.id).__dict__, sort_keys=True))
+        return 0
+    with _connect(args.db) as conn:
+        query = "SELECT * FROM observations"
+        params: tuple[str, ...] = ()
+        if args.disposition:
+            query += " WHERE disposition = ?"
+            params = (args.disposition,)
+        query += " ORDER BY imported_at, id"
+        for row in conn.execute(query, params):
+            print(json.dumps(dict(row), sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
