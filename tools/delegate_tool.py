@@ -31,7 +31,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_child_request_overrides, _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -223,12 +223,14 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
-    if override_request_overrides is not None:
-        # honored whenever set, incl. the inherit branch where
-        # _resolve_delegation_credentials already merged OVER the parent's
-        request_overrides = dict(override_request_overrides)
-    else:
-        request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+    request_overrides = _resolve_child_request_overrides(
+        parent_agent,
+        child_model=rt.get("model"),
+        child_provider=rt.get("provider"),
+        child_base_url=rt.get("base_url"),
+        explicit_overrides=override_request_overrides,
+        inherit_parent_route=not override_provider and not override_base_url,
+    )
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
@@ -242,7 +244,8 @@ def _build_child_agent(
                     (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
                     if child_progress_cb else None
                 ),
-                session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                session_db=child_session_db, parent_session_id=parent_sid,
+                request_overrides=request_overrides or {},
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
             )

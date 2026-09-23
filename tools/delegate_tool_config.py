@@ -176,6 +176,85 @@ def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     return is_truthy_value(_cfg().get("inherit_mcp_toolsets"), default=True)
 
+
+_FAST_REQUEST_OVERRIDE_KEYS = frozenset({"service_tier", "speed"})
+
+
+def _inherit_service_tier() -> bool:
+    """Whether delegated children inherit the parent's effective fast preference."""
+    return is_truthy_value(_cfg().get("inherit_service_tier", False))
+
+
+def _parent_has_fast_preference(parent_agent) -> bool:
+    """Return whether the parent's normalized runtime preference is Fast."""
+    mode = getattr(parent_agent, "service_tier", None)
+    if mode == "priority":
+        return True
+    if mode not in {"auto", "cold"}:
+        return False
+    try:
+        from agent.fast_mode import effective_request_overrides
+        effective = effective_request_overrides(parent_agent)
+    except Exception:
+        return False
+    return isinstance(effective, dict) and any(
+        effective.get(key) in {"priority", "fast"} for key in _FAST_REQUEST_OVERRIDE_KEYS
+    )
+
+
+def _resolve_child_request_overrides(
+    parent_agent,
+    *,
+    child_model: Optional[str],
+    child_provider: Optional[str],
+    child_base_url: Optional[str],
+    explicit_overrides: Optional[Dict[str, Any]],
+    inherit_parent_route: bool,
+) -> Optional[Dict[str, Any]]:
+    """Resolve child request overrides without leaking transient parent fast state.
+
+    Non-fast parent overrides remain available when the child stays on the parent's
+    route. Fast fields are copied only when explicitly enabled, and are re-derived
+    for the child's route. Explicit child overrides win over inherited fast state.
+    """
+    import copy
+
+    explicit = copy.deepcopy(explicit_overrides) if isinstance(explicit_overrides, dict) else {}
+    inherited = {}
+    if inherit_parent_route:
+        parent_overrides = getattr(parent_agent, "request_overrides", {})
+        if isinstance(parent_overrides, dict):
+            inherited = copy.deepcopy(parent_overrides)
+        for key in _FAST_REQUEST_OVERRIDE_KEYS:
+            inherited.pop(key, None)
+
+        if _inherit_service_tier() and _parent_has_fast_preference(parent_agent) and not any(
+            key in explicit for key in _FAST_REQUEST_OVERRIDE_KEYS
+        ):
+            try:
+                from agent.fast_mode import effective_request_overrides
+                parent_effective = effective_request_overrides(parent_agent)
+            except Exception:
+                parent_effective = parent_overrides if isinstance(parent_overrides, dict) else {}
+            if not isinstance(parent_effective, dict):
+                parent_effective = {}
+            parent_fast = {
+                key: parent_effective[key]
+                for key in _FAST_REQUEST_OVERRIDE_KEYS
+                if key in parent_effective
+            }
+            if parent_fast:
+                from hermes_cli.models import resolve_fast_mode_overrides
+                child_fast = resolve_fast_mode_overrides(
+                    child_model,
+                    provider=child_provider,
+                    base_url=child_base_url,
+                )
+                if child_fast:
+                    inherited.update(child_fast)
+
+    return _merge_request_overrides(inherited, explicit)
+
 def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
@@ -430,7 +509,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
         return _credential_bundle(
             values["model"], None, None, None, None,
-            _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
+            explicit_request_overrides,
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
 

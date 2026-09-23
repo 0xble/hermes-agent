@@ -1334,6 +1334,10 @@ DEFAULT_CONFIG = {
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
         # toolsets=["web"] doesn't strip MCP). false = strict intersection.
         "inherit_mcp_toolsets": True,
+        # When true, delegated children inherit the parent's effective Fast/normal preference.
+        # Fast fields are re-derived for the child's own provider/model route. false preserves
+        # existing child behavior while preventing transient parent service_tier/speed leakage.
+        "inherit_service_tier": False,
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
         # Hard per-summary char ceiling on subagent results, layered on the dynamic budget (each
