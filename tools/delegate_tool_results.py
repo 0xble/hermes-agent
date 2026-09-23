@@ -365,6 +365,7 @@ def _fire_subagent_stop_hooks(results, child_by_index, parent_agent) -> float:
             invoke_hook(
                 "subagent_stop", parent_session_id=getattr(parent_agent, "session_id", None),
                 parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                parent_agent=parent_agent,
                 child_session_id=getattr(child, "session_id", None), child_role=child_role,
                 child_summary=entry.get("summary"), child_status=entry.get("status"),
                 tool_call_history=_subagent_stop_tool_call_history(entry.get("tool_trace")),
