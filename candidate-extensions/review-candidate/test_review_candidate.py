@@ -183,6 +183,75 @@ def test_availability_failure_falls_back_once_and_records_the_reason(plugin, tmp
     assert receipt["reviewer_model"] == "claude-opus-5" and "429" in receipt["fallback_reason"]
 
 
+def _configure_review_routes(monkeypatch, *models):
+    import sys
+    from types import ModuleType
+    cfg = ModuleType("hermes_cli.config")
+    cfg.load_config_readonly = lambda: {"auxiliary": {"review": {"fallback_providers": [
+        {"provider": "custom:route", "model": model} for model in models
+    ]}}}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg)
+
+
+def test_execution_rate_limit_falls_back_and_late_primary_cannot_overwrite(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    _configure_review_routes(monkeypatch, "gpt-6-astra", "claude-opus-5")
+    attempts = _stub_dispatch(plugin, monkeypatch, [DISPATCHED, DISPATCHED])
+    first = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert first["status"] == "pending"
+    assert [a["credentials"].get("model") for a in attempts] == ["claude-fable-5-1"]
+
+    plugin._on_subagent_start(child_session_id="primary", child_goal=f"Review candidate {head[:12]}")
+    plugin._on_subagent_stop(
+        child_summary="HTTP 429: This request would exceed your account's rate limit",
+        child_status="failed", child_session_id="primary", parent_agent=object(),
+    )
+    assert [a["credentials"].get("model") for a in attempts] == ["claude-fable-5-1", "gpt-6-astra"]
+    pending = json.loads(plugin._pending_path(head).read_text())
+    assert pending["route_index"] == 1
+    assert pending["attempts"][0]["outcome"] == "provider_unavailable"
+
+    # The failed primary may deliver a late duplicate stop event, but it no longer owns the marker.
+    plugin._on_subagent_stop(
+        child_summary="late primary result", child_status="completed", child_session_id="primary",
+        parent_agent=object(),
+    )
+    assert plugin._pending_path(head).exists()
+    assert not plugin._receipt_path(head).exists()
+
+    plugin._on_subagent_start(child_session_id="fallback", child_goal=f"Review candidate {head[:12]}")
+    plugin._on_subagent_stop(
+        child_summary=_reviewer_message(head, "approve"), child_status="completed", child_session_id="fallback",
+    )
+    receipt = json.loads(plugin._receipt_path(head).read_text())
+    assert receipt["status"] == "reviewed"
+    assert receipt["reviewer_model"] == "gpt-6-astra"
+    assert receipt["result"]["verdict"] == "approve"
+    assert receipt["attempts"][0]["outcome"] == "provider_unavailable"
+    assert receipt["attempts"][1]["outcome"] == "reviewed"
+
+
+def test_execution_failures_exhaust_routes_without_approval(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    _configure_review_routes(monkeypatch, "gpt-6-astra", "claude-opus-5")
+    attempts = _stub_dispatch(plugin, monkeypatch, [DISPATCHED, {"error": "503 unavailable"},
+                                                     {"error": "429 rate limit"}])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    plugin._on_subagent_start(child_session_id="primary", child_goal=f"Review candidate {head[:12]}")
+    plugin._on_subagent_stop(
+        child_summary="provider returned 429 rate limit", child_status="failed",
+        child_session_id="primary", parent_agent=object(),
+    )
+    receipt = json.loads(plugin._receipt_path(head).read_text())
+    assert receipt["status"] == "not_reviewed"
+    assert receipt["error_code"] == "review_incomplete"
+    assert len(attempts) == 3
+    assert [entry["outcome"] for entry in receipt["attempts"]] == [
+        "provider_unavailable", "dispatch_failed", "dispatch_failed",
+    ]
+    assert not plugin._pending_path(head).exists()
+
+
 def test_non_availability_dispatch_error_is_not_retried_on_the_fallback(plugin, tmp_path, monkeypatch):
     base, head = _repo(tmp_path)
     attempts = _stub_dispatch(plugin, monkeypatch, [{"error": "delegation spawning is paused by the operator"}])
@@ -234,8 +303,10 @@ def test_unparsable_reviewer_output_is_marked_unparsed(plugin, tmp_path, monkeyp
 def test_availability_classifier_separates_the_two_failure_classes(plugin):
     for availability in ("429 rate limit", "401 unauthorized", "503 unavailable", "connection reset", "quota exceeded"):
         assert plugin._is_availability_failure(availability) is True
-    for ran_and_failed in ("child timed out", "status unknown", "interrupted by user", "assertion failed in tests"):
+    for ran_and_failed in ("status unknown", "interrupted by user", "assertion failed in tests"):
         assert plugin._is_availability_failure(ran_and_failed) is False
+    assert plugin._is_availability_failure("provider timed out") is True
+    assert plugin._is_availability_failure("", "timeout") is True
 
 
 def test_failed_reviewer_with_no_summary_is_recorded_not_reviewed(plugin, tmp_path, monkeypatch):

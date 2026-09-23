@@ -31,10 +31,9 @@ _SCHEMA = {
 # coverage the reviewer never saw.
 _MAX_DIFF_BYTES = 2_000_000
 
-# Only a provider-level AVAILABILITY failure may fall back to the secondary reviewer. A child
-# that started and then failed, timed out, or returned an unknown status is recorded as
-# "not reviewed" — re-running it on another model would review a different thing and is not
-# what the delivery gate promises.
+# Only a provider-level AVAILABILITY failure may fall back to the next configured reviewer. The
+# candidate, base, head, and scope remain frozen across routes. A semantic finding, policy
+# violation, or user interruption is never converted into a provider fallback.
 _AVAILABILITY_PATTERN = re.compile(
     r"\b(401|403|429|50[0-9]|auth|authentication|unauthorized|credential|quota|rate.?limit|"
     r"overloaded|unavailable|capacity|no such model|model not found|could not start|failed to start|"
@@ -43,29 +42,43 @@ _AVAILABILITY_PATTERN = re.compile(
 )
 _NON_AVAILABILITY_PATTERN = re.compile(r"\b(timeout|timed out|unknown|interrupted|cancell?ed)\b", re.IGNORECASE)
 
-# Secondary reviewer, used only on a dispatch-time availability failure. Read from
-# ``auxiliary.review.fallback_providers[0]`` (same entry shape as the delegation chain) so the
-# route follows the profile's provider naming; these literals are the last resort.
+# Last-resort route when the profile has no configured fallback. Configured routes always win.
 _FALLBACK_PROVIDER = "anthropic"
 _FALLBACK_MODEL = "claude-opus-5"
 
 
-def _fallback_credentials(primary: dict[str, Any] | None) -> dict[str, Any]:
-    fallback = dict(primary or {})
-    provider, model = _FALLBACK_PROVIDER, _FALLBACK_MODEL
+def _review_routes(primary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the primary route followed by every configured fallback route.
+
+    Route entries may contain secrets in memory, but callers must only persist provider/model
+    metadata in receipts. Keeping the whole route list here lets dispatch-time and child-time
+    failures use the same bounded fallback policy.
+    """
+    routes = [dict(primary or {})]
     try:
         from hermes_cli.config import load_config_readonly
         chain = ((load_config_readonly().get("auxiliary") or {}).get("review") or {}).get("fallback_providers") or []
-        first = next((e for e in chain if isinstance(e, dict) and e.get("model")), None)
-        if first:
-            provider, model = str(first.get("provider") or provider), str(first["model"])
-            for key in ("base_url", "api_key", "api_mode"):
-                if first.get(key):
-                    fallback[key] = str(first[key])
+        for entry in chain:
+            if not isinstance(entry, dict) or not entry.get("model"):
+                continue
+            route = dict(primary or {})
+            for key in ("provider", "model", "base_url", "api_key", "api_mode", "reasoning_effort",
+                        "request_overrides"):
+                if key in entry and entry[key] is not None:
+                    route[key] = entry[key]
+            routes.append(route)
     except Exception:
         pass
-    fallback["provider"], fallback["model"] = provider, model
-    return fallback
+    if len(routes) == 1:
+        fallback = dict(primary or {})
+        fallback["provider"], fallback["model"] = _FALLBACK_PROVIDER, _FALLBACK_MODEL
+        routes.append(fallback)
+    return routes
+
+
+def _fallback_credentials(primary: dict[str, Any] | None) -> dict[str, Any]:
+    """Compatibility helper for callers and tests that need the first fallback route."""
+    return _review_routes(primary)[1]
 
 
 def _json(**fields: Any) -> str:
@@ -96,9 +109,19 @@ def _existing_receipt(path: Path, *, base_sha: str, head_sha: str, scope: list[s
     return None
 
 
-def _is_availability_failure(error: Any) -> bool:
-    """True only for provider-level failures that mean the reviewer never ran."""
+def _is_availability_failure(error: Any, status: Any = None) -> bool:
+    """True for provider failures that justify trying the next reviewer route.
+
+    A child timeout is eligible because the provider route did not produce a verdict. Explicit
+    interruption/cancellation is not eligible because it is an owner action, not availability.
+    """
     text = str(error or "")
+    if re.search(r"\b(interrupted|cancell?ed)\b", text, re.IGNORECASE):
+        return False
+    if re.search(r"\b(timeout|timed out)\b", text, re.IGNORECASE):
+        return True
+    if str(status or "").lower() in {"timeout", "timed_out"}:
+        return True
     if _NON_AVAILABILITY_PATTERN.search(text):
         return False
     return bool(_AVAILABILITY_PATTERN.search(text))
@@ -202,8 +225,51 @@ def _dispatch_review(context: str, head: str, parent: Any, credentials: dict[str
         return {"error": f"review dispatch returned unparsable output: {str(raw)[:400]}"}
 
 
+def _review_context(repository: str, base_sha: str, head_sha: str, covers: list[str]) -> str:
+    """Rebuild the exact frozen review prompt for an execution-time fallback."""
+    repo = Path(repository)
+    diff = _git(repo, "diff", "--no-ext-diff", "--unified=3", base_sha, head_sha, "--", *covers)
+    return (
+        "You are the independent reviewer for this exact candidate. Do not edit files, create "
+        "commits, or call review_candidate (it is parent-only and you are the reviewer it spawned). "
+        "Inspect the repository read-only and run relevant tests when a terminal is available; "
+        "if it is not, say so and review the diff statically. Your FINAL message must be a single "
+        "fenced ```json block with keys head_sha (the exact head you reviewed), verdict (approve or "
+        "changes_requested), findings (array of objects with severity, path, line, message), and "
+        "summary. No prose outside the block.\n\n"
+        f"Repository: {repo}\nBase: {base_sha}\nHead: {head_sha}\n"
+        f"Covered paths: {json.dumps(covers)}\nFull diff:\n{diff}"
+    )
+
+
+def _route_metadata(route: dict[str, Any]) -> dict[str, str]:
+    """Return receipt-safe route metadata without persisting credentials or request overrides."""
+    return {key: str(route.get(key) or "") for key in ("provider", "model")}
+
+
+def _write_not_reviewed(pending: dict[str, Any], *, error_code: str, error: str) -> None:
+    _write_json(_receipt_path(pending["head_sha"]), {
+        "status": "not_reviewed",
+        "error_code": error_code,
+        "repository": pending["repository"],
+        "base_sha": pending["base_sha"],
+        "head_sha": pending["head_sha"],
+        "scope": pending.get("covers", []),
+        "covers": pending.get("covers", []),
+        "reviewer_model": pending.get("reviewer_model", ""),
+        "fallback_reason": pending.get("fallback_reason", ""),
+        "attempts": pending.get("attempts", []),
+        "error": error,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 def _finalize_receipt(pending: dict[str, Any], result: dict[str, Any], *, reviewer_model: str,
                       fallback_reason: str) -> dict[str, Any]:
+    attempts = list(pending.get("attempts") or [])
+    if attempts and attempts[-1].get("outcome") == "dispatched":
+        attempts[-1]["outcome"] = "reviewed"
+    pending["attempts"] = attempts
     receipt = {
         "status": "reviewed",
         "repository": pending["repository"],
@@ -213,6 +279,7 @@ def _finalize_receipt(pending: dict[str, Any], result: dict[str, Any], *, review
         "covers": pending["covers"],
         "reviewer_model": reviewer_model,
         "fallback_reason": fallback_reason,
+        "attempts": attempts,
         "result": _structured_verdict(result),
         "raw_child_result": result.get("results", result),
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -253,13 +320,14 @@ def _on_subagent_start(child_session_id: Any = None, child_goal: Any = None, **_
 
 
 def _on_subagent_stop(child_summary: Any = None, child_status: Any = None, child_session_id: Any = None,
-                      parent_session_id: Any = None, **_: Any) -> None:
+                      parent_session_id: Any = None, parent_agent: Any = None, **_: Any) -> None:
     """Turn a finished reviewer child into a durable receipt.
 
     Only the child bound at ``subagent_start`` (by session id, in memory or on the marker) may
     complete a pending review. There is deliberately no fallback on summary text: any child whose
     output merely mentions the candidate's SHA must not be able to write a ``reviewed`` receipt.
-    Fires for every child stop, so it must be cheap and must ignore every unrelated child.
+    A provider availability failure may advance the same frozen candidate to the next configured
+    route. Fires for every child stop, so it must be cheap and must ignore every unrelated child.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -278,21 +346,91 @@ def _on_subagent_stop(child_summary: Any = None, child_status: Any = None, child
             if not head:
                 continue
             bound = str(pending.get("child_session_id") or "")
-            if not ((head12 and head.startswith(head12)) or (bound and bound == child)):
+            if child in {str(value) for value in (pending.get("superseded_child_session_ids") or [])}:
+                continue
+            # Once a marker has a bound child, a late result from an earlier route must not
+            # complete or overwrite the replacement review merely because it shares the head SHA.
+            if bound:
+                if bound != child:
+                    continue
+            elif not (head12 and head.startswith(head12)):
                 continue
             status = str(child_status or "")
-            if status not in ("completed", "success", "ok") or not summary:
-                _write_json(_receipt_path(head), {
-                    "status": "not_reviewed", "error_code": "review_incomplete",
-                    "repository": pending["repository"], "base_sha": pending["base_sha"], "head_sha": head,
-                    "reviewer_model": pending.get("reviewer_model", ""),
-                    "error": f"reviewer child ended with status {status!r}" + ("" if summary else " and no summary"),
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                })
-            else:
+            if status in ("completed", "success", "ok") and summary:
                 _finalize_receipt(pending, {"results": [{"status": status, "summary": summary}]},
                                   reviewer_model=pending.get("reviewer_model", ""),
                                   fallback_reason=pending.get("fallback_reason", ""))
+                marker.unlink(missing_ok=True)
+                return
+
+            failure = summary or f"reviewer child ended with status {status!r} and no summary"
+            attempts = list(pending.get("attempts") or [])
+            if attempts:
+                attempts[-1]["outcome"] = "provider_unavailable" if _is_availability_failure(failure, status) else "failed"
+                attempts[-1]["error"] = failure[:500]
+            pending["attempts"] = attempts
+
+            if _is_availability_failure(failure, status) and parent_agent is not None:
+                try:
+                    from agent.review_engine import _load_review_credentials_cfg
+                    routes = _review_routes(_load_review_credentials_cfg())
+                    next_index = int(pending.get("route_index", 0)) + 1
+                    context = _review_context(pending["repository"], pending["base_sha"], head,
+                                              list(pending.get("covers") or []))
+                    # Clear the old binding before dispatch. The new child-start hook will bind the
+                    # replacement child, while the old child is no longer allowed to match.
+                    superseded = list(pending.get("superseded_child_session_ids") or [])
+                    if child not in superseded:
+                        superseded.append(child)
+                    pending["superseded_child_session_ids"] = superseded
+                    pending["child_session_id"] = ""
+                    _write_json(marker, pending)
+                    fallback_reasons = [str(pending.get("fallback_reason") or "").strip()]
+                    for index in range(next_index, len(routes)):
+                        route = routes[index]
+                        handle = _dispatch_review(context, head, parent_agent, route)
+                        if handle.get("error"):
+                            reason = str(handle["error"])[:500]
+                            fallback_reasons.append(reason)
+                            attempts.append({"attempt": index + 1, **_route_metadata(route),
+                                             "outcome": "dispatch_failed", "error": reason})
+                            pending["attempts"] = attempts
+                            if _is_availability_failure(reason):
+                                continue
+                            break
+                        if handle.get("status") != "dispatched":
+                            attempts.append({"attempt": index + 1, **_route_metadata(route), "outcome": "completed"})
+                            pending["attempts"] = attempts
+                            receipt = _finalize_receipt(
+                                pending, handle,
+                                reviewer_model=str(handle.get("review_model") or route.get("model") or ""),
+                                fallback_reason="; ".join(filter(None, fallback_reasons)),
+                            )
+                            marker.unlink(missing_ok=True)
+                            return
+                        pending.update({
+                            "route_index": index,
+                            "attempt": index + 1,
+                            "reviewer_model": str(route.get("model") or ""),
+                            "fallback_reason": "; ".join(filter(None, fallback_reasons + [failure[:500]])),
+                            "delegation_id": str(handle.get("delegation_id") or ""),
+                            "child_session_id": "",
+                            "dispatched_at": datetime.now(timezone.utc).isoformat(),
+                        })
+                        attempts.append({"attempt": index + 1, **_route_metadata(route), "outcome": "dispatched"})
+                        pending["attempts"] = attempts
+                        _write_json(marker, pending)
+                        return
+                except Exception as exc:
+                    attempts.append({"attempt": int(pending.get("route_index", 0)) + 1,
+                                     "outcome": "fallback_dispatch_failed", "error": str(exc)[:500]})
+                    pending["attempts"] = attempts
+
+            _write_not_reviewed(
+                pending,
+                error_code="review_incomplete",
+                error=failure,
+            )
             marker.unlink(missing_ok=True)
             return
     except Exception:
@@ -336,17 +474,7 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
                          base_sha=base_resolved, head_sha=head_resolved,
                          error="candidate diff exceeds the review context limit; split the candidate")
 
-        context = (
-            "You are the independent reviewer for this exact candidate. Do not edit files, create "
-            "commits, or call review_candidate (it is parent-only and you are the reviewer it spawned). "
-            "Inspect the repository read-only and run relevant tests when a terminal is available; "
-            "if it is not, say so and review the diff statically. Your FINAL message must be a single "
-            "fenced ```json block with keys head_sha (the exact head you reviewed), verdict (approve or "
-            "changes_requested), findings (array of objects with severity, path, line, message), and "
-            "summary. No prose outside the block.\n\n"
-            f"Repository: {repo}\nBase: {base_resolved}\nHead: {head_resolved}\n"
-            f"Covered paths: {json.dumps(covers)}\nFull diff:\n{diff}"
-        )
+        context = _review_context(str(repo), base_resolved, head_resolved, covers)
 
         from agent.review_engine import _load_review_credentials_cfg
         from agent.subagent_lifecycle import get_active_subagent_parent
@@ -356,6 +484,7 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
                          base_sha=base_resolved, head_sha=head_resolved,
                          error="review child requires an active parent agent")
         credentials = _load_review_credentials_cfg()
+        routes = _review_routes(credentials)
         primary_model = str((credentials or {}).get("model") or "")
 
         pending_marker = _pending_path(head_resolved)
@@ -379,27 +508,39 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
                 "created_at": datetime.now(timezone.utc).isoformat()})
             pending_marker.unlink(missing_ok=True)
 
-        handle = _dispatch_review(context, head_resolved, parent, credentials)
-        reviewer_model, fallback_reason = primary_model, ""
-        if handle.get("error"):
-            if not _is_availability_failure(handle["error"]):
+        handle: dict[str, Any] = {"error": "no reviewer route configured"}
+        route_index = 0
+        reviewer_model = primary_model
+        fallback_reason = ""
+        dispatch_attempts: list[dict[str, Any]] = []
+        for route_index, route in enumerate(routes):
+            handle = _dispatch_review(context, head_resolved, parent, route)
+            if not handle.get("error"):
+                reviewer_model = str(route.get("model") or "")
+                break
+            reason = str(handle["error"])[:500]
+            dispatch_attempts.append({"attempt": route_index + 1, **_route_metadata(route),
+                                     "outcome": "dispatch_failed", "error": reason})
+            if not _is_availability_failure(reason):
                 return _json(success=False, status="not_reviewed", error_code="review_incomplete",
                              base_sha=base_resolved, head_sha=head_resolved, reviewer_model=primary_model,
-                             error=str(handle["error"]))
-            fallback_reason = str(handle["error"])[:500]
-            fallback = _fallback_credentials(credentials)
-            handle = _dispatch_review(context, head_resolved, parent, fallback)
-            reviewer_model = fallback["model"]
-            if handle.get("error"):
-                return _json(success=False, status="not_reviewed", error_code="review_unavailable",
-                             base_sha=base_resolved, head_sha=head_resolved,
-                             error=f"primary unavailable ({fallback_reason}); fallback failed: {handle['error']}")
+                             attempts=dispatch_attempts, error=reason)
+            fallback_reason = "; ".join(filter(None, [fallback_reason, reason]))
+        if handle.get("error"):
+            return _json(success=False, status="not_reviewed", error_code="review_unavailable",
+                         base_sha=base_resolved, head_sha=head_resolved,
+                         attempts=dispatch_attempts,
+                         error=f"all configured reviewer routes unavailable: {fallback_reason}")
 
         pending = {
             "repository": str(repo), "base_sha": base_resolved, "head_sha": head_resolved, "covers": covers,
             "reviewer_model": reviewer_model, "fallback_reason": fallback_reason,
+            "route_index": route_index, "attempt": route_index + 1,
             "delegation_id": str(handle.get("delegation_id") or ""),
+            "child_session_id": "",
             "dispatched_at": datetime.now(timezone.utc).isoformat(),
+            "attempts": dispatch_attempts + [{"attempt": route_index + 1, **_route_metadata(routes[route_index]),
+                                              "outcome": "dispatched"}],
         }
         if handle.get("status") == "dispatched":
             _write_json(pending_marker, pending)
