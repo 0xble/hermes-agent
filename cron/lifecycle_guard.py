@@ -471,7 +471,9 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 # get a far tighter cap.
 # See #78398.
 _MAX_LIFECYCLE_SCAN_BYTES = _MAX_REFERENCED_SCRIPT_BYTES  # 1 MiB across the walk
-_MAX_LIFECYCLE_SCAN_LINES = 16384
+# Large generated Python CLIs can stay below the byte cap while legitimately exceeding 16K
+# short lines. Keep a separate bounded line-work ceiling without rejecting those executables.
+_MAX_LIFECYCLE_SCAN_LINES = 32768
 _MAX_LIFECYCLE_SCAN_LINE_BYTES = 64 * 1024
 _MAX_LIFECYCLE_SCAN_PATHS = 1024
 _MAX_LIFECYCLE_SCAN_REMOTE_READS = 64
