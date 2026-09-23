@@ -37,13 +37,52 @@ from hermes_startup_watchdog import (
 
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
-    """Every test gets a fresh singleton and its own HERMES_HOME."""
+    """Own watchdogs through teardown, including helpers outside the singleton."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv(sw.ENV_STARTUP_WATCHDOG, raising=False)
     monkeypatch.delenv(sw.ENV_STARTUP_WATCHDOG_TIMEOUT_S, raising=False)
     sw._reset_for_tests()
-    yield
-    sw._reset_for_tests()
+    handles = []
+    helpers = []
+    unexpected_exits = []
+    stop_escorts = threading.Event()
+    original_init = StartupWatchdogHandle.__init__
+    original_start = threading.Thread.start
+
+    def own_handle(handle, *args, **kwargs):
+        original_init(handle, *args, **kwargs)
+        # A helper that escapes a failed bounded join must never inherit the
+        # real os._exit when pytest restores the class-level monkeypatch.
+        handle._exit = StartupWatchdogHandle._exit
+        handles.append(handle)
+
+    def own_helper(thread):
+        if thread.name.startswith("gateway-startup-watchdog"):
+            helpers.append(thread)
+        return original_start(thread)
+
+    monkeypatch.setattr(StartupWatchdogHandle, "__init__", own_handle)
+    monkeypatch.setattr(StartupWatchdogHandle, "_exit", staticmethod(unexpected_exits.append))
+    monkeypatch.setattr(StartupWatchdogHandle, "_sleep", staticmethod(stop_escorts.wait))
+    monkeypatch.setattr(threading.Thread, "start", own_helper)
+    try:
+        yield
+    finally:
+        sw._reset_for_tests()
+        for handle in handles:
+            handle.disarm()
+        stop_escorts.set()
+        deadline = time.monotonic() + 10
+        for handle in handles:
+            handle.join(timeout=max(0, deadline - time.monotonic()))
+        # Joining the main workers first also captures ledger helpers created
+        # during cleanup. Fast-escort tests retain their own sleep seam.
+        for helper in helpers:
+            if helper.ident is not None:
+                helper.join(timeout=max(0, deadline - time.monotonic()))
+        alive = [helper.name for helper in helpers if helper.is_alive()]
+        assert not alive, f"watchdog helpers survived test teardown: {alive}"
+        assert not unexpected_exits, f"unexpected watchdog exits: {unexpected_exits}"
 
 
 @pytest.fixture(autouse=True)
@@ -587,12 +626,14 @@ class TestBoundedExit:
         monkeypatch.setattr(sw, "_write_dump_record", _hang)
         handle = arm_startup_watchdog(timeout_s=0.1)
         assert handle is not None
-        assert exit_capture.fired.wait(timeout=10)
-        assert SERVICE_RESTART_EXIT_CODE in exit_capture.codes
-        # Unblock and drain the fire thread before monkeypatch teardown
-        # (same real-os._exit hazard as above).
-        forever.set()
-        handle.join(timeout=10)
+        try:
+            assert exit_capture.fired.wait(timeout=10)
+            assert SERVICE_RESTART_EXIT_CODE in exit_capture.codes
+        finally:
+            # Release the barrier even when an assertion fails. The owning
+            # fixture also drains all helpers before monkeypatch teardown.
+            forever.set()
+            handle.join(timeout=10)
 
     def test_escort_stands_down_when_fire_completes(self, exit_capture, monkeypatch):
         """When forensics complete normally the escort must NOT double-exit:
@@ -629,3 +670,50 @@ class TestDumpPath:
             sw, "get_startup_watchdog_dump_path", lambda home=None: Path("/dev/null/nope")
         )
         sw._write_dump_record({"tag": "x"})
+
+
+def test_isolation_drains_firing_handle_before_restoring_exit(tmp_path):
+    """A non-singleton fire cannot escape its test or inherit a later exit seam."""
+    in_dump = threading.Event()
+    release_dump = threading.Event()
+    captured = []
+    wrong_exit = []
+
+    with pytest.MonkeyPatch.context() as patches:
+        isolation = _isolate.__wrapped__(tmp_path, patches)
+        next(isolation)
+        patches.setattr(StartupWatchdogHandle, "_exit", staticmethod(captured.append))
+
+        def blocked_dump(record):
+            in_dump.set()
+            assert release_dump.wait(timeout=10)
+
+        patches.setattr(sw, "_write_dump_record", blocked_dump)
+        handle = StartupWatchdogHandle(0.01, SERVICE_RESTART_EXIT_CODE)
+        original_join = handle.join
+
+        def release_and_join(timeout=None):
+            release_dump.set()
+            original_join(timeout=timeout)
+
+        patches.setattr(handle, "join", release_and_join)
+        try:
+            assert handle._start()
+            assert in_dump.wait(timeout=5)
+            # The handle must retain its own callback even if the class seam
+            # changes while its forensic worker is still blocked.
+            patches.setattr(StartupWatchdogHandle, "_exit", staticmethod(wrong_exit.append))
+            isolation.close()
+            assert not handle.is_alive(), "fixture returned before draining its fire worker"
+            assert not any(
+                thread.name.startswith("gateway-startup-watchdog")
+                for thread in threading.enumerate()
+            ), "fixture returned before draining its helpers"
+            assert captured
+            assert wrong_exit == []
+        finally:
+            # The RED version of the fixture does not drain. Keep this
+            # regression safe even when that exact defect returns.
+            release_dump.set()
+            original_join(timeout=5)
+            isolation.close()

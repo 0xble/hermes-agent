@@ -210,7 +210,8 @@ def python_tests(env: dict[str, str], roots: list[str], workers: int,
     python(env)  # No fallback to a personal runtime environment.
     require_tools(('rg',), env)
     env = dict(env)
-    command = ['bash', 'scripts/run_tests.sh', '-j', str(workers), *roots, *(pytest_args or [])]
+    command = ['bash', 'scripts/run_tests.sh', '-j', str(workers), '--file-retries', '0',
+               *roots, *(pytest_args or [])]
     # The runner provides a disk-backed original HOME outside the checkout.
     # Keep large Python fixtures there, separate from isolated child HOME and
     # standard TMPDIR, which may be a small tmpfs in the read-only sandbox.

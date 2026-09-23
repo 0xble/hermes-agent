@@ -32,9 +32,23 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
   `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
-  `full-zip-failure-accounting`, `sqlite-backup-wal-snapshot`, `evidence`
-  (records, not patches).
+  `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
+  `evidence` (records, not patches).
   `maintenance-contract` is owned by the root contract.
+- `config-backup-content`: config backup deduplication reads current bytes rather
+  than reusing `filecmp` results cached by paths and stat signatures. Same-size
+  edits with preserved mtimes must produce a new backup. The existing config
+  backup test controls mtimes and checks deduplication and exact retained bytes.
+  Upstream main `6c4536aed298112e976cf7c484ee63e99150e09d` still uses the cached
+  comparison. Open upstream [PR #110248](https://github.com/NousResearch/hermes-agent/pull/110248)
+  addresses separate same-second destination collisions and retains that comparison.
+  Open [PR #106871](https://github.com/NousResearch/hermes-agent/pull/106871) changes
+  Docker rollback selection, not this helper. Neither replaces this fix.
+  Verify with `scripts/run_tests.sh tests/hermes_cli/test_config_backups.py
+  tests/hermes_cli/test_config_lkg_backup.py --file-retries 0`.
+  Retire when an accepted upstream release passes the controlled-mtime invariant
+  without this patch. Rollback only the byte-comparison change, its regression
+  additions, and this record, preserving other backup and CI patches.
 - `HERMES-123` (`0cac0f8432`) stops `_run_full_backup` reporting a held backup slot as a
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
   setting) has its own message on the snapshot path. Retire it if the two stop sharing

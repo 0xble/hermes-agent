@@ -1,4 +1,5 @@
 """config.yaml backups: one dir, deduped, bounded — never a pile of siblings in HERMES_HOME."""
+import os
 from pathlib import Path
 
 from hermes_cli.config_backups import backup_config, list_config_backups
@@ -7,6 +8,9 @@ from hermes_cli.config_backups import backup_config, list_config_backups
 def test_repeat_backups_dedupe_and_rotate(tmp_path: Path, monkeypatch):
     cfg = tmp_path / "config.yaml"
     cfg.write_text("model: a\n")
+    # Reproduce coarse/preserved mtimes even when same-size contents change.
+    timestamp_ns = 1_700_000_000_000_000_000
+    os.utime(cfg, ns=(timestamp_ns, timestamp_ns))
     stamps = iter(f"2026010100000{i}" for i in range(10))
     monkeypatch.setattr("hermes_cli.config_backups.time.strftime", lambda _fmt: next(stamps))
 
@@ -16,9 +20,11 @@ def test_repeat_backups_dedupe_and_rotate(tmp_path: Path, monkeypatch):
     assert backup_config(cfg, "pre-setup", keep=2) is None
     for i in range(3):
         cfg.write_text(f"model: {i}\n")
-        backup_config(cfg, "pre-setup", keep=2)
+        os.utime(cfg, ns=(timestamp_ns, timestamp_ns))
+        assert backup_config(cfg, "pre-setup", keep=2) is not None
+        assert backup_config(cfg, "pre-setup", keep=2) is None
     kept = list_config_backups(cfg, "pre-setup")
-    assert len(kept) == 2 and kept[0].read_text() == "model: 2\n"
+    assert [p.read_text() for p in kept] == ["model: 2\n", "model: 1\n"]
     # Nothing left beside config.yaml in the home root.
     assert [p.name for p in tmp_path.iterdir() if p.is_file()] == ["config.yaml"]
 
