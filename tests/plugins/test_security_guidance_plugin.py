@@ -136,6 +136,32 @@ class TestScanContent:
         )
         assert "react_dangerously_set_html" in [n for n, _ in findings]
 
+    @pytest.mark.parametrize(
+        ("path", "content", "rule"),
+        [
+            ("/tmp/example.py", "text = 'new Function(value)'", "new_function_injection"),
+            ("/tmp/example.py", "html = '<div dangerouslySetInnerHTML />'", "react_dangerously_set_html"),
+            ("/tmp/example.py", "text = 'document.write(value)'", "document_write_xss"),
+            ("/tmp/example.py", "text = '.innerHTML = value'", "innerHTML_xss"),
+            ("/tmp/example.py", "text = '.outerHTML = value'", "outerHTML_xss"),
+            ("/tmp/example.py", "text = '.insertAdjacentHTML(value)'", "insertAdjacentHTML_xss"),
+        ],
+    )
+    def test_browser_rules_skip_non_javascript_files(self, path, content, rule):
+        """Browser/XSS rules should not warn on prose or non-JS source."""
+        mod = _load_plugin_init()
+        assert rule not in [name for name, _ in mod._scan_content(path, content)]
+
+    def test_browser_rules_warn_in_javascript_files(self):
+        mod = _load_plugin_init()
+        findings = mod._scan_content(
+            "/tmp/example.tsx",
+            "element.innerHTML = value; document.write(value);",
+        )
+        names = [name for name, _ in findings]
+        assert "innerHTML_xss" in names
+        assert "document_write_xss" in names
+
     def test_github_workflow_path_check_fires_on_path_alone(self):
         """github_actions_workflow has no regex/substring — fires on path."""
         mod = _load_plugin_init()
