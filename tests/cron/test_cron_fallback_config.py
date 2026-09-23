@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from cron import scheduler
+from cron import scheduler_preflight
 from cron.scheduler_preflight import _preflight_check_provider_key
 from hermes_cli import runtime_provider
 from hermes_cli.auth import AuthError
@@ -61,29 +62,34 @@ def test_profile_chain_reaches_agent_without_changing_global(tmp_path, monkeypat
 @pytest.mark.parametrize("chain,expected", [(CRON, CRON), ([], [])])
 @pytest.mark.parametrize("failure", [AuthError("missing key"), OSError(errno.ECONNREFUSED, "connection refused")])
 def test_preflight_and_provider_recovery_obey_cron_chain(monkeypatch, chain, expected, failure, global_chain):
+    # Unpinned job: it follows cron.model / the main model, so it inherits the cron chain. A job
+    # pinned to its own provider/model walks no chain at all (test_cron_pinned_job_fallback.py);
+    # the cron override changes WHICH chain an unpinned job inherits, never that rule.
     cfg = {"cron": {"fallback_providers": chain}, "fallback_providers": global_chain}
-    job = {"id": "recovery", "provider": "openrouter", "model": "primary"}
+    job = {"id": "recovery"}
+    primary = "primary"
     calls = []
 
     def resolve(**kwargs):
         calls.append((kwargs["requested"], kwargs["target_model"]))
-        if kwargs["target_model"] == job["model"]:
+        if kwargs["target_model"] == primary:
             raise failure
         return {"provider": kwargs["requested"]}
 
     monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", resolve)
+    monkeypatch.setattr(scheduler_preflight, "cron_env_setting", lambda _name: primary)
     preflight = _preflight_check_provider_key(job, cfg)
     if expected or not isinstance(failure, AuthError):
         assert preflight is None
     else:
         assert "provider credential missing" in preflight
     calls.clear()
-    jc = scheduler._CronJobConfig(cfg, job["model"], {}, "")
+    jc = scheduler._CronJobConfig(cfg, primary, {}, "")
     if expected:
         runtime, model = scheduler._resolve_job_runtime(job, job["id"], jc)
         assert (runtime["provider"], model) == (expected[0]["provider"], expected[0]["model"])
-        assert calls == [(job["provider"], job["model"]), (expected[0]["provider"], expected[0]["model"])]
+        assert calls == [(None, primary), (expected[0]["provider"], expected[0]["model"])]
     else:
         with pytest.raises(RuntimeError):
             scheduler._resolve_job_runtime(job, job["id"], jc)
-        assert calls == [(job["provider"], job["model"])]
+        assert calls == [(None, primary)]
