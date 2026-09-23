@@ -97,17 +97,28 @@ test('controlSocketPath is stable, short, and host-distinct', () => {
 })
 
 test('controlSocketPath default base stays under sun_path even with the temp-listener suffix', () => {
-  // OpenSSH binds a temporary listener at `<ControlPath>.<16 random chars>` (a
-  // 17-byte suffix) while opening the master. The macOS regression was the
-  // default base under os.tmpdir() (/var/folders/.../T/) pushing it over 104.
-  const p = controlSocketPath('hermes', 'remote-build-server', 22) // no baseDir → default
-  const worstCase = `${p}.0123456789abcdef` // mimic the .<16-char> temp suffix
-  assert.ok(
-    worstCase.length <= 104,
-    `default control socket + temp suffix must fit sun_path (got ${worstCase.length}: ${worstCase})`
-  )
-  // And it must NOT live under the deeply-nested macOS per-user temp dir.
-  assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
+  // The CI runner gives each test an intentionally deep temporary HOME. Use a
+  // short POSIX home for this pure path-contract check so it validates the
+  // production default without making the assertion depend on the harness path.
+  const originalHome = process.env.HOME
+  process.env.HOME = '/tmp'
+  try {
+    // OpenSSH binds a temporary listener at `<ControlPath>.<16 random chars>`
+    // (a 17-byte suffix) while opening the master. The macOS regression was
+    // the default base under os.tmpdir() (/var/folders/.../T/) pushing it over
+    // 104.
+    const p = controlSocketPath('hermes', 'remote-build-server', 22) // no baseDir → default
+    const worstCase = `${p}.0123456789abcdef` // mimic the .<16-char> temp suffix
+    assert.ok(
+      worstCase.length <= 104,
+      `default control socket + temp suffix must fit sun_path (got ${worstCase.length}: ${worstCase})`
+    )
+    // And it must NOT live under the deeply-nested macOS per-user temp dir.
+    assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME
+    else process.env.HOME = originalHome
+  }
 })
 
 test('baseSshOptions carries the house ControlMaster/BatchMode/accept-new policy', () => {
