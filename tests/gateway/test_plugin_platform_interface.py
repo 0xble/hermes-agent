@@ -14,7 +14,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+# parents[2] is the repository root (tests/gateway/<file> -> repo root), NOT
+# ``tests/``. Resolving to ``tests/`` made PLATFORMS_DIR point at the test
+# mirror ``tests/plugins/platforms/``, so discovery silently returned [] and
+# both parametrised tests collected a single NOTSET case — green with zero
+# coverage of the real plugins.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PLATFORMS_DIR = PROJECT_ROOT / "plugins" / "platforms"
 
 
@@ -48,12 +53,25 @@ def clean_registry():
 class _MockPluginContext:
     """Minimal mock of hermes_cli.plugins.PluginContext.
 
-    Only implements register_platform so we can exercise the plugin's
-    register() entrypoint without importing the real plugin system.
+    ``register_platform`` is implemented for real because this suite asserts
+    on the resulting PlatformEntry. Every other ``register_*`` surface a
+    plugin may legitimately touch during ``register()`` (CLI commands, hooks,
+    tools, skills, …) resolves to an inert recorder, so exercising the
+    platform entrypoint does not require the whole plugin system.
     """
 
     def __init__(self):
         self.registered_names: list[str] = []
+        self.other_registrations: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        if not name.startswith("register_"):
+            raise AttributeError(name)
+
+        def _record(*_args: Any, **_kwargs: Any) -> None:
+            self.other_registrations.append(name)
+
+        return _record
 
     def register_platform(
         self,
