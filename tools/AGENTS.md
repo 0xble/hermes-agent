@@ -142,10 +142,10 @@ the result as `orphaned_processes`, exited-but-never-read notify processes as `u
 delegation is process-local; work that must survive restart uses `cronjob` or
 `terminal(background=True, notify_on_complete=True)`. An INTERRUPTED background delegation is not
 auto-resumed; `action='resume'` (`tools/delegation_resume.py`) hands the parent a one-shot, durably
-claimed recovery brief for a single-task row, which the parent then spawns normally — it re-spawns
+claimed recovery brief for a single-task row, which the parent then spawns normally. It re-spawns
 nothing itself (fork unit `maintenance/delegation-restart.md`).
 
-**Stop fan-out:** a turn's hard interrupt reaches only
+`heartbeat=N` on the same spawn emits a `heartbeat` event (type on the completion queue; delta output only, `HEARTBEAT_MIN_SECONDS` floor, one daemon timer thread for all sessions in `process_registry.py::ProcessRegistry._heartbeat_loop`) — every surface that renders `watch_match` must render `heartbeat` (`process_registry_notifications.py`, `gateway/run.py::_drain_gateway_watch_events`, `tui_gateway/session_notifications.py::_DEDUP_EXTRA_FIELDS`). **Stop fan-out:** a turn's hard interrupt reaches only
 `_active_children`; background units are detached at dispatch, so every stop surface (gateway `/stop` busy AND
 idle paths, TUI `session.interrupt`, ACP `cancel`, CLI `/stop` via `interrupt_all`) calls
 `async_delegation.interrupt_for_session` too. Depth>0 delegations are always synchronous

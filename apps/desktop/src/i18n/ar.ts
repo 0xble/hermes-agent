@@ -407,6 +407,7 @@ export const ar = defineLocale({
       gatewayManagedUpdatesUnavailable: 'تتطلب التحديثات البعيدة إصدار سطح مكتب يدعم تحديثات SSH المُدارة.',
       gatewayManagedUpdatesEmpty: 'أضف اتصال SSH في الاتصالات المحفوظة لإدارة تحديثاته هنا.',
       keyboardShortcuts: 'تعيينات المفاتيح',
+      hudGesture: 'إيماءة HUD',
       screenCapture: 'التقاط الشاشة',
       notificationAlerts: 'تنبيهات سطح المكتب',
       notificationSounds: 'الأصوات',
@@ -520,14 +521,20 @@ export const ar = defineLocale({
       blurb:
         'امتدادات واجهة تُحمّل داخل هذا التطبيق — إما مضمّنة مع البناء، أو موضوعة في مجلد desktop-plugins (بما فيها التي يكتبها Hermes). تعطيل الإضافة يفرغها مباشرة ويبقى بعد إعادة التشغيل.',
       count: n => `${n} مثبتة`,
-      openFolder: 'فتح مجلد الإضافات',
+      openFolder: 'فتح مجلد إضافات سطح المكتب',
       rescan: 'إعادة الفحص',
       reveal: 'إظهار في مدير الملفات',
       enable: 'تفعيل',
       disable: 'تعطيل',
       failed: 'فشل',
       empty: 'لا توجد إضافات سطح مكتب مثبتة بعد.',
-      kinds: { bundled: 'مضمّنة', disk: 'على القرص', runtime: 'وقت التشغيل' }
+      kinds: { bundled: 'مضمّنة', disk: 'على القرص', runtime: 'وقت التشغيل' },
+      installModal: {
+        toolsConnected: n => `تم توصيل ${n} من الأدوات`,
+        skillsReady: names => (names.length === 1 ? `المهارة ${names[0]} جاهزة` : `${names.length} من المهارات جاهزة`),
+        nextChat: 'أدوات أخرى متاحة في دردشتك التالية',
+        serverNotConnected: (server, reason) => `خادم MCP ${server} غير متصل${reason ? `: ${reason}` : '.'}`
+      }
     },
     notifications: {
       title: 'الإشعارات',
@@ -879,6 +886,11 @@ export const ar = defineLocale({
       daysAgo: count => `قبل ${count} يوم`
     },
     config: {
+      minimizeToTrayTitle: 'التصغير إلى علبة النظام',
+      minimizeToTrayDesc:
+        'تصغير النوافذ أو إغلاق النافذة الرئيسية يخفيها في علبة النظام (شريط القوائم على macOS) مع استمرار Hermes في العمل. استخدم إنهاء Hermes من قائمة العلبة أو Cmd+Q للخروج. معطّل افتراضيًا ويُطبّق على هذا الجهاز فقط.',
+      minimizeToTrayUnavailable:
+        'علبة النظام غير متاحة. ستُصغّر النوافذ وتُغلق كالمعتاد. أوقف هذا الخيار ثم فعّله لإعادة المحاولة.',
       none: 'لا شيء',
       noneParen: '(لا شيء)',
       notSet: 'غير مضبوط',
@@ -893,6 +905,18 @@ export const ar = defineLocale({
       autosaveFailed: 'فشل الحفظ التلقائي',
       imported: 'تم استيراد الإعدادات',
       invalidJson: 'JSON غير صالح'
+    },
+    hudModifier: {
+      title: 'استدعاء HUD بضغطة',
+      description:
+        'اضغط ثم حرّر ⌘ + Option على Mac، أو Ctrl + Alt على Windows/Linux، لإظهار HUD من أي تطبيق. معطّل افتراضيًا ويُطبّق على هذا الجهاز فقط.',
+      permission:
+        'اسمح لـ Hermes في إعدادات النظام ← الخصوصية والأمان ← مراقبة الإدخال، ثم أعد المحاولة. لا تسجّل هذه الإيماءة ضغطات المفاتيح ولا تلتقط الشاشة.',
+      unavailable:
+        'تعذّر تشغيل مساعد إيماءة HUD أو توقف بشكل غير متوقع. أعد المحاولة أو أعد تشغيل Hermes. يظل اختصار HUD الحالي يعمل داخل Hermes.',
+      missingHelper: 'مساعد إيماءة HUD غير موجود في تثبيت Hermes هذا. حدّث Hermes أو أعد تثبيته، ثم أعد المحاولة.',
+      unsupportedSession:
+        'جلسة سطح المكتب هذه لا تدعم ضغطات مفاتيح التعديل على مستوى النظام. يتطلب Linux جلسة X11؛ Wayland غير مدعوم.'
     },
     screenshot: {
       enabledTitle: 'اختصار لقطة الشاشة',
@@ -1020,31 +1044,16 @@ export const ar = defineLocale({
     },
     mcp: {
       loading: 'جار تحميل خوادم MCP...',
-      failedLoad: 'فشل تحميل إعدادات MCP',
-      nameRequiredTitle: 'الاسم مطلوب',
-      nameRequiredMessage: 'أعط هذا الخادم مفتاح إعداد.',
-      objectRequired: 'يجب أن تكون إعدادات الخادم كائن JSON',
       invalidJson: 'JSON الخاص بـ MCP غير صالح',
       saveFailed: 'فشل الحفظ',
       removeFailed: 'فشلت الإزالة',
-      gatewayUnavailableTitle: 'البوابة غير متاحة',
-      gatewayUnavailableMessage: 'أعد الاتصال بالبوابة قبل إعادة تحميل MCP.',
-      reloadedTitle: 'تمت إعادة تحميل أدوات MCP',
-      reloadedMessage: 'مخططات الأدوات الجديدة تطبق على الأدوار الجديدة.',
       reloadFailed: 'فشلت إعادة تحميل MCP',
       savedTitle: 'تم حفظ خادم MCP',
       savedMessage: name => `سيطبق ${name} بعد إعادة تحميل MCP.`,
-      newServer: 'خادم جديد',
-      reload: 'إعادة تحميل MCP',
-      reloading: 'جار إعادة التحميل...',
-      emptyTitle: 'لا توجد خوادم MCP',
-      emptyDesc: 'أضف خادم stdio أو HTTP لإتاحة أدوات MCP.',
       disabled: 'معطل',
-      editServer: 'تحرير الخادم',
       name: 'الاسم',
       serverJson: 'JSON الخادم',
       remove: 'إزالة',
-      saveServer: 'حفظ الخادم',
       deepLinkTitle: 'إضافة خادم MCP؟',
       deepLinkDescription:
         'طلب رابط إضافة خادم MCP هذا إلى Hermes. راجع الإعدادات الكاملة أدناه — فهي قادمة من الرابط وليست من Hermes.',
@@ -2832,6 +2841,19 @@ export const ar = defineLocale({
       fallbackTitle: 'معاينة'
     }
   },
+  interfaceMode: {
+    title: 'وضع الواجهة',
+    hint: 'يغيّر ما يظهر، وليس ما يستطيع Hermes فعله.',
+    sessionNote: 'يحدده الوضع البسيط. التغيير هنا يستمر لهذه الجلسة فقط؛ بدّل إلى المتقدم لجعله خيارك.',
+    simple: {
+      label: 'بسيط',
+      description: 'للتحدث مع Hermes. الشريط الجانبي والدردشة؛ بلا طرفية أو لوحات ملفات أو فروقات.'
+    },
+    advanced: {
+      label: 'متقدم',
+      description: 'للمطورين. الطرفية والملفات والفروقات وشريط الحالة والتخطيطات، كما أعددتها.'
+    }
+  },
   zones: {
     showTabStrip: 'إظهار علامات التبويب',
     hideTabStrip: 'إخفاء علامات التبويب',
@@ -2903,6 +2925,29 @@ export const ar = defineLocale({
     }
   },
   assistant: {
+    catalogInstall: {
+      preparing: 'جارٍ تجهيز التثبيت…',
+      install: 'تثبيت',
+      advanced: 'خيارات متقدمة',
+      skip: 'تخطٍّ',
+      installing: 'جارٍ التثبيت…',
+      installed: 'مثبّت',
+      notInstalled: 'غير مثبّت',
+      failed: 'فشل',
+      showNames: 'إظهار الأسماء',
+      hideNames: 'إخفاء الأسماء',
+      skill: name => `المهارة ${name}`,
+      kind: { plugin: 'إضافة', skill: 'مهارة' },
+      tier: { official: 'رسمي', community: 'مجتمعي' },
+      targetProfile: profile => `يُثبَّت في ملفك الشخصي ${profile}`,
+      sendFailed: 'تعذّر إرسال ردك. حاول مرة أخرى.',
+      commitLabel: 'الإيداع',
+      subdirLabel: 'المجلد',
+      securityHeading: 'الأمان',
+      scan: { passed: 'نجح الفحص', warnings: 'وجد الفحص تحذيرات', failed: 'فشل الفحص' },
+      requirementsLabel: 'المتطلبات',
+      credentialsHeading: 'بيانات الاعتماد'
+    },
     thread: {
       loadingSession: 'جار تحميل الجلسة...',
       showEarlier: 'عرض الرسائل الأقدم',
