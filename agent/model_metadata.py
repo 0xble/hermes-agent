@@ -646,12 +646,12 @@ def _skip_persistent_context_cache(base_url: str, provider: str) -> bool:
     return (provider or "").strip().lower() in {"lmstudio", "openai-codex"}
 
 
-def _is_codex_route(provider: str, base_url: str, custom_providers: list | None) -> bool:
+def _is_codex_route(provider: str, base_url: str, custom_providers: list | None, api_mode: str = "") -> bool:
     """True when the request travels the Codex Responses wire regardless of host: the native
-    ``openai-codex`` provider (also behind a ``HERMES_CODEX_BASE_URL`` / ``model.base_url`` proxy)
-    or a custom entry declaring ``api_mode: codex_responses``. The transport, not the hostname,
-    decides which window the model actually gets (#116191)."""
-    if (provider or "").strip().lower() == "openai-codex":
+    ``openai-codex`` provider (also behind a ``HERMES_CODEX_BASE_URL`` / ``model.base_url`` proxy),
+    an explicit ``api_mode: codex_responses``, or a custom entry declaring that mode. The transport,
+    not the hostname, decides which window the model actually gets (#116191)."""
+    if (provider or "").strip().lower() == "openai-codex" or api_mode == "codex_responses":
         return True
     if not base_url:
         return False
@@ -2254,7 +2254,7 @@ def get_model_context_length(
     # A Codex Responses route is keyed on its transport, not its host: behind a proxy
     # (HERMES_CODEX_BASE_URL, model.base_url, custom api_mode: codex_responses) the URL looks
     # generic while the window is still the Codex OAuth one (#116191).
-    codex_route = _is_codex_route(provider, base_url, custom_providers)
+    codex_route = _is_codex_route(provider, base_url, custom_providers, api_mode)
     # 1. Persistent cache (LM Studio / Codex routes excluded — see _skip_persistent_context_cache).
     cached = get_cached_context_length(model, base_url) if base_url and not is_bedrock_context and not codex_route and not _skip_persistent_context_cache(base_url, provider) else None
     validated = _validate_cached_context_length(model, base_url, cached, api_key=api_key) if cached is not None else None
@@ -2271,21 +2271,7 @@ def get_model_context_length(
             if base_url:
                 save_context_length(model, base_url, ctx)
             return ctx
-    # The declared wire protocol identifies Codex proxies even on generic custom URLs.
-    # Native routes retain their live catalog and opt-in variant handling.
-    # Config overrides above still win; do not persist this static OAuth fallback.
-    if (
-        api_mode == "codex_responses"
-        and _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url)
-    ):
-        lookup_bare = _bare_codex_slug(strip_codex_context_variant_suffix(model))
-        hit = _longest_key_match(_CODEX_OAUTH_CONTEXT_FALLBACK, lookup_bare.lower())
-        if hit:
-            logger.info(
-                "Using Codex OAuth context length %s for model %r (codex_responses endpoint)",
-                f"{hit[1]:,}", model,
-            )
-            return hit[1]
+
     # 2. Live /models for truly custom endpoints. Known providers skip this: their /models may
     # report a provider-imposed limit (Copilot: 128k) rather than the window. The native
     # openai-codex provider skips it too even on a proxy URL — step 5 runs its live catalog probe.
