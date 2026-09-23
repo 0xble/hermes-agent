@@ -8,6 +8,11 @@ runs both `tests` and `candidate-extensions` through the canonical isolated
 does not use changed-file classification or substitute a smoke manifest for
 complete discovery.
 
+Portable Python execution passes `--file-retries 0`, including E2E and native OS
+qualification. A fail-once test stays failed at the gate entrypoint. Interactive
+runner defaults remain unchanged. `scripts/ci/tests/test_portable.py` exercises
+both outcomes with a real pytest file and a persistent attempt counter.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. The standalone runner binds

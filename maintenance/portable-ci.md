@@ -12,6 +12,10 @@ A setup failure stops the gate because dependencies are not qualified. The
 standalone runner owns timeouts, cancellation, process-group cleanup, logs and
 publication. A timeout or killed run is never a passing result.
 
+The portable Python, E2E, and native OS lanes disable automatic file retries.
+A first-attempt test failure fails CI even if a retry might pass. Direct
+interactive use of `scripts/run_tests.sh` retains its default retry behavior.
+
 Dependency-bound and plugin-admission checks inspect current working files by
 default, including newly added catalog entries. Their explicit `--head` option
 checks a committed revision instead. Plugin admission fetches exact pins and

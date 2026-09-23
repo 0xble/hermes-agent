@@ -32,7 +32,7 @@ class PythonScratchTests(unittest.TestCase):
                 observed = []
 
                 def observe(command, *, env):
-                    self.assertEqual(command, ['bash', 'scripts/run_tests.sh', '-j', '4', 'tests', 'candidate-extensions'])
+                    self.assertEqual(command, ['bash', 'scripts/run_tests.sh', '-j', '4', '--file-retries', '0', 'tests', 'candidate-extensions'])
                     if writable:
                         self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', env)
                     else:
@@ -83,7 +83,7 @@ class PythonScratchTests(unittest.TestCase):
             makedirs = os.makedirs
 
             def readonly_default(path, *args, **kwargs):
-                if str(path).startswith('/var/tmp'):
+                if Path(path) == Path('/var/tmp/hermes-pytest'):
                     raise OSError(errno.EROFS, 'Read-only file system', path)
                 return makedirs(path, *args, **kwargs)
 

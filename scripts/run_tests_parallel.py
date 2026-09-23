@@ -598,6 +598,21 @@ def _run_one_file_once(
         # (venv without pytest, -k that matches nothing) can't report green.
         rc = 0
     summary = _parse_pytest_summary(output)
+    if rc != 0:
+        child_rc = proc.returncode
+        signal_note = ""
+        if child_rc is not None and child_rc < 0:
+            import signal as _signal
+
+            try:
+                signal_note = f"; signal={_signal.Signals(-child_rc).name}"
+            except ValueError:
+                signal_note = f"; signal={-child_rc}"
+        summary_note = "present" if summary else "missing"
+        output = (
+            f"(pytest subprocess: returncode={child_rc}{signal_note}; "
+            f"runner_status={rc}; terminal_summary={summary_note})\n{output}"
+        )
     crash = _describe_interpreter_crash(rc, output) if rc != 0 else None
     if crash:
         # Same convention as the timeout path: the diagnosis leads the
@@ -1408,7 +1423,11 @@ def main() -> int:
         f", {files_crashed} file{'s' if files_crashed != 1 else ''} CRASHED"
         if files_crashed else ""
     )
-    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{crashed_note}{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+    failed_files_note = (
+        f", {fail_count} file{'s' if fail_count != 1 else ''} FAILED"
+        if fail_count else ""
+    )
+    print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed{failed_files_note}{crashed_note}{skipped_note} ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
 
     # Host-OS gating note: tests marked for another OS were skipped by the
     # conftest hook, not run. Say so explicitly — a green local run on Linux
@@ -1435,13 +1454,13 @@ def main() -> int:
     if no_tests_ran_at_all:
         print()
         print(
-            "=== ✗ NO TESTS RAN — 0 collected across "
+            "=== ✗ NO TEST OUTCOMES RECOVERED — 0 summarized outcomes across "
             f"{len(files)} file{'s' if len(files) != 1 else ''}. "
             "This is NOT a pass. ==="
         )
         print(
             "  Common causes: the selected venv has no pytest; a -k/-m filter "
-            "matched nothing; or collection errored in every file."
+            "matched nothing; collection errored; or pytest exited before its summary."
         )
         print("  Check the per-file output above for the real error.")
 
@@ -1521,7 +1540,7 @@ def main() -> int:
             for file, s in all_passed_but_nonzero:
                 print(f"  {_format_file(file, repo_root)}  ({s.get('passed', 0)} passed)")
         if no_tests_ran:
-            print(f"=== {len(no_tests_ran)} file{'s' if len(no_tests_ran) != 1 else ''} where no tests ran (collection/import error, timeout before collection, etc.) ===")
+            print(f"=== {len(no_tests_ran)} file{'s' if len(no_tests_ran) != 1 else ''} without parsed pass/fail counts (inspect subprocess status and output) ===")
             for file, s in no_tests_ran:
                 print(f"  {_format_file(file, repo_root)}")
         return 1

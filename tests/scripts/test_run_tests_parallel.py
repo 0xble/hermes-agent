@@ -433,7 +433,7 @@ def test_zero_collected_across_run_fails_and_says_so(tmp_path: Path) -> None:
     probe_dir = _make_probe_dir(tmp_path)
     proc = _run_runner(probe_dir, "-k", "zzz_matches_nothing")
     assert proc.returncode == 1, proc.stdout
-    assert "NO TESTS RAN" in proc.stdout
+    assert "NO TEST OUTCOMES RECOVERED" in proc.stdout
     assert "NOT a pass" in proc.stdout
 
 
@@ -550,8 +550,42 @@ def test_interpreter_crash_is_reported_as_a_crash_not_as_no_tests_ran(tmp_path: 
     assert proc.returncode != 0
     assert "1 file CRASHED" in proc.stdout
     assert "SIGSEGV" in proc.stdout
+    import signal
+
+    assert f"returncode={-signal.SIGSEGV}" in proc.stdout
+    assert "signal=SIGSEGV" in proc.stdout
+    assert "terminal_summary=missing" in proc.stdout
+    assert "1 file FAILED" in proc.stdout
+    assert "NO TEST OUTCOMES RECOVERED" not in proc.stdout
+    assert "without parsed pass/fail counts" not in proc.stdout
     assert "where no tests ran" not in proc.stdout
     assert "NO TESTS RAN" not in proc.stdout
+
+
+@pytest.mark.parametrize("finish", ["exit75", "timeout"])
+def test_postbody_hard_exit_preserves_child_status(tmp_path: Path, finish: str) -> None:
+    """Passing bodies do not make an abruptly terminated pytest file green."""
+    probe_dir = _make_probe_dir(tmp_path)
+    action = "os._exit(75)" if finish == "exit75" else "threading.Event().wait()"
+    (probe_dir / "conftest.py").write_text(
+        "import os, threading\n\ndef pytest_sessionfinish(session, exitstatus):\n"
+        f"    {action}\n"
+    )
+    proc = _run_runner(probe_dir, "--file-retries", "0", "--file-timeout", "5")
+    assert proc.returncode == 1, proc.stdout
+    if finish == "exit75":
+        assert "returncode=75" in proc.stdout
+        assert "runner_status=75" in proc.stdout
+    else:
+        assert "runner_status=124" in proc.stdout
+        if sys.platform != "win32":
+            assert "returncode=-9; signal=SIGKILL" in proc.stdout
+    assert "terminal_summary=missing" in proc.stdout
+    assert "1 file FAILED" in proc.stdout
+    assert "NO TEST OUTCOMES RECOVERED" in proc.stdout
+    assert "without parsed pass/fail counts" in proc.stdout
+    assert "NO TESTS RAN" not in proc.stdout
+    assert "where no tests ran" not in proc.stdout
 
 
 # ── --files-from: file-backed explicit file lists ───────────────────────────

@@ -407,6 +407,7 @@ from hermes_cli.subcommands.migrate import build_migrate_parser
 from hermes_cli.subcommands.checkpoints import build_checkpoints_parser
 from hermes_cli.subcommands.bundles import build_bundles_parser
 from hermes_cli.subcommands.curator import build_curator_parser
+from hermes_cli.subcommands.observations import build_observations_parser
 from hermes_cli.subcommands.pets import build_pets_parser
 from hermes_cli.subcommands.journey import build_journey_parser
 from hermes_cli.subcommands.computer_use import build_computer_use_parser
@@ -3434,6 +3435,7 @@ def _build_cli_parser():
     _register_plugin_cli_commands(subparsers)
 
     build_curator_parser(subparsers)
+    build_observations_parser(subparsers)
     build_pets_parser(subparsers)
     build_journey_parser(subparsers)
     build_memory_parser(subparsers, cmd_memory=cmd_memory)

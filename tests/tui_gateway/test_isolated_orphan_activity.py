@@ -29,6 +29,10 @@ def _session(sid):
                 attached_images=[], cols=80, source="desktop", inflight_turn=None)
 
 
+def _wait_for_completion(completed):
+    assert completed.wait(timeout=5), "previous completion callback did not settle"
+
+
 @pytest.mark.parametrize("mode", ["fresh", "stale", "missing", "previous"])
 def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
     """Real supervisor pipes, child admission/turn thread, bridge and orphan timer.
@@ -39,6 +43,19 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
     sid = "detached-turn"
     session = _session(sid)
     forwarded = []
+    completed = threading.Event()
+    on_done = server._on_compute_host_turn_done
+
+    def settled(*args, **kwargs):
+        try:
+            return on_done(*args, **kwargs)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(server, "_on_compute_host_turn_done", settled)
+    # Parent UI metadata is unrelated to the child activity contract and can
+    # block the single supervisor stdout reader after running becomes False.
+    monkeypatch.setattr(server, "_compute_host_session_info", lambda session: {})
     monkeypatch.setattr(server, "_sessions", {sid: session})
     monkeypatch.setattr(server, "_pending_ws_reaps", {})
     monkeypatch.setattr(server, "write_json", lambda msg: forwarded.append(msg) or True)
@@ -89,6 +106,10 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             while session["running"] and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert not session["running"]
+            # running=False precedes the rest of the completion callback. Do
+            # not dispatch the reused caller ID until that reader is available.
+            _wait_for_completion(completed)
+            completed.clear()
             assert "_compute_host_activity_ns" not in session
             (tmp_path / "release").unlink()
             (tmp_path / "provider-started").unlink()
@@ -117,6 +138,37 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             assert session["_client_gone_interrupt_requested"]
     finally:
         supervisor.shutdown()
+
+
+def test_reused_turn_waits_for_previous_completion(tmp_path, monkeypatch):
+    """Hold the real callback after running=False until the test awaits it."""
+    entered = threading.Event()
+    release = threading.Event()
+    on_done = server._on_compute_host_turn_done
+    waits = []
+
+    def delayed(*args, **kwargs):
+        result = on_done(*args, **kwargs)
+        entered.set()
+        assert release.wait(timeout=10), "completion wait was never reached"
+        return result
+
+    real_wait = _wait_for_completion
+
+    def wait_then_release(completed):
+        assert entered.wait(timeout=5)
+        assert not completed.is_set(), "callback unexpectedly already settled"
+        waits.append(True)
+        release.set()
+        real_wait(completed)
+
+    monkeypatch.setattr(server, "_on_compute_host_turn_done", delayed)
+    monkeypatch.setattr(sys.modules[__name__], "_wait_for_completion", wait_then_release)
+    try:
+        test_real_child_detached_turn_activity(tmp_path, monkeypatch, "fresh")
+        assert waits == [True]
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize("change", ["none", "other-session", "old-turn", "not-running", "stale", "missing"])

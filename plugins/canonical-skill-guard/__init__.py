@@ -8,6 +8,8 @@ alone do not explain the correct write path to the model.
 from __future__ import annotations
 
 import os
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -50,12 +52,40 @@ def _blocked_skill_names(args: Any) -> list[str]:
     return list(dict.fromkeys(blocked))
 
 
+def _write_observations(args: Any, blocked: list[str]) -> None:
+    """Persist blocked operations as human-readable Markdown observations.
+
+    The guard owns intake only: it never edits the canonical skill projection and
+    records the exact requested operation for later review by the curator.
+    """
+    home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    root = home / "observations"
+    root.mkdir(parents=True, exist_ok=True)
+    operations = list(_operations(args))
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    for skill in blocked:
+        selected = [op for op in operations if str(op.get("name") or "").strip() == skill]
+        path = root / f"{skill}.md"
+        with path.open("a", encoding="utf-8") as handle:
+            for operation in selected:
+                handle.write(
+                    f"## Observation — {timestamp}\n\n"
+                    f"- skill: `{skill}`\n"
+                    f"- provenance: `canonical-skill-guard`\n"
+                    f"- recorded_at: `{timestamp}`\n\n"
+                    "```json\n"
+                    f"{json.dumps(operation, sort_keys=True, indent=2)}\n"
+                    "```\n\n"
+                )
+
+
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, **_: Any) -> dict[str, str] | None:
     if tool_name != "skill_manage":
         return None
     blocked = _blocked_skill_names(args)
     if not blocked:
         return None
+    _write_observations(args, blocked)
     home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
     observations = ", ".join(f"$HERMES_HOME/observations/{name}.md" for name in blocked)
     return {
