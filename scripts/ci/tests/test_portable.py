@@ -152,7 +152,7 @@ try {
                 stack.enter_context(patch.object(ci, name, side_effect=action))
             stack.enter_context(patch.object(ci, 'python_tests', side_effect=lambda env, roots, workers: seen.append(tuple(roots))))
             self.assertEqual(ci.main(), 1)
-            self.assertEqual(seen, ['setup', 'static', ('tests', 'candidate-extensions'), ('tests/e2e',), 'node', 'docs', 'rust', 'container_lint'])
+            self.assertEqual(seen, ['setup', 'static', ('tests',), ('tests/e2e',), 'node', 'docs', 'rust', 'container_lint'])
 
     def test_python_gate_preserves_first_failure_but_interactive_runner_can_retry(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -224,7 +224,7 @@ with ci.checkout_lock():
             command = [sys.executable, str(ci.ROOT / 'bin/ci')]
             result = subprocess.run([*command, 'list'], cwd=directory, capture_output=True, text=True, encoding='utf-8', errors='replace')
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('candidate-extensions', result.stdout)
+            self.assertIn('python', result.stdout)
             bad = subprocess.run([*command, 'check', '--workers', '0'], cwd=directory, capture_output=True, text=True, encoding='utf-8', errors='replace')
             self.assertNotEqual(bad.returncode, 0)
             self.assertIn('positive', bad.stderr)

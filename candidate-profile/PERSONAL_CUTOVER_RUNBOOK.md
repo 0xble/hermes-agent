@@ -59,7 +59,9 @@ Authorization: Brian's go for "activate", after move 1's readback.
 
 1. Install the candidate as the managed checkout: the replacement source at
    `~/Repos/hermes-agent-next` (branch `candidate/release-v2026.9.14` plus the follow-ups),
-   editable-installed into a fresh venv; `scripts/install_candidate_extensions.py --home ~/.hermes`.
+   editable-installed into a fresh venv. Profile plugins are sourced separately
+   from the external `agents` repository; this Hermes checkout no longer installs
+   a second copy of their source.
 2. Write the translated `config.yaml` (precondition 4) over the profile, keeping a copy of the
    legacy file beside it.
 3. `hermes gateway install` for the profile, preserving `--external-supervisor` semantics, then

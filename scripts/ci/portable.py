@@ -22,7 +22,7 @@ PINS = json.loads((ROOT / 'scripts/ci/toolchain.json').read_text(encoding='utf-8
 EXTRAS = ('all', 'dev', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'hindsight', 'parallel-web')
 LANES = {
     'static': 'Blocking lint, source policies, attribution, history and lock consistency',
-    'python': 'Canonical full tests + candidate-extensions (excludes integration/e2e/docker)',
+    'python': 'Canonical full tests (excludes integration/e2e/docker)',
     'e2e': 'Canonical isolated tests/e2e, without external integration opt-ins',
     'node': 'All nine nonrelease workspace checks plus runner regression tests',
     'docs': 'Snapshot generation parity, links, diagrams and English site build',
@@ -360,7 +360,7 @@ def main() -> int:
                 return 0
         lanes = {
             'static': lambda: static(env),
-            'python': lambda: python_tests(env, ['tests', 'candidate-extensions'], args.workers),
+            'python': lambda: python_tests(env, ['tests'], args.workers),
             'e2e': lambda: python_tests(env, ['tests/e2e'], args.workers),
             'node': lambda: node(env, args.node_workers),
             'docs': lambda: docs(env),
