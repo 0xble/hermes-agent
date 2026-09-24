@@ -169,11 +169,12 @@ def test_private_probe_optional_snapshot_and_vault(server, monkeypatch):
     assert len(calls) == 1
 
 
-def test_new_tabs_open_blank_so_the_target_loads_once(server):
+def test_new_tabs_open_without_url_so_the_target_loads_once(server):
     calls, failures = server
     _open()
     creates = [kw.get("json", {}) for m, p, kw in calls if m == "post" and p == "/tabs"]
-    assert creates and all(body.get("url") == "about:blank" for body in creates)
+    # Camofox rejects non-http(s) create URLs (about:blank → 400) after registering the tab.
+    assert creates and all("url" not in body for body in creates)
     navigations = [p for _, p, _ in calls if p.endswith("/navigate")]
     assert navigations == ["/tabs/tab-1/navigate"]
 

@@ -363,11 +363,18 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
         return _adopt_existing_tab(session)
 
 
-def _ensure_tab(task_id: Optional[str], url: str = "about:blank", account: Optional[str] = None) -> Dict[str, Any]:
-    """Ensure a tab exists for the session, creating one if needed."""
+def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Optional[str] = None) -> Dict[str, Any]:
+    """Ensure a tab exists for the session, creating one if needed.
+
+    Without ``url`` the tab is created blank: Camofox only accepts http(s) URLs on
+    ``POST /tabs`` (it rejects ``about:blank`` with 400 after registering the tab) and skips
+    navigation when the field is absent."""
     session = _get_session(task_id, account) if account is not None else _get_session(task_id)
     if not session["tab_id"]:
-        data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url})
+        body = {"userId": session["user_id"], "listItemId": session["session_key"]}
+        if url:
+            body["url"] = url
+        data = _post("/tabs", body)
         session["tab_id"] = data.get("tabId")
     return session
 
@@ -465,11 +472,11 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
 def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[str] = None) -> tuple[Dict[str, Any], dict]:
     """Navigate explicitly even for newly created/adopted tabs; retry one stale tab.
 
-    New tabs open on about:blank so the explicit navigate is the only load of the target URL
+    New tabs open without a URL so the explicit navigate is the only load of the target URL
     (a create-with-URL followed by navigate would load one-time links twice)."""
     session = _get_session(task_id, account) if account is not None else _get_session(task_id)
     if not session["tab_id"]:
-        session = _ensure_tab(task_id, "about:blank", account)
+        session = _ensure_tab(task_id, None, account)
     for attempt in range(2):
         try:
             data = _post(_tab_path(session, "navigate"),
@@ -480,7 +487,7 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[st
                 raise
             if attempt:
                 raise RuntimeError(_STALE_TAB_ERROR) from None
-            session = _ensure_tab(task_id, "about:blank", account)
+            session = _ensure_tab(task_id, None, account)
     raise RuntimeError(_STALE_TAB_ERROR)  # unreachable
 
 
