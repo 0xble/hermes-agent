@@ -93,6 +93,25 @@ def format_subagent_failure_line(
     return line + ". Details: /agents, or ask me to retry with a smaller task."
 
 
+def subagent_failure_notice_claimed(**payload: Any) -> bool:
+    """True when a plugin's ``subagent_failure_notice`` hook claims this child failure.
+
+    A plugin that recovers the failure itself (for example by retrying the same work on another route)
+    returns ``{"action": "suppress"}`` so the user is not told the work failed while it is still running.
+    Only the user-facing notice is suppressed: the child result, its ``subagent_stop`` hook and the parent's
+    consolidated result are unchanged. Any error, or no plugin, keeps the notice.
+    """
+    try:
+        from hermes_cli.plugins import has_hook, invoke_hook
+        if not has_hook("subagent_failure_notice"):
+            return False
+        results = invoke_hook("subagent_failure_notice", **payload)
+    except Exception:
+        logger.debug("subagent_failure_notice hook failed", exc_info=True)
+        return False
+    return any(isinstance(r, dict) and r.get("action") == "suppress" for r in results)
+
+
 class DelegateEvent(str, enum.Enum):
     """Formal delegation progress event types. The relay normalises incoming legacy strings (``tool.started``,
     ``_thinking``, …) to these via ``_LEGACY_EVENT_MAP``; external consumers (gateway SSE, ACP adapter, CLI) still
@@ -356,7 +375,15 @@ class _ChildProgressRelay:
         # The echo is an automatic diagnostic presentation: it goes through the warning
         # boundary under the parent's turn snapshot. The relayed event (the gateway's
         # producer, which classifies it) and the child result are never gated here.
-        if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
+        # A plugin recovering the failure itself may claim the notice. Evaluate the claim exactly once
+        # (the first relay to see the event) and carry the decision on the relayed event, so nested
+        # relays and the gateway never re-invoke a hook that may start recovery work.
+        if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES and "failure_notice_claimed" not in kwargs:
+            kwargs = {**kwargs, "failure_notice_claimed": subagent_failure_notice_claimed(
+                child_session_id=self.session_ref.get("session_id"), child_goal=self.goal_label,
+                child_status=kwargs.get("status"), error=kwargs.get("summary") or preview,
+                failure_reason=kwargs.get("failure_reason"))}
+        if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES and not kwargs.get("failure_notice_claimed"):
             from gateway.warning_notifications import render_notification
             parent = self.parent_scope
             render_notification(

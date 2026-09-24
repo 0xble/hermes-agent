@@ -177,3 +177,83 @@ class TestGatewayFailureNotice:
             summary="the real error detail",
         )
         assert "the real error detail" in captured[0]
+
+
+class TestPluginClaimedFailureNotice:
+    """A plugin that recovers a child failure itself (review fallback) can claim the notice."""
+
+    def _hook(self, monkeypatch, result):
+        seen = []
+
+        def _invoke(name, **kw):
+            seen.append((name, kw))
+            return [result]
+
+        import hermes_cli.plugins as plugins
+        monkeypatch.setattr(plugins, "has_hook", lambda name: name == "subagent_failure_notice")
+        monkeypatch.setattr(plugins, "invoke_hook", _invoke)
+        return seen
+
+    def _fail(self, runner):
+        runner.progress_callback("subagent.complete", preview="HTTP 429", status="failed",
+                                 goal="Review candidate c665c6b2d03f", child_session_id="child-1")
+
+    def test_suppress_claims_the_notice(self, monkeypatch):
+        seen = self._hook(monkeypatch, {"action": "suppress"})
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert captured == []
+        assert seen[0][1]["child_session_id"] == "child-1"
+        assert seen[0][1]["child_goal"] == "Review candidate c665c6b2d03f"
+
+    @pytest.mark.parametrize("result", [None, {"action": "keep"}, "suppress"])
+    def test_anything_else_keeps_the_notice(self, monkeypatch, result):
+        self._hook(monkeypatch, result)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert len(captured) == 1 and "429" in captured[0]
+
+    def test_hook_error_keeps_the_notice(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+        monkeypatch.setattr(plugins, "has_hook", lambda name: True)
+
+        def _boom(name, **kw):
+            raise RuntimeError("plugin crashed")
+
+        monkeypatch.setattr(plugins, "invoke_hook", _boom)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert len(captured) == 1
+
+
+class TestClaimEvaluatedOncePerFailure:
+    """Real child relay -> gateway TurnRunner: the hook fires once and its decision holds end to end."""
+
+    def _relay_into(self, runner, spinner=None):
+        from types import SimpleNamespace
+        from tools.delegate_tool_progress import _build_child_progress_callback
+        parent = SimpleNamespace(_delegate_spinner=spinner, tool_progress_callback=runner.progress_callback)
+        return _build_child_progress_callback(0, "Review candidate c665c6b2d03f", parent, 1,
+                                              session_ref={"session_id": "child-1"})
+
+    @pytest.mark.parametrize("answers, delivered", [
+        ([{"action": "suppress"}, None], 0),  # a second call would have leaked the notice
+        ([None, {"action": "suppress"}], 1),  # a second call would have hidden a real failure
+    ])
+    def test_hook_runs_once_and_its_first_decision_wins(self, monkeypatch, answers, delivered):
+        import hermes_cli.plugins as plugins
+        calls = []
+
+        def _invoke(name, **kw):
+            calls.append(kw)
+            return [answers[len(calls) - 1]]
+
+        monkeypatch.setattr(plugins, "has_hook", lambda name: True)
+        monkeypatch.setattr(plugins, "invoke_hook", _invoke)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        spinner = MagicMock()
+        self._relay_into(runner, spinner)("subagent.complete", preview="HTTP 429", status="failed",
+                                          duration_seconds=3.0, summary="HTTP 429: rate limit")
+        assert len(calls) == 1 and calls[0]["child_session_id"] == "child-1"
+        assert len(captured) == delivered
+        assert spinner.print_above.called is bool(delivered)
