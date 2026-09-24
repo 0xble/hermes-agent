@@ -24,7 +24,7 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
 
 ## Provenance and patches
 
-- Fork patch identity: `restart-continuation`. Local narrow patch; no upstream
+- Fork patch identities: `restart-continuation`, `crash-left-media-resume`. Local narrow patch; no upstream
   submission. Re-port of the archived fork's HERMES-075 (`dc6610ac64`,
   `fab8126cf2`) onto the `v2026.9.14` baseline, where the call sites had moved
   into `gateway/run_turn_runner.py`.
@@ -55,3 +55,13 @@ Retire when a released upstream version lets interactive platforms opt into
 continue-on-resume. Roll back by reverting the single fork commit and removing
 `gateway.restart_resume_policy` (and per-platform overrides) from configuration;
 no schema or persistent-data change is involved.
+
+## Crash-left replies with attachments
+
+v2026.9.24 settles a turn whose final reply was persisted before a crash by
+ledgering its text, then clearing the active-turn marker. The ledger redelivers
+text only, so a reply carrying `MEDIA:` attachments lost them, and a media-only
+reply read as unfinished. `crash-left-media-resume` leaves any reply with
+attachments marked, so it resumes through the normal path instead.
+`tests/gateway/test_crash_left_reply_media.py` guards it. Offer upstream; drop
+once the ledger carries attachments.

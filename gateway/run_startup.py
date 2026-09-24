@@ -843,6 +843,11 @@ class GatewayStartupMixin:
                     return ""
         if is_intentional_silence_response(last["content"]):
             return "" if machinery else _UNEXPECTED_SILENCE_REPLY
+        # The ledger redelivers text only, so a reply that carries attachments is not settled here:
+        # it stays marked and resumes, instead of being redelivered with its attachments dropped.
+        from gateway.platforms.base import BasePlatformAdapter
+        if BasePlatformAdapter.extract_media(last["content"])[0]:
+            return None
         return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
 
     @staticmethod
