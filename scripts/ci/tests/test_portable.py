@@ -103,6 +103,16 @@ class PortableGateTests(unittest.TestCase):
             self.assertEqual(env['HOME'], str(state / 'isolated'))
             self.assertEqual(env['CARGO_HOME'], str(state / 'cargo'))
             self.assertEqual(env['UV_PROJECT_ENVIRONMENT'], str(ci.ROOT / '.venv'))
+            config = Path(env['GIT_CONFIG_GLOBAL'])
+            self.assertEqual(config, (state / 'isolated' / 'gitconfig').resolve())
+            self.assertEqual(config.read_text(encoding='utf-8'),
+                             f'[safe]\n\tdirectory = {ci.ROOT.resolve().as_posix()}\n')
+            self.assertEqual(env['GIT_CONFIG_NOSYSTEM'], '1')
+            directories = subprocess.check_output(
+                ['git', 'config', '--global', '--get-all', 'safe.directory'],
+                env=env, text=True,
+            ).splitlines()
+            self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
 
     def test_external_fixture_has_no_git_or_node_dependency_ancestry(self):
         with tempfile.TemporaryDirectory() as directory:

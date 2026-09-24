@@ -128,10 +128,13 @@ def environment(home: Path) -> dict[str, str]:
         'CARGO_BUILD_JOBS': '2',
         'TZ': 'UTC', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PYTHONHASHSEED': '0',
         'PYTHONUTF8': '1', 'CI': 'true', 'GIT_CONFIG_NOSYSTEM': '1',
-        'GIT_CONFIG_GLOBAL': os.devnull,
+        'GIT_CONFIG_GLOBAL': (home / 'gitconfig').resolve().as_posix(),
     })
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
+    (home / 'gitconfig').write_text(
+        f'[safe]\n\tdirectory = {ROOT.resolve().as_posix()}\n', encoding='utf-8'
+    )
     return env
 
 
