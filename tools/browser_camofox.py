@@ -495,6 +495,7 @@ def camofox_handoff(account: str, task_id: Optional[str] = None) -> str:
     """Open/focus the visible shared identity and bind its returned tab to this task."""
     try:
         session = _get_session(task_id, account)
+        prior_tab_id = session.get("tab_id")
         data = _post(f"/browser/identities/{session['user_id']}/open", {})
         tab_id = data.get("tabId")
         if data.get("ok") is not True or not isinstance(tab_id, str) or not tab_id:
@@ -502,13 +503,20 @@ def camofox_handoff(account: str, task_id: Optional[str] = None) -> str:
         session["tab_id"] = tab_id
         result = {"success": True, "account": session["account"], "focused": bool(data.get("focused")),
                   "tabId": tab_id}
+        if prior_tab_id and prior_tab_id != tab_id:
+            result["replacedTab"] = True
+        if isinstance(data.get("restarted"), bool):
+            result["restarted"] = data["restarted"]
         for field in ("url", "title"):
             if isinstance(data.get(field), str):
                 result[field] = data[field]
         return json.dumps(result)
     except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 404:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 404:
             return tool_error("This account is not configured as a shared visible identity on the Camofox server. Configure it there before handoff.", success=False)
+        if status == 409:
+            return tool_error("Another operation is using this account's browser. Wait for it to finish, then retry the handoff; do not interrupt it.", success=False)
         return tool_error("Camofox visible handoff failed; check the server and its authentication", success=False)
     except requests.RequestException:
         return tool_error("Camofox visible handoff failed; check the server connection", success=False)

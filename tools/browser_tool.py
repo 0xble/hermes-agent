@@ -463,7 +463,7 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_handoff",
-        "description": "Open or focus a named Camofox account's visible shared window and continue in its returned tab. Camofox only; call this before snapshot, click, or type when a person needs to use the same browser window.",
+        "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely.",
         "parameters": {"type": "object", "properties": {"account": {"type": "string", "description": "Named Camofox account alias"}}, "required": ["account"]},
     },
     {

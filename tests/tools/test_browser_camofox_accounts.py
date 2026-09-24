@@ -205,7 +205,7 @@ def test_handoff_adopts_tab_for_followup_tools(tmp_path, monkeypatch):
     def request(url, **kw):
         seen.append((url, kw))
         if url.endswith("/open"):
-            return _response({"ok": True, "focused": True, "tabId": "visible-tab"})
+            return _response({"ok": True, "focused": True, "tabId": "visible-tab", "restarted": True})
         if url.endswith("/navigate"):
             return _response({"url": "https://example.com", "title": "Example"})
         if url.endswith("/click"):
@@ -217,7 +217,13 @@ def test_handoff_adopts_tab_for_followup_tools(tmp_path, monkeypatch):
         # Exercise the registered handler, not just the backend function.
         raw_handoff = registry.dispatch("browser_handoff", {"account": "brianle"}, task_id="t")
         handoff = json.loads(raw_handoff) if isinstance(raw_handoff, str) else raw_handoff
-        assert handoff == {"success": True, "account": "brianle", "focused": True, "tabId": "visible-tab"}
+        assert handoff == {
+            "success": True,
+            "account": "brianle",
+            "focused": True,
+            "tabId": "visible-tab",
+            "restarted": True,
+        }
         assert json.loads(browser_tool.browser_snapshot(task_id="t"))["success"] is True
         assert json.loads(browser_tool.browser_click("@e1", task_id="t"))["success"] is True
         assert json.loads(browser_tool.browser_navigate("https://example.com", task_id="t"))["success"] is True
@@ -230,9 +236,45 @@ def test_handoff_adopts_tab_for_followup_tools(tmp_path, monkeypatch):
     assert camofox._get_session("t")["tab_id"] == "visible-tab"
 
 
+def test_handoff_reports_replaced_prior_tab_and_preserves_restart_flag(tmp_path, monkeypatch):
+    from tools import browser_camofox as camofox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    session = camofox._get_session("replace", "brianle")
+    session["tab_id"] = "old-tab"
+    with patch("tools.browser_camofox.requests.post", return_value=_response({
+        "ok": True, "focused": True, "tabId": "new-tab", "restarted": False,
+    })):
+        result = json.loads(camofox.camofox_handoff("brianle", "replace"))
+    assert result["replacedTab"] is True
+    assert result["restarted"] is False
+    assert session["tab_id"] == "new-tab"
+
+
+def test_handoff_busy_identity_leaves_tab_unchanged(tmp_path, monkeypatch):
+    import requests
+    from tools import browser_camofox as camofox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    session = camofox._get_session("busy", "brianle")
+    session["tab_id"] = "existing-tab"
+    response = _response({"error": "identity busy"})
+    response.status_code = 409
+    response.raise_for_status.side_effect = requests.HTTPError("409 identity busy", response=response)
+    with patch("tools.browser_camofox.requests.post", return_value=response):
+        result = json.loads(camofox.camofox_handoff("brianle", "busy"))
+    assert result["success"] is False
+    assert "another operation is using this account's browser" in result["error"].lower()
+    assert "wait for it to finish" in result["error"].lower()
+    assert session["tab_id"] == "existing-tab"
+
+
 def test_handoff_not_configured_does_not_adopt_tab(tmp_path, monkeypatch):
     import requests
     from tools import browser_camofox as camofox
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
     response = _response({"error": "Shared identity not configured"})
