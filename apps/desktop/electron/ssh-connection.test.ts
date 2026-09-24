@@ -116,8 +116,11 @@ test('controlSocketPath default base stays under sun_path even with the temp-lis
     // And it must NOT live under the deeply-nested macOS per-user temp dir.
     assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
   } finally {
-    if (originalHome === undefined) delete process.env.HOME
-    else process.env.HOME = originalHome
+    if (originalHome === undefined) {
+      delete process.env.HOME
+    } else {
+      process.env.HOME = originalHome
+    }
   }
 })
 

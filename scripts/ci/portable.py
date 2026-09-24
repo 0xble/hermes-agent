@@ -33,6 +33,50 @@ OPTIONAL_LANES = {
     'native-os': 'Partial: actual macOS/Windows marked tests, plus both Windows installer shells',
 }
 
+# Keep the existing full/check interface for maintainers. Hosted CI selects these
+# explicit profiles rather than treating partial --lane runs as qualification.
+GATE_PYTHON_FILES = (
+    'tests/agent/test_agent_guardrails.py',
+    'tests/agent/test_oneshot.py',
+    'tests/gateway/test_own_policy_startup_gate.py',
+    'tests/hermes_cli/test_cli_retry.py',
+)
+GATE_LANES = ('static', 'python-gate', 'node-gate')
+
+
+def git_environment(*, root: Path | None = ROOT, base: dict[str, str] | None = None,
+                    config_path: Path | None = None) -> dict[str, str]:
+    """Isolate repository selection while trusting only the requested checkout."""
+    source = os.environ if base is None else base
+    env = {key: value for key, value in source.items() if not key.startswith('GIT_')}
+    if root is None:
+        env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        return env
+    config = (config_path or STATE / 'gitconfig').resolve()
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(f'[safe]\n\tdirectory = {root.resolve().as_posix()}\n', encoding='utf-8')
+    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=config.as_posix())
+    return env
+
+
+def assert_exact_checkout(expected: str) -> None:
+    if not re.fullmatch(r'[0-9a-f]{40}', expected):
+        raise RuntimeError('Expected a full lowercase 40-character commit SHA')
+    actual = git('rev-parse', 'HEAD').strip()
+    if actual != expected:
+        raise RuntimeError(f'Checkout SHA mismatch: expected {expected}, got {actual}')
+    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT)).returncode != 0 or \
+       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT)).returncode != 0:
+        raise RuntimeError('Tracked checkout differs from the committed SHA')
+
+
+def preflight() -> None:
+    # No installs or credential-bearing runtime: fast developer feedback.
+    run([sys.executable, '-m', 'unittest',
+         'scripts.ci.tests.test_portable.PortableGateTests.test_exact_checkout_rejects_malformed_wrong_and_mutated_sha'])
+    run([sys.executable, '-m', 'py_compile', 'scripts/ci/portable.py'])
+
+
 
 def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
     print('+ ' + ' '.join(map(str, argv)), flush=True)
@@ -40,7 +84,7 @@ def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None)
 
 
 def git(*args: str, cwd: Path = ROOT) -> str:
-    return subprocess.check_output(['git', *args], cwd=cwd).decode('utf-8', errors='surrogateescape')
+    return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment(root=cwd)).decode('utf-8', errors='surrogateescape')
 
 
 def source_files(root: Path = ROOT) -> list[str]:
@@ -98,11 +142,11 @@ def environment(home: Path) -> dict[str, str]:
         'CARGO_HOME': str(STATE / 'cargo'), 'CARGO_TARGET_DIR': str(STATE / 'cargo-target'),
         'CARGO_BUILD_JOBS': '2',
         'TZ': 'UTC', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PYTHONHASHSEED': '0',
-        'PYTHONUTF8': '1', 'CI': 'true', 'GIT_CONFIG_NOSYSTEM': '1',
-        'GIT_CONFIG_GLOBAL': os.devnull,
+        'PYTHONUTF8': '1', 'CI': 'true',
     })
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
+    env.update(git_environment(root=ROOT, base=env, config_path=home / 'gitconfig'))
     return env
 
 
@@ -246,6 +290,20 @@ def native_os(env: dict[str, str], workers: int) -> None:
         raise RuntimeError('Native OS checks failed.')
 
 
+def node_gate(env: dict[str, str], workers: int) -> None:
+    # Admit fast cross-workspace checks on every PR; the full nine-unit Node
+    # profile, including desktop UI and TUI suites, runs in nightly.
+    python(env)
+    require_tools(('node', 'npm'), env)
+    run(['node', '--test', 'scripts/ci/tests/workspace-checks.test.mjs'], env=env)
+    command = ['node', 'scripts/run-workspace-checks.mjs', '--concurrency', str(workers),
+               '--skip', 'check:test:ui', '--skip', 'check:test:desktop:all',
+               '--skip', 'ui-tui/packages/hermes-ink', '--skip', 'ui-tui :: check']
+    if sys.platform.startswith('linux'):
+        command = ['xvfb-run', '-a', *command]
+    run(command, env=env)
+
+
 def node(env: dict[str, str], workers: int) -> None:
     python(env)  # JavaScript tests spawn Python subprocesses from PATH.
     require_tools(('node', 'npm'), env)
@@ -338,7 +396,8 @@ def checkout_lock() -> Iterator[None]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list'))
+    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
+    parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by gate/nightly')
     parser.add_argument('--lane', choices=(*LANES, *OPTIONAL_LANES), action='append', help='Partial check, never full-gate evidence')
     parser.add_argument('--workers', type=int, default=4, help='Python file workers (default 4)')
     parser.add_argument('--node-workers', type=int, default=2)
@@ -347,6 +406,14 @@ def main() -> int:
         parser.error('Worker counts must be positive')
     if args.command != 'check' and args.lane:
         parser.error('--lane is only valid for check')
+    exact = args.command in ('gate', 'nightly', 'nightly-native')
+    if exact != bool(args.expected_sha):
+        parser.error('gate/nightly require a positional full SHA; other commands do not accept one')
+    if args.command == 'preflight':
+        preflight()
+        return 0
+    if exact:
+        assert_exact_checkout(args.expected_sha)
     if args.command == 'list':
         for name, description in {**LANES, **OPTIONAL_LANES}.items():
             print(f'{name}: {description}')
@@ -355,12 +422,18 @@ def main() -> int:
     STATE.mkdir(exist_ok=True)
     with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
         env = environment(home)
-        if args.command in ('setup', 'full'):
+        if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)
             if args.command == 'setup':
                 return 0
+        # Dependency setup is allowed to write ignored state, not tracked source.
+        # Assert immediately before checks and again after successful lanes.
+        if exact:
+            assert_exact_checkout(args.expected_sha)
         lanes = {
             'static': lambda: static(env),
+            'python-gate': lambda: python_tests(env, list(GATE_PYTHON_FILES), args.workers),
+            'node-gate': lambda: node_gate(env, args.node_workers),
             'python': lambda: python_tests(env, ['tests'], args.workers),
             'e2e': lambda: python_tests(env, ['tests/e2e'], args.workers),
             'node': lambda: node(env, args.node_workers),
@@ -369,9 +442,13 @@ def main() -> int:
             'container-lint': lambda: container_lint(env),
             'native-os': lambda: native_os(env, args.workers),
         }
-        selected = args.lane or list(LANES)
+        selected = args.lane or (list(GATE_LANES) if args.command == 'gate' else
+                                 ['native-os'] if args.command == 'nightly-native' else list(LANES))
         passed = aggregate([(name, lanes[name]) for name in dict.fromkeys(selected)])
-        scope = 'PARTIAL' if args.lane else f'FULL SOURCE GATE ({sys.platform})'
+        if exact:
+            assert_exact_checkout(args.expected_sha)
+        scope = ('GATE' if args.command == 'gate' else 'NIGHTLY' if exact else
+                 'PARTIAL' if args.lane else f'FULL SOURCE GATE ({sys.platform})')
         print(f'{scope}: {"PASS" if passed else "FAIL"}. Native OS, external integration and release lanes are separate.')
         return 0 if passed else 1
 
