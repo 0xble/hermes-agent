@@ -53,7 +53,9 @@ def test_aliases_select_distinct_sessions_and_echo_only_alias(tmp_path, monkeypa
     # The raw identity is sent to Camofox but never returned to the model.
     assert "user_id" not in brian
     bodies = [call.kwargs["json"] for call in post.call_args_list if "userId" in call.kwargs["json"]]
-    assert bodies[0]["userId"] != bodies[1]["userId"]
+    assert bodies[0]["userId"] == bodies[1]["userId"]
+    assert bodies[2]["userId"] == bodies[3]["userId"]
+    assert bodies[0]["userId"] != bodies[2]["userId"]
 
 
 def test_unknown_alias_is_refused_without_http(tmp_path, monkeypatch):

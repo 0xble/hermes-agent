@@ -121,8 +121,8 @@ class TestManagedPersistenceMode:
         assert first["success"] is True
         assert second["success"] is True
         tab_requests = [req for req in requests_seen if "userId" in req]
-        assert len(tab_requests) == 2
-        assert tab_requests[0]["userId"] == tab_requests[1]["userId"]
+        assert len(tab_requests) == 4
+        assert len({req["userId"] for req in tab_requests}) == 1
 
 
 class TestConfiguredCamofoxIdentity:
@@ -164,8 +164,9 @@ class TestConfiguredCamofoxIdentity:
                 result = json.loads(
                     camofox_navigate("https://example.com", task_id="scoped-precedence")
                 )
-                request_url = mock_post.call_args.args[0]
-                request_body = mock_post.call_args.kwargs["json"]
+                request_url = mock_post.call_args_list[0].args[0]
+                request_body = mock_post.call_args_list[0].kwargs["json"]
+                assert mock_post.call_args_list[1].args[0] == "https://secondary.example/tabs/scoped-tab/navigate"
         finally:
             secret_scope.reset_secret_scope(token)
             secret_scope.set_multiplex_active(False)

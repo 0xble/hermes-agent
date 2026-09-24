@@ -39,6 +39,57 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 30  # fallback when config is unreadable
 _NO_SESSION_ERROR = "No browser session. Call browser_navigate first."
+_STALE_TAB_ERROR = "Browser tab is gone (closed by the browser server). Call browser_navigate to open a new tab."
+_EVAL_CAPABILITY_ERROR = ("JavaScript evaluation is not supported by this Camofox server. "
+                          "Use browser_snapshot or browser_vision to inspect page state.")
+_TAB_MISSING_CODES = frozenset({"tab_destroyed", "tab_timeout", "tab_not_found", "unknown_tab",
+                                "tab_gone", "page_crashed", "browser_restarted"})
+
+
+def classify_camofox_http_error(exc: BaseException, *, endpoint: str = "mandatory") -> str:
+    """Distinguish a destroyed tab from an optional evaluate route missing on older servers."""
+    response = getattr(exc, "response", None)
+    if not isinstance(exc, requests.HTTPError) or response is None:
+        return "other"
+    status = response.status_code
+    if status == 410:
+        return "stale"
+    if status in (405, 501) and endpoint == "evaluate":
+        return "capability"
+    if status != 404:
+        return "other"
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    code = str(payload.get("code") or "").lower()
+    text = " ".join(str(payload.get(key) or "") for key in ("error", "message")).lower()
+    missing = (code in _TAB_MISSING_CODES or payload.get("recovery") == "create_new_tab" or
+               any(token in text for token in ("tab not found", "unknown tab", "tab destroyed",
+                                                "no such tab", "tab_destroyed", "page_crashed")) or
+               bool(re.search(r"\btab\b.{0,80}\b(?:not found|does not exist|missing)\b", text)))
+    if missing:
+        return "stale"
+    return "capability" if endpoint == "evaluate" else "other"
+
+
+def _clear_stale_tab(session: Dict[str, Any], exc: BaseException, *, endpoint: str = "mandatory") -> bool:
+    if classify_camofox_http_error(exc, endpoint=endpoint) != "stale":
+        return False
+    session["tab_id"] = None
+    # A managed account may still list the destroyed tab; only explicit navigation creates anew.
+    session["adopt_existing_tab"] = False
+    return True
+
+
+def _tab_error(session: Dict[str, Any], exc: BaseException, *, endpoint: str = "mandatory") -> str:
+    if _clear_stale_tab(session, exc, endpoint=endpoint):
+        return tool_error(_STALE_TAB_ERROR, success=False)
+    if classify_camofox_http_error(exc, endpoint=endpoint) == "capability":
+        return tool_error(_EVAL_CAPABILITY_ERROR, success=False)
+    return tool_error(str(exc), success=False)
 _vnc_url: Optional[str] = None  # cached from /health response
 _vnc_url_checked = False  # only probe once per process
 # Routed profiles (multiplexed gateway) each point CAMOFOX_URL at their own server, so the one-shot
@@ -412,22 +463,22 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
 
 
 def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[str] = None) -> tuple[Dict[str, Any], dict]:
-    """Open ``browser_url`` in the task's tab (creating it if missing) and return
-    ``(session, navigate_response)``. A 404 on the existing tab means the server
-    garbage-collected it — recreate instead of failing."""
+    """Navigate explicitly even for newly created/adopted tabs; retry one stale tab."""
     session = _get_session(task_id, account) if account is not None else _get_session(task_id)
-    if session["tab_id"]:
+    if not session["tab_id"]:
+        session = _ensure_tab(task_id, browser_url, account)
+    for attempt in range(2):
         try:
-            data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)
+            data = _post(_tab_path(session, "navigate"),
+                         {"userId": session["user_id"], "url": browser_url}, timeout=60)
             return session, data
-        except requests.HTTPError as e:
-            if e.response is None or e.response.status_code != 404:
+        except requests.HTTPError as exc:
+            if not _clear_stale_tab(session, exc):
                 raise
-            logger.warning("Camofox tab %s returned 404 — tab was garbage collected. Creating a fresh tab.",
-                           session["tab_id"])
-            session["tab_id"] = None
-    session = _ensure_tab(task_id, browser_url) if account is None else _ensure_tab(task_id, browser_url, account)
-    return session, {"ok": True, "url": browser_url}
+            if attempt:
+                raise RuntimeError(_STALE_TAB_ERROR) from None
+            session = _ensure_tab(task_id, browser_url, account)
+    raise RuntimeError(_STALE_TAB_ERROR)  # unreachable
 
 
 def camofox_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
@@ -449,6 +500,8 @@ def camofox_navigate(url: str, task_id: Optional[str] = None, account: Optional[
                                   "Share this link with the user so they can watch the browser live.")
         try:  # Auto-take a compact snapshot so the model can act immediately.
             result["snapshot"], result["element_count"] = _fetch_snapshot(session)
+        except requests.HTTPError as exc:
+            _clear_stale_tab(session, exc)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
         return json.dumps(result)
@@ -474,7 +527,9 @@ def _camofox_private_page_block(session: Dict[str, Any], task_id: Optional[str],
     from tools.browser_tool_eval_policy import _camofox_current_page_private_url, _eval_ssrf_guard_active
     if not _eval_ssrf_guard_active(task_id or "default"):
         return None
-    blocked_url = _camofox_current_page_private_url(session["tab_id"], session["user_id"])
+    blocked_url = _camofox_current_page_private_url(session["tab_id"], session["user_id"], session=session)
+    if not session["tab_id"]:
+        return tool_error(_STALE_TAB_ERROR, success=False)
     if not blocked_url:
         return None
     return json.dumps({"success": False, "error": (
@@ -493,11 +548,14 @@ def _require_tab(task_id: Optional[str], action: Optional[str] = None) -> tuple[
 def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callable[[Dict[str, Any]], str]) -> str:
     """Require a tab (+ private-page guard when ``guard_action`` is set), then run ``body(session)``;
     any exception becomes a ``tool_error``."""
+    session = None
     try:
         session, blocked = _require_tab(task_id, guard_action)
         if blocked:
             return blocked
         return body(session)
+    except requests.HTTPError as exc:
+        return _tab_error(session, exc) if session is not None else tool_error(str(exc), success=False)
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -527,6 +585,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     """Type text into an element by ref via Camofox."""
+    session = None
     try:
         session, blocked = _require_tab(task_id, "type")
         if blocked:
@@ -540,6 +599,11 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         display_text = (redact_tool_args_for_display("browser_type", {"text": text}) or {})["text"]
         response = {"success": True, "typed": display_text, "element": clean_ref}
         return json.dumps(redact_browser_typed_text_for_display(response, text))
+    except requests.HTTPError as exc:
+        from agent.display import redact_browser_typed_text_for_display
+        if session is not None and _clear_stale_tab(session, exc):
+            return tool_error(_STALE_TAB_ERROR, success=False)
+        return tool_error(redact_browser_typed_text_for_display(str(exc), text), success=False)
     except Exception as e:
         from agent.display import redact_browser_typed_text_for_display
         return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
@@ -613,6 +677,8 @@ def camofox_vision(question: str, annotate: bool = False, task_id: Optional[str]
             try:
                 snapshot = _snapshot_data(session).get("snapshot", "")
                 annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
+            except requests.HTTPError as exc:
+                _clear_stale_tab(session, exc)
             except Exception:
                 pass
         # The screenshot itself cannot be redacted, but the text-based accessibility snippet

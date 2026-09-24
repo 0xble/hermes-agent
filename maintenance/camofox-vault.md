@@ -5,6 +5,9 @@ the browser vault fill tool, or the 1Password backends.
 
 ## Required behavior
 
+- A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.
+  Only explicit navigation creates/retries a tab, once; page actions and vault evaluations
+  never replay on replacement tabs, and account identity survives invalidation.
 - Named Camofox accounts route per profile; account aliases are profile-specific.
 - Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are
   minted from Connect one-time-password fields, automatic 2FA is announced only when a code
@@ -23,7 +26,12 @@ the browser vault fill tool, or the 1Password backends.
 
 - Fork patch identities: `slice-8-camofox-accounts` (local, no upstream submission),
   `slice-9-vault-camofox`, `slice-9-vault-shadow-dom`, `slice-9-vault-op-cards` (own fork
-  feature; no upstream issue or PR as of 2026-09-19).
+  feature; no upstream issue or PR as of 2026-09-19), and `camofox-stale-tab-recovery`
+  (adopted design from [upstream PR 93249](https://github.com/NousResearch/hermes-agent/pull/93249)
+  at `b5e999a5b52b70e286f6e55ec8dc8ec6e872ac8a`, related
+  [issue 80276](https://github.com/NousResearch/hermes-agent/issues/80276)).
+  The fork adaptation adds vault evaluation, preserves a no-session branch, and classifies
+  404 by its tab-missing payload; revisit when upstream ships equivalent behavior.
 - Adopted upstream sources, all open on 2026-09-19:
   [PR 114414](https://github.com/NousResearch/hermes-agent/pull/114414) at
   `d8a374630aef825ad3d86c1e41defa57a4874247` (Connect and secret-safe fills);
