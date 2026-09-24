@@ -49,6 +49,9 @@ def browser(tmp_path):
     process = subprocess.Popen([executable, '--headless=new', '--no-sandbox',
                                 '--disable-dev-shm-usage', '--no-first-run',
                                 '--no-default-browser-check', '--remote-debugging-port=0',
+                                # The portable gate replaces HOME, so a real macOS Chrome
+                                # finds no login keychain and blocks on a modal prompt.
+                                '--use-mock-keychain', '--password-store=basic',
                                 f'--user-data-dir={profile}', origin + '/unrelated'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     task = 'vault-shadow-regression'
