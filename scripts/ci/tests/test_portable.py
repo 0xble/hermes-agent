@@ -232,7 +232,7 @@ try {
             with self.assertRaisesRegex(RuntimeError, 'require'):
                 ci.require_tools(('node',), {})
 
-    def test_setup_provisions_the_pinned_npm_ahead_of_host_npm(self):
+    def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             toolchain = Path(directory) / 'toolchain'
             stack.enter_context(patch.object(ci, 'TOOLCHAIN', toolchain))
@@ -253,6 +253,14 @@ try {
             with patch.dict(os.environ, {'PATH': '/host/bin'}, clear=True), patch.object(ci, 'STATE', Path(directory)):
                 path = ci.environment(Path(directory) / 'home')['PATH'].split(os.pathsep)
             self.assertLess(path.index(str(toolchain / 'node_modules' / '.bin')), path.index('/host/bin'))
+            self.assertLess(path.index(str(toolchain / 'bin')), path.index('/host/bin'))
+            commands.clear()
+            stack.enter_context(patch.object(ci, 'rust_environment', side_effect=lambda env: env))
+            versions = iter(('ripgrep 99.0.0\n',))
+            stack.enter_context(patch.object(ci.subprocess, 'check_output', side_effect=lambda *a, **k: next(versions)))
+            ci.provision_rg({})
+            self.assertEqual(commands[-1][:2], ['cargo', 'install'])
+            self.assertIn(f"ripgrep@{ci.PINS['rg']}", commands[-1])
 
     def test_default_invocation_sets_up_and_runs_all_lanes_after_failure(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
