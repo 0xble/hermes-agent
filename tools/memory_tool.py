@@ -175,6 +175,9 @@ def _background_delete_gate(store, action, operations, target="memory", content=
 
     if not is_unattended_review():
         return None
+    # Owner opt-in: trust the unattended fork with replace/remove (memory.write_approval still applies).
+    if is_truthy_value(get_builtin_memory_config().get("background_review_allow_delete"), default=False):
+        return None
     payload = ({"action": "batch", "target": target, "operations": operations}
                if operations is not None else
                {"action": action, "target": target, "content": content, "old_text": old_text})
