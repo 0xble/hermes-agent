@@ -21,7 +21,7 @@ STATE = ROOT / '.ci'
 # Checkout-owned npm and ripgrep at the exact pins; host tools only bootstrap them.
 TOOLCHAIN = STATE / 'toolchain'
 PINS = json.loads((ROOT / 'scripts/ci/toolchain.json').read_text(encoding='utf-8'))
-EXTRAS = ('all', 'dev', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'hindsight', 'parallel-web')
+EXTRAS = ('all', 'dev', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'parallel-web')
 LANES = {
     'static': 'Blocking lint, source policies, attribution, history and lock consistency',
     'python': 'Canonical full tests (excludes integration/e2e/docker)',

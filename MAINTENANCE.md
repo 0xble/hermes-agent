@@ -6,14 +6,10 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.21`, `d337b736aa1e8ebecfab043842d13e4a2d2f48a3`.
-Explicit upstream exception authorized on 2026-09-23: adopt through
-`38c289c0146ed8c8b2b767eca1fff6f5b7e6382e` for native Codex GPT-6 Sol/Luna.
-This cutoff includes registration (`79ec1f2a34a5b58d91ee835488490a8fbce007b8`),
-live catalog discovery (`1d10cef8363aa3148d70ed162d0a1fc809347182`), and removal
-of unpublished Terra. The user waived aging for this adoption, not verification,
-independent review, protected landing, or backup safeguards. Later Desktop picker
-and generic provider-cache changes are outside this native Codex adoption.
+`v2026.9.24`, `f97608f178d1ffeca59860195ab7da295f7c8e5f`.
+The operator authorized age-only adoption of this release on 2026-09-24. The
+exception waives release age only, not verification, independent review,
+protected landing, or backup safeguards.
 This replacement fork was established on 2026-09-19. The former fork is preserved
 as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
