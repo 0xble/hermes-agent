@@ -16,7 +16,7 @@ from hermes_cli.fallback_config import get_fallback_chain
 
 GLOBAL = [{"provider": "openrouter", "model": "global-backup"}]
 LEGACY = {"provider": "anthropic", "model": "legacy-backup"}
-CRON = [{"provider": "custom:cron-backup", "model": "cron-backup"}]
+CRON = [{"provider": "custom:cron-backup", "model": "cron-backup", "reasoning_effort": "high"}]
 
 
 @pytest.mark.parametrize("cron_config,expected", [

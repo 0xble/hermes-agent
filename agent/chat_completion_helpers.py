@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
-from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH, parse_reasoning_effort
 from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE)
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
@@ -1953,15 +1953,26 @@ def _update_fallback_context_compressor(agent) -> None:
         revalidate_compression_feasibility(agent)
 
 
-def _reresolve_fallback_reasoning_config(agent) -> None:
-    """Per-model override > global reasoning_effort (YAML False = disabled); a config load
-    failure keeps the current reasoning_config rather than killing the swap."""
+def _reresolve_fallback_reasoning_config(agent, fallback_entry: dict) -> None:
+    """Use an entry effort when present; otherwise retain per-model/global resolution."""
     try:
-        # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
-        # because a config load failure must not kill the swap.
         from hermes_cli.config import load_config
         from hermes_constants import resolve_reasoning_config
-        agent.reasoning_config = resolve_reasoning_config(load_config() or {}, agent.model)
+
+        entry_effort = fallback_entry.get("reasoning_effort")
+        if "reasoning_effort" in fallback_entry and entry_effort not in (None, ""):
+            resolved = parse_reasoning_effort(entry_effort)
+            if resolved is None:
+                logger.warning(
+                    "Fallback %s: invalid reasoning_effort %r; using configured resolution",
+                    agent.model,
+                    entry_effort,
+                )
+                resolved = resolve_reasoning_config(load_config() or {}, agent.model)
+        else:
+            resolved = resolve_reasoning_config(load_config() or {}, agent.model)
+        # None is the resolved default, not a failure: never carry the previous route's effort.
+        agent.reasoning_config = resolved
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:
         logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)
@@ -2096,7 +2107,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
                 provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
             agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
             _update_fallback_context_compressor(agent)
-            _reresolve_fallback_reasoning_config(agent)
+            _reresolve_fallback_reasoning_config(agent, fb)
             _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 

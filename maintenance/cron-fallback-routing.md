@@ -14,6 +14,14 @@ to cron preflight, provider recovery, agent construction, or fallback normalizat
 - Fork adaptation: retain the release baseline's failure-notice wording while
   pointing to the cron setting. Do not import the newer upstream-only notice tests
   or its notice renderer. Routing implementation and new regression tests are unchanged.
+- Follow-up fork patch identity: `fallback-reasoning-effort` (`Fork-Patch:` trailer).
+  A selected fallback entry's valid `reasoning_effort` overrides the active route;
+  invalid values warn and use normal per-model/global resolution. Primary reasoning is
+  snapshotted and restored. The proof surface is the real `try_activate_fallback`
+  path in `tests/agent/test_provider_fallback.py` plus the primary-runtime and cron
+  reasoning suites. Retire when upstream PR [#45961](https://github.com/NousResearch/hermes-agent/pull/45961)
+  or an equivalent released change covers these semantics; roll back by reverting
+  this logical patch.
 - Source adoption does not activate the personal or company installations or
   change their model policy. Use the separately authorized runtime owner for that.
 
