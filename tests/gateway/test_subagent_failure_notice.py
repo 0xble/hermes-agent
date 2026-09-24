@@ -224,3 +224,36 @@ class TestPluginClaimedFailureNotice:
         runner, captured = _make_runner_and_captured(monkeypatch)
         self._fail(runner)
         assert len(captured) == 1
+
+
+class TestClaimEvaluatedOncePerFailure:
+    """Real child relay -> gateway TurnRunner: the hook fires once and its decision holds end to end."""
+
+    def _relay_into(self, runner, spinner=None):
+        from types import SimpleNamespace
+        from tools.delegate_tool_progress import _build_child_progress_callback
+        parent = SimpleNamespace(_delegate_spinner=spinner, tool_progress_callback=runner.progress_callback)
+        return _build_child_progress_callback(0, "Review candidate c665c6b2d03f", parent, 1,
+                                              session_ref={"session_id": "child-1"})
+
+    @pytest.mark.parametrize("answers, delivered", [
+        ([{"action": "suppress"}, None], 0),  # a second call would have leaked the notice
+        ([None, {"action": "suppress"}], 1),  # a second call would have hidden a real failure
+    ])
+    def test_hook_runs_once_and_its_first_decision_wins(self, monkeypatch, answers, delivered):
+        import hermes_cli.plugins as plugins
+        calls = []
+
+        def _invoke(name, **kw):
+            calls.append(kw)
+            return [answers[len(calls) - 1]]
+
+        monkeypatch.setattr(plugins, "has_hook", lambda name: True)
+        monkeypatch.setattr(plugins, "invoke_hook", _invoke)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        spinner = MagicMock()
+        self._relay_into(runner, spinner)("subagent.complete", preview="HTTP 429", status="failed",
+                                          duration_seconds=3.0, summary="HTTP 429: rate limit")
+        assert len(calls) == 1 and calls[0]["child_session_id"] == "child-1"
+        assert len(captured) == delivered
+        assert spinner.print_above.called is bool(delivered)

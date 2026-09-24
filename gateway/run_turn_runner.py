@@ -184,11 +184,14 @@ class TurnRunner:
         try:
             from tools.delegate_tool import SUBAGENT_FAILURE_STATUSES, format_subagent_failure_line
             from tools.delegate_tool_progress import subagent_failure_notice_claimed
-            if (status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current()
-                    and not subagent_failure_notice_claimed(
-                        child_session_id=kwargs.get("child_session_id"), child_goal=kwargs.get("goal"),
-                        child_status=status, error=kwargs.get("summary") or preview,
-                        failure_reason=kwargs.get("failure_reason"))):
+            claimed = kwargs.get("failure_notice_claimed")
+            if claimed is None and status in SUBAGENT_FAILURE_STATUSES:
+                # Only events that bypassed the delegation relay reach here without a decision.
+                claimed = subagent_failure_notice_claimed(
+                    child_session_id=kwargs.get("child_session_id"), child_goal=kwargs.get("goal"),
+                    child_status=status, error=kwargs.get("summary") or preview,
+                    failure_reason=kwargs.get("failure_reason"))
+            if status in SUBAGENT_FAILURE_STATUSES and ctx._run_still_current() and not claimed:
                 line = format_subagent_failure_line(
                     kwargs.get("goal"), status, error=kwargs.get("summary") or preview,
                     duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),

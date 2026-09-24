@@ -375,10 +375,15 @@ class _ChildProgressRelay:
         # The echo is an automatic diagnostic presentation: it goes through the warning
         # boundary under the parent's turn snapshot. The relayed event (the gateway's
         # producer, which classifies it) and the child result are never gated here.
-        if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES and not subagent_failure_notice_claimed(
+        # A plugin recovering the failure itself may claim the notice. Evaluate the claim exactly once
+        # (the first relay to see the event) and carry the decision on the relayed event, so nested
+        # relays and the gateway never re-invoke a hook that may start recovery work.
+        if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES and "failure_notice_claimed" not in kwargs:
+            kwargs = {**kwargs, "failure_notice_claimed": subagent_failure_notice_claimed(
                 child_session_id=self.session_ref.get("session_id"), child_goal=self.goal_label,
                 child_status=kwargs.get("status"), error=kwargs.get("summary") or preview,
-                failure_reason=kwargs.get("failure_reason")):
+                failure_reason=kwargs.get("failure_reason"))}
+        if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES and not kwargs.get("failure_notice_claimed"):
             from gateway.warning_notifications import render_notification
             parent = self.parent_scope
             render_notification(
