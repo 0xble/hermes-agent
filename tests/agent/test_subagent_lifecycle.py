@@ -146,6 +146,7 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
         "subagent_stop",
         parent_session_id="parent-aggregate",
         parent_turn_id="turn-1",
+        parent_agent=parent,
         child_session_id="child-session",
         child_role="leaf",
         child_summary="aggregated",
