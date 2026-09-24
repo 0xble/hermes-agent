@@ -150,6 +150,43 @@ def test_final_success_requires_completed_matching_receipt_and_runtime(tmp_path,
         assert result[0] is True
 
 
+@pytest.mark.parametrize("case", ["noop", "noop_with_stale_fleet", "noop_failed_outcome", "noop_pending_restart"])
+def test_already_up_to_date_is_success_without_runtime_to_verify(tmp_path, case):
+    """A no-op update restarts nothing, so an empty fleet is expected, not missing evidence."""
+    data = pending(tmp_path)
+    finalize_update(tmp_path, noop=True, outcome="partial" if case == "noop_failed_outcome" else "success")
+    path = tmp_path / "logs" / "update_receipts" / "latest.json"
+    if case == "noop_with_stale_fleet":
+        receipt = json.loads(path.read_text())
+        receipt["fleet"] = [{"profile": "default", "pid": 1, "state": "stale", "code_sha": "c" * 40}]
+        path.write_text(json.dumps(receipt))
+    elif case == "noop_pending_restart":
+        (tmp_path / "fleet_restart_pending").write_text("native updater obligation")
+    result = final_outcome(tmp_path, data)
+    if case == "noop":
+        assert result == (True, f"Hermes is already at revision {'a' * 12}.")
+    elif case == "noop_pending_restart":
+        assert result is None
+    else:
+        assert result[0] is False
+
+
+@pytest.mark.asyncio
+async def test_already_up_to_date_request_reports_already_latest(tmp_path):
+    data = pending(tmp_path)
+    finalize_update(tmp_path, noop=True)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is True
+    final = adapter.send.call_args_list[-1].args[1]
+    assert final.startswith("ℹ️ Already Latest")
+    assert data["reason"] in final and "not restarted" in final
+    assert not any("❌" in c.args[1] for c in adapter.send.call_args_list)
+    assert read_pending(tmp_path) is None
+
+
 @pytest.mark.asyncio
 async def test_failed_legacy_update_output_never_claims_success(tmp_path):
     runner = _make_runner()
