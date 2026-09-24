@@ -1467,9 +1467,12 @@ def _profile_bound_backend_pids(canon: str, profile_dir: Path) -> list[int]:
     except Exception:
         current_user = None
     pids: list[int] = []
-    for proc in psutil.process_iter(["pid", "name", "username", "cmdline"]):
+    # Iterate WITHOUT an attrs prefetch: psutil runs that prefetch inside the generator, so a process
+    # exiting mid-scan on macOS raised SystemError (KERN_PROCARGS2) out of next() and finished the whole
+    # generator — delete_profile aborted. Fetch per process inside the guard instead; one bad row skips.
+    for proc in psutil.process_iter():
         try:
-            info = proc.info
+            info = getattr(proc, "info", None) or proc.as_dict(["pid", "name", "username", "cmdline"])
             pid = info.get("pid")
             if pid is None or pid in skip:
                 continue

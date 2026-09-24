@@ -52,8 +52,13 @@ def test_headless_terminal_result_survives_cli_exit(tmp_path):
                 self.send_error(404)
                 return
             tool_results = [m for m in request["messages"] if m["role"] == "tool"]
-            follow_ups.extend(m["content"] for m in request["messages"]
-                              if m["role"] == "user" and "Background process" in str(m.get("content") or ""))
+            # Each request carries the whole history, so a later request (or a transport retry) re-carries
+            # the same follow-up. Keep the largest per-request set: a genuine double delivery still shows as
+            # two follow-up messages inside one request, while a re-sent history does not double-count.
+            in_request = [str(m.get("content") or "") for m in request["messages"]
+                          if m["role"] == "user" and "Background process" in str(m.get("content") or "")]
+            if len(in_request) > len(follow_ups):
+                follow_ups[:] = in_request
             has_terminal = any(t.get("function", {}).get("name") == "terminal"
                                for t in request.get("tools", []))
             message = {"role": "assistant", "content": "Coordinator finished."}
