@@ -122,6 +122,18 @@ class TestMem0EnsureCalled:
 # ---------------------------------------------------------------------------
 
 
+class TestBundledHindsightAllowlisted:
+    def test_bundled_provider_feature_is_allowlisted_and_matches_its_manifest(self):
+        """The fork keeps plugins/memory/hindsight, whose client calls ensure("memory.hindsight").
+        Upstream dropped the entry with its bundled copy; without it the provider cannot build."""
+        import yaml
+        from pathlib import Path
+        manifest = Path(__file__).resolve().parents[3] / "plugins/memory/hindsight/plugin.yaml"
+        declared = yaml.safe_load(manifest.read_text(encoding="utf-8"))["pip_dependencies"]
+        spec = ld.LAZY_DEPS["memory.hindsight"]
+        assert len(spec) == 1 and spec[0].startswith(declared[0])
+
+
 class TestSupermemoryIsAvailable:
     def test_available_with_key_even_when_sdk_absent(self, monkeypatch):
         """With the key set but the SDK not importable, is_available() must

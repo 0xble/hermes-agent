@@ -110,6 +110,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Cloud memory SDKs MUST be allowlisted + ensure()'d at the import site, or they never
     # install on the sealed Docker image (durable-target only).
     "memory.supermemory": ("supermemory==3.50.0",),
+    # Fork keeps the bundled Hindsight provider (maintenance/hindsight-memory.md); its client
+    # dependency must stay allowlisted, mirroring plugins/memory/hindsight/plugin.yaml.
+    "memory.hindsight": ("hindsight-client>=0.6.1,<1",),
     # Plugin-owned SDKs mirror the range their plugin.yaml declares instead of an exact pin: an exact pin
     # made _is_satisfied() reject every newer compatible release, so `hermes update` kept downgrading a
     # working newer client and broke daemons whose DB it had migrated (#86992, #39424, #98407).
