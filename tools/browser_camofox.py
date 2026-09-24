@@ -491,6 +491,31 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[st
     raise RuntimeError(_STALE_TAB_ERROR)  # unreachable
 
 
+def camofox_handoff(account: str, task_id: Optional[str] = None) -> str:
+    """Open/focus the visible shared identity and bind its returned tab to this task."""
+    try:
+        session = _get_session(task_id, account)
+        data = _post(f"/browser/identities/{session['user_id']}/open", {})
+        tab_id = data.get("tabId")
+        if data.get("ok") is not True or not isinstance(tab_id, str) or not tab_id:
+            return tool_error("Camofox did not return a shared tab; the task's tab was not changed", success=False)
+        session["tab_id"] = tab_id
+        result = {"success": True, "account": session["account"], "focused": bool(data.get("focused")),
+                  "tabId": tab_id}
+        for field in ("url", "title"):
+            if isinstance(data.get(field), str):
+                result[field] = data[field]
+        return json.dumps(result)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return tool_error("This account is not configured as a shared visible identity on the Camofox server. Configure it there before handoff.", success=False)
+        return tool_error("Camofox visible handoff failed; check the server and its authentication", success=False)
+    except requests.RequestException:
+        return tool_error("Camofox visible handoff failed; check the server connection", success=False)
+    except ValueError as exc:
+        return tool_error(str(exc), success=False)
+
+
 def camofox_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
     try:

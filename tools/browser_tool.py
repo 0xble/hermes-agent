@@ -462,6 +462,11 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 # ----------------------------------------------------------------------------
 BROWSER_TOOL_SCHEMAS = [
     {
+        "name": "browser_handoff",
+        "description": "Open or focus a named Camofox account's visible shared window and continue in its returned tab. Camofox only; call this before snapshot, click, or type when a person needs to use the same browser window.",
+        "parameters": {"type": "object", "properties": {"account": {"type": "string", "description": "Named Camofox account alias"}}, "required": ["account"]},
+    },
+    {
         "name": "browser_navigate",
         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer a lightweight retrieval tool when one is available (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer an available text-extraction or terminal-fetch tool; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
         "parameters": {
@@ -477,7 +482,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate or browser_handoff first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -492,7 +497,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate or browser_handoff and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -506,7 +511,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate or browser_handoff and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -726,6 +731,13 @@ def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> Non
             _merge_fallback_warning(response, snap_result)
     except Exception as e:
         logger.debug("Auto-snapshot after navigate failed: %s", e)
+
+
+def browser_handoff(account: str, task_id: Optional[str] = None) -> str:
+    """Bind this task to the visible Camofox account window without navigating away."""
+    if not _is_camofox_mode():
+        return _dumps(_err("Visible account handoff requires the Camofox browser backend"))
+    return _camofox("camofox_handoff", account, task_id)
 
 
 def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
@@ -1287,6 +1299,14 @@ from tools.browser_extension_router import extension_controller_available, route
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
+def _camofox_handoff_schema_override() -> Dict[str, Any]:
+    from tools.browser_camofox_state import get_camofox_account_aliases
+    return {"parameters": {"type": "object", "properties": {"account": {
+        "type": "string", "enum": list(get_camofox_account_aliases()),
+        "description": "Allowed account alias to bind to this task; cannot switch after binding.",
+    }}, "required": ["account"]}}
+
+
 def _camofox_account_schema_override() -> Dict[str, Any]:
     """Advertise account selection only when Camofox is the active backend."""
     if not _is_camofox_mode():
@@ -1359,6 +1379,11 @@ def _routed_handler(name: str, fallback):
                                       task_id=kw.get("task_id"), session_id=kw.get("session_id"))
     return handler
 
+
+registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_handoff"],
+                  handler=lambda args, **kw: browser_handoff(args.get("account", ""), task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
+                  emoji="🌐")
 
 for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
     if _check_fn is None:  # also binds the legacy check_browser_<x>_requirements globals (tests + callers)
