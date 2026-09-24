@@ -1101,24 +1101,30 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    import requests
+    from tools.browser_camofox import (_get_session, _post, _tab_error, _NO_SESSION_ERROR,
+                                      _STALE_TAB_ERROR)
     try:
-        tab_info = _ensure_tab(task_id or "default")
-        tab_id = tab_info.get("tab_id") or tab_info.get("id")
+        tab_info = _get_session(task_id or "default")
+        tab_id = tab_info.get("tab_id")
+        if not tab_id:
+            return tool_error(_NO_SESSION_ERROR, success=False)
         user_id = tab_info["user_id"]
-        resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
+        try:
+            resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
+        except requests.HTTPError as exc:
+            return _tab_error(tab_info, exc, endpoint="evaluate")
         parsed = _parse_eval_value(resp.get("result") if isinstance(resp, dict) else resp)
 
         if _eval_policy._eval_ssrf_guard_active(task_id or "default"):
-            _blocked_url = _eval_policy._camofox_current_page_private_url(tab_id, user_id)
+            _blocked_url = _eval_policy._camofox_current_page_private_url(tab_id, user_id, session=tab_info)
+            if not tab_info["tab_id"]:
+                return tool_error(_STALE_TAB_ERROR, success=False)
             if _blocked_url:
                 return _blocked_private_page_json(_blocked_url, _EVAL_NAVIGATED_WHY)
 
         return _dumps(_eval_ok_response(parsed), default=str)
     except Exception as e:
-        if any(code in str(e) for code in ("404", "405", "501")):  # server without eval support
-            return json.dumps(_err("JavaScript evaluation is not supported by this Camofox server. "
-                                   "Use browser_snapshot or browser_vision to inspect page state."))
         return tool_error(str(e), success=False)
 
 
