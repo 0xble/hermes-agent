@@ -46,3 +46,15 @@ The old in-checkout source tree and its source-local installer/tests are retired
 Rollback of this ownership transfer means restoring the previous source commit
 and installer only through an explicitly reviewed change. Do not restore a
 second source authority as an operational shortcut.
+
+## Pending migration: canonical-skill-guard
+
+The patch identity `canonical-skill-guard` owns `plugins/canonical-skill-guard/`.
+It keeps externally owned canonical skills read-only. It overlaps the
+profile-owned `skill-source-guard` (dotfiles `agents/guards/`), and both are
+planned to merge into one profile-owned guard. Until then, keep changes here
+narrow: bug fixes and manifest correctness only. Verify with
+`tests/plugins/test_canonical_skill_guard.py` and
+`hermes plugins validate plugins/canonical-skill-guard`. Retire this identity by
+deleting the plugin once the merged profile guard is installed, enabled, and
+verified live.
