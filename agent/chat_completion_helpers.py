@@ -1971,8 +1971,8 @@ def _reresolve_fallback_reasoning_config(agent, fallback_entry: dict) -> None:
                 resolved = resolve_reasoning_config(load_config() or {}, agent.model)
         else:
             resolved = resolve_reasoning_config(load_config() or {}, agent.model)
-        if resolved is not None:
-            agent.reasoning_config = resolved
+        # None is the resolved default, not a failure: never carry the previous route's effort.
+        agent.reasoning_config = resolved
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:
         logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)

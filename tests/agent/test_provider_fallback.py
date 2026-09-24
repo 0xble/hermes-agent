@@ -140,6 +140,24 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
         assert agent.reasoning_config == {"enabled": False}
 
+    def test_next_fallback_without_effort_does_not_inherit_previous_route(self):
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "openai", "model": "gpt-4o", "reasoning_effort": False},
+                {"provider": "zai", "model": "glm-4.7"},
+            ],
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(_mock_client(), "gpt-4o"), (_mock_client(), "glm-4.7")],
+        ), patch("hermes_cli.config.load_config", return_value={}):
+            assert agent._try_activate_fallback() is True
+            assert agent.reasoning_config == {"enabled": False}
+            assert agent._try_activate_fallback() is True
+        assert agent.model == "glm-4.7"
+        assert agent.reasoning_config is None
+
     def test_advances_index(self):
         fbs = [
             {"provider": "openai", "model": "gpt-4o"},
