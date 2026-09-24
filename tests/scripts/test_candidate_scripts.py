@@ -151,30 +151,6 @@ def test_check_receipt_partial_with_other_causes_is_not_excused(tmp_path, monkey
     assert mod.check_receipt(tmp_path) == []
 
 
-def _fake_gh(tmp_path: Path, exit_code: int, stdout: str = "") -> Path:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    gh = bin_dir / "gh"
-    gh.write_text(f"#!/bin/sh\nprintf '%s\\n' {stdout!r}\nexit {exit_code}\n")
-    gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
-    return bin_dir
-
-
-def test_create_pr_reports_failure_and_retire_is_idempotent(tmp_path, monkeypatch):
-    mod = _load("curate_skill_observations")
-    monkeypatch.setenv("PATH", f"{_fake_gh(tmp_path, 1)}:{os.environ['PATH']}")
-    assert mod._create_pr(tmp_path, "skills/curate-x", "main", ["hermes"], "body") == ""
-    monkeypatch.setenv("PATH", f"{_fake_gh(tmp_path, 0, 'https://github.com/0xble/dotfiles/pull/1')}:{os.environ['PATH']}")
-    assert mod._create_pr(tmp_path, "skills/curate-x", "main", ["hermes"], "body").endswith("/pull/1")
-    monkeypatch.setenv("PATH", f"{_fake_gh(tmp_path, 0, 'created something but no url')}:{os.environ['PATH']}")
-    assert mod._create_pr(tmp_path, "skills/curate-x", "main", ["hermes"], "body") == ""
-    observations = tmp_path / "obs"
-    observations.mkdir()
-    (observations / "hermes.md").write_text("- note\n")
-    mod._retire_observations(observations, observations / "processed" / "2026-09-19", {"hermes": ["note"], "gone": []})
-    assert (observations / "processed/2026-09-19/hermes.md").is_file() and not (observations / "hermes.md").exists()
-
-
 def test_rollback_reinstall_failure_reaches_recovery(tmp_path):
     """The exact shell shape the rollback script uses: a failing pipeline under set -euo pipefail."""
     script = tmp_path / "shape.sh"

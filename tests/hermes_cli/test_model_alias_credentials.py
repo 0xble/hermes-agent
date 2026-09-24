@@ -801,7 +801,7 @@ class TestNoProductionCodeMutatesTheAliasCacheInPlace:
         import pathlib
 
         repo = pathlib.Path(__file__).resolve().parents[2]
-        skip = {".git", "node_modules", "tests", "build", "dist", ".venv"}
+        skip = {".git", ".ci", ".worktrees", "node_modules", "tests", "build", "dist", ".venv"}
         for path in repo.rglob("*.py"):
             if any(part in skip for part in path.parts):
                 continue
