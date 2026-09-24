@@ -10,6 +10,8 @@ A stored prompt whose `Platform:` line is `gateway_hygiene` is treated as stale 
 identity, so the next real turn rebuilds and persists a full prompt. Other platform changes
 still reuse the stored bytes and stage a surface-switch note (#104414).
 
+Fork patch identity: `hygiene-prompt-not-reused`.
+
 ## Why
 
 Gateway hygiene compaction runs a memory-only agent, and the compaction boundary rebuilds
