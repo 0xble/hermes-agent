@@ -35,7 +35,13 @@ OPTIONAL_LANES = {
 
 # Keep the existing full/check interface for maintainers. Hosted CI selects these
 # explicit profiles rather than treating partial --lane runs as qualification.
-GATE_LANES = ('static', 'python', 'node')
+GATE_PYTHON_FILES = (
+    'tests/agent/test_agent_guardrails.py',
+    'tests/agent/test_oneshot.py',
+    'tests/gateway/test_own_policy_startup_gate.py',
+    'tests/hermes_cli/test_cli_retry.py',
+)
+GATE_LANES = ('static', 'python-gate', 'node')
 
 
 def assert_exact_checkout(expected: str) -> None:
@@ -397,6 +403,7 @@ def main() -> int:
             assert_exact_checkout(args.expected_sha)
         lanes = {
             'static': lambda: static(env),
+            'python-gate': lambda: python_tests(env, list(GATE_PYTHON_FILES), args.workers),
             'python': lambda: python_tests(env, ['tests'], args.workers),
             'e2e': lambda: python_tests(env, ['tests/e2e'], args.workers),
             'node': lambda: node(env, args.node_workers),
