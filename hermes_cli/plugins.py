@@ -132,6 +132,11 @@ VALID_HOOKS: Set[str] = {
     "on_session_finalize", "on_session_reset",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
+    # subagent_failure_notice: a child ended failed/error/timeout, BEFORE the user-facing failure notice
+    # (gateway chat notice, CLI tree line). Kwargs: child_session_id, child_goal, child_status, error,
+    # failure_reason. Return {"action": "suppress"} when the plugin recovers the failure itself; the
+    # child result and subagent_stop are unchanged. Anything else keeps the notice.
+    "subagent_failure_notice",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.

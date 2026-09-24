@@ -177,3 +177,50 @@ class TestGatewayFailureNotice:
             summary="the real error detail",
         )
         assert "the real error detail" in captured[0]
+
+
+class TestPluginClaimedFailureNotice:
+    """A plugin that recovers a child failure itself (review fallback) can claim the notice."""
+
+    def _hook(self, monkeypatch, result):
+        seen = []
+
+        def _invoke(name, **kw):
+            seen.append((name, kw))
+            return [result]
+
+        import hermes_cli.plugins as plugins
+        monkeypatch.setattr(plugins, "has_hook", lambda name: name == "subagent_failure_notice")
+        monkeypatch.setattr(plugins, "invoke_hook", _invoke)
+        return seen
+
+    def _fail(self, runner):
+        runner.progress_callback("subagent.complete", preview="HTTP 429", status="failed",
+                                 goal="Review candidate c665c6b2d03f", child_session_id="child-1")
+
+    def test_suppress_claims_the_notice(self, monkeypatch):
+        seen = self._hook(monkeypatch, {"action": "suppress"})
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert captured == []
+        assert seen[0][1]["child_session_id"] == "child-1"
+        assert seen[0][1]["child_goal"] == "Review candidate c665c6b2d03f"
+
+    @pytest.mark.parametrize("result", [None, {"action": "keep"}, "suppress"])
+    def test_anything_else_keeps_the_notice(self, monkeypatch, result):
+        self._hook(monkeypatch, result)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert len(captured) == 1 and "429" in captured[0]
+
+    def test_hook_error_keeps_the_notice(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+        monkeypatch.setattr(plugins, "has_hook", lambda name: True)
+
+        def _boom(name, **kw):
+            raise RuntimeError("plugin crashed")
+
+        monkeypatch.setattr(plugins, "invoke_hook", _boom)
+        runner, captured = _make_runner_and_captured(monkeypatch)
+        self._fail(runner)
+        assert len(captured) == 1
