@@ -17,9 +17,7 @@ spec.loader.exec_module(ci)
 
 def clean_git_env():
     """Keep temporary repositories independent of hook and personal Git state."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
-    return env
+    return ci.git_environment(root=None)
 
 
 class PortableGateTests(unittest.TestCase):

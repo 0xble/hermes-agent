@@ -44,9 +44,19 @@ GATE_PYTHON_FILES = (
 GATE_LANES = ('static', 'python-gate', 'node-gate')
 
 
-def git_environment() -> dict[str, str]:
-    """Git must resolve its repository from cwd, not an invoking hook's exports."""
-    return {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+def git_environment(*, root: Path | None = ROOT, base: dict[str, str] | None = None,
+                    config_path: Path | None = None) -> dict[str, str]:
+    """Isolate repository selection while trusting only the requested checkout."""
+    source = os.environ if base is None else base
+    env = {key: value for key, value in source.items() if not key.startswith('GIT_')}
+    if root is None:
+        env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        return env
+    config = (config_path or STATE / 'gitconfig').resolve()
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(f'[safe]\n\tdirectory = {root.resolve().as_posix()}\n', encoding='utf-8')
+    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=config.as_posix())
+    return env
 
 
 def assert_exact_checkout(expected: str) -> None:
@@ -55,8 +65,8 @@ def assert_exact_checkout(expected: str) -> None:
     actual = git('rev-parse', 'HEAD').strip()
     if actual != expected:
         raise RuntimeError(f'Checkout SHA mismatch: expected {expected}, got {actual}')
-    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment()).returncode != 0 or \
-       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment()).returncode != 0:
+    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT)).returncode != 0 or \
+       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment(root=ROOT)).returncode != 0:
         raise RuntimeError('Tracked checkout differs from the committed SHA')
 
 
@@ -74,7 +84,7 @@ def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None)
 
 
 def git(*args: str, cwd: Path = ROOT) -> str:
-    return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment()).decode('utf-8', errors='surrogateescape')
+    return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment(root=cwd)).decode('utf-8', errors='surrogateescape')
 
 
 def source_files(root: Path = ROOT) -> list[str]:
@@ -132,14 +142,11 @@ def environment(home: Path) -> dict[str, str]:
         'CARGO_HOME': str(STATE / 'cargo'), 'CARGO_TARGET_DIR': str(STATE / 'cargo-target'),
         'CARGO_BUILD_JOBS': '2',
         'TZ': 'UTC', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PYTHONHASHSEED': '0',
-        'PYTHONUTF8': '1', 'CI': 'true', 'GIT_CONFIG_NOSYSTEM': '1',
-        'GIT_CONFIG_GLOBAL': (home / 'gitconfig').resolve().as_posix(),
+        'PYTHONUTF8': '1', 'CI': 'true',
     })
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
-    (home / 'gitconfig').write_text(
-        f'[safe]\n\tdirectory = {ROOT.resolve().as_posix()}\n', encoding='utf-8'
-    )
+    env.update(git_environment(root=ROOT, base=env, config_path=home / 'gitconfig'))
     return env
 
 
