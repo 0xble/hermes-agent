@@ -24,6 +24,9 @@ def _git(repo, *args):
 
 def _repo(tmp_path):
     _git(tmp_path, "init", "-q")
+    # A developer's global excludes (git's default ~/.config/git/ignore included) must not decide what
+    # the fixture tracks: an ignored package-lock.json is never committed, so its churn is invisible.
+    _git(tmp_path, "config", "core.excludesFile", os.devnull)
     (tmp_path / "package.json").write_text(json.dumps({"workspaces": ["apps/*", "ui-tui"]}), encoding="utf-8")
     (tmp_path / "package-lock.json").write_text("lock v1\n", encoding="utf-8")
     for rel in ("apps/desktop", "ui-tui", "vendor/foo"):
