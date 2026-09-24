@@ -12,9 +12,17 @@ import pytest
 def test_unfinished_delegation_recovery_keeps_transcript_locator(tmp_path, split, missing_writer):
     repo = str(Path(__file__).resolve().parents[2])
     handle_path = tmp_path / "dispatch.json"
+    # The recovery hint reads the owner's git state; give it a small private checkout instead of the live
+    # source tree, whose size and concurrent writers (other workers, a human's index.lock) made git flaky here.
+    owner = tmp_path / "owner-checkout"
+    owner.mkdir()
+    git = ["git", "-C", str(owner), "-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "owner base"], check=True)
+    (owner / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
     env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo,
            "REPRO_HANDLE": str(handle_path), "REPRO_SPLIT": str(int(split)),
-           "REPRO_MISSING": str(int(missing_writer))}
+           "REPRO_MISSING": str(int(missing_writer)), "REPRO_OWNER_CWD": str(owner)}
     (tmp_path / 'config.yaml').write_text('delegation:\n  independent_completions: true\n', encoding='utf-8')
     producer = r'''
 import json, os, threading
@@ -51,6 +59,7 @@ if os.environ['REPRO_MISSING'] == '1':
         return ident, writers, paths[1:]
     live.create_live_transcripts = missing
 kwargs = {'tasks': [{'goal': 'first diagnostic task'}, {'goal': 'second diagnostic task'}]} if os.environ['REPRO_SPLIT'] == '1' else {'goal': 'unfinished diagnostic task'}
+os.chdir(os.environ['REPRO_OWNER_CWD'])  # the dispatcher records the owner's cwd for the recovery git hint
 handle = json.loads(dt.delegate_task(**kwargs, background=True, parent_agent=parent))
 assert handle["status"] == "dispatched", handle
 assert started.wait(10), "child did not start"

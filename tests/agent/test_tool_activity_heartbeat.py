@@ -110,10 +110,13 @@ def test_heartbeat_touches_periodically_and_stops():
 
     touches: list = []
     stop = threading.Event()
+    saw_two = threading.Event()
 
     class _Agent:
         def _touch_activity(self, desc):
             touches.append(desc)
+            if len(touches) >= 2:
+                saw_two.set()
 
     thread = threading.Thread(
         target=te._run_tool_activity_heartbeat,
@@ -122,7 +125,9 @@ def test_heartbeat_touches_periodically_and_stops():
         daemon=True,
     )
     thread.start()
-    time.sleep(0.12)
+    # Event-based: a loaded runner drifts wakeups, so wait for the cadence to be
+    # observed instead of assuming a fixed sleep covers two intervals.
+    assert saw_two.wait(10.0), f"expected periodic touches, got {len(touches)}"
     stop.set()
     thread.join(timeout=1.0)
 
@@ -149,7 +154,20 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    enough = threading.Event()
+
+    def _record(desc):
+        touches.append(time.time())
+        if len(touches) >= 3:
+            enough.set()
+
+    agent._touch_activity = _record
+
+    # Event-based: hold the tool open until the mid-call heartbeats actually land,
+    # rather than assuming a fixed 0.25s covers several 0.05s wakeups on a loaded runner.
+    def _execute(next_args):
+        enough.wait(10.0)
+        return json.dumps({"ok": True})
 
     result = te._run_agent_tool_execution_middleware(
         agent,
@@ -157,16 +175,16 @@ def test_slow_tool_call_refreshes_activity_during_execution(monkeypatch):
         function_args={"command": "true"},
         effective_task_id="task",
         tool_call_id="tc1",
-        execute=_slow_execute(delay=0.25),
+        execute=_execute,
         display_index=1,
     )
 
     assert json.loads(result.result) == {"ok": True}
 
-    # Start stamp + at least one heartbeat mid-call (0.25s run, 0.05s cadence).
+    # Start stamp + at least one heartbeat mid-call.
     assert len(touches) >= 3, f"expected mid-call heartbeats, got {len(touches)}"
     spread = touches[-1] - touches[0]
-    assert spread >= 0.15, f"touches not spread across the call: {spread:.3f}s"
+    assert spread >= 0.05, f"touches not spread across the call: {spread:.3f}s"
 
 
 def test_fast_tool_call_does_not_leave_stray_heartbeat(monkeypatch):
@@ -241,7 +259,14 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
         before_call=lambda name, args: MagicMock(allows_execution=True)
     )
     touches: list = []
-    agent._touch_activity = lambda desc: touches.append(time.time())
+    enough = threading.Event()
+
+    def _record(desc):
+        touches.append(time.time())
+        if len(touches) >= 3:
+            enough.set()
+
+    agent._touch_activity = _record
 
     agent._execute_tool_calls_concurrent = (
         __import__("run_agent").AIAgent._execute_tool_calls_concurrent.__get__(agent)
@@ -258,7 +283,9 @@ def test_concurrent_tool_call_heartbeat(monkeypatch):
             self.tool_calls = tool_calls
 
     def _invoke(name, *a, **kw):
-        time.sleep(0.25)
+        # Event-based: keep the concurrent call open until the mid-call
+        # heartbeats land instead of relying on a fixed sleep.
+        enough.wait(10.0)
         return json.dumps({"ok": name})
 
     agent._invoke_tool = MagicMock(side_effect=_invoke)
@@ -283,11 +310,13 @@ def test_heartbeat_exits_once_worker_tid_is_interrupted():
 
     touches: list = []
     stop = threading.Event()
+    stamped = threading.Event()
     fake_worker_tid = 10**9 + 111922  # not a live thread; only the bit matters
 
     class _Agent:
         def _touch_activity(self, desc):
             touches.append(desc)
+            stamped.set()
 
     thread = threading.Thread(
         target=te._run_tool_activity_heartbeat,
@@ -297,10 +326,10 @@ def test_heartbeat_exits_once_worker_tid_is_interrupted():
     )
     thread.start()
     try:
-        time.sleep(0.12)
-        assert touches, "heartbeat never stamped while the worker was live"
+        # Event-based: a loaded runner drifts wakeups past any fixed sleep.
+        assert stamped.wait(10.0), "heartbeat never stamped while the worker was live"
         set_interrupt(True, fake_worker_tid)
-        thread.join(timeout=1.0)
+        thread.join(timeout=5.0)
         assert not thread.is_alive(), "heartbeat kept running after its worker was abandoned"
         n = len(touches)
         time.sleep(0.12)

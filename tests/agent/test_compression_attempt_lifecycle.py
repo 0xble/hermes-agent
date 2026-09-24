@@ -152,8 +152,11 @@ class TestWorkerTeardownOnCeiling:
             worker=stuck_worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
-            total_ceiling_seconds=0.3,
+            # Idle == ceiling (the ceiling is clamped to >= idle): a 20ms progress ticker starved on a loaded runner
+            # can no longer outlast a short idle window and take the idle path (no lease retention) instead of the
+            # total-ceiling path this test pins. Only the TOTAL ceiling may expire here.
+            idle_timeout_seconds=2.0,
+            total_ceiling_seconds=2.0,
             fence=fence,
             stall_fallback=False,
         )

@@ -174,6 +174,20 @@ def test_named_provider_branch_without_explicit_key_unchanged(mock_resolve):
 # ── Branch 3: parent-inherit (no provider, no base_url) ────────────────────
 
 
+def _child_overrides(cfg, parent):
+    """End-to-end inherit path: the credential bundle carries only the explicit key, and the parent merge happens
+    at child build (``_resolve_child_request_overrides``), which also strips parent fast-tier fields unless
+    ``delegation.inherit_service_tier`` opts in."""
+    from tools import delegate_tool_config as config
+
+    creds = _resolve_delegation_credentials(cfg, parent)
+    with patch.object(config, "_cfg", return_value={}):
+        return creds, config._resolve_child_request_overrides(
+            parent, child_model=None, child_provider=None, child_base_url=None,
+            explicit_overrides=creds["request_overrides"], inherit_parent_route=True,
+        )
+
+
 def test_inherit_branch_honors_explicit_key_over_parent():
     """Pure-inherit setups still apply delegation.request_overrides, merged
     over the parent agent's own request_overrides."""
@@ -188,9 +202,10 @@ def test_inherit_branch_honors_explicit_key_over_parent():
         "provider": "",
         "request_overrides": {"extra_body": {"provider": {"sort": "throughput"}}},
     }
-    creds = _resolve_delegation_credentials(cfg, parent)
-    assert creds["request_overrides"] == {
-        "service_tier": "default",
+    creds, merged = _child_overrides(cfg, parent)
+    assert creds["request_overrides"] == {"extra_body": {"provider": {"sort": "throughput"}}}
+    # Parent fast-tier state is not inherited by default; everything else merges under the explicit key.
+    assert merged == {
         "extra_body": {
             "thinking": {"type": "disabled"},
             "provider": {"sort": "throughput"},
@@ -215,8 +230,9 @@ def test_inherit_branch_deep_copies_parent_overrides():
         "provider": "",
         "request_overrides": {"extra_body": {"provider": {"sort": "throughput"}}},
     }
-    creds = _resolve_delegation_credentials(cfg, parent)
-    creds["request_overrides"]["extra_body"]["thinking"]["type"] = "mutated"
+    creds, merged = _child_overrides(cfg, parent)
+    assert merged is not None
+    merged["extra_body"]["thinking"]["type"] = "mutated"
     assert parent_overrides == {"extra_body": {"thinking": {"type": "disabled"}}}
 
 

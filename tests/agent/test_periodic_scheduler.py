@@ -28,9 +28,11 @@ def test_two_intervals_fire_proportionally_and_cancel_stops_one():
 
     h_fast.cancel(wait=1.0)
     n_fast = len(fast)
-    time.sleep(0.1)
+    # Proof the sibling kept running is event-based: wait for two more slow ticks (a fixed 0.1s sleep can
+    # starve on a loaded runner and see zero), then check the cancelled callback stayed silent throughout.
+    n_slow = len(slow)
+    assert _wait_until(lambda: len(slow) >= n_slow + 2), "sibling callback stopped when another was cancelled"
     assert len(fast) == n_fast, "cancelled callback kept firing"
-    assert len(slow) > 3, "sibling callback stopped when another was cancelled"
     h_slow.cancel(wait=1.0)
     # With every handle quiesced, scheduling + cancelling adds no persistent thread.
     before = threading.active_count()
