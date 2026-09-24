@@ -41,7 +41,7 @@ GATE_PYTHON_FILES = (
     'tests/gateway/test_own_policy_startup_gate.py',
     'tests/hermes_cli/test_cli_retry.py',
 )
-GATE_LANES = ('static', 'python-gate', 'node')
+GATE_LANES = ('static', 'python-gate', 'node-gate')
 
 
 def assert_exact_checkout(expected: str) -> None:
@@ -275,6 +275,20 @@ def native_os(env: dict[str, str], workers: int) -> None:
         raise RuntimeError('Native OS checks failed.')
 
 
+def node_gate(env: dict[str, str], workers: int) -> None:
+    # Admit fast cross-workspace checks on every PR; the full nine-unit Node
+    # profile, including desktop UI and TUI suites, runs in nightly.
+    python(env)
+    require_tools(('node', 'npm'), env)
+    run(['node', '--test', 'scripts/ci/tests/workspace-checks.test.mjs'], env=env)
+    command = ['node', 'scripts/run-workspace-checks.mjs', '--concurrency', str(workers),
+               '--skip', 'check:test:ui', '--skip', 'check:test:desktop:all',
+               '--skip', 'ui-tui/packages/hermes-ink', '--skip', 'ui-tui :: check']
+    if sys.platform.startswith('linux'):
+        command = ['xvfb-run', '-a', *command]
+    run(command, env=env)
+
+
 def node(env: dict[str, str], workers: int) -> None:
     python(env)  # JavaScript tests spawn Python subprocesses from PATH.
     require_tools(('node', 'npm'), env)
@@ -404,6 +418,7 @@ def main() -> int:
         lanes = {
             'static': lambda: static(env),
             'python-gate': lambda: python_tests(env, list(GATE_PYTHON_FILES), args.workers),
+            'node-gate': lambda: node_gate(env, args.node_workers),
             'python': lambda: python_tests(env, ['tests'], args.workers),
             'e2e': lambda: python_tests(env, ['tests/e2e'], args.workers),
             'node': lambda: node(env, args.node_workers),
