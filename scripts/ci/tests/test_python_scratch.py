@@ -32,7 +32,7 @@ class PythonScratchTests(unittest.TestCase):
                 observed = []
 
                 def observe(command, *, env):
-                    self.assertEqual(command, ['bash', 'scripts/run_tests.sh', '-j', '4', '--file-retries', '0', 'tests', 'candidate-extensions'])
+                    self.assertEqual(command, ['bash', 'scripts/run_tests.sh', '-j', '4', '--file-retries', '0', 'tests'])
                     if writable:
                         self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', env)
                     else:
@@ -44,7 +44,7 @@ class PythonScratchTests(unittest.TestCase):
                         observed.append(scratch)
 
                 with self.subTest(writable=writable), patch.object(ci, 'python'), patch.object(ci, 'require_tools'), patch.object(ci.sys, 'platform', 'linux'), patch.object(ci.os, 'access', return_value=writable), patch.object(ci.Path, 'home', return_value=original_home), patch.object(ci, 'run', side_effect=observe):
-                    ci.python_tests(original_env, ['tests', 'candidate-extensions'], 4)
+                    ci.python_tests(original_env, ['tests'], 4)
                     self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', original_env)
                 for scratch in observed:
                     self.assertFalse(scratch.exists())

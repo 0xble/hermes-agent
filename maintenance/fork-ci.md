@@ -3,8 +3,9 @@
 ## Required behavior
 
 `bin/ci` owns contributor setup and the complete source gate. Its Python lane
-runs both `tests` and `candidate-extensions` through the canonical isolated
-`scripts/run_tests.sh` harness. A selected lane is partial evidence. The gate
+runs the canonical `tests` tree through the isolated `scripts/run_tests.sh`
+harness. Profile-owned plugins are tested from their canonical source repository,
+not from this Hermes application checkout. A selected lane is partial evidence. The gate
 does not use changed-file classification or substitute a smoke manifest for
 complete discovery.
 

@@ -1,6 +1,0 @@
-name: request-update
-version: "0.1.0"
-description: "Parent-only request for the native Hermes update watcher."
-author: "0xble"
-provides_tools:
-  - request_update

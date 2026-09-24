@@ -28,7 +28,8 @@ The personal profile's script jobs and optional sync helper use regular files un
 `scripts/install_candidate_extensions.py --maintenance-only --home <profile>` installs
 sync/verifier forwarding entry points without changing plugins or configuration.
 They execute procedures in `<profile>/hermes-agent/scripts`, so native promotion
-updates their implementation too. Other candidate scripts remain copies. Review
+updates their implementation too. Profile plugin source is maintained in the external
+`agents` repository. Review
 source revision, installed entry points, actual arguments, and receipts together.
 The personal wrapper uses the permanent source checkout's `.venv` for tests. Its
 prerequisites include pytest and the pinned lazy Hindsight client

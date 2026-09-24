@@ -181,9 +181,9 @@ surfaces before candidate publication. Source-only ownership verification keeps
 unpromoted candidate checks separate from installed update receipts.
 `tests/scripts/test_sync_fork_candidate.py` exercises local Git remotes, stale refs,
 new releases, candidate-only publication, failure refusal, and worktree recovery.
-`tests/plugins/test_candidate_extensions_install.py` verifies maintenance entry
-points follow promoted code without changing config. These repairs belong to the
-existing `maintenance-tooling` identity and remain local fork automation.
+The maintenance-only compatibility installer verifies entry points follow promoted
+code without changing config. These repairs belong to the existing
+`maintenance-tooling` identity and remain local fork automation.
 
 ## Retirement and rollback
 
