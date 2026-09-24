@@ -46,9 +46,11 @@ jobs:
         run: |
           # Root is only needed for apt and the pinned toolchain installation.
           # PostgreSQL, permissions, and user-systemd tests need a regular user.
+          # runuser resets HOME to the passwd home; keep the runner's disk-backed
+          # HOME (root-installed toolchain state and large test scratch live there).
           useradd --uid 1001 --create-home --shell /bin/bash ci
-          chown -R ci:ci "$GITHUB_WORKSPACE"
-          runuser -u ci -- ./bin/ci nightly '${{ github.sha }}'
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
+          runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}'
   qualification:
     if: always()
     needs: [linux]

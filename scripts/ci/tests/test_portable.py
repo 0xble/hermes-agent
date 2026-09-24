@@ -63,7 +63,8 @@ class PortableGateTests(unittest.TestCase):
         install = next(step for step in linux['steps'] if step.get('name') == 'Install pinned Linux toolchain and platform libraries')
         self.assertIn(' ffmpeg ', install['run'])
         profile = next(step for step in linux['steps'] if step.get('name') == 'Broad exact-SHA source profile')
-        self.assertIn('runuser -u ci -- ./bin/ci nightly', profile['run'])
+        self.assertIn('runuser -u ci -- env HOME="$HOME" ./bin/ci nightly', profile['run'])
+        self.assertIn('chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"', profile['run'])
 
     def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
         with tempfile.TemporaryDirectory() as directory:
