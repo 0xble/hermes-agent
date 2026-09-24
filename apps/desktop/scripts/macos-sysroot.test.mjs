@@ -8,7 +8,7 @@ vi.mock('node:child_process', () => ({
 }))
 
 const { execFileSync } = await import('node:child_process')
-const { macosSysroot, xcrunClangArgv } = await import('./macos-sysroot.mjs')
+const { macosSysroot, xcrunClangArgv, xcrunEnv } = await import('./macos-sysroot.mjs')
 
 const exec = vi.mocked(execFileSync)
 const opts = env => ({ encoding: 'utf8', env, stdio: 'pipe' })
@@ -106,4 +106,10 @@ it('hands SDK selection back to xcrun when xcode-select fails or answers nothing
   exec.mockReturnValue('\n')
   expect(macosSysroot(env)).toBeNull()
   expect(warn).not.toHaveBeenCalled()
+})
+
+it('drops SDKROOT from the compiler environment, since xcrun rejects a stale one even with -isysroot', () => {
+  const inherited = { PATH: '/usr/bin', SDKROOT: '/gone/MacOSX99.sdk' }
+  expect(xcrunEnv(inherited)).toEqual({ PATH: '/usr/bin' })
+  expect(inherited.SDKROOT).toBe('/gone/MacOSX99.sdk')
 })

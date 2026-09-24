@@ -232,7 +232,12 @@ def history_policy() -> None:
     base = git('merge-base', 'origin/main', 'HEAD').strip()
     if not base:
         raise RuntimeError('No common ancestor with origin/main')
-    emails = git('log', f'{base}..HEAD', '--format=%ae', '--no-merges').splitlines()
+    # Upstream release ancestry is attributed upstream; only fork commits need mappings here.
+    sys.path.insert(0, str(ROOT / 'scripts/ci'))
+    from release_baseline import accepted_release_baseline
+    release = accepted_release_baseline(ROOT)
+    emails = git('log', f'{base}..HEAD', *([f'^{release}'] if release else []),
+                 '--format=%ae', '--no-merges').splitlines()
     legacy = (ROOT / 'scripts/release.py').read_text(encoding='utf-8')
     missing = []
     for email in sorted(set(emails)):

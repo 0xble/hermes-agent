@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import { chmodSync, mkdirSync, renameSync, rmSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { macosSysroot, xcrunClangArgv } from './macos-sysroot.mjs'
+import { macosSysroot, xcrunClangArgv, xcrunEnv } from './macos-sysroot.mjs'
 
 const script = fileURLToPath(import.meta.url)
 const root = resolve(dirname(script), '..')
@@ -28,7 +28,7 @@ export function buildCommandScreenshotMonitor({
       '-fobjc-arc', '-fblocks', '-O2', '-Wall', '-Wextra',
       '-framework', 'Cocoa', '-framework', 'CoreGraphics',
       resolve(root, 'electron/native/command-screenshot-monitor.m'), '-o', staging,
-    ], { stdio: 'inherit', timeout: 120_000 })
+    ], { env: xcrunEnv(), stdio: 'inherit', timeout: 120_000 })
     chmodSync(staging, 0o755)
     renameSync(staging, output)
     // electron-builder signs this Mach-O with the app; dist/** is already asarUnpack.
