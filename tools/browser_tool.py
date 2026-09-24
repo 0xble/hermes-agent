@@ -1388,7 +1388,7 @@ def _routed_handler(name: str, fallback):
 
 registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_handoff"],
                   handler=lambda args, **kw: browser_handoff(args.get("account", ""), task_id=kw.get("task_id"),
-                                                               release=args.get("release", False)),
+                                                               release=args.get("release") is True),
                   check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
                   emoji="🌐")
 
