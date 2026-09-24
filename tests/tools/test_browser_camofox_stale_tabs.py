@@ -167,3 +167,21 @@ def test_private_probe_optional_snapshot_and_vault(server, monkeypatch):
     assert not result["success"] and "Call browser_navigate" in result["error"]
     assert "VERY_SECRET" not in str(result) and session["tab_id"] is None
     assert len(calls) == 1
+
+
+def test_new_tabs_open_blank_so_the_target_loads_once(server):
+    calls, failures = server
+    _open()
+    creates = [kw.get("json", {}) for m, p, kw in calls if m == "post" and p == "/tabs"]
+    assert creates and all(body.get("url") == "about:blank" for body in creates)
+    navigations = [p for _, p, _ in calls if p.endswith("/navigate")]
+    assert navigations == ["/tabs/tab-1/navigate"]
+
+
+def test_stale_snapshot_after_navigate_warns_the_model(server):
+    calls, failures = server
+    session = _open()
+    failures[f"/tabs/{session['tab_id']}/snapshot"] = {"status": 410, "body": {"code": "tab_timeout"}}
+    result = json.loads(bt.browser_navigate("https://example.test", task_id="stale"))
+    assert result["success"] and "browser_navigate again" in result["warning"]
+    assert session["tab_id"] is None

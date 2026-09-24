@@ -463,10 +463,13 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
 
 
 def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[str] = None) -> tuple[Dict[str, Any], dict]:
-    """Navigate explicitly even for newly created/adopted tabs; retry one stale tab."""
+    """Navigate explicitly even for newly created/adopted tabs; retry one stale tab.
+
+    New tabs open on about:blank so the explicit navigate is the only load of the target URL
+    (a create-with-URL followed by navigate would load one-time links twice)."""
     session = _get_session(task_id, account) if account is not None else _get_session(task_id)
     if not session["tab_id"]:
-        session = _ensure_tab(task_id, browser_url, account)
+        session = _ensure_tab(task_id, "about:blank", account)
     for attempt in range(2):
         try:
             data = _post(_tab_path(session, "navigate"),
@@ -477,7 +480,7 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[st
                 raise
             if attempt:
                 raise RuntimeError(_STALE_TAB_ERROR) from None
-            session = _ensure_tab(task_id, browser_url, account)
+            session = _ensure_tab(task_id, "about:blank", account)
     raise RuntimeError(_STALE_TAB_ERROR)  # unreachable
 
 
@@ -501,7 +504,9 @@ def camofox_navigate(url: str, task_id: Optional[str] = None, account: Optional[
         try:  # Auto-take a compact snapshot so the model can act immediately.
             result["snapshot"], result["element_count"] = _fetch_snapshot(session)
         except requests.HTTPError as exc:
-            _clear_stale_tab(session, exc)
+            if _clear_stale_tab(session, exc):
+                result["warning"] = ("The browser server closed this tab right after navigation. "
+                                     "Call browser_navigate again before acting on the page.")
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
         return json.dumps(result)
