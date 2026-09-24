@@ -33,6 +33,29 @@ OPTIONAL_LANES = {
     'native-os': 'Partial: actual macOS/Windows marked tests, plus both Windows installer shells',
 }
 
+# Keep the existing full/check interface for maintainers. Hosted CI selects these
+# explicit profiles rather than treating partial --lane runs as qualification.
+GATE_LANES = ('static', 'python', 'node')
+
+
+def assert_exact_checkout(expected: str) -> None:
+    if not re.fullmatch(r'[0-9a-f]{40}', expected):
+        raise RuntimeError('Expected a full lowercase 40-character commit SHA')
+    actual = git('rev-parse', 'HEAD').strip()
+    if actual != expected:
+        raise RuntimeError(f'Checkout SHA mismatch: expected {expected}, got {actual}')
+    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT).returncode != 0 or \
+       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT).returncode != 0:
+        raise RuntimeError('Tracked checkout differs from the committed SHA')
+
+
+def preflight() -> None:
+    # No installs or credential-bearing runtime: fast developer feedback.
+    run([sys.executable, '-m', 'unittest',
+         'scripts.ci.tests.test_portable.PortableGateTests.test_exact_checkout_rejects_malformed_wrong_and_mutated_sha'])
+    run([sys.executable, '-m', 'py_compile', 'scripts/ci/portable.py'])
+
+
 
 def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
     print('+ ' + ' '.join(map(str, argv)), flush=True)
@@ -338,7 +361,8 @@ def checkout_lock() -> Iterator[None]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list'))
+    parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
+    parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by gate/nightly')
     parser.add_argument('--lane', choices=(*LANES, *OPTIONAL_LANES), action='append', help='Partial check, never full-gate evidence')
     parser.add_argument('--workers', type=int, default=4, help='Python file workers (default 4)')
     parser.add_argument('--node-workers', type=int, default=2)
@@ -347,6 +371,14 @@ def main() -> int:
         parser.error('Worker counts must be positive')
     if args.command != 'check' and args.lane:
         parser.error('--lane is only valid for check')
+    exact = args.command in ('gate', 'nightly', 'nightly-native')
+    if exact != bool(args.expected_sha):
+        parser.error('gate/nightly require a positional full SHA; other commands do not accept one')
+    if args.command == 'preflight':
+        preflight()
+        return 0
+    if exact:
+        assert_exact_checkout(args.expected_sha)
     if args.command == 'list':
         for name, description in {**LANES, **OPTIONAL_LANES}.items():
             print(f'{name}: {description}')
@@ -355,10 +387,14 @@ def main() -> int:
     STATE.mkdir(exist_ok=True)
     with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
         env = environment(home)
-        if args.command in ('setup', 'full'):
+        if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)
             if args.command == 'setup':
                 return 0
+        # Dependency setup is allowed to write ignored state, not tracked source.
+        # Assert immediately before checks and again after successful lanes.
+        if exact:
+            assert_exact_checkout(args.expected_sha)
         lanes = {
             'static': lambda: static(env),
             'python': lambda: python_tests(env, ['tests'], args.workers),
@@ -369,9 +405,13 @@ def main() -> int:
             'container-lint': lambda: container_lint(env),
             'native-os': lambda: native_os(env, args.workers),
         }
-        selected = args.lane or list(LANES)
+        selected = args.lane or (list(GATE_LANES) if args.command == 'gate' else
+                                 ['native-os'] if args.command == 'nightly-native' else list(LANES))
         passed = aggregate([(name, lanes[name]) for name in dict.fromkeys(selected)])
-        scope = 'PARTIAL' if args.lane else f'FULL SOURCE GATE ({sys.platform})'
+        if exact:
+            assert_exact_checkout(args.expected_sha)
+        scope = ('GATE' if args.command == 'gate' else 'NIGHTLY' if exact else
+                 'PARTIAL' if args.lane else f'FULL SOURCE GATE ({sys.platform})')
         print(f'{scope}: {"PASS" if passed else "FAIL"}. Native OS, external integration and release lanes are separate.')
         return 0 if passed else 1
 

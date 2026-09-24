@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Optional local feedback; hosted qualification never relies on this hook.
+if [[ "${HERMES_SKIP_PREFLIGHT:-0}" == 1 ]]; then
+  exit 0
+fi
+root="$(git rev-parse --show-toplevel)"
+"$root/bin/ci" preflight

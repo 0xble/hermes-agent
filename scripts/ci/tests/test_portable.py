@@ -16,6 +16,30 @@ spec.loader.exec_module(ci)
 
 
 class PortableGateTests(unittest.TestCase):
+    def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'ci@example.invalid'], check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'CI'], check=True)
+            tracked = root / 'tracked.txt'
+            tracked.write_text('original', encoding='utf-8')
+            subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], check=True)
+            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], check=True)
+            with patch.object(ci, 'ROOT', root):
+                sha = ci.git('rev-parse', 'HEAD').strip()
+                ci.assert_exact_checkout(sha)
+                with self.assertRaisesRegex(RuntimeError, 'full lowercase'):
+                    ci.assert_exact_checkout('bad')
+                with self.assertRaisesRegex(RuntimeError, 'SHA mismatch'):
+                    ci.assert_exact_checkout('0' * 40 if sha != '0' * 40 else '1' * 40)
+                tracked.write_text('changed during checks', encoding='utf-8')
+                with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
+                    ci.assert_exact_checkout(sha)
+                subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], check=True)
+                with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
+                    ci.assert_exact_checkout(sha)
+
     def test_failures_do_not_hide_later_results(self):
         seen = []
 
