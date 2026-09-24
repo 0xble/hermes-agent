@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'portable.py'
 spec = importlib.util.spec_from_file_location('portable_ci', MODULE_PATH)
 ci = importlib.util.module_from_spec(spec)
@@ -16,6 +18,37 @@ spec.loader.exec_module(ci)
 
 
 class PortableGateTests(unittest.TestCase):
+    def test_container_jobs_install_git_and_configure_safe_directory_before_checkout(self):
+        workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
+        for workflow_name in ('gate.yml', 'nightly.yml'):
+            with self.subTest(workflow=workflow_name):
+                document = yaml.safe_load((workflows / workflow_name).read_text(encoding='utf-8'))
+                for job_name, job in document['jobs'].items():
+                    if 'container' not in job:
+                        continue
+                    steps = job['steps']
+                    checkout_index = next(
+                        index for index, step in enumerate(steps)
+                        if str(step.get('uses', '')).startswith('actions/checkout@')
+                    )
+                    preceding = steps[:checkout_index]
+                    self.assertTrue(
+                        any(
+                            'apt-get install' in step.get('run', '')
+                            and 'git' in step.get('run', '')
+                            and 'ca-certificates' in step.get('run', '')
+                            for step in preceding
+                        ),
+                        f'{workflow_name}:{job_name} must install git and ca-certificates before checkout',
+                    )
+                    self.assertTrue(
+                        any(
+                            'git config --global --add safe.directory "$GITHUB_WORKSPACE"' in step.get('run', '')
+                            for step in preceding
+                        ),
+                        f'{workflow_name}:{job_name} must configure Git safe.directory before checkout',
+                    )
+
     def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
