@@ -232,6 +232,28 @@ try {
             with self.assertRaisesRegex(RuntimeError, 'require'):
                 ci.require_tools(('node',), {})
 
+    def test_setup_provisions_the_pinned_npm_ahead_of_host_npm(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            toolchain = Path(directory) / 'toolchain'
+            stack.enter_context(patch.object(ci, 'TOOLCHAIN', toolchain))
+            commands = []
+
+            def install(argv, **kwargs):
+                commands.append(argv)
+                package = toolchain / 'node_modules' / 'npm' / 'package.json'
+                package.parent.mkdir(parents=True, exist_ok=True)
+                package.write_text('{"version": "%s"}' % ci.PINS['npm'], encoding='utf-8')
+
+            stack.enter_context(patch.object(ci, 'run', side_effect=install))
+            ci.provision_npm({})
+            ci.provision_npm({})
+            self.assertEqual(len(commands), 1)
+            self.assertIn(f"npm@{ci.PINS['npm']}", commands[0])
+            self.assertEqual(commands[0][commands[0].index('--prefix') + 1], str(toolchain))
+            with patch.dict(os.environ, {'PATH': '/host/bin'}, clear=True), patch.object(ci, 'STATE', Path(directory)):
+                path = ci.environment(Path(directory) / 'home')['PATH'].split(os.pathsep)
+            self.assertLess(path.index(str(toolchain / 'node_modules' / '.bin')), path.index('/host/bin'))
+
     def test_default_invocation_sets_up_and_runs_all_lanes_after_failure(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             stack.enter_context(patch.object(ci, 'STATE', Path(directory)))

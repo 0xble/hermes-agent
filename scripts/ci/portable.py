@@ -18,6 +18,8 @@ from collections.abc import Callable, Iterator
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / '.ci'
+# Checkout-owned npm at the exact pin; host npm only bootstraps it.
+TOOLCHAIN = STATE / 'toolchain'
 PINS = json.loads((ROOT / 'scripts/ci/toolchain.json').read_text(encoding='utf-8'))
 EXTRAS = ('all', 'dev', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'hindsight', 'parallel-web')
 LANES = {
@@ -133,7 +135,8 @@ def environment(home: Path) -> dict[str, str]:
     env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
     env.update({
         'HOME': str(home), 'USERPROFILE': str(home),
-        'PATH': str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')) + os.pathsep + env.get('PATH', ''),
+        'PATH': os.pathsep.join((str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
+                                 str(TOOLCHAIN / 'node_modules' / '.bin'), env.get('PATH', ''))),
         'TMPDIR': str(home / 'tmp'), 'TEMP': str(home / 'tmp'), 'TMP': str(home / 'tmp'),
         'XDG_CACHE_HOME': str(STATE / 'cache'), 'XDG_CONFIG_HOME': str(home / 'config'),
         'UV_CACHE_DIR': str(STATE / 'cache/uv'), 'UV_PYTHON_INSTALL_DIR': str(STATE / 'python'),
@@ -182,8 +185,19 @@ def aggregate(actions: list[tuple[str, Callable[[], None]]]) -> bool:
     return not failed
 
 
+def provision_npm(env: dict[str, str]) -> None:
+    npm = TOOLCHAIN / 'node_modules' / 'npm' / 'package.json'
+    if npm.is_file() and json.loads(npm.read_text(encoding='utf-8')).get('version') == PINS['npm']:
+        return
+    TOOLCHAIN.mkdir(parents=True, exist_ok=True)
+    run(['npm', 'install', '--prefix', str(TOOLCHAIN), '--no-save', '--no-audit', '--no-fund',
+         '--ignore-scripts', f"npm@{PINS['npm']}"], env=env)
+
+
 def setup(env: dict[str, str]) -> None:
-    require_tools(('uv', 'node', 'npm'), env)
+    require_tools(('uv', 'node'), env)
+    provision_npm(env)
+    require_tools(('npm',), env)
     run(['uv', 'sync', '--locked', '--python', PINS['python'], *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=ROOT / 'website', env=env)
