@@ -614,6 +614,18 @@ class TestRegisterHandlers:
         "_handle_inline_query", "_handle_forum_topic_service_message",
     )
 
+    def _adapter_with_handlers(self) -> TelegramAdapter:
+        a = _adapter()
+        # Stand-ins for the bound handler methods. _register_handlers only
+        # passes them to add_handler, it never calls them.
+        for name in self._HANDLER_ATTRS:
+            setattr(a, name, object())
+        return a
+
+    @staticmethod
+    def _observer_calls(app):
+        return [c for c in app.add_handler.call_args_list if c.kwargs.get("group") == 99]
+
     @pytest.fixture
     def handler_factories(self, monkeypatch):
         import plugins.platforms.telegram.adapter as telegram_adapter

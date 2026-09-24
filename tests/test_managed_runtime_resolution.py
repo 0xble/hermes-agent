@@ -31,6 +31,7 @@ import json
 import os
 from pathlib import Path
 
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_MARKER = "<module>"
@@ -320,7 +321,18 @@ def test_resolution_allowlist_has_no_stale_rows():
     )
 
 
-def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, monkeypatch):
+@pytest.fixture
+def _fresh_scan_caches():
+    """The scans are cached per process; a test that swaps REPO_ROOT must not leak its tree."""
+    caches = (_findings, _resolution_sites, _is_packaging_copy)
+    for cached in caches:
+        cached.cache_clear()
+    yield
+    for cached in caches:
+        cached.cache_clear()
+
+
+def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, monkeypatch, _fresh_scan_caches):
     import sys
 
     monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
@@ -329,7 +341,7 @@ def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, mo
         path.parent.mkdir(parents=True)
         path.write_text('import shutil\nshutil.which("uv")\n', encoding="utf-8")
 
-    assert _findings() == [("hermes_cli/new_command.py", "uv", 2)]
+    assert _findings() == (("hermes_cli/new_command.py", "uv", 2),)
 
 
 def test_no_unreviewed_bare_managed_runtime_lookups():
