@@ -15,6 +15,13 @@ ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
 
 
+def clean_git_env():
+    """Keep temporary repositories independent of hook and personal Git state."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+    return env
+
+
 class PortableGateTests(unittest.TestCase):
     def test_container_jobs_install_git_and_configure_safe_directory_before_checkout(self):
         import yaml
@@ -52,13 +59,14 @@ class PortableGateTests(unittest.TestCase):
     def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            subprocess.run(['git', 'init', '-q', str(root)], check=True)
-            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'ci@example.invalid'], check=True)
-            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'CI'], check=True)
+            env = clean_git_env()
+            subprocess.run(['git', 'init', '-q', str(root)], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'ci@example.invalid'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'CI'], env=env, check=True)
             tracked = root / 'tracked.txt'
             tracked.write_text('original', encoding='utf-8')
-            subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], check=True)
-            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], check=True)
+            subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], env=env, check=True)
             with patch.object(ci, 'ROOT', root):
                 sha = ci.git('rev-parse', 'HEAD').strip()
                 ci.assert_exact_checkout(sha)
@@ -69,9 +77,30 @@ class PortableGateTests(unittest.TestCase):
                 tracked.write_text('changed during checks', encoding='utf-8')
                 with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
                     ci.assert_exact_checkout(sha)
-                subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], check=True)
+                subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], env=env, check=True)
                 with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
                     ci.assert_exact_checkout(sha)
+
+    def test_preflight_fixture_cannot_mutate_inherited_git_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sentinel = Path(directory) / 'sentinel'
+            sentinel.mkdir()
+            env = clean_git_env()
+            subprocess.run(['git', 'init', '-q', str(sentinel)], env=env, check=True)
+            subprocess.run(['git', '-C', str(sentinel), '-c', 'user.name=Sentinel',
+                            '-c', 'user.email=sentinel@example.invalid', 'commit',
+                            '--allow-empty', '-qm', 'sentinel'], env=env, check=True)
+            git_dir = sentinel / '.git'
+            before = {name: (git_dir / name).read_bytes() for name in ('HEAD', 'index', 'config') if (git_dir / name).exists()}
+            poisoned = dict(env, GIT_DIR=str(git_dir), GIT_PREFIX='sub/')
+            result = subprocess.run(
+                [sys.executable, '-m', 'unittest',
+                 'scripts.ci.tests.test_portable.PortableGateTests.test_exact_checkout_rejects_malformed_wrong_and_mutated_sha'],
+                cwd=ci.ROOT, env=poisoned, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            after = {name: (git_dir / name).read_bytes() for name in ('HEAD', 'index', 'config') if (git_dir / name).exists()}
+            self.assertEqual(after, before, 'preflight fixture modified the inherited repository')
 
     def test_failures_do_not_hide_later_results(self):
         seen = []
@@ -119,7 +148,7 @@ class PortableGateTests(unittest.TestCase):
             base = Path(directory)
             checkout = base / 'checkout'
             checkout.mkdir()
-            subprocess.run(['git', 'init', '-q', str(checkout)], check=True)
+            subprocess.run(['git', 'init', '-q', str(checkout)], env=clean_git_env(), check=True)
             package = checkout / 'node_modules/ci-ancestry-probe'
             package.mkdir(parents=True)
             (package / 'index.js').write_text('module.exports = true', encoding='utf-8')
@@ -134,9 +163,10 @@ try {
   if (error.code !== 'MODULE_NOT_FOUND') throw error;
 }
 """
-            env = {k: v for k, v in os.environ.items() if not k.startswith(('GIT_', 'NODE_'))}
+            env = clean_git_env()
             old_git = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=contaminated, env=env, capture_output=True)
-            old_node = subprocess.run(['node', '-e', script], cwd=contaminated, env=env, capture_output=True)
+            old_node = subprocess.run(['node', '-e', script], cwd=contaminated,
+                                      env={k: v for k, v in env.items() if not k.startswith('NODE_')}, capture_output=True)
             self.assertEqual(old_git.returncode, 0)
             self.assertEqual(old_node.returncode, 5)
             with ci.external_temporary_directory('home-', parent=base) as home:
@@ -186,7 +216,7 @@ try {
     def test_source_guard_detects_mutation_without_overwriting_user_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            subprocess.run(['git', 'init', '-q', str(root)], env=clean_git_env(), check=True)
             source = root / 'source.txt'
             source.write_text('uncommitted user work', encoding='utf-8')
             with patch.object(ci, 'ROOT', root), patch.object(ci, 'source_files', return_value=['source.txt']):

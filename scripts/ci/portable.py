@@ -44,14 +44,19 @@ GATE_PYTHON_FILES = (
 GATE_LANES = ('static', 'python-gate', 'node-gate')
 
 
+def git_environment() -> dict[str, str]:
+    """Git must resolve its repository from cwd, not an invoking hook's exports."""
+    return {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+
+
 def assert_exact_checkout(expected: str) -> None:
     if not re.fullmatch(r'[0-9a-f]{40}', expected):
         raise RuntimeError('Expected a full lowercase 40-character commit SHA')
     actual = git('rev-parse', 'HEAD').strip()
     if actual != expected:
         raise RuntimeError(f'Checkout SHA mismatch: expected {expected}, got {actual}')
-    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT).returncode != 0 or \
-       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT).returncode != 0:
+    if subprocess.run(['git', 'diff', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment()).returncode != 0 or \
+       subprocess.run(['git', 'diff', '--cached', '--quiet', '--exit-code'], cwd=ROOT, env=git_environment()).returncode != 0:
         raise RuntimeError('Tracked checkout differs from the committed SHA')
 
 
@@ -69,7 +74,7 @@ def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None)
 
 
 def git(*args: str, cwd: Path = ROOT) -> str:
-    return subprocess.check_output(['git', *args], cwd=cwd).decode('utf-8', errors='surrogateescape')
+    return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment()).decode('utf-8', errors='surrogateescape')
 
 
 def source_files(root: Path = ROOT) -> list[str]:
