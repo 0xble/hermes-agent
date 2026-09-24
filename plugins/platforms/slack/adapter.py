@@ -2423,6 +2423,11 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             response = await self._get_client(chat_id).chat_delete(channel=chat_id, ts=message_id)
             if not (hasattr(response, "get") and response.get("ok") is False):
+                # End-of-turn progress cleanup deletes status bubbles too; forget them so the next
+                # status posts fresh instead of editing a message Slack no longer has.
+                for key in [k for k, v in self._status_message_ids.items()
+                            if k[0] == str(chat_id) and v == str(message_id)]:
+                    self._status_message_ids.pop(key, None)
                 return True
             logger.debug(
                 "[Slack] chat.delete returned ok=false for message %s in channel %s: %s",

@@ -4155,6 +4155,12 @@ class TelegramAdapter(BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
+    def _forget_status_message(self, chat_id: str, message_id: str) -> None:
+        """Drop a deleted bubble from the status cache so the next status sends fresh instead of editing a
+        message Telegram no longer has (end-of-turn progress cleanup deletes status bubbles too)."""
+        for key in [k for k, v in self._status_message_ids.items() if k[0] == str(chat_id) and v == str(message_id)]:
+            self._status_message_ids.pop(key, None)
+
     async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None) -> None:
         """``editMessageText`` with normalized ids; ``parse_mode=None`` sends plain text."""
         kwargs: Dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id), "text": text}
@@ -4429,6 +4435,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         try:
             await self._bot.delete_message(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id))
+            self._forget_status_message(chat_id, message_id)
             return True
         except Exception as e:
             logger.debug("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))

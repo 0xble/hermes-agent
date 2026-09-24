@@ -106,3 +106,19 @@ async def test_distinct_status_keys_do_not_collide(adapter):
     assert adapter._status_message_ids[("chat-1", "model-switch")] == "200"
 
 
+@pytest.mark.asyncio
+async def test_status_after_cleanup_delete_sends_fresh_without_editing(adapter):
+    """End-of-turn progress cleanup deletes status bubbles; the next turn's status must not edit the gone id."""
+    adapter.send.side_effect = [
+        SendResult(success=True, message_id="100"),
+        SendResult(success=True, message_id="200"),
+    ]
+    adapter._bot.delete_message = AsyncMock()
+
+    await adapter.send_or_update_status("chat-1", "lifecycle", "recalled 3 memories")
+    assert await adapter.delete_message("chat-1", "100") is True
+    result = await adapter.send_or_update_status("chat-1", "lifecycle", "recalled 2 memories")
+
+    adapter.edit_message.assert_not_awaited()
+    assert result.message_id == "200"
+    assert adapter._status_message_ids[("chat-1", "lifecycle")] == "200"
