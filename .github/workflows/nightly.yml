@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
+      # PID 1 must reap orphaned descendants from the process-tree tests.
+      options: --init
     steps:
       - name: Install Git for checkout
         shell: bash
@@ -34,14 +36,19 @@ jobs:
         shell: bash
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
+          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
           python3 ci/install-linux-tools.py amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
           uv python install 3.11.14
           npm install --global npm@12.0.0
       - name: Broad exact-SHA source profile
         shell: bash
-        run: ./bin/ci nightly '${{ github.sha }}'
+        run: |
+          # Root is only needed for apt and the pinned toolchain installation.
+          # PostgreSQL, permissions, and user-systemd tests need a regular user.
+          useradd --uid 1001 --create-home --shell /bin/bash ci
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+          runuser -u ci -- ./bin/ci nightly '${{ github.sha }}'
   qualification:
     if: always()
     needs: [linux]

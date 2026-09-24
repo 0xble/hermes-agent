@@ -54,6 +54,17 @@ class PortableGateTests(unittest.TestCase):
                         f'{workflow_name}:{job_name} must configure Git safe.directory before checkout',
                     )
 
+    def test_nightly_reaps_orphans_and_runs_python_suite_as_nonroot(self):
+        import yaml
+
+        workflow = Path(__file__).resolve().parents[3] / '.github/workflows/nightly.yml'
+        linux = yaml.safe_load(workflow.read_text(encoding='utf-8'))['jobs']['linux']
+        self.assertIn('--init', linux['container']['options'].split())
+        install = next(step for step in linux['steps'] if step.get('name') == 'Install pinned Linux toolchain and platform libraries')
+        self.assertIn(' ffmpeg ', install['run'])
+        profile = next(step for step in linux['steps'] if step.get('name') == 'Broad exact-SHA source profile')
+        self.assertIn('runuser -u ci -- ./bin/ci nightly', profile['run'])
+
     def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -140,6 +151,35 @@ class PortableGateTests(unittest.TestCase):
                 env=env, text=True,
             ).splitlines()
             self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
+
+    def test_python_file_runner_preserves_only_isolated_git_config(self):
+        # The shell runner clears its environment before spawning pytest. The
+        # per-file process still needs the isolated checkout's safe.directory
+        # when root runs against a runner-owned GitHub Actions workspace.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_file = root / 'test_runner_git_config.py'
+            test_file.write_text(
+                'import os, subprocess\n'
+                'def test_isolated_checkout_config():\n'
+                '    config = os.environ["GIT_CONFIG_GLOBAL"]\n'
+                '    assert config.endswith("/gitconfig")\n'
+                '    assert os.environ["GIT_CONFIG_NOSYSTEM"] == "1"\n'
+                '    directories = subprocess.check_output(\n'
+                '        ["git", "config", "--global", "--get-all", "safe.directory"], text=True\n'
+                '    ).splitlines()\n'
+                f'    assert directories == [{str(ci.ROOT.resolve())!r}]\n',
+                encoding='utf-8',
+            )
+            env = ci.environment(root / 'isolated')
+            env['HERMES_PYTHON'] = sys.executable
+            env['HERMES_TEST_SCRATCH_ROOT'] = str(root / 'scratch')
+            result = subprocess.run(
+                ['bash', 'scripts/run_tests.sh', '-j', '1', '--file-retries', '0', str(test_file)],
+                cwd=ci.ROOT, env=env, capture_output=True, text=True,
+                encoding='utf-8', errors='replace',
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_external_fixture_has_no_git_or_node_dependency_ancestry(self):
         with tempfile.TemporaryDirectory() as directory:
