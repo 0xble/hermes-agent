@@ -9,8 +9,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import yaml
-
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'portable.py'
 spec = importlib.util.spec_from_file_location('portable_ci', MODULE_PATH)
 ci = importlib.util.module_from_spec(spec)
@@ -19,6 +17,8 @@ spec.loader.exec_module(ci)
 
 class PortableGateTests(unittest.TestCase):
     def test_container_jobs_install_git_and_configure_safe_directory_before_checkout(self):
+        import yaml
+
         workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
         for workflow_name in ('gate.yml', 'nightly.yml'):
             with self.subTest(workflow=workflow_name):
