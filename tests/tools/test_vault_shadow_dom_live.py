@@ -75,16 +75,21 @@ def browser(tmp_path):
 
             parsed = urlsplit(url)
             page_origin = f'{parsed.scheme}://{parsed.netloc}'
-            # Generous: under a saturated 8-worker gate a cold headless Chrome can take >30s to settle its
-            # first tab; this only bounds the failure case, a ready page returns immediately.
-            deadline = time.monotonic() + 90
+            # Attach once, then poll readiness on that session. Every successful focus_page attaches a
+            # fresh CDP session (enable domains + dialog bridge), so re-focusing each poll floods a
+            # loaded Chrome with sessions and starved the page past the file timeout on full gates.
+            deadline = time.monotonic() + 60
+            focused = False
             while time.monotonic() < deadline:
-                if sup.focus_page(page_origin).get('ok'):
+                if not focused:
+                    focused = bool(sup.focus_page(page_origin).get('ok'))
+                if focused:
                     ready = sup.evaluate_runtime(
                         f'location.href === {json.dumps(url)} && document.readyState === "complete"')
                     if ready.get('ok') and ready.get('result'):
                         return
-                time.sleep(.05)
+                    focused = bool(ready.get('ok'))  # re-attach only if the session itself broke
+                time.sleep(.1)
             pytest.fail('test page did not finish loading')
 
         wait_page(origin + '/unrelated')
