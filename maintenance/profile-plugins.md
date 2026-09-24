@@ -2,8 +2,9 @@
 
 Load this unit when changing the Hermes integration boundary for the personal
 profile plugins formerly stored in this checkout. The root contract owns the
-fork baseline and publication. The local ownership-transfer identity is
-`profile-plugin-source-migration`.
+fork baseline and publication.
+
+Fork patch identity: `profile-plugin-source-migration` (the local ownership transfer).
 
 ## Current ownership
 

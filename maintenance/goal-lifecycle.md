@@ -11,6 +11,8 @@ Failed or interrupted model turns do not run completion judging.
 
 ## Provenance and adaptation
 
+- Fork patch identity: `slice-3-goal-lifecycle`. The original goal lifecycle slice: `goal_set`
+  honors the profile budget and surfaces agent `goal_set` receipts as notices.
 - Fork patch identity: `goal-criteria-completeness`. Own upstream contribution:
   [PR #118343](https://github.com/NousResearch/hermes-agent/pull/118343),
   tracked by [issue #118334](https://github.com/NousResearch/hermes-agent/issues/118334).
