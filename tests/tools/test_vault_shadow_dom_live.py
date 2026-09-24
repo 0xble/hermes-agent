@@ -56,7 +56,7 @@ def browser(tmp_path):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     task = 'vault-shadow-regression'
     try:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         active_port = profile / 'DevToolsActivePort'
         address = []
         while time.monotonic() < deadline and process.poll() is None:
@@ -75,7 +75,9 @@ def browser(tmp_path):
 
             parsed = urlsplit(url)
             page_origin = f'{parsed.scheme}://{parsed.netloc}'
-            deadline = time.monotonic() + 30
+            # Generous: under a saturated 8-worker gate a cold headless Chrome can take >30s to settle its
+            # first tab; this only bounds the failure case, a ready page returns immediately.
+            deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
                 if sup.focus_page(page_origin).get('ok'):
                     ready = sup.evaluate_runtime(
@@ -96,7 +98,12 @@ def browser(tmp_path):
     finally:
         SUPERVISOR_REGISTRY.stop(task)
         process.terminate()
-        process.wait(timeout=10)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # A headless Chrome still busy under a loaded gate must not turn teardown into a second error.
+            process.kill()
+            process.wait(timeout=10)
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

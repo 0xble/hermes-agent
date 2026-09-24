@@ -114,7 +114,7 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
         if cached_only:
             return {}
         fetch_started.set()
-        release_fetch.wait(timeout=5)
+        release_fetch.wait(timeout=30)
         return {}
 
     row = {
@@ -150,8 +150,11 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
         elapsed = monotonic() - started_at
         assert payload["providers"][0]["slug"] == "openrouter"
         assert "pricing" not in payload["providers"][0]
-        assert elapsed < 2.0, f"cold picker blocked for {elapsed:.2f}s"
-        assert fetch_started.wait(timeout=1), "pricing should prewarm in the background"
+        assert fetch_started.wait(timeout=5), "pricing should prewarm in the background"
+        # Off the request path by construction: the payload came back while the fetch is still parked on
+        # release_fetch (a synchronous fetch would have held build_model_options_payload for the full 30s).
+        assert any(t.is_alive() for t in inv._pricing_prewarm_threads.values()), "fetch finished before payload"
+        assert elapsed < 10.0, f"cold picker blocked for {elapsed:.2f}s"
     finally:
         threads = list(inv._pricing_prewarm_threads.values())
         release_fetch.set()
