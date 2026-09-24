@@ -463,8 +463,11 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 BROWSER_TOOL_SCHEMAS = [
     {
         "name": "browser_handoff",
-        "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely.",
-        "parameters": {"type": "object", "properties": {"account": {"type": "string", "description": "Named Camofox account alias"}}, "required": ["account"]},
+        "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely. Use release=true when the user is done with the visible window to return the account to the background.",
+        "parameters": {"type": "object", "properties": {
+            "account": {"type": "string", "description": "Named Camofox account alias"},
+            "release": {"type": "boolean", "description": "Close the visible account window and return to headless-by-default when done.", "default": False},
+        }, "required": ["account"]},
     },
     {
         "name": "browser_navigate",
@@ -733,11 +736,11 @@ def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> Non
         logger.debug("Auto-snapshot after navigate failed: %s", e)
 
 
-def browser_handoff(account: str, task_id: Optional[str] = None) -> str:
-    """Bind this task to the visible Camofox account window without navigating away."""
+def browser_handoff(account: str, task_id: Optional[str] = None, release: bool = False) -> str:
+    """Show or release this task's Camofox account window without navigating away."""
     if not _is_camofox_mode():
         return _dumps(_err("Visible account handoff requires the Camofox browser backend"))
-    return _camofox("camofox_handoff", account, task_id)
+    return _camofox("camofox_handoff", account, task_id, release)
 
 
 def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
@@ -1304,6 +1307,9 @@ def _camofox_handoff_schema_override() -> Dict[str, Any]:
     return {"parameters": {"type": "object", "properties": {"account": {
         "type": "string", "enum": list(get_camofox_account_aliases()),
         "description": "Allowed account alias to bind to this task; cannot switch after binding.",
+    }, "release": {
+        "type": "boolean", "description": "Close the visible window and return the account to headless-by-default.",
+        "default": False,
     }}, "required": ["account"]}}
 
 
@@ -1381,7 +1387,8 @@ def _routed_handler(name: str, fallback):
 
 
 registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_handoff"],
-                  handler=lambda args, **kw: browser_handoff(args.get("account", ""), task_id=kw.get("task_id")),
+                  handler=lambda args, **kw: browser_handoff(args.get("account", ""), task_id=kw.get("task_id"),
+                                                               release=args.get("release", False)),
                   check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
                   emoji="🌐")
 

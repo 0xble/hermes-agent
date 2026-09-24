@@ -229,6 +229,7 @@ def test_handoff_adopts_tab_for_followup_tools(tmp_path, monkeypatch):
         assert json.loads(browser_tool.browser_navigate("https://example.com", task_id="t"))["success"] is True
     assert seen[0][0].endswith(f"/browser/identities/{camofox._get_session('t')['user_id']}/open")
     assert seen[0][1]["headers"] == camofox._auth_headers()
+    assert seen[0][1]["timeout"] == max(camofox._get_command_timeout(), 90)
     assert seen[1][0].endswith("/tabs/visible-tab/click")
     assert seen[2][0].endswith("/tabs/visible-tab/navigate")
     assert get.call_args_list[0].args[0].endswith("/tabs/visible-tab/snapshot")
@@ -286,6 +287,55 @@ def test_handoff_not_configured_does_not_adopt_tab(tmp_path, monkeypatch):
     assert "shared visible identity on the Camofox server" in result["error"]
     assert "shared_visible_01" not in json.dumps(result)
     assert camofox._get_session("t")["tab_id"] is None
+
+
+@pytest.mark.parametrize("released", [True, False])
+def test_release_clears_stale_tab_and_preserves_account_binding(tmp_path, monkeypatch, released):
+    from tools import browser_camofox as camofox, browser_tool
+    from tools.registry import registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+    monkeypatch.setattr(camofox, "_get_command_timeout", lambda: 120)
+    session = camofox._get_session("release", "brianle")
+    session["tab_id"] = "visible-tab"
+    user_id = session["user_id"]
+    with patch("tools.browser_camofox.requests.post", return_value=_response({
+        "ok": True, "released": released, "userId": user_id,
+    })) as post:
+        raw = registry.dispatch("browser_handoff", {"account": "brianle", "release": True}, task_id="release")
+    result = json.loads(raw) if isinstance(raw, str) else raw
+    assert result == {"success": True, "account": "brianle", "released": released}
+    assert user_id not in json.dumps(result)
+    assert post.call_args.args[0].endswith(f"/browser/identities/{user_id}/release")
+    assert post.call_args.kwargs["json"] == {}
+    assert post.call_args.kwargs["timeout"] == 120
+    assert session["tab_id"] is None
+    assert camofox._get_session("release", "brianle") is session
+
+
+def test_release_busy_leaves_tab_unchanged_and_requests_retry(tmp_path, monkeypatch):
+    import requests
+    from tools import browser_camofox as camofox, browser_tool
+    from tools.registry import registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+    session = camofox._get_session("busy-release", "brianle")
+    session["tab_id"] = "visible-tab"
+    response = _response({"error": "identity busy"})
+    response.status_code = 409
+    response.raise_for_status.side_effect = requests.HTTPError("409 identity busy", response=response)
+    with patch("tools.browser_camofox.requests.post", return_value=response):
+        raw = registry.dispatch("browser_handoff", {"account": "brianle", "release": True}, task_id="busy-release")
+    result = json.loads(raw) if isinstance(raw, str) else raw
+    assert result["success"] is False
+    assert "wait for it to finish" in result["error"].lower()
+    assert "retry the release" in result["error"].lower()
+    assert session["user_id"] not in json.dumps(result)
+    assert session["tab_id"] == "visible-tab"
 
 
 def test_handoff_gated_to_camofox_and_refuses_switch(tmp_path, monkeypatch):

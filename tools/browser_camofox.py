@@ -491,12 +491,20 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[st
     raise RuntimeError(_STALE_TAB_ERROR)  # unreachable
 
 
-def camofox_handoff(account: str, task_id: Optional[str] = None) -> str:
-    """Open/focus the visible shared identity and bind its returned tab to this task."""
+def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool = False) -> str:
+    """Open/focus a shared identity, or release it back to headless-by-default."""
     try:
         session = _get_session(task_id, account)
+        # Headless-to-visible restart and clean shutdown can exceed the ordinary 30s command timeout.
+        lifecycle_timeout = max(_get_command_timeout(), 90)
+        if release:
+            data = _post(f"/browser/identities/{session['user_id']}/release", {}, timeout=lifecycle_timeout)
+            if data.get("ok") is not True or not isinstance(data.get("released"), bool):
+                return tool_error("Camofox did not confirm account release; the task's tab was not changed", success=False)
+            session["tab_id"] = None
+            return json.dumps({"success": True, "account": session["account"], "released": data["released"]})
         prior_tab_id = session.get("tab_id")
-        data = _post(f"/browser/identities/{session['user_id']}/open", {})
+        data = _post(f"/browser/identities/{session['user_id']}/open", {}, timeout=lifecycle_timeout)
         tab_id = data.get("tabId")
         if data.get("ok") is not True or not isinstance(tab_id, str) or not tab_id:
             return tool_error("Camofox did not return a shared tab; the task's tab was not changed", success=False)
@@ -514,12 +522,13 @@ def camofox_handoff(account: str, task_id: Optional[str] = None) -> str:
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else None
         if status == 404:
-            return tool_error("This account is not configured as a shared visible identity on the Camofox server. Configure it there before handoff.", success=False)
+            return tool_error("This account is not configured as a shared visible identity on the Camofox server. Configure it there before handoff or release.", success=False)
         if status == 409:
-            return tool_error("Another operation is using this account's browser. Wait for it to finish, then retry the handoff; do not interrupt it.", success=False)
-        return tool_error("Camofox visible handoff failed; check the server and its authentication", success=False)
+            action = "release" if release else "handoff"
+            return tool_error(f"Another operation is using this account's browser. Wait for it to finish, then retry the {action}; do not interrupt it.", success=False)
+        return tool_error("Camofox account handoff/release failed; check the server and its authentication", success=False)
     except requests.RequestException:
-        return tool_error("Camofox visible handoff failed; check the server connection", success=False)
+        return tool_error("Camofox account handoff/release failed; check the server connection", success=False)
     except ValueError as exc:
         return tool_error(str(exc), success=False)
 

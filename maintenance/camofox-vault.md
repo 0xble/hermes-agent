@@ -24,6 +24,12 @@ the browser vault fill tool, or the 1Password backends.
   explains that the shared visible identity must be configured there; HTTP 409 means
   another operation is using the account and the agent must wait and retry. Hermes does
   not restart the browser outside the handoff, copy cookies, or kill processes.
+  Both handoff and release allow at least 90 seconds for the server's browser lifecycle.
+  `browser_handoff(account=..., release=true)` asks the server to close the visible or
+  hidden browser and return the account to headless-by-default; `released=false` means
+  it was already stopped. Successful release invalidates only Hermes's local tab ID,
+  retaining the task's account binding. Busy (409) leaves it intact for retry; neither
+  action exposes userId.
 - Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are
   minted from Connect one-time-password fields, automatic 2FA is announced only when a code
   can really be minted, an unusable OTP field never hides a usable one, and upstream
