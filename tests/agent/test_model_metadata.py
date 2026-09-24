@@ -493,19 +493,33 @@ class TestCodexOAuthContextLength:
 
 
 
-    def test_codex_responses_api_mode_uses_codex_oauth_window_on_custom_endpoint(self):
-        from agent.model_metadata import _CODEX_OAUTH_CONTEXT_FALLBACK
+    def test_codex_responses_api_mode_uses_verified_variant_window_on_custom_endpoint(self):
+        """A custom Codex route must reuse the native resolver, including the verified -900k bump."""
 
         with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata._resolve_endpoint_context_length", return_value=None), \
              patch("agent.model_metadata._probe_local_context_length", return_value=None), \
              patch("agent.model_metadata._query_ollama_api_show", return_value=None):
             ctx = get_model_context_length(
-                "gpt-6-astra", base_url="http://127.0.0.1:8317/v1",
+                "gpt-6-astra-900k", base_url="http://127.0.0.1:8317/v1",
                 provider="custom:codex-proxy", api_mode="codex_responses",
             )
 
-        assert ctx == _CODEX_OAUTH_CONTEXT_FALLBACK["gpt-6-astra"]
+        assert ctx == 900_000
+
+    def test_codex_responses_api_mode_bypasses_stale_persistent_cache(self):
+        """A stale direct-API cache entry must not win before Codex variant resolution."""
+        with patch("agent.model_metadata.get_cached_context_length", return_value=1_050_000), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.model_metadata.is_local_endpoint", return_value=False), \
+             patch("agent.model_metadata._fetch_codex_oauth_context_lengths_with_source", return_value=({}, False)):
+            ctx = get_model_context_length(
+                "gpt-6-astra-900k", base_url="http://127.0.0.1:8317/v1",
+                provider="custom:codex-proxy", api_mode="codex_responses",
+            )
+
+        assert ctx == 900_000
 
     @pytest.mark.parametrize("api_mode", ["", "chat_completions", "responses"])
     def test_custom_endpoint_without_codex_api_mode_is_unchanged(self, api_mode):

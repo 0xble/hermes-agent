@@ -2221,6 +2221,7 @@ from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
+from gateway.run_plugin_rewire import GatewayPluginRewireMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
@@ -3086,7 +3087,7 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type == "async_delegation":
+    if evt_type in ("async_delegation", "heartbeat"):
         from tools.process_registry_notifications import format_process_notification
         return format_process_notification(evt)
 
@@ -3105,7 +3106,8 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
             break
         evt_type = evt.get("type", "completion")
         if evt_type in {
-            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released"}:
+            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
+            "heartbeat"}:
             watch_events.append(evt)
         elif evt_type in {"async_delegation", "delegation_auto_resume"}:
             requeue.append(evt)
@@ -3414,7 +3416,7 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayProfileReconcileMixin):
+    GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
@@ -3510,9 +3512,14 @@ class GatewayRunner(
         # With multiplex_profiles on, load under the default profile secret scope so bot tokens in its
         # .env resolve as secondary profiles' do; explicit config= injection (tests) is left untouched.
         # See #64674.
-        # An injected config (tests, ``gateway run --config``) is taken verbatim: an unset flag there
-        # stays None (= standalone); only the loaded path runs the boot-time default-on guard.
+        # Injected configs keep their mode (including None), except the launching profile's
+        # standalone opt-out: --config must not turn that profile into a host multiplexer.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        if config is not None:
+            from hermes_cli.gateway_multiplex_mode import standalone_launcher_decision, log_multiplex_decision
+            decision = standalone_launcher_decision(self.config)
+            if decision is not None:
+                log_multiplex_decision(decision)
         # Multiplexer flag flips agent.secret_scope.get_secret() to fail-closed on unscoped credential
         # reads, so a missed migration crashes loudly instead of leaking a cross-profile value.
         try:
@@ -4312,6 +4319,17 @@ class GatewayRunner(
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
+    @_contextmanager
+    def _session_env_scope(self, context: SessionContext):
+        """Bind session context variables for the duration of the block, e.g. a plugin command
+        handler invoked outside the normal agent-turn path (``_set_session_env`` is otherwise only
+        reached there). Always cleared on exit, including on exception."""
+        tokens = self._set_session_env(context)
+        try:
+            yield
+        finally:
+            self._clear_session_env(tokens)
+
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
         loop = asyncio.get_running_loop()
@@ -4927,8 +4945,9 @@ async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0, config: Any = 
     the trailing wildcard pass — the only one that stops the shared loop — never ran.
 
     The worker runs in a FRESH context, not ``copy_context()``: the caller may sit inside a served
-    profile's scope, and ``launch_profile_scope_if_multiplexed`` documents "no HERMES_HOME override"
-    — inheriting one made the wildcard pass resolve the live home to that profile.
+    profile's scope, and the trailing wildcard pass must run under the launch profile's own scope
+    (``launch_profile_scope_if_multiplexed`` binds the launch home) — inheriting the caller's made it
+    resolve the live home to that profile.
 
     See #82874.
     """
@@ -5379,6 +5398,15 @@ def _claim_host_gateway_role(force: bool = False) -> None:
     """
     from gateway import host_rendezvous as hr
 
+    # The host lock can be free after a standalone owner exits while a coexisting
+    # multiplexer remains live. Its per-home channel still governs our opt-out.
+    if not force:
+        from gateway.host_attach import REFUSE, standalone_attach_decision
+        decision = standalone_attach_decision(get_hermes_home(), None)
+        if decision is not None and decision.outcome == REFUSE:
+            from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+            print(decision.message)
+            raise SystemExit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
     try:
         outcome, error = hr.claim_host_lock(hr.ROLE_GATEWAY)
         if outcome is hr.HostLockOutcome.ACQUIRED:
@@ -5412,6 +5440,22 @@ def _claim_host_gateway_role(force: bool = False) -> None:
         logger.warning("--force: starting a second gateway although %s owns this host.",
                        hr.describe(owner) if owner else "another process")
         return
+    from gateway.host_attach import (
+        ATTACH_CHANNEL_WAIT_S, START, host_gateway, standalone_attach_decision,
+    )
+    from hermes_cli.profiles import profile_is_standalone
+    if profile_is_standalone(get_hermes_home()):
+        # Recheck after losing the atomic lock: the pre-lock served set may be stale.
+        live_owner = host_gateway(wait_for_channel=ATTACH_CHANNEL_WAIT_S)
+        if live_owner is not None:
+            decision = standalone_attach_decision(get_hermes_home(), live_owner)
+            if decision is not None:
+                if decision.outcome == START:
+                    return
+                from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+                print(decision.message)
+                raise SystemExit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
+        _refuse_second_host_gateway(owner)
     if _owner_is_standalone():
         # COMPOSITION with #118236: `host_attach.decide` sent us here with START precisely because
         # the owner is another profile's STANDALONE gateway and will never serve us. Refusing now
@@ -5470,6 +5514,26 @@ def _refuse_second_host_gateway(owner) -> None:
     logger.error("Refusing to start a second gateway on this host: %s", who)
     print(message)
     raise SystemExit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
+
+
+def _log_standalone_profiles_at_boot(runner) -> None:
+    """One INFO line per standalone profile when the MULTIPLEXER takes its served set at boot.
+
+    The host gateway silently omits an opted-out profile from its served set; without this line an
+    operator reading the boot log cannot tell "not created yet" from "excluded by config".
+    """
+    try:
+        if not getattr(runner.config, "multiplex_profiles", False):
+            return
+        from hermes_cli.profiles import profiles_to_serve, profile_is_standalone
+        from hermes_cli.gateway_multiplex_mode import STANDALONE_DEPRECATION_NOTICE
+        served = set(runner.served_profile_names())
+        for name, home in profiles_to_serve(True, include_standalone=True):
+            if name != "default" and name not in served and profile_is_standalone(home):
+                logger.warning("profile '%s' is standalone (gateway.standalone: true); not served by "
+                               "this gateway. %s", name, STANDALONE_DEPRECATION_NOTICE)
+    except Exception:
+        logger.warning("standalone-profile boot notice failed", exc_info=True)
 
 
 def _refresh_host_gateway_record(runner) -> None:
@@ -5546,6 +5610,7 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.slash_commands import _spawn_detached_update
         from hermes_cli.config import is_managed
         from gateway.run_profile_reconcile import migrate_profile_identity_verb, purge_profile_identity_verb
+        from gateway.run_plugin_rewire import reload_plugins_verb
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
@@ -5602,7 +5667,10 @@ async def _start_gateway_start_control_socket(runner):
                            "agent-update": _agent_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
-                           "purge-profile-identity": purge_profile_identity_verb(runner)})
+                           "purge-profile-identity": purge_profile_identity_verb(runner),
+                           # A plugin installed/enabled by another process loads now and re-wires the
+                           # live adapters' handlers (#87770); tools/prompt still wait for the next session.
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5834,6 +5902,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _control_server = await _start_gateway_start_control_socket(runner)
     # Now the attach channel answers: republish the host record with the settled served set.
     _refresh_host_gateway_record(runner)
+    _log_standalone_profiles_at_boot(runner)
 
     def _lifecycle_record_startup() -> None:
         # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the

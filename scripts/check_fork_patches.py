@@ -45,8 +45,8 @@ EXPECTED_CONFIG = {
     "delegation.model": None,
     "auxiliary.review.model": None,
 }
-# Upstream release baseline the fork is built on (v2026.9.21).
-DEFAULT_BASELINE = "d337b736aa1e8ebecfab043842d13e4a2d2f48a3"
+# Accepted upstream baseline: explicit GPT-6 adoption exception in MAINTENANCE.md.
+DEFAULT_BASELINE = "38c289c0146ed8c8b2b767eca1fff6f5b7e6382e"
 # Last published commit whose fork behavior is documented by a maintenance unit. Every later
 # commit must carry its own ``Fork-Patch:`` trailer. A sync may rewrite this SHA, so the floor
 # is also located by its exact subject when the SHA is gone.

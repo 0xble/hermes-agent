@@ -7,6 +7,13 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
 `v2026.9.21`, `d337b736aa1e8ebecfab043842d13e4a2d2f48a3`.
+Explicit upstream exception authorized on 2026-09-23: adopt through
+`38c289c0146ed8c8b2b767eca1fff6f5b7e6382e` for native Codex GPT-6 Sol/Luna.
+This cutoff includes registration (`79ec1f2a34a5b58d91ee835488490a8fbce007b8`),
+live catalog discovery (`1d10cef8363aa3148d70ed162d0a1fc809347182`), and removal
+of unpublished Terra. The user waived aging for this adoption, not verification,
+independent review, protected landing, or backup safeguards. Later Desktop picker
+and generic provider-cache changes are outside this native Codex adoption.
 This replacement fork was established on 2026-09-19. The former fork is preserved
 as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
@@ -15,6 +22,11 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - Maintain `main` as an upstream **release tag plus narrow, justified patches**.
   This is the accepted migration design's exception to default-branch tracking.
   Inspect upstream `main` for fixes, but do not silently adopt it as the baseline.
+  The exact Background exception is authorized, not permission to follow moving main.
+- Never reset, downgrade, or reintegrate a release already contained in a validated
+  ahead-of-release fork. Preserve published fork commits and upstream ancestry.
+  After the required fresh source checks, an unchanged ahead-of-release run is
+  a silent no-op. Failed validation or an uncontained newer release is not a no-op.
 - Keep profile routing, credentials, Hindsight banks, and browser identities
   separate. Personal plugin and scheduling policy does not override company overlays.
 - Keep upstream delegation and update machinery as the owners of their lifecycles.
@@ -71,6 +83,10 @@ release merge or published candidate does not authorize promotion. Refresh relea
 selection before reporting current and prove the selected tag is an ancestor of
 the proposed fork head. Report upstream-main divergence separately from release
 currency. Preserve this release policy when applying generic maintenance guidance.
+For the Background exception, freeze its exact upstream cutoff and use it as the
+source checker baseline while separately proving latest-release ancestry. Resume
+that candidate across interruptions rather than moving the cutoff. Return to
+release selection after adoption without discarding the exception ancestry.
 
 ## Verify
 
