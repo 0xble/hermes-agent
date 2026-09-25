@@ -61,7 +61,10 @@ the browser vault fill tool, or the 1Password backends.
   [issue 80276](https://github.com/NousResearch/hermes-agent/issues/80276)), and
   `vault-op-multi-account` (own fork feature; upstream
   [PR 71596](https://github.com/NousResearch/hermes-agent/pull/71596) covers only the
-  `secrets.onepassword` loader, not vault logins, as of 2026-09-24).
+  `secrets.onepassword` loader, not vault logins, as of 2026-09-24), and
+  `op-quota-resilience` (own fork fix: last-good 1Password secrets on rate limit or
+  outage, a display-only listing cache, and https for bare-host websites; no upstream
+  issue or PR as of 2026-09-24).
   The fork adaptation adds vault evaluation, preserves a no-session branch, and classifies
   404 by its tab-missing payload; revisit when upstream ships equivalent behavior.
 - Adopted upstream sources, all open on 2026-09-19:
@@ -81,6 +84,7 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_onepassword_selector.py`, `tests/agent/test_vault_onepassword_cards.py`,
 `tests/agent/test_vault_onepassword_subprocess.py` (real subprocess, fake `op`),
 `tests/agent/test_vault_onepassword_accounts.py` (multi-account, real config + fake `op`),
+`tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification),
 `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome). Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
@@ -100,3 +104,6 @@ no-origin branch of `browser_vault_fill`, and vault tests. Retire `vault-op-mult
 when a released upstream lists logins from several 1Password accounts with per-account
 token isolation; its commit touches only `agent/vault_backends/`, the vault tool's
 browser-account check, `get_session_account`, the config default, docs, and its test file.
+Retire `op-quota-resilience` when a released upstream serves last-good 1Password secrets
+on transient failures; its commit touches only `agent/secret_sources/`,
+`agent/vault_backends/onepassword.py`, and 1Password tests.
