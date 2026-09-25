@@ -1591,9 +1591,11 @@ def _stop_bot_desktop(profile_dir: Path) -> None:
     try:
         if runtime.stop():
             print("✓ Bot Desktop stopped")
-            # The screen a human's exclusion protected is gone; on rename the directory (lease.json
-            # included) moves with the profile, and a human lease for a dead viewer would fence the
-            # agent out of the renamed profile's next screen until someone force-released it.
+        # The screen a human's exclusion protected is gone, whether stop() signalled it or it was
+        # already dead; on rename the directory (lease.json included) moves with the profile, and a
+        # human lease for a dead viewer would fence the agent out of the renamed profile's next
+        # screen until someone force-released it.
+        if (profile_dir / "bot-desktop" / "lease.json").exists():
             from tools.bot_desktop import lease
             lease.release()
     except Exception as e:

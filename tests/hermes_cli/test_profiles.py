@@ -1877,6 +1877,23 @@ def test_profile_delete_and_rename_stop_the_profiles_bot_desktop(profile_env, op
         proc.kill()
 
 
+def test_profile_rename_clears_a_stale_human_lease_when_the_screen_was_already_stopped(profile_env, monkeypatch):
+    """A dead screen makes runtime.stop() return False; its human lease must not move with the rename."""
+    from tools.bot_desktop import runtime
+
+    monkeypatch.setattr(runtime, "is_supported_host", lambda: True)
+    monkeypatch.setattr(runtime, "stop", lambda: False)
+    profile_dir = create_profile("coder", no_alias=True)
+    (profile_dir / "bot-desktop").mkdir()
+    (profile_dir / "bot-desktop" / "lease.json").write_text(
+        json.dumps({"holder": "human", "viewer_id": "gone", "since": 1.0, "epoch": 3, "reason": ""}), encoding="utf-8")
+    with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+         patch("hermes_cli.profiles.check_alias_collision", return_value="skip"):
+        rename_profile("coder", "hacker")
+    moved = json.loads((profile_dir.parent / "hacker" / "bot-desktop" / "lease.json").read_text(encoding="utf-8"))
+    assert moved["holder"] == "agent", "stale human lease survived the rename"
+
+
 @pytest.mark.parametrize("name", ["coder", "default"])
 def test_export_leaves_the_bot_desktop_browser_profile_out(profile_env, tmp_path, name):
     """bot-desktop/ holds the screen's persistent Chromium profile (Cookies, Login Data: the bot's live web
