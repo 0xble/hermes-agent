@@ -2963,15 +2963,18 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to load forum topic icon options", self.name, exc_info=True)
             return []
 
-    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str, icon_custom_emoji_id: Optional[str] = None) -> bool:
-        """Rename a forum topic in a private (DM) chat, returning whether Telegram accepted it."""
+    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: Optional[str], icon_custom_emoji_id: Optional[str] = None) -> bool:
+        """Rename a forum topic in a private (DM) chat, returning whether Telegram accepted it.
+        ``name=None`` sends an icon-only edit; Bot API ``editForumTopic`` keeps the current name."""
         if not self._bot:
             return False
         try:
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
             chat_id_arg = chat_id
-        kwargs = {"chat_id": chat_id_arg, "message_thread_id": int(thread_id), "name": name}
+        kwargs = {"chat_id": chat_id_arg, "message_thread_id": int(thread_id)}
+        if name:
+            kwargs["name"] = name
         if icon_custom_emoji_id:
             kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
         await self._bot.edit_forum_topic(**kwargs)

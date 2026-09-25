@@ -217,6 +217,17 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Guard: `tests/gateway/test_delivery_ledger.py`
   (`test_absurd_penalty_is_abandoned_when_the_failure_is_recorded`).
 
+## Hindsight capability cache leaked between tests
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- The `update_mode='append'` capability is cached process-wide per (API URL, key), and every
+  Hindsight test fixture shares one URL and key. A capability test's mocked "modern API" answer
+  therefore decided later tests' document IDs, making `TestSyncTurn` order-dependent, and tests
+  that never patched the probe contacted whatever listened on the fixture URL. The autouse
+  fixture now gives each test a fresh cache and a legacy-API default probe.
+- Guard: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_capability_cache_does_not_leak_between_tests_first`/`_second`).
+
 ## Telegram album flood refusal read as a permanent failure
 
 - Fork patch identity: `telegram-album-flood-contract`.
