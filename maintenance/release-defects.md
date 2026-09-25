@@ -246,3 +246,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_album_reports_the_platform_penalty_beyond_the_local_window_cap`,
   `test_album_fallback_route_reports_the_platform_penalty`,
   `test_animation_only_album_reports_the_platform_penalty`).
+
+## Hindsight config parsing and failed append retains
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- Three defects in the Hindsight provider. `recall_tags` stayed a string although the schema documents
+  comma-separated tags, so the SDK's `RecallRequest` rejected every recall (auto and tool); it is now
+  normalized like `retain_tags`. `_resolve_bank_id_template()` caught only `KeyError`/`IndexError`, so a
+  template with unmatched braces raised `ValueError` and stopped initialization instead of using the
+  fallback bank. The writer discarded a failed retain job although append mode had already dropped
+  those turns from `_session_turns`, so a transient outage lost conversation memory permanently. Failed
+  jobs now stay in an ordered, bounded backlog (5 attempts with exponential backoff, at most 50 jobs)
+  that retries before newer jobs and on idle, with one last attempt at shutdown.
+- Guard: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_malformed_bank_id_template_falls_back`, `test_csv_recall_tags_reach_the_sdk_as_a_list`,
+  `TestRetainRetry`).

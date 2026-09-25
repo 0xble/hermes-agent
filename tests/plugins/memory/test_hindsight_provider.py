@@ -1948,3 +1948,94 @@ def test_append_mode_trims_retained_turns_without_dropping_any(provider, monkeyp
     assert len(provider._session_turns) == 1  # only the un-retained tail (turn 7)
     assert provider._last_retained_turn_count == 0
     assert len(shipped) == 6 and len(set(shipped)) == 6
+
+
+# ---------------------------------------------------------------------------
+# Config normalization and retain durability (v0.21.5 sync review)
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_bank_id_template_falls_back():
+    """Unmatched braces raise ValueError from str.format; the documented fallback applies."""
+    assert _resolve_bank_id_template("hermes-{profile", "hermes", profile="default") == "hermes"
+    assert _resolve_bank_id_template("hermes-{profile:!}", "hermes", profile="default") == "hermes"
+
+
+def test_csv_recall_tags_reach_the_sdk_as_a_list(provider_with_config):
+    """The schema documents comma-separated recall_tags; RecallRequest rejects a string."""
+    p = provider_with_config(recall_tags="project-a, project-b,project-a")
+    assert p._recall_tags == ["project-a", "project-b"]
+    p._recall("what changed?")
+    kwargs = p._client.arecall.call_args.kwargs
+    assert kwargs["tags"] == ["project-a", "project-b"]
+    recall_request = pytest.importorskip("hindsight_client_api.models").RecallRequest
+    recall_request(query="what changed?", tags=kwargs["tags"])  # real SDK validation boundary
+
+
+def test_list_recall_tags_are_preserved(provider_with_config):
+    assert provider_with_config(recall_tags=["a", "b"])._recall_tags == ["a", "b"]
+    assert provider_with_config(recall_tags="")._recall_tags is None
+
+
+class TestRetainRetry:
+    """A queued append delta is the only copy of those turns: a transient failure must not lose it."""
+
+    def _append_provider(self, provider, monkeypatch):
+        monkeypatch.setattr("plugins.memory.hindsight._fetch_hindsight_api_version", lambda *a, **kw: "0.5.6")
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_RETRY_BASE_S", 0.0)
+        return provider
+
+    def _wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return predicate()
+
+    def test_failed_append_turn_is_retried_in_order(self, provider, monkeypatch):
+        p = self._append_provider(provider, monkeypatch)
+        shipped = []
+
+        async def _flaky(**kwargs):
+            if not shipped and not getattr(_flaky, "failed", False):
+                _flaky.failed = True
+                raise ConnectionError("hindsight unreachable")
+            shipped.append(kwargs["items"][0]["content"])
+            return SimpleNamespace(ok=True)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_flaky)
+        p.sync_turn("first question", "first answer")
+        p._retain_queue.join()
+        assert shipped == []  # the first attempt failed and was kept, not discarded
+        p.sync_turn("second question", "second answer")
+        assert self._wait_for(lambda: len(shipped) == 2)
+        assert "first question" in shipped[0] and "second question" in shipped[1]
+        assert not p._retain_backlog
+
+    def test_backlog_retries_on_idle_without_new_turns(self, provider, monkeypatch):
+        p = self._append_provider(provider, monkeypatch)
+        calls = []
+
+        async def _fail_once(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise ConnectionError("hindsight unreachable")
+            return SimpleNamespace(ok=True)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_fail_once)
+        p.sync_turn("only question", "only answer")
+        assert self._wait_for(lambda: len(calls) == 2)
+        assert self._wait_for(lambda: not p._retain_backlog)
+
+    def test_persistent_failure_is_bounded(self, provider, monkeypatch):
+        p = self._append_provider(provider, monkeypatch)
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_MAX_ATTEMPTS", 3)
+        p._client.aretain_batch = AsyncMock(side_effect=ConnectionError("down"))
+        p.sync_turn("q", "a")
+        assert self._wait_for(lambda: p._client.aretain_batch.await_count >= 3 and not p._retain_backlog)
+        time.sleep(0.3)
+        assert p._client.aretain_batch.await_count == 3
+        started = time.monotonic()
+        p.shutdown()
+        assert time.monotonic() - started < 12.0
