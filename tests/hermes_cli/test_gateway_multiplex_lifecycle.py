@@ -184,3 +184,22 @@ def test_default_status_distinguishes_served_and_parked(homes, monkeypatch, caps
     output = capsys.readouterr().out
     assert 'Served profiles: default' in output
     assert "Profile 'worker': parked" in output
+
+
+def test_parked_status_still_reports_a_forced_gateway(homes, monkeypatch, capsys):
+    """A --force gateway bypasses parking and leaves the marker: status must still show it."""
+    from hermes_cli import gateway as gw, profiles
+    root, secondary = homes
+    (secondary / 'gateway.parked').touch()
+    monkeypatch.setenv('HERMES_HOME', str(secondary))
+    monkeypatch.setattr(gw, '_current_profile_name', lambda: 'worker')
+    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'worker')
+    monkeypatch.setattr(gw, 'get_gateway_runtime_snapshot', lambda system=False: gw.GatewayRuntimeSnapshot(
+        manager='manual', gateway_pids=(4242,)))
+    monkeypatch.setattr(gw, 'named_profile_served_by_running_multiplexer', lambda: False)
+    monkeypatch.setattr(gw, '_installed_service_kind_for', lambda _check: None)
+    gw._cmd_status(SimpleNamespace())
+    output = capsys.readouterr().out
+    assert 'parked (hermes -p worker gateway start)' in output
+    assert 'Gateway is running (PID: 4242)' in output
+
