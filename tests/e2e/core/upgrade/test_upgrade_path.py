@@ -551,7 +551,7 @@ def template_home(tmp_path_factory, provider) -> Path:
     # Copying an open WAL's sidecars can leave the clone's read-only integrity probe
     # unable to create its shared-memory index. Close/checkpoint both seed DBs first.
     for db in (seed.hermes_home / "state.db", work / "state.db"):
-        with sqlite3.connect(db) as con:
+        with contextlib.closing(sqlite3.connect(db)) as con:
             assert con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     template = seed.root / "template-home"
     shutil.copytree(seed.hermes_home, template, symlinks=True)
