@@ -75,3 +75,16 @@ and drop it once upstream carries an equivalent fix.
   branch has its own test.
 - Guard: `tests/hermes_cli/test_update_launchd_restart_verification.py`
   (`test_restart_handed_to_the_enclosing_gateway_skips_verification`).
+
+## /update never reports its result
+
+- Fork patch identity: `slash-update-v2-lifecycle`.
+- The detached update wrapper records completion only in
+  `.update_process_exit_code` and deletes `.update_exit_code`, but `/update`
+  still wrote a legacy pending record that waits on `.update_exit_code`. Every
+  chat-started update therefore stayed pending until the 30-minute deadline and
+  was then reported as unverified, even when it failed at once. `/update` now
+  launches through the same v2 lifecycle as agent-requested updates, which also
+  clears a stale completion marker and refuses a second concurrent request.
+- Guard: `tests/gateway/test_update_lifecycle_notifications.py`
+  (`test_slash_update_final_outcome_follows_the_detached_wrapper`).

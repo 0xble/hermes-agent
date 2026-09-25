@@ -219,3 +219,38 @@ async def test_missing_adapter_retries_then_expires_without_success_claim(tmp_pa
         assert await runner._send_update_notification() is True
     assert read_pending(tmp_path) is None
     assert "adapter never connected" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass  # Fixed python -c only: no updater, git, service or runtime access.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX detached wrapper")
+async def test_slash_update_final_outcome_follows_the_detached_wrapper(tmp_path):
+    """A /update request and the wrapper it spawns must agree on the completion marker.
+
+    The wrapper reports only ``.update_process_exit_code`` and deletes ``.update_exit_code``,
+    so a request still waiting on the legacy marker never sees the updater finish.
+    """
+    from tests.gateway.test_update_command import _make_event
+    runner = _make_runner()
+    event = _make_event(platform=Platform.TELEGRAM, chat_id="42")
+    fake_root = tmp_path / "project"
+    (fake_root / ".git").mkdir(parents=True)
+    (fake_root / "gateway").mkdir()
+    (fake_root / "gateway" / "run.py").touch()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".update_process_exit_code").write_text("0", encoding="utf-8")  # stale, from an earlier update
+    failing = [sys.executable, "-c", "print('updater ran', flush=True); raise SystemExit(7)"]
+    with patch("gateway.run._hermes_home", home), \
+         patch("gateway.run.__file__", str(fake_root / "gateway" / "run.py")), \
+         patch("gateway.run._resolve_hermes_bin", return_value=failing), \
+         patch("gateway.slash_commands._systemd_scope_wrap_if_supervised", side_effect=lambda argv: (argv, None)), \
+         patch.object(runner, "_schedule_update_notification_watch"):
+        await runner._handle_update_command(event)
+    record = read_pending(home)[1]
+    deadline = time.monotonic() + 10
+    outcome = None
+    while outcome is None and time.monotonic() < deadline:
+        outcome = final_outcome(home, record)
+        time.sleep(.05)
+    assert outcome is not None and outcome[0] is False and "code 7" in outcome[1]
