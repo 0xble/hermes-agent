@@ -442,8 +442,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 - Fork patch identity: `fork-ci-reliability`.
 - The macOS portability shim assumed macOS always drops `S_ISGID`. The kernel only drops it on
-  `chmod` when an unprivileged caller is not in the directory's group: under `/tmp` (group `wheel`)
-  the bit is dropped, under the default `/var/folders` temp dir (group `staff`) it is kept, so seven
-  `tests/test_scratch_dir.py` tests failed wherever pytest's temp root was not `/tmp`. Sandboxed runs
-  drop it even for the caller's own group. The expectation is now measured: the same mode is applied
-  to a throwaway sibling directory on the same filesystem, and the bit is expected only if it survives.
+  `chmod` when an unprivileged caller is not in the directory's group: under the system temp root
+  (group `wheel`) the bit is dropped, under the per-user `/var/folders` temp dir (group `staff`) it is
+  kept, so seven `tests/test_scratch_dir.py` tests failed wherever pytest's temp root was the per-user
+  one. Sandboxed runs drop it even for the caller's own group. The expectation is now measured: the
+  same mode is applied to a throwaway sibling directory on the same filesystem, and the bit is
+  expected only if it survives.
