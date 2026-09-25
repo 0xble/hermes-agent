@@ -588,8 +588,12 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._retain_backlog.popleft()
                     logger.warning("Hindsight retain backlog full (%d); dropped the oldest failed retain",
                                    _RETAIN_BACKLOG_MAX)
+                waiting = bool(self._retain_backlog) and time.monotonic() < self._retain_backlog_next_at
                 self._retain_backlog.append([job, 0])
-                self._drain_retain_backlog()
+                # Behind a failed job still inside its backoff, a new job just queues (order is
+                # preserved); only the idle poll or shutdown retries the head.
+                if not waiting:
+                    self._drain_retain_backlog()
             finally:
                 self._retain_queue.task_done()
 
@@ -655,12 +659,14 @@ class HindsightMemoryProvider(MemoryProvider):
         durability). False on timeout/shutdown."""
         deadline = None if timeout <= 0 else time.monotonic() + timeout
         expired = lambda: deadline is not None and time.monotonic() >= deadline  # noqa: E731
-        while self._retain_queue.unfinished_tasks > 0:
+        # A failed retain leaves the queue (task_done) but stays in the retry backlog until it
+        # succeeds or is abandoned, so the backlog is part of the barrier too.
+        while self._retain_queue.unfinished_tasks > 0 or self._retain_backlog:
             if self._shutting_down.is_set():
                 return False
             if expired():
-                logger.debug("Prefetch: retain drain timed out after %.1fs (%d pending)",
-                             timeout, self._retain_queue.unfinished_tasks)
+                logger.debug("Prefetch: retain drain timed out after %.1fs (%d queued, %d awaiting retry)",
+                             timeout, self._retain_queue.unfinished_tasks, len(self._retain_backlog))
                 return False
             time.sleep(0.05)
         return self._wait_for_server_retain_ops(expired, timeout)

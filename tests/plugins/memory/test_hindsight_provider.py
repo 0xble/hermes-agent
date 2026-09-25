@@ -2039,3 +2039,32 @@ class TestRetainRetry:
         started = time.monotonic()
         p.shutdown()
         assert time.monotonic() - started < 12.0
+
+    def test_queued_jobs_do_not_bypass_the_retry_delay(self, provider, monkeypatch):
+        """Newer jobs queue behind a failed head inside its backoff instead of retrying it."""
+        p = self._append_provider(provider, monkeypatch)
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_RETRY_BASE_S", 30.0)
+        p._client.aretain_batch = AsyncMock(side_effect=ConnectionError("down"))
+        p.sync_turn("q1", "a1")
+        p._retain_queue.join()
+        for i in range(2, 6):
+            p.sync_turn(f"q{i}", f"a{i}")
+        p._retain_queue.join()
+        assert p._client.aretain_batch.await_count == 1  # no retry burst inside the 30s backoff
+        assert len(p._retain_backlog) == 5
+        assert p._retain_backlog[0][1] == 1
+
+    def test_prefetch_barrier_waits_for_a_pending_retry(self, provider, monkeypatch):
+        """A failed retain awaiting retry is not recall-visible, so the drain barrier holds."""
+        p = self._append_provider(provider, monkeypatch)
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_RETRY_BASE_S", 30.0)
+        p._client.aretain_batch = AsyncMock(side_effect=ConnectionError("down"))
+        p.sync_turn("q", "a")
+        p._retain_queue.join()
+        assert p._retain_queue.unfinished_tasks == 0 and len(p._retain_backlog) == 1
+        assert p._wait_for_retains_drained(0.2) is False
+        # Once the retry succeeds the barrier releases.
+        p._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(ok=True))
+        p._retain_backlog_next_at = 0.0
+        assert self._wait_for(lambda: not p._retain_backlog)
+        assert p._wait_for_retains_drained(2.0) is True

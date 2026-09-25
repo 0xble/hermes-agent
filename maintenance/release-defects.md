@@ -257,7 +257,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   fallback bank. The writer discarded a failed retain job although append mode had already dropped
   those turns from `_session_turns`, so a transient outage lost conversation memory permanently. Failed
   jobs now stay in an ordered, bounded backlog (5 attempts with exponential backoff, at most 50 jobs)
-  that retries before newer jobs and on idle, with one last attempt at shutdown.
+  that retries oldest-first once its backoff expires (newer jobs queue behind it, never forcing an
+  early retry), with one last attempt at shutdown. The prefetch drain barrier counts that backlog, so
+  recall does not read before a pending retain lands.
 - Guard: `tests/plugins/memory/test_hindsight_provider.py`
   (`test_malformed_bank_id_template_falls_back`, `test_csv_recall_tags_reach_the_sdk_as_a_list`,
-  `TestRetainRetry`).
+  `TestRetainRetry`, including `test_queued_jobs_do_not_bypass_the_retry_delay` and
+  `test_prefetch_barrier_waits_for_a_pending_retry`).
