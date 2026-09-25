@@ -28,7 +28,12 @@ def _resolve_repo() -> Path:
     """The Hermes checkout this script operates on: the installed hermes_cli package's parent.
 
     Deriving it from __file__ broke the moment the installer copied this script into
-    $HERMES_HOME/scripts (the cron --script root), where parents[1] is the profile home."""
+    $HERMES_HOME/scripts (the cron --script root), where parents[1] is the profile home. But the
+    script's own checkout wins when it is one: run from a candidate worktree, the shared venv's
+    editable hermes_cli points at the primary checkout, which silently checked the wrong tree."""
+    own = Path(__file__).resolve().parents[1]
+    if (own / "hermes_cli" / "__init__.py").is_file() and (own / "scripts" / "check_fork_patches.py").is_file():
+        return own
     try:
         import hermes_cli
         return Path(hermes_cli.__file__).resolve().parents[1]
