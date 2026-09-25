@@ -335,3 +335,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_retry_judges_the_earlier_send_by_its_outcome_not_the_wait`,
   `test_explicit_empty_recall_types_disables_the_filter`).
 
+## Hindsight stale prefetch overwrite and cross-bank retain-op status
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- `queue_prefetch()` captured the prefetch generation without advancing it, so within one session a
+  recall worker that outlived `prefetch()`'s 3s join could publish its older result over a newer
+  request's completed recall. Each queued request now starts its own generation.
+- Pending server-side retain operations shared one bank ID, overwritten by every retain. With a
+  session-scoped `bank_id_template`, old-session ops were polled against the new bank, whose 404 reads
+  as completion, so the recall-visibility barrier passed early. Each op now keeps the bank it was
+  retained to.
+- Regression coverage: `test_hindsight_provider.py` (`test_pending_ops_are_polled_against_their_own_bank`,
+  `TestPrefetchSupersession::test_superseded_slow_worker_cannot_overwrite_newer_result`).
