@@ -182,7 +182,7 @@ def _prune_durable_records() -> None:
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
+            "DELETE FROM async_delegations WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?", (cutoff,))
         terminal_count = conn.execute(
             "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
@@ -202,14 +202,14 @@ def _prune_durable_records() -> None:
                    )""", (pending_count - _MAX_DURABLE_PENDING,))
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+def _persist_completion(event: Dict[str, Any], result: Dict[str, Any], delivery_state: str = "pending") -> None:
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
+               event_json=?, result_json=?, delivery_state=?
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]))
+             json.dumps(event), json.dumps(result), delivery_state, event["delegation_id"]))
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -825,6 +825,36 @@ def dispatch_async_delegation_batch(
 
 
 # ── Finalization + completion events ────────────────────────────────────────
+# Everything that decides which parent a completion re-enters. A replacement must match all of it: CLI/TUI units
+# share an empty session_key, and a gateway session_key outlives a conversation reset.
+_PARENT_IDENTITY_KEYS = ("session_key", "origin_ui_session_id", "origin_session_id", "parent_session_id",
+                         *_ROUTING_KEYS)
+
+
+def supersede_delegation(delegation_id: str, replacement_id: str, reason: str = "") -> bool:
+    """Mark a still-running single-task unit as replaced by ``replacement_id``, an admitted delegation that reports
+    the same work. Its completion is then recorded (``delivery_state='superseded'``) but never wakes the parent.
+
+    For owners that retry a failed child elsewhere, e.g. a reviewer rate-limited on one route and re-dispatched on
+    the next from its ``subagent_stop`` hook, which runs before this unit finalizes. Refused (False) unless this
+    unit is still active and runs one task, and the replacement is a known delegation reporting to the same parent
+    (every routing field in ``_PARENT_IDENTITY_KEYS``), so the parent always hears about the work once."""
+    if not delegation_id or not replacement_id or delegation_id == replacement_id:
+        return False
+    with _records_lock:
+        record, replacement = _records.get(delegation_id), _records.get(replacement_id)
+        if record is None or replacement is None or record.get("status") not in _ACTIVE_STATES:
+            return False
+        if any((replacement.get(k) or "") != (record.get(k) or "") for k in _PARENT_IDENTITY_KEYS):
+            return False  # the replacement would report to a different parent
+        tasks = record.get("task_indexes")
+        if len(tasks if tasks is not None else (record.get("goals") or [record.get("goal")])) != 1:
+            return False
+        record["superseded_by"] = replacement_id
+        record["superseded_reason"] = str(reason or "")[:500]
+    return True
+
+
 def _finalize(delegation_id: str, result: Any, status: str) -> None:
     """Atomically claim terminal delivery, push the completion event, then mark ``status``.
     ``result`` is a dict or a callable receiving the record snapshot (stall path). The record
@@ -886,6 +916,17 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
+    if record.get("superseded_by"):
+        # The owner already replaced this unit with a running delegation whose own completion will report the
+        # outcome. Record the result durably, but never wake the parent for an attempt it no longer waits on.
+        evt.update(superseded_by=record["superseded_by"], superseded_reason=record.get("superseded_reason") or "")
+        try:
+            _persist_completion(evt, result, delivery_state="superseded")
+        except Exception as exc:  # noqa: BLE001 — the replacement still reports; only the audit row is lost
+            logger.error("Async delegation %s: superseded completion write failed: %s", record.get("delegation_id"), exc)
+        logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
+                    label, record.get("delegation_id"), record["superseded_by"])
+        return
     try:
         _persist_completion(evt, result)
     except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not

@@ -2,6 +2,7 @@
 from contextlib import ExitStack, nullcontext
 import importlib.util
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -251,6 +252,36 @@ try {
             (docs / 'added.md').write_text('new', encoding='utf-8')
             with self.assertRaisesRegex(RuntimeError, 'added.md'):
                 ci.check_docs_parity(before, ci.docs_inventory(root))
+
+    @unittest.skipIf(os.name == 'nt', 'shell-script interpreter fake')
+    def test_python_lanes_require_a_wal_capable_sqlite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / 'python'
+            fake.write_text('#!/bin/sh\necho "SQLite 3.50.4, WAL-reset vulnerable: True"\nexit 1\n', encoding='utf-8')
+            fake.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, 'WAL-capable SQLite.*3.50.4'):
+                ci.require_wal_capable_sqlite(str(fake), dict(os.environ))
+            with patch.object(ci, 'python', return_value=str(fake)), patch.object(ci, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'WAL-capable'):
+                    ci.python_tests(dict(os.environ), ['tests'], 1)
+                run.assert_not_called()
+        ci.require_wal_capable_sqlite(sys.executable, dict(os.environ))
+
+    def test_workflows_install_the_pinned_python(self):
+        for name in ('gate.yml', 'nightly.yml'):
+            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            self.assertIn(f"uv python install {ci.PINS['python']}", text, name)
+        self.assertNotEqual(ci.PINS['python'], '3.11.14', '3.11.14 links WAL-reset-vulnerable SQLite 3.50.4')
+
+    def test_uv_pin_is_consistent_across_installers(self):
+        # uv's bundled download manifest decides which CPython patches install; a stale uv cannot
+        # provision a newer pinned interpreter on a fresh runner.
+        artifacts = (ci.ROOT / 'ci/linux-artifacts.json').read_text(encoding='utf-8')
+        self.assertIn(f"/uv/releases/download/{ci.PINS['uv']}/", artifacts)
+        self.assertNotRegex(artifacts, r'/uv/releases/download/(?!' + re.escape(ci.PINS['uv']) + r'/)')
+        for name in ('e2e-desktop-core.yml', 'live-providers.yml'):
+            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            self.assertRegex(text, r"version: ['\"]" + re.escape(ci.PINS['uv']) + r"['\"]", name)
 
     def test_every_reusable_only_workflow_has_a_caller(self):
         import yaml
