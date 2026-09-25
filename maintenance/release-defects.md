@@ -266,6 +266,27 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `tests/gateway/test_update_result_heading.py`
   (`test_same_revision_with_verified_restart_is_not_reported_as_noop`).
 
+## Boot recovery notice suppressed while adapter disconnected
+
+- Fork patch identity: `delegation-explicit-resume`.
+- Auto-resume authorization consulted adapter-owned policy before the transport connected;
+  an apparent refusal then consumed the one-shot trigger permanently. A closed parent remains
+  terminal, but an unavailable adapter now defers without claiming, and authorization is checked
+  only after the delivery route is live.
+- Guard: `tests/gateway/test_delegation_auto_resume.py`
+  (`test_boot_notice_defers_disconnected_owner_then_delivers_after_reconnect`).
+
+## Update output repeated after partial chunk delivery
+
+- Fork patch identity: `update-lifecycle`.
+- A failed later progress chunk retried the entire buffered output; final-send also retained its
+  original byte offset. Both paths now checkpoint exact raw-byte progress per successful chunk,
+  preserving invalid UTF-8 and stripping ANSI without splitting an escape at a chunk boundary.
+  The final notice waits for all output to be delivered.
+- Guard: `tests/gateway/test_update_lifecycle_notifications.py`
+  (`test_stream_retry_only_sends_unsent_chunk`,
+  `test_final_retry_only_sends_unsent_chunk_and_then_final`).
+
 ## Hindsight config parsing and failed append retains
 
 - Fork patch identity: `hindsight-session-lifecycle`.
