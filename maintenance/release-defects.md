@@ -437,3 +437,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Five fork-touched test files carried trailing blank lines at EOF or whitespace-only lines, so
   `git diff --check <release> <main>` over the retained fork delta was not clean. Whitespace only;
   no test logic changed.
+
+## Scratch-dir setgid expectation depended on the temp directory's group
+
+- Fork patch identity: `fork-ci-reliability`.
+- The macOS portability shim assumed macOS always drops `S_ISGID`. The kernel only drops it on
+  `chmod` when an unprivileged caller is not in the directory's group: under `/tmp` (group `wheel`)
+  the bit is dropped, under the default `/var/folders` temp dir (group `staff`) it is kept, so seven
+  `tests/test_scratch_dir.py` tests failed wherever pytest's temp root was not `/tmp`. The expectation
+  now follows the directory's actual group membership instead of the platform name.
