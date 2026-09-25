@@ -60,8 +60,16 @@ no schema or persistent-data change is involved.
 
 v2026.9.24 settles a turn whose final reply was persisted before a crash by
 ledgering its text, then clearing the active-turn marker. The ledger redelivers
-text only, so a reply carrying `MEDIA:` attachments lost them, and a media-only
-reply read as unfinished. `crash-left-media-resume` leaves any reply with
-attachments marked, so it resumes through the normal path instead.
-`tests/gateway/test_crash_left_reply_media.py` guards it. Offer upstream; drop
-once the ledger carries attachments.
+text only, so attachments were lost in two places:
+
+- Startup settled a crash-left reply carrying attachments as plain text, and a
+  media-only reply read as unfinished. Any reply the live extractor would send
+  attachments for (`MEDIA:` tags, markdown or HTML images, bare local files)
+  now stays marked and resumes through the normal path.
+- Live delivery released the marker once the text row was ledgered, before the
+  attachments were sent. A final with attachments now keeps the marker until
+  they are delivered.
+
+`crash-left-media-resume` owns both. `tests/gateway/test_crash_left_reply_media.py`
+and `tests/gateway/test_final_marker_after_attachments.py` guard them. Offer
+upstream; drop once the ledger carries attachments.

@@ -4306,7 +4306,7 @@ class BasePlatformAdapter(ABC):
 
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
-        reply_to: Optional[str], is_ephemeral_response: bool = False,
+        reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
@@ -4320,8 +4320,10 @@ class BasePlatformAdapter(ABC):
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
-        if obligation_id is not None:
-            await self._release_turn_marker(event)  # the ledger now owns the crash recovery
+        if obligation_id is not None and release_marker:
+            # The ledger now owns the crash recovery. It carries text only, so a caller with
+            # attachments still to send keeps the marker until they are delivered.
+            await self._release_turn_marker(event)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
@@ -4337,11 +4339,13 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable,
+        attachments_pending: bool = False) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
-            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
+            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,
+            release_marker=not attachments_pending)
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
@@ -4567,7 +4571,9 @@ class BasePlatformAdapter(ABC):
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                        is_ephemeral_response, _ephemeral_ttl, _record_delivery,
+                        attachments_pending=bool(
+                            extracted.images or extracted.media_files or extracted.local_files))
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,

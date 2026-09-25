@@ -30,5 +30,15 @@ def test_media_only_reply_resumes():
     assert _reply("MEDIA:/tmp/hermes-photo.png") is None
 
 
+def test_markdown_image_reply_resumes():
+    assert _reply("Done. ![chart](https://example.invalid/chart.png)") is None
+
+
+def test_bare_local_file_reply_resumes(tmp_path):
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"png")
+    assert _reply(f"Done. Saved to {image}") is None
+
+
 def test_text_reply_is_still_redelivered():
     assert _reply("Done, no attachment.") == "Done, no attachment."
