@@ -430,3 +430,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   session keeps it.
 - Regression coverage: `test_hindsight_provider.py` (`test_shared_loop_is_not_replaced_during_startup`,
   `test_switch_to_unrelated_session_clears_the_old_parent`, `test_rewind_of_the_same_session_keeps_its_parent`).
+
+## Fork test whitespace flagged by `git diff --check`
+
+- Fork patch identity: `fork-ci-reliability`.
+- Five fork-touched test files carried trailing blank lines at EOF or whitespace-only lines, so
+  `git diff --check <release> <main>` over the retained fork delta was not clean. Whitespace only;
+  no test logic changed.

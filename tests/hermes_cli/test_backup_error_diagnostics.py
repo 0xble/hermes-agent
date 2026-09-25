@@ -95,4 +95,3 @@ def test_vanished_entries_reach_the_profile_log(tmp_path, monkeypatch, caplog):
         assert any(path.name in message for message in vanished)
     with zipfile.ZipFile(output) as archive:
         assert archive.read("config.yaml") == config.read_bytes()
-
