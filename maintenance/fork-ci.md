@@ -25,6 +25,13 @@ qualification. A fail-once test stays failed at the gate entrypoint. Interactive
 runner defaults remain unchanged. `scripts/ci/tests/test_portable.py` exercises
 both outcomes with a real pytest file and a persistent attempt counter.
 
+The nightly fetches upstream CalVer release tags before its historical upgrade E2E:
+`actions/checkout` sees only fork tags (latest `v2026.8.3`), otherwise the test's
+`git describe HEAD~1` stages an obsolete updater instead of the previous release.
+The test still uses a local origin with no network and seeds a v45 user config to
+exercise the MCP disabled → enabled migration even when the release binary is v46.
+A missing upstream tag fetch fails the nightly rather than silently narrowing coverage.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
