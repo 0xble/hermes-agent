@@ -1097,6 +1097,45 @@ class TestMissionConfig:
         assert order.count("retain") == 2
         assert p._client.acreate_bank.await_count == 1
 
+    def test_waiter_does_not_overtake_a_mission_applied_after_embedded_reconnect(self, provider_with_config):
+        """With a short provider timeout, a reconnect retry that finishes the mission late must
+        still hold concurrent callers for that bank until the mission is applied."""
+        p = provider_with_config(bank_retain_mission="Extract decisions", timeout=1)
+        p._timeout = 0.5
+        p._mode = "local_embedded"
+        order: list = []
+        attempts: list = []
+        started = threading.Event()
+
+        async def _create(**_kw):
+            attempts.append(1)
+            started.set()
+            if len(attempts) == 1:
+                await asyncio.sleep(0.3)
+                raise RuntimeError("Cannot connect to host 127.0.0.1:8888")
+            # The retry outlives the 0.5s provider timeout (lands ~0.65s) but succeeds.
+            await asyncio.sleep(0.35)
+            order.append("mission-applied")
+            return SimpleNamespace()
+
+        async def _retain(**_kw):
+            order.append("retain")
+            return SimpleNamespace(operation_id=None, operation_ids=None)
+
+        client = p._client
+        client.acreate_bank = AsyncMock(side_effect=_create)
+        client.aretain_batch = AsyncMock(side_effect=_retain)
+        p._get_client = lambda: client
+        first = threading.Thread(target=p._retain_batch, args=({"content": "a"},), kwargs={"bank_id": "bank-a"})
+        first.start()
+        assert started.wait(5.0)
+        second = threading.Thread(target=p._retain_batch, args=({"content": "b"},), kwargs={"bank_id": "bank-a"})
+        second.start()
+        first.join(5.0)
+        second.join(5.0)
+        assert len(attempts) == 2
+        assert order == ["mission-applied", "retain", "retain"], order
+
     def test_no_missions_configured_makes_no_bank_calls(self, provider):
         provider._client.acreate_bank = AsyncMock()
         provider._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(operation_id=None, operation_ids=None))

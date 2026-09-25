@@ -369,8 +369,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   The remaining budget now bounds each status request and poll sleep.
 - `bank_mission`/`bank_retain_mission` were stored but never sent (inherited from upstream, where the
   README says "Applied via Banks API"). They are now applied once per resolved bank through the Banks
-  API before its first retain or reflect, best effort; concurrent callers for that bank wait for the
-  attempt in flight so none reaches the bank ahead of its missions.
+  API before its first retain or reflect, best effort; concurrent callers for that bank wait until the
+  attempt in flight has actually finished (one bounded budget, including a reconnect retry and a late
+  landing), so none reaches the bank ahead of its missions.
 - The local_embedded reconnect retry reused the caller's full timeout; one budget now covers the
   operation, so the retry gets only what the first attempt left and is skipped when it is spent.
 - Regression coverage: `test_hindsight_provider.py`

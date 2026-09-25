@@ -1007,17 +1007,34 @@ class HindsightMemoryProvider(MemoryProvider):
             if owner:
                 done = self._mission_banks[bank_id] = threading.Event()
         if not owner:
-            # Another caller is applying this bank's missions: don't reach the bank before it has
-            # them. Bounded by the request timeout; the attempt itself is best effort.
-            done.wait(float(self._timeout or _DEFAULT_TIMEOUT))
+            # Another caller is applying this bank's missions: don't reach the bank before that
+            # attempt has finished. The owner's attempt is bounded by one explicit budget (below)
+            # and always sets the event, so waiting for it rather than a separate clock can't
+            # let this caller overtake a slow but successful application.
+            done.wait()
             return
         kwargs: Dict[str, Any] = {"bank_id": bank_id}
         if self._bank_mission:
             kwargs["reflect_mission"] = self._bank_mission
         if self._bank_retain_mission:
             kwargs["retain_mission"] = self._bank_retain_mission
+        budget = float(self._timeout or _DEFAULT_TIMEOUT)
+        pending: list = []
         try:
-            self._run_hindsight_operation(lambda client: client.acreate_bank(**kwargs))
+            # One budget for the whole attempt, including an embedded reconnect retry.
+            self._run_hindsight_operation(lambda client: client.acreate_bank(**kwargs),
+                                          keep_pending=pending.append, timeout=budget)
+        except TimeoutError:
+            # The wait timed out, not the request: it may still land. Waiters are released only
+            # once it has actually finished (or a final cap passes), so none overtakes it.
+            if pending:
+                concurrent.futures.wait(pending[-1:], timeout=budget)
+            if not pending or not pending[-1].done():
+                logger.warning("Hindsight: mission update for bank %s still unresolved after %.1fs; "
+                               "proceeding without confirmation", bank_id, 2 * budget)
+            elif pending[-1].cancelled() or pending[-1].exception() is not None:
+                logger.warning("Hindsight: could not apply configured missions to bank %s: %s", bank_id,
+                               "cancelled" if pending[-1].cancelled() else pending[-1].exception())
         except Exception as exc:
             logger.warning("Hindsight: could not apply configured missions to bank %s: %s", bank_id, exc)
         finally:
