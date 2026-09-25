@@ -279,3 +279,16 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_malformed_bank_id_template_falls_back`, `test_csv_recall_tags_reach_the_sdk_as_a_list`,
   `TestRetainRetry`, including `test_queued_jobs_do_not_bypass_the_retry_delay` and
   `test_prefetch_barrier_waits_for_a_pending_retry`).
+
+## Hindsight timed-out retains resent and empty recall_types overridden
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- `_run_sync()` stops waiting at the provider timeout but leaves the coroutine running on the shared
+  loop, so the retain backlog could resend an append that later landed, writing the same turns twice.
+  A timed-out send is now kept with its job: the retry first settles it (one more timeout), skips the
+  resend if it landed, resends only if it failed, and otherwise fails the attempt and backs off. An
+  explicit `recall_types: []` was also replaced with `["observation"]`, unlike the equivalent empty
+  string; only an unset key now gets the default.
+- Guard: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_timed_out_write_that_lands_is_not_sent_again`, `test_timed_out_write_that_failed_is_sent_again`,
+  `test_explicit_empty_recall_types_disables_the_filter`).
