@@ -263,7 +263,7 @@ def _before_version(text: str, block: str) -> str:
 
 
 def gen_case(seed: int, *, long: bool = False, n_sections: tuple = (5, 11), exclude_top: set = frozenset(),
-             null_leaves: bool = True) -> Case:
+             null_leaves: bool = True, require_null: bool = False) -> Case:
     rng = random.Random(seed)
     env: dict[str, str] = {}
     by_section: dict[str, list] = {}
@@ -295,6 +295,11 @@ def gen_case(seed: int, *, long: bool = False, n_sections: tuple = (5, 11), excl
         if isinstance(tree["skills"], dict):
             tree["skills"]["external_dirs"] = [f"/opt/c18/{rng.choice(_WORDS)}", rng.choice(_UNICODE)]
     tree["_config_version"] = LATEST
+    if require_null and not any(v is None for v in _leaves(tree).values()):
+        assert null_leaves, "required null leaf conflicts with null_leaves=False"
+        # A random draw can miss nulls (seed 102); keep the null-specific case non-vacuous.
+        first_section_leaf = next(p for p in _leaves(tree) if p[0] == sections[0])
+        _set(tree, first_section_leaf, None)
 
     lines: list[str] = [f"# C18 generated config (seed={seed}) — comments must survive every write"]
     leaf_lines: dict[tuple, int] = {}
@@ -439,7 +444,7 @@ def test_p1_noop_save_is_byte_identical(seed, home, monkeypatch):
 
 @pytest.mark.parametrize("seed", [101, 102])
 def test_p1_explicit_null_leaves_survive_a_noop_save(seed, home, monkeypatch):
-    case = gen_case(seed)
+    case = gen_case(seed, require_null=True)
     assert any(v is None for v in _leaves(case.tree).values()), f"seed {seed} generated no null leaf"
     _noop_save_roundtrip(case, monkeypatch)
 
