@@ -198,6 +198,10 @@ def _telegram_retry_after(error: Exception) -> Optional[float]:
     """The platform's requested wait for a flood refusal, or None when this is not one."""
     retry_after = getattr(error, "retry_after", None)
     if retry_after is not None:
+        # PTB reports a timedelta when PTB_TIMEDELTA is enabled; float() rejects it, and the
+        # fallback below would shrink a real multi-minute penalty to one second.
+        if hasattr(retry_after, "total_seconds"):
+            return float(retry_after.total_seconds())
         try:
             return float(retry_after)
         except (TypeError, ValueError):
@@ -5651,7 +5655,7 @@ class TelegramAdapter(BasePlatformAdapter):
             anim_result = await super().send_multiple_images(chat_id, animations, metadata, human_delay=human_delay)
             delivered = anim_result.success
         if not photos:
-            return SendResult(success=delivered, error=None if delivered else "all images failed to send")
+            return self._album_result(chat_id, delivered)
         from urllib.parse import unquote as _unquote
         CHUNK = 10  # Telegram's album limit
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
@@ -5692,7 +5696,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._bot.send_media_group, {**send_kwargs, "media": media}, metadata, reply_to_id,
                     "media group", reset_media=_reset_opened_files)
                 delivered = True
+            except _MediaFloodRefusal as flood:
+                # The chat is in a flood window: a per-image fallback would only be refused again.
+                logger.warning(
+                    "[%s] media group refused for flood control (chunk %d/%d, %.0fs)", self.name,
+                    chunk_idx + 1, len(chunks), flood.wait)
             except Exception as e:
+                wait = _telegram_retry_after(e)
+                if wait is not None:
+                    # A platform flood refusal: arm the per-chat window instead of firing a per-image
+                    # fallback into the same penalty.
+                    self._record_send_flood_cooldown(chat_id, wait)
+                    logger.warning(
+                        "[%s] media group refused for flood control (chunk %d/%d, retry_after=%.1fs)", self.name,
+                        chunk_idx + 1, len(chunks), wait)
+                    continue
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
                     chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
@@ -5705,6 +5723,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 for tmp in temp_paths:
                     with contextlib.suppress(OSError):
                         os.remove(tmp)
+        return self._album_result(chat_id, delivered)
+
+    def _album_result(self, chat_id: str, delivered: bool) -> SendResult:
+        """A wholly undelivered album answers with the flood contract while the chat's window is
+        armed (an album refusal or a per-image fallback refusal both arm it), so the caller can
+        reschedule instead of reading a permanent 'all images failed to send'."""
+        if not delivered:
+            cooldown = self._send_flood_cooldown_remaining(chat_id)
+            if cooldown is not None:
+                return _flood_cap_result(cooldown)
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     async def send_image_file(

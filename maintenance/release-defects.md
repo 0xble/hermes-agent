@@ -209,3 +209,17 @@ and drop it once upstream carries an equivalent fix.
   the moment the refusal is recorded.
 - Guard: `tests/gateway/test_delivery_ledger.py`
   (`test_absurd_penalty_is_abandoned_when_the_failure_is_recorded`).
+
+## Telegram album flood refusal read as a permanent failure
+
+- Fork patch identity: `telegram-album-flood-contract`.
+- `send_multiple_images()` caught a media-group flood refusal (local or platform) in its generic
+  handler, fell back to per-image sends that were refused again, and returned
+  `all images failed to send` with no `retry_after`, so the caller saw a permanent failure. The album
+  path now arms the per-chat window, skips the futile fallback, and answers a wholly undelivered album
+  with `flood_control:<s>` while the window is armed. `_telegram_retry_after()` also honours a
+  `timedelta` `retry_after` (PTB_TIMEDELTA) instead of shrinking it to one second.
+- Guard: `tests/gateway/test_telegram_flood_coherence.py`
+  (`test_album_inside_an_armed_window_returns_the_flood_contract`,
+  `test_album_refused_by_the_platform_returns_the_flood_contract`,
+  `test_timedelta_retry_after_keeps_the_full_penalty`).
