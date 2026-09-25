@@ -124,3 +124,14 @@ and drop it once upstream carries an equivalent fix.
   checkout always failed. External rows are now skipped.
 - Guard: `tests/scripts/test_candidate_scripts.py`
   (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
+
+## Launchd wrapped-child test predates update home scoping
+
+- Fork patch identity: `launchd-child-test-home-scope`.
+- `test_launchd_exclusion_protects_real_wrapped_process` (fork #52) predates
+  upstream #93349, which stops only manual gateways whose live home the update
+  owns. Its synthetic manual gateway had no readable home, so it was correctly
+  left running and the test failed on macOS. The test now binds both candidates
+  to the updating home, so the wrapped child survives only through the
+  service-ancestry exclusion (verified: removing that exclusion fails the test).
+- Guard: `tests/hermes_cli/test_gateway_launchd_supervised_child.py`.
