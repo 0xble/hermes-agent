@@ -96,6 +96,34 @@ def _clean_env(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "hindsight_client_api.exceptions", exceptions)
 
 
+@pytest.fixture(autouse=True)
+def _stop_retain_writers(monkeypatch):
+    """Join every provider's writer at teardown, while this test's patches still apply."""
+    # Every provider a test builds may start a retain writer thread; stop them all while this
+    # test's patches are still active, so no writer keeps retrying with restored globals or
+    # leaks queued jobs into later tests (the retry backlog makes that leak observable).
+    created: list = []
+    original_init = HindsightMemoryProvider.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(HindsightMemoryProvider, "__init__", _tracking_init)
+    yield
+    leaked = []
+    for provider in created:
+        provider._shutting_down.set()
+        writer = provider._writer_thread
+        if writer is not None and writer.is_alive():
+            provider._retain_queue.put(_WRITER_SENTINEL)
+            writer.join(timeout=5.0)
+            if writer.is_alive():
+                leaked.append(writer.name)
+        provider._join_prefetch(5.0)
+    assert not leaked, f"retain writer(s) still running after teardown: {leaked}"
+
+
 def _make_mock_client():
     """Create a mock Hindsight client with async methods."""
     async def _aretain(
