@@ -601,10 +601,18 @@ class GatewayNotificationsMixin:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             pre_sha = str((receipt.get("pre_update") or {}).get("sha") or "")
             post_sha = str((receipt.get("post_update") or {}).get("sha") or "")
-            if pre_sha and post_sha and pre_sha == post_sha:
+            same_revision = bool(pre_sha and post_sha and pre_sha == post_sha)
+            # Same classification as ``final_outcome``: a same-SHA run that restarted the
+            # gateway or verified a fleet (checkout repair, fleet catch-up) is not a no-op.
+            if same_revision and not receipt.get("gateway_restart") and not receipt.get("fleet"):
                 return "ℹ️ Already Latest", (
                     f"Hermes is already running revision {post_sha[:12]}. "
                     "No changes were applied, and the gateway was not restarted."
+                )
+            if same_revision:
+                return "✅ Update Complete", (
+                    f"Hermes stayed on revision {post_sha[:12]}; the gateway was restarted "
+                    "and the running revision was verified."
                 )
             if post_sha:
                 return "✅ Update Complete", f"Hermes updated successfully to revision {post_sha[:12]}."
@@ -612,28 +620,52 @@ class GatewayNotificationsMixin:
             pass
         return "✅ Update Complete", "Hermes update finished successfully."
     @staticmethod
-    def _read_update_output_since(path: Path, offset: int) -> tuple[str, int]:
-        """Read update output defensively; logs may contain invalid UTF-8."""
+    def _read_update_output_since(path: Path, offset: int) -> tuple[bytes, int]:
+        """Keep the original bytes: a replacement character cannot reconstruct its file offset."""
         try:
             data = path.read_bytes()
         except OSError:
-            return "", offset
+            return b"", offset
         if len(data) <= offset:
-            return "", len(data)
-        return data[offset:].decode("utf-8", errors="replace"), len(data)
+            return b"", len(data)
+        return data[offset:], len(data)
 
-    async def _send_update_output(self, target: "_UpdateTarget", text: str) -> bool:
-        from tools.ansi_strip import strip_ansi
-        clean = strip_ansi(text).strip()
-        for i in range(0, len(clean), 3500):
-            try:
-                result = await target.send(f"```\n{clean[i:i + 3500]}\n```")
-                if _send_failed(result):
-                    return False
-            except Exception:
-                logger.debug("Update stream send failed", exc_info=True)
-                return False
-        return True
+    async def _send_update_output(self, target: "_UpdateTarget", data: bytes,
+                                  *, trailer: str = "") -> int:
+        """Return the exact raw byte prefix delivered (or blank), even on partial failure.
+
+        Surrogateescape keeps invalid UTF-8 round-trippable for offsets; only the display copy
+        decodes with replacement. Chunk boundaries are Unicode-character boundaries, extended
+        past any crossing ANSI escape, so stripping each chunk cannot leak half an escape.
+        """
+        from tools.ansi_strip import strip_ansi, _ANSI_ESCAPE_RE
+        raw = data.decode("utf-8", errors="surrogateescape")
+        consumed = 0
+        pos = 0
+        while pos < len(raw):
+            end = min(pos + 3500, len(raw))
+            while len(raw[pos:end].encode("utf-8", errors="surrogateescape")) > 3500:
+                end -= 1
+            for match in _ANSI_ESCAPE_RE.finditer(raw):
+                if match.start() < end < match.end():
+                    end = match.end()
+                    break
+            chunk = raw[pos:end]
+            clean = strip_ansi(chunk.encode("utf-8", errors="surrogateescape")
+                               .decode("utf-8", errors="replace")).strip()
+            if trailer and end == len(raw):
+                clean += trailer
+            if clean:
+                try:
+                    result = await target.send(f"```\n{clean}\n```")
+                    if _send_failed(result):
+                        return consumed
+                except Exception:
+                    logger.debug("Update stream send failed", exc_info=True)
+                    return consumed
+            consumed += len(chunk.encode("utf-8", errors="surrogateescape"))
+            pos = end
+        return consumed
 
     async def _forward_update_prompt(self, target: "_UpdateTarget", prompt_text: str, default: str) -> None:
         """Forward an update prompt: platform-native buttons first (Discord, Telegram), else text."""
@@ -683,18 +715,28 @@ class GatewayNotificationsMixin:
         record = read_pending(paths.pending.parent)
         bytes_sent = int(record[1].get("output_offset", 0)) if record else 0
         last_stream_time = loop.time()
-        buffer = ""
+        buffer = b""
+
+        def _checkpoint_output() -> None:
+            current = read_pending(paths.pending.parent)
+            if current:
+                marker, pending = current
+                pending["output_offset"] = bytes_sent - len(buffer)
+                save_pending(marker, pending)
 
         async def _flush_buffer() -> None:
             nonlocal buffer, last_stream_time
-            if buffer.strip() and await self._send_update_output(target, buffer):
-                buffer = ""
-                last_stream_time = loop.time()
-                current = read_pending(paths.pending.parent)
-                if current:
-                    marker, pending = current
-                    pending["output_offset"] = bytes_sent
-                    save_pending(marker, pending)
+            if buffer and not buffer.strip():
+                # Consume whitespace without sending, including after a partial delivery.
+                buffer = b""
+                _checkpoint_output()
+                return
+            if buffer:
+                delivered = await self._send_update_output(target, buffer)
+                buffer = buffer[delivered:]
+                if delivered:
+                    last_stream_time = loop.time()
+                    _checkpoint_output()
 
         def _read_new_output() -> None:
             nonlocal buffer, bytes_sent
@@ -821,14 +863,22 @@ class GatewayNotificationsMixin:
             output, end_offset = self._read_update_output_since(paths.output, offset)
             output_sent = False
             if output.strip():
-                if legacy_marker:
-                    output += ("\n\nHermes update finished successfully." if success
-                               else f"\n\nHermes update failed. {detail}")
-                if not await self._send_update_output(target, output):
+                trailer = (("\n\nHermes update finished successfully." if success
+                            else f"\n\nHermes update failed. {detail}") if legacy_marker else "")
+                delivered = await self._send_update_output(target, output, trailer=trailer)
+                if delivered:
+                    current = read_pending(paths.pending.parent)
+                    if current:
+                        marker, pending = current
+                        pending["output_offset"] = offset + delivered
+                        save_pending(marker, pending)
+                if delivered != len(output):
                     if legacy_marker:
+                        # Pre-v2 markers retain their historical terminal failure contract.
                         self._clear_update_markers(paths, target.session_key)
                     return False
                 output_sent = True
+            elif output:
                 current = read_pending(paths.pending.parent)
                 if current:
                     marker, pending = current
@@ -1931,21 +1981,39 @@ class GatewayNotificationsMixin:
         """Re-queue undelivered async completions from every SECONDARY profile's ledger. The process
         registry restores only the launch profile's ``state.db`` at import; a secondary's rows would
         otherwise never be replayed after a restart."""
-        from gateway.run import _profile_runtime_scope
         from tools.async_delegation import restore_undelivered_completions
         from tools.process_registry import process_registry as _pr
+        self._each_secondary_ledger(profile_homes, lambda: restore_undelivered_completions(_pr.completion_queue),
+                                    "Restored")
+
+    def _sweep_orphaned_completion_ledgers(self) -> None:
+        """Offer completions whose owner process died while this gateway runs (#97202): the launch
+        ledger in the launch scope, each served secondary under its own. Startup replay only covers
+        owners that were already gone when the gateway started."""
+        from tools.async_delegation import sweep_orphaned_completions
+        from tools.process_registry import process_registry as _pr
+        sweep = lambda: sweep_orphaned_completions(_pr.completion_queue)  # noqa: E731
+        with _log_suppressed(logging.DEBUG, "Orphaned async completion sweep failed: %s"):
+            if count := sweep():
+                logger.info("Re-offered %d orphaned async completion(s)", count)
+        self._each_secondary_ledger((getattr(self, "_served_profile_homes", None) or {}).items(), sweep,
+                                    "Re-offered orphaned")
+
+    def _each_secondary_ledger(self, profile_homes, fn, verb: str) -> None:
+        """Run ``fn`` (returns a completion count) once per SECONDARY profile, bound to that profile."""
+        from gateway.run import _profile_runtime_scope
         primary = getattr(self, "_primary_profile_name", None)
         for profile_name, profile_home in profile_homes:
             if profile_name == primary:
                 continue
             try:
                 with _profile_runtime_scope(Path(profile_home), {}):
-                    restored = restore_undelivered_completions(_pr.completion_queue)
+                    count = fn()
             except Exception:
-                logger.warning("Could not restore async completions for profile %r", profile_name, exc_info=True)
+                logger.warning("Could not replay async completions for profile %r", profile_name, exc_info=True)
                 continue
-            if restored:
-                logger.info("Restored %d undelivered async completion(s) for profile %r", restored, profile_name)
+            if count:
+                logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
 
     async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
@@ -1966,10 +2034,22 @@ class GatewayNotificationsMixin:
                     )
                 return True
 
-            # Internal adapter admission bypasses the normal inbound authorization gate. Re-run the
-            # current live-transport authorization before spending the one-shot claim; an unauthorized
-            # destination is terminal for this boot notice, never a retry loop.
+            if parent_session_id:
+                verdict = await self._classify_completion_target(parent_session_id)
+                if verdict == "terminal":
+                    # Closed owners are terminal even if their transport is disconnected.
+                    return await _suppress_claimed_notice()
+                if verdict != "deliver":
+                    return False
+            # Authorization depends on the live adapter's allowlist and policy. A disconnected
+            # transport is not an authorization refusal and must not consume the one-shot trigger.
             source = await asyncio.to_thread(self._build_process_event_source, evt)
+            if source is not None:
+                platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+                if self._resolve_injection_adapter(platform, source) is None:
+                    return False
+            if not await self._completion_delivery_ready(evt):
+                return False
             if source is not None:
                 try:
                     authorized = self._is_user_authorized_for_source(source)
@@ -1978,17 +2058,6 @@ class GatewayNotificationsMixin:
                     authorized = False
                 if not authorized:
                     return await _suppress_claimed_notice()
-
-            if parent_session_id:
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "terminal":
-                    # The original owner is gone; durably suppress future boot notices rather
-                    # than waking a replacement session on every subsequent gateway start.
-                    return await _suppress_claimed_notice()
-                if verdict != "deliver":
-                    return False
-            if not await self._completion_delivery_ready(evt):
-                return False
             record, reason = claim_auto_resume_trigger(evt.get("delegation_id", ""))
             if reason is not None or record is None:
                 # Includes an explicit resume claim racing this notice, or another gateway
@@ -2018,9 +2087,15 @@ class GatewayNotificationsMixin:
         consumer; both must progress without a later foreground turn.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
         from tools.process_registry import process_registry as _pr
+        last_orphan_sweep = None
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
+                # Completions whose owner process died while this gateway runs (#97202).
+                if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
+                    last_orphan_sweep = time.monotonic()
+                    await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.

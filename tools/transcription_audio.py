@@ -247,10 +247,13 @@ def _trim_silence_for_cloud_stt(file_path: str, stt_config: Dict[str, Any]) -> O
         return None
     keep_seconds = keep_ms / 1000.0
     # start_periods=1 strips leading silence; stop_periods=-1 collapses every interior/trailing silence.
+    # detection=peak: ffmpeg 5.x's default RMS detection misjudges steady tones as silence
+    # (dense speech trims to nothing); peak gives the same result on ffmpeg 5.1 through 9.0.
     filter_expr = (
         f"silenceremove="
         f"start_periods=1:start_threshold={threshold_db}dB:start_silence={keep_seconds}:"
-        f"stop_periods=-1:stop_threshold={threshold_db}dB:stop_silence={keep_seconds}")
+        f"stop_periods=-1:stop_threshold={threshold_db}dB:stop_silence={keep_seconds}:"
+        f"detection=peak")
     work_dir = tempfile.mkdtemp(prefix="hermes-stt-trim-")
     trimmed_path = os.path.join(work_dir, f"{Path(file_path).stem or 'audio'}-trimmed.m4a")
     # Scale the all-silence guard with keep_ms: output that is solely kept pause must never upload as "speech".

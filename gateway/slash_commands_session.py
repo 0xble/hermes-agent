@@ -736,17 +736,10 @@ class GatewaySessionCommandsMixin:
         adapter = self._delivery_adapter_for(source)
         if adapter is None or not callable(getattr(adapter, "rename_dm_topic", None)):
             return "Telegram topic editing is unavailable right now."
-        if not title:
-            session_entry = await self.async_session_store.get_or_create_session(source)
-            title = await self._session_db.get_session_title(session_entry.session_id) if self._session_db else None
-        if not title:
-            topic_info = getattr(adapter, "_get_dm_topic_info", lambda *_args: None)(
-                str(source.chat_id), str(source.thread_id)
-            )
-            title = topic_info.get("name") if isinstance(topic_info, dict) else None
-        if not title:
-            return "A title is required when this topic has no saved session title."
-        title = self._sanitize_telegram_topic_title(title)
+        # An icon-only edit omits the name, so Telegram keeps the visible one: the saved session
+        # title can be stale after an earlier `--title` edit, and resending it reverted that rename.
+        if title:
+            title = self._sanitize_telegram_topic_title(title)
         icon_id = None
         if icon:
             options = await adapter.get_forum_topic_icon_options()
@@ -755,7 +748,7 @@ class GatewaySessionCommandsMixin:
                 choices = " ".join(str(item.get("emoji")) for item in options if item.get("emoji"))
                 return f"Unsupported topic icon {icon!r}. Available icons: {choices or 'none'}"
             icon_id = selected.get("custom_emoji_id")
-        kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": title}
+        kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": title or None}
         if icon_id:
             kwargs["icon_custom_emoji_id"] = icon_id
         try:
@@ -769,6 +762,8 @@ class GatewaySessionCommandsMixin:
                     emoji=icon, owner="manual", profile_name=profile)
                 sync_db.record_telegram_topic_icon_history(
                     str(source.chat_id), emoji=icon, custom_emoji_id=icon_id, profile_name=profile)
+            if not title:
+                return f"Topic icon updated: {icon}"
             return f"Topic updated: {title}" + (f" {icon}" if icon else "")
         except Exception as exc:
             logger.warning("Telegram topic edit failed: %s", exc)
@@ -779,7 +774,8 @@ class GatewaySessionCommandsMixin:
         """Handle /save — export the current session and send it as a document."""
         import tempfile
         from hermes_cli.session_export import (
-            SAVE_USAGE, default_save_filename, normalize_save_format, render_session_for_save)
+            SAVE_TRANSCRIPT_FORMATS, SAVE_USAGE, default_save_filename, normalize_save_format,
+            render_session_for_save)
 
         parts = event.get_command_args().split()
         redact = bool(parts) and parts[-1].lower() in ("redact", "--redact")
@@ -800,7 +796,7 @@ class GatewaySessionCommandsMixin:
         # Never trust path separators from chat input; the filename is only echoed to the platform.
         filename = parts[1] if len(parts) > 1 else default_save_filename(session_id, fmt)
         filename = os.path.basename(filename) or default_save_filename(session_id, fmt)
-        export_data = await self._session_db.export_session(session_id)
+        export_data = await self._session_db.export_session(session_id, include_compacted=fmt in SAVE_TRANSCRIPT_FORMATS)
         if not export_data:
             return f"No stored messages found for this session ({session_id})."
         if redact:
@@ -973,6 +969,10 @@ class GatewaySessionCommandsMixin:
         # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
         # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
         self._clear_conversation_scope(session_key, reason="resume")
+        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
+        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
+        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
+        await self.async_session_store.set_model_override(session_key, None)
         # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
         # provider cached _session_id at initialize() and would keep writing to the wrong session.
         self._evict_cached_agent(session_key)

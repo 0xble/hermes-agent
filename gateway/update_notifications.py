@@ -82,8 +82,36 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
             return True, f"Hermes is already at revision {expected[:12]}."
         if not expected or not isinstance(fleet, list) or not fleet:
             return False, "The updater finalized without verified runtime evidence. Runtime state is unknown."
-        if any(not isinstance(row, dict) or row.get("state") != "current" or row.get("code_sha") != expected for row in fleet):
+        verdicts = [_row_verdict(home, row, expected) for row in fleet]
+        if any(verdict is False for verdict in verdicts):
             return False, "The runtime verification did not confirm the updated revision. Runtime state is unverified."
+        if any(verdict is None for verdict in verdicts):
+            return None  # the enclosing gateway accepted a self-restart and has not come back yet
         return True, f"Update finalized and the running gateway revision was verified ({expected[:12]}). Interrupted work may still need recovery."
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
+
+
+def _row_verdict(home: Path, row, expected: str) -> bool | None:
+    """True when the fleet row proves the updated revision runs, None while that proof is still due.
+
+    A ``restart_pending`` row is the gateway the updater ran inside (``request_update``, cron): it
+    restarts only after the updater exits, so the receipt cannot prove the new code by construction.
+    The proof is the replacement gateway for the same home, verified live, reporting the expected
+    revision. While the recorded process still serves, the answer is pending, never a failure.
+    """
+    if not isinstance(row, dict):
+        return False
+    if row.get("state") == "current":
+        return row.get("code_sha") == expected
+    if row.get("state") != "restart_pending":
+        return False
+    from gateway.status import live_gateway_pid_for_home, read_runtime_status
+
+    live_pid = live_gateway_pid_for_home(home)
+    if live_pid is None or live_pid == row.get("pid"):
+        return None
+    runtime = read_runtime_status(home / "gateway_state.json") or {}
+    if runtime.get("pid") != live_pid or not runtime.get("code_sha"):
+        return None
+    return runtime.get("code_sha") == expected

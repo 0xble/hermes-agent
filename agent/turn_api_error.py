@@ -219,6 +219,18 @@ def handle_api_error(
     return _verdict(_ue.action, _ue.result)
 
 
+def exceeds_retry_wait_cap(agent: Any, api_error: Any) -> bool:
+    """True when the provider's declared cooldown is longer than the agent's
+    ``max_retry_wait_seconds`` (set per route by the routing owner, e.g. a reviewer with
+    fallback routes). Without a cap, or without a declared cooldown, retries are unchanged."""
+    cap = getattr(agent, "_max_retry_wait_s", None)
+    if cap is None:
+        return False
+    from agent.turn_recovery_autorecover import _retry_after_seconds
+    retry_after = _retry_after_seconds(api_error)
+    return retry_after is not None and retry_after > cap
+
+
 def _is_local_validation_error(api_error: Any) -> bool:
     """ValueError/TypeError are local bugs, except: UnicodeEncodeError (surrogate recovery
     path), json.JSONDecodeError (transient provider/network failure, must retry),
@@ -346,10 +358,17 @@ def settle_unrecovered_error(
             base_url=_base, model=_model,
         ))
 
+    over_wait_cap = exceeds_retry_wait_cap(agent, api_error)
+    if over_wait_cap:
+        # The route owner would rather move on than sit out this cooldown: settle now as an
+        # exhausted attempt so its own fallback runs in seconds instead of after the wait. The
+        # transport rebuild and the auto-recovery ladder below would each restart or park the
+        # attempt, so both are skipped too.
+        max_retries = retry_count
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for
         # transient transport errors (stale pool, TCP reset).
-        if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+        if not over_wait_cap and not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
             api_error, retry_count=retry_count, max_retries=max_retries,
         ):
             _retry.primary_recovery_attempted = True
@@ -372,7 +391,7 @@ def settle_unrecovered_error(
         # Fallback first (above); only with nothing left to move to does the bounded auto-recovery
         # ladder park the turn on a transient outage instead of ending it (#85426, #107307).
         from agent.turn_recovery_autorecover import auto_recover_after_exhaustion
-        _ladder = auto_recover_after_exhaustion(
+        _ladder = None if over_wait_cap else auto_recover_after_exhaustion(
             agent, api_error, classified, _retry, messages=messages,
             conversation_history=conversation_history, api_call_count=api_call_count,
         )

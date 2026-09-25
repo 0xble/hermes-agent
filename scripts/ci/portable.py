@@ -21,7 +21,7 @@ STATE = ROOT / '.ci'
 # Checkout-owned npm and ripgrep at the exact pins; host tools only bootstrap them.
 TOOLCHAIN = STATE / 'toolchain'
 PINS = json.loads((ROOT / 'scripts/ci/toolchain.json').read_text(encoding='utf-8'))
-EXTRAS = ('all', 'dev', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'hindsight', 'parallel-web')
+EXTRAS = ('all', 'dev', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'parallel-web')
 LANES = {
     'static': 'Blocking lint, source policies, attribution, history and lock consistency',
     'python': 'Canonical full tests (excludes integration/e2e/docker)',
@@ -107,12 +107,12 @@ def fingerprints(root: Path, paths: list[str]) -> dict[str, str]:
 
 @contextmanager
 def source_unchanged() -> Iterator[None]:
-    paths = source_files()
-    before = fingerprints(ROOT, paths)
+    before = fingerprints(ROOT, source_files(ROOT))
     try:
         yield
     finally:
-        after = fingerprints(ROOT, paths)
+        # Re-enumerate: source created during CI is a mutation too, not only edits to known files.
+        after = fingerprints(ROOT, source_files(ROOT))
         changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
         if changed:
             raise RuntimeError('CI modified source files: ' + ', '.join(changed))
@@ -232,7 +232,12 @@ def history_policy() -> None:
     base = git('merge-base', 'origin/main', 'HEAD').strip()
     if not base:
         raise RuntimeError('No common ancestor with origin/main')
-    emails = git('log', f'{base}..HEAD', '--format=%ae', '--no-merges').splitlines()
+    # Upstream release ancestry is attributed upstream; only fork commits need mappings here.
+    sys.path.insert(0, str(ROOT / 'scripts/ci'))
+    from release_baseline import accepted_release_baseline
+    release = accepted_release_baseline(ROOT)
+    emails = git('log', f'{base}..HEAD', *([f'^{release}'] if release else []),
+                 '--format=%ae', '--no-merges').splitlines()
     legacy = (ROOT / 'scripts/release.py').read_text(encoding='utf-8')
     missing = []
     for email in sorted(set(emails)):
@@ -275,12 +280,29 @@ def static(env: dict[str, str]) -> None:
         raise RuntimeError('Blocking static checks failed')
 
 
+# Hermes picks DELETE journal mode on a SQLite with the WAL-reset bug, and the WAL test arms skip
+# there, so a vulnerable interpreter would pass every lane without exercising WAL. Fail closed.
+SQLITE_WAL_PROBE = ("import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); "
+                    "print(f'SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)")
+
+
+def require_wal_capable_sqlite(py: str, env: dict[str, str]) -> None:
+    probe = subprocess.run([py, '-c', SQLITE_WAL_PROBE], cwd=ROOT, env=env, capture_output=True,
+                           text=True, encoding='utf-8', errors='replace')
+    if probe.returncode != 0:
+        detail = (probe.stdout + probe.stderr).strip()
+        raise RuntimeError(f'Checkout Python must link a WAL-capable SQLite, or WAL tests silently skip: {detail}')
+
+
 def python_tests(env: dict[str, str], roots: list[str], workers: int,
-                 pytest_args: list[str] | None = None) -> None:
+                 pytest_args: list[str] | None = None, file_timeout: int | None = None) -> None:
     py = python(env)
+    require_wal_capable_sqlite(py, env)
     require_tools(('rg',), env)
     env = dict(env)
     env['HERMES_PYTHON'] = py
+    if file_timeout is not None:
+        env['HERMES_TEST_FILE_TIMEOUT'] = str(file_timeout)
     command = ['bash', 'scripts/run_tests.sh', '-j', str(workers), '--file-retries', '0',
                *roots, *(pytest_args or [])]
     # The runner provides a disk-backed original HOME outside the checkout.
@@ -292,6 +314,31 @@ def python_tests(env: dict[str, str], roots: list[str], workers: int,
             run(command, env=env)
     else:
         run(command, env=env)
+
+
+# Each upgrade file drives several real N-1 -> HEAD installs and updates. The
+# path suite takes about 415 s on an idle Linux container, past the runner's
+# 300 s per-file default, so upstream runs this directory in its own job.
+# Only this directory gets the larger finite bound. Other e2e files keep the default.
+E2E_UPGRADE_ROOT = 'tests/e2e/core/upgrade'
+E2E_UPGRADE_FILE_TIMEOUT = 900
+
+
+def e2e_tests(env: dict[str, str], workers: int) -> None:
+    upgrade = ROOT / E2E_UPGRADE_ROOT
+    files = sorted(
+        path.relative_to(ROOT).as_posix() for path in (ROOT / 'tests/e2e').rglob('test_*.py')
+        if not path.is_relative_to(upgrade)
+        and not {'integration', 'docker'} & set(path.relative_to(ROOT).parts)
+    )
+    failures = []
+    for roots, timeout in ((files, None), ([E2E_UPGRADE_ROOT], E2E_UPGRADE_FILE_TIMEOUT)):
+        try:
+            python_tests(env, roots, workers, file_timeout=timeout)
+        except subprocess.CalledProcessError as error:
+            failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 def native_os(env: dict[str, str], workers: int) -> None:
@@ -466,7 +513,7 @@ def main() -> int:
             'python-gate': lambda: python_tests(env, list(GATE_PYTHON_FILES), args.workers),
             'node-gate': lambda: node_gate(env, args.node_workers),
             'python': lambda: python_tests(env, ['tests'], args.workers),
-            'e2e': lambda: python_tests(env, ['tests/e2e'], args.workers),
+            'e2e': lambda: e2e_tests(env, args.workers),
             'node': lambda: node(env, args.node_workers),
             'docs': lambda: docs(env),
             'rust': lambda: rust(env),

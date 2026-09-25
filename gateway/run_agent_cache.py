@@ -160,10 +160,13 @@ class GatewayAgentCacheMixin:
             return
         override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
+        from hermes_cli.runtime_provider import is_foreign_provider_endpoint
+        if is_foreign_provider_endpoint(provider, override.get("base_url")):
+            override["base_url"] = None  # left over from a switch that kept the previous provider's URL
         if provider:
             # Re-resolve credentials for the persisted provider. On failure (e.g. credentials removed
             # since the switch) keep the credential-less override — _resolve_session_agent_runtime
-            # falls back to env resolution and layers model/provider.
+            # retries the resolution for that provider on each turn (default route + notice meanwhile).
             try:
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider, target_model=persisted.get("model") or None)
                 for k in ("api_key", "api_mode", "credential_pool", "requested_provider", "max_tokens"):
@@ -514,6 +517,12 @@ class GatewayAgentCacheMixin:
             except Exception:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
         adapter = self._delivery_adapter_for(source)
+        # /stop, /new, and /reset invalidate the adapter-side deferred-command queue too. The
+        # runner's turn generation protects agent state, but queued slash events live on adapters
+        # and otherwise could drain into the replacement session.
+        invalidate_deferred = getattr(adapter, "_invalidate_deferred_commands", None)
+        if adapter and callable(invalidate_deferred):
+            invalidate_deferred(session_key)
         interrupt_session_activity = getattr(type(adapter), "interrupt_session_activity", None)
         if adapter and callable(interrupt_session_activity):
             metadata = self._thread_metadata_for_source(source)

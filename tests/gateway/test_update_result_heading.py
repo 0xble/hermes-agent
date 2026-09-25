@@ -39,3 +39,21 @@ def test_update_result_heading_reports_process_failure(tmp_path: Path) -> None:
 
     assert heading == "❌ Update Failed"
     assert "code 7" in detail
+
+
+def test_same_revision_with_verified_restart_is_not_reported_as_noop(tmp_path: Path) -> None:
+    """Checkout repair and fleet catch-up keep the SHA but restart the gateway."""
+    receipt_dir = tmp_path / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "latest.json").write_text(json.dumps({
+        "pre_update": {"sha": "a" * 40},
+        "post_update": {"sha": "a" * 40},
+        "gateway_restart": {"restarted_services": ["gateway"]},
+        "fleet": [{"profile": "default", "state": "current", "code_sha": "a" * 40}],
+    }))
+
+    heading, detail = GatewayNotificationsMixin._update_result_heading(tmp_path, {}, 0)
+
+    assert heading == "✅ Update Complete"
+    assert "not restarted" not in detail
+    assert "restarted" in detail and "a" * 12 in detail

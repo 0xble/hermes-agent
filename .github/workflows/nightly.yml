@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
+      # PID 1 must reap orphaned descendants from the process-tree tests.
+      options: --init
     steps:
       - name: Install Git for checkout
         shell: bash
@@ -30,21 +32,40 @@ jobs:
       - name: Assert scheduled or dispatched SHA
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
+      - name: Fetch upstream release tags for historical upgrade tests
+        shell: bash
+        run: |
+          # The fork does not publish upstream's newer release tags. Without them,
+          # git describe stages the August release instead of the previous release.
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
+            'refs/tags/v20*:refs/tags/v20*'
+          git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1
       - name: Install pinned Linux toolchain and platform libraries
         shell: bash
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
+          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
           python3 ci/install-linux-tools.py amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
-          uv python install 3.11.14
+          uv python install 3.11.16
           npm install --global npm@12.0.0
       - name: Broad exact-SHA source profile
         shell: bash
-        run: ./bin/ci nightly '${{ github.sha }}'
+        run: |
+          # Root is only needed for apt and the pinned toolchain installation.
+          # PostgreSQL, permissions, and user-systemd tests need a regular user.
+          # runuser resets HOME to the passwd home; keep the runner's disk-backed
+          # HOME (root-installed toolchain state and large test scratch live there).
+          useradd --uid 1001 --create-home --shell /bin/bash ci
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
+          runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}'
+  desktop-core:
+    # The deterministic Desktop core E2E suite (transcript integrity, backend
+    # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.
+    uses: ./.github/workflows/e2e-desktop-core.yml
   qualification:
     if: always()
-    needs: [linux]
+    needs: [linux, desktop-core]
     runs-on: ubuntu-latest
     steps:
       - name: Require every nightly job

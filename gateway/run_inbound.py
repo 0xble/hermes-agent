@@ -1047,7 +1047,8 @@ class GatewayInboundMixin:
             or self._gateway_idle_command_handlers().get(canonical)
         )
         if plain_handler is not None:
-            return True, await plain_handler(event)
+            async with self._async_profile_scope_for_source(source):
+                return True, await plain_handler(event)
         if canonical in self._HM_CANONICAL_COMMANDS:
             return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
         return False, None
@@ -1431,8 +1432,11 @@ class GatewayInboundMixin:
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
             self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
             # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-            # recovery pass.
-            await self._clear_durable_active_turn(event)
+            # recovery pass. A turn the adapter delivers hands its marker to that lifecycle, which
+            # clears it only once the reply is in the delivery ledger (else a kill in between
+            # left neither marker nor ledger row and the persisted reply was never sent).
+            if not getattr(event, "_turn_marker_handoff", False):
+                await self._clear_durable_active_turn(event)
             # Release only this turn's generation. Eviction may immediately admit a replacement
             # through the cold path; an unconditional release here would then clear the replacement
             # sentinel/agent and lease. Reset/stop release their stale slot before installing a
@@ -1441,6 +1445,12 @@ class GatewayInboundMixin:
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            # Deferred commands wait for the runner's turn, not the adapter task that received them:
+            # the two can diverge (an internal wake running after /stop), so resume them here.
+            _deferred_adapter = self._delivery_adapter_for(source)
+            _resume_deferred = getattr(_deferred_adapter, "resume_deferred_commands", None)
+            if callable(_resume_deferred):
+                _resume_deferred(_quick_key)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.

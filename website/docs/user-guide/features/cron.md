@@ -79,8 +79,10 @@ Hermes will use the unified `cronjob_manage` tool internally.
 Before constructing any agent machinery for a scheduled run, the scheduler
 validates that the job's configuration can actually produce a successful run:
 
-- the provider API key resolves (skipped when a `fallback_providers` chain is
-  configured, since the fallback path may rescue a missing primary key),
+- the provider API key resolves (skipped for an unpinned job when a
+  `fallback_providers` chain is configured, since the fallback path may rescue a
+  missing primary key; a pinned job does not use that chain, so it is always
+  checked),
 - attached skills are ready (no missing required environment variables,
   commands, or credential files),
 - delivery platform targets are known and have gateway credentials configured
@@ -1007,10 +1009,10 @@ From the CLI: `hermes cron create "every 6h" "Scan for news" --continuity`, and 
 
 ## Provider recovery
 
-Cron jobs inherit your configured fallback providers and credential pool rotation. If the primary API key is rate-limited or the provider returns an error, the cron agent can:
+If the primary API key is rate-limited or the provider returns an error, the cron agent can:
 
-- **Fall back to an alternate provider** if you have `fallback_providers` (or the legacy `fallback_model`) configured in `config.yaml`
-- **Rotate to the next credential** in your [credential pool](../configuration.md#credential-pool-strategies) for the same provider
+- **Rotate to the next credential** in your [credential pool](../configuration.md#credential-pool-strategies) for the same provider. This applies to every job, pinned or not.
+- **Fall back to an alternate provider** from `fallback_providers` (or the legacy `fallback_model`) in `config.yaml` — **unpinned jobs only**. That covers a failure while resolving credentials before the run starts and a provider error mid-run.
 
 To give cron agents a separate fallback chain, set `cron.fallback_providers`:
 
@@ -1023,15 +1025,18 @@ cron:
       model: claude-sonnet-4
 ```
 
-Omitting this setting or setting it to `null` inherits the top-level
-`fallback_providers` and legacy `fallback_model` chain. An explicit list replaces
-that chain for all cron agents, including jobs with a primary model/provider pin.
+Omitting this setting or setting it to `null` lets unpinned jobs inherit the top-level
+`fallback_providers` and legacy `fallback_model` chain. A job pinned to its own
+`provider`, `model`, or `base_url` does not borrow that global chain. An explicit
+cron list replaces it for all cron agents, including pinned jobs.
 An empty list (`[]`) disables cron provider fallback. Entries use the same format
 and normalization as the global chain. Invalid entries are ignored without
 restoring the global chain.
 
 This setting applies to preflight credential checks, provider-resolution recovery,
-and the cron agent's model-call fallback. It leaves interactive sessions,
+and the cron agent's model-call fallback. Pinned jobs without an explicit cron
+chain fail on provider outage, but same-provider credential rotation still works.
+It leaves interactive sessions,
 delegation settings, auxiliary-task routing, and same-provider credential rotation
 unchanged. Per-job fallback lists are not supported.
 

@@ -259,25 +259,56 @@ def is_network_accessible(host: str) -> bool:
         return True
 
 
+# ``scutil --proxy`` is a fork+exec (~11 ms measured) and resolve_proxy_url runs it on the SEND path —
+# per chunk of an outbound message and per media attachment, not once per adapter. The answer is an
+# OS-level network setting that changes when someone edits Network Settings or joins a VPN, so it is
+# cached briefly rather than per call. The TTL is the staleness a proxy change can suffer; a send that
+# goes out on a stale answer fails and is retried, which is the same outcome as any transient proxy error.
+# No lock: a race costs one extra fork and both answers are equally current.
+_MACOS_PROXY_TTL_SECONDS = 60.0
+_macos_proxy_cache: "tuple[float, str | None] | None" = None
+
+
 def _detect_macos_system_proxy() -> str | None:
     """Read the macOS system HTTP(S) proxy via ``scutil --proxy``: ``http://host:port``
-    when an HTTP(S) proxy is enabled, else None (non-macOS or any subprocess error)."""
+    when an HTTP(S) proxy is enabled, else None (non-macOS or any subprocess error).
+
+    Memoised for ``_MACOS_PROXY_TTL_SECONDS``; call :func:`reset_macos_proxy_cache` to force a re-read.
+    """
+    global _macos_proxy_cache
+
     if sys.platform != "darwin":
         return None
+    cached = _macos_proxy_cache
+    now = time.monotonic()
+    if cached is not None and (now - cached[0]) < _MACOS_PROXY_TTL_SECONDS:
+        return cached[1]
     try:
         out = subprocess.check_output(["scutil", "--proxy"], timeout=3, text=True, encoding='utf-8',
                                       errors='replace', stderr=subprocess.DEVNULL)
     except Exception:
+        # Cache the failure too: a broken/slow scutil must not re-fork on every chunk.
+        _macos_proxy_cache = (now, None)
         return None
     props = {
         key.strip(): val.strip()
         for key, sep, val in (line.strip().partition(" : ") for line in out.splitlines()) if sep}
     # Prefer HTTPS, fall back to HTTP
+    resolved = None
     for enable_key, host_key, port_key in (
         ("HTTPSEnable", "HTTPSProxy", "HTTPSPort"), ("HTTPEnable", "HTTPProxy", "HTTPPort")):
         if props.get(enable_key) == "1" and props.get(host_key) and props.get(port_key):
-            return f"http://{props[host_key]}:{props[port_key]}"
-    return None
+            resolved = f"http://{props[host_key]}:{props[port_key]}"
+            break
+    _macos_proxy_cache = (now, resolved)
+    return resolved
+
+
+def reset_macos_proxy_cache() -> None:
+    """Drop the memoised ``scutil --proxy`` answer so the next call re-reads it."""
+    global _macos_proxy_cache
+
+    _macos_proxy_cache = None
 
 
 def should_bypass_proxy(target_hosts: str | list[str] | tuple[str, ...] | set[str] | None) -> bool:
@@ -1895,7 +1926,11 @@ class BasePlatformAdapter(ABC):
         # Commands accepted while a turn is active but requiring a committed session boundary.
         # Kept separate from ordinary follow-up text so a deferred mutation cannot be merged into
         # or displaced by the one-slot prompt queue.
-        self._deferred_commands: Dict[str, List[MessageEvent]] = {}
+        self._deferred_commands: Dict[str, List[tuple[str, int, MessageEvent]]] = {}
+        # Monotonic identity for the committed session represented by each session key. A
+        # deferred event from an older incarnation must never run after /new, /reset, /stop,
+        # shutdown, or any other teardown/replacement path reuses the key.
+        self._session_generations: Dict[str, int] = {}
 
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
@@ -1938,7 +1973,9 @@ class BasePlatformAdapter(ABC):
         # Per-chat status phrase; the regular _keep_typing refresh renders it (no extra API calls).
         self._status_text: Dict[str, str] = {}
 
-    def defer_command_until_idle(self, session_key: str, event: MessageEvent) -> int:
+    _MAX_DEFERRED_COMMANDS_PER_SESSION = 8
+
+    def defer_command_until_idle(self, session_key: str, event: MessageEvent) -> Optional[int]:
         """Record a command for execution after the active session turn commits.
 
         Returns the 1-based queue depth. Deferred commands are deliberately separate from
@@ -1946,17 +1983,75 @@ class BasePlatformAdapter(ABC):
         must retain its command identity and execute before that prompt.
         """
         queue = self._deferred_commands.setdefault(session_key, [])
-        queue.append(event)
+        if len(queue) >= self._MAX_DEFERRED_COMMANDS_PER_SESSION:
+            return None
+        generation = self._session_generations.setdefault(session_key, 0)
+        setattr(event, "_deferred_session_key", session_key)
+        setattr(event, "_deferred_generation", generation)
+        queue.append((session_key, generation, event))
         return len(queue)
 
     def _pop_deferred_command(self, session_key: str) -> Optional[MessageEvent]:
         queue = self._deferred_commands.get(session_key)
+        while queue:
+            queued_session, queued_generation, event = queue[0]
+            current_generation = self._session_generations.get(session_key, 0)
+            if not (queued_session == session_key
+                    and getattr(event, "_deferred_session_key", None) == session_key
+                    and queued_generation == current_generation
+                    and getattr(event, "_deferred_generation", None) == current_generation):
+                queue.pop(0)
+                continue
+            if getattr(event, "_deferred_parked", False):
+                # Parked by the runner: its turn is still running. Only resume_deferred_commands,
+                # called when that turn releases, may run it; draining here would spin.
+                return None
+            queue.pop(0)
+            if not queue:
+                self._deferred_commands.pop(session_key, None)
+            return event
+        self._deferred_commands.pop(session_key, None)
+        return None
+
+    def park_deferred_command(self, session_key: str, event: MessageEvent) -> None:
+        """Return a replayed deferred command to the head of its queue without re-acknowledging it.
+
+        The adapter drains deferred commands when its own task ends, but the runner can still own a
+        turn the adapter never saw (an internal wake admitted after ``/stop``). The replay then finds
+        the session busy; re-deferring it as a new command re-acks and re-drains it immediately, in
+        a loop. A parked command waits for ``resume_deferred_commands`` instead.
+        """
+        generation = self._session_generations.get(session_key, 0)
+        if (getattr(event, "_deferred_session_key", None) != session_key
+                or getattr(event, "_deferred_generation", None) != generation):
+            return
+        setattr(event, "_deferred_parked", True)
+        self._deferred_commands.setdefault(session_key, []).insert(0, (session_key, generation, event))
+
+    def resume_deferred_commands(self, session_key: str) -> None:
+        """Called by the runner when a turn releases: unpark queued commands and, if no adapter task
+        owns the session, start the next one. An owning task drains them when it finishes."""
+        queue = self._deferred_commands.get(session_key)
         if not queue:
-            return None
-        event = queue.pop(0)
-        if not queue:
-            self._deferred_commands.pop(session_key, None)
-        return event
+            return
+        for _session, _generation, event in queue:
+            if getattr(event, "_deferred_parked", False):
+                setattr(event, "_deferred_parked", False)
+        if session_key in self._active_sessions:
+            return
+        deferred = self._pop_deferred_command(session_key)
+        if deferred is not None:
+            self._start_session_processing(deferred, session_key)
+
+    def _invalidate_deferred_commands(self, session_key: str) -> None:
+        """Advance the session incarnation and discard commands from the old one."""
+        self._session_generations[session_key] = self._session_generations.get(session_key, 0) + 1
+        self._deferred_commands.pop(session_key, None)
+
+    def _invalidate_all_deferred_commands(self) -> None:
+        """Fence every queued command during adapter shutdown/replacement."""
+        for session_key in set(self._session_generations) | set(self._deferred_commands):
+            self._invalidate_deferred_commands(session_key)
     @property
     def message_len_fn(self) -> Callable[[str], int]:
         """Length function for message size; override where the platform counts
@@ -3863,6 +3958,7 @@ class BasePlatformAdapter(ABC):
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
+        self._invalidate_deferred_commands(session_key)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -3900,6 +3996,9 @@ class BasePlatformAdapter(ABC):
         """Cancel in-flight processing for one session. ``release_guard=False`` keeps the guard so
         reset-like commands finish atomically; the await is bounded (5s) so a wedged finally can't
         stall."""
+        # Cancellation is a teardown boundary: commands captured for the old turn must not
+        # cross it, even when the caller keeps the guard to finish /new or /reset atomically.
+        self._invalidate_deferred_commands(session_key)
         task = self._session_tasks.pop(session_key, None)
         if task is not None and not task.done():
             logger.debug("[%s] Cancelling active processing for session %s", self.name, session_key)
@@ -4275,7 +4374,7 @@ class BasePlatformAdapter(ABC):
 
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
-        reply_to: Optional[str], is_ephemeral_response: bool = False,
+        reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
@@ -4289,19 +4388,32 @@ class BasePlatformAdapter(ABC):
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        if obligation_id is not None and release_marker:
+            # The ledger now owns the crash recovery. It carries text only, so a caller with
+            # attachments still to send keeps the marker until they are delivered.
+            await self._release_turn_marker(event)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
 
+    async def _release_turn_marker(self, event: MessageEvent) -> None:
+        """Clear the crash-recovery marker the runner handed to this delivery lifecycle
+        (``_turn_marker_handoff``): only once the final reply is ledgered or nothing more is owed,
+        so no kill leaves a persisted reply with neither marker nor ledger row. Idempotent."""
+        if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
+            await self.gateway_runner._clear_durable_active_turn(event)
+
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable,
+        attachments_pending: bool = False) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
-            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
+            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,
+            release_marker=not attachments_pending)
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
@@ -4431,16 +4543,23 @@ class BasePlatformAdapter(ABC):
         it."""
         # Deferred control commands run before ordinary queued text, against the committed
         # transcript/context produced by this turn. Keep any ordinary follow-up in its slot.
-        deferred = self._pop_deferred_command(session_key)
-        late_pending = self._pending_messages.pop(session_key, None)
-        if deferred is not None:
-            if late_pending is not None:
-                self._pending_messages[session_key] = late_pending
-            self._spawn_drain_task(deferred, session_key)
-            return
         current_task = asyncio.current_task()
+        existing_task = self._session_tasks.get(session_key)
+        if existing_task is not None and existing_task is not current_task and not existing_task.done():
+            # The in-band drain (or an earlier late-arrival drain) already handed the session to a
+            # successor task; it drains deferred commands and queued text in order. Spawning here would
+            # run two tasks on one session.
+            return
+        if interrupt_event.is_set():
+            self._invalidate_deferred_commands(session_key)
+        deferred = None if interrupt_event.is_set() else self._pop_deferred_command(session_key)
+        if deferred is not None:
+            if not self._spawn_drain_task(deferred, session_key):
+                if current_task is not None and self._session_tasks.get(session_key) is current_task:
+                    self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
+        late_pending = self._pending_messages.pop(session_key, None)
         if late_pending is not None:
-            existing_task = self._session_tasks.get(session_key)
             if existing_task is not None and existing_task is not current_task:
                 # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
                 # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
@@ -4458,6 +4577,16 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        deferred_session = getattr(event, "_deferred_session_key", None)
+        if deferred_session is not None:
+            current_generation = self._session_generations.get(session_key, 0)
+            if (deferred_session != session_key
+                    or getattr(event, "_deferred_generation", None) != current_generation):
+                logger.info("[%s] Dropping stale deferred command for session %s", self.name, session_key)
+                current_task = asyncio.current_task()
+                if current_task is not None and self._session_tasks.get(session_key) is current_task:
+                    self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
+                return
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
         def _record_delivery(result):
@@ -4472,6 +4601,7 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
+            event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
@@ -4526,11 +4656,14 @@ class BasePlatformAdapter(ABC):
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
-                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                        is_ephemeral_response, _ephemeral_ttl, _record_delivery,
+                        attachments_pending=bool(
+                            extracted.images or extracted.media_files or extracted.local_files))
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+            await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
@@ -4542,8 +4675,12 @@ class BasePlatformAdapter(ABC):
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
-            if session_key in self._pending_messages:
+            # Deferred control commands run before ordinary queued text, against the transcript this
+            # turn committed; the ordinary follow-up keeps its slot for the command task's handoff.
+            pending_event = self._pop_deferred_command(session_key)
+            if pending_event is None and session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
+            if pending_event is not None:
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
@@ -4563,6 +4700,8 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            await self._release_turn_marker(event)
+            event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
@@ -4574,14 +4713,22 @@ class BasePlatformAdapter(ABC):
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
 
-    def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
+    def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> bool:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained
         follow-ups grew the C stack to SIGSEGV). Clearing (not deleting) the Event keeps the guard
         live for concurrent inbound; ownership moves so stale-lock detection works."""
+        deferred_session = getattr(pending_event, "_deferred_session_key", None)
+        if deferred_session is not None:
+            current_generation = self._session_generations.get(session_key, 0)
+            if (deferred_session != session_key
+                    or getattr(pending_event, "_deferred_generation", None) != current_generation):
+                logger.info("[%s] Not spawning stale deferred command for session %s", self.name, session_key)
+                return False
         self._clear_session_guard(session_key)
         self._track_session_task(
             session_key,
             asyncio.create_task(self._process_message_background(pending_event, session_key)))
+        return True
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""
@@ -4610,6 +4757,9 @@ class BasePlatformAdapter(ABC):
     async def cancel_background_tasks(self) -> None:
         """Cancel in-flight background tasks (shutdown/replacement); 5s bound each,
         stragglers are untracked and left to unwind."""
+        # Fence deferred commands first: a cancelled owner's cleanup would otherwise drain one (task
+        # cancellation does not set its interrupt event) and mutate a transcript during teardown.
+        self._invalidate_all_deferred_commands()
         # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
         # untrack.
         for _ in range(5):
@@ -4628,13 +4778,15 @@ class BasePlatformAdapter(ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
+        self._invalidate_all_deferred_commands()
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
             from gateway.shutdown_flush import flush_pending_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
-                       self._pending_messages, self._active_sessions, self._text_debounce_store()):
+                       self._pending_messages, self._deferred_commands, self._active_sessions,
+                       self._text_debounce_store()):
             bucket.clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:

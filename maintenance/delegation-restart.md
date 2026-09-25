@@ -67,7 +67,10 @@ or how an interrupted child reports why it stopped.
   live/routable, takes a separate durable one-shot notice claim, and injects a
   synthetic turn that asks the parent to call the explicit `resume` action. It never
   reconstructs a child directly; unavailable/closed parents are suppressed. Set
-  `gateway.auto_resume_on_boot: false` to disable this queueing path.
+  `gateway.auto_resume_on_boot: false` to disable this queueing path. The key is
+  bridged from `config.yaml` in `gateway/config_loader.py`'s top-level bridge (either
+  top-level or under `gateway:`); a setting missing from that bridge is silently
+  dropped, so guard it on the real YAML path (`test_yaml_startup_honours_auto_resume_on_boot`).
 
 ## Provenance and patches
 

@@ -71,8 +71,11 @@ _OP_ERROR_RULES = (
     (ErrorKind.BINARY_MISSING, ("not found on path", "not an executable", "failed to invoke")),
     (ErrorKind.AUTH_FAILED, ("unauthorized", "not signed in", "session expired",
                              "authentication", "401", "403")),
+    # After AUTH_FAILED: a message naming both is a rejection, which must evict rather than
+    # fall back to the last good values (_STALE_OK_KINDS).
+    (ErrorKind.RATE_LIMITED, ("too many requests", "rate-limited", "rate limited")),
     (ErrorKind.EMPTY_VALUE, ("empty value",)),
-    (ErrorKind.NETWORK, ("network", "connection", "resolve host", "dns")),
+    (ErrorKind.NETWORK, ("network", "connection", "resolve host", "dns", "no such host", "dial tcp")),
 )
 
 
@@ -86,6 +89,9 @@ def _classify_op_error(message: str) -> ErrorKind:
 # Slow or unreachable backends are a different class and invalidate nothing entirely
 # (see the ErrorKind docstring in ``base``).
 _AUTH_ERROR_KINDS = frozenset({ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED})
+# Failures that say nothing about the values already resolved: serving the last good value
+# for them keeps startup working through an outage or an exhausted account quota.
+_STALE_OK_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT, ErrorKind.RATE_LIMITED})
 
 
 def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
@@ -157,7 +163,12 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
                    timeout_message=f"op read timed out after {_OP_RUN_TIMEOUT}s for {reference!r}", stdin=None)
 
     if proc.returncode != 0:
-        err = _scrub(proc.stderr or "")[:200]
+        err = _scrub(proc.stderr or "").strip()
+        # op puts the reason last ("could not read secret '<ref>': could not get item
+        # <vault>/<item>: Too many requests…"); a long item path pushes it past a head cut,
+        # and an unclassifiable reason disables the last-good fallback for the whole pull.
+        if len(err) > 300:
+            err = "…" + err[-300:]
         if err:
             raise RuntimeError(f"op read failed for {reference!r}: {err}")
         raise RuntimeError(f"op read exited {proc.returncode} for {reference!r}")
@@ -248,7 +259,22 @@ def fetch_onepassword_secrets(
             _STORE.disk.clear(home_path)
         return secrets, warnings
 
-    if use_cache and secrets:
+    stale_used: List[str] = []
+    if use_cache and cache_ttl_seconds > 0 and failure_kinds and all(k in _STALE_OK_KINDS for k in failure_kinds):
+        # Every failure was transient, so the last good value for a ref is still the
+        # best answer. Served for this process only: the stale entry is never re-stored
+        # under a fresh timestamp, so the next start retries the backend.
+        stale = _STORE.disk.read(cache_key, float("inf"), home_path)
+        if stale is not None:
+            stale_used = [n for n in valid if n not in secrets and n in stale.secrets]
+            for name in stale_used:
+                secrets[name] = stale.secrets[name]
+            if stale_used:
+                age = int(max(0.0, time.time() - stale.fetched_at))
+                warnings.append(f"1Password unavailable ({failure_kinds[0].value}); served {len(stale_used)} "
+                                f"value(s) from the last good cache ({age}s old)")
+
+    if use_cache and secrets and not stale_used:
         # Age the entry from the oldest value it carries, so reusing a partial entry
         # cannot extend a carried-over value past the configured TTL.
         fetched_at = prefetched_at if prefetched and prefetched_at is not None else time.time()

@@ -47,8 +47,10 @@ async def test_boot_notice_suppresses_unauthorized_target_before_claimed_injecti
     runner._build_process_event_source = Mock(return_value=SessionSource(
         platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm", user_id="foreign",
     ))
+    runner._resolve_injection_adapter = Mock(return_value=object())
+    runner._completion_delivery_ready = AsyncMock(return_value=True)
     runner._is_user_authorized_for_source = Mock(return_value=False)
-    runner._classify_completion_target = AsyncMock(side_effect=AssertionError("authorization must precede target checks"))
+    runner._classify_completion_target = AsyncMock(return_value="deliver")
     runner._inject_watch_notification = AsyncMock(side_effect=AssertionError("unauthorized target was injected"))
 
     seen = []
@@ -69,6 +71,37 @@ async def test_boot_notice_suppresses_unauthorized_target_before_claimed_injecti
     assert await runner._deliver_auto_resume_notice(evt) is True
     assert seen == [("deleg-unauthorized", "boot:unauthorized")]
     runner._is_user_authorized_for_source.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_boot_notice_defers_disconnected_owner_then_delivers_after_reconnect(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._completion_event_scope = lambda _evt: nullcontext()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm", user_id="owner")
+    runner._build_process_event_source = Mock(return_value=source)
+    adapter = object()
+    runner._resolve_injection_adapter = Mock(return_value=None)
+    runner._is_user_authorized_for_source = Mock(return_value=False)
+    runner._classify_completion_target = AsyncMock(return_value="deliver")
+    runner._completion_delivery_ready = AsyncMock(return_value=True)
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    seen = []
+    monkeypatch.setattr("tools.delegation_resume.claim_auto_resume_trigger",
+                        lambda _id: (seen.append("claim") or {"auto_resume_claim": "boot:claim"}, None))
+    monkeypatch.setattr("tools.delegation_resume.complete_auto_resume_trigger",
+                        lambda *_args: seen.append("complete"))
+    monkeypatch.setattr("tools.delegation_resume.release_auto_resume_trigger",
+                        lambda *_args: seen.append("release"))
+    evt = {"type": "delegation_auto_resume", "delegation_id": "deleg-reconnect",
+           "parent_session_id": "parent-reconnect", "text": "resume"}
+    assert await runner._deliver_auto_resume_notice(evt) is False
+    assert seen == []
+    runner._is_user_authorized_for_source.assert_not_called()
+    runner._resolve_injection_adapter.return_value = adapter
+    runner._is_user_authorized_for_source.return_value = True
+    assert await runner._deliver_auto_resume_notice(evt) is True
+    assert seen == ["claim", "complete"]
+    runner._inject_watch_notification.assert_awaited_once()
 
 
 @pytest.mark.asyncio

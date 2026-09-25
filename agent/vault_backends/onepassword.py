@@ -8,6 +8,12 @@ urls, username / masked card number. Resolve: ``op item get <id> --vault
 <vault-id> ...``, selecting the item's vault from fresh listing metadata
 (required for service accounts). Cards carry no origin: the browser fill
 binds them to the page it is on and the user confirms that origin per fill.
+
+Additional accounts (``vault.onepassword.accounts``) are separate backend instances
+with ``op@<alias>:`` handles. Each authenticates only with its own service-account
+token (never Connect, never an interactive session), so a handle can never resolve
+under another account's credential. ``browser_account`` pins an account's fills to
+one named Camofox browser account.
 """
 
 from __future__ import annotations
@@ -15,20 +21,35 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+from agent.secret_sources._cache import fingerprint as _fingerprint
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
-from agent.vault_backends.base import LoginBackend, UnlockRequired, run_with_stdin_secret
+from agent.vault_backends.base import LoginBackend, MissingCredential, UnlockRequired, run_with_stdin_secret
 from agent.vault_backends import unlock as _unlock
 from agent.vault_store import VaultItemMeta, normalize_origin, normalize_otp_secret, totp_now
 
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
+_DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
+_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _CATEGORIES = "Login,Credit Card"  # one listing feeds both metadata and the vault selector
+# `op item list` output, reused briefly for display listings only (browser_vault_list is
+# called repeatedly against a per-account request quota). Metadata only, never secrets.
+# Anything that authorizes a fill (get_meta's origins, _locate's vault) always lists fresh.
+_LISTING_TTL_SECONDS = 120.0
+_LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+_LISTING_LOCK = threading.Lock()
+# A bare "host[.tld][:port][/path]" website. Anything else without "://" (mailto:, user@host,
+# javascript:) stays unparseable rather than being coerced into an https origin.
+_BARE_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+(?::\d{1,5})?(?:[/?#][^\s]*)?")
 
 # 1Password Credit Card field ids → local-vault PAYMENT_FIELDS keys (agent/vault_store.py).
 # ``expiry`` is YYYYMM and is split below; ZIP has no stable id so it is matched by label.
@@ -63,11 +84,49 @@ class OnePasswordLoginBackend(LoginBackend):
     needs_unlock = True
     binds_cards_to_page = True
 
-    def __init__(self, cfg: Optional[Dict] = None):
+    def __init__(self, cfg: Optional[Dict] = None, *, alias: str = ""):
         self.cfg = cfg or {}
+        self.alias = alias
+        if alias:
+            # Instance attributes shadow the class defaults: a distinct name keeps unlock state
+            # and diagnostics apart, and a distinct prefix routes handles without a lookup table.
+            self.name = f"onepassword@{alias}"
+            self.display_name = f"1Password ({alias})"
+            self.prefix = f"op@{alias}:"
+            self.needs_unlock = False  # service-account only; there is nothing to prompt for
+            self.browser_account = str(self.cfg.get("browser_account") or "").strip().lower()
         from agent.secret_scope import get_secret
-        env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
-        self._service_token = get_secret(env_name, "") or ""
+        self._token_env = str(self.cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV)
+        self._service_token = get_secret(self._token_env, "") or ""
+
+    @classmethod
+    def additional_accounts(cls, cfg: Dict) -> List["OnePasswordLoginBackend"]:
+        """One backend per valid ``accounts`` entry. An entry must name a unique alias, its
+        account, and its OWN token env (never the primary's), so no two accounts can share a
+        credential. Invalid entries are skipped with a warning: fail closed, never widen."""
+        entries = cfg.get("accounts") or []
+        if not isinstance(entries, list):
+            logger.warning("Ignoring vault.onepassword.accounts: expected a list")
+            return []
+        aliases: set = set()
+        token_envs = {str(cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV)}
+        out: List[OnePasswordLoginBackend] = []
+        for entry in entries:
+            entry = entry if isinstance(entry, dict) else {}
+            alias = str(entry.get("alias") or "").strip().lower()
+            account = str(entry.get("account") or "").strip()
+            token_env = str(entry.get("service_account_token_env") or "").strip()
+            if (not _ALIAS_RE.fullmatch(alias) or alias in aliases or not account
+                    or not token_env or token_env in token_envs):
+                logger.warning("Ignoring vault.onepassword.accounts entry %r: it needs a unique alias "
+                               "([a-z0-9-]), an account, and its own service_account_token_env", alias)
+                continue
+            aliases.add(alias)
+            token_envs.add(token_env)
+            out.append(cls({"binary_path": cfg.get("binary_path") or "", "account": account,
+                            "service_account_token_env": token_env,
+                            "browser_account": entry.get("browser_account") or ""}, alias=alias))
+        return out
 
     # ── auth ────────────────────────────────────────────────────────────────
 
@@ -82,7 +141,8 @@ class OnePasswordLoginBackend(LoginBackend):
         env = {k: os.environ[k] for k in _OP_ENV_ALLOWLIST if k in os.environ and not k.startswith("OP_CONNECT_")}
         # Connect credentials outrank OP_SERVICE_ACCOUNT_TOKEN inside op, so they must come from the
         # profile's own secret scope like the service token does — never from the launch environment.
-        for k in ("OP_CONNECT_HOST", "OP_CONNECT_TOKEN"):
+        # An additional account never gets them: Connect would answer for a different account.
+        for k in () if self.alias else ("OP_CONNECT_HOST", "OP_CONNECT_TOKEN"):
             if v := get_secret(k, ""):
                 env[k] = v
         env["NO_COLOR"] = "1"
@@ -98,6 +158,8 @@ class OnePasswordLoginBackend(LoginBackend):
         return env
 
     def _connect_credentials(self):
+        if self.alias:
+            return "", ""
         from agent.secret_scope import get_secret
         host, token = get_secret("OP_CONNECT_HOST", ""), get_secret("OP_CONNECT_TOKEN", "")
         if bool(host) != bool(token):
@@ -196,6 +258,8 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def unlock(self, master_password: str) -> None:
         """Mint a session token from the master password (consumed on stdin, never argv)."""
+        if self.alias:
+            raise MissingCredential(self._missing_token_error())
         generation = _unlock.begin_unlock(self.name)
         cmd = [str(self._op()), "signin", "--raw"]
         if account := str(self.cfg.get("account") or ""):
@@ -207,7 +271,12 @@ class OnePasswordLoginBackend(LoginBackend):
         if not _unlock.store_session_token(self.name, token, generation):
             raise RuntimeError("1Password was locked while unlocking; try again")
 
+    def _missing_token_error(self) -> str:
+        return f"{self.display_name} needs its service-account token in {self._token_env}"
+
     def _run(self, *args: str) -> str:
+        if self.alias and not self._service_token:
+            raise MissingCredential(self._missing_token_error())
         token = None if self._service_token else _unlock.get_session_token(self.name)
         if not self._service_token and not token:
             raise UnlockRequired(self)
@@ -221,9 +290,29 @@ class OnePasswordLoginBackend(LoginBackend):
             raise RuntimeError(f"op failed: {err[:200]}")
         return proc.stdout or ""
 
+    def _item_list_json(self) -> str:
+        """`op item list` for this account, reused for ``_LISTING_TTL_SECONDS``. Keyed by the
+        credential's fingerprint, so another account, token or session never sees this listing;
+        failures are never cached."""
+        credential = self._service_token or _unlock.get_session_token(self.name) or ""
+        key = (self.name, str(self.cfg.get("account") or ""), _fingerprint(credential))
+        with _LISTING_LOCK:
+            hit = _LISTING_CACHE.get(key)
+            if hit and time.monotonic() - hit[0] < _LISTING_TTL_SECONDS:
+                return hit[1]
+        out = self._list_json_fresh()
+        with _LISTING_LOCK:
+            _LISTING_CACHE[key] = (time.monotonic(), out)
+        return out
+
+    def _list_json_fresh(self) -> str:
+        return self._run("item", "list", "--categories", _CATEGORIES, "--format", "json")
+
     # ── backend contract ───────────────────────────────────────────────────
-    def list_items(self) -> List[VaultItemMeta]:
+    def list_items(self, *, fresh: bool = False) -> List[VaultItemMeta]:
         self._connect_credentials()  # Misconfigured Connect must never fall back to another route.
+        if self.alias and not self._service_token:
+            raise MissingCredential(self._missing_token_error())  # surfaced, not an empty account
         if not self.is_unlocked():
             return []
         if self._connect_credentials()[1]:
@@ -237,7 +326,7 @@ class OnePasswordLoginBackend(LoginBackend):
                         if meta:
                             out.append(meta)
             return out
-        raw = json.loads(self._run("item", "list", "--categories", _CATEGORIES, "--format", "json") or "[]")
+        raw = json.loads((self._list_json_fresh() if fresh else self._item_list_json()) or "[]")
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
             handle = f"{self.prefix}{item.get('id')}"
@@ -262,7 +351,9 @@ class OnePasswordLoginBackend(LoginBackend):
         if self._connect_credentials()[1]:
             item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
             return self._connect_meta(item, item["vault"]["id"])
-        return next((m for m in self.list_items() if m.id == handle), None)
+        # Fresh: this is the fill's origin authorization, and _locate resolves the secret
+        # from a fresh listing too, so both must see the item's current websites.
+        return next((m for m in self.list_items(fresh=True) if m.id == handle), None)
 
     def _item_selector(self, handle: str, categories=("LOGIN",)) -> List[str]:
         return self._locate(handle, categories)[0]
@@ -278,7 +369,7 @@ class OnePasswordLoginBackend(LoginBackend):
             c.isascii() and (c.isalnum() or c == "-") for c in item_id
         ):
             raise ValueError("Invalid 1Password item handle")
-        raw = json.loads(self._run("item", "list", "--categories", _CATEGORIES, "--format", "json") or "[]")
+        raw = json.loads(self._list_json_fresh() or "[]")
         if not isinstance(raw, list):
             raise RuntimeError("Invalid 1Password item metadata")
         matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id
@@ -315,6 +406,8 @@ class OnePasswordLoginBackend(LoginBackend):
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
         try:
             code = self._run("item", "get", *self._item_selector(handle), "--otp").strip()
+        except MissingCredential:
+            raise
         except Exception:
             return None
         return code if code.isdigit() else None
@@ -365,6 +458,9 @@ def _all_origins(urls: List[str]) -> List[str]:
     """
     out: List[str] = []
     for u in urls:
+        u = u.strip()
+        if _BARE_HOST_RE.fullmatch(u):
+            u = "https://" + u  # 1Password saves a typed "example.com" verbatim and opens it as https
         try:
             origin = normalize_origin(u)
         except Exception:

@@ -40,7 +40,7 @@ _REGISTRY_LOCK = threading.RLock()
 # singles these two out ("stale-cache fallback on NETWORK/TIMEOUT, never AUTH_FAILED");
 # the rest (NOT_CONFIGURED, BINARY_MISSING, AUTH_FAILED, REF_INVALID, ...) describe a
 # genuine configuration fault that restarting will not repair.
-_TRANSIENT_ERROR_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT})
+_TRANSIENT_ERROR_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT, ErrorKind.RATE_LIMITED})
 
 # Homes whose most recent apply_all() lost secrets to a retryable condition. Keyed by
 # home, NOT a bare flag: a multiplexing gateway hydrates each secondary profile through

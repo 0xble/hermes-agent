@@ -198,6 +198,10 @@ def _telegram_retry_after(error: Exception) -> Optional[float]:
     """The platform's requested wait for a flood refusal, or None when this is not one."""
     retry_after = getattr(error, "retry_after", None)
     if retry_after is not None:
+        # PTB reports a timedelta when PTB_TIMEDELTA is enabled; float() rejects it, and the
+        # fallback below would shrink a real multi-minute penalty to one second.
+        if hasattr(retry_after, "total_seconds"):
+            return float(retry_after.total_seconds())
         try:
             return float(retry_after)
         except (TypeError, ValueError):
@@ -740,6 +744,9 @@ class _PollingStallError(RuntimeError):
 class TelegramAdapter(BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
+    # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
+    _STATUS_MESSAGE_IDS_MAX = 2000
+
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
@@ -808,6 +815,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._seen_update_ids: dict = {}
         self._inflight_update_ids: dict = {}
         self._update_admission = None
+        # Completed update IDs survive adapter replacement and restarts (update_admission.py).
+        # Resolved now: secondary profiles construct adapters inside their own home scope.
+        from hermes_constants import get_hermes_home
+        self._update_receipt_dir = get_hermes_home()
+        self._update_receipts_loaded: set = set()
+        self._update_receipts_dirty: set = set()
+        self._update_receipt_flush: Optional[asyncio.Task] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
@@ -1502,6 +1516,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Retry stale private-topic media replies once without the topic anchor. Serialized per chat with
         ``send()`` so a file upload cannot land between two chunks of the text it accompanies."""
         async with self._chat_send_lock(send_kwargs.get("chat_id")):
+            cooldown = self._send_flood_cooldown_remaining(send_kwargs.get("chat_id"))
+            if cooldown is not None:
+                logger.warning(
+                    "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing %s upload without an API call",
+                    self.name, send_kwargs.get("chat_id"), cooldown, media_label)
+                raise _MediaFloodRefusal(cooldown)
             try:
                 return await _await_with_thread_deadline(
                     send_fn(**send_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
@@ -1517,6 +1537,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 retry_kwargs["reply_to_message_id"] = None
                 retry_kwargs.pop("message_thread_id", None)
                 retry_kwargs.pop("direct_messages_topic_id", None)
+                cooldown = self._send_flood_cooldown_remaining(retry_kwargs.get("chat_id"))
+                if cooldown is not None:
+                    logger.warning(
+                        "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing %s upload without an API call",
+                        self.name, retry_kwargs.get("chat_id"), cooldown, media_label)
+                    raise _MediaFloodRefusal(cooldown)
                 return await _await_with_thread_deadline(
                     send_fn(**retry_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
 
@@ -2937,15 +2963,18 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to load forum topic icon options", self.name, exc_info=True)
             return []
 
-    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str, icon_custom_emoji_id: Optional[str] = None) -> bool:
-        """Rename a forum topic in a private (DM) chat, returning whether Telegram accepted it."""
+    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: Optional[str], icon_custom_emoji_id: Optional[str] = None) -> bool:
+        """Rename a forum topic in a private (DM) chat, returning whether Telegram accepted it.
+        ``name=None`` sends an icon-only edit; Bot API ``editForumTopic`` keeps the current name."""
         if not self._bot:
             return False
         try:
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
             chat_id_arg = chat_id
-        kwargs = {"chat_id": chat_id_arg, "message_thread_id": int(thread_id), "name": name}
+        kwargs = {"chat_id": chat_id_arg, "message_thread_id": int(thread_id)}
+        if name:
+            kwargs["name"] = name
         if icon_custom_emoji_id:
             kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
         await self._bot.edit_forum_topic(**kwargs)
@@ -3790,6 +3819,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
         self._bot = None
+        # Land the last completed receipts before a replacement adapter reads them.
+        flush = getattr(self, "_update_receipt_flush", None)
+        if flush is not None and not flush.done():
+            await self._await_disconnect_step(asyncio.shield(flush), _DISCONNECT_STEP_TIMEOUT, "update-receipt flush")
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -4146,12 +4179,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if cached_id is not None:
             result = await self.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
             if result.success:
-                if result.message_id:
+                # Only write back if nobody evicted/replaced this key during the await.
+                if result.message_id and self._status_message_ids.get(key) == cached_id:
                     self._status_message_ids[key] = str(result.message_id)
                 return result
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
+            if len(self._status_message_ids) >= self._STATUS_MESSAGE_IDS_MAX:
+                # FIFO trim: drop the oldest half to bound memory (mirrors the Slack adapter).
+                for stale in list(self._status_message_ids)[: self._STATUS_MESSAGE_IDS_MAX // 2]:
+                    self._status_message_ids.pop(stale, None)
             self._status_message_ids[key] = str(result.message_id)
         return result
 
@@ -5490,25 +5528,38 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, chat_id, cooldown, media_label)
             raise _MediaFloodRefusal(cooldown)
         send_kwargs = {**kwargs, **media_kwargs}
-        for attempt in range(2):
-            try:
-                return await self._send_with_dm_topic_reply_anchor_retry(
-                    send_fn, send_kwargs, metadata, reply_to_id, media_label, reset_media=reset_media)
-            except Exception as err:
-                wait = _telegram_retry_after(err)
-                if wait is None:
-                    raise
-                if wait > _FLOOD_INLINE_WAIT_CAP_SECS or attempt:
+        # The short in-place retry holds this chat's send lock across its wait (as send() does) and arms
+        # the shared window for it, so no other send, edit or typing request reaches Telegram inside the
+        # penalty the platform just asked us to observe. The lock is reentrant for this task, so the
+        # funnel below re-enters it.
+        async with self._chat_send_lock(chat_id):
+            for attempt in range(2):
+                try:
+                    return await self._send_with_dm_topic_reply_anchor_retry(
+                        send_fn, send_kwargs, metadata, reply_to_id, media_label, reset_media=reset_media)
+                except Exception as err:
+                    wait = _telegram_retry_after(err)
+                    if wait is None:
+                        raise
+                    if wait > _FLOOD_INLINE_WAIT_CAP_SECS or attempt:
+                        logger.warning(
+                            "[%s] Telegram flood control on %s upload (retry_after=%.1fs); failing closed so the "
+                            "delivery ledger owns the wait", self.name, media_label, wait)
+                        self._record_send_flood_cooldown(chat_id, wait)
+                        raise _MediaFloodRefusal(wait) from err
                     logger.warning(
-                        "[%s] Telegram flood control on %s upload (retry_after=%.1fs); failing closed so the "
-                        "delivery ledger owns the wait", self.name, media_label, wait)
+                        "[%s] Telegram flood control on %s upload, retrying in %.1fs", self.name, media_label, wait)
+                    if reset_media is not None:
+                        reset_media()
                     self._record_send_flood_cooldown(chat_id, wait)
-                    raise _MediaFloodRefusal(wait) from err
-                logger.warning(
-                    "[%s] Telegram flood control on %s upload, retrying in %.1fs", self.name, media_label, wait)
-                if reset_media is not None:
-                    reset_media()
-                await asyncio.sleep(wait)
+                    until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
+                    key = str(normalize_telegram_chat_id(chat_id))
+                    armed = until.get(key)
+                    await asyncio.sleep(wait)
+                    # The wait we armed is over; release only our own window so the retry may go out. A
+                    # longer penalty another path armed meanwhile replaced it and still stands.
+                    if until.get(key) == armed:
+                        until.pop(key, None)
         raise _MediaFloodRefusal(_FLOOD_INLINE_WAIT_CAP_SECS)
 
     @staticmethod
@@ -5620,7 +5671,7 @@ class TelegramAdapter(BasePlatformAdapter):
             anim_result = await super().send_multiple_images(chat_id, animations, metadata, human_delay=human_delay)
             delivered = anim_result.success
         if not photos:
-            return SendResult(success=delivered, error=None if delivered else "all images failed to send")
+            return self._album_result(chat_id, delivered)
         from urllib.parse import unquote as _unquote
         CHUNK = 10  # Telegram's album limit
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
@@ -5661,7 +5712,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._bot.send_media_group, {**send_kwargs, "media": media}, metadata, reply_to_id,
                     "media group", reset_media=_reset_opened_files)
                 delivered = True
+            except _MediaFloodRefusal as flood:
+                # The chat is in a flood window: a per-image fallback would only be refused again.
+                logger.warning(
+                    "[%s] media group refused for flood control (chunk %d/%d, %.0fs)", self.name,
+                    chunk_idx + 1, len(chunks), flood.wait)
             except Exception as e:
+                wait = _telegram_retry_after(e)
+                if wait is not None:
+                    # A platform flood refusal: arm the per-chat window instead of firing a per-image
+                    # fallback into the same penalty.
+                    self._record_send_flood_cooldown(chat_id, wait)
+                    logger.warning(
+                        "[%s] media group refused for flood control (chunk %d/%d, retry_after=%.1fs)", self.name,
+                        chunk_idx + 1, len(chunks), wait)
+                    continue
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
                     chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
@@ -5674,6 +5739,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 for tmp in temp_paths:
                     with contextlib.suppress(OSError):
                         os.remove(tmp)
+        return self._album_result(chat_id, delivered)
+
+    def _album_result(self, chat_id: str, delivered: bool) -> SendResult:
+        """A wholly undelivered album answers with the flood contract while the chat is penalised
+        (an album refusal or a per-image fallback refusal both arm the window), so the caller can
+        reschedule instead of reading a permanent 'all images failed to send'. The wait is the
+        longer of the local window and the platform's own remaining deadline: the window is capped
+        at 300s, and reporting it for a multi-hour penalty would redeliver early and hide an absurd
+        penalty from the delivery ledger. The platform deadline is recorded for every refusal route
+        (media group, per-image fallback, animations), not just the album call."""
+        if not delivered:
+            waits = [w for w in (self._send_flood_cooldown_remaining(chat_id),) if w is not None]
+            key = str(normalize_telegram_chat_id(chat_id))
+            platform = self.__dict__.get("_telegram_platform_flood_until", {})
+            deadline = platform.get(key)
+            if deadline is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    waits.append(remaining)
+                else:
+                    platform.pop(key, None)  # expired: keep the dict bounded
+            if waits:
+                return _flood_cap_result(max(waits))
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     async def send_image_file(
@@ -5914,7 +6002,13 @@ class TelegramAdapter(BasePlatformAdapter):
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
         until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
+        key = str(normalize_telegram_chat_id(chat_id))
+        now = asyncio.get_running_loop().time()
+        until[key] = now + max(1.0, min(float(wait), 300.0))
+        # The window above is capped; keep the platform's own deadline so an aggregate result (an
+        # album whose images were refused on any route) can report the full penalty.
+        platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
+        platform[key] = max(platform.get(key, 0.0), now + float(wait))
         return _flood_cap_result(wait)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
@@ -5987,7 +6081,13 @@ class TelegramAdapter(BasePlatformAdapter):
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
         until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
+        key = str(normalize_telegram_chat_id(chat_id))
+        now = asyncio.get_running_loop().time()
+        until[key] = now + max(1.0, min(float(wait), 300.0))
+        # The window above is capped; keep the platform's own deadline so an aggregate result (an
+        # album whose images were refused on any route) can report the full penalty.
+        platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
+        platform[key] = max(platform.get(key, 0.0), now + float(wait))
         return _flood_cap_result(wait)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
@@ -6090,17 +6190,24 @@ class TelegramAdapter(BasePlatformAdapter):
         # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.
         text = _degrade_unsupported_markdown_links(text, preserve_citation_brackets=False)
 
+        # Validate and emit the parsed destination, not the raw group: a CommonMark title
+        # (``(url "Title")``) or angle-bracket destination (``(<url>)``) is otherwise either
+        # rejected as unsupported or shipped inside the Telegram URL.
         def _convert_citation(m):
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
+            target = _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
+                return _ph(_escape_mdv2(m.group(1)))
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[\\[{_escape_mdv2(m.group(1))}\\]]({url})')
 
         text = _EXPLICIT_NUMERIC_CITATION_RE.sub(_convert_citation, text)
 
         def _convert_link(m):
             display = _escape_mdv2(m.group(1))
-            if not _tg_link_target_supported(m.group(2)):
+            target = _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
                 return _ph(display)
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{display}]({url})')
 
         text = _MD_LINK_RE.sub(_convert_link, text)

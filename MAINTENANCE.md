@@ -6,14 +6,10 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.21`, `d337b736aa1e8ebecfab043842d13e4a2d2f48a3`.
-Explicit upstream exception authorized on 2026-09-23: adopt through
-`38c289c0146ed8c8b2b767eca1fff6f5b7e6382e` for native Codex GPT-6 Sol/Luna.
-This cutoff includes registration (`79ec1f2a34a5b58d91ee835488490a8fbce007b8`),
-live catalog discovery (`1d10cef8363aa3148d70ed162d0a1fc809347182`), and removal
-of unpublished Terra. The user waived aging for this adoption, not verification,
-independent review, protected landing, or backup safeguards. Later Desktop picker
-and generic provider-cache changes are outside this native Codex adoption.
+`v2026.9.24`, `f97608f178d1ffeca59860195ab7da295f7c8e5f`.
+The operator authorized age-only adoption of this release on 2026-09-24. The
+exception waives release age only, not verification, independent review,
+protected landing, or backup safeguards.
 This replacement fork was established on 2026-09-19. The former fork is preserved
 as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
@@ -57,11 +53,13 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Security guidance plugin | Keep bounded path-aware security pattern guidance and explicit warning/block semantics | Security-guidance pattern, plugin wiring, or focused-test changes | [Security guidance plugin](maintenance/security-guidance.md) |
 | Essential skill opt-out | Let one home opt out of seeding and protecting the essential `hermes-agent` skill | Bundled or essential skill seeding, disabled-list, or delete-guard changes | [Essential skill opt-out](maintenance/essential-skill-opt-out.md) |
 | Background review memory delete | Opt-in lets the unattended review fork replace/remove memory instead of staging | Background-review memory gate or `memory` config changes | [Background review memory delete](maintenance/background-review-memory-delete.md) |
+| Skill observation files | One immutable `<skill>@<suffix>.md` file per observation, indexed and archived independently | Observation store, `hermes observations`, or observation writers change | [Skill observation files](maintenance/skill-observation-files.md) |
 | Profile plugins and skills | Keep Hermes runtime contracts and skill ownership boundaries explicit while profile plugin source remains external | Profile-plugin integration, skill guard, or curation changes | [Profile plugins](maintenance/profile-plugins.md) |
 | Wrapped gateway service ownership | Protect service-owned gateway descendants from updater and reaper manual sweeps | Service PID discovery, updater restart, or wrapper changes | [Wrapped gateway ownership](maintenance/wrapped-gateway-ownership.md) |
 | Launchd restart verification | Start the respawn window after the old gateway exits, so a slow drain is not a failed restart | Updater launchd restart verification or shutdown budget changes | [Launchd verify after shutdown](maintenance/launchd-verify-after-shutdown.md) |
 | Backup, state, and tooling | Truthful backups, schema rehearsal, per-job timezone, fork maintenance scripts | Backup, cron scheduling, context ports, or maintenance script changes | [Backup and tooling](maintenance/backup-and-tooling.md) |
 | Hindsight memory provider | Keep the provider constructible before `initialize()`, so a construction error cannot silently disable retain and recall | Memory plugin lifecycle, retain strategy, or cron-exclusion changes | [Hindsight memory](maintenance/hindsight-memory.md) |
+| Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 
 ## Update
 

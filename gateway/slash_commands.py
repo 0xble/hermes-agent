@@ -15,7 +15,7 @@ import re
 import shlex
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
@@ -90,6 +90,16 @@ def _nested_dict(root: dict, *keys: str) -> dict:
             root[k] = {}
         root = root[k]
     return root
+
+
+def _write_raw_config_leaf(config_path: Path, keys: tuple, value) -> None:
+    """Set one leaf through a strict raw round-trip. The behavioral read is fail-open (``{}``) and
+    expanded, so writing it back wipes the file after a read error and persists ``${VAR}`` values."""
+    from hermes_cli.config import read_user_config_raw
+    raw = read_user_config_raw(config_path)
+    *parents, leaf = keys
+    _nested_dict(raw, *parents)[leaf] = value
+    atomic_config_write(config_path, raw)
 
 
 def _preview(text: str, limit: int = 60) -> str:
@@ -1000,8 +1010,7 @@ class GatewaySlashCommandsMixin(
         new_mode = cycle[(cycle.index(current if current in cycle else "all") + 1) % len(cycle)]
         description = t(f"gateway.verbose.mode_{new_mode}")
         try:
-            _nested_dict(user_config, "display", "platforms", platform_key)["tool_progress"] = new_mode
-            atomic_config_write(config_path, user_config)
+            _write_raw_config_leaf(config_path, ("display", "platforms", platform_key, "tool_progress"), new_mode)
             return f"{description}\n" + t("gateway.verbose.saved_suffix", platform=platform_key)
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
@@ -1068,8 +1077,7 @@ class GatewaySlashCommandsMixin(
             return t("gateway.footer.usage")
         new_state = _FOOTER_STATE_BY_ARG[arg] if arg else not effective["enabled"]
         try:
-            _nested_dict(user_config, "display", "runtime_footer")["enabled"] = new_state
-            atomic_config_write(config_path, user_config)
+            _write_raw_config_leaf(config_path, ("display", "runtime_footer", "enabled"), new_state)
         except Exception as e:
             logger.warning("Failed to save runtime_footer.enabled: %s", e)
             return t("gateway.config_save_failed", error=e)
@@ -1286,7 +1294,6 @@ class GatewaySlashCommandsMixin(
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update — spawn ``hermes update`` detached (``setsid``) so it survives the gateway
         restart it may trigger; marker files let this or the next gateway process notify the user."""
-        import json
         from gateway.run import _hermes_home, _resolve_hermes_bin
         from hermes_cli.config import is_managed, format_managed_message
         # Block non-messaging platforms (API server, webhooks, ACP); plugin platforms with
@@ -1307,27 +1314,25 @@ class GatewaySlashCommandsMixin(
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             return t("gateway.update.hermes_cmd_not_found")
-        pending_path = _hermes_home / ".update_pending.json"
-        output_path = _hermes_home / ".update_output.txt"
-        exit_code_path = _hermes_home / ".update_exit_code"
         pending = {
             "platform": src.platform.value, "chat_id": src.chat_id, "chat_type": src.chat_type,
             "user_id": src.user_id, "session_key": self._session_key_for_source(src),
-            "timestamp": datetime.now().isoformat()}
+            "timestamp": datetime.now(timezone.utc).isoformat()}
         # ``profile``: the update watcher (possibly the NEXT gateway process) must answer through the
         # requester's own profile bot, not the default profile's adapter for the same platform.
         pending.update({k: v for k, v in (("thread_id", src.thread_id), ("message_id", event.message_id),
                                           ("profile", getattr(src, "profile", None))) if v})
-        _tmp_pending = pending_path.with_suffix(".tmp")
-        _tmp_pending.write_text(json.dumps(pending), encoding="utf-8")
-        _tmp_pending.replace(pending_path)
-        exit_code_path.unlink(missing_ok=True)
+        # The detached wrapper reports completion only through ``.update_process_exit_code``, so the
+        # request must use the same v2 lifecycle as agent-requested updates: a legacy marker would
+        # wait on ``.update_exit_code``, which the wrapper deletes.
+        from gateway.update_launcher import launch_native_update
         try:
-            _spawn_detached_update(hermes_cmd, output_path, exit_code_path)
+            result = launch_native_update(home=_hermes_home, hermes_cmd=hermes_cmd, pending=pending,
+                                          spawn=_spawn_detached_update)
         except Exception as e:
-            pending_path.unlink(missing_ok=True)
-            exit_code_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
+        if not result["started"]:
+            return t("gateway.update.start_failed", error="an update is already in progress")
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")
 

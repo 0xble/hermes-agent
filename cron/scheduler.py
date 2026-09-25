@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; Windows uses msvcrt
 try:
@@ -40,8 +40,8 @@ from cron.env_settings import cron_env_setting
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     load_config, load_config_readonly)
-from hermes_cli.fallback_config import get_cron_fallback_chain
-from hermes_time import now as _hermes_now
+from hermes_cli.fallback_config import get_cron_fallback_chain, get_fallback_chain, scoped_fallback_chain
+from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
@@ -99,18 +99,47 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
-def _fallback_chain_phrase() -> str:
-    """Backup-provider clause for a provider-failure notice: "the backups failed too" vs "none
-    configured" (most installs). Fails open to the former if config can't be read — never crash
-    delivery.
+def _job_route_pinned(job: dict) -> bool:
+    """True when the job carries its own provider, model or endpoint. Unpinned jobs store none of
+    these (they follow the main model at fire time), so any value is an explicit operator pin."""
+    return any(isinstance(job.get(k), str) and job[k].strip() for k in ("provider", "model", "base_url"))
+
+
+def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
+    """The fallback chain this job may walk, at credential resolution AND mid-run (#100437).
+
+    A pinned job never borrows the global chain, but can use an explicitly declared
+    ``cron.fallback_providers`` chain. Same-provider credential-pool rotation still applies.
+    """
+    cron = cfg.get("cron") if isinstance(cfg, dict) else None
+    declared = cron.get("fallback_providers") if isinstance(cron, dict) else None
+    if declared is not None:
+        # Unlike a delegated child's malformed override, an explicit cron override
+        # never silently restores the global chain (including legacy fallback_model).
+        return get_cron_fallback_chain(cfg) or None
+    return scoped_fallback_chain(
+        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+
+
+def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
+    """Backup-provider clause for a provider-failure notice: "pinned, no fallback" vs "the backups
+    failed too" vs "none configured" (most installs). Fails open to "the backups failed too" if
+    config can't be read — never crash delivery.
     """
     try:
         cfg = load_config() or {}
-        chain = get_cron_fallback_chain(cfg)
+        chain = _job_fallback_chain(job or {}, cfg)
     except Exception:
         return "No backup provider succeeded either."
     if chain:
         return "No backup provider succeeded either."
+    if job is not None and _job_route_pinned(job):
+        return (
+            "This job is pinned to its own provider/model, so it does not inherit "
+            f"global `fallback_providers`; `hermes cron edit {job.get('id')} --unpin` "
+            "lets it follow the global chain, or configure `cron.fallback_providers` "
+            "for an explicit cron backup chain."
+        )
     return (
         "No backup provider is configured — check `cron.fallback_providers` or add a global backup with `hermes fallback add`, "
         "or set a cron fleet default via `cron.model` + `cron.model_provider` in config.yaml."
@@ -294,7 +323,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if not job.get("no_agent"):
         notice = provider_failure_notice(
             job_name, job_id, classify_cron_failure_reason(text),
-            backup_provider_phrase=_fallback_chain_phrase(), provider=job.get("provider"))
+            backup_provider_phrase=_fallback_chain_phrase(job), provider=job.get("provider"))
         if notice is not None:
             return notice
 
@@ -351,12 +380,12 @@ def _repeat_alert_withheld(incident: dict) -> bool:
     if not alerted_at:
         return False
     try:
-        from cron.jobs import _ensure_aware
+        from cron.jobs import _elapsed_seconds, _ensure_aware
 
         last = _ensure_aware(datetime.fromisoformat(str(alerted_at)))
     except (TypeError, ValueError):
         return False
-    return _hermes_now() - last < timedelta(hours=hours)
+    return _elapsed_seconds(_hermes_now(), last) < hours * 3600
 
 
 def _upsert_incident_for_failure(
@@ -1698,7 +1727,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
     """Resolve the runtime, walking the fallback chain on auth/transient-network errors. Returns
     ``(runtime, model)``; provider+model swap atomically (never swap only the provider while keeping
     a paid primary model). Provider precedence: per-job pin > cron.model_provider > persisted
-    global config (None lets resolve_runtime_provider read it)."""
+    global config (None lets resolve_runtime_provider read it). A pinned job has no chain here
+    (``_job_fallback_chain``): its resolve failure is the job's failure."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider, format_runtime_provider_error)
     from hermes_cli.auth import AuthError
@@ -1724,10 +1754,14 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
+        chain = _job_fallback_chain(job, jc.cfg) or []
         logger.warning(
-            "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
-            job_id, "auth" if is_auth else "transient network", resolve_exc)
-        for entry in get_cron_fallback_chain(jc.cfg):
+            "Job '%s': primary provider resolve failed (%s: %s), %s",
+            job_id, "auth" if is_auth else "transient network", resolve_exc,
+            "trying fallback" if chain else (
+                "not falling back: the job is pinned and has no cron fallback" if _job_route_pinned(job)
+                else "no fallback configured"))
+        for entry in chain:
             if not isinstance(entry, dict):
                 continue
             fb_provider = str(entry.get("provider") or "").strip()
@@ -2065,7 +2099,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         # Title the cron session from the job (name -> id) and PERSIST it BEFORE end_session()/close() tear
         # the connection down, so the close can never run over an in-flight title write (#50536).
         _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-        _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+        _cron_title = f"{_title_base} · {safe_strftime(_hermes_now(), '%b %d %H:%M')}"
         if not _set_cron_session_title(_session_db, _final_cron_session_id, _cron_title):
             _set_cron_session_title(_session_db, _final_cron_session_id, f"cron {job_id}")
     except (Exception, KeyboardInterrupt) as e:
@@ -2244,7 +2278,7 @@ class _CronRunScope:
 
     def __init__(self, job: dict, job_id: str, execution_id: Optional[str]):
         from gateway.session_context import set_session_vars, _VAR_MAP
-        from tools.terminal_tool import record_session_cwd
+        from tools.terminal_tool import record_session_cwd, register_run_scoped_task
 
         self._var_map = _VAR_MAP
         # Resolve workdir BEFORE set_session_vars so it owns the _SESSION_CWD set/clear.
@@ -2274,6 +2308,7 @@ class _CronRunScope:
         self.task_id = f"cron:{job_id}:{execution_id or job.get('execution_id') or uuid.uuid4().hex}"
         if self.workdir:
             record_session_cwd(self.task_id, self.workdir)
+        register_run_scoped_task(self.task_id)
         self._cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
         self._cron_session_token = None
         self._non_dispatcher_token = None
@@ -2290,9 +2325,10 @@ class _CronRunScope:
 
     def exit(self) -> None:
         from gateway.session_context import clear_session_vars
-        from tools.terminal_tool import clear_session_cwd
+        from tools.terminal_tool import clear_run_scoped_task, clear_session_cwd
 
         clear_session_cwd(self.task_id)
+        clear_run_scoped_task(self.task_id)
         clear_session_vars(self._ctx_tokens)  # also clears _SESSION_CWD
         if self._cron_session_token is not None:
             self._cron_session_var.reset(self._cron_session_token)
@@ -2362,7 +2398,9 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
-    setup.fallback_model = get_cron_fallback_chain(_cfg) or None
+    # Mid-run provider ladder: same rule as resolution above. A pinned job cannot
+    # borrow the global chain, but may use the explicitly declared cron chain.
+    setup.fallback_model = _job_fallback_chain(job, _cfg)
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)
@@ -3147,7 +3185,8 @@ def _run_one_job_body(
 
         # get_secret() fails closed outside a scope; the ticker thread has none. Delivery adapters
         # resolve credentials, so the scope must span delivery too (reset in the outer finally).
-        _scope_token = set_secret_scope(build_profile_secret_scope(_get_hermes_home()))
+        _scope_token = set_secret_scope(
+            build_profile_secret_scope(_get_hermes_home()), profile_home=str(_get_hermes_home()))
         # Same for terminal policy (gateway/run.py _profile_runtime_scope): else the ticker reads
         # process-global TERMINAL_* env a concurrent profile pinned. Resolution failure installs a
         # refusal scope — terminal execution raises instead of using the launch process's policy.
@@ -3484,7 +3523,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
 
     profile_home = _get_hermes_home().resolve()
     hydrate_profile_secret_sources(profile_home)
-    secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
+    secret_token = set_secret_scope(build_profile_secret_scope(profile_home), profile_home=str(profile_home))
     try:
         worker_env = strip_launch_profile_env(build_subprocess_env(
             scrub_secrets=multiplex_active,
@@ -3661,13 +3700,14 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
         set_hermes_home_override,
     )
 
-    home_token = set_hermes_home_override(profile_home)
     previous_multiplex = is_multiplex_active()
-    multiplex_active = bool(payload.get("multiplex_active", False))
-    set_multiplex_active(multiplex_active)
-    hydrate_profile_secret_sources(profile_home)
-    secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
+    home_token = secret_token = None
     try:
+        home_token = set_hermes_home_override(profile_home)
+        multiplex_active = bool(payload.get("multiplex_active", False))
+        set_multiplex_active(multiplex_active)
+        hydrate_profile_secret_sources(profile_home)
+        secret_token = set_secret_scope(build_profile_secret_scope(profile_home), profile_home=str(profile_home))
         with use_cron_store(profile_home):
             if adopt_claimed_execution(execution_id) is None:
                 logger.error(
@@ -3716,9 +3756,11 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 with contextlib.suppress(OSError):
                     ack_path.with_suffix(".stderr").unlink(missing_ok=True)
     finally:
-        reset_secret_scope(secret_token)
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
         set_multiplex_active(previous_multiplex)
-        reset_hermes_home_override(home_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 def _notify_provider_jobs_changed() -> None:
