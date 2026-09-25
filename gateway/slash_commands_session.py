@@ -736,17 +736,10 @@ class GatewaySessionCommandsMixin:
         adapter = self._delivery_adapter_for(source)
         if adapter is None or not callable(getattr(adapter, "rename_dm_topic", None)):
             return "Telegram topic editing is unavailable right now."
-        if not title:
-            session_entry = await self.async_session_store.get_or_create_session(source)
-            title = await self._session_db.get_session_title(session_entry.session_id) if self._session_db else None
-        if not title:
-            topic_info = getattr(adapter, "_get_dm_topic_info", lambda *_args: None)(
-                str(source.chat_id), str(source.thread_id)
-            )
-            title = topic_info.get("name") if isinstance(topic_info, dict) else None
-        if not title:
-            return "A title is required when this topic has no saved session title."
-        title = self._sanitize_telegram_topic_title(title)
+        # An icon-only edit omits the name, so Telegram keeps the visible one: the saved session
+        # title can be stale after an earlier `--title` edit, and resending it reverted that rename.
+        if title:
+            title = self._sanitize_telegram_topic_title(title)
         icon_id = None
         if icon:
             options = await adapter.get_forum_topic_icon_options()
@@ -755,7 +748,7 @@ class GatewaySessionCommandsMixin:
                 choices = " ".join(str(item.get("emoji")) for item in options if item.get("emoji"))
                 return f"Unsupported topic icon {icon!r}. Available icons: {choices or 'none'}"
             icon_id = selected.get("custom_emoji_id")
-        kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": title}
+        kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": title or None}
         if icon_id:
             kwargs["icon_custom_emoji_id"] = icon_id
         try:
@@ -769,6 +762,8 @@ class GatewaySessionCommandsMixin:
                     emoji=icon, owner="manual", profile_name=profile)
                 sync_db.record_telegram_topic_icon_history(
                     str(source.chat_id), emoji=icon, custom_emoji_id=icon_id, profile_name=profile)
+            if not title:
+                return f"Topic icon updated: {icon}"
             return f"Topic updated: {title}" + (f" {icon}" if icon else "")
         except Exception as exc:
             logger.warning("Telegram topic edit failed: %s", exc)

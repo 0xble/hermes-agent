@@ -17,7 +17,9 @@ its optional icon, and the durable alias can be observed through one Telegram to
   close the prompt. Dropping any of these measurably lengthens titles; verify prompt changes by
   sampling the configured model on a few real opening messages, not by unit tests alone.
 - Telegram topic icons use Bot API `get_forum_topic_icon_stickers` options only.
-  Name and icon changes share one `edit_forum_topic` call. Manual icon ownership is
+  Name and icon changes share one `edit_forum_topic` call. An icon-only `/topic edit --icon`
+  omits `name`, so Telegram keeps the visible name; resending the saved session title
+  reverted an earlier `--title` rename. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
 - `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
   such as `X #2` only when that exact text is held by another session; the visible Telegram
