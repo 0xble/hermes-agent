@@ -252,6 +252,17 @@ try {
             with self.assertRaisesRegex(RuntimeError, 'added.md'):
                 ci.check_docs_parity(before, ci.docs_inventory(root))
 
+    def test_every_reusable_only_workflow_has_a_caller(self):
+        import yaml
+        workflows = ci.ROOT / '.github/workflows'
+        texts = {path.name: path.read_text(encoding='utf-8') for path in workflows.glob('*.y*ml')}
+        for name, text in texts.items():
+            triggers = yaml.safe_load(text).get(True) or yaml.safe_load(text).get('on') or {}
+            if isinstance(triggers, dict) and set(triggers) <= {'workflow_call', 'workflow_dispatch'} and 'workflow_call' in triggers:
+                callers = [other for other, body in texts.items() if other != name and f'./.github/workflows/{name}' in body]
+                self.assertTrue(callers, f'{name} is reusable-only and nothing calls it')
+        self.assertIn('desktop-core', yaml.safe_load(texts['nightly.yml'])['jobs']['qualification']['needs'])
+
     def test_source_guard_detects_mutation_without_overwriting_user_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

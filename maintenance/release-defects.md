@@ -124,3 +124,15 @@ and drop it once upstream carries an equivalent fix.
   checkout always failed. External rows are now skipped.
 - Guard: `tests/scripts/test_candidate_scripts.py`
   (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
+
+## Desktop core E2E lost its only caller
+
+- Fork patch identity: `ci-desktop-core-nightly`.
+- Retiring `ci.yaml` removed the only caller of `e2e-desktop-core.yml`, a
+  `workflow_call`-only workflow, so the deterministic Desktop core suite
+  (transcript integrity, backend lifecycle and orphans, clarify/approval) no
+  longer ran anywhere. Nightly now calls it and its `qualification` requires it.
+  It also runs on demand, on `ubuntu-latest`, because this repository has no
+  larger hosted runners.
+- Guard: `scripts/ci/tests/test_portable.py`
+  (`test_every_reusable_only_workflow_has_a_caller`).
