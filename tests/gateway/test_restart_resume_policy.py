@@ -164,3 +164,18 @@ def test_turn_runner_platform_override_beats_global_at_the_call_site():
 
     assert "CONTINUE the interrupted task" in ctx.message
 
+
+
+@pytest.mark.parametrize(("yaml_text", "expected"), [
+    ("gateway:\n  auto_resume_on_boot: false\n", False),
+    ("auto_resume_on_boot: false\n", False),
+    ("gateway:\n  restart_resume_policy: ask\n", True),
+])
+def test_yaml_startup_honours_auto_resume_on_boot(tmp_path, monkeypatch, yaml_text, expected):
+    """The real config.yaml path, not GatewayConfig.from_dict: an operator's `false` must survive
+    the YAML bridge, or interrupted delegations still queue recovery turns on boot."""
+    from gateway.config import load_gateway_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml_text)
+    assert load_gateway_config().auto_resume_on_boot is expected
