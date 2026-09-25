@@ -124,3 +124,16 @@ and drop it once upstream carries an equivalent fix.
   checkout always failed. External rows are now skipped.
 - Guard: `tests/scripts/test_candidate_scripts.py`
   (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
+
+## Hindsight session lifecycle loses bank isolation, buffered turns, and recall scope
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- A session switch kept the prior template-derived bank, shutdown discarded
+  turns below the retain batch boundary, and a prefetch worker outliving the
+  switch could inject the prior session's recall. Switch now rotates the bank
+  after queuing old-bank writes and invalidates old prefetch workers; shutdown
+  enqueues the unretained tail before stopping the writer.
+- Guards: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_session_template_rotates_bank_without_redirecting_queued_writes`,
+  `test_shutdown_flushes_buffered_tail`,
+  `test_slow_old_prefetch_cannot_repopulate_new_session`).
