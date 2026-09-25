@@ -681,6 +681,29 @@ def _db_rows(db: Path, sql: str) -> list[tuple]:
         conn.close()
 
 
+def _unexpected_service_calls(log: str) -> list[str]:
+    """Read-only systemctl probes are expected; all other shim calls remain violations."""
+    read_only = {"is-system-running", "is-active", "status", "show", "list-units", "--version"}
+    unexpected = []
+    for line in log.splitlines():
+        argv = line.split()
+        if argv[:1] == ["systemctl"]:
+            args = argv[1:]
+            if args[:1] in (["--user"], ["--system"]):
+                args = args[1:]
+            if args and args[0] in read_only:
+                continue
+        unexpected.append(line)
+    return unexpected
+
+
+def test_service_shim_classification_rejects_mutations():
+    assert _unexpected_service_calls("systemctl --user start hermes-gateway.service")
+    assert _unexpected_service_calls("systemctl daemon-reload")
+    assert _unexpected_service_calls("sudo systemctl restart hermes-gateway.service")
+    assert not _unexpected_service_calls("systemctl --user is-system-running\nsystemctl status hermes-gateway.service")
+
+
 @pytest.mark.parametrize("case", list(_ENTRIES))
 def test_entrypoint_in_a_fresh_process(case, tmp_path):
     _sandbox_or_skip()
@@ -706,8 +729,9 @@ def test_entrypoint_in_a_fresh_process(case, tmp_path):
     assert cp.returncode in entry.rcs, describe(cp)
     assert TRACEBACK not in out, describe(cp)
     shim_log = tmp_path / "shims" / "shim-calls.log"
-    assert not shim_log.exists() or not shim_log.read_text(encoding="utf-8").strip(), (
-        f"{case} called a service manager: {shim_log.read_text(encoding='utf-8')}")
+    shim_calls = shim_log.read_text(encoding="utf-8") if shim_log.exists() else ""
+    unexpected = _unexpected_service_calls(shim_calls)
+    assert not unexpected, f"{case} called a mutating/unknown service manager command: {unexpected}"
     if entry.prints_version:
         assert PROJECT_VERSION in cp.stdout, describe(cp)
     db = hermes_home / "state.db"
