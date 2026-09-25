@@ -38,6 +38,8 @@ def _runner(tmp_path, monkeypatch):
     (home / "profiles").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # gateway.run binds its process home at import time; this in-process fixture changes it later.
+    monkeypatch.setattr("gateway.run._hermes_home", home)
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._running = True
