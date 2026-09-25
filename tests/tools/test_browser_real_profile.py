@@ -847,7 +847,7 @@ class TestReviewRound3:
         assert cdp == "http://127.0.0.1:9251" and err is None
         snap.assert_not_called()  # ← the fix: no overlay while a live browser owns the dir
         bt._real_profile_cdp_cache.clear()
-    
+
     def test_relaunch_path_does_snapshot(self, tmp_path):
         """When there's no reusable session, the overlay DOES run (relaunch)."""
         import tools.browser_tool as bt

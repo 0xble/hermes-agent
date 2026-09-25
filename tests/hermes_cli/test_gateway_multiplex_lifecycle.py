@@ -240,4 +240,3 @@ def test_parked_status_still_reports_a_forced_gateway(homes, monkeypatch, capsys
     output = capsys.readouterr().out
     assert 'parked (hermes -p worker gateway start)' in output
     assert 'Gateway is running (PID: 4242)' in output
-
