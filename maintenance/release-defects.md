@@ -63,3 +63,15 @@ and drop it once upstream carries an equivalent fix.
   restart path.
 - Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
   (`test_restart_after_stop_unparks_and_serves_the_profile`).
+
+## Launchd restart tests depend on the host gateway
+
+- Fork patch identity: `launchd-restart-test-isolation`.
+- The invoking-profile restart tests pinned the restart and the verifier but
+  left the real LaunchAgent pid and process-ancestry probes live. When the
+  suite runs under a Hermes gateway, pytest descends from the supervised pid,
+  so the updater correctly took the in-gateway self-restart branch and three
+  tests failed. The fixture now pins both probes, and the enclosing-gateway
+  branch has its own test.
+- Guard: `tests/hermes_cli/test_update_launchd_restart_verification.py`
+  (`test_restart_handed_to_the_enclosing_gateway_skips_verification`).
