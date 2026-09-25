@@ -7,7 +7,7 @@ def _profile(root, name, *, identity=True):
     home = root / "profiles" / name
     (home / "models").mkdir(parents=True)
     if identity:
-        (home / "config.yaml").write_text("{}\n")
+        (home / "config.yaml").write_bytes(b"{}\n")
     return home
 
 
@@ -15,25 +15,25 @@ def test_legacy_models_move_into_the_machine_dir_without_clobbering(tmp_path, mo
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     new_dir = bootstrap.models_dir()
     new_dir.mkdir(parents=True)
-    (new_dir / "shared.gguf").write_text("current")
+    (new_dir / "shared.gguf").write_bytes(b"current")
     work = _profile(tmp_path, "work")
     split = ["big-00001-of-00002.gguf", "big-00002-of-00002.gguf"]
     for name in (*split, "shared.gguf"):
-        (work / "models" / name).write_text(f"legacy {name}")
+        (work / "models" / name).write_bytes(f"legacy {name}".encode())
     (work / "models" / "assets").mkdir()
-    (work / "models" / "assets" / "mmproj.gguf").write_text("proj")
+    (work / "models" / "assets" / "mmproj.gguf").write_bytes(b"proj")
     play = _profile(tmp_path, "play")
-    (play / "models" / "small.gguf").write_text("small")
+    (play / "models" / "small.gguf").write_bytes(b"small")
     ghost = _profile(tmp_path, "ghost", identity=False)  # marker-less shell: not a profile
     (ghost / "models" / "ghost.gguf").touch()
 
     bootstrap.adopt_legacy_models()
 
     assert {p.name for p in bootstrap.staged_models()} == {"shared.gguf", "big-00001-of-00002.gguf", "small.gguf"}
-    assert all((new_dir / name).read_text() == f"legacy {name}" for name in split)
-    assert (bootstrap.assets_dir() / "mmproj.gguf").read_text() == "proj"
-    assert (new_dir / "shared.gguf").read_text() == "current"  # never clobbered...
-    assert (work / "models" / "shared.gguf").read_text() == "legacy shared.gguf"  # ...and not lost
+    assert all((new_dir / name).read_bytes() == f"legacy {name}".encode() for name in split)
+    assert (bootstrap.assets_dir() / "mmproj.gguf").read_bytes() == b"proj"
+    assert (new_dir / "shared.gguf").read_bytes() == b"current"  # never clobbered...
+    assert (work / "models" / "shared.gguf").read_bytes() == b"legacy shared.gguf"  # ...and not lost
     assert not (play / "models").exists()  # emptied legacy dir is cleaned up
     assert (ghost / "models" / "ghost.gguf").exists()
     assert bootstrap.adopt_legacy_models() == []  # idempotent
