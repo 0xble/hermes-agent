@@ -44,7 +44,7 @@ SEED_ENV = "HERMES_SQLITE_TORTURE_SEED"
 JOURNAL_MODES = ("wal", "delete")
 # Read ONLY by _roles.py in each child: the SQLite version its production version probe reports.
 SQLITE_PIN_ENV = "HERMES_E2E_SQLITE_VERSION_PIN"
-VULNERABLE_SQLITE = "3.50.4"  # bundled by uv's CPython 3.11.14 (the unit CI job): Hermes runs DELETE there
+VULNERABLE_SQLITE = "3.50.4"  # bundled by uv's CPython 3.11.14: Hermes runs DELETE there (CI pins 3.11.15, WAL-capable)
 # DELETE mode holds an EXCLUSIVE lock for every commit's journal+db fsyncs and has no writer fairness: an unpaced
 # append loop starves every other writer and reader. Gateway/TUI writers are paced by turns in the field.
 DELETE_WRITER_PACE = 0.02

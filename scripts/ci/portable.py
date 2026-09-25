@@ -280,9 +280,24 @@ def static(env: dict[str, str]) -> None:
         raise RuntimeError('Blocking static checks failed')
 
 
+# Hermes picks DELETE journal mode on a SQLite with the WAL-reset bug, and the WAL test arms skip
+# there, so a vulnerable interpreter would pass every lane without exercising WAL. Fail closed.
+SQLITE_WAL_PROBE = ("import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); "
+                    "print(f'SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)")
+
+
+def require_wal_capable_sqlite(py: str, env: dict[str, str]) -> None:
+    probe = subprocess.run([py, '-c', SQLITE_WAL_PROBE], cwd=ROOT, env=env, capture_output=True,
+                           text=True, encoding='utf-8', errors='replace')
+    if probe.returncode != 0:
+        detail = (probe.stdout + probe.stderr).strip()
+        raise RuntimeError(f'Checkout Python must link a WAL-capable SQLite, or WAL tests silently skip: {detail}')
+
+
 def python_tests(env: dict[str, str], roots: list[str], workers: int,
                  pytest_args: list[str] | None = None) -> None:
     py = python(env)
+    require_wal_capable_sqlite(py, env)
     require_tools(('rg',), env)
     env = dict(env)
     env['HERMES_PYTHON'] = py

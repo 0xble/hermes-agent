@@ -88,3 +88,16 @@ and drop it once upstream carries an equivalent fix.
   clears a stale completion marker and refuses a second concurrent request.
 - Guard: `tests/gateway/test_update_lifecycle_notifications.py`
   (`test_slash_update_final_outcome_follows_the_detached_wrapper`).
+
+## Portable CI lost the WAL-capable SQLite guard
+
+- Fork patch identity: `ci-wal-capable-sqlite`.
+- Retiring `tests.yml` dropped its "Check SQLite runs WAL" step while the
+  replacement gate and nightly pinned CPython 3.11.14, whose every published
+  build links WAL-reset-vulnerable SQLite 3.50.4. Hermes then runs DELETE mode
+  and the WAL test arms skip, so CI could pass without exercising WAL. The pin is
+  now 3.11.15 (SQLite 3.53.1), and every portable Python lane fails closed on a
+  vulnerable interpreter before running tests.
+- Guards: `scripts/ci/tests/test_portable.py`
+  (`test_python_lanes_require_a_wal_capable_sqlite`,
+  `test_workflows_install_the_pinned_python`).

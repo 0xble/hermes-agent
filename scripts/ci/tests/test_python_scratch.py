@@ -43,7 +43,7 @@ class PythonScratchTests(unittest.TestCase):
                         self.assertFalse(scratch.is_relative_to(Path(env['HOME'])))
                         observed.append(scratch)
 
-                with self.subTest(writable=writable), patch.object(ci, 'python'), patch.object(ci, 'require_tools'), patch.object(ci.sys, 'platform', 'linux'), patch.object(ci.os, 'access', return_value=writable), patch.object(ci.Path, 'home', return_value=original_home), patch.object(ci, 'run', side_effect=observe):
+                with self.subTest(writable=writable), patch.object(ci, 'python'), patch.object(ci, 'require_wal_capable_sqlite'), patch.object(ci, 'require_tools'), patch.object(ci.sys, 'platform', 'linux'), patch.object(ci.os, 'access', return_value=writable), patch.object(ci.Path, 'home', return_value=original_home), patch.object(ci, 'run', side_effect=observe):
                     ci.python_tests(original_env, ['tests'], 4)
                     self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', original_env)
                 for scratch in observed:
