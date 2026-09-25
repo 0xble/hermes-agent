@@ -98,3 +98,28 @@ def test_cli_has_no_legacy_publish_fallback(tmp_path, capsys):
     with pytest.raises(SystemExit):
         module.main(["--observations", str(tmp_path), "--publish"])
     assert "following arguments are required: command" in capsys.readouterr().err
+
+
+def test_per_observation_files_disposition_and_archive_independently(tmp_path):
+    """Writers add one ``<skill>@<suffix>.md`` file per observation; a newer
+    observation for the same skill must not block archiving an older one."""
+    module = load_module()
+    observations = tmp_path / "observations"
+    observations.mkdir()
+    first = observations / "deploy@20260924T010000Z-aaaa.md"
+    first.write_text("Keep the rollback step.\n", encoding="utf-8")
+    db = tmp_path / "observations.sqlite3"
+    module.index_observations(observations, db)
+    first_id = module.observation_id("deploy", "Keep the rollback step.\n")
+
+    second = observations / "deploy@20260924T020000Z-bbbb.md"
+    second.write_text("Verify the health check.\n", encoding="utf-8")
+    assert module.index_observations(observations, db).imported == 1
+    assert module.set_disposition(db, first_id, "rejected", reason="duplicate")
+
+    assert module.archive_dispositioned(observations, db).archived == 1
+    assert not first.exists()
+    assert second.exists()
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute("SELECT skill, disposition FROM observations ORDER BY source_path").fetchall()
+    assert rows == [("deploy", "rejected"), ("deploy", "pending")]
