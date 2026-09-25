@@ -909,6 +909,58 @@ class TestPrefetchServerRetainVisibility:
         assert time.monotonic() - start < 2.5
         assert p._pending_retain_ops == set()
 
+    def test_embedded_reconnect_retry_gets_only_the_remaining_budget(self, provider):
+        """The local_embedded reconnect retry must spend what the first attempt left of the
+        caller's budget, not a fresh copy of it."""
+        provider._mode = "local_embedded"
+        budgets, calls = [], []
+        real_run_sync = provider._run_sync
+
+        def _spy(coro, *, keep_pending=None, timeout=None):
+            budgets.append(timeout)
+            return real_run_sync(coro, keep_pending=keep_pending, timeout=timeout)
+
+        async def _status(*, bank_id, operation_id):
+            calls.append(1)
+            if len(calls) == 1:
+                await asyncio.sleep(0.2)
+                raise RuntimeError("Cannot connect to host 127.0.0.1:8888")
+            return SimpleNamespace(status="completed")
+
+        client = _make_mock_client()
+        client.operations = MagicMock()
+        client.operations.get_operation_status = AsyncMock(side_effect=_status)
+        provider._client = client
+        provider._get_client = lambda: client
+        provider._run_sync = _spy
+
+        assert provider._is_retain_op_complete("bank", "op-1", timeout=1.0) is True
+        assert budgets[0] == 1.0
+        assert len(budgets) == 2 and budgets[1] <= 0.85, budgets
+
+    def test_embedded_reconnect_is_skipped_when_the_budget_is_spent(self, provider):
+        """A slow client recreation that consumes the rest of the budget means no retry."""
+        provider._mode = "local_embedded"
+        calls = []
+
+        async def _status(*, bank_id, operation_id):
+            calls.append(1)
+            raise RuntimeError("Cannot connect to host 127.0.0.1:8888")
+
+        client = _make_mock_client()
+        client.operations = MagicMock()
+        client.operations.get_operation_status = AsyncMock(side_effect=_status)
+        provider._client = client
+
+        def _slow_recreate():
+            if provider._client is None:
+                time.sleep(0.3)
+            return client
+
+        provider._get_client = _slow_recreate
+        assert provider._is_retain_op_complete("bank", "op-1", timeout=0.2) is False
+        assert len(calls) == 1
+
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
         exceptions = pytest.importorskip(
@@ -1009,6 +1061,41 @@ class TestMissionConfig:
             {"bank_id": "bank-b", "reflect_mission": "Reflect framing", "retain_mission": "Extract decisions"},
         ]
         assert p._client.aretain_batch.await_count == 3
+
+    def test_concurrent_caller_waits_for_the_bank_mission_in_flight(self, provider_with_config):
+        """A second retain/reflect for the same bank must not reach the server while the first
+        caller is still applying that bank's missions."""
+        p = provider_with_config(bank_retain_mission="Extract decisions")
+        order: list = []
+        started, release = threading.Event(), threading.Event()
+
+        async def _create(**_kw):
+            order.append("mission-start")
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            order.append("mission-applied")
+            return SimpleNamespace()
+
+        async def _retain(**_kw):
+            order.append("retain")
+            return SimpleNamespace(operation_id=None, operation_ids=None)
+
+        p._client.acreate_bank = AsyncMock(side_effect=_create)
+        p._client.aretain_batch = AsyncMock(side_effect=_retain)
+        first = threading.Thread(target=p._retain_batch, args=({"content": "a"},), kwargs={"bank_id": "bank-a"})
+        first.start()
+        assert started.wait(5.0)
+        second = threading.Thread(target=p._retain_batch, args=({"content": "b"},), kwargs={"bank_id": "bank-a"})
+        second.start()
+        time.sleep(0.2)
+        assert order == ["mission-start"], order
+        release.set()
+        first.join(5.0)
+        second.join(5.0)
+        assert order[:2] == ["mission-start", "mission-applied"]
+        assert order.count("retain") == 2
+        assert p._client.acreate_bank.await_count == 1
 
     def test_no_missions_configured_makes_no_bank_calls(self, provider):
         provider._client.acreate_bank = AsyncMock()

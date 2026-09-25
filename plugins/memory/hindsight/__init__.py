@@ -400,8 +400,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_generation = 0
-        # Banks whose configured missions were already applied (once per bank per process).
-        self._mission_banks: set[str] = set()
+        # Per-bank mission application (once per bank per process). The event is set when the
+        # attempt finishes (success or failure); other callers for that bank wait for it.
+        self._mission_banks: dict[str, threading.Event] = {}
         self._mission_lock = threading.Lock()
         self._prefetch_thread = None
         self._last_recall_returned, self._last_recall_count = False, 0
@@ -549,7 +550,9 @@ class HindsightMemoryProvider(MemoryProvider):
     def _run_hindsight_operation(self, operation, *, keep_pending: Callable[[Any], None] | None = None,
                                  timeout: float | None = None):
         """Run an async client operation; for local_embedded, a stale-daemon
-        connection failure recreates the client and retries once."""
+        connection failure recreates the client and retries once. A *timeout* is one budget
+        for the whole operation: the retry gets only what the first attempt left, or none."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
             return self._run_sync(operation(self._get_client()), keep_pending=keep_pending, timeout=timeout)
         except Exception as exc:
@@ -559,7 +562,10 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.info("Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s", exc)
             self._client = None
             self._client = client = self._get_client()
-            return self._run_sync(operation(client), keep_pending=keep_pending, timeout=timeout)
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                raise
+            return self._run_sync(operation(client), keep_pending=keep_pending, timeout=left)
 
     # -- retain writer thread + server-side visibility -------------------------
 
@@ -996,9 +1002,15 @@ class HindsightMemoryProvider(MemoryProvider):
         if not (self._bank_mission or self._bank_retain_mission) or not bank_id:
             return
         with self._mission_lock:
-            if bank_id in self._mission_banks:
-                return
-            self._mission_banks.add(bank_id)
+            done = self._mission_banks.get(bank_id)
+            owner = done is None
+            if owner:
+                done = self._mission_banks[bank_id] = threading.Event()
+        if not owner:
+            # Another caller is applying this bank's missions: don't reach the bank before it has
+            # them. Bounded by the request timeout; the attempt itself is best effort.
+            done.wait(float(self._timeout or _DEFAULT_TIMEOUT))
+            return
         kwargs: Dict[str, Any] = {"bank_id": bank_id}
         if self._bank_mission:
             kwargs["reflect_mission"] = self._bank_mission
@@ -1008,6 +1020,8 @@ class HindsightMemoryProvider(MemoryProvider):
             self._run_hindsight_operation(lambda client: client.acreate_bank(**kwargs))
         except Exception as exc:
             logger.warning("Hindsight: could not apply configured missions to bank %s: %s", bank_id, exc)
+        finally:
+            done.set()
 
     def _reflect(self, query: str) -> str | None:
         self._apply_bank_missions(self._bank_id)
