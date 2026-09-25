@@ -1013,7 +1013,7 @@ def _restart_launchd_gateway_after_update(
     """
     from hermes_cli.gateway import (
         get_launchd_label, get_launchd_plist_path, launchd_restart, wait_for_launchd_gateway_supervision,
-        _is_pid_ancestor_of_current_process, _launchctl_supervised_pid,
+        _is_pid_ancestor_of_current_process, _launchctl_supervised_pid, _ancestor_chain_to,
     )
     current_label = get_launchd_label()
     old_pid = None
@@ -1050,9 +1050,12 @@ def _restart_launchd_gateway_after_update(
     if old_pid is not None and _is_pid_ancestor_of_current_process(old_pid):
         # launchd_restart() handed the restart to the gateway this updater runs INSIDE (cron job in
         # the gateway tree, #100179): it exits only after this process does, so no fresh supervised
-        # pid can appear while we wait. Record it as pending for the fleet matrix (#119597).
+        # pid can appear while we wait. Record it as pending for the fleet matrix (#119597) — together
+        # with every process between it and this updater: launchd supervises a wrapper (osascript →
+        # stderr_timestamp → gateway), and the gateway row carries the gateway's own pid.
         if self_restart_pending is not None:
             self_restart_pending.add(old_pid)
+            self_restart_pending.update(_ancestor_chain_to(old_pid))
         return [current_label], []
 
     # launchd_restart() returning only means "restart REQUESTED" (async). A helper dying

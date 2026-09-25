@@ -448,3 +448,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   one. Sandboxed runs drop it even for the caller's own group. The expectation is now measured: the
   same mode is applied to a throwaway sibling directory on the same filesystem, and the bit is
   expected only if it survives.
+
+## In-gateway launchd update recorded the wrapper, not the gateway, as restart-pending
+
+- Fork patch identity: `update-lifecycle`.
+- A `hermes update` running inside the gateway's process tree hands the restart to that gateway and
+  marks it restart-pending so the fleet matrix does not call it stale. On macOS launchd supervises the
+  `osascript` wrapper (`osascript` → `stderr_timestamp` → gateway), so only the wrapper pid was
+  recorded while the matrix row carries the gateway pid. Every in-gateway update therefore printed
+  "STALE (pre-update code)", exited 1 and wrote a `partial` receipt although the restart completed.
+  Every process between the supervised pid and the updater is now recorded as pending.
+- Regression coverage: `test_fleet_matrix_self_restart_pending.py`
+  (`test_launchd_wrapper_pid_still_marks_the_gateway_below_it_pending`).

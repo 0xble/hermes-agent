@@ -102,3 +102,37 @@ def test_restart_phase_records_accepted_self_restart_and_verify_exits_clean(monk
             restart, _pre_update_plan=None, _windows_gateway_resume=None, node_failures=[], update_complete=True,
         )
     assert exc.value.code == 1
+
+
+def test_launchd_wrapper_pid_still_marks_the_gateway_below_it_pending(monkeypatch, tmp_path):
+    """launchd supervises the ``osascript`` wrapper, not the gateway: the chain is
+    osascript → stderr_timestamp → gateway → … → updater. Recording only the supervised
+    wrapper pid left the gateway row STALE and the receipt ``partial`` on every in-gateway
+    update. Every ancestor between the supervised pid and the updater is pending."""
+    import hermes_cli.gateway as gateway
+
+    updater, cron, gw, stamp, wrapper = os.getpid(), 800001, 800002, 800003, 800004
+    parents = {updater: cron, cron: gw, gw: stamp, stamp: wrapper, wrapper: 1}
+    monkeypatch.setattr(gateway, "_get_parent_pid", lambda pid: parents.get(pid))
+
+    class _Plist:
+        def exists(self):
+            return True
+
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: _Plist())
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway, "_launchctl_supervised_pid", lambda label: wrapper)
+    monkeypatch.setattr(gateway, "launchd_restart", lambda: None)
+    monkeypatch.setattr(gateway, "wait_for_launchd_gateway_supervision", lambda **k: pytest.fail("must not wait on itself"))
+
+    pending: set = set()
+    restarted, failed = fleet_mod._restart_launchd_gateway_after_update(
+        supervision_verify=True, self_restart_pending=pending,
+    )
+    assert (restarted, failed) == (["ai.hermes.gateway"], [])
+    assert gw in pending and wrapper in pending
+    assert 1 not in pending
+
+    _fleet_homes(monkeypatch, tmp_path, {"default": {"pid": gw, "gateway_state": "running", "code_sha": OLD}})
+    fleet = ur.collect_fleet_versions(pre_restart_pids=[gw], self_restart_pending=pending)
+    assert [row["state"] for row in fleet] == [ur.RESTART_PENDING_STATE]
