@@ -213,3 +213,99 @@ async def test_media_queued_behind_send_lock_rechecks_flood_cooldown(tmp_path):
     assert result.success is False
     assert (result.error or "").startswith("flood_control:")
     adapter._bot.send_animation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_album_inside_an_armed_window_returns_the_flood_contract():
+    """An album refused locally for flood control must stay reschedulable, not look permanent."""
+    adapter = _adapter()
+    await _arm_window(adapter, wait=90.0)
+    adapter._bot.send_media_group = AsyncMock()
+    adapter._bot.send_photo = AsyncMock()
+
+    result = await adapter.send_multiple_images(
+        "4242", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:"), result.error
+    assert result.retry_after is not None and result.retry_after > 60
+    adapter._bot.send_media_group.assert_not_awaited()
+    adapter._bot.send_photo.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_album_refused_by_the_platform_returns_the_flood_contract(monkeypatch):
+    adapter = _adapter()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+    adapter._bot.send_media_group = AsyncMock(side_effect=_FloodError(200.0))
+    adapter._bot.send_photo = AsyncMock()
+
+    result = await adapter.send_multiple_images(
+        "4242", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:"), result.error
+    adapter._bot.send_photo.assert_not_awaited()
+
+
+def test_timedelta_retry_after_keeps_the_full_penalty():
+    from datetime import timedelta
+
+    from plugins.platforms.telegram.adapter import _telegram_retry_after
+
+    err = _FloodError(0)
+    err.retry_after = timedelta(seconds=90)
+    assert _telegram_retry_after(err) == 90.0
+
+
+@pytest.mark.asyncio
+async def test_album_reports_the_platform_penalty_beyond_the_local_window_cap(monkeypatch):
+    """The per-chat window caps at 300s; the album result must still carry Telegram's full deadline."""
+    adapter = _adapter()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+    adapter._bot.send_media_group = AsyncMock(side_effect=_FloodError(3600.0))
+    adapter._bot.send_photo = AsyncMock()
+
+    result = await adapter.send_multiple_images(
+        "4242", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:"), result.error
+    assert result.retry_after is not None and result.retry_after > 3500
+    adapter._bot.send_photo.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_album_fallback_route_reports_the_platform_penalty(tmp_path, monkeypatch):
+    """A non-flood album error falls back per image; a long refusal there must reach the album result.
+    Local files keep the route off URL-safety DNS checks."""
+    adapter = _adapter()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+    adapter._compress_image_to_jpeg = lambda path: None
+    adapter._bot.send_media_group = AsyncMock(side_effect=ValueError("bad media group"))
+    adapter._bot.send_photo = AsyncMock(side_effect=_FloodError(3600.0))
+    adapter._bot.send_document = AsyncMock(side_effect=_FloodError(3600.0))
+    images = []
+    for name in ("a.png", "b.png"):
+        path = tmp_path / name
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        images.append((f"file://{path}", name))
+
+    result = await adapter.send_multiple_images("4242", images)
+
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:"), result.error
+    assert result.retry_after is not None and result.retry_after > 3500
+
+
+@pytest.mark.asyncio
+async def test_animation_only_album_reports_the_platform_penalty(tmp_path, monkeypatch):
+    adapter = _adapter()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+    adapter._bot.send_animation = AsyncMock(side_effect=_FloodError(3600.0))
+
+    result = await adapter.send_multiple_images("4242", [("https://example.com/a.gif", "a")])
+
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:"), result.error
+    assert result.retry_after is not None and result.retry_after > 3500

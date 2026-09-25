@@ -1,12 +1,19 @@
 # Upstream release defects
 
-Load this unit when changing gateway status for parked profiles, Bot Desktop
-teardown during profile delete and rename, the workspace snapshot pin, or
-memory-provider config cloning, or restarting a parked profile.
+Load this unit before changing any file named in a section's guard or description
+below, when a sync review finds a defect in upstream or fork code, and when deciding
+whether a fix here can retire because upstream now carries an equivalent. Current
+scope: parked-profile gateway status and restart, Bot Desktop teardown, the workspace
+snapshot pin, memory-provider config cloning, `/update` reporting, deferred slash
+commands, portable CI and its source guards, launchd test scoping, desktop E2E
+wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
+session lifecycle, and the alias-cache isolation guard.
 
-These are narrow fixes for defects that shipped in upstream `v2026.9.24` and
-were still present on upstream `main` when the fork synced. Offer each upstream
-and drop it once upstream carries an equivalent fix.
+Each section is a narrow fix for a defect found while syncing to upstream
+`v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
+records its patch identity and guard test. Offer upstream-origin fixes upstream and
+drop each once upstream carries an equivalent fix. Append new defects as sections
+here; move a section into a behavior-specific unit when that unit starts owning it.
 
 ## Parked status hides a live gateway
 
@@ -220,3 +227,22 @@ and drop it once upstream carries an equivalent fix.
   fixture now gives each test a fresh cache and a legacy-API default probe.
 - Guard: `tests/plugins/memory/test_hindsight_provider.py`
   (`test_capability_cache_does_not_leak_between_tests_first`/`_second`).
+
+## Telegram album flood refusal read as a permanent failure
+
+- Fork patch identity: `telegram-album-flood-contract`.
+- `send_multiple_images()` caught a media-group flood refusal (local or platform) in its generic
+  handler, fell back to per-image sends that were refused again, and returned
+  `all images failed to send` with no `retry_after`, so the caller saw a permanent failure. The album
+  path now arms the per-chat window, skips the futile fallback, and answers a wholly undelivered album
+  with `flood_control:<s>`, using the longer of the window and the platform's own remaining deadline
+  (the window caps at 300s, so a multi-hour penalty still reaches the ledger intact). Every refusal
+  records that deadline per chat, so per-image fallback and animation refusals report it too. `_telegram_retry_after()` also honours a
+  `timedelta` `retry_after` (PTB_TIMEDELTA) instead of shrinking it to one second.
+- Guard: `tests/gateway/test_telegram_flood_coherence.py`
+  (`test_album_inside_an_armed_window_returns_the_flood_contract`,
+  `test_album_refused_by_the_platform_returns_the_flood_contract`,
+  `test_timedelta_retry_after_keeps_the_full_penalty`,
+  `test_album_reports_the_platform_penalty_beyond_the_local_window_cap`,
+  `test_album_fallback_route_reports_the_platform_penalty`,
+  `test_animation_only_album_reports_the_platform_penalty`).

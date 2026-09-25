@@ -198,6 +198,10 @@ def _telegram_retry_after(error: Exception) -> Optional[float]:
     """The platform's requested wait for a flood refusal, or None when this is not one."""
     retry_after = getattr(error, "retry_after", None)
     if retry_after is not None:
+        # PTB reports a timedelta when PTB_TIMEDELTA is enabled; float() rejects it, and the
+        # fallback below would shrink a real multi-minute penalty to one second.
+        if hasattr(retry_after, "total_seconds"):
+            return float(retry_after.total_seconds())
         try:
             return float(retry_after)
         except (TypeError, ValueError):
@@ -5654,7 +5658,7 @@ class TelegramAdapter(BasePlatformAdapter):
             anim_result = await super().send_multiple_images(chat_id, animations, metadata, human_delay=human_delay)
             delivered = anim_result.success
         if not photos:
-            return SendResult(success=delivered, error=None if delivered else "all images failed to send")
+            return self._album_result(chat_id, delivered)
         from urllib.parse import unquote as _unquote
         CHUNK = 10  # Telegram's album limit
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
@@ -5695,7 +5699,21 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._bot.send_media_group, {**send_kwargs, "media": media}, metadata, reply_to_id,
                     "media group", reset_media=_reset_opened_files)
                 delivered = True
+            except _MediaFloodRefusal as flood:
+                # The chat is in a flood window: a per-image fallback would only be refused again.
+                logger.warning(
+                    "[%s] media group refused for flood control (chunk %d/%d, %.0fs)", self.name,
+                    chunk_idx + 1, len(chunks), flood.wait)
             except Exception as e:
+                wait = _telegram_retry_after(e)
+                if wait is not None:
+                    # A platform flood refusal: arm the per-chat window instead of firing a per-image
+                    # fallback into the same penalty.
+                    self._record_send_flood_cooldown(chat_id, wait)
+                    logger.warning(
+                        "[%s] media group refused for flood control (chunk %d/%d, retry_after=%.1fs)", self.name,
+                        chunk_idx + 1, len(chunks), wait)
+                    continue
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
                     chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
@@ -5708,6 +5726,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 for tmp in temp_paths:
                     with contextlib.suppress(OSError):
                         os.remove(tmp)
+        return self._album_result(chat_id, delivered)
+
+    def _album_result(self, chat_id: str, delivered: bool) -> SendResult:
+        """A wholly undelivered album answers with the flood contract while the chat is penalised
+        (an album refusal or a per-image fallback refusal both arm the window), so the caller can
+        reschedule instead of reading a permanent 'all images failed to send'. The wait is the
+        longer of the local window and the platform's own remaining deadline: the window is capped
+        at 300s, and reporting it for a multi-hour penalty would redeliver early and hide an absurd
+        penalty from the delivery ledger. The platform deadline is recorded for every refusal route
+        (media group, per-image fallback, animations), not just the album call."""
+        if not delivered:
+            waits = [w for w in (self._send_flood_cooldown_remaining(chat_id),) if w is not None]
+            key = str(normalize_telegram_chat_id(chat_id))
+            platform = self.__dict__.get("_telegram_platform_flood_until", {})
+            deadline = platform.get(key)
+            if deadline is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    waits.append(remaining)
+                else:
+                    platform.pop(key, None)  # expired: keep the dict bounded
+            if waits:
+                return _flood_cap_result(max(waits))
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     async def send_image_file(
@@ -5948,7 +5989,13 @@ class TelegramAdapter(BasePlatformAdapter):
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
         until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
+        key = str(normalize_telegram_chat_id(chat_id))
+        now = asyncio.get_running_loop().time()
+        until[key] = now + max(1.0, min(float(wait), 300.0))
+        # The window above is capped; keep the platform's own deadline so an aggregate result (an
+        # album whose images were refused on any route) can report the full penalty.
+        platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
+        platform[key] = max(platform.get(key, 0.0), now + float(wait))
         return _flood_cap_result(wait)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
@@ -6021,7 +6068,13 @@ class TelegramAdapter(BasePlatformAdapter):
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
         until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        until[str(normalize_telegram_chat_id(chat_id))] = asyncio.get_running_loop().time() + max(1.0, min(float(wait), 300.0))
+        key = str(normalize_telegram_chat_id(chat_id))
+        now = asyncio.get_running_loop().time()
+        until[key] = now + max(1.0, min(float(wait), 300.0))
+        # The window above is capped; keep the platform's own deadline so an aggregate result (an
+        # album whose images were refused on any route) can report the full penalty.
+        platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
+        platform[key] = max(platform.get(key, 0.0), now + float(wait))
         return _flood_cap_result(wait)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
