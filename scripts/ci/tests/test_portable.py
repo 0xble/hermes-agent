@@ -283,6 +283,27 @@ try {
             text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
             self.assertRegex(text, r"version: ['\"]" + re.escape(ci.PINS['uv']) + r"['\"]", name)
 
+    def test_every_reusable_only_workflow_has_a_caller(self):
+        import yaml
+        workflows = ci.ROOT / '.github/workflows'
+        texts = {path.name: path.read_text(encoding='utf-8') for path in workflows.glob('*.y*ml')}
+        for name, text in texts.items():
+            triggers = yaml.safe_load(text).get(True) or yaml.safe_load(text).get('on') or {}
+            if isinstance(triggers, dict) and set(triggers) <= {'workflow_call', 'workflow_dispatch'} and 'workflow_call' in triggers:
+                callers = [other for other, body in texts.items() if other != name and f'./.github/workflows/{name}' in body]
+                self.assertTrue(callers, f'{name} is reusable-only and nothing calls it')
+        self.assertIn('desktop-core', yaml.safe_load(texts['nightly.yml'])['jobs']['qualification']['needs'])
+
+    def test_every_local_action_reference_resolves(self):
+        import re
+        missing = []
+        for path in sorted((ci.ROOT / '.github/workflows').glob('*.y*ml')):
+            for ref in re.findall(r'uses:\s*(\./[^\s#]+)', path.read_text(encoding='utf-8')):
+                target = ci.ROOT / ref
+                if not (target.is_file() or any((target / name).is_file() for name in ('action.yml', 'action.yaml', 'Dockerfile'))):
+                    missing.append(f'{path.name}: {ref}')
+        self.assertEqual(missing, [])
+
     def test_source_guard_detects_mutation_without_overwriting_user_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -153,6 +153,22 @@ and drop it once upstream carries an equivalent fix.
   service-ancestry exclusion (verified: removing that exclusion fails the test).
 - Guard: `tests/hermes_cli/test_gateway_launchd_supervised_child.py`.
 
+## Desktop core E2E lost its only caller
+
+- Fork patch identity: `ci-desktop-core-nightly`.
+- Retiring `ci.yaml` removed the only caller of `e2e-desktop-core.yml`, a
+  `workflow_call`-only workflow, so the deterministic Desktop core suite
+  (transcript integrity, backend lifecycle and orphans, clarify/approval) no
+  longer ran anywhere. Nightly now calls it and its `qualification` requires it.
+  It also runs on demand, on `ubuntu-latest`, because this repository has no
+  larger hosted runners.
+- The same retirement (#62) deleted `.github/actions/retry`, which this suite
+  and `live-providers.yml` still use, so both failed at their first install
+  step. The upstream composite action is restored unchanged.
+- Guards: `scripts/ci/tests/test_portable.py`
+  (`test_every_reusable_only_workflow_has_a_caller`,
+  `test_every_local_action_reference_resolves`).
+
 ## Media send checks flood cooldown after chat lock acquisition
 
 - Fork patch identity: `telegram-media-flood-under-lock`.
