@@ -4757,6 +4757,9 @@ class BasePlatformAdapter(ABC):
     async def cancel_background_tasks(self) -> None:
         """Cancel in-flight background tasks (shutdown/replacement); 5s bound each,
         stragglers are untracked and left to unwind."""
+        # Fence deferred commands first: a cancelled owner's cleanup would otherwise drain one (task
+        # cancellation does not set its interrupt event) and mutate a transcript during teardown.
+        self._invalidate_all_deferred_commands()
         # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
         # untrack.
         for _ in range(5):
