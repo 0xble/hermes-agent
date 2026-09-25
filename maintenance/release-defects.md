@@ -2,7 +2,7 @@
 
 Load this unit when changing gateway status for parked profiles, Bot Desktop
 teardown during profile delete and rename, the workspace snapshot pin, or
-memory-provider config cloning.
+memory-provider config cloning, or restarting a parked profile.
 
 These are narrow fixes for defects that shipped in upstream `v2026.9.24` and
 were still present on upstream `main` when the fork synced. Offer each upstream
@@ -51,3 +51,15 @@ and drop it once upstream carries an equivalent fix.
   are skipped.
 - Guard: `tests/hermes_cli/test_profiles.py`
   (`test_clone_config_never_follows_symlinks_out_of_the_provider_dir`).
+
+## Restart leaves a parked profile stopped
+
+- Fork patch identity: `parked-profile-restart`.
+- `hermes -p <name> gateway stop` parks the profile and the host stops serving
+  it. A later `gateway restart` then found no host serving the profile and fell
+  through to the standalone restart path, so the profile stayed parked and
+  stopped. Restarting a parked profile now unparks it and asks the host to serve
+  it, the same as `gateway start`. A separate `--force` gateway keeps its own
+  restart path.
+- Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
+  (`test_restart_after_stop_unparks_and_serves_the_profile`).

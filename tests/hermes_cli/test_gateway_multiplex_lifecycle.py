@@ -92,6 +92,44 @@ def test_cli_lifecycle_orders_marker_before_socket(homes, monkeypatch, capsys, v
             'start': "Profile 'worker' served", 'restart': "Profile 'worker' restarted"}[verb] in output
 
 
+def test_restart_after_stop_unparks_and_serves_the_profile(homes, monkeypatch, capsys):
+    """`gateway stop` parks the profile and drops it from the host's served set, so a later
+    `gateway restart` must bring it back through the host, not fall through to a standalone restart."""
+    from hermes_cli import gateway as gw
+    from gateway import control_socket
+    root, secondary = homes
+    marker = secondary / 'gateway.parked'
+    marker.touch()
+    owner = SimpleNamespace(home=root, profile_label='default', profiles=('default',),
+                            describe=lambda: 'test host')
+    monkeypatch.setenv('HERMES_HOME', str(secondary))
+    monkeypatch.setattr(gw, '_current_profile_name', lambda: 'worker')
+    monkeypatch.setattr(gw, '_refuse_from_inside_gateway', lambda *a: None)
+    monkeypatch.setattr(gw, 'find_gateway_pids', lambda **kw: [])
+    monkeypatch.setattr(gw, '_served_by_another_host_gateway', lambda *a: None)
+    monkeypatch.setattr(gw, 'named_profile_served_by_running_multiplexer', lambda *a: False)
+    monkeypatch.setattr(gw, '_host_multiplexer_for_all_verb', lambda: owner)
+    calls = []
+
+    def serve(home, name):
+        assert home == root and name == 'worker' and not marker.exists()
+        calls.append('serve')
+        return {'served': name, 'served_profiles': ['default', name]}
+
+    class FellThrough(Exception):
+        pass
+
+    def standalone(*a, **kw):
+        raise FellThrough('restart fell through to the standalone gateway path')
+
+    monkeypatch.setattr(control_socket, 'request_serve_profile_hot', serve)
+    monkeypatch.setattr(gw, '_guard_named_profile_under_multiplexer', standalone)
+    gw._cmd_restart(SimpleNamespace())
+    assert calls == ['serve']
+    assert not marker.exists()
+    assert "Profile 'worker' served by the host gateway." in capsys.readouterr().out
+
+
 def test_parked_status_and_topology_keep_roster(homes, monkeypatch, capsys):
     from hermes_cli import gateway as gw, profiles
     from hermes_cli.web_server_gateway import _collect_profile_gateway_topology
