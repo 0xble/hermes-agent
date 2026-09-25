@@ -254,3 +254,24 @@ async def test_slash_update_final_outcome_follows_the_detached_wrapper(tmp_path)
         outcome = final_outcome(home, record)
         time.sleep(.05)
     assert outcome is not None and outcome[0] is False and "code 7" in outcome[1]
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_trailing_output_does_not_hold_the_final_notice(tmp_path):
+    """A trailing newline after the last flush must not delay completion to the deadline."""
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_text("\n")
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        # The watcher deadline is 30s; completion must arrive well before it.
+        await asyncio.wait_for(
+            runner._watch_update_progress(poll_interval=.01, stream_interval=.01, timeout=30.0), 5
+        )
+    messages = [c.args[1] for c in adapter.send.call_args_list]
+    assert messages[-1].startswith("✅ Update Complete")
+    assert not any("timed out" in m.lower() or "still running" in m.lower() for m in messages)
+    assert read_pending(tmp_path) is None
