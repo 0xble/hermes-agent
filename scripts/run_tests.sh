@@ -157,6 +157,17 @@ for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST
   fi
 done
 
+# Portable CI supplies a fresh global config containing only the current
+# checkout's safe.directory. Keep that exact path across env -i so Git works
+# when the Actions container runs as root over a runner-owned workspace. Do
+# not forward repository selectors, credential helpers, or arbitrary GIT_* vars.
+GIT_ENV=()
+for _git_var in GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM; do
+  if [ -n "${!_git_var:-}" ]; then
+    GIT_ENV+=("$_git_var=${!_git_var}")
+  fi
+done
+
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
@@ -179,6 +190,7 @@ exec env -i \
   HOME="$HOME" \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
+  ${GIT_ENV[@]+"${GIT_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
