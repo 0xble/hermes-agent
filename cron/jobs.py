@@ -2109,9 +2109,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             updated["next_run_at"] = _next_run_or_reject_past_oneshot(
                 updated["schedule"], updated.get("name", job_id), updated["schedule"], "update ",
                 job_timezone=updated.get("timezone"))
-        if {"schedule", "next_run_at", "enabled", "state"}.intersection(updates):
+        if {"schedule", "next_run_at", "enabled", "state", "timezone"}.intersection(updates):
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
+            # A zone edit counts: the unclaimed slot is the old zone's wall clock.
             updated.pop("pending_slot", None)
         _fill_missing_next_run(updated)
         _reject_terminal_activation(job, updated, job_id)
