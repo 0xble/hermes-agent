@@ -397,3 +397,58 @@ async def test_shutdown_invalidates_all_deferred_commands():
 
     assert adapter._deferred_commands == {}
     assert adapter._session_generations["session"] == before + 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_command_replayed_while_runner_busy_waits_for_turn_release():
+    """A deferred command replayed while the runner's turn is still running is acknowledged once
+    and runs once, after that turn releases.
+
+    The adapter drains deferred commands when its own task ends, but the runner may still own a
+    turn the adapter never saw (an internal wake admitted after /stop). Re-deferring the replay as a
+    new command re-acked and re-drained it in a tight loop, one chat message per iteration.
+    """
+    from gateway.platforms.base import BasePlatformAdapter
+    from hermes_cli.commands import resolve_command
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return {}
+
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    sent = []
+
+    async def _send(**kwargs):
+        sent.append(kwargs.get("content"))
+
+    adapter._send_with_retry = AsyncMock(side_effect=_send)
+    runner = _make_runner()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    runner._delivery_adapter_for = lambda _source: adapter
+    event = _make_event("/undo 2")
+    session_key = build_session_key(event.source)
+    runner_busy = True
+    ran = []
+
+    async def handler(ev):
+        if runner_busy:
+            return await runner._dispatch_busy_slash_command(
+                ev, resolve_command("undo"), session_key, ev.source)
+        ran.append(ev.text)
+        return None
+
+    adapter.set_message_handler(handler)
+    await adapter.handle_message(event)
+    await asyncio.sleep(0.3)
+    acks = [text for text in sent if text and "scheduled" in text]
+    assert len(acks) == 1
+    assert ran == []
+
+    runner_busy = False
+    adapter.resume_deferred_commands(session_key)
+    await asyncio.sleep(0.1)
+    await adapter.cancel_background_tasks()
+    assert ran == ["/undo 2"]
+    assert len([text for text in sent if text and "scheduled" in text]) == 1

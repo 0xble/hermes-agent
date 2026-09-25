@@ -942,6 +942,11 @@ class GatewayBusySessionMixin:
             adapter = self._delivery_adapter_for(source)
             if adapter is None or not hasattr(adapter, "defer_command_until_idle"):
                 return f"⚠️ `/{name}` could not be scheduled because this session has no deferred-command queue."
+            if getattr(event, "_deferred_session_key", None) is not None and hasattr(adapter, "park_deferred_command"):
+                # A replayed deferred command found this turn still running: it was already
+                # acknowledged once, so wait silently for the turn to release it.
+                adapter.park_deferred_command(quick_key, event)
+                return None
             depth = adapter.defer_command_until_idle(quick_key, event)
             if depth is None:
                 limit = getattr(adapter, "_MAX_DEFERRED_COMMANDS_PER_SESSION", "the configured limit")

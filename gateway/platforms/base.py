@@ -1994,17 +1994,54 @@ class BasePlatformAdapter(ABC):
     def _pop_deferred_command(self, session_key: str) -> Optional[MessageEvent]:
         queue = self._deferred_commands.get(session_key)
         while queue:
-            queued_session, queued_generation, event = queue.pop(0)
+            queued_session, queued_generation, event = queue[0]
             current_generation = self._session_generations.get(session_key, 0)
-            if (queued_session == session_key
+            if not (queued_session == session_key
                     and getattr(event, "_deferred_session_key", None) == session_key
                     and queued_generation == current_generation
                     and getattr(event, "_deferred_generation", None) == current_generation):
-                if not queue:
-                    self._deferred_commands.pop(session_key, None)
-                return event
+                queue.pop(0)
+                continue
+            if getattr(event, "_deferred_parked", False):
+                # Parked by the runner: its turn is still running. Only resume_deferred_commands,
+                # called when that turn releases, may run it; draining here would spin.
+                return None
+            queue.pop(0)
+            if not queue:
+                self._deferred_commands.pop(session_key, None)
+            return event
         self._deferred_commands.pop(session_key, None)
         return None
+
+    def park_deferred_command(self, session_key: str, event: MessageEvent) -> None:
+        """Return a replayed deferred command to the head of its queue without re-acknowledging it.
+
+        The adapter drains deferred commands when its own task ends, but the runner can still own a
+        turn the adapter never saw (an internal wake admitted after ``/stop``). The replay then finds
+        the session busy; re-deferring it as a new command re-acks and re-drains it immediately, in
+        a loop. A parked command waits for ``resume_deferred_commands`` instead.
+        """
+        generation = self._session_generations.get(session_key, 0)
+        if (getattr(event, "_deferred_session_key", None) != session_key
+                or getattr(event, "_deferred_generation", None) != generation):
+            return
+        setattr(event, "_deferred_parked", True)
+        self._deferred_commands.setdefault(session_key, []).insert(0, (session_key, generation, event))
+
+    def resume_deferred_commands(self, session_key: str) -> None:
+        """Called by the runner when a turn releases: unpark queued commands and, if no adapter task
+        owns the session, start the next one. An owning task drains them when it finishes."""
+        queue = self._deferred_commands.get(session_key)
+        if not queue:
+            return
+        for _session, _generation, event in queue:
+            if getattr(event, "_deferred_parked", False):
+                setattr(event, "_deferred_parked", False)
+        if session_key in self._active_sessions:
+            return
+        deferred = self._pop_deferred_command(session_key)
+        if deferred is not None:
+            self._start_session_processing(deferred, session_key)
 
     def _invalidate_deferred_commands(self, session_key: str) -> None:
         """Advance the session incarnation and discard commands from the old one."""
