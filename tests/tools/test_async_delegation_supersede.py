@@ -112,19 +112,23 @@ def test_unit_replaced_from_its_stop_hook_reports_only_through_the_replacement(m
 def test_supersede_is_refused_when_the_parent_could_lose_the_outcome(monkeypatch):
     gate = threading.Event()
 
-    def dispatch(goals, session_key="k"):
+    def dispatch(goals, session_key="k", **parent):
         return ad.dispatch_async_delegation_batch(
             goals=goals, context=None, toolsets=None, role="leaf", model="m", session_key=session_key,
-            max_async_children=8,
+            max_async_children=8, **parent,
             runner=lambda: (gate.wait(5), {"results": [{"task_index": i, "status": "failed"} for i in
                                                         range(len(goals))]})[1])["delegation_id"]
 
     single, pair, other = dispatch(["one"]), dispatch(["a", "b"]), dispatch(["replacement"])
     elsewhere = dispatch(["replacement"], session_key="another parent")
+    # CLI/TUI: every unit has an empty session_key; only the parent session and tab tell them apart.
+    tab_a = dispatch(["one"], session_key="", parent_session_id="parent-A", origin_ui_session_id="tab-A")
+    tab_b = dispatch(["replacement"], session_key="", parent_session_id="parent-B", origin_ui_session_id="tab-B")
     assert ad.supersede_delegation(single, "deleg_unknown") is False  # no admitted replacement
     assert ad.supersede_delegation(single, single) is False
     assert ad.supersede_delegation(single, elsewhere) is False  # would report to a different parent
+    assert ad.supersede_delegation(tab_a, tab_b) is False  # same empty key, different parent
     assert ad.supersede_delegation(pair, other) is False  # would hide a sibling's result
     gate.set()
-    assert {e["delegation_id"] for e in _drain()} == {single, pair, other, elsewhere}
+    assert {e["delegation_id"] for e in _drain()} == {single, pair, other, elsewhere, tab_a, tab_b}
     assert ad.supersede_delegation(single, other) is False  # already reported

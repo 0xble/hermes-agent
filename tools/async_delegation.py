@@ -825,6 +825,12 @@ def dispatch_async_delegation_batch(
 
 
 # ── Finalization + completion events ────────────────────────────────────────
+# Everything that decides which parent a completion re-enters. A replacement must match all of it: CLI/TUI units
+# share an empty session_key, and a gateway session_key outlives a conversation reset.
+_PARENT_IDENTITY_KEYS = ("session_key", "origin_ui_session_id", "origin_session_id", "parent_session_id",
+                         *_ROUTING_KEYS)
+
+
 def supersede_delegation(delegation_id: str, replacement_id: str, reason: str = "") -> bool:
     """Mark a still-running single-task unit as replaced by ``replacement_id``, an admitted delegation that reports
     the same work. Its completion is then recorded (``delivery_state='superseded'``) but never wakes the parent.
@@ -832,14 +838,14 @@ def supersede_delegation(delegation_id: str, replacement_id: str, reason: str = 
     For owners that retry a failed child elsewhere, e.g. a reviewer rate-limited on one route and re-dispatched on
     the next from its ``subagent_stop`` hook, which runs before this unit finalizes. Refused (False) unless this
     unit is still active and runs one task, and the replacement is a known delegation reporting to the same parent
-    session, so the parent always hears about the work once."""
+    (every routing field in ``_PARENT_IDENTITY_KEYS``), so the parent always hears about the work once."""
     if not delegation_id or not replacement_id or delegation_id == replacement_id:
         return False
     with _records_lock:
         record, replacement = _records.get(delegation_id), _records.get(replacement_id)
         if record is None or replacement is None or record.get("status") not in _ACTIVE_STATES:
             return False
-        if replacement.get("session_key", "") != record.get("session_key", ""):
+        if any((replacement.get(k) or "") != (record.get(k) or "") for k in _PARENT_IDENTITY_KEYS):
             return False  # the replacement would report to a different parent
         tasks = record.get("task_indexes")
         if len(tasks if tasks is not None else (record.get("goals") or [record.get("goal")])) != 1:

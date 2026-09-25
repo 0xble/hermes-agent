@@ -27,9 +27,10 @@ Load this unit when changing the user-facing "Subagent failed" notice
   is then persisted with `delivery_state='superseded'`: recorded, visible in
   the delegation list, never queued or replayed to the parent. Core refuses
   when the replacement is not an admitted delegation for the same parent
-  session, when the old unit has more than one task (a sibling's result would
-  be hidden), or when the old unit has already been reported. A refusal leaves
-  normal delivery.
+  (every routing field: session key, UI session, origin and parent session
+  ids, gateway routing origin), when the old unit has more than one task (a
+  sibling's result would be hidden), or when the old unit has already been
+  reported. A refusal leaves normal delivery.
 
 ## Why
 
