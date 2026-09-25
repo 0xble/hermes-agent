@@ -4464,21 +4464,23 @@ class BasePlatformAdapter(ABC):
         it."""
         # Deferred control commands run before ordinary queued text, against the committed
         # transcript/context produced by this turn. Keep any ordinary follow-up in its slot.
+        current_task = asyncio.current_task()
+        existing_task = self._session_tasks.get(session_key)
+        if existing_task is not None and existing_task is not current_task and not existing_task.done():
+            # The in-band drain (or an earlier late-arrival drain) already handed the session to a
+            # successor task; it drains deferred commands and queued text in order. Spawning here would
+            # run two tasks on one session.
+            return
         if interrupt_event.is_set():
             self._invalidate_deferred_commands(session_key)
         deferred = None if interrupt_event.is_set() else self._pop_deferred_command(session_key)
-        late_pending = self._pending_messages.pop(session_key, None)
         if deferred is not None:
-            if late_pending is not None:
-                self._pending_messages[session_key] = late_pending
             if not self._spawn_drain_task(deferred, session_key):
-                current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
             return
-        current_task = asyncio.current_task()
+        late_pending = self._pending_messages.pop(session_key, None)
         if late_pending is not None:
-            existing_task = self._session_tasks.get(session_key)
             if existing_task is not None and existing_task is not current_task:
                 # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
                 # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
@@ -4590,8 +4592,12 @@ class BasePlatformAdapter(ABC):
             # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
             # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
-            if session_key in self._pending_messages:
+            # Deferred control commands run before ordinary queued text, against the transcript this
+            # turn committed; the ordinary follow-up keeps its slot for the command task's handoff.
+            pending_event = self._pop_deferred_command(session_key)
+            if pending_event is None and session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
+            if pending_event is not None:
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
