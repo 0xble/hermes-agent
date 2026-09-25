@@ -1564,6 +1564,23 @@ class TestSessionSwitchBufferFlush:
         assert provider.prefetch("new question") == ""
         assert provider.recall_status() is None
 
+    def test_switch_to_unrelated_session_clears_the_old_parent(self, provider_with_config):
+        """An explicit empty parent on a switch to a different session must drop the previous
+        branch's parent, or later retains tag the unrelated conversation with the old lineage."""
+        p = provider_with_config()
+        p.on_session_switch("branch-sid", parent_session_id="root-sid")
+        assert p._parent_session_id == "root-sid"
+        p.on_session_switch("unrelated-sid", parent_session_id="")
+        assert p._session_id == "unrelated-sid"
+        assert p._parent_session_id == ""
+
+    def test_rewind_of_the_same_session_keeps_its_parent(self, provider_with_config):
+        """/undo re-fires the hook for the SAME session with no parent; lineage must survive."""
+        p = provider_with_config()
+        p.on_session_switch("branch-sid", parent_session_id="root-sid")
+        p.on_session_switch("branch-sid", parent_session_id="", reset=False, rewound=True)
+        assert p._parent_session_id == "root-sid"
+
     def test_buffered_turns_flushed_before_clear(self, provider_with_config):
         """retain_every_n_turns > 1 must not silently drop partial buffers
         on session switch. Whatever's in _session_turns at switch time
@@ -2518,3 +2535,36 @@ class TestRetainRetry:
         p._retain_backlog_next_at = 0.0
         assert self._wait_for(lambda: not p._retain_backlog)
         assert p._wait_for_retains_drained(2.0) is True
+
+
+def test_shared_loop_is_not_replaced_during_startup(monkeypatch):
+    """A second caller arriving while the first loop thread is still starting must get the same
+    loop, not a replacement: one cached async client cannot span two event loops."""
+    import asyncio
+    import threading
+
+    import plugins.memory.hindsight as hs
+
+    monkeypatch.setattr(hs, "_loop", None)
+    monkeypatch.setattr(hs, "_loop_thread", None)
+    real_set = asyncio.set_event_loop
+    gate = threading.Event()
+
+    def slow_set_event_loop(loop):
+        gate.wait(timeout=0.5)  # widen the startup window before run_forever()
+        real_set(loop)
+
+    monkeypatch.setattr(hs.asyncio, "set_event_loop", slow_set_event_loop)
+    results: list = []
+    callers = [threading.Thread(target=lambda: results.append(hs._get_loop())) for _ in range(2)]
+    for c in callers:
+        c.start()
+    for c in callers:
+        c.join(timeout=10.0)
+    loops = {id(loop) for loop in results}
+    try:
+        assert len(results) == 2
+        assert len(loops) == 1, "startup window let a second loop replace the first"
+    finally:
+        for loop in {id(l): l for l in results}.values():
+            loop.call_soon_threadsafe(loop.stop)

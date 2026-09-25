@@ -202,10 +202,20 @@ def _get_loop() -> asyncio.AbstractEventLoop:
         if _loop is not None and _loop.is_running():
             return _loop
         loop = _loop = asyncio.new_event_loop()
-        _loop_thread = threading.Thread(
-            target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()), daemon=True, name="hindsight-loop",
-        )
+        ready = threading.Event()
+
+        def _serve() -> None:
+            asyncio.set_event_loop(loop)
+            loop.call_soon(ready.set)
+            loop.run_forever()
+
+        _loop_thread = threading.Thread(target=_serve, daemon=True, name="hindsight-loop")
         _loop_thread.start()
+        # Hold initialization ownership until the loop is actually running: a caller arriving in the
+        # startup window would otherwise see is_running() False and replace this loop with another,
+        # splitting one cached async client across two loops.
+        if not ready.wait(timeout=10.0):
+            logger.warning("Hindsight event loop did not start within 10s")
         return _loop
 
 
@@ -1393,8 +1403,12 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_result, self._prefetch_count = "", 0
 
         # 3. Rotate to the new session.
-        if parent_session_id:
-            self._parent_session_id = str(parent_session_id).strip()
+        # An explicit empty parent on a real switch clears the old lineage (an unrelated resumed
+        # session must not inherit the previous branch's parent). A rewind keeps the same session,
+        # and its caller passes no parent, so the existing lineage stays.
+        new_parent = str(parent_session_id or "").strip()
+        if new_parent or (new_id != self._session_id and not kwargs.get("rewound")):
+            self._parent_session_id = new_parent
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
         if self._bank_id_template:
             cfg = self._config or {}
