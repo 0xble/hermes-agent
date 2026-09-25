@@ -240,6 +240,34 @@ def test_already_up_to_date_is_success_without_runtime_to_verify(tmp_path, case)
         assert result[0] is False
 
 
+@pytest.mark.parametrize("live", ["replacement_current", "replacement_old_code", "not_back_yet", "down", "other_row_stale"])
+def test_self_restart_pending_is_judged_by_the_replacement_gateway(tmp_path, live):
+    """An in-gateway update (request_update) finalizes before its own gateway restarts, so the receipt
+    row is ``restart_pending`` with the OLD pid and sha. The notice must wait for the replacement and
+    judge it: the new code running is success, old code is failure, not-yet-back is still pending.
+    Rendering every such row as a failure sent a false "Update Failed" after each promotion."""
+    data = pending(tmp_path)
+    finalize_update(tmp_path, fleet_state="restart_pending")
+    path = tmp_path / "logs" / "update_receipts" / "latest.json"
+    receipt = json.loads(path.read_text())
+    receipt["fleet"][0]["code_sha"] = "b" * 40  # the pre-update code the enclosing gateway still ran
+    if live == "other_row_stale":
+        receipt["fleet"].append({"profile": "ops", "pid": 4321, "state": "stale", "code_sha": "b" * 40})
+    path.write_text(json.dumps(receipt))
+    live_pid = {"replacement_current": 5678, "replacement_old_code": 5678, "not_back_yet": 1234,
+                "down": None, "other_row_stale": 5678}[live]
+    runtime_sha = "b" * 40 if live == "replacement_old_code" else "a" * 40
+    (tmp_path / "gateway_state.json").write_text(json.dumps({"pid": live_pid, "code_sha": runtime_sha}))
+    with patch("gateway.status.live_gateway_pid_for_home", return_value=live_pid):
+        result = final_outcome(tmp_path, data)
+    if live == "replacement_current":
+        assert result is not None and result[0] is True and "a" * 12 in result[1]
+    elif live in {"not_back_yet", "down"}:
+        assert result is None
+    else:
+        assert result is not None and result[0] is False
+
+
 @pytest.mark.asyncio
 async def test_already_up_to_date_request_reports_already_latest(tmp_path):
     data = pending(tmp_path)
