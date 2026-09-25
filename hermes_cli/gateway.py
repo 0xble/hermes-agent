@@ -1741,6 +1741,25 @@ def _reaper_candidate_is_supervisor_owned(pid: int) -> bool:
     return False
 
 
+def _reaper_candidate_matches_home(pid: int) -> bool:
+    """Reject a gateway explicitly launched under another home before sending signals.
+
+    Process argv does not carry an inherited HERMES_HOME. Keep the old best-effort
+    behavior when process environment inspection is unavailable or no override exists.
+    """
+    import psutil
+    try:
+        candidate_home = psutil.Process(pid).environ().get("HERMES_HOME", "").strip()
+    except Exception:
+        # A restricted or already-exited process cannot supply an identity;
+        # preserve the existing reaper behavior rather than claiming a match.
+        return True
+    if not candidate_home:
+        return True
+    from hermes_constants import get_process_hermes_home
+    return Path(candidate_home).expanduser().resolve() == get_process_hermes_home().resolve()
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see. On WSL/no-systemd hosts
     the restart fallback runs the gateway in-process under a ``gateway restart`` argv; a stale pidfile
@@ -1771,9 +1790,13 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     from gateway.status import _pid_exists, get_process_start_time, write_planned_stop_marker
     own = _reaper_exclusion_pids(extra_exclude)
     try:
-        # On Windows also drop Task Scheduler-owned candidates (the pidfile-less gap).
+        # Cmdlines of ordinary `gateway run` children do not name their HERMES_HOME.
+        # The process-table fallback otherwise sweeps healthy gateways belonging to
+        # another isolated home (including a concurrent desktop backend's test).
         orphans = [
-            p for p in find_gateway_pids(exclude_pids=own) if p and p > 0 and not _reaper_candidate_is_supervisor_owned(p)
+            p for p in find_gateway_pids(exclude_pids=own)
+            if p and p > 0 and _reaper_candidate_matches_home(p)
+            and not _reaper_candidate_is_supervisor_owned(p)
         ]
     except Exception:
         return False
