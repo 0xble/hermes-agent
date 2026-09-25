@@ -11,13 +11,18 @@ import pytest
 
 
 def _expected_mode(mode: int, path) -> int:
-    """The kernel drops S_ISGID on chmod when an unprivileged caller is not in the directory's
-    group (e.g. a macOS ``/tmp`` dir inherits ``wheel``), and keeps it otherwise (a
-    ``/var/folders`` dir inherits ``staff``). Expect the bit only where chmod can keep it."""
-    gid = os.stat(path).st_gid
-    if os.geteuid() == 0 or gid == os.getegid() or gid in os.getgroups():
-        return mode
-    return mode & ~stat.S_ISGID
+    """Whether chmod keeps S_ISGID depends on the kernel, group membership and sandboxing, so
+    measure it: apply the same mode to a throwaway sibling on the same filesystem and expect the
+    setgid bit only if that sibling kept it."""
+    import tempfile
+
+    probe = tempfile.mkdtemp(prefix=".setgid-probe-", dir=os.path.dirname(os.fspath(path)))
+    try:
+        os.chmod(probe, mode)
+        keeps_setgid = bool(os.stat(probe).st_mode & stat.S_ISGID)
+    finally:
+        os.rmdir(probe)
+    return mode if keeps_setgid else mode & ~stat.S_ISGID
 
 
 from hermes_constants import apply_scratch_tmp_env, get_scratch_dir, prune_scratch_dir
