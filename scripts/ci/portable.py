@@ -295,12 +295,14 @@ def require_wal_capable_sqlite(py: str, env: dict[str, str]) -> None:
 
 
 def python_tests(env: dict[str, str], roots: list[str], workers: int,
-                 pytest_args: list[str] | None = None) -> None:
+                 pytest_args: list[str] | None = None, file_timeout: int | None = None) -> None:
     py = python(env)
     require_wal_capable_sqlite(py, env)
     require_tools(('rg',), env)
     env = dict(env)
     env['HERMES_PYTHON'] = py
+    if file_timeout is not None:
+        env['HERMES_TEST_FILE_TIMEOUT'] = str(file_timeout)
     command = ['bash', 'scripts/run_tests.sh', '-j', str(workers), '--file-retries', '0',
                *roots, *(pytest_args or [])]
     # The runner provides a disk-backed original HOME outside the checkout.
@@ -312,6 +314,31 @@ def python_tests(env: dict[str, str], roots: list[str], workers: int,
             run(command, env=env)
     else:
         run(command, env=env)
+
+
+# Each upgrade file drives several real N-1 -> HEAD installs and updates. The
+# path suite takes about 415 s on an idle Linux container, past the runner's
+# 300 s per-file default, so upstream runs this directory in its own job.
+# Only this directory gets the larger finite bound. Other e2e files keep the default.
+E2E_UPGRADE_ROOT = 'tests/e2e/core/upgrade'
+E2E_UPGRADE_FILE_TIMEOUT = 900
+
+
+def e2e_tests(env: dict[str, str], workers: int) -> None:
+    upgrade = ROOT / E2E_UPGRADE_ROOT
+    files = sorted(
+        path.relative_to(ROOT).as_posix() for path in (ROOT / 'tests/e2e').rglob('test_*.py')
+        if not path.is_relative_to(upgrade)
+        and not {'integration', 'docker'} & set(path.relative_to(ROOT).parts)
+    )
+    failures = []
+    for roots, timeout in ((files, None), ([E2E_UPGRADE_ROOT], E2E_UPGRADE_FILE_TIMEOUT)):
+        try:
+            python_tests(env, roots, workers, file_timeout=timeout)
+        except subprocess.CalledProcessError as error:
+            failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 def native_os(env: dict[str, str], workers: int) -> None:
@@ -486,7 +513,7 @@ def main() -> int:
             'python-gate': lambda: python_tests(env, list(GATE_PYTHON_FILES), args.workers),
             'node-gate': lambda: node_gate(env, args.node_workers),
             'python': lambda: python_tests(env, ['tests'], args.workers),
-            'e2e': lambda: python_tests(env, ['tests/e2e'], args.workers),
+            'e2e': lambda: e2e_tests(env, args.workers),
             'node': lambda: node(env, args.node_workers),
             'docs': lambda: docs(env),
             'rust': lambda: rust(env),

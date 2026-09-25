@@ -379,8 +379,44 @@ try {
                         raise RuntimeError('intentional failure')
                 stack.enter_context(patch.object(ci, name, side_effect=action))
             stack.enter_context(patch.object(ci, 'python_tests', side_effect=lambda env, roots, workers: seen.append(tuple(roots))))
+            stack.enter_context(patch.object(ci, 'e2e_tests', side_effect=lambda env, workers: seen.append('e2e')))
             self.assertEqual(ci.main(), 1)
-            self.assertEqual(seen, ['setup', 'static', ('tests',), ('tests/e2e',), 'node', 'docs', 'rust', 'container_lint'])
+            self.assertEqual(seen, ['setup', 'static', ('tests',), 'e2e', 'node', 'docs', 'rust', 'container_lint'])
+
+    def test_e2e_lane_bounds_only_the_upgrade_suite_higher_and_runs_both_parts(self):
+        calls = []
+
+        def fake(env, roots, workers, file_timeout=None):
+            calls.append((roots, file_timeout))
+            if file_timeout is None:
+                raise subprocess.CalledProcessError(1, ['run_tests.sh'])
+
+        with patch.object(ci, 'python_tests', side_effect=fake):
+            with self.assertRaises(subprocess.CalledProcessError):
+                ci.e2e_tests({}, 3)
+        (ordinary, ordinary_timeout), (upgrade, upgrade_timeout) = calls
+        expected = sorted(
+            path.relative_to(ci.ROOT).as_posix() for path in (ci.ROOT / 'tests/e2e').rglob('test_*.py')
+            if not {'integration', 'docker'} & set(path.relative_to(ci.ROOT).parts)
+        )
+        upgrade_files = [f for f in expected if f.startswith(ci.E2E_UPGRADE_ROOT + '/')]
+        self.assertTrue(upgrade_files)
+        # Every e2e file runs exactly once: the upgrade suite in its own bounded run.
+        self.assertEqual(sorted(ordinary + upgrade_files), expected)
+        self.assertFalse(set(ordinary) & set(upgrade_files))
+        self.assertIsNone(ordinary_timeout)
+        self.assertEqual((upgrade, upgrade_timeout), ([ci.E2E_UPGRADE_ROOT], ci.E2E_UPGRADE_FILE_TIMEOUT))
+        self.assertGreater(ci.E2E_UPGRADE_FILE_TIMEOUT, 300)
+
+    def test_python_tests_forwards_only_an_explicit_file_timeout(self):
+        seen = []
+        with patch.object(ci, 'python', return_value=sys.executable), \
+                patch.object(ci, 'require_wal_capable_sqlite'), patch.object(ci, 'require_tools'), \
+                patch.object(ci, 'run', side_effect=lambda argv, env=None, **kw: seen.append(env)):
+            ci.python_tests({'PATH': '/bin'}, ['tests/e2e/core/upgrade'], 1, file_timeout=900)
+            ci.python_tests({'PATH': '/bin'}, ['tests/e2e'], 1)
+        self.assertEqual(seen[0]['HERMES_TEST_FILE_TIMEOUT'], '900')
+        self.assertNotIn('HERMES_TEST_FILE_TIMEOUT', seen[1])
 
     def test_python_gate_preserves_first_failure_but_interactive_runner_can_retry(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
