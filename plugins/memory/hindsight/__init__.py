@@ -390,8 +390,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # *acceptance*, not durability, so the prefetch gates on these via
         # get_operation_status (a drained local queue is not a read-after-write signal).
         self._pending_retain_ops: set[str] = set()
+        # Bank each pending op was retained to: a session-scoped bank_id_template can leave
+        # old-session ops pending after a switch, and their status lives only in their own bank.
+        self._pending_retain_op_banks: dict[str, str] = {}
         self._pending_retain_ops_lock = threading.Lock()
-        self._retain_ops_bank_id = ""
         self._apply_retain_policy({})
 
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
@@ -641,9 +643,9 @@ class HindsightMemoryProvider(MemoryProvider):
         only the local queue drain as a signal."""
         raw_ids = [getattr(retain_response, "operation_id", None), *(getattr(retain_response, "operation_ids", None) or [])]
         if ids := [str(op) for op in raw_ids if op]:
-            self._retain_ops_bank_id = bank_id
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.update(ids)
+                self._pending_retain_op_banks.update(dict.fromkeys(ids, bank_id))
 
     def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
         """True when a server-side retain op is done or gone (completed ops are evicted,
@@ -690,14 +692,14 @@ class HindsightMemoryProvider(MemoryProvider):
         join). Trades a possibly-stale recall for liveness; WARNING once per prefetch."""
         while True:
             with self._pending_retain_ops_lock:
-                bank_id = self._retain_ops_bank_id or self._bank_id
-                pending = list(self._pending_retain_ops)
+                pending = [(op_id, self._pending_retain_op_banks.get(op_id) or self._bank_id)
+                           for op_id in self._pending_retain_ops]
             if not pending:
                 return True
             if self._shutting_down.is_set():
                 return False
             done: set[str] = set()
-            for op_id in pending:
+            for op_id, bank_id in pending:
                 if self._shutting_down.is_set():
                     return False
                 if _expired():
@@ -706,11 +708,14 @@ class HindsightMemoryProvider(MemoryProvider):
                     done.add(op_id)
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.difference_update(done)
+                for op_id in done:
+                    self._pending_retain_op_banks.pop(op_id, None)
                 if not self._pending_retain_ops:
                     return True
                 dropped = len(self._pending_retain_ops) if _expired() else 0
                 if dropped:
                     self._pending_retain_ops.clear()
+                    self._pending_retain_op_banks.clear()
             if dropped:
                 logger.warning("Prefetch: server retain visibility timed out after %.1fs; "
                                "dropping %d unresolved op(s) so later prefetches stay "
@@ -1042,7 +1047,10 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_sync or self._recall_disabled():
             return
 
+        # Each queued request is its own generation: a worker that outlived prefetch()'s capped
+        # join must not publish over a newer request's result, not only across session switches.
         with self._prefetch_lock:
+            self._prefetch_generation += 1
             generation = self._prefetch_generation
 
         def _run():

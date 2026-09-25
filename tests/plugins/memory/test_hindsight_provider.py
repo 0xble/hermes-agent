@@ -840,6 +840,25 @@ class TestPrefetchServerRetainVisibility:
         assert order == ["recall"], "prefetch should recall after the timeout"
         assert elapsed < 3.0, "prefetch must not block well past the drain budget"
 
+    def test_pending_ops_are_polled_against_their_own_bank(self, provider):
+        """A session-scoped bank template can leave an old-session op pending when the next
+        session retains to another bank; each op's status must be queried in the bank it was
+        retained to, or the other bank's 404 reads as completion and the barrier lies."""
+        polled = []
+
+        async def _status(*, bank_id, operation_id):
+            polled.append((operation_id, bank_id))
+            return SimpleNamespace(status="completed")
+
+        provider._client.operations = MagicMock()
+        provider._client.operations.get_operation_status = AsyncMock(side_effect=_status)
+        provider._track_retain_ops(SimpleNamespace(operation_id="old-op", operation_ids=None), "old-bank")
+        provider._track_retain_ops(SimpleNamespace(operation_id="new-op", operation_ids=None), "new-bank")
+
+        assert provider._wait_for_server_retain_ops(lambda: False, 5.0) is True
+        assert sorted(polled) == [("new-op", "new-bank"), ("old-op", "old-bank")]
+        assert provider._pending_retain_ops == set()
+
     def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config):
         """Ops unresolved at deadline must be EVICTED so a permanently failing
         status endpoint can't make every later prefetch re-burn the full
@@ -904,6 +923,37 @@ class TestPrefetchServerRetainVisibility:
 # ---------------------------------------------------------------------------
 # recall_status (deterministic recall indicator) tests
 # ---------------------------------------------------------------------------
+
+
+class TestPrefetchSupersession:
+    def test_superseded_slow_worker_cannot_overwrite_newer_result(self, provider):
+        """A worker that outlives prefetch()'s capped join must not publish over a newer
+        request's completed recall in the same session."""
+        release_old = threading.Event()
+        old_started = threading.Event()
+
+        async def _recall(**kwargs):
+            if kwargs.get("query") == "old":
+                old_started.set()
+                while not release_old.is_set():
+                    await asyncio.sleep(0.01)
+                return SimpleNamespace(results=[SimpleNamespace(text="old memory")])
+            return SimpleNamespace(results=[SimpleNamespace(text="new memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+        provider._prefetch_waits_for_retain = False
+        provider.queue_prefetch("old")
+        old_worker = provider._prefetch_thread
+        assert old_started.wait(5.0)
+        provider.queue_prefetch("new")
+        provider._prefetch_thread.join(timeout=5.0)
+        assert "new memory" in provider._prefetch_result
+
+        release_old.set()
+        old_worker.join(timeout=5.0)
+        assert not old_worker.is_alive()
+        assert "new memory" in provider._prefetch_result
+        assert "old memory" not in provider._prefetch_result
 
 
 class TestRecallStatus:
