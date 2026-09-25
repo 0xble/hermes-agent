@@ -1,0 +1,57 @@
+name: Repository gate
+on:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: repository-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container:
+      image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
+    steps:
+      - name: Install Git for checkout
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y ca-certificates git
+      - name: Configure Git safe directory
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Assert checked-out PR head
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
+      - name: Install pinned Linux toolchain and platform libraries
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
+          python3 ci/install-linux-tools.py amd64
+          echo /opt/ci/rust/bin >> "$GITHUB_PATH"
+          uv python install 3.11.14
+          npm install --global npm@12.0.0
+      - name: Exact-SHA Linux gate
+        shell: bash
+        run: ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
+  qualification:
+    if: always()
+    needs: [linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every gate job
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
+          print(results)
+          sys.exit(0 if results and all(result == 'success' for result in results.values()) else 1)
+          PY

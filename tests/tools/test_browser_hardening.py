@@ -1,6 +1,7 @@
 """Tests for browser_tool.py hardening: caching, security, thread safety, truncation."""
 
 import inspect
+import json
 import re
 from unittest.mock import MagicMock, patch
 
@@ -323,14 +324,19 @@ class TestEmptyStdoutFailure:
 
 class TestCamofoxEvalFix:
 
-    def test_uses_correct_ensure_tab_signature(self):
-        """_camofox_eval should pass task_id string to _ensure_tab, not a session dict."""
+    def test_eval_uses_existing_tab_and_never_creates_one(self, monkeypatch):
+        """_camofox_eval reads the task's cached tab; with none it errors instead of opening a tab."""
+        import tools.browser_camofox as camofox
         import tools.browser_tool as bt
-        src = inspect.getsource(bt._camofox_eval)
-        # Should NOT call _get_session at all — _ensure_tab handles it
-        assert "_get_session" not in src, \
-            "_camofox_eval should not call _get_session (removed unused import)"
-        # Should use body= not json_data=
-        assert "json_data=" not in src, \
-            "_camofox_eval should use body= kwarg for _post, not json_data="
-        assert "body=" in src
+
+        posts = []
+        monkeypatch.setattr(camofox, "_post", lambda path, body=None, **_kw: posts.append((path, body)) or {"result": "2"})
+        monkeypatch.setattr(bt._eval_policy, "_eval_ssrf_guard_active", lambda task_id: False)
+        monkeypatch.setattr(camofox, "_get_session", lambda task_id: {"tab_id": None, "user_id": "u"})
+        result = json.loads(bt._camofox_eval("1+1", task_id="t"))
+        assert result["success"] is False and "No browser session" in result["error"]
+        assert posts == []
+
+        monkeypatch.setattr(camofox, "_get_session", lambda task_id: {"tab_id": "tab-1", "user_id": "u"})
+        assert json.loads(bt._camofox_eval("1+1", task_id="t"))["success"] is True
+        assert posts == [("/tabs/tab-1/evaluate", {"expression": "1+1", "userId": "u"})]

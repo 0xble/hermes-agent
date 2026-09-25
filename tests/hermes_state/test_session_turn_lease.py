@@ -502,7 +502,8 @@ def test_turn_lease_revives_expired_row_still_owned_by_writer(tmp_path):
         "shared",
         [{"role": "assistant", "content": "after ttl"}],
         turn_lease_holder=holder,
-        turn_lease_ttl_seconds=0.2,
+        # The revived lease must still be live when the contender tries below; 0.2s expired under load.
+        turn_lease_ttl_seconds=5,
     ) == 1
     assert not db.try_acquire_session_turn_lease(
         "shared", f"pid={os.getpid()}:turn=contender", ttl_seconds=5

@@ -567,6 +567,11 @@ class CompressionCommitFence:
             self.release_cancelled_compression_lock()
 
     @property
+    def commit_started(self) -> bool:
+        """Lock-free read: a commit was admitted (it may already have finished)."""
+        return self._commit_started
+
+    @property
     def commit_in_flight(self) -> bool:
         """Lock-free read: an admitted commit is in progress (hosts reach the overrun loop on a hung commit)."""
         return self._commit_phase.is_set()
@@ -1252,6 +1257,11 @@ def run_compress_context_with_progress_timeout(
         settled, result = _await_worker_within_budget(
             future, fence, idle=idle, ceiling=ceiling, wait_started=wait_started
         )
+        if settled and fence.deadline_exceeded and not fence.commit_started:
+            # The worker observed the fence deadline and aborted before commit, settling the future just
+            # ahead of the host's own timeout (inevitable when ceiling == idle for over-window requests).
+            # That is a stall, not a result: take the stall path so the fallback ladder still runs.
+            settled = False
         if settled:
             handled_exit = True
             return result

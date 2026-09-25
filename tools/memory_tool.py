@@ -146,6 +146,9 @@ def _background_delete_gate(action, operations, target="memory", content=None, o
 
     if not is_unattended_review():
         return None
+    # Owner opt-in: trust the unattended fork with replace/remove (memory.write_approval still applies).
+    if is_truthy_value(get_builtin_memory_config().get("background_review_allow_delete"), default=False):
+        return None
     hit = action in _BG_DELETE_ACTIONS or any(
         isinstance(op, dict) and op.get("action") in _BG_DELETE_ACTIONS for op in (operations or []))
     if not hit:

@@ -240,7 +240,8 @@ describe('ConnectionsRegistrySection', () => {
     render(<ConnectionsRegistrySection />)
 
     await waitFor(() => expect(list).toHaveBeenCalledTimes(1))
-    expect(screen.getByText('At startup, return to Sessions on the last-used gateway')).toBeTruthy()
+    // The resolved registry renders on a later tick; wait for it rather than racing a loaded runner.
+    expect(await screen.findByText('At startup, return to Sessions on the last-used gateway')).toBeTruthy()
   })
 
   it('keeps search out of the way for a small registry', async () => {

@@ -993,3 +993,23 @@ class TestBackgroundReviewDeleteGate:
             reset_current_write_origin(token)
         assert result["success"] is True
         assert "rewritten by refine" in store._entries_for("memory")
+
+    def test_owner_opt_in_applies_unattended_delete(self, store, tmp_path, monkeypatch):
+        # memory.background_review_allow_delete: the owner trusts the unattended fork, so a
+        # consolidation batch applies directly instead of staging for /memory pending.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("memory:\n  background_review_allow_delete: true\n")
+        store.add("memory", "stale entry to consolidate")
+        token = set_current_write_origin("background_review")
+        try:
+            result = json.loads(memory_tool(operations=[
+                {"action": "remove", "old_text": "stale entry"},
+                {"action": "add", "content": "consolidated entry"},
+            ], store=store))
+        finally:
+            reset_current_write_origin(token)
+        assert result["success"] is True
+        assert not result.get("staged")
+        entries = store._entries_for("memory")
+        assert "stale entry to consolidate" not in entries
+        assert "consolidated entry" in entries

@@ -79,26 +79,20 @@ class TestEAGAINRecurringRedispatches:
         so the substrate-failure injection point is the Popen constructor.
         """
         import cron.scheduler_script as script_mod
+        real_popen = script_mod.subprocess.Popen
         state = {"n": 0}
 
-        class _OkProc:
-            def __init__(self, argv, **kwargs):
-                self.returncode = 0
-
-            def poll(self):
-                return self.returncode
-
-            def communicate(self, timeout=None):
-                return ("ok\n", "")
-
-            def wait(self, timeout=None):
-                return 0
-
         def fake_popen(argv, **kwargs):
+            # ``script_mod.subprocess`` IS the stdlib module, so this patch is global:
+            # match the job's own script argv or an unrelated spawn earlier in the tick
+            # swallows the one-shot EAGAIN and the script runs clean on tick 1.
+            is_job_script = any("probe.py" in str(part) for part in (argv or []))
+            if not is_job_script:
+                return real_popen(argv, **kwargs)
             state["n"] += 1
             if state["n"] == 1:
                 raise OSError(11, "Resource temporarily unavailable")
-            return _OkProc(argv, **kwargs)
+            return real_popen(argv, **kwargs)
 
         monkeypatch.setattr(script_mod.subprocess, "Popen", fake_popen)
         return state

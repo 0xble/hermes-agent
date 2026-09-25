@@ -5,7 +5,31 @@ the browser vault fill tool, or the 1Password backends.
 
 ## Required behavior
 
-- Named Camofox accounts route per profile; account aliases are profile-specific.
+- A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.
+  Only explicit navigation creates/retries a tab, once; page actions and vault evaluations
+  never replay on replacement tabs, and account identity survives invalidation.
+- Named Camofox accounts route per profile; account aliases are profile-specific. Their
+  shared identity userId is `hermes_camofox_` plus the first 24 lowercase hex
+  characters of SHA-256 over `camofox-account:{profile_camofox_state_dir}:{alias}`;
+  this matches the server and dotfiles launcher contract. The session key is unchanged.
+  This is a hard cutover from the old `hermes_<10hex>` account IDs: the parent's
+  server-side cutover retires old account profiles and moves their data to these
+  derived IDs; Hermes does not dual-read, map, or migrate profiles.
+  `browser_handoff(account=...)` opens/focuses that account's shared identity, restarts
+  its headless-by-default browser as visible, adopts the returned tabId for subsequent
+  browser actions, and never returns the userId. The restart restores the last URL but
+  can lose page-only state such as half-filled forms; logins persist. Confirm no other
+  work is using the account, then call handoff before the step whose page state matters
+  (for example, before submitting a password when an OTP is likely). A server-side 404
+  explains that the shared visible identity must be configured there; HTTP 409 means
+  another operation is using the account and the agent must wait and retry. Hermes does
+  not restart the browser outside the handoff, copy cookies, or kill processes.
+  Both handoff and release allow at least 90 seconds for the server's browser lifecycle.
+  `browser_handoff(account=..., release=true)` asks the server to close the visible or
+  hidden browser and return the account to headless-by-default; `released=false` means
+  it was already stopped. Successful release invalidates only Hermes's local tab ID,
+  retaining the task's account binding. Busy (409) leaves it intact for retry; neither
+  action exposes userId.
 - Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are
   minted from Connect one-time-password fields, automatic 2FA is announced only when a code
   can really be minted, an unusable OTP field never hides a usable one, and upstream
@@ -22,8 +46,15 @@ the browser vault fill tool, or the 1Password backends.
 ## Provenance and patches
 
 - Fork patch identities: `slice-8-camofox-accounts` (local, no upstream submission),
-  `slice-9-vault-camofox`, `slice-9-vault-shadow-dom`, `slice-9-vault-op-cards` (own fork
-  feature; no upstream issue or PR as of 2026-09-19).
+  `slice-8-camofox-visible-handoff` (fork-only shared-window handoff; upstream does not
+  expose these server endpoints); `slice-9-vault-camofox`, `slice-9-vault-shadow-dom`,
+  `slice-9-vault-op-cards` (own fork feature; no upstream issue or PR as of 2026-09-19),
+  and `camofox-stale-tab-recovery`
+  (adopted design from [upstream PR 93249](https://github.com/NousResearch/hermes-agent/pull/93249)
+  at `b5e999a5b52b70e286f6e55ec8dc8ec6e872ac8a`, related
+  [issue 80276](https://github.com/NousResearch/hermes-agent/issues/80276)).
+  The fork adaptation adds vault evaluation, preserves a no-session branch, and classifies
+  404 by its tab-missing payload; revisit when upstream ships equivalent behavior.
 - Adopted upstream sources, all open on 2026-09-19:
   [PR 114414](https://github.com/NousResearch/hermes-agent/pull/114414) at
   `d8a374630aef825ad3d86c1e41defa57a4874247` (Connect and secret-safe fills);
@@ -31,8 +62,8 @@ the browser vault fill tool, or the 1Password backends.
   `988a691a1d122561dc3809840357090b27612287` (shadow DOM);
   [PR 109456](https://github.com/NousResearch/hermes-agent/pull/109456) at
   `90a17768fd85cc40153a2dbcc2d8f21f2f6dc748` (`--vault` selector).
-- Surfaces: `tools/browser_camofox*.py`, `agent/vault_login_classifier.py`,
-  `agent/vault_backends/`, `tools/browser_vault_tool.py`.
+- Surfaces: `tools/browser_camofox*.py`, `tools/browser_tool.py`, `toolsets.py`,
+  `agent/vault_login_classifier.py`, `agent/vault_backends/`, `tools/browser_vault_tool.py`.
 
 ## Verification
 
@@ -47,7 +78,10 @@ the browser vault fill tool, or the 1Password backends.
 ## Retirement and rollback
 
 Retire each adopted patch when its PR or an equivalent merges upstream and the candidate
-tag includes it. Retire named accounts when upstream ships named account selection. The
+tag includes it. Retire named accounts and `slice-8-camofox-visible-handoff` when released upstream
+supports equivalent named visible shared-window selection and tab adoption. At cutover,
+move the server's old profiles onto Hermes's derived userIds before invoking handoff;
+Hermes never maps or migrates them. The
 shadow-DOM commit touches only `agent/vault_login_classifier.py`,
 `tools/browser_vault_tool.py`, and vault tests; revert it alone to roll back. Retire the
 card listing when a released upstream lists manager cards with equivalent per-fill

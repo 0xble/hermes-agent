@@ -825,6 +825,11 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # Platform is deliberately NOT an identity field: a surface switch does not invalidate the
     # stored bytes, it only makes their interface section out of date, and that is corrected by
     # agent.surface_switch.stage_surface_switch_note without touching the cached prefix (#104414).
+    # The one exception is a prompt left by gateway hygiene compaction: that agent loads only the
+    # memory toolset, so its rebuilt prompt lacks the skills index and tool guidance. It was never
+    # a real surface, and adopting it would strip every later turn.
+    if identity_line_value(prompt, "Platform") == "gateway_hygiene":
+        return False
     return True
 
 

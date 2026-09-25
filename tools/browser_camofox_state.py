@@ -6,6 +6,7 @@ active profile so Camofox maps it to the same persistent browser profile across 
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
@@ -73,11 +74,11 @@ def get_camofox_account_identity(account: str, task_id: Optional[str] = None) ->
     if account not in allowed:
         raise ValueError(f"Unknown Camofox account {account!r}; choose one of: {', '.join(allowed)}")
     scope_root = str(get_camofox_state_dir())
-    user_digest = uuid.uuid5(uuid.NAMESPACE_URL, f"camofox-account:{scope_root}:{account}").hex[:10]
+    user_digest = hashlib.sha256(f"camofox-account:{scope_root}:{account}".encode()).hexdigest()[:24]
     session_digest = uuid.uuid5(
         uuid.NAMESPACE_URL, f"camofox-account-session:{scope_root}:{account}:{task_id or 'default'}"
     ).hex[:16]
-    return {"user_id": f"hermes_{user_digest}", "session_key": f"{account}_{session_digest}"}
+    return {"user_id": f"hermes_camofox_{user_digest}", "session_key": f"{account}_{session_digest}"}
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

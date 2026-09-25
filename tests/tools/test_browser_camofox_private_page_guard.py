@@ -32,7 +32,7 @@ def _block_active(monkeypatch):
 
     monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
     monkeypatch.setattr(
-        bt_eval_policy, "_camofox_current_page_private_url", lambda tab_id, user_id: PRIVATE_URL
+        bt_eval_policy, "_camofox_current_page_private_url", lambda tab_id, user_id, session=None: PRIVATE_URL
     )
 
 
@@ -53,7 +53,7 @@ def _public_page(monkeypatch):
 
     monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
     monkeypatch.setattr(
-        bt_eval_policy, "_camofox_current_page_private_url", lambda tab_id, user_id: None
+        bt_eval_policy, "_camofox_current_page_private_url", lambda tab_id, user_id, session=None: None
     )
 
 

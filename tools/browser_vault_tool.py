@@ -134,14 +134,18 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
     """
     from tools.browser_camofox import is_camofox_mode
     if is_camofox_mode():
-        from tools.browser_camofox import _ensure_tab, _post, get_camofox_url
+        from tools.browser_camofox import _get_session, _post, get_camofox_url, _clear_stale_tab, _STALE_TAB_ERROR
         from urllib.parse import urlsplit
+        import requests
+        tab = None
         try:
             url = urlsplit(get_camofox_url())
             if (url.username or url.password or url.query or url.fragment or
                     not (url.scheme == "https" or (url.scheme == "http" and url.hostname in ("localhost", "127.0.0.1", "::1")))):
                 raise ValueError("Vault requires HTTPS or loopback HTTP")
-            tab = _ensure_tab(task_id)
+            tab = _get_session(task_id)
+            if not tab["tab_id"]:
+                return {"success": False, "error_type": "eval_failed", "error": "No browser session. Call browser_navigate first."}
             # Catch page exceptions in-page too: the REST server logs JS error messages.
             wrapped = "(() => { try { return (" + expression + "); } catch (_) { return {vault_eval_failed:true}; } })()"
             response = _post(f"/tabs/{tab['tab_id']}/evaluate", body={
@@ -149,6 +153,10 @@ def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
             if (isinstance(response, dict) and "result" in response and not response.get("error")
                     and response.get("result") != {"vault_eval_failed": True}):
                 return {"success": True, "result": response["result"]}
+        except requests.HTTPError as exc:
+            if tab is not None and _clear_stale_tab(tab, exc, endpoint="evaluate"):
+                return {"success": False, "error_type": "eval_failed", "error": _STALE_TAB_ERROR}
+            # Do not expose a server exception that may contain the expression.
         except Exception:
             # Browser exceptions may contain the entire secret-bearing expression.
             pass
