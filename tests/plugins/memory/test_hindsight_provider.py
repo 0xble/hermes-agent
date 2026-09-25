@@ -1172,6 +1172,23 @@ class TestShutdownRace:
         assert provider._client.aretain_batch.call_count == 2
 
 
+    def test_shutdown_flushes_buffered_tail(self, provider_with_config):
+        p = provider_with_config(retain_every_n_turns=3, retain_async=False)
+        client = p._client
+        old_doc = p._document_id
+        p.sync_turn("last user turn", "last assistant turn")
+        client.aretain_batch.assert_not_called()
+
+        p.shutdown()
+
+        client.aretain_batch.assert_called_once()
+        kw = client.aretain_batch.call_args.kwargs
+        assert kw["bank_id"] == "test-bank"
+        assert kw["document_id"] == old_doc
+        assert "last user turn" in kw["items"][0]["content"]
+        assert "session:test-session" in kw["items"][0]["tags"]
+        assert p._retain_queue.empty()
+
     def test_shutdown_drains_pending_retains(self, provider):
         """Shutdown must wait for queued retains to complete, not abandon them.
 
@@ -1193,6 +1210,59 @@ class TestShutdownRace:
 
 
 class TestSessionSwitchBufferFlush:
+    def test_session_template_rotates_bank_without_redirecting_queued_writes(self, provider_with_config):
+        p = provider_with_config(bank_id_template="hermes-{session}",
+                                 retain_every_n_turns=2, retain_async=False)
+        client = p._client
+        entered, release = threading.Event(), threading.Event()
+
+        async def retain(**kwargs):
+            if kwargs["items"][0]["metadata"]["turn_index"] == "2":
+                entered.set()
+                assert release.wait(timeout=5.0)
+
+        client.aretain_batch = AsyncMock(side_effect=retain)
+        assert p._bank_id == "hermes-test-session"
+        try:
+            p.sync_turn("old first", "reply")
+            p.sync_turn("old second", "reply")
+            assert entered.wait(timeout=5.0)
+            p.sync_turn("old tail", "reply")
+            p.on_session_switch("new-sid")
+            assert p._bank_id == "hermes-new-sid"
+        finally:
+            release.set()
+        p._retain_queue.join()
+        assert [call.kwargs["bank_id"] for call in client.aretain_batch.call_args_list] == [
+            "hermes-test-session", "hermes-test-session",
+        ]
+        p.sync_turn("new first", "reply")
+        p.sync_turn("new second", "reply")
+        p._retain_queue.join()
+        assert client.aretain_batch.call_args.kwargs["bank_id"] == "hermes-new-sid"
+        p.handle_tool_call("hindsight_recall", {"query": "new query"})
+        assert client.arecall.call_args.kwargs["bank_id"] == "hermes-new-sid"
+
+    def test_slow_old_prefetch_cannot_repopulate_new_session(self, provider):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_recall(query):
+            entered.set()
+            assert release.wait(timeout=10.0)
+            return "- old session context", 1
+
+        provider._do_recall = slow_recall
+        provider.queue_prefetch("old question")
+        assert entered.wait(timeout=5.0)
+        try:
+            provider.on_session_switch("new-sid")
+        finally:
+            release.set()
+        provider._prefetch_thread.join(timeout=5.0)
+        assert not provider._prefetch_thread.is_alive()
+        assert provider.prefetch("new question") == ""
+        assert provider.recall_status() is None
+
     def test_buffered_turns_flushed_before_clear(self, provider_with_config):
         """retain_every_n_turns > 1 must not silently drop partial buffers
         on session switch. Whatever's in _session_turns at switch time

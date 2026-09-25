@@ -175,3 +175,16 @@ and drop it once upstream carries an equivalent fix.
 - A media send checked the shared flood cooldown before entering the per-chat send lock. When it queued behind a text send that armed a 120-second window, it later acquired the lock and uploaded anyway. Media sends now recheck the cooldown inside the serialization boundary before the API call and before the topic-anchor retry.
 - Guard: `tests/gateway/test_telegram_flood_coherence.py`
   (`test_media_queued_behind_send_lock_rechecks_flood_cooldown`).
+
+## Hindsight session lifecycle loses bank isolation, buffered turns, and recall scope
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- A session switch kept the prior template-derived bank, shutdown discarded
+  turns below the retain batch boundary, and a prefetch worker outliving the
+  switch could inject the prior session's recall. Switch now rotates the bank
+  after queuing old-bank writes and invalidates old prefetch workers; shutdown
+  enqueues the unretained tail before stopping the writer.
+- Guards: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_session_template_rotates_bank_without_redirecting_queued_writes`,
+  `test_shutdown_flushes_buffered_tail`,
+  `test_slow_old_prefetch_cannot_repopulate_new_session`).

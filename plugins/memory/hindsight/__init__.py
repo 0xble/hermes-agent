@@ -374,6 +374,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
+        self._prefetch_generation = 0
         self._prefetch_thread = None
         self._last_recall_returned, self._last_recall_count = False, 0
         self._apply_recall_settings({})
@@ -978,6 +979,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_sync or self._recall_disabled():
             return
 
+        with self._prefetch_lock:
+            generation = self._prefetch_generation
+
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
             # retain to be recall-visible so the warmed context includes it.
@@ -986,7 +990,8 @@ class HindsightMemoryProvider(MemoryProvider):
             text, count = self._do_recall(query)
             if text:
                 with self._prefetch_lock:
-                    self._prefetch_result, self._prefetch_count = text, count
+                    if generation == self._prefetch_generation:
+                        self._prefetch_result, self._prefetch_count = text, count
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -1221,12 +1226,22 @@ class HindsightMemoryProvider(MemoryProvider):
         # 2. Drain the old session's in-flight prefetch and drop its result.
         self._join_prefetch(3.0)
         with self._prefetch_lock:
-            self._prefetch_result = ""
+            self._prefetch_generation += 1
+            self._prefetch_result, self._prefetch_count = "", 0
 
         # 3. Rotate to the new session.
         if parent_session_id:
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)
+        if self._bank_id_template:
+            cfg = self._config or {}
+            banks = cfg_get(cfg, "banks", "hermes", default={})
+            self._bank_id = _resolve_bank_id_template(
+                self._bank_id_template,
+                fallback=cfg.get("bank_id") or banks.get("bankId", "hermes"),
+                profile=self._agent_identity, workspace=self._agent_workspace,
+                platform=self._platform, user=self._user_id, session=new_id,
+            )
         self._session_turns = []
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
         logger.debug("Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
@@ -1249,7 +1264,17 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
-        # Stop accepting retain jobs first so late sync_turn() calls are dropped.
+        # Flush a partial batch while jobs can still enter the FIFO writer queue.
+        # Append-mode buffers contain only unsent turns; legacy mode keeps the
+        # entire session, so only a non-boundary tail needs another write.
+        if (not self._shutting_down.is_set() and not self._cron_skipped and self._auto_retain
+                and self._session_turns and self._turn_counter % self._retain_every_n_turns):
+            document_id, update_mode = self._resolve_retain_target(self._document_id)
+            self._enqueue_retain(self._make_turn_retain_job(
+                list(self._session_turns), document_id=document_id,
+                update_mode=update_mode, label="flush-on-shutdown", track_ops=False,
+            ))
+        # Stop accepting retain jobs so late sync_turn() calls are dropped.
         self._shutting_down.set()
         # The writer finishes in-flight work then exits on the sentinel; the
         # bounded join keeps shutdown predictable even if the daemon is wedged.
