@@ -300,3 +300,82 @@ def test_shared_key_ignored_outside_persistent_docker(monkeypatch):
         assert terminal_tool._resolve_container_task_id(None) == "session:sess-A"
     finally:
         clear_session_vars(tokens)
+
+
+# --- Session-less scheduled runs (cron) --------------------------------------
+#
+# Cron runs carry no session key, so they used to collapse onto the shared
+# "default" environment with every other session-less run. On the local
+# backend that environment keeps the shell snapshot (exported variables, PATH),
+# so one job's ``export PATH=...`` resolved another job's bare ``hermes`` to a
+# stale checkout. Each cron run keys its own environment; its delegate_task
+# children still share it.
+
+
+def _cron_run_scope(job_id, execution_id):
+    import cron.scheduler as cron_scheduler
+
+    return cron_scheduler._CronRunScope({"id": job_id}, job_id, execution_id)
+
+
+def test_concurrent_cron_runs_get_distinct_environments(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    first, second = _cron_run_scope("job-a", "run-1"), _cron_run_scope("job-b", "run-1")
+    try:
+        a = terminal_tool._resolve_container_task_id(first.task_id)
+        b = terminal_tool._resolve_container_task_id(second.task_id)
+        assert a != b
+        assert "default" not in (a, b)
+    finally:
+        first.exit()
+        second.exit()
+    assert terminal_tool._resolve_container_task_id(first.task_id) == "default"
+
+
+def test_cron_subagent_shares_its_parent_run_environment(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    run = _cron_run_scope("job-a", "run-1")
+    terminal_tool.register_container_alias("subagent-0-abc", run.task_id)
+    try:
+        assert terminal_tool._resolve_container_task_id(
+            "subagent-0-abc"
+        ) == terminal_tool._resolve_container_task_id(run.task_id) == run.task_id
+    finally:
+        terminal_tool.clear_task_env_overrides("subagent-0-abc")
+        run.exit()
+
+
+def test_persistent_docker_cron_run_keeps_the_profile_container(monkeypatch):
+    _persistent_docker(monkeypatch)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    run = _cron_run_scope("job-a", "run-1")
+    try:
+        assert terminal_tool._resolve_container_task_id(run.task_id) == "default"
+    finally:
+        run.exit()
+
+
+def test_cron_run_does_not_see_another_runs_exports(tmp_path, monkeypatch):
+    """Real local-backend path: an export in one cron run must not reach another."""
+    import json
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    from tools.terminal_tool_lifecycle import cleanup_vm
+
+    runs = _cron_run_scope("job-a", "run-leak"), _cron_run_scope("job-b", "run-leak")
+    first, second = (run.task_id for run in runs)
+    try:
+        terminal_tool.terminal_tool("export CRON_LEAK_PROBE=from-job-a", task_id=first)
+        own = json.loads(terminal_tool.terminal_tool("printf %s \"$CRON_LEAK_PROBE\"", task_id=first))
+        other = json.loads(terminal_tool.terminal_tool("printf %s \"$CRON_LEAK_PROBE\"", task_id=second))
+        assert own["output"] == "from-job-a"
+        assert other["output"] == ""
+    finally:
+        for task in (first, second):
+            cleanup_vm(terminal_tool._resolve_container_task_id(task))
+        for run in runs:
+            run.exit()

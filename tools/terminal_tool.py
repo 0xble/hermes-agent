@@ -247,6 +247,11 @@ _session_cwd_lock = threading.Lock()
 _container_aliases: Dict[str, str] = {}
 _container_alias_lock = threading.Lock()
 
+# Session-less runs that own their local terminal environment (cron runs).
+# Without a session key they would otherwise share "default" with every other
+# session-less run, and the local shell snapshot carries exports between them.
+_run_scoped_tasks: set = set()
+
 
 def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """Record *cwd* as *session_key*'s working directory (after a completed
@@ -346,6 +351,29 @@ def register_container_alias(child_task_id: str, parent_task_id: Optional[str]) 
         return
     with _container_alias_lock:
         _container_aliases[child_task_id] = str(parent_task_id or "default")
+
+
+def register_run_scoped_task(task_id: str) -> None:
+    """Give session-less *task_id* (a cron run) its own local terminal environment.
+
+    Its delegate_task children still share it through the container alias."""
+    if task_id:
+        with _container_alias_lock:
+            _run_scoped_tasks.add(task_id)
+
+
+def clear_run_scoped_task(task_id: str) -> None:
+    with _container_alias_lock:
+        _run_scoped_tasks.discard(task_id)
+
+
+def _run_scoped_owner(task_id: Optional[str]) -> Optional[str]:
+    """The registered run that owns *task_id* (itself or via aliases), else None."""
+    if not task_id:
+        return None
+    owner = _resolve_container_alias(task_id)
+    with _container_alias_lock:
+        return owner if owner in _run_scoped_tasks else None
 
 
 def _resolve_container_alias(task_id: str) -> str:
@@ -472,7 +500,9 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     4. No session key (CLI, cron): ``shared:<key>`` when opted in (else a CLI run of a
        keyed profile would split from its gateway sessions); a routed multiplexed profile
        keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
-       else ``"default"``, which subagent ids collapse onto to share the parent's container.
+       on the local backend a registered run (cron) keys itself so one job's shell exports
+       cannot reach another; else ``"default"``, which subagent ids collapse onto to share
+       the parent's container. Sandboxed backends keep their shared-container contract.
     """
     if task_id and _has_isolation_overrides(task_id):
         return task_id
@@ -495,7 +525,8 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         # ONE container/cache slot (and sandbox dir) regardless of profile name (#84671).
         return f"shared:{shared}"
     if not session_key:
-        return _routed_home_task_key(scope.docker_profile_scoped) or "default"
+        run_owner = _run_scoped_owner(task_id) if scope.env_type == "local" else None
+        return run_owner or _routed_home_task_key(scope.docker_profile_scoped) or "default"
     if not scope.docker_profile_scoped:
         return f"session:{session_key}"
     profile = _current_session_profile() or "default"
