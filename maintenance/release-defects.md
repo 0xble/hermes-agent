@@ -125,6 +125,23 @@ and drop it once upstream carries an equivalent fix.
 - Guard: `tests/scripts/test_candidate_scripts.py`
   (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
 
+## Portable CI lost the WAL-capable SQLite guard
+
+- Fork patch identity: `ci-wal-capable-sqlite`.
+- Retiring `tests.yml` dropped its "Check SQLite runs WAL" step while the
+  replacement gate and nightly pinned uv 0.9.28 and CPython 3.11.14, whose
+  every published build links WAL-reset-vulnerable SQLite 3.50.4. Hermes then
+  runs DELETE mode and the WAL test arms skip, so CI could pass without
+  exercising WAL. The pins are now uv 0.12.13 and CPython 3.11.16 (SQLite
+  3.53.1), the pair upstream's retired workflow used; uv 0.9.28 cannot download
+  any newer 3.11 patch. The Linux uv artifact checksums match the published
+  `.sha256` files. Every portable Python lane fails closed on a vulnerable
+  interpreter before running tests.
+- Guards: `scripts/ci/tests/test_portable.py`
+  (`test_python_lanes_require_a_wal_capable_sqlite`,
+  `test_workflows_install_the_pinned_python`,
+  `test_uv_pin_is_consistent_across_installers`).
+
 ## Launchd wrapped-child test predates update home scoping
 
 - Fork patch identity: `launchd-child-test-home-scope`.

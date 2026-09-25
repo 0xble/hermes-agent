@@ -17,8 +17,8 @@
     },
     {
       "kind": "uv",
-      "url": "https://github.com/astral-sh/uv/releases/download/0.9.28/uv-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "66ad1822dd9cf96694b95c24f25bc05cff417a65351464da01682a91796d1f2b"
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.13/uv-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd"
     },
     {
       "kind": "shellcheck",
@@ -54,8 +54,8 @@
     },
     {
       "kind": "uv",
-      "url": "https://github.com/astral-sh/uv/releases/download/0.9.28/uv-aarch64-unknown-linux-gnu.tar.gz",
-      "sha256": "382c342735ff29f8ba4574d88e39bca798bcbac50bff6742710ca9cd8143e7d2"
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.13/uv-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "2eaa5d94f5db7b3a1a092156b9420459e42ab0217d917fe74a876309cef9b5e9"
     },
     {
       "kind": "shellcheck",
