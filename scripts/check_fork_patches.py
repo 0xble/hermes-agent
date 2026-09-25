@@ -276,7 +276,8 @@ def check_receipt(home: Path) -> list[str]:
     # only when such a row was re-verified live AND the receipt's restart bookkeeping records no other
     # cause (failed restart units, an incomplete restart phase, an unaccounted runtime). Causes the
     # updater does not write into the receipt (desktop rebuild, SQLite remediation) cannot be seen here.
-    needs_live = [row for row in receipt.get("fleet") or [] if isinstance(row, dict)
+    # ``external`` rows serve a separate checkout this update did not touch; their code is not this one.
+    needs_live = [row for row in receipt.get("fleet") or [] if isinstance(row, dict) and row.get("state") != "external"
                   and (str(row.get("state") or "") in ("stale", "down") or (row.get("code_sha") and str(row.get("code_sha")) != head))]
     live = _live_fleet() if needs_live else {}
     live_verified: list[str] = []

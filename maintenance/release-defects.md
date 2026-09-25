@@ -113,3 +113,14 @@ and drop it once upstream carries an equivalent fix.
 - Guards: `scripts/ci/tests/test_plugin_admission.py`
   (`test_exact_head_baseline_comes_from_the_checked_revision_not_the_working_tree`),
   `scripts/ci/tests/test_portable.py` (`test_source_guard_detects_source_created_during_ci`).
+
+## Fork-patch check fails on a separate-checkout gateway
+
+- Fork patch identity: `fork-patch-check-external-fleet`.
+- `scripts/check_fork_patches.py` compared every update-receipt fleet row's
+  `code_sha` with the checkout, including rows the updater marks `external`
+  (gateways serving a separate checkout it did not touch). The live fleet probe
+  excludes those rows, so a successful update beside a legitimate second
+  checkout always failed. External rows are now skipped.
+- Guard: `tests/scripts/test_candidate_scripts.py`
+  (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
