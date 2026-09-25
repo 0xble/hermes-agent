@@ -992,6 +992,24 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
         print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
+def _self_restart_gateway_pids(supervised_pid: int) -> set[int]:
+    """Pids the fleet matrix may see for an enclosing gateway that accepted a self-restart.
+
+    launchd can supervise a wrapper rather than the gateway (the TCC ``osascript`` launcher runs
+    python as its child), so the supervised pid is not the pid the gateway's pid file and runtime
+    status report, which is what the matrix rows carry. ``launchd_restart()`` delivered the restart
+    to ``get_running_pid()``; record it too when it is also an ancestor of this updater.
+    """
+    from gateway.status import get_running_pid
+    from hermes_cli.gateway import _is_pid_ancestor_of_current_process
+
+    pids = {supervised_pid}
+    gateway_pid = get_running_pid()
+    if gateway_pid is not None and _is_pid_ancestor_of_current_process(gateway_pid):
+        pids.add(gateway_pid)
+    return pids
+
+
 def _restart_launchd_gateway_after_update(
     *, supervision_verify: bool = True, self_restart_pending: set | None = None,
 ) -> tuple[list, list]:
@@ -1052,7 +1070,7 @@ def _restart_launchd_gateway_after_update(
         # the gateway tree, #100179): it exits only after this process does, so no fresh supervised
         # pid can appear while we wait. Record it as pending for the fleet matrix (#119597).
         if self_restart_pending is not None:
-            self_restart_pending.add(old_pid)
+            self_restart_pending.update(_self_restart_gateway_pids(old_pid))
         return [current_label], []
 
     # launchd_restart() returning only means "restart REQUESTED" (async). A helper dying

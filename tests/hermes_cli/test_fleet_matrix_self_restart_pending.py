@@ -102,3 +102,52 @@ def test_restart_phase_records_accepted_self_restart_and_verify_exits_clean(monk
             restart, _pre_update_plan=None, _windows_gateway_resume=None, node_failures=[], update_complete=True,
         )
     assert exc.value.code == 1
+
+
+def _launchd_self_restart(monkeypatch, *, supervised_pid: int, gateway_pid: int) -> set:
+    """Drive the invoking-profile launchd restart with REAL process ancestry: the updater (this
+    pytest process) runs inside the gateway, as it does under ``request_update``."""
+    import hermes_cli.gateway as gateway
+
+    class _Plist:
+        def exists(self):
+            return True
+
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: _Plist())
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway, "_launchctl_supervised_pid", lambda label: supervised_pid)
+    monkeypatch.setattr(gateway, "launchd_restart", lambda: None)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: gateway_pid)
+    pending: set = set()
+    assert fleet_mod._restart_launchd_gateway_after_update(self_restart_pending=pending) == (["ai.hermes.gateway"], [])
+    return pending
+
+
+def test_wrapped_launchd_gateway_is_pending_under_the_pid_the_matrix_reads(monkeypatch, tmp_path):
+    """launchd supervises the osascript wrapper; the gateway is its child and its pid file names the
+    child. The pending set held only the wrapper, so the gateway's own row stayed STALE and every
+    in-gateway update exited 1 after a restart that did happen."""
+    wrapper, gateway_pid = os.getppid(), os.getpid()  # both genuinely enclose this updater
+    pending = _launchd_self_restart(monkeypatch, supervised_pid=wrapper, gateway_pid=gateway_pid)
+    assert pending == {wrapper, gateway_pid}
+
+    _fleet_homes(monkeypatch, tmp_path, {"default": {"pid": gateway_pid, "gateway_state": "running", "code_sha": OLD}})
+    fleet = ur.collect_fleet_versions(pre_restart_pids=[gateway_pid], self_restart_pending=pending)
+    assert [row["state"] for row in fleet] == [ur.RESTART_PENDING_STATE]
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert ur.print_fleet_version_matrix(fleet) is False
+
+
+def test_gateway_outside_the_updaters_tree_is_never_marked_pending(monkeypatch):
+    """Only a gateway that encloses this updater restarts after it exits; any other pid the status
+    file names must keep the stale verdict, so it is not added."""
+    import subprocess
+    import sys
+
+    outsider = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        pending = _launchd_self_restart(monkeypatch, supervised_pid=os.getppid(), gateway_pid=outsider.pid)
+    finally:
+        outsider.kill()
+        outsider.wait()
+    assert pending == {os.getppid()}
