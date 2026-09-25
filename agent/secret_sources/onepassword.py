@@ -163,7 +163,12 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
                    timeout_message=f"op read timed out after {_OP_RUN_TIMEOUT}s for {reference!r}", stdin=None)
 
     if proc.returncode != 0:
-        err = _scrub(proc.stderr or "")[:200]
+        err = _scrub(proc.stderr or "").strip()
+        # op puts the reason last ("could not read secret '<ref>': could not get item
+        # <vault>/<item>: Too many requests…"); a long item path pushes it past a head cut,
+        # and an unclassifiable reason disables the last-good fallback for the whole pull.
+        if len(err) > 300:
+            err = "…" + err[-300:]
         if err:
             raise RuntimeError(f"op read failed for {reference!r}: {err}")
         raise RuntimeError(f"op read exited {proc.returncode} for {reference!r}")

@@ -611,3 +611,17 @@ def test_rejection_that_also_mentions_a_rate_limit_is_a_rejection():
     assert op._classify_op_error("[ERROR] 401 Unauthorized: too many requests") == op.ErrorKind.AUTH_FAILED
     assert op._classify_op_error(
         "[ERROR] 2026/09/24 19:40:01 Too many requests. Your client has been rate-limited.") == op.ErrorKind.RATE_LIMITED
+
+
+def test_reason_survives_a_long_item_path(monkeypatch, tmp_path):
+    """op names the vault and item before the reason; a long item name must not hide it."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    ref = "op://Default/MERCURY_API_KEY_HOST_HOME_CLEANERS_MYRTLE_BEACH/credential"
+    stderr = ("[ERROR] 2026/09/24 21:50:11 could not read secret '" + ref + "': could not get item "
+              "Default/MERCURY_API_KEY_HOST_HOME_CLEANERS_MYRTLE_BEACH: Too many requests. "
+              "Your client has been rate-limited. Try again in  seconds")
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(1, stderr))
+    with pytest.raises(RuntimeError) as exc:
+        op._run_op_read(fake_op, ref)
+    assert op._classify_op_error(str(exc.value)) == op.ErrorKind.RATE_LIMITED
