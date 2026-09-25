@@ -95,7 +95,7 @@ required fork statuses. Linux success does not qualify macOS or Windows.
 | Existing workflow | Allocation |
 | --- | --- |
 | `ci.yaml` | `bin/ci` aggregates seven blocking source lanes. Trusted publisher owns status and cancellation semantics. |
-| `tests.yml` | `python`: canonical `scripts/run_tests.sh tests`. `e2e`: canonical `scripts/run_tests.sh tests/e2e`. Profile-plugin source is maintained outside this checkout. Integration and Docker directories stay excluded from the ordinary Python lane. |
+| `tests.yml` | `python`: canonical `scripts/run_tests.sh tests`. `e2e`: canonical `scripts/run_tests.sh` over `tests/e2e`, with `tests/e2e/core/upgrade` in its own run under a 900 s per-file bound (upstream runs it as a separate `e2e-upgrade` job; real N-1 -> HEAD updates exceed the 300 s default). Profile-plugin source is maintained outside this checkout. Integration and Docker directories stay excluded from the ordinary Python lane. |
 | `tests-os.yml` | Native maintainer qualification using the existing marker selector and canonical test runner. Require the actual OS and nonzero selection. See native commands below. |
 | `lint.yml` | `static`: blocking ruff, Windows-footgun, compatibility-pointer, temporary-path and OS-marker checks. Advisory ruff/ty comparison stays a separate advisory review lane. |
 | `js-tests.yml` | `node`: nine nonrelease workspace units plus behavioral runner tests. Signed desktop packaging remains a release lane. |

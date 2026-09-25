@@ -3,15 +3,15 @@
 Class C6 (bricked installs, stale code, lost state after `hermes update`). Each leg:
 
 1. stages a local bare ``origin`` (``--shared`` onto this repository, so no network and no
-   object copy) with ``main`` parked at release N-1 (``git describe --tags --abbrev=0 HEAD~1``);
+   object copy) with ``main`` parked at release N-1 (nearest CalVer tag before HEAD);
 2. clones it as a git-mode install with its own venv (``uv sync --locked --extra all`` from N-1's
    own uv.lock and the warm uv cache: the installer's tier 0 and its editable layout; the installer
    script itself is covered by ``.github/workflows/install-e2e*.yml``);
 3. gives it user state created BY THE N-1 CLI ITSELF: sessions in state.db from real one-shot
    turns against the scripted fake provider, a named profile with its own state.db, a cron
-   job, and a hand-edited config.yaml at the N-1 schema version with comments, long quoted
-   unicode values and a legacy MCP ``disabled: true`` entry (the one documented N-1 -> HEAD
-   migration);
+   job, and a hand-edited config.yaml at a schema version the N-1 CLI accepts with comments, long quoted
+   unicode values and a legacy MCP ``disabled: true`` entry (the documented schema
+   migration exercised even when N-1 already ships the latest schema);
 4. moves ``origin/main`` to HEAD and runs the real ``hermes update --yes`` non-interactively.
 
 Legs: ``clean``; ``autostash`` (local edits + an orphan update autostash from an earlier run);
@@ -102,14 +102,16 @@ class _Refs(NamedTuple):
 def _refs() -> _Refs:
     """HEAD and release N-1, resolved on first use: collection (every CI shard) runs no git.
 
-    N-1 is ``git describe --tags --abbrev=0 HEAD~1``; HERMES_E2E_UPGRADE_BASE=<ref> starts from any
+    N-1 is the nearest CalVer release tag before HEAD; HERMES_E2E_UPGRADE_BASE=<ref> starts from any
     older ref instead (e.g. the pre-handoff v2026.9.14, or a patched base when proving a leg red
     against the N-1 side).
     """
     head = _git("rev-parse", "HEAD", cwd=H.WORKTREE)
     try:
-        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git("describe", "--tags", "--abbrev=0", "HEAD~1",
-                                                                  cwd=H.WORKTREE)
+        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git(
+            "describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0", "HEAD~1",
+            cwd=H.WORKTREE,
+        )
         return _Refs(head, tag, _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
     except AssertionError:  # shallow CI checkout without tags
         return _Refs(head, "", "")
@@ -479,7 +481,7 @@ def assert_healthy_at_head(leg: Leg, provider: FakeLLMServer, final: subprocess.
             assert a.get(section) == o.get(section), f"{name}: `{section}` changed by the update: {a.get(section)!r}"
         assert a["personalities"]["reviewer"] == LONG_VALUE and a["quick_commands"]["deploy"]["command"] == QUICK_CMD
         off = a["mcp_servers"]["legacy-off"]
-        assert off.get("enabled", True) is False or off.get("disabled") is True, f"{name}: MCP server switched back on"
+        assert off.get("enabled") is False and "disabled" not in off, f"{name}: MCP legacy disabled flag was not migrated"
         assert a["mcp_servers"]["kept-on"] == o["mcp_servers"]["kept-on"]
         after_lines = after.decode("utf-8").splitlines()
         for line in orig.decode("utf-8").splitlines():
@@ -525,7 +527,9 @@ def provider():
 def template_home(tmp_path_factory, provider) -> Path:
     """HERMES_HOME populated by the N-1 CLI itself (sessions, profile, cron, config)."""
     seed = make_leg(tmp_path_factory.mktemp("seed"), None)
-    version = _base_config_version(seed)
+    # A user's config may predate the release binary. v45 is the last schema before
+    # the MCP editor's disabled → enabled migration, so even a v46+ base must exercise it.
+    version = min(_base_config_version(seed), 45)
     cfg = user_config(provider.base_url, version)
     (seed.hermes_home / "config.yaml").write_text(cfg, encoding="utf-8")
     (seed.hermes_home / ".env").write_text("OPENAI_API_KEY=sk-fake-e2e\n", encoding="utf-8")
@@ -544,6 +548,11 @@ def template_home(tmp_path_factory, provider) -> Path:
     # Configs were written by hand AFTER the N-1 CLI touched them; re-pin them to the user's bytes.
     (seed.hermes_home / "config.yaml").write_text(cfg, encoding="utf-8")
     (work / "config.yaml").write_text(cfg, encoding="utf-8")
+    # Copying an open WAL's sidecars can leave the clone's read-only integrity probe
+    # unable to create its shared-memory index. Close/checkpoint both seed DBs first.
+    for db in (seed.hermes_home / "state.db", work / "state.db"):
+        with contextlib.closing(sqlite3.connect(db)) as con:
+            assert con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     template = seed.root / "template-home"
     shutil.copytree(seed.hermes_home, template, symlinks=True)
     return template
