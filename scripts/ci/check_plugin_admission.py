@@ -70,7 +70,7 @@ def changed_entries(root: Path, base: str, head: str | None) -> tuple[str | None
         names += run(["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *patterns], cwd=root)
     selected = {name for name in names.split("\0") if name and not name.endswith("/removed.yaml")}
     return head_sha if head is not None else None, sorted(
-        name for name in selected if not _matches_release(root, name, head_sha)
+        name for name in selected if not _matches_release(root, name, head_sha if head is not None else None)
     )
 
 

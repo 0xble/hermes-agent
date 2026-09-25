@@ -159,6 +159,12 @@ class PluginAdmissionTests(unittest.TestCase):
         head = self.commit(self.catalog)
         self.assertEqual(admission.changed_entries(self.catalog, base, head),
                          (head, ["plugin-catalog/forked.yaml"]))
+        (directory / "upstream.yaml").write_text("invalid dirty entry\n", encoding="utf-8")
+        self.assertEqual(admission.changed_entries(self.catalog, base, None),
+                         (None, ["plugin-catalog/forked.yaml", "plugin-catalog/upstream.yaml"]))
+        self.git(self.catalog, "checkout", "-q", "--", "plugin-catalog/upstream.yaml")
+        self.assertEqual(admission.changed_entries(self.catalog, base, None),
+                         (None, ["plugin-catalog/forked.yaml"]))
         (self.catalog / "MAINTENANCE.md").write_text("no baseline\n", encoding="utf-8")
         unrecorded = self.commit(self.catalog)
         self.assertEqual(admission.changed_entries(self.catalog, base, unrecorded)[1],
