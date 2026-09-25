@@ -460,3 +460,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Every process between the supervised pid and the updater is now recorded as pending.
 - Regression coverage: `test_fleet_matrix_self_restart_pending.py`
   (`test_launchd_wrapper_pid_still_marks_the_gateway_below_it_pending`).
+
+## Update notice treated a restart-pending receipt row as a failed update
+
+- Fork patch identity: `update-lifecycle`.
+- Once the updater recorded the enclosing gateway as `restart_pending`, its exit code and receipt
+  became `success`. The gateway's final notice still required every fleet row to be `current`, so
+  each `request_update` promotion sent "❌ Update Failed … did not confirm the updated revision". The
+  receipt cannot prove that row: the gateway restarts only after the updater exits. The notice now
+  judges that row by the replacement gateway for the same home. Success needs a live, identity-verified
+  replacement reporting the expected revision. Old code is still a failure. While the recorded
+  process still serves, or no gateway is up, the notice stays pending until its existing deadline.
+  Every other row keeps the strict `current` check.
+- Regression coverage: `test_update_lifecycle_notifications.py`
+  (`test_self_restart_pending_is_judged_by_the_replacement_gateway`), plus a replay of the
+  2026-09-25 10:09 receipt: the old code reports failure, the patched code reports success
+  (`b6fb36d94a21`).
