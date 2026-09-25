@@ -168,3 +168,10 @@ and drop it once upstream carries an equivalent fix.
 - Guards: `scripts/ci/tests/test_portable.py`
   (`test_every_reusable_only_workflow_has_a_caller`,
   `test_every_local_action_reference_resolves`).
+
+## Media send checks flood cooldown after chat lock acquisition
+
+- Fork patch identity: `telegram-media-flood-under-lock`.
+- A media send checked the shared flood cooldown before entering the per-chat send lock. When it queued behind a text send that armed a 120-second window, it later acquired the lock and uploaded anyway. Media sends now recheck the cooldown inside the serialization boundary before the API call and before the topic-anchor retry.
+- Guard: `tests/gateway/test_telegram_flood_coherence.py`
+  (`test_media_queued_behind_send_lock_rechecks_flood_cooldown`).
