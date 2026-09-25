@@ -378,3 +378,23 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Upstream `main` at `7b761da2de49` still has the same sweep; retire this patch
   once an upstream release protects the same cross-home boundary. No upstream
   issue or PR matched a targeted `gateway reaper HERMES_HOME orphan` search.
+
+## Hindsight empty prefetch, unbounded status poll and unapplied bank missions
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- A newer prefetch whose recall came back empty did not replace an older worker's buffered result, so
+  the next turn injected memories from the superseded query. Advancing the generation now clears the
+  buffer, and the current generation publishes its result even when empty.
+- The retain-drain deadline was checked only between retain-op status requests; each request ran with
+  the full provider timeout (120s default), so a hung status endpoint overran the 10s prefetch drain.
+  The remaining budget now bounds each status request and poll sleep.
+- `bank_mission`/`bank_retain_mission` were stored but never sent (inherited from upstream, where the
+  README says "Applied via Banks API"). They are now applied once per resolved bank through the Banks
+  API before its first retain or reflect, best effort; concurrent callers for that bank wait until the
+  attempt in flight has actually finished (one bounded budget, including a reconnect retry and a late
+  landing), so none reaches the bank ahead of its missions.
+- The local_embedded reconnect retry reused the caller's full timeout; one budget now covers the
+  operation, so the retry gets only what the first attempt left and is skipped when it is spent.
+- Regression coverage: `test_hindsight_provider.py`
+  (`test_empty_newer_recall_does_not_inject_older_query_memories`,
+  `test_drain_budget_bounds_the_status_request_itself`, `test_embedded_reconnect_*`, `TestMissionConfig`).

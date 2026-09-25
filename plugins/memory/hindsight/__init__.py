@@ -400,6 +400,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_generation = 0
+        # Per-bank mission application (once per bank per process). The event is set when the
+        # attempt finishes (success or failure); other callers for that bank wait for it.
+        self._mission_banks: dict[str, threading.Event] = {}
+        self._mission_lock = threading.Lock()
         self._prefetch_thread = None
         self._last_recall_returned, self._last_recall_count = False, 0
         self._apply_recall_settings({})
@@ -538,15 +542,19 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
         return self._client
 
-    def _run_sync(self, coro, *, keep_pending: Callable[[Any], None] | None = None):
-        """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout, keep_pending=keep_pending)
+    def _run_sync(self, coro, *, keep_pending: Callable[[Any], None] | None = None, timeout: float | None = None):
+        """Schedule *coro* on the shared loop using the configured timeout (or a tighter *timeout*)."""
+        limit = self._timeout if timeout is None else min(float(self._timeout or _DEFAULT_TIMEOUT), timeout)
+        return _run_sync(coro, timeout=limit, keep_pending=keep_pending)
 
-    def _run_hindsight_operation(self, operation, *, keep_pending: Callable[[Any], None] | None = None):
+    def _run_hindsight_operation(self, operation, *, keep_pending: Callable[[Any], None] | None = None,
+                                 timeout: float | None = None):
         """Run an async client operation; for local_embedded, a stale-daemon
-        connection failure recreates the client and retries once."""
+        connection failure recreates the client and retries once. A *timeout* is one budget
+        for the whole operation: the retry gets only what the first attempt left, or none."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            return self._run_sync(operation(self._get_client()), keep_pending=keep_pending)
+            return self._run_sync(operation(self._get_client()), keep_pending=keep_pending, timeout=timeout)
         except Exception as exc:
             text = f"{type(exc).__name__}: {exc}".lower()
             if self._mode != "local_embedded" or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
@@ -554,7 +562,10 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.info("Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s", exc)
             self._client = None
             self._client = client = self._get_client()
-            return self._run_sync(operation(client), keep_pending=keep_pending)
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                raise
+            return self._run_sync(operation(client), keep_pending=keep_pending, timeout=left)
 
     # -- retain writer thread + server-side visibility -------------------------
 
@@ -647,14 +658,16 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._pending_retain_ops.update(ids)
                 self._pending_retain_op_banks.update(dict.fromkeys(ids, bank_id))
 
-    def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
+    def _is_retain_op_complete(self, bank_id: str, op_id: str, timeout: float | None = None) -> bool:
         """True when a server-side retain op is done or gone (completed ops are evicted,
-        so 404 = no longer pending). Transient errors -> False, caller keeps waiting."""
+        so 404 = no longer pending). Transient errors (and a status request that outlives
+        *timeout*) -> False, caller keeps waiting."""
         from hindsight_client_api.exceptions import NotFoundException
 
         try:
             resp = self._run_hindsight_operation(
-                lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
+                lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id),
+                timeout=timeout,
             )
         except NotFoundException:
             return True
@@ -672,6 +685,8 @@ class HindsightMemoryProvider(MemoryProvider):
         durability). False on timeout/shutdown."""
         deadline = None if timeout <= 0 else time.monotonic() + timeout
         expired = lambda: deadline is not None and time.monotonic() >= deadline  # noqa: E731
+        # The budget bounds each status request and poll sleep too, not only the loop checks.
+        remaining = lambda: None if deadline is None else max(0.0, deadline - time.monotonic())  # noqa: E731
         # A failed retain leaves the queue (task_done) but stays in the retry backlog until it
         # succeeds or is abandoned, so the backlog is part of the barrier too.
         while self._retain_queue.unfinished_tasks > 0 or self._retain_backlog:
@@ -682,9 +697,10 @@ class HindsightMemoryProvider(MemoryProvider):
                              timeout, self._retain_queue.unfinished_tasks, len(self._retain_backlog))
                 return False
             time.sleep(0.05)
-        return self._wait_for_server_retain_ops(expired, timeout)
+        return self._wait_for_server_retain_ops(expired, timeout, remaining)
 
-    def _wait_for_server_retain_ops(self, _expired: Callable[[], bool], timeout: float) -> bool:
+    def _wait_for_server_retain_ops(self, _expired: Callable[[], bool], timeout: float,
+                                    _remaining: Callable[[], float | None] = lambda: None) -> bool:
         """Poll tracked async retain ops until complete or *_expired()* (deadline
         predicate). Ops still pending at the deadline are DROPPED: keeping them
         would let a permanently failing status endpoint burn the full timeout on
@@ -704,7 +720,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     return False
                 if _expired():
                     break
-                if self._is_retain_op_complete(bank_id, op_id):
+                if self._is_retain_op_complete(bank_id, op_id, timeout=_remaining()):
                     done.add(op_id)
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.difference_update(done)
@@ -721,7 +737,8 @@ class HindsightMemoryProvider(MemoryProvider):
                                "dropping %d unresolved op(s) so later prefetches stay "
                                "bounded (recall may miss the just-completed turn)", timeout, dropped)
                 return False
-            time.sleep(self._RETAIN_OP_POLL_INTERVAL_S)
+            left = _remaining()
+            time.sleep(self._RETAIN_OP_POLL_INTERVAL_S if left is None else min(self._RETAIN_OP_POLL_INTERVAL_S, left))
 
     # -- retain target -----------------------------------------------------------
 
@@ -978,7 +995,53 @@ class HindsightMemoryProvider(MemoryProvider):
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
         return resp.results or []
 
+    def _apply_bank_missions(self, bank_id: str) -> None:
+        """Apply configured ``bank_mission``/``bank_retain_mission`` to *bank_id* through the
+        Banks API, once per bank (dynamic banks included). Best effort: a failure is logged
+        and not retried, so an unavailable endpoint never taxes every retain."""
+        if not (self._bank_mission or self._bank_retain_mission) or not bank_id:
+            return
+        with self._mission_lock:
+            done = self._mission_banks.get(bank_id)
+            owner = done is None
+            if owner:
+                done = self._mission_banks[bank_id] = threading.Event()
+        if not owner:
+            # Another caller is applying this bank's missions: don't reach the bank before that
+            # attempt has finished. The owner's attempt is bounded by one explicit budget (below)
+            # and always sets the event, so waiting for it rather than a separate clock can't
+            # let this caller overtake a slow but successful application.
+            done.wait()
+            return
+        kwargs: Dict[str, Any] = {"bank_id": bank_id}
+        if self._bank_mission:
+            kwargs["reflect_mission"] = self._bank_mission
+        if self._bank_retain_mission:
+            kwargs["retain_mission"] = self._bank_retain_mission
+        budget = float(self._timeout or _DEFAULT_TIMEOUT)
+        pending: list = []
+        try:
+            # One budget for the whole attempt, including an embedded reconnect retry.
+            self._run_hindsight_operation(lambda client: client.acreate_bank(**kwargs),
+                                          keep_pending=pending.append, timeout=budget)
+        except TimeoutError:
+            # The wait timed out, not the request: it may still land. Waiters are released only
+            # once it has actually finished (or a final cap passes), so none overtakes it.
+            if pending:
+                concurrent.futures.wait(pending[-1:], timeout=budget)
+            if not pending or not pending[-1].done():
+                logger.warning("Hindsight: mission update for bank %s still unresolved after %.1fs; "
+                               "proceeding without confirmation", bank_id, 2 * budget)
+            elif pending[-1].cancelled() or pending[-1].exception() is not None:
+                logger.warning("Hindsight: could not apply configured missions to bank %s: %s", bank_id,
+                               "cancelled" if pending[-1].cancelled() else pending[-1].exception())
+        except Exception as exc:
+            logger.warning("Hindsight: could not apply configured missions to bank %s: %s", bank_id, exc)
+        finally:
+            done.set()
+
     def _reflect(self, query: str) -> str | None:
+        self._apply_bank_missions(self._bank_id)
         resp = self._run_hindsight_operation(
             lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget)
         )
@@ -1052,6 +1115,9 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_generation += 1
             generation = self._prefetch_generation
+            # An older worker's result that landed after prefetch()'s capped join belongs to a
+            # superseded query; it must not be injected for this one.
+            self._prefetch_result, self._prefetch_count = "", 0
 
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
@@ -1059,10 +1125,10 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._prefetch_waits_for_retain:
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
             text, count = self._do_recall(query)
-            if text:
-                with self._prefetch_lock:
-                    if generation == self._prefetch_generation:
-                        self._prefetch_result, self._prefetch_count = text, count
+            # Publish the current generation's result even when empty: an empty recall is an answer.
+            with self._prefetch_lock:
+                if generation == self._prefetch_generation:
+                    self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -1111,6 +1177,7 @@ class HindsightMemoryProvider(MemoryProvider):
                       retain_async: bool | None = None, keep_pending: Callable[[Any], None] | None = None):
         """Dispatch one item via aretain_batch (bank_id/document_id/retain_async are
         call-level args, never item keys)."""
+        self._apply_bank_missions(bank_id)
         kwargs: Dict[str, Any] = {"bank_id": bank_id, "items": [item], "document_id": document_id, "retain_async": retain_async}
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs), keep_pending=keep_pending)

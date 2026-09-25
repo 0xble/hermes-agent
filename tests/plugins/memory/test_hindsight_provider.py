@@ -891,6 +891,76 @@ class TestPrefetchServerRetainVisibility:
             "second prefetch re-polled dropped ops — eviction regressed"
         )
 
+    def test_drain_budget_bounds_the_status_request_itself(self, provider_with_config):
+        """The drain deadline must bound each status request, not only the loop checks: a hung
+        status endpoint otherwise holds the prefetch for the full request timeout (120s default)."""
+        p = provider_with_config(timeout=30)
+
+        async def _hung(*, bank_id, operation_id):
+            await asyncio.sleep(10)
+            return SimpleNamespace(status="completed")
+
+        p._client.operations = MagicMock()
+        p._client.operations.get_operation_status = AsyncMock(side_effect=_hung)
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "test-bank")
+
+        start = time.monotonic()
+        assert p._wait_for_retains_drained(0.3) is False
+        assert time.monotonic() - start < 2.5
+        assert p._pending_retain_ops == set()
+
+    def test_embedded_reconnect_retry_gets_only_the_remaining_budget(self, provider):
+        """The local_embedded reconnect retry must spend what the first attempt left of the
+        caller's budget, not a fresh copy of it."""
+        provider._mode = "local_embedded"
+        budgets, calls = [], []
+        real_run_sync = provider._run_sync
+
+        def _spy(coro, *, keep_pending=None, timeout=None):
+            budgets.append(timeout)
+            return real_run_sync(coro, keep_pending=keep_pending, timeout=timeout)
+
+        async def _status(*, bank_id, operation_id):
+            calls.append(1)
+            if len(calls) == 1:
+                await asyncio.sleep(0.2)
+                raise RuntimeError("Cannot connect to host 127.0.0.1:8888")
+            return SimpleNamespace(status="completed")
+
+        client = _make_mock_client()
+        client.operations = MagicMock()
+        client.operations.get_operation_status = AsyncMock(side_effect=_status)
+        provider._client = client
+        provider._get_client = lambda: client
+        provider._run_sync = _spy
+
+        assert provider._is_retain_op_complete("bank", "op-1", timeout=1.0) is True
+        assert budgets[0] == 1.0
+        assert len(budgets) == 2 and budgets[1] <= 0.85, budgets
+
+    def test_embedded_reconnect_is_skipped_when_the_budget_is_spent(self, provider):
+        """A slow client recreation that consumes the rest of the budget means no retry."""
+        provider._mode = "local_embedded"
+        calls = []
+
+        async def _status(*, bank_id, operation_id):
+            calls.append(1)
+            raise RuntimeError("Cannot connect to host 127.0.0.1:8888")
+
+        client = _make_mock_client()
+        client.operations = MagicMock()
+        client.operations.get_operation_status = AsyncMock(side_effect=_status)
+        provider._client = client
+
+        def _slow_recreate():
+            if provider._client is None:
+                time.sleep(0.3)
+            return client
+
+        provider._get_client = _slow_recreate
+        assert provider._is_retain_op_complete("bank", "op-1", timeout=0.2) is False
+        assert len(calls) == 1
+
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
         exceptions = pytest.importorskip(
@@ -918,6 +988,7 @@ class TestPrefetchServerRetainVisibility:
         provider._client = client
 
         assert provider._is_retain_op_complete("bank", "op-1") is False
+
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +1025,131 @@ class TestPrefetchSupersession:
         assert not old_worker.is_alive()
         assert "new memory" in provider._prefetch_result
         assert "old memory" not in provider._prefetch_result
+
+    def test_empty_newer_recall_does_not_inject_older_query_memories(self, provider):
+        """An older worker's result buffered after prefetch()'s capped join must not survive a
+        newer query that found nothing: the next turn would get the older query's memories."""
+        async def _recall(**kwargs):
+            if kwargs.get("query") == "old":
+                return SimpleNamespace(results=[SimpleNamespace(text="old memory")])
+            return SimpleNamespace(results=[])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+        provider._prefetch_waits_for_retain = False
+        provider.queue_prefetch("old")
+        provider._prefetch_thread.join(timeout=5.0)
+        assert "old memory" in provider._prefetch_result  # landed, never consumed
+        provider.queue_prefetch("new")
+        provider._prefetch_thread.join(timeout=5.0)
+        assert "old memory" not in provider.prefetch("new")
+
+class TestMissionConfig:
+    def test_configured_missions_are_applied_once_per_bank_before_retain(self, provider_with_config):
+        """``bank_mission``/``bank_retain_mission`` are documented as applied via the Banks API;
+        they must reach the bank (each resolved bank once), not only sit on the provider."""
+        p = provider_with_config(bank_mission="Reflect framing", bank_retain_mission="Extract decisions")
+        p._client.acreate_bank = AsyncMock(return_value=SimpleNamespace())
+        p._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(operation_id=None, operation_ids=None))
+
+        p._retain_batch({"content": "a"}, bank_id="bank-a")
+        p._retain_batch({"content": "b"}, bank_id="bank-a")
+        p._retain_batch({"content": "c"}, bank_id="bank-b")
+
+        calls = [c.kwargs for c in p._client.acreate_bank.await_args_list]
+        assert calls == [
+            {"bank_id": "bank-a", "reflect_mission": "Reflect framing", "retain_mission": "Extract decisions"},
+            {"bank_id": "bank-b", "reflect_mission": "Reflect framing", "retain_mission": "Extract decisions"},
+        ]
+        assert p._client.aretain_batch.await_count == 3
+
+    def test_concurrent_caller_waits_for_the_bank_mission_in_flight(self, provider_with_config):
+        """A second retain/reflect for the same bank must not reach the server while the first
+        caller is still applying that bank's missions."""
+        p = provider_with_config(bank_retain_mission="Extract decisions")
+        order: list = []
+        started, release = threading.Event(), threading.Event()
+
+        async def _create(**_kw):
+            order.append("mission-start")
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            order.append("mission-applied")
+            return SimpleNamespace()
+
+        async def _retain(**_kw):
+            order.append("retain")
+            return SimpleNamespace(operation_id=None, operation_ids=None)
+
+        p._client.acreate_bank = AsyncMock(side_effect=_create)
+        p._client.aretain_batch = AsyncMock(side_effect=_retain)
+        first = threading.Thread(target=p._retain_batch, args=({"content": "a"},), kwargs={"bank_id": "bank-a"})
+        first.start()
+        assert started.wait(5.0)
+        second = threading.Thread(target=p._retain_batch, args=({"content": "b"},), kwargs={"bank_id": "bank-a"})
+        second.start()
+        time.sleep(0.2)
+        assert order == ["mission-start"], order
+        release.set()
+        first.join(5.0)
+        second.join(5.0)
+        assert order[:2] == ["mission-start", "mission-applied"]
+        assert order.count("retain") == 2
+        assert p._client.acreate_bank.await_count == 1
+
+    def test_waiter_does_not_overtake_a_mission_applied_after_embedded_reconnect(self, provider_with_config):
+        """With a short provider timeout, a reconnect retry that finishes the mission late must
+        still hold concurrent callers for that bank until the mission is applied."""
+        p = provider_with_config(bank_retain_mission="Extract decisions", timeout=1)
+        p._timeout = 0.5
+        p._mode = "local_embedded"
+        order: list = []
+        attempts: list = []
+        started = threading.Event()
+
+        async def _create(**_kw):
+            attempts.append(1)
+            started.set()
+            if len(attempts) == 1:
+                await asyncio.sleep(0.3)
+                raise RuntimeError("Cannot connect to host 127.0.0.1:8888")
+            # The retry outlives the 0.5s provider timeout (lands ~0.65s) but succeeds.
+            await asyncio.sleep(0.35)
+            order.append("mission-applied")
+            return SimpleNamespace()
+
+        async def _retain(**_kw):
+            order.append("retain")
+            return SimpleNamespace(operation_id=None, operation_ids=None)
+
+        client = p._client
+        client.acreate_bank = AsyncMock(side_effect=_create)
+        client.aretain_batch = AsyncMock(side_effect=_retain)
+        p._get_client = lambda: client
+        first = threading.Thread(target=p._retain_batch, args=({"content": "a"},), kwargs={"bank_id": "bank-a"})
+        first.start()
+        assert started.wait(5.0)
+        second = threading.Thread(target=p._retain_batch, args=({"content": "b"},), kwargs={"bank_id": "bank-a"})
+        second.start()
+        first.join(5.0)
+        second.join(5.0)
+        assert len(attempts) == 2
+        assert order == ["mission-applied", "retain", "retain"], order
+
+    def test_no_missions_configured_makes_no_bank_calls(self, provider):
+        provider._client.acreate_bank = AsyncMock()
+        provider._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(operation_id=None, operation_ids=None))
+        provider._retain_batch({"content": "a"}, bank_id="bank-a")
+        provider._client.acreate_bank.assert_not_awaited()
+
+    def test_mission_failure_does_not_block_retain(self, provider_with_config):
+        p = provider_with_config(bank_retain_mission="Extract decisions")
+        p._client.acreate_bank = AsyncMock(side_effect=RuntimeError("banks api down"))
+        p._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(operation_id=None, operation_ids=None))
+        p._retain_batch({"content": "a"}, bank_id="bank-a")
+        p._retain_batch({"content": "b"}, bank_id="bank-a")
+        assert p._client.aretain_batch.await_count == 2
+        assert p._client.acreate_bank.await_count == 1  # best effort, not retried every retain
 
 
 class TestRecallStatus:
