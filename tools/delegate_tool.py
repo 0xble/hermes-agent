@@ -134,6 +134,16 @@ def _child_compression_cap_tokens(raw) -> "int | None":
     return int(raw)
 
 
+def _max_retry_wait_seconds(routing_cfg: Optional[Dict[str, Any]]) -> Optional[float]:
+    """The route owner's ``max_retry_wait_seconds``: the longest provider cooldown the child sits
+    out before failing the attempt so the owner can move to another route. Absent, negative, or
+    non-numeric (YAML ``true`` included) means no cap."""
+    value = (routing_cfg or {}).get("max_retry_wait_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
 def _apply_child_compression_cap(child, delegation_cfg: dict) -> None:
     """Optional absolute cap on the child's compaction trigger, ``delegation.compression_threshold_tokens``
     (lower of it and any global ``compression.threshold_tokens``). Off by default: a 1M-window child
@@ -268,6 +278,7 @@ def _build_child_agent(
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)
+    child._max_retry_wait_s = _max_retry_wait_seconds(routing_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
     try:
