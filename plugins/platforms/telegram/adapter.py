@@ -5528,25 +5528,38 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, chat_id, cooldown, media_label)
             raise _MediaFloodRefusal(cooldown)
         send_kwargs = {**kwargs, **media_kwargs}
-        for attempt in range(2):
-            try:
-                return await self._send_with_dm_topic_reply_anchor_retry(
-                    send_fn, send_kwargs, metadata, reply_to_id, media_label, reset_media=reset_media)
-            except Exception as err:
-                wait = _telegram_retry_after(err)
-                if wait is None:
-                    raise
-                if wait > _FLOOD_INLINE_WAIT_CAP_SECS or attempt:
+        # The short in-place retry holds this chat's send lock across its wait (as send() does) and arms
+        # the shared window for it, so no other send, edit or typing request reaches Telegram inside the
+        # penalty the platform just asked us to observe. The lock is reentrant for this task, so the
+        # funnel below re-enters it.
+        async with self._chat_send_lock(chat_id):
+            for attempt in range(2):
+                try:
+                    return await self._send_with_dm_topic_reply_anchor_retry(
+                        send_fn, send_kwargs, metadata, reply_to_id, media_label, reset_media=reset_media)
+                except Exception as err:
+                    wait = _telegram_retry_after(err)
+                    if wait is None:
+                        raise
+                    if wait > _FLOOD_INLINE_WAIT_CAP_SECS or attempt:
+                        logger.warning(
+                            "[%s] Telegram flood control on %s upload (retry_after=%.1fs); failing closed so the "
+                            "delivery ledger owns the wait", self.name, media_label, wait)
+                        self._record_send_flood_cooldown(chat_id, wait)
+                        raise _MediaFloodRefusal(wait) from err
                     logger.warning(
-                        "[%s] Telegram flood control on %s upload (retry_after=%.1fs); failing closed so the "
-                        "delivery ledger owns the wait", self.name, media_label, wait)
+                        "[%s] Telegram flood control on %s upload, retrying in %.1fs", self.name, media_label, wait)
+                    if reset_media is not None:
+                        reset_media()
                     self._record_send_flood_cooldown(chat_id, wait)
-                    raise _MediaFloodRefusal(wait) from err
-                logger.warning(
-                    "[%s] Telegram flood control on %s upload, retrying in %.1fs", self.name, media_label, wait)
-                if reset_media is not None:
-                    reset_media()
-                await asyncio.sleep(wait)
+                    until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
+                    key = str(normalize_telegram_chat_id(chat_id))
+                    armed = until.get(key)
+                    await asyncio.sleep(wait)
+                    # The wait we armed is over; release only our own window so the retry may go out. A
+                    # longer penalty another path armed meanwhile replaced it and still stands.
+                    if until.get(key) == armed:
+                        until.pop(key, None)
         raise _MediaFloodRefusal(_FLOOD_INLINE_WAIT_CAP_SECS)
 
     @staticmethod

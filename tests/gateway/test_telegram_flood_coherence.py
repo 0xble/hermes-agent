@@ -139,6 +139,51 @@ async def test_short_media_flood_retries_once_and_succeeds(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_short_media_flood_wait_holds_other_outbound_traffic(tmp_path):
+    """The in-place media retry's wait is a penalty the platform is applying: a concurrent text send
+    must not reach Telegram during it, and cosmetic traffic (typing) is suppressed until it ends."""
+    adapter = _adapter()
+    order: list = []
+    first_refused = asyncio.Event()
+
+    async def flaky(**_kw):
+        order.append("animation")
+        if order.count("animation") == 1:
+            first_refused.set()
+            raise _FloodError(0.3)
+        return MagicMock(message_id=99)
+
+    async def text(**_kw):
+        order.append("text")
+        return MagicMock(message_id=7)
+
+    adapter._bot.send_animation = AsyncMock(side_effect=flaky)
+    adapter._bot.send_message = AsyncMock(side_effect=text)
+    adapter._bot.send_chat_action = AsyncMock(side_effect=lambda **_kw: order.append("typing"))
+    path = tmp_path / "clip.gif"
+    path.write_bytes(b"GIF89a")
+
+    media = asyncio.create_task(adapter.send_animation("4242", str(path)))
+    await asyncio.wait_for(first_refused.wait(), timeout=5.0)
+    # The refusal propagates back through the media deadline wrapper; wait until the adapter has
+    # handled it (armed the window or, before the fix, started its unguarded sleep).
+    for _ in range(200):
+        if adapter._send_flood_cooldown_remaining("4242") is not None or media.done():
+            break
+        await asyncio.sleep(0.005)
+    await adapter.send_typing("4242")
+    follow_up = await asyncio.wait_for(adapter.send("4242", "text during the media wait"), timeout=5.0)
+    result = await asyncio.wait_for(media, timeout=5.0)
+
+    assert result.success is True and result.message_id == "99"
+    assert follow_up.success is True
+    # Nothing reaches Telegram between the refusal and the retry. (send() may re-arm typing after its
+    # own message, once the penalty is over; that is allowed.)
+    assert order[:3] == ["animation", "animation", "text"], order
+    assert adapter._send_flood_cooldown_remaining("4242") is None
+
+
+@pytest.mark.asyncio
 async def test_media_upload_is_refused_locally_inside_an_armed_window(tmp_path):
     adapter = _adapter()
     await _arm_window(adapter)
