@@ -368,6 +368,9 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         # Suspect recycle: a command timeout marked this session; the expensive recycle
         # lives here at next use, not on the timeout path (mark must stay cheap).
         if not _bt._browser_session_backend(task_id).ensure_healthy():
+            with _bt._cleanup_lock:
+                if _bt._active_sessions.get(task_id) is existing_session:
+                    raise RuntimeError("Protected browser close was not confirmed; refusing to replace its session")
             replacement = _replacement_after_teardown()
             if replacement is not None:
                 return replacement
@@ -377,6 +380,9 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         else:
             _bt.logger.info("Replacing expired or dead browser session for task %s", task_id)
             _lifecycle._cleanup_single_browser_session(task_id)
+            with _bt._cleanup_lock:
+                if _bt._active_sessions.get(task_id) is existing_session:
+                    raise RuntimeError("Protected browser close was not confirmed; refusing to replace its session")
             replacement = _replacement_after_teardown()
             if replacement is not None:
                 return replacement
@@ -403,6 +409,12 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
 def _discard_timed_out_browser_session(task_id: str, session_info: Dict[str, Any], task_socket_dir: str) -> None:
     """Drop a stuck client generation without losing cloud cleanup state."""
+    from agent.redact import has_vault_date_components
+    if has_vault_date_components(task_id):
+        # A timeout cannot prove the browser died; keep its ownership and
+        # protections until an acknowledged close can be retried.
+        _bt.logger.warning("Keeping protected browser %s after command timeout", task_id)
+        return
     with _bt._cleanup_lock:
         if _bt._active_sessions.get(task_id) is not session_info:
             return

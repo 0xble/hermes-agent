@@ -80,15 +80,35 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
     agent = _build_agent_with_db(db, session_id)
     agent._cached_system_prompt = "sys"
 
-    # Fast host timeout for the owned wrapper.
+    # Fast idle timeout for the owned wrapper.  The ceiling leaves room for
+    # loaded-CI startup; the idle clock below starts at the engine boundary.
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_timeouts",
-        lambda cfg=None: (0.6, 1.2),
+        lambda cfg=None: (0.6, 10.0),
     )
 
     engine_started = threading.Event()
     release_engine = threading.Event()
     mutated_lists = []
+
+    # This test is about a worker that has reached the mutating engine and is
+    # then detached by the inactivity watchdog.  Under a loaded parallel run,
+    # agent setup can consume the tiny idle budget before the engine starts,
+    # which exercises a different (cancel-before-dispatch) path.  Keep the idle
+    # clock at zero until the target boundary is reached; the ordinary watchdog
+    # takes over immediately afterwards.
+    from agent.conversation_compression import CompressionCommitFence
+
+    original_seconds_since_progress = CompressionCommitFence.seconds_since_progress
+    monkeypatch.setattr(
+        CompressionCommitFence,
+        "seconds_since_progress",
+        lambda fence: (
+            original_seconds_since_progress(fence)
+            if engine_started.is_set()
+            else 0.0
+        ),
+    )
 
     def _mutating_engine(msgs, **_kwargs):
         # Legacy/plugin-engine contract: mutate the input list IN PLACE.

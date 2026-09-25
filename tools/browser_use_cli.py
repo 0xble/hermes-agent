@@ -614,6 +614,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
+    # Full Python can capture and print image bytes without calling the named
+    # screenshot helper, so a code-text check cannot secure this path.
+    from tools.browser_tool_vision import blocked_protected_date_pixels
+    blocked_pixels = blocked_protected_date_pixels(task_id or "default")
+    if blocked_pixels is not None:
+        return blocked_pixels
     if not code or not code.strip():
         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
 
@@ -680,18 +686,17 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
         return tool_result(dispatched)
     proc = dispatched["proc"]
 
-    # browser_vault_fill registers injected values with this forced model-egress
-    # boundary. Preserve raw stdout only for screenshot-path detection below.
+    vault_tab = task_id or "default"
     result = {
         "success": proc.returncode == 0,
         "exit_code": proc.returncode,
-        "output": redact_sensitive_text(proc.stdout, force=True),
+        "output": redact_sensitive_text(proc.stdout, force=True, vault_tab=vault_tab),
     }
     if workspace:
         result["workspace"] = workspace
     if session:
         result["session"] = session
-    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True)
+    stderr = redact_sensitive_text((proc.stderr or "").strip(), force=True, vault_tab=vault_tab)
     if len(stderr) > _STDERR_CAP_CHARS:
         stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
     if stderr:

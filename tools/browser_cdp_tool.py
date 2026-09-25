@@ -45,7 +45,8 @@ _CDP_FLAGGED_BINARY_PATHS: Dict[str, tuple] = {
 }
 
 
-def _redact_cdp_output(value: Any, *, always_paths: tuple = (), flagged_paths: tuple = ()) -> Any:
+def _redact_cdp_output(value: Any, *, always_paths: tuple = (), flagged_paths: tuple = (),
+                       field_context: bool = False, vault_tab: str = "default", vault_origin: str = "") -> Any:
     """Redact browser-originated CDP result text; opaque bytes stay byte-identical.
 
     Exemptions come ONLY from the calling method's spec as exact result paths. Path
@@ -57,11 +58,14 @@ def _redact_cdp_output(value: Any, *, always_paths: tuple = (), flagged_paths: t
     """
     from agent.redact import redact_sensitive_text
     if isinstance(value, str):
-        return redact_sensitive_text(value, force=True)
+        return redact_sensitive_text(value, force=True,
+                                     vault_tab=vault_tab, vault_origin=vault_origin)
     if isinstance(value, (list, tuple)):
-        return type(value)(_redact_cdp_output(item) for item in value)
+        return type(value)(_redact_cdp_output(item, field_context=field_context,
+                                              vault_tab=vault_tab, vault_origin=vault_origin) for item in value)
     if not isinstance(value, dict):
-        return value
+        from agent.redact import redact_registered_vault_number
+        return redact_registered_vault_number(value, tab=vault_tab, origin=vault_origin)
     base64_flagged = value.get("base64Encoded") is True
     def leaf(paths: tuple, key: str) -> bool:
         return any(len(p) == 1 and p[0] == key for p in paths)
@@ -70,13 +74,17 @@ def _redact_cdp_output(value: Any, *, always_paths: tuple = (), flagged_paths: t
     redacted: Dict[str, Any] = {}
     for key, item in value.items():
         opaque = leaf(always_paths, key) or (leaf(flagged_paths, key) and base64_flagged)
-        out_key = redact_sensitive_text(key, force=True) if isinstance(key, str) else key  # by-value objects can carry a secret as a KEY
+        out_key = redact_sensitive_text(key, force=True,
+                                        vault_tab=vault_tab, vault_origin=vault_origin) if isinstance(key, str) else key
         redacted[out_key] = item if isinstance(item, str) and opaque else _redact_cdp_output(
-            item, always_paths=descend(always_paths, key), flagged_paths=descend(flagged_paths, key))
+            item, always_paths=descend(always_paths, key), flagged_paths=descend(flagged_paths, key),
+            field_context=field_context, vault_tab=vault_tab, vault_origin=vault_origin)
     return redacted
 
 
-# ``websockets`` is a direct dependency; wrap so a stale env yields a clean error.
+def _cdp_field_context(method: str, params: Optional[Dict[str, Any]]) -> bool:
+    # Arbitrary-code CDP channels use the tab-scoped fail-closed rule.
+    return method in {"Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.getProperties"}
 try:
     import websockets
     from websockets.exceptions import WebSocketException
@@ -254,7 +262,11 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
         return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
 
     return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
-                       "result": result_msg.get("result", {})}, ensure_ascii=False)
+                       "result": _redact_cdp_output(result_msg.get("result", {}),
+                           always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+                           flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
+                           field_context=_cdp_field_context(method, params),
+                           vault_tab=task_id)}, ensure_ascii=False)
 
 
 def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id: Optional[str] = None,
@@ -265,6 +277,18 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
     hit signed-URL expiry (Browserbase). Both paths share the same private-page/SSRF guard. Returns JSON
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
     effective_task_id = task_id or "default"
+    if method in {"Page.captureScreenshot", "Page.printToPDF", "HeadlessExperimental.beginFrame"}:
+        from tools.browser_tool_vision import blocked_protected_date_pixels
+        blocked = blocked_protected_date_pixels(effective_task_id)
+        if blocked is not None:
+            return blocked
+
+    # Both stateless target IDs and supervisors attached to a caller-supplied
+    # endpoint can reach another task's page; neither proves target ownership.
+    from agent.redact import has_any_vault_date_components
+    if has_any_vault_date_components():
+        return tool_error("Raw CDP is unavailable while a protected birth-date browser remains open; "
+                          "the endpoint cannot prove which task owns its target.")
 
     if frame_id:
         blocked = _browser_cdp_private_guard(task_id=effective_task_id, method=method, params=params or {})
@@ -315,7 +339,8 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
 
     payload: Dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
-        flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))}
+ flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
+ field_context=_cdp_field_context(method, call_params), vault_tab=effective_task_id)}
     if target_id:
         payload["target_id"] = target_id
     return json.dumps(payload, ensure_ascii=False)

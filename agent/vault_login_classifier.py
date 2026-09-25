@@ -32,6 +32,7 @@ LOGIN_AUTOFILL_TOKENS = ("username", "email", "tel", "current-password")
 PAYMENT_AUTOFILL_TOKENS = ("cc-number", "cc-name", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc")
 ADDRESS_AUTOFILL_TOKENS = ("address-line1", "address-line2", "address-level2", "address-level1",
                            "postal-code", "country-name", "country")
+PROTECTED_FIELD_TOKENS = ("bday", "bday-day", "bday-month", "bday-year")
 _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:card\s*number|cardnumber|ccnumber|cc\s*num|pan)\b"), "cc-number"),
     (re.compile(r"\b(?:name\s*on\s*card|cardholder|cc\s*name|ccname)\b"), "cc-name"),
@@ -282,6 +283,92 @@ def select_checkout_fills(classified: List[ClassifiedLoginControl], secret: Dict
     return fills
 
 
+_RE_BDAY = re.compile(r"\b(?:date\s*of\s*birth|birth\s*date|birthdate|dob)\b")
+_DATE_PART_CONTROL_TYPES = frozenset({"select", "text", "number", "tel"})
+_PROTECTED_CONTROL_TYPES = {
+    "bday": frozenset({"date"}),
+    "bday-month": _DATE_PART_CONTROL_TYPES,
+    "bday-day": _DATE_PART_CONTROL_TYPES,
+    "bday-year": _DATE_PART_CONTROL_TYPES,
+}
+_RE_BDAY_PART = {
+    f"bday-{part}": re.compile(
+        rf"\b(?:(?:birth|dob)\s*(?:date\s*)?{part}|{part}\s*(?:of\s*)?(?:birth|dob))\b"
+    )
+    for part in ("month", "day", "year")
+}
+
+
+def classify_protected_field_control(control: LoginControl, semantic: str) -> Optional[ClassifiedLoginControl]:
+    """Classify one explicitly configured protected semantic.
+
+    Standard WHATWG autocomplete tokens are authoritative. Heuristics are
+    deliberately narrow: a birth date may match only a control whose own
+    name or label says birth date or DOB, never a generic date control.
+    """
+    if semantic != "bday":
+        return None
+    # Control type gates every match, standard token included: a page can put
+    # autocomplete="bday" on any control, and only these can show a date part.
+    allowed = _PROTECTED_CONTROL_TYPES
+    tokens = [t for t in control.autocomplete.lower().split() if t]
+    for token in PROTECTED_FIELD_TOKENS:
+        if token in tokens:
+            return ClassifiedLoginControl(control, 100, token) if control.type in allowed[token] else None
+    if control.type not in allowed["bday-day"] | allowed["bday"]:
+        return None
+    searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
+    for token, pattern in _RE_BDAY_PART.items():
+        if pattern.search(searchable):
+            return ClassifiedLoginControl(control, 80, token) if control.type in allowed[token] else None
+    # A heuristic combined date is safe only for a date input. Selects and
+    # numeric/text controls need an explicit day/month/year meaning.
+    if control.type == "date" and _RE_BDAY.search(searchable):
+        return ClassifiedLoginControl(control, 80, "bday")
+    return None
+
+
+def select_protected_field_fills(classified: List[ClassifiedLoginControl], semantic: str,
+                                 value: str) -> List[Dict[str, Any]]:
+    """Select one birth-date field or a complete day/month/year split."""
+    if semantic != "bday" or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""):
+        return []
+    year, month, day = value.split("-")
+    parts = {"bday-month": month, "bday-day": day, "bday-year": year}
+    # A split date is one widget only when all three controls share a real form,
+    # or, outside any form, one tight container. Form-less controls with no
+    # container are never grouped: None is "unknown", not a shared widget.
+    def group_of(c: ClassifiedLoginControl) -> Optional[tuple]:
+        if c.control.form_index is not None:
+            return ("form", c.control.form_index)
+        if c.control.container_index is not None:
+            return ("container", c.control.container_index)
+        return None
+
+    groups = {group_of(c) for c in classified if c.token in parts} - {None}
+    complete_groups = []
+    for group in groups:
+        selected: List[Dict[str, Any]] = []
+        score = 0
+        for token, part in parts.items():
+            candidates = sorted(
+                (c for c in classified if c.token == token and group_of(c) == group),
+                key=lambda c: (-c.score, c.control.index),
+            )
+            if not candidates:
+                break
+            score += candidates[0].score
+            selected.append({"index": candidates[0].control.index, "token": token, "value": part})
+        if len(selected) == 3:
+            complete_groups.append((score, min(f["index"] for f in selected), selected))
+    if complete_groups:
+        return sorted(complete_groups, key=lambda group: (-group[0], group[1]))[0][2]
+    singles = sorted((c for c in classified if c.token == "bday"),
+                     key=lambda c: (-c.score, c.control.index))
+    return ([{"index": singles[0].control.index, "token": "bday", "value": value}]
+            if singles else [])
+
+
 # JS expression evaluated in the page to inspect candidate input controls.
 # Ported from OpenInstinct's nativeLoginControlInspectionExpression.
 # Inspection stamps every input with ``<nonce>:<index>`` under a per-inspection attribute; the fill
@@ -443,6 +530,7 @@ _FILL_JS_TEMPLATE = """(() => {
   __QUERY_ALL__
   const stamped = queryAll("[data-hermes-vault-slot]");
   let filled = 0;
+  const selectedOptions = [];
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
     const el = stamped.find((n) => n.getAttribute("data-hermes-vault-slot") === nonce + ':' + f.index);
@@ -450,8 +538,31 @@ _FILL_JS_TEMPLATE = """(() => {
     try {
       if (el.tagName === "SELECT") {
         const want = norm(f.value);
-        const opt = Array.from(el.options).find((o) => [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, "")));
-        if (opt) { el.value = opt.value; el.dispatchEvent(new Event("change", { bubbles: true })); filled += 1; }
+        const options = Array.from(el.options);
+        const same = (t) => norm(t) === want || norm(t) === want.replace(/^0/, "");
+        let opt;
+        if (f.token === "bday-month") {
+          // Month option values are often zero-based ("3" = April): trust visible
+          // text, by month name when present, and never guess from a bare value.
+          const names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+          const monthOf = (t) => names.findIndex((n) => new RegExp("(^|[^a-z])" + n).test(norm(t)));
+          const named = options.filter((o) => monthOf(o.textContent) >= 0);
+          if (named.length) {
+            const hits = named.filter((o) => monthOf(o.textContent) === parseInt(want, 10) - 1);
+            opt = hits.length === 1 ? hits[0] : undefined;
+          } else {
+            const byText = options.filter((o) => same(o.textContent));
+            opt = byText.length === 1 ? byText[0] : undefined;
+          }
+        } else {
+          opt = options.find((o) => [o.value, o.textContent].some(same));
+        }
+        if (opt) {
+          el.value = opt.value;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
+          filled += 1;
+        }
         continue;
       }
       el.focus();
@@ -478,5 +589,5 @@ _FILL_JS_TEMPLATE = """(() => {
     } catch (e) { /* skip */ }
   }
   stamped.forEach((n) => n.removeAttribute("data-hermes-vault-slot"));
-  return JSON.stringify({ filled });
+  return JSON.stringify({ filled, selectedOptions });
 })()"""

@@ -711,12 +711,18 @@ def _post_redirect_block(nav_session_key: str, url: str, final_url: str, auto_lo
     return json.dumps(_err(f"Blocked: redirect landed on {what}"))
 
 
-def _snapshot_fields(snap_result: Dict[str, Any]) -> Dict[str, Any]:
+def _snapshot_fields(snap_result: Dict[str, Any], nav_session_key: str = "default") -> Dict[str, Any]:
     """``snapshot`` + ``element_count`` fields from a successful snapshot result; oversized
     snapshots truncate at line boundaries with the full tree stored for read_file paging."""
     data = snap_result.get("data", {})
     snapshot_text = data.get("snapshot", "")
     refs = data.get("refs", {})
+    from agent.redact import has_vault_date_components, redact_registered_vault_snapshot
+    origin = ""
+    if has_vault_date_components(nav_session_key):
+        from tools.browser_vault_tool import _current_page_origin
+        origin = _current_page_origin(nav_session_key) or ""
+    snapshot_text = redact_registered_vault_snapshot(snapshot_text, tab=nav_session_key, origin=origin)
     threshold = get_browser_snapshot_threshold()
     if len(snapshot_text) > threshold:
         snapshot_text = _snapshot._truncate_snapshot(snapshot_text, max_chars=threshold)
@@ -734,7 +740,7 @@ def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> Non
     try:
         snap_result = _session._run_browser_command(nav_session_key, "snapshot", ["-c"])
         if snap_result.get("success"):
-            response.update(_snapshot_fields(snap_result))
+            response.update(_snapshot_fields(snap_result, nav_session_key))
             _merge_fallback_warning(response, snap_result)
     except Exception as e:
         logger.debug("Auto-snapshot after navigate failed: %s", e)
@@ -838,7 +844,7 @@ def browser_snapshot(
     if blocked is not None:
         return blocked
 
-    response = {"success": True, **_snapshot_fields(result)}
+    response = {"success": True, **_snapshot_fields(result, effective_task_id)}
     _lp._copy_fallback_warning(response, result)
 
     # Merge supervisor state (pending dialogs + frame tree) when a CDP supervisor is
@@ -1035,8 +1041,14 @@ def _parse_eval_value(raw_result: Any) -> Any:
     return raw_result
 
 
-def _eval_ok_response(parsed: Any, **extra) -> Dict[str, Any]:
-    return {"success": True, "result": _snapshot._redact_browser_output(parsed), "result_type": type(parsed).__name__, **extra}
+def _eval_ok_response(parsed: Any, *, vault_tab: str = "default", vault_origin: str = "", **extra) -> Dict[str, Any]:
+    return {
+        "success": True,
+        "result": _snapshot._redact_browser_output(parsed,
+                                                    vault_tab=vault_tab, vault_origin=vault_origin),
+        "result_type": type(parsed).__name__,
+        **extra,
+    }
 
 
 def _eval_result_or_blocked(effective_task_id: str, parsed: Any, result: Dict[str, Any], **extra) -> str:
@@ -1045,7 +1057,8 @@ def _eval_result_or_blocked(effective_task_id: str, parsed: Any, result: Dict[st
     blocked = _blocked_private_page_content(effective_task_id)
     if blocked is not None:
         return blocked
-    return _dumps(_lp._copy_fallback_warning(_eval_ok_response(parsed, **extra), result), default=str)
+    return _dumps(_lp._copy_fallback_warning(
+        _eval_ok_response(parsed, vault_tab=effective_task_id, **extra), result), default=str)
 
 
 def _eval_supervisor_fast_path(effective_task_id: str, expression: str) -> Optional[str]:
@@ -1061,7 +1074,8 @@ def _eval_supervisor_fast_path(effective_task_id: str, expression: str) -> Optio
         sup_result = supervisor.evaluate_runtime(expression)
         if sup_result.get("ok"):
             return _eval_result_or_blocked(
-                effective_task_id, _parse_eval_value(sup_result.get("result")), {}, method="cdp_supervisor")
+                effective_task_id, _parse_eval_value(sup_result.get("result")), {},
+                method="cdp_supervisor")
         err = sup_result.get("error") or "evaluate_runtime failed"
         if "supervisor" not in err.lower():
             return _dumps(_err(err))
@@ -1123,7 +1137,8 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     result = _session._run_browser_command(effective_task_id, "eval", [expression])
     if not result.get("success"):
         return _eval_failure_response(result)
-    return _eval_result_or_blocked(effective_task_id, _parse_eval_value(result.get("data", {}).get("result")), result)
+    return _eval_result_or_blocked(
+        effective_task_id, _parse_eval_value(result.get("data", {}).get("result")), result)
 
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
@@ -1261,11 +1276,15 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     if _is_camofox_mode():
         return _camofox("camofox_vision", question, annotate, task_id)
 
+    effective_task_id = _last_session_key(task_id or "default")
+    blocked = _vision.blocked_protected_date_pixels(effective_task_id)
+    if blocked is not None:
+        return blocked
+
     import uuid as uuid_mod
     from hermes_constants import get_hermes_dir
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
-    effective_task_id = _last_session_key(task_id or "default")
     blocked = _blocked_private_page_content(effective_task_id)
     if blocked is not None:
         return blocked

@@ -42,6 +42,20 @@ the browser vault fill tool, or the 1Password backends.
   `resolve_secret` onto the local-vault `PAYMENT_FIELDS` shape. A manager's card binds to the
   current page origin at fill time and the existing payment confirmation names that origin;
   local-vault cards keep their saved-origin binding. A card handle never resolves as a login.
+- Configured 1Password protected fields expose only an opaque handle and semantic token. They
+  remain exact-origin bound, resolve server-side, and fill only a matching supported control
+  in a verified task-owned local Chromium session. Birth-date fills refuse all Camofox
+  browsers, including managed persistence and brianle/lpg/meridian accounts, as well as
+  `/browser connect`, CDP overrides, real-profile, shared Bot Desktop, Lightpanda and
+  unprovable cloud sessions. These identities can still handle login and payment fills.
+  Values are registered at the model-egress redaction boundary before page injection.
+  Every browser-derived result in that browser session is then masked for the full date
+  and exact year/month/day components, including snapshots, eval, console/CDP and iframe
+  output. This intentionally masks unrelated standalone matches such as `4`, `12`,
+  or `1990` on every tab until a confirmed session close (focusing another tab cannot
+  prove the filled tab is gone); failed close retains masking and pixel refusal.
+  Raw CDP refuses all commands while any protected browser is open because
+  neither caller-supplied targets nor attached frame supervisors prove page ownership.
 - Additional 1Password accounts (`vault.onepassword.accounts`) are separate backend instances
   named `onepassword@<alias>` with `op@<alias>:<item-id>` handles. Each authenticates only
   with its own service-account token env (never the primary's, never Connect, never an
@@ -54,8 +68,8 @@ the browser vault fill tool, or the 1Password backends.
 - Fork patch identities: `slice-8-camofox-accounts` (local, no upstream submission),
   `slice-8-camofox-visible-handoff` (fork-only shared-window handoff; upstream does not
   expose these server endpoints); `slice-9-vault-camofox`, `slice-9-vault-shadow-dom`,
-  `slice-9-vault-op-cards` (own fork feature; no upstream issue or PR as of 2026-09-19),
-  and `camofox-stale-tab-recovery`
+  `slice-9-vault-op-cards`, `slice-9-vault-protected-fields` (own fork feature; no upstream
+  issue or PR as of 2026-09-19), and `camofox-stale-tab-recovery`
   (adopted design from [upstream PR 93249](https://github.com/NousResearch/hermes-agent/pull/93249)
   at `b5e999a5b52b70e286f6e55ec8dc8ec6e872ac8a`, related
   [issue 80276](https://github.com/NousResearch/hermes-agent/issues/80276)), and
@@ -84,6 +98,7 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_connect.py`, `tests/agent/test_vault_backends.py`,
 `tests/agent/test_vault_onepassword_selector.py`, `tests/agent/test_vault_onepassword_cards.py`,
 `tests/agent/test_vault_onepassword_subprocess.py` (real subprocess, fake `op`),
+`tests/agent/test_vault_protected_fields.py`,
 `tests/agent/test_vault_onepassword_accounts.py` (multi-account, real config + fake `op`),
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),

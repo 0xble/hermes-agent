@@ -79,6 +79,8 @@ def _clear_stale_tab(session: Dict[str, Any], exc: BaseException, *, endpoint: s
     if classify_camofox_http_error(exc, endpoint=endpoint) != "stale":
         return False
     session["tab_id"] = None
+    from agent.redact import clear_vault_date_components
+    clear_vault_date_components(session.get("task_id", "default"))
     # A managed account may still list the destroyed tab; only explicit navigation creates anew.
     session["adopt_existing_tab"] = False
     return True
@@ -292,6 +294,79 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str,
 # ---- Session management ----
 _sessions: Dict[str, Dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
 _sessions_lock = threading.Lock()
+# A managed tab containing a filled date must never be adopted under another task.
+_protected_tab_ids: set[str] = set()
+# tab_id -> the task whose live protection covers it; only that task may keep the binding.
+# In memory only: after a restart no task holds protection, so every quarantined tab is refused.
+_protected_tab_owners: Dict[str, str] = {}
+
+
+def _protected_tabs_path():
+    """Directory of quarantine records, one create-only file per tab: concurrent
+    processes never read-modify-write a shared list, so no record can be lost."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "camofox_protected_tabs"
+
+
+def _protected_tabs_on_disk() -> set[str] | None:
+    """Persist tab quarantine across gateway restarts and processes; unreadable state
+    (``None``) forbids adoption."""
+    try:
+        path = _protected_tabs_path()
+        if not path.exists():
+            return set()
+        return {record.read_text(encoding="utf-8") for record in path.iterdir()
+                if not record.name.startswith(".")}
+    except (OSError, ValueError):
+        return None
+
+
+def _quarantine_protected_tab(tab_id: str) -> None:
+    import hashlib
+    from pathlib import Path
+    import tempfile
+    _protected_tab_ids.add(tab_id)
+    path = _protected_tabs_path()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    record = path / hashlib.sha256(tab_id.encode("utf-8")).hexdigest()
+    fd, temp = tempfile.mkstemp(prefix=".camofox-protected-", dir=str(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(tab_id)
+        os.chmod(temp, 0o600)
+        os.replace(temp, record)
+    finally:
+        Path(temp).unlink(missing_ok=True)
+
+
+def quarantine_current_protected_tab(task_id: str) -> None:
+    """Durably mark the tab before a protected fill can write into it, and detach every
+    other task bound to it: their protection state is empty, so they must not read it."""
+    with _sessions_lock:
+        session = _sessions.get(task_id)
+        if not session or not session.get("tab_id"):
+            raise OSError("protected Camofox tab is unavailable")
+        tab_id = session["tab_id"]
+        _quarantine_protected_tab(tab_id)
+        _protected_tab_owners[tab_id] = task_id
+        for other_task, other in _sessions.items():
+            if other_task != task_id and other.get("tab_id") == tab_id:
+                other["tab_id"] = None
+
+
+def _release_protected_tab_binding(task_id: str, session: Dict[str, Any]) -> None:
+    """Drop a binding to a protected tab this task does not own (caller holds the lock).
+
+    Consults the persistent quarantine too: another Hermes process (CLI beside the
+    gateway) may have filled the tab, and this process holds no protection for it.
+    Unreadable quarantine state fails closed for every non-owner."""
+    tab_id = session.get("tab_id")
+    if not tab_id or _protected_tab_owners.get(tab_id) == task_id:
+        return
+    quarantined = _protected_tabs_on_disk()
+    if quarantined is None or tab_id in (_protected_tab_ids | quarantined):
+        session["tab_id"] = None
+
 
 
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -304,7 +379,11 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         logger.debug("Camofox tab adoption failed for %s: %s", session.get("user_id"), exc)
         return session
+    quarantined = _protected_tabs_on_disk()
+    if quarantined is None:
+        return session  # fail closed if persistent quarantine cannot be read
     dict_tabs = [tab for tab in tabs if isinstance(tab, dict)] if isinstance(tabs, list) else []
+    dict_tabs = [tab for tab in dict_tabs if tab.get("tabId") not in (_protected_tab_ids | quarantined)]
     candidates = [tab for tab in dict_tabs if tab.get("listItemId") == session.get("session_key")] or dict_tabs
     tab_id = candidates[-1].get("tabId") if candidates else None
     if isinstance(tab_id, str) and tab_id:
@@ -352,6 +431,7 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
                 # A read-only preflight may have created an empty local session. Bind it now.
                 _sessions.pop(task_id, None)
             else:
+                _release_protected_tab_binding(task_id, session)
                 return _adopt_existing_tab(session)
         camofox_cfg = _get_camofox_config()
         identity = get_camofox_account_identity(account, task_id) if account is not None else None
@@ -365,7 +445,7 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
         else:
             managed, adopt = True, _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
         session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
-                   "managed": managed, "adopt_existing_tab": adopt, "account": account}
+                   "task_id": task_id or "default", "managed": managed, "adopt_existing_tab": adopt, "account": account}
         _sessions[task_id] = session
         return _adopt_existing_tab(session)
 
@@ -387,9 +467,17 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Opti
 
 
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Remove and return session info."""
+    """Remove session; quarantine a protected managed tab before dropping its scope."""
+    from agent.redact import clear_vault_date_components, has_vault_date_components
+    key = task_id or "default"
     with _sessions_lock:
-        return _sessions.pop(task_id or "default", None)
+        session = _sessions.pop(key, None)
+        if session and session.get("tab_id") and has_vault_date_components(key):
+            _quarantine_protected_tab(session["tab_id"])
+        for tab_id in [t for t, owner in _protected_tab_owners.items() if owner == key]:
+            del _protected_tab_owners[tab_id]
+    clear_vault_date_components(key)
+    return session
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
@@ -470,7 +558,14 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
     from tools.browser_tool_snapshot import _truncate_snapshot
     from tools.browser_tool import get_browser_snapshot_threshold
     data = _snapshot_data(session)
-    snapshot, threshold = data.get("snapshot", ""), get_browser_snapshot_threshold()
+    from agent.redact import has_vault_date_components, redact_registered_vault_snapshot
+    task = session.get("task_id", "default")
+    origin = ""
+    if has_vault_date_components(task):
+        from tools.browser_vault_tool import _current_page_origin
+        origin = _current_page_origin(task) or ""
+    snapshot = redact_registered_vault_snapshot(data.get("snapshot", ""), tab=task, origin=origin)
+    threshold = get_browser_snapshot_threshold()
     if len(snapshot) > threshold:
         snapshot = _truncate_snapshot(snapshot, max_chars=threshold)
     return snapshot, data.get("refsCount", 0)
@@ -515,9 +610,22 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
         tab_id = data.get("tabId")
         if data.get("ok") is not True or not isinstance(tab_id, str) or not tab_id:
             return tool_error("Camofox did not return a shared tab; the task's tab was not changed", success=False)
-        session["tab_id"] = tab_id
+        # Handoff shows the page to the user, but a quarantined protected tab (from an
+        # earlier task or before a restart) must never become this task's model-readable
+        # tab: its protection state is gone, so reads and screenshots would expose it.
+        # Only the task that still holds that tab's live protection may keep it.
+        quarantined = _protected_tabs_on_disk()
+        is_protected = quarantined is None or tab_id in (_protected_tab_ids | quarantined)
+        from agent.redact import has_vault_date_components
+        owns_protection = (_protected_tab_owners.get(tab_id) == (task_id or "default")
+                           and has_vault_date_components(task_id or "default"))
+        session["tab_id"] = tab_id if not is_protected or owns_protection else None
         result = {"success": True, "account": session["account"], "focused": bool(data.get("focused")),
                   "tabId": tab_id}
+        if session["tab_id"] is None:
+            result["modelDetached"] = True
+            result["note"] = ("Shown to the user only: this tab holds protected data from an earlier "
+                              "session. Navigate to open a fresh tab for further browser work.")
         if prior_tab_id and prior_tab_id != tab_id:
             result["replacedTab"] = True
         if isinstance(data.get("restarted"), bool):
@@ -746,6 +854,10 @@ def _save_screenshot(content: bytes) -> str:
 def camofox_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> str:
     """Take a screenshot and analyze it with vision AI via Camofox."""
     def body(session):
+        from tools.browser_tool_vision import blocked_protected_date_pixels
+        blocked = blocked_protected_date_pixels(task_id or "default")
+        if blocked is not None:
+            return blocked
         resp = _get_raw(_tab_path(session, "screenshot"), params=_user_params(session))
         screenshot_path = _save_screenshot(resp.content)
         img_b64 = base64.b64encode(resp.content).decode("utf-8")

@@ -18,6 +18,7 @@ one named Camofox browser account.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -325,7 +326,7 @@ class OnePasswordLoginBackend(LoginBackend):
                         meta = self._connect_meta(item, vault_id)
                         if meta:
                             out.append(meta)
-            return out
+            return out + self.list_protected_fields()
         raw = json.loads((self._list_json_fresh() if fresh else self._item_list_json()) or "[]")
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
@@ -345,9 +346,31 @@ class OnePasswordLoginBackend(LoginBackend):
                 origin=origins[0], created_at=str(item.get("created_at") or ""),
                 identifier_type="username" if username else None, identifier=username,
                 allowed_origins=_web_origins(origins)))
+        return out + self.list_protected_fields()
+
+    def list_protected_fields(self) -> List[VaultItemMeta]:
+        """Configured origin-bound fields as opaque model-facing handles."""
+        # Connect cannot resolve arbitrary ``op://`` secret references. Do not
+        # advertise handles whose values this backend cannot consume.
+        if self._connect_credentials()[1]:
+            return []
+        configured = self.cfg.get("protected_fields") or []
+        out: List[VaultItemMeta] = []
+        for entry in configured if isinstance(configured, list) else []:
+            normalized = _normalize_protected_field_entry(entry)
+            if normalized is None:
+                continue
+            reference, semantic, value_type, label, origins = normalized
+            out.append(VaultItemMeta(
+                id=_protected_field_handle(self.prefix, reference, semantic, value_type, origins),
+                kind="protected_field", label=label, origin=origins[0], created_at="",
+                allowed_origins=tuple(origins), field_token=semantic,
+            ))
         return out
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
+        if handle.startswith(f"{self.prefix}field:"):
+            return next((m for m in self.list_protected_fields() if m.id == handle), None)
         if self._connect_credentials()[1]:
             item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
             return self._connect_meta(item, item["vault"]["id"])
@@ -413,7 +436,21 @@ class OnePasswordLoginBackend(LoginBackend):
         return code if code.isdigit() else None
 
     def resolve_secret(self, handle: str) -> Dict[str, str]:
-        """Full payload for a Credit Card item (PAYMENT_FIELDS shape); logins keep the password-only shape."""
+        """Full payload for a Credit Card item or configured protected field."""
+        if handle.startswith(f"{self.prefix}field:"):
+            if self._connect_credentials()[1]:
+                raise RuntimeError("Configured protected fields require 1Password CLI authentication")
+            configured = self.cfg.get("protected_fields") or []
+            for entry in configured if isinstance(configured, list) else []:
+                normalized = _normalize_protected_field_entry(entry)
+                if normalized is None:
+                    continue
+                reference, semantic, value_type, _label, origins = normalized
+                if _protected_field_handle(self.prefix, reference, semantic, value_type, origins) != handle:
+                    continue
+                value = self._run("read", "--", reference).rstrip("\r\n")
+                return {"value": _normalize_protected_date(value)}
+            raise RuntimeError("Configured protected field is missing")
         if self._connect_credentials()[1]:
             item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
             if item.get("category") != "CREDIT_CARD":
@@ -429,6 +466,71 @@ class OnePasswordLoginBackend(LoginBackend):
         if not all(secret.get(k) for k in ("card_number", "exp_month", "exp_year", "cvc")):
             raise RuntimeError("1Password card is missing its number, expiry, or verification number")
         return secret
+
+
+def _normalize_protected_field_entry(entry):
+    from urllib.parse import urlsplit
+
+    if not isinstance(entry, dict):
+        return None
+    reference = str(entry.get("reference") or "").strip()
+    semantic = str(entry.get("semantic") or "").strip()
+    value_type = str(entry.get("value_type") or "").strip()
+    label = str(entry.get("label") or "").strip()
+    raw_origins = entry.get("origins") or []
+    try:
+        parsed_reference = urlsplit(reference)
+    except ValueError:
+        return None
+    reference_parts = [part for part in parsed_reference.path.split("/") if part]
+    if (parsed_reference.scheme != "op" or not parsed_reference.netloc or len(reference_parts) < 2
+            or parsed_reference.username or parsed_reference.password or parsed_reference.query
+            or parsed_reference.fragment or semantic != "bday" or value_type != "date"
+            or not label or not isinstance(raw_origins, list)):
+        return None
+    origins: List[str] = []
+    for raw in raw_origins:
+        try:
+            origin = normalize_origin(str(raw))
+        except Exception:
+            continue
+        if not origin.startswith("https://") or origin in origins:
+            continue
+        origins.append(origin)
+    return (reference, semantic, value_type, label, origins) if origins else None
+
+
+def _protected_field_handle(prefix: str, reference: str, semantic: str, value_type: str,
+                            origins: List[str]) -> str:
+    """Account-scoped handle (``op:field:`` / ``op@<alias>:field:``) so routing by
+    prefix reaches the backend, and account binding, that advertised it."""
+    digest = hashlib.sha256(
+        json.dumps([reference, semantic, value_type, origins], separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+    return f"{prefix}field:{digest}"
+
+
+def _normalize_protected_date(value: str) -> str:
+    """Normalize 1Password DATE output to ``YYYY-MM-DD`` without disclosure."""
+    from datetime import datetime, timezone
+    value = (value or "").strip()
+    if len(value) == 10 and value[4] == "-" and value[7] == "-":
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return value
+        except ValueError:
+            pass
+    # Eight digits can be either YYYYMMDD or an early Unix timestamp. Neither
+    # interpretation is safe without source-type metadata, so fail closed.
+    digits = value.lstrip("-")
+    if digits.isdigit() and digits and len(digits) != 8 and value.count("-") <= 1:
+        try:
+            result = datetime.fromtimestamp(int(value), tz=timezone.utc).date().isoformat()
+            if 1900 <= int(result[:4]) <= datetime.now(timezone.utc).year:
+                return result
+        except (OverflowError, OSError, ValueError):
+            pass
+    raise RuntimeError("Configured protected date has an unsupported format")
 
 
 def _card_last4(masked: str) -> Optional[str]:

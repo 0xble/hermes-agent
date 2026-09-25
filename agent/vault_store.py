@@ -171,6 +171,9 @@ class VaultItemMeta:
     # ``origin`` is the first/primary one). Fill matching stays exact-origin against
     # this list — no wildcard or subdomain inference is ever derived from it.
     allowed_origins: tuple = ()
+    # Nonsecret semantic token for a configured model-blind protected field.
+    # The resolved value never enters metadata.
+    field_token: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -187,6 +190,8 @@ class VaultItemMeta:
             out["has_otp"] = True
         if len(self.allowed_origins) > 1:
             out["allowed_origins"] = list(self.allowed_origins)
+        if self.field_token is not None:
+            out["field_token"] = self.field_token
         return out
 
 
