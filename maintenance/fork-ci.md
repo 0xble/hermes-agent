@@ -2,12 +2,23 @@
 
 ## Required behavior
 
-`bin/ci` owns contributor setup and the complete source gate. Its Python lane
-runs the canonical `tests` tree through the isolated `scripts/run_tests.sh`
-harness. Profile-owned plugins are tested from their canonical source repository,
-not from this Hermes application checkout. A selected lane is partial evidence. The gate
-does not use changed-file classification or substitute a smoke manifest for
-complete discovery.
+The current CI interface is owned by [repository-ci-contract.md](repository-ci-contract.md);
+this unit keeps the reliability rules that every profile must still satisfy. Two profiles
+carry different evidence and must not be confused:
+
+- **PR gate** (`./bin/ci gate <sha>`, run by `.github/workflows/gate.yml`, aggregated as the
+  required `qualification` check): static policies, the focused Python files listed in
+  `GATE_PYTHON_FILES` in `scripts/ci/portable.py`, and the bounded Node checks. It is
+  deliberately partial. A gate pass is not complete-suite evidence.
+- **Complete profile** (`./bin/ci nightly <sha>`, `.github/workflows/nightly.yml`, and the
+  local `./bin/ci full`): the canonical `tests` tree through the isolated
+  `scripts/run_tests.sh` harness plus all nine nonrelease Node checks, E2E, docs, Rust and
+  container lint. Claims of complete coverage need this profile, not the gate.
+
+Profile-owned plugins are tested from their canonical source repository, not from this
+Hermes application checkout. A selected lane (`check --lane`) is partial evidence. No
+profile uses changed-file classification, and the complete profile never substitutes a
+smoke manifest for complete discovery.
 
 Portable Python execution passes `--file-retries 0`, including E2E and native OS
 qualification. A fail-once test stays failed at the gate entrypoint. Interactive
@@ -16,14 +27,16 @@ both outcomes with a real pytest file and a persistent attempt counter.
 
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
-need no personal tooling or publisher credentials. The standalone runner binds
-results to the selected candidate, owns cancellation and timeouts, and publishes
-the existing required `local-ci/full` check for ordinary GitHub merges.
+need no personal tooling or publisher credentials. Both exact-SHA profiles bind
+results to the selected candidate and fail closed on cancellation or timeout.
 
-All nine nonrelease Node checks remain. As in PR #50, the source gate excludes
-signed desktop packaging, whose stamp requires release context. Packaging still
-belongs to release qualification. Unknown skip labels and invalid concurrency
+As in PR #50, no profile runs signed desktop packaging, whose stamp requires release
+context; it belongs to release qualification. Unknown skip labels and invalid concurrency
 must fail rather than narrow coverage silently.
+
+Historical: before the gate/nightly split, a standalone runner published a required
+`local-ci/full` check that ran the complete profile on every PR, including all nine Node
+checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
