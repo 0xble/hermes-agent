@@ -247,6 +247,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_album_fallback_route_reports_the_platform_penalty`,
   `test_animation_only_album_reports_the_platform_penalty`).
 
+## Update notice held or mislabelled at completion
+
+- Fork patch identity: `update-lifecycle`.
+- `_watch_update_progress()` left a whitespace-only unread output suffix in its buffer (the flush
+  sends only non-blank text) while the completion branch waited for an empty buffer, so a trailing
+  newline after the last flush held the final notice until the 30-minute deadline. Blank output is
+  now consumed and checkpointed without sending. `_update_result_heading()` also labelled every
+  same-SHA run "Already Latest … the gateway was not restarted", including checkout repair or fleet
+  catch-up runs that did restart and verify the gateway; it now uses `final_outcome()`'s no-op rule
+  (same revision, no restart, no fleet) and reports a verified same-revision restart as complete.
+- Guard: `tests/gateway/test_update_lifecycle_notifications.py`
+  (`test_whitespace_only_trailing_output_does_not_hold_the_final_notice`) and
+  `tests/gateway/test_update_result_heading.py`
+  (`test_same_revision_with_verified_restart_is_not_reported_as_noop`).
+
 ## Hindsight config parsing and failed append retains
 
 - Fork patch identity: `hindsight-session-lifecycle`.

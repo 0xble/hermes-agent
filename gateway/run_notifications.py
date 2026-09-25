@@ -601,10 +601,18 @@ class GatewayNotificationsMixin:
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             pre_sha = str((receipt.get("pre_update") or {}).get("sha") or "")
             post_sha = str((receipt.get("post_update") or {}).get("sha") or "")
-            if pre_sha and post_sha and pre_sha == post_sha:
+            same_revision = bool(pre_sha and post_sha and pre_sha == post_sha)
+            # Same classification as ``final_outcome``: a same-SHA run that restarted the
+            # gateway or verified a fleet (checkout repair, fleet catch-up) is not a no-op.
+            if same_revision and not receipt.get("gateway_restart") and not receipt.get("fleet"):
                 return "ℹ️ Already Latest", (
                     f"Hermes is already running revision {post_sha[:12]}. "
                     "No changes were applied, and the gateway was not restarted."
+                )
+            if same_revision:
+                return "✅ Update Complete", (
+                    f"Hermes stayed on revision {post_sha[:12]}; the gateway was restarted "
+                    "and the running revision was verified."
                 )
             if post_sha:
                 return "✅ Update Complete", f"Hermes updated successfully to revision {post_sha[:12]}."
@@ -685,16 +693,25 @@ class GatewayNotificationsMixin:
         last_stream_time = loop.time()
         buffer = ""
 
+        def _checkpoint_output() -> None:
+            current = read_pending(paths.pending.parent)
+            if current:
+                marker, pending = current
+                pending["output_offset"] = bytes_sent
+                save_pending(marker, pending)
+
         async def _flush_buffer() -> None:
             nonlocal buffer, last_stream_time
+            if buffer and not buffer.strip():
+                # Whitespace-only output (a trailing newline after the last flush) has nothing
+                # to show; consume it so the final notice is not held until the deadline.
+                buffer = ""
+                _checkpoint_output()
+                return
             if buffer.strip() and await self._send_update_output(target, buffer):
                 buffer = ""
                 last_stream_time = loop.time()
-                current = read_pending(paths.pending.parent)
-                if current:
-                    marker, pending = current
-                    pending["output_offset"] = bytes_sent
-                    save_pending(marker, pending)
+                _checkpoint_output()
 
         def _read_new_output() -> None:
             nonlocal buffer, bytes_sent
