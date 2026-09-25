@@ -75,6 +75,11 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
             return None
         fleet = receipt.get("fleet")
         expected = (receipt.get("post_update") or {}).get("sha")
+        previous = (receipt.get("pre_update") or {}).get("sha")
+        if expected and previous == expected and not restart and not fleet:
+            # "Already up to date": no code changed and nothing was restarted, so there is no
+            # runtime to verify. The caller labels this result "Already Latest".
+            return True, f"Hermes is already at revision {expected[:12]}."
         if not expected or not isinstance(fleet, list) or not fleet:
             return False, "The updater finalized without verified runtime evidence. Runtime state is unknown."
         if any(not isinstance(row, dict) or row.get("state") != "current" or row.get("code_sha") != expected for row in fleet):

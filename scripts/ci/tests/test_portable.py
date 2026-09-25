@@ -15,7 +15,91 @@ ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
 
 
+def clean_git_env():
+    """Keep temporary repositories independent of hook and personal Git state."""
+    return ci.git_environment(root=None)
+
+
 class PortableGateTests(unittest.TestCase):
+    def test_container_jobs_install_git_and_configure_safe_directory_before_checkout(self):
+        import yaml
+
+        workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
+        for workflow_name in ('gate.yml', 'nightly.yml'):
+            with self.subTest(workflow=workflow_name):
+                document = yaml.safe_load((workflows / workflow_name).read_text(encoding='utf-8'))
+                for job_name, job in document['jobs'].items():
+                    if 'container' not in job:
+                        continue
+                    steps = job['steps']
+                    checkout_index = next(
+                        index for index, step in enumerate(steps)
+                        if str(step.get('uses', '')).startswith('actions/checkout@')
+                    )
+                    preceding = steps[:checkout_index]
+                    self.assertTrue(
+                        any(
+                            'apt-get install' in step.get('run', '')
+                            and 'git' in step.get('run', '')
+                            and 'ca-certificates' in step.get('run', '')
+                            for step in preceding
+                        ),
+                        f'{workflow_name}:{job_name} must install git and ca-certificates before checkout',
+                    )
+                    self.assertTrue(
+                        any(
+                            'git config --global --add safe.directory "$GITHUB_WORKSPACE"' in step.get('run', '')
+                            for step in preceding
+                        ),
+                        f'{workflow_name}:{job_name} must configure Git safe.directory before checkout',
+                    )
+
+    def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = clean_git_env()
+            subprocess.run(['git', 'init', '-q', str(root)], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'ci@example.invalid'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'CI'], env=env, check=True)
+            tracked = root / 'tracked.txt'
+            tracked.write_text('original', encoding='utf-8')
+            subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], env=env, check=True)
+            with patch.object(ci, 'ROOT', root):
+                sha = ci.git('rev-parse', 'HEAD').strip()
+                ci.assert_exact_checkout(sha)
+                with self.assertRaisesRegex(RuntimeError, 'full lowercase'):
+                    ci.assert_exact_checkout('bad')
+                with self.assertRaisesRegex(RuntimeError, 'SHA mismatch'):
+                    ci.assert_exact_checkout('0' * 40 if sha != '0' * 40 else '1' * 40)
+                tracked.write_text('changed during checks', encoding='utf-8')
+                with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
+                    ci.assert_exact_checkout(sha)
+                subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], env=env, check=True)
+                with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
+                    ci.assert_exact_checkout(sha)
+
+    def test_preflight_fixture_cannot_mutate_inherited_git_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sentinel = Path(directory) / 'sentinel'
+            sentinel.mkdir()
+            env = clean_git_env()
+            subprocess.run(['git', 'init', '-q', str(sentinel)], env=env, check=True)
+            subprocess.run(['git', '-C', str(sentinel), '-c', 'user.name=Sentinel',
+                            '-c', 'user.email=sentinel@example.invalid', 'commit',
+                            '--allow-empty', '-qm', 'sentinel'], env=env, check=True)
+            git_dir = sentinel / '.git'
+            before = {name: (git_dir / name).read_bytes() for name in ('HEAD', 'index', 'config') if (git_dir / name).exists()}
+            poisoned = dict(env, GIT_DIR=str(git_dir), GIT_PREFIX='sub/')
+            result = subprocess.run(
+                [sys.executable, '-m', 'unittest',
+                 'scripts.ci.tests.test_portable.PortableGateTests.test_exact_checkout_rejects_malformed_wrong_and_mutated_sha'],
+                cwd=ci.ROOT, env=poisoned, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            after = {name: (git_dir / name).read_bytes() for name in ('HEAD', 'index', 'config') if (git_dir / name).exists()}
+            self.assertEqual(after, before, 'preflight fixture modified the inherited repository')
+
     def test_failures_do_not_hide_later_results(self):
         seen = []
 
@@ -46,13 +130,23 @@ class PortableGateTests(unittest.TestCase):
             self.assertEqual(env['HOME'], str(state / 'isolated'))
             self.assertEqual(env['CARGO_HOME'], str(state / 'cargo'))
             self.assertEqual(env['UV_PROJECT_ENVIRONMENT'], str(ci.ROOT / '.venv'))
+            config = Path(env['GIT_CONFIG_GLOBAL'])
+            self.assertEqual(config, (state / 'isolated' / 'gitconfig').resolve())
+            self.assertEqual(config.read_text(encoding='utf-8'),
+                             f'[safe]\n\tdirectory = {ci.ROOT.resolve().as_posix()}\n')
+            self.assertEqual(env['GIT_CONFIG_NOSYSTEM'], '1')
+            directories = subprocess.check_output(
+                ['git', 'config', '--global', '--get-all', 'safe.directory'],
+                env=env, text=True,
+            ).splitlines()
+            self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
 
     def test_external_fixture_has_no_git_or_node_dependency_ancestry(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             checkout = base / 'checkout'
             checkout.mkdir()
-            subprocess.run(['git', 'init', '-q', str(checkout)], check=True)
+            subprocess.run(['git', 'init', '-q', str(checkout)], env=clean_git_env(), check=True)
             package = checkout / 'node_modules/ci-ancestry-probe'
             package.mkdir(parents=True)
             (package / 'index.js').write_text('module.exports = true', encoding='utf-8')
@@ -67,9 +161,10 @@ try {
   if (error.code !== 'MODULE_NOT_FOUND') throw error;
 }
 """
-            env = {k: v for k, v in os.environ.items() if not k.startswith(('GIT_', 'NODE_'))}
+            env = clean_git_env()
             old_git = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=contaminated, env=env, capture_output=True)
-            old_node = subprocess.run(['node', '-e', script], cwd=contaminated, env=env, capture_output=True)
+            old_node = subprocess.run(['node', '-e', script], cwd=contaminated,
+                                      env={k: v for k, v in env.items() if not k.startswith('NODE_')}, capture_output=True)
             self.assertEqual(old_git.returncode, 0)
             self.assertEqual(old_node.returncode, 5)
             with ci.external_temporary_directory('home-', parent=base) as home:
@@ -119,7 +214,7 @@ try {
     def test_source_guard_detects_mutation_without_overwriting_user_work(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            subprocess.run(['git', 'init', '-q', str(root)], env=clean_git_env(), check=True)
             source = root / 'source.txt'
             source.write_text('uncommitted user work', encoding='utf-8')
             with patch.object(ci, 'ROOT', root), patch.object(ci, 'source_files', return_value=['source.txt']):
@@ -136,6 +231,36 @@ try {
         with patch.object(ci.subprocess, 'check_output', return_value='v0.0.0\n'):
             with self.assertRaisesRegex(RuntimeError, 'require'):
                 ci.require_tools(('node',), {})
+
+    def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            toolchain = Path(directory) / 'toolchain'
+            stack.enter_context(patch.object(ci, 'TOOLCHAIN', toolchain))
+            commands = []
+
+            def install(argv, **kwargs):
+                commands.append(argv)
+                package = toolchain / 'node_modules' / 'npm' / 'package.json'
+                package.parent.mkdir(parents=True, exist_ok=True)
+                package.write_text('{"version": "%s"}' % ci.PINS['npm'], encoding='utf-8')
+
+            stack.enter_context(patch.object(ci, 'run', side_effect=install))
+            ci.provision_npm({})
+            ci.provision_npm({})
+            self.assertEqual(len(commands), 1)
+            self.assertIn(f"npm@{ci.PINS['npm']}", commands[0])
+            self.assertEqual(commands[0][commands[0].index('--prefix') + 1], str(toolchain))
+            with patch.dict(os.environ, {'PATH': '/host/bin'}, clear=True), patch.object(ci, 'STATE', Path(directory)):
+                path = ci.environment(Path(directory) / 'home')['PATH'].split(os.pathsep)
+            self.assertLess(path.index(str(toolchain / 'node_modules' / '.bin')), path.index('/host/bin'))
+            self.assertLess(path.index(str(toolchain / 'bin')), path.index('/host/bin'))
+            commands.clear()
+            stack.enter_context(patch.object(ci, 'rust_environment', side_effect=lambda env: env))
+            versions = iter(('ripgrep 99.0.0\n',))
+            stack.enter_context(patch.object(ci.subprocess, 'check_output', side_effect=lambda *a, **k: next(versions)))
+            ci.provision_rg({})
+            self.assertEqual(commands[-1][:2], ['cargo', 'install'])
+            self.assertIn(f"ripgrep@{ci.PINS['rg']}", commands[-1])
 
     def test_default_invocation_sets_up_and_runs_all_lanes_after_failure(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:

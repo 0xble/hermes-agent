@@ -98,6 +98,15 @@ class TestSurfaceSwitch:
         assert agent._cached_system_prompt == self._stored("desktop")
         agent._build_system_prompt.assert_not_called()
 
+    def test_prompt_left_by_gateway_hygiene_compaction_is_rebuilt(self):
+        """Hygiene compaction runs a memory-only agent whose rebuilt prompt lacks the skills
+        index and most tool guidance. A real turn must rebuild instead of adopting it as a
+        surface switch, or every later turn inherits the stripped prompt."""
+        agent = self._restore(stored="gateway_hygiene", current="telegram")
+        agent._build_system_prompt.assert_called_once()
+        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        agent._session_db.update_system_prompt.assert_called_once_with(agent.session_id, "BUILT_PROMPT")
+
     def test_switch_stages_the_new_surface_guidance(self):
         agent = self._restore(stored="desktop", current="tui")
         note = agent._surface_switch_note

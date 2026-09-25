@@ -1,0 +1,45 @@
+# Plugin-claimed subagent failure notices
+
+Load this unit when changing the user-facing "Subagent failed" notice
+(`gateway/run_turn_runner.py::_progress_subagent_notice`,
+`tools/delegate_tool_progress.py::_ChildProgressRelay._on_complete`) or the
+`subagent_failure_notice` plugin hook.
+
+## Required behavior
+
+- A child that ends `failed`, `error`, or `timeout` asks the
+  `subagent_failure_notice` hook once, before any user-facing notice. A plugin
+  that recovers the failure itself returns `{"action": "suppress"}`.
+- The first relay records the decision on the relayed event as
+  `failure_notice_claimed`. The gateway reuses it and asks the hook only for
+  events that bypassed the relay, so one failure never runs the hook twice.
+- Only presentation is suppressed. The child result, `subagent_stop`, and the
+  parent's consolidated result are unchanged. No plugin, any other answer, or
+  a hook error keeps the notice.
+
+## Why
+
+`review-candidate` retries a rate-limited reviewer on the next configured
+route from `subagent_stop`, which runs after core has already announced the
+failure. Each Fable 429 therefore told the user the review failed while the
+fallback reviewer was still working and usually approved.
+
+## Provenance
+
+Fork patch identity: `review-fallback-notice`.
+
+Upstream-owned code. No upstream issue or PR covered it when this patch landed.
+The consuming plugin is `review-candidate` in the `agents` repository.
+
+## Verification
+
+Run `scripts/run_tests.sh tests/gateway/test_subagent_failure_notice.py`.
+`TestClaimEvaluatedOncePerFailure` drives the real child relay into the gateway
+`TurnRunner` and asserts one hook call whose first decision holds on both
+surfaces.
+
+## Retirement and rollback
+
+Retire when upstream lets a plugin claim or defer a child failure notice. To
+roll back, revert the patch commits; `review-candidate` then only loses the
+suppression, not its fallback.

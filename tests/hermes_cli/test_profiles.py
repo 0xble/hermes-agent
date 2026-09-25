@@ -598,6 +598,49 @@ class TestDeleteProfile:
         pids = profiles._profile_bound_backend_pids("coder", profile_dir)
         assert pids == [101]
 
+    def test_backend_scan_skips_a_process_whose_attrs_raise_mid_scan(self, profile_env, monkeypatch):
+        """On macOS a process that exits mid-scan can raise SystemError (KERN_PROCARGS2) from its
+        cmdline read. That one row is skipped; the scan still finds the bound backend after it,
+        so ``profile delete`` never aborts on a racing exit."""
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        self_pid = os.getpid()
+
+        class RealLikeProc:
+            """No prefetched ``.info``: attrs are read per process, like psutil without an attrs list."""
+
+            def __init__(self, pid, cmdline, fail=False):
+                self.pid = pid
+                self._cmdline = cmdline
+                self._fail = fail
+
+            def as_dict(self, attrs):
+                if self._fail:
+                    raise SystemError("<built-in function proc_cmdline> returned a result with an exception set")
+                return {"pid": self.pid, "name": "python3", "username": "me", "cmdline": self._cmdline}
+
+            def parent(self):
+                return None
+
+            def username(self):
+                return "me"
+
+            def environ(self):
+                return {}
+
+        procs = [
+            RealLikeProc(201, [], fail=True),
+            RealLikeProc(202, ["python", "-m", "hermes_cli.main", "--profile", "coder", "serve"]),
+        ]
+        fake_psutil = types.SimpleNamespace(
+            process_iter=lambda attrs=None: iter(procs),
+            Process=lambda pid=None: RealLikeProc(self_pid, []),
+            NoSuchProcess=Exception, AccessDenied=Exception, ZombieProcess=Exception,
+        )
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        assert profiles._profile_bound_backend_pids("coder", profile_dir) == [202]
+
     def test_backend_scan_matches_shebang_exec_of_hermes_shim(self, profile_env, monkeypatch):
         """A `hermes` console-script shim spawned directly (e.g. Electron's
         findOnPath('hermes') resolution) reports argv[0] as the interpreter

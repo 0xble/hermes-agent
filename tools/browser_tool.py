@@ -462,6 +462,14 @@ atexit.register(_lifecycle._stop_browser_cleanup_thread)
 # ----------------------------------------------------------------------------
 BROWSER_TOOL_SCHEMAS = [
     {
+        "name": "browser_handoff",
+        "description": "Show a named account's browser window for a person. May restart that account's hidden Camofox browser as visible (page-only state such as half-filled forms can be lost; logins persist). Confirm no other work is using the account first, then call before the step whose page state matters, such as submitting a password when an OTP is likely. Use release=true when the user is done with the visible window to return the account to the background.",
+        "parameters": {"type": "object", "properties": {
+            "account": {"type": "string", "description": "Named Camofox account alias"},
+            "release": {"type": "boolean", "description": "Close the visible account window and return to headless-by-default when done.", "default": False},
+        }, "required": ["account"]},
+    },
+    {
         "name": "browser_navigate",
         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer a lightweight retrieval tool when one is available (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer an available text-extraction or terminal-fetch tool; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
         "parameters": {
@@ -477,7 +485,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate or browser_handoff first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -492,7 +500,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_click",
-        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate or browser_handoff and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -506,7 +514,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_type",
-        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate and browser_snapshot to be called first.",
+        "description": "Type text into an input field identified by its ref ID. Clears the field first, then types the new text. Requires browser_navigate or browser_handoff and browser_snapshot to be called first.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -726,6 +734,13 @@ def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> Non
             _merge_fallback_warning(response, snap_result)
     except Exception as e:
         logger.debug("Auto-snapshot after navigate failed: %s", e)
+
+
+def browser_handoff(account: str, task_id: Optional[str] = None, release: bool = False) -> str:
+    """Show or release this task's Camofox account window without navigating away."""
+    if not _is_camofox_mode():
+        return _dumps(_err("Visible account handoff requires the Camofox browser backend"))
+    return _camofox("camofox_handoff", account, task_id, release)
 
 
 def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
@@ -1101,24 +1116,30 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    import requests
+    from tools.browser_camofox import (_get_session, _post, _tab_error, _NO_SESSION_ERROR,
+                                      _STALE_TAB_ERROR)
     try:
-        tab_info = _ensure_tab(task_id or "default")
-        tab_id = tab_info.get("tab_id") or tab_info.get("id")
+        tab_info = _get_session(task_id or "default")
+        tab_id = tab_info.get("tab_id")
+        if not tab_id:
+            return tool_error(_NO_SESSION_ERROR, success=False)
         user_id = tab_info["user_id"]
-        resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
+        try:
+            resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
+        except requests.HTTPError as exc:
+            return _tab_error(tab_info, exc, endpoint="evaluate")
         parsed = _parse_eval_value(resp.get("result") if isinstance(resp, dict) else resp)
 
         if _eval_policy._eval_ssrf_guard_active(task_id or "default"):
-            _blocked_url = _eval_policy._camofox_current_page_private_url(tab_id, user_id)
+            _blocked_url = _eval_policy._camofox_current_page_private_url(tab_id, user_id, session=tab_info)
+            if not tab_info["tab_id"]:
+                return tool_error(_STALE_TAB_ERROR, success=False)
             if _blocked_url:
                 return _blocked_private_page_json(_blocked_url, _EVAL_NAVIGATED_WHY)
 
         return _dumps(_eval_ok_response(parsed), default=str)
     except Exception as e:
-        if any(code in str(e) for code in ("404", "405", "501")):  # server without eval support
-            return json.dumps(_err("JavaScript evaluation is not supported by this Camofox server. "
-                                   "Use browser_snapshot or browser_vision to inspect page state."))
         return tool_error(str(e), success=False)
 
 
@@ -1281,6 +1302,17 @@ from tools.browser_extension_router import extension_controller_available, route
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
+def _camofox_handoff_schema_override() -> Dict[str, Any]:
+    from tools.browser_camofox_state import get_camofox_account_aliases
+    return {"parameters": {"type": "object", "properties": {"account": {
+        "type": "string", "enum": list(get_camofox_account_aliases()),
+        "description": "Allowed account alias to bind to this task; cannot switch after binding.",
+    }, "release": {
+        "type": "boolean", "description": "Close the visible window and return the account to headless-by-default.",
+        "default": False,
+    }}, "required": ["account"]}}
+
+
 def _camofox_account_schema_override() -> Dict[str, Any]:
     """Advertise account selection only when Camofox is the active backend."""
     if not _is_camofox_mode():
@@ -1353,6 +1385,12 @@ def _routed_handler(name: str, fallback):
                                       task_id=kw.get("task_id"), session_id=kw.get("session_id"))
     return handler
 
+
+registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_handoff"],
+                  handler=lambda args, **kw: browser_handoff(args.get("account", ""), task_id=kw.get("task_id"),
+                                                               release=args.get("release") is True),
+                  check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
+                  emoji="🌐")
 
 for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
     if _check_fn is None:  # also binds the legacy check_browser_<x>_requirements globals (tests + callers)

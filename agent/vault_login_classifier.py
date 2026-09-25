@@ -73,6 +73,14 @@ class LoginControl:
     name: str
     type: str
     max_length: Optional[int] = None
+    empty: bool = False
+    width: float = 0
+    height: float = 0
+    container_index: Optional[int] = None
+    container_input_count: int = 0
+    container_has_password: bool = False
+    nearby_text: str = ""
+    context_truncated: bool = False
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "LoginControl":
@@ -86,6 +94,14 @@ class LoginControl:
             name=str(raw.get("name") or ""),
             type=str(raw.get("type") or ""),
             max_length=int(max_length) if max_length is not None else None,
+            empty=raw.get("empty") is True,
+            width=float(raw.get("width") or 0),
+            height=float(raw.get("height") or 0),
+            container_index=raw.get("containerIndex"),
+            container_input_count=int(raw.get("containerInputCount") or 0),
+            container_has_password=raw.get("containerHasPassword") is True,
+            nearby_text=str(raw.get("nearbyText") or "")[:300],
+            context_truncated=raw.get("contextTruncated") is True,
         )
 
 
@@ -136,6 +152,43 @@ _RE_OTP = re.compile(
 )
 
 
+_RE_OTP_CONTEXT = re.compile(
+    r"\b(?:verification|security\s+code|one\s+time\s+code|2fa|mfa|authenticator|"
+    r"two\s+factor|codigo\s+de\s+verificacion|code\s+de\s+verification|sicherheitscode)\b"
+)
+_RE_NOT_OTP_CONTEXT = re.compile(
+    r"\b(?:card|cc|cvv|cvc|csc|expir\w*|mm\s*yy|billing|phone|mobile|telephone|"
+    r"date|day|month|year|address|zip|postal|coupon|promo|voucher|gift)\b"
+)
+
+
+def _anonymous_otp_group(controls: List[LoginControl], code_length: Optional[int] = None) -> bool:
+    """Require a complete, compact anonymous widget; never infer OTP from box count alone."""
+    if not 4 <= len(controls) <= 8 or (code_length is not None and len(controls) != code_length):
+        return False
+    boxes = sorted(controls, key=lambda c: c.index)
+    first = boxes[0]
+    if (first.container_index is None or first.container_input_count != len(boxes)
+            or first.container_has_password or first.context_truncated
+            or first.width < 16 or first.height < 16
+            or first.width > 100 or first.height > 100):
+        return False
+    context = _normalize_text(first.nearby_text)
+    if not _RE_OTP_CONTEXT.search(context) or _RE_NOT_OTP_CONTEXT.search(context):
+        return False
+    return all(
+        c.type == first.type and c.type in ("text", "tel", "number")
+        and c.empty and not c.name.strip() and not c.label.strip() and not c.autocomplete.strip()
+        and c.container_index == first.container_index and c.form_index == first.form_index
+        and c.container_input_count == len(boxes) and not c.container_has_password
+        and not c.context_truncated
+        and abs(c.width - first.width) <= 2 and abs(c.height - first.height) <= 2
+        and _normalize_text(c.nearby_text) == context
+        and (i == 0 or c.index == boxes[i - 1].index + 1)
+        for i, c in enumerate(boxes)
+    )
+
+
 def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginControl]:
     """The controls that take a second-factor code. ``autocomplete=one-time-code`` is authoritative;
     otherwise a text/tel/number input whose name/label says code/OTP/2FA/verification. Some sites split
@@ -151,7 +204,17 @@ def classify_otp_controls(controls: List[LoginControl]) -> List[ClassifiedLoginC
             continue
         if _RE_OTP.search(_normalize_text(" ".join(p for p in (c.name, c.label) if p))):
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
-    return out
+    if out:
+        return out
+    groups: Dict[int, List[LoginControl]] = {}
+    for c in controls:
+        if c.container_index is not None:
+            groups.setdefault(c.container_index, []).append(c)
+    matched = [g for g in groups.values() if _anonymous_otp_group(g)]
+    # Ambiguous page: never choose between two similarly shaped widgets.
+    if len(matched) == 1:
+        return [ClassifiedLoginControl(c, 55, "anonymous-one-time-code") for c in matched[0]]
+    return []
 
 
 def select_password_fill(
@@ -234,6 +297,14 @@ def build_otp_fills(otp_controls: List[ClassifiedLoginControl], code: str) -> Li
     ``maxlength=1``, all in the same form, and adjacent in DOM order (the classic N-box widget). Anything
     looser (several code-like inputs scattered over a page) gets ONE field, never a digit sprayed across
     unrelated inputs."""
+    if not otp_controls:
+        return []
+    if any(c.token == "anonymous-one-time-code" for c in otp_controls):
+        boxes = [c.control for c in otp_controls]
+        if not all(c.token == "anonymous-one-time-code" for c in otp_controls) or not _anonymous_otp_group(boxes, len(code)):
+            return []
+        return [{"index": c.index, "token": "one-time-code", "value": ch}
+                for c, ch in zip(sorted(boxes, key=lambda c: c.index), code)]
     best = max(otp_controls, key=lambda c: c.score)
     boxes = sorted((c for c in otp_controls if c.control.max_length == 1), key=lambda c: c.control.index)
     if (len(boxes) == len(code)
@@ -274,6 +345,27 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
   __QUERY_ALL__
   const elements = queryAll("input, select");
   const forms = queryAll("form");
+  const containerIds = new WeakMap();
+  let nextContainerId = 0;
+  const containerFor = (element) => {
+    // A tight ancestor, not merely the page's form: never combine distant fields.
+    let parent = element.parentElement;
+    for (let depth = 0; parent && depth < 4; parent = parent.parentElement, depth++) {
+      const count = parent.querySelectorAll("input").length;
+      if (count >= 4 && count <= 8) return parent;
+    }
+    return null;
+  };
+  const contextFor = (container) => {
+    if (!container) return { text: "", truncated: false };
+    let heading = "";
+    for (let node = container, depth = 0; node && depth < 7; node = node.parentElement, depth++) {
+      const h = node.querySelector("h1, h2, h3, h4, [role=heading]");
+      if (h) { heading = h.textContent || ""; break; }
+    }
+    const raw = [heading, container.parentElement && container.parentElement.textContent || ""].join(" ").replace(/\\s+/g, " ").trim();
+    return { text: raw.slice(0, 300), truncated: raw.length > 300 };
+  };
   elements.forEach((element, index) => element.setAttribute("data-hermes-vault-slot", nonce + ":" + index));
   const out = elements.flatMap((element, index) => {
     if (element.matches(":disabled") || element.readOnly) return [];
@@ -286,10 +378,22 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
       .map((id) => { const n = element.getRootNode().getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
+    const container = containerFor(element);
+    if (container && !containerIds.has(container)) containerIds.set(container, nextContainerId++);
+    const context = contextFor(container);
+    const rect = element.getBoundingClientRect();
     return [{
       autocomplete: element.getAttribute("autocomplete") || "",
       formIndex: resolvedFormIndex >= 0 ? resolvedFormIndex : null,
       index,
+      empty: element.value === "",
+      width: Math.round(rect.width * 10) / 10,
+      height: Math.round(rect.height * 10) / 10,
+      containerIndex: container ? containerIds.get(container) : null,
+      containerInputCount: container ? container.querySelectorAll("input").length : 0,
+      containerHasPassword: !!container && !!container.querySelector('input[type="password"]'),
+      nearbyText: context.text,
+      contextTruncated: context.truncated,
       maxLength: element.maxLength > 0 ? element.maxLength : null,
       label: [
         ...labels,

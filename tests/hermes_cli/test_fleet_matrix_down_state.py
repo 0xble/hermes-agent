@@ -36,6 +36,9 @@ def _verify_self_as_gateway(monkeypatch):
     pid from it only when the home's identity resolver verifies that pid as the gateway
     (#110420). The live-pid tests write the record about pytest itself, so verify it."""
     monkeypatch.setattr("gateway.status.live_gateway_pid_for_home", lambda h: os.getpid())
+    # pytest is the "gateway" here, so its code root is wherever this venv lives: a worktree sharing
+    # another checkout's venv would classify the row ``external``. Pin it to the updater's checkout.
+    monkeypatch.setattr(ur, "_gateway_code_root", lambda pid, home: ur._updater_code_root())
 
 
 _DEAD_PID = 999999899  # never a live pid

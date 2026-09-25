@@ -3749,9 +3749,11 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        # A live stream that would run ~6s; the 0.5s total timeout must cut it off well before it finishes.
+        # Wall-clock bound kept >= 2s for loaded runners (AGENTS.md timing rule) and still far under 6s.
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
+                for _ in range(200):
                     time.sleep(0.03)
                     yield SimpleNamespace(type="response.in_progress")
 
@@ -3768,10 +3770,10 @@ class TestCodexAuxiliaryAdapterTimeout:
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
-                timeout=0.05,
+                timeout=0.5,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert time.monotonic() - started < 2.5
 
     def test_no_progress_timeout_kwarg_overrides_default_window(self):
         """#108104: an explicit ``no_progress_timeout`` kwarg (the task-scoped

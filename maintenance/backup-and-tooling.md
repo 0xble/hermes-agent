@@ -33,7 +33,8 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
   `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
-  `evidence` (records, not patches).
+  `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
+  their review fallback), `slice-14-request-update` (the parent-only native update request).
   `maintenance-contract` is owned by the root contract.
 - `config-backup-content`: config backup deduplication reads current bytes rather
   than reusing `filecmp` results cached by paths and stat signatures. Same-size

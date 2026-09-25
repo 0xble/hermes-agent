@@ -49,11 +49,14 @@ def browser(tmp_path):
     process = subprocess.Popen([executable, '--headless=new', '--no-sandbox',
                                 '--disable-dev-shm-usage', '--no-first-run',
                                 '--no-default-browser-check', '--remote-debugging-port=0',
+                                # The portable gate replaces HOME, so a real macOS Chrome
+                                # finds no login keychain and blocks on a modal prompt.
+                                '--use-mock-keychain', '--password-store=basic',
                                 f'--user-data-dir={profile}', origin + '/unrelated'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     task = 'vault-shadow-regression'
     try:
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 60
         active_port = profile / 'DevToolsActivePort'
         address = []
         while time.monotonic() < deadline and process.poll() is None:
@@ -72,14 +75,21 @@ def browser(tmp_path):
 
             parsed = urlsplit(url)
             page_origin = f'{parsed.scheme}://{parsed.netloc}'
-            deadline = time.monotonic() + 30
+            # Attach once, then poll readiness on that session. Every successful focus_page attaches a
+            # fresh CDP session (enable domains + dialog bridge), so re-focusing each poll floods a
+            # loaded Chrome with sessions and starved the page past the file timeout on full gates.
+            deadline = time.monotonic() + 60
+            focused = False
             while time.monotonic() < deadline:
-                if sup.focus_page(page_origin).get('ok'):
+                if not focused:
+                    focused = bool(sup.focus_page(page_origin).get('ok'))
+                if focused:
                     ready = sup.evaluate_runtime(
                         f'location.href === {json.dumps(url)} && document.readyState === "complete"')
                     if ready.get('ok') and ready.get('result'):
                         return
-                time.sleep(.05)
+                    focused = bool(ready.get('ok'))  # re-attach only if the session itself broke
+                time.sleep(.1)
             pytest.fail('test page did not finish loading')
 
         wait_page(origin + '/unrelated')
@@ -93,7 +103,12 @@ def browser(tmp_path):
     finally:
         SUPERVISOR_REGISTRY.stop(task)
         process.terminate()
-        process.wait(timeout=10)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # A headless Chrome still busy under a loaded gate must not turn teardown into a second error.
+            process.kill()
+            process.wait(timeout=10)
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

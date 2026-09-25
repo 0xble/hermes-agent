@@ -3,12 +3,17 @@
 import json
 
 from agent.tool_guardrails import (
+    PROGRESS_RESET_TOOL_NAMES,
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
     canonical_tool_args,
     classify_tool_failure,
 )
+
+
+def test_browser_handoff_resets_no_progress_tracking():
+    assert "browser_handoff" in PROGRESS_RESET_TOOL_NAMES
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():

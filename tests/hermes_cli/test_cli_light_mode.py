@@ -262,8 +262,17 @@ class TestOsc11DrainGuard:
 
         read_fd, write_fd = os.pipe()
         fake_attrs = [0, 0, 0, 0, 0, 0, [b'\x00'] * 32]
+        straggler_sent = []
+
+        def fake_tcsetattr(fd, when, attrs):
+            # The teardown TCSAFLUSH marks "main loop finished": deliver the straggler right after it, so
+            # it lands inside the drain window by construction instead of racing a sleep on a loaded box.
+            if when == termios.TCSAFLUSH and not straggler_sent:
+                straggler_sent.append(True)
+                os.write(write_fd, b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\")
+
         monkeypatch.setattr(termios, "tcgetattr", lambda fd: fake_attrs)
-        monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, attrs: None)
+        monkeypatch.setattr(termios, "tcsetattr", fake_tcsetattr)
         monkeypatch.setattr(_tty, "setcbreak", lambda fd: None)
         monkeypatch.setattr(cli_mod.sys.stdin, "isatty", lambda: True, raising=False)
         monkeypatch.setattr(cli_mod.sys.stdout, "isatty", lambda: True, raising=False)
@@ -275,18 +284,9 @@ class TestOsc11DrainGuard:
         # loop exits fast — then a straggler payload lands during teardown.
         os.write(write_fd, b"\x1b[?62;22c")
 
-        import threading
-
-        def straggler():
-            import time
-            time.sleep(0.02)  # inside the 50ms drain window
-            os.write(write_fd, b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\")
-
-        t = threading.Thread(target=straggler, daemon=True)
-        t.start()
-
         result = cli_mod._query_osc11_background()
         assert result is None  # OSC 11 was swallowed; only DA1 answered
+        assert straggler_sent, "teardown flush must run before the drain window"
 
         import select
         r, _, _ = select.select([read_fd], [], [], 0)

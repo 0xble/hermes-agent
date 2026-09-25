@@ -16,6 +16,9 @@ plugin wiring, or focused tests.
 ## Provenance and patches
 
 - Fork patch identity: `security-guidance`.
+
+Fork-Patch-Backfill: 0701c45707e8d75c530026baef92af51d44e7dfc; security-guidance
+
 - Pattern provenance: Anthropic's `claude-plugins-official`, Apache-2.0,
   synchronized from the recorded upstream commit in `plugins/security-guidance/NOTICE`.
 - Hermes-side glue, documentation, and tests are maintained under the Hermes
