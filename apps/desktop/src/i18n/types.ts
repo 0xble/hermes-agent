@@ -3463,6 +3463,7 @@ export interface Translations {
     maybeLater: string
     moreChanges: (count: number) => string
     manualTitle: string
+    manualUnavailableTitle: string
     manualBody: string
     manualPickedUp: string
     /** GUI/backend skew (#45205): backend updated but the running desktop app
