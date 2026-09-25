@@ -150,6 +150,16 @@ def test_launchd_exclusion_protects_real_wrapped_process(tmp_path, monkeypatch):
         monkeypatch.setattr(gateway, "_get_service_pids", lambda **kwargs: service_pids)
         monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda **kwargs: [])
         from hermes_cli.update_cmd_fleet import _restart_manual_gateways
+        # #93349 stops only gateways whose live home this update owns. Both candidates run on the
+        # updating home, so the wrapped child survives only through the service-ancestry exclusion.
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr("hermes_cli.update_receipt._profile_homes", lambda: [("default", home)])
+        from hermes_cli import dashboard_procs
+        real_home_for_pid = dashboard_procs._hermes_home_for_pid
+        monkeypatch.setattr(dashboard_procs, "_hermes_home_for_pid",
+                            lambda pid: str(home) if pid in (700, child.pid) else real_home_for_pid(pid))
         signals = []
         monkeypatch.setattr(os, "kill", lambda pid, sig: signals.append(pid))
         outcome = SimpleNamespace(
