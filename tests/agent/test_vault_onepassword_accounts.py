@@ -29,7 +29,8 @@ if account is None:
     print("authentication rejected", file=sys.stderr)
     sys.exit(1)
 item = {"personal": ("item-p", "vault-p", "https://personal.example/login"),
-        "business": ("item-b", "vault-b", "https://business.example/login")}[account]
+        "business": ("item-b", "vault-b", (lambda f: f.read_text().strip() if f.exists() else "https://business.example/login")(
+            Path(__file__).parent / "business_url"))}[account]
 if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
     print(json.dumps([{"id": item[0], "title": account, "category": "LOGIN", "vault": {"id": item[1]},
                        "urls": [{"href": item[2]}], "additional_information": account + "@example.com"}]))
@@ -201,3 +202,54 @@ def test_missing_token_surfaces_through_otp_instead_of_prompting(env, monkeypatc
         out = json.loads(browser_vault_tool.browser_vault_enter_code("op@business:item-b", task_id="t1"))
     assert out["error_type"] == "credential_missing" and "OP_SERVICE_ACCOUNT_TOKEN_BUSINESS" in out["error"]
     assert prompted == [] and calls() == []
+
+
+def _listings(calls):
+    return [c for c in calls() if c["argv"][:2] == ["item", "list"]]
+
+
+def test_display_listing_is_reused_but_never_across_tokens(env, monkeypatch):
+    """browser_vault_list is called repeatedly against a per-account request quota."""
+    home, op, calls = env
+    _write_config(home, op, [_BUSINESS])
+    business = backend_for_handle("op@business:item-b")
+    business.list_items()
+    business.list_items()
+    assert len(_listings(calls)) == 1
+
+    # A rotated token is a new identity: it must list for itself, not reuse the old answer.
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "dummy-personal-token")
+    assert [m.id for m in backend_for_handle("op@business:item-b").list_items()] == ["op@business:item-p"]
+    assert len(_listings(calls)) == 2
+
+
+def test_fill_authorization_sees_a_website_change_the_display_cache_has_not(env):
+    """A password must never be authorized for a site the item no longer names."""
+    home, op, _calls = env
+    _write_config(home, op, [_BUSINESS])
+    business = backend_for_handle("op@business:item-b")
+    assert business.list_items()[0].origin == "https://business.example"
+    op.with_name("business_url").write_text("https://moved.example/login")
+    assert business.get_meta("op@business:item-b").origin == "https://moved.example"
+
+
+def test_failed_listing_is_not_reused(env, monkeypatch):
+    home, op, calls = env
+    _write_config(home, op, [_BUSINESS])
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "rejected-token")
+    with pytest.raises(RuntimeError):
+        backend_for_handle("op@business:item-b").list_items()
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "dummy-business-token")
+    assert [m.id for m in backend_for_handle("op@business:item-b").list_items()] == ["op@business:item-b"]
+
+
+@pytest.mark.parametrize("saved,expected", [
+    ("business.example", ["https://business.example"]),
+    ("business.example:8443/login", ["https://business.example:8443"]),
+    ("mailto:someone@evil.example", []),
+    ("user@evil.example", []),
+    ("javascript:alert(1)", []),
+])
+def test_only_bare_hostnames_gain_an_https_scheme(saved, expected):
+    from agent.vault_backends.onepassword import _all_origins
+    assert _all_origins([saved]) == expected

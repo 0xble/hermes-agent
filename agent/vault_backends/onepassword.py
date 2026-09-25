@@ -23,9 +23,12 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+from agent.secret_sources._cache import fingerprint as _fingerprint
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
 from agent.vault_backends.base import LoginBackend, MissingCredential, UnlockRequired, run_with_stdin_secret
@@ -38,6 +41,15 @@ _TIMEOUT = 30.0
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
 _ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _CATEGORIES = "Login,Credit Card"  # one listing feeds both metadata and the vault selector
+# `op item list` output, reused briefly for display listings only (browser_vault_list is
+# called repeatedly against a per-account request quota). Metadata only, never secrets.
+# Anything that authorizes a fill (get_meta's origins, _locate's vault) always lists fresh.
+_LISTING_TTL_SECONDS = 120.0
+_LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+_LISTING_LOCK = threading.Lock()
+# A bare "host[.tld][:port][/path]" website. Anything else without "://" (mailto:, user@host,
+# javascript:) stays unparseable rather than being coerced into an https origin.
+_BARE_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+(?::\d{1,5})?(?:[/?#][^\s]*)?")
 
 # 1Password Credit Card field ids → local-vault PAYMENT_FIELDS keys (agent/vault_store.py).
 # ``expiry`` is YYYYMM and is split below; ZIP has no stable id so it is matched by label.
@@ -278,8 +290,26 @@ class OnePasswordLoginBackend(LoginBackend):
             raise RuntimeError(f"op failed: {err[:200]}")
         return proc.stdout or ""
 
+    def _item_list_json(self) -> str:
+        """`op item list` for this account, reused for ``_LISTING_TTL_SECONDS``. Keyed by the
+        credential's fingerprint, so another account, token or session never sees this listing;
+        failures are never cached."""
+        credential = self._service_token or _unlock.get_session_token(self.name) or ""
+        key = (self.name, str(self.cfg.get("account") or ""), _fingerprint(credential))
+        with _LISTING_LOCK:
+            hit = _LISTING_CACHE.get(key)
+            if hit and time.monotonic() - hit[0] < _LISTING_TTL_SECONDS:
+                return hit[1]
+        out = self._list_json_fresh()
+        with _LISTING_LOCK:
+            _LISTING_CACHE[key] = (time.monotonic(), out)
+        return out
+
+    def _list_json_fresh(self) -> str:
+        return self._run("item", "list", "--categories", _CATEGORIES, "--format", "json")
+
     # ── backend contract ───────────────────────────────────────────────────
-    def list_items(self) -> List[VaultItemMeta]:
+    def list_items(self, *, fresh: bool = False) -> List[VaultItemMeta]:
         self._connect_credentials()  # Misconfigured Connect must never fall back to another route.
         if self.alias and not self._service_token:
             raise MissingCredential(self._missing_token_error())  # surfaced, not an empty account
@@ -296,7 +326,7 @@ class OnePasswordLoginBackend(LoginBackend):
                         if meta:
                             out.append(meta)
             return out
-        raw = json.loads(self._run("item", "list", "--categories", _CATEGORIES, "--format", "json") or "[]")
+        raw = json.loads((self._list_json_fresh() if fresh else self._item_list_json()) or "[]")
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
             handle = f"{self.prefix}{item.get('id')}"
@@ -321,7 +351,9 @@ class OnePasswordLoginBackend(LoginBackend):
         if self._connect_credentials()[1]:
             item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
             return self._connect_meta(item, item["vault"]["id"])
-        return next((m for m in self.list_items() if m.id == handle), None)
+        # Fresh: this is the fill's origin authorization, and _locate resolves the secret
+        # from a fresh listing too, so both must see the item's current websites.
+        return next((m for m in self.list_items(fresh=True) if m.id == handle), None)
 
     def _item_selector(self, handle: str, categories=("LOGIN",)) -> List[str]:
         return self._locate(handle, categories)[0]
@@ -337,7 +369,7 @@ class OnePasswordLoginBackend(LoginBackend):
             c.isascii() and (c.isalnum() or c == "-") for c in item_id
         ):
             raise ValueError("Invalid 1Password item handle")
-        raw = json.loads(self._run("item", "list", "--categories", _CATEGORIES, "--format", "json") or "[]")
+        raw = json.loads(self._list_json_fresh() or "[]")
         if not isinstance(raw, list):
             raise RuntimeError("Invalid 1Password item metadata")
         matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id
@@ -426,6 +458,9 @@ def _all_origins(urls: List[str]) -> List[str]:
     """
     out: List[str] = []
     for u in urls:
+        u = u.strip()
+        if _BARE_HOST_RE.fullmatch(u):
+            u = "https://" + u  # 1Password saves a typed "example.com" verbatim and opens it as https
         try:
             origin = normalize_origin(u)
         except Exception:

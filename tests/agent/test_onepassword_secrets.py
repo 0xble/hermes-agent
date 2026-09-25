@@ -519,3 +519,95 @@ def test_one_forbidden_item_does_not_block_caching_the_rest(monkeypatch, tmp_pat
     assert all("forbidden" in r for r in reads), "the readable item must come from cache"
     assert second == {"OK": "ok-value"}, "the forbidden item must not take the good ones"
     assert _entry(tmp_path, refs) is not None, "and must not delete the cache"
+
+
+# ---------------------------------------------------------------------------
+# Last-good fallback when 1Password cannot answer
+# ---------------------------------------------------------------------------
+
+
+def _expire_disk_entry(tmp_path, refs, age_seconds=3600):
+    path = op._STORE.disk.path(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["fetched_at"] = time.time() - age_seconds
+    path.write_text(json.dumps(payload))
+    op._CACHE.clear()
+
+
+@pytest.mark.parametrize("stderr", [
+    "[ERROR] 2026/09/24 19:40:01 Too many requests. Your client has been rate-limited.",
+    "[ERROR] dial tcp: lookup my.1password.com: no such host",
+])
+def test_expired_values_carry_a_start_through_a_1password_outage(monkeypatch, tmp_path, stderr):
+    """An exhausted quota or unreachable 1Password must not start Hermes without its keys.
+
+    The expired entry is served for this call only: it is not re-stored with a fresh
+    timestamp, so the next start asks 1Password again instead of trusting it forever.
+    """
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/a/F", "B": "op://V/b/F"}
+    failing = {"on": False}
+
+    def fake_run(argv, *a, **k):
+        return _err(1, stderr) if failing["on"] else _ok("value-" + argv[-1].split("/")[3])
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    _expire_disk_entry(tmp_path, refs)
+    expired_stamp = json.loads(op._STORE.disk.path(tmp_path).read_text())["fetched_at"]
+
+    failing["on"] = True
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
+    )
+    assert secrets == {"A": "value-a", "B": "value-b"}
+    assert any("last good cache" in w for w in warnings)
+    assert json.loads(op._STORE.disk.path(tmp_path).read_text())["fetched_at"] == expired_stamp
+
+
+def test_rejected_identity_never_falls_back_to_expired_values(monkeypatch, tmp_path):
+    """A revoked or wrong token is a real credential problem, not an outage to paper over."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/a/F"}
+    failing = {"on": False}
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(
+        1, "[ERROR] 401: Unauthorized: authentication required") if failing["on"] else _ok("value-a"))
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    _expire_disk_entry(tmp_path, refs)
+
+    failing["on"] = True
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
+    )
+    assert secrets == {}
+
+
+def test_expired_values_of_another_identity_are_never_served(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"A": "op://V/a/F"}
+    failing = {"on": False}
+    monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _err(
+        1, "Too many requests") if failing["on"] else _ok("value-a"))
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "token-one")
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    _expire_disk_entry(tmp_path, refs)
+
+    failing["on"] = True
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "token-two")
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
+    )
+    assert secrets == {}
+
+
+def test_rejection_that_also_mentions_a_rate_limit_is_a_rejection():
+    """Mixed wording must take the eviction path, never the last-good fallback."""
+    assert op._classify_op_error("[ERROR] 401 Unauthorized: too many requests") == op.ErrorKind.AUTH_FAILED
+    assert op._classify_op_error(
+        "[ERROR] 2026/09/24 19:40:01 Too many requests. Your client has been rate-limited.") == op.ErrorKind.RATE_LIMITED
