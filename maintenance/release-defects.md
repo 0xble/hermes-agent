@@ -89,6 +89,18 @@ and drop it once upstream carries an equivalent fix.
 - Guard: `tests/gateway/test_update_lifecycle_notifications.py`
   (`test_slash_update_final_outcome_follows_the_detached_wrapper`).
 
+## Deferred command races a queued follow-up
+
+- Fork patch identity: `deferred-command-drain-order`.
+- When both a deferred control command (`/compress`, `/undo`) and ordinary
+  follow-up text were queued behind a turn, the in-band handoff started the
+  follow-up first, and turn cleanup then started the command as a second task
+  on the same session. The command ran after the prompt it was meant to precede,
+  concurrently with it. The handoff now takes deferred commands first, and
+  cleanup never spawns while a live successor owns the session.
+- Guard: `tests/gateway/test_cancel_background_drain.py`
+  (`test_deferred_command_runs_before_queued_prompt_with_one_session_owner`).
+
 ## CI baseline and source guard read the wrong state
 
 - Fork patch identity: `ci-exact-head-baseline-and-new-source`.
