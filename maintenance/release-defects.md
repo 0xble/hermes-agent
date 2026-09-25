@@ -7,7 +7,8 @@ scope: parked-profile gateway status and restart, Bot Desktop teardown, the work
 snapshot pin, memory-provider config cloning, `/update` reporting, deferred slash
 commands, portable CI and its source guards, launchd test scoping, desktop E2E
 wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
-session lifecycle, and the alias-cache isolation guard.
+session lifecycle, the alias-cache isolation guard, and gateway orphan-reaper
+home scoping.
 
 Each section is a narrow fix for a defect found while syncing to upstream
 `v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
@@ -357,3 +358,23 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   holds the chat's send lock across its wait and arms the shared window for it, releasing only its own
   window before the retry.
 - Regression coverage: `test_telegram_flood_coherence.py::test_short_media_flood_wait_holds_other_outbound_traffic`.
+
+## Desktop orphan reap crosses isolated gateway homes
+
+- Fork patch identity: `gateway-orphan-reaper-home-scope`.
+- A Desktop backend starts its unsupervised-orphan sweep with no profile PID record.
+  The fallback command-line scan matches every default-profile `gateway run` process,
+  even when that process was launched with another `HERMES_HOME` in its environment.
+  Starting an independent Desktop backend therefore SIGTERMed a healthy gateway
+  during the two-tenant E2E run, which entered drain and returned HTTP 503.
+  Before signalling, the reaper now compares an explicitly advertised process
+  home with its own; unknown/inaccessible process environments preserve the
+  prior best-effort behavior. The unrelated AF_UNIX path-length warning did not
+  activate drain.
+- Guards: `tests/hermes_cli/test_gateway.py`
+  (`test_desktop_reaper_does_not_signal_another_home`), plus concurrent
+  `tests/e2e/core/tenancy/test_two_tenant_gateway.py` and
+  `tests/e2e/core/tenancy/test_two_tenant_desktop_backend.py` under `-j 2`.
+- Upstream `main` at `7b761da2de49` still has the same sweep; retire this patch
+  once an upstream release protects the same cross-home boundary. No upstream
+  issue or PR matched a targeted `gateway reaper HERMES_HOME orphan` search.
