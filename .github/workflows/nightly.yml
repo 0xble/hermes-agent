@@ -51,9 +51,13 @@ jobs:
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}'
+  desktop-core:
+    # The deterministic Desktop core E2E suite (transcript integrity, backend
+    # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.
+    uses: ./.github/workflows/e2e-desktop-core.yml
   qualification:
     if: always()
-    needs: [linux]
+    needs: [linux, desktop-core]
     runs-on: ubuntu-latest
     steps:
       - name: Require every nightly job

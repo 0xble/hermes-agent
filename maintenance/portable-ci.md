@@ -122,6 +122,7 @@ required fork statuses. Linux success does not qualify macOS or Windows.
 | `install-e2e-windows-run.yml` | Residual native Windows installation/update integration. |
 | `windows-venv-e2e.yml` | Preserve the six native Windows live tests below. The old workflow was on-demand on `wine2e/**`, not normal PR coverage. |
 | `e2e-desktop.yml` | Already disabled upstream (`if: false`). Remains explicitly disabled, with no newly covered desktop Playwright claim. |
+| `e2e-desktop-core.yml` | Called by `nightly.yml` (`desktop-core`, required by nightly `qualification`) and runnable on demand. The deterministic core suite is not part of the PR gate. |
 | `deploy-site.yml` | Retire upstream-owner-only site publication. A source build does not publish the site. |
 | `skills-index.yml` | Retire upstream-owner-only scheduled refresh/publication. |
 | `skills-index-freshness.yml` | Retire upstream-owner-only freshness monitor. |
