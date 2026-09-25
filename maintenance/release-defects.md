@@ -279,3 +279,17 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_malformed_bank_id_template_falls_back`, `test_csv_recall_tags_reach_the_sdk_as_a_list`,
   `TestRetainRetry`, including `test_queued_jobs_do_not_bypass_the_retry_delay` and
   `test_prefetch_barrier_waits_for_a_pending_retry`).
+
+## Telegram legacy links lost titled or angle-bracket destinations
+
+- Fork patch identity: `telegram-link-targets`.
+- The unsupported-link scrubber parses CommonMark destinations (`[t](url "Title")`, `[t](<url>)`) with
+  `_markdown_link_target()` and keeps such links, but the legacy MarkdownV2 converters in
+  `format_message()` re-validated the raw group: an ordinary link with a title or angle brackets lost
+  its URL and became plain text, and an explicit numeric citation shipped the title inside the Telegram
+  URL. Both converters now validate and emit the parsed destination, and a citation with an unsupported
+  target degrades to its number.
+- Guard: `tests/gateway/test_telegram_unsupported_link_targets.py`
+  (`test_link_with_title_keeps_its_url`, `test_angle_bracket_destination_keeps_its_url`,
+  `test_citation_with_title_does_not_put_the_title_in_the_url`,
+  `test_citation_with_unsupported_target_degrades_to_its_number`).
