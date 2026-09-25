@@ -2,6 +2,7 @@
 from contextlib import ExitStack, nullcontext
 import importlib.util
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -271,6 +272,16 @@ try {
             text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
             self.assertIn(f"uv python install {ci.PINS['python']}", text, name)
         self.assertNotEqual(ci.PINS['python'], '3.11.14', '3.11.14 links WAL-reset-vulnerable SQLite 3.50.4')
+
+    def test_uv_pin_is_consistent_across_installers(self):
+        # uv's bundled download manifest decides which CPython patches install; a stale uv cannot
+        # provision a newer pinned interpreter on a fresh runner.
+        artifacts = (ci.ROOT / 'ci/linux-artifacts.json').read_text(encoding='utf-8')
+        self.assertIn(f"/uv/releases/download/{ci.PINS['uv']}/", artifacts)
+        self.assertNotRegex(artifacts, r'/uv/releases/download/(?!' + re.escape(ci.PINS['uv']) + r'/)')
+        for name in ('e2e-desktop-core.yml', 'live-providers.yml'):
+            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            self.assertRegex(text, r"version: ['\"]" + re.escape(ci.PINS['uv']) + r"['\"]", name)
 
     def test_source_guard_detects_mutation_without_overwriting_user_work(self):
         with tempfile.TemporaryDirectory() as directory:
