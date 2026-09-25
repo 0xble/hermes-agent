@@ -9,15 +9,15 @@ import pytest
 from run_agent import AIAgent
 
 
-def _rate_limit(retry_after: str):
-    class _RateLimitError(Exception):
-        status_code = 429
+def _rate_limit(retry_after: str, status: int = 429):
+    class _ProviderError(Exception):
+        status_code = status
 
         def __init__(self):
-            super().__init__("Error code: 429 - All credentials for model are cooling down")
+            super().__init__(f"Error code: {status} - provider cooling down")
             self.response = SimpleNamespace(headers={"retry-after": retry_after})
 
-    return _RateLimitError()
+    return _ProviderError()
 
 
 @pytest.fixture()
@@ -35,20 +35,25 @@ def agent():
     return a
 
 
-def _drive(agent, retry_after: str):
+def _drive(agent, retry_after: str, status: int = 429):
     calls, sleeps = [], []
 
     def _fake_api_call(api_kwargs):
         calls.append(api_kwargs)
-        raise _rate_limit(retry_after)
+        raise _rate_limit(retry_after, status)
 
     def _fake_sleep(agent_, wait, *args, **kwargs):
         sleeps.append(wait)
         agent_._interrupt_requested = True  # never actually wait; end the turn
-        return None
+        return True
 
     agent._interruptible_api_call = _fake_api_call
-    with patch("agent.turn_api_error.interruptible_backoff_sleep", side_effect=_fake_sleep):
+    # The retry backoff and the post-exhaustion auto-recovery ladder each sleep through their own
+    # module's reference; patch both so any wait at all is recorded.
+    with (
+        patch("agent.turn_api_error.interruptible_backoff_sleep", side_effect=_fake_sleep),
+        patch("agent.turn_recovery.interruptible_backoff_sleep", side_effect=_fake_sleep),
+    ):
         result = agent.run_conversation("hello")
     return result, calls, sleeps
 
@@ -56,6 +61,15 @@ def _drive(agent, retry_after: str):
 def test_cooldown_longer_than_the_cap_fails_the_attempt_without_waiting(agent):
     agent._max_retry_wait_s = 60.0
     result, calls, sleeps = _drive(agent, "600")
+    assert len(calls) == 1 and sleeps == []
+    assert result["failed"] is True and not result.get("interrupted")
+
+
+def test_over_cap_transient_error_skips_the_auto_recovery_ladder(agent):
+    """A 503 with a long Retry-After is ladder-eligible; the cap must still end the attempt."""
+    agent._max_retry_wait_s = 60.0
+    agent._auto_recovery_cycles = 5
+    result, calls, sleeps = _drive(agent, "600", status=503)
     assert len(calls) == 1 and sleeps == []
     assert result["failed"] is True and not result.get("interrupted")
 
