@@ -141,3 +141,20 @@ worktree isolation, complete allocation of the 36 workflows, and residual native
 OS/integration/release lanes. The candidate removes hosted orchestration while
 remote enforcement remains until replacement qualification and cutover. A partial
 lane or a Linux pass cannot establish all-platform coverage.
+
+## Release-sync scope
+
+A release sync merges thousands of upstream commits. Fork policy checks classify
+fork work only, so contributor attribution (`scripts/ci/portable.py`), catalog
+admission (`scripts/ci/check_plugin_admission.py`) and the trailer check
+(`scripts/check_fork_patches.py`) exclude history reachable from the accepted
+release baseline in `MAINTENANCE.md`, read by `scripts/ci/release_baseline.py`. A
+catalog entry is skipped only when byte-identical to that release; a fork edit is
+still admitted. Without this the v2026.9.24 gate failed on upstream contributors
+unmapped in the fork, and on an upstream catalog pin whose repository is gone.
+
+The same sync exposed an upstream desktop build bug: `xcrun` honors an inherited
+`SDKROOT` and exits 72 on a stale one even when `-isysroot` names a valid SDK, so
+`macos-sysroot-native.test.mjs` failed on its stale-SDKROOT rung. The helper
+builds now pass `xcrunEnv()`, which drops `SDKROOT` after the resolver has chosen
+the SDK. Offer this upstream; drop the patch once upstream carries an equivalent.

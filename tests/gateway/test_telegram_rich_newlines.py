@@ -63,7 +63,7 @@ class TestRichMessageNewlineNormalization:
         twice = adapter._rich_message_payload(once)["markdown"]
 
         assert twice == once
-
+    
     def test_mixed_single_and_double_newlines(self, adapter):
         """Content with both list items and paragraph breaks must be handled correctly."""
         content = (
@@ -80,6 +80,7 @@ class TestRichMessageNewlineNormalization:
         assert "\n\u00a0  \nFooter" in md
         # Single newlines converted to hard breaks
         assert "`/new` -- Start  \n`/model` -- Switch  \n`/reset` -- Reset" in md
+
 
 
 class TestRichMessageTableProtection:
