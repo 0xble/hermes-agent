@@ -134,5 +134,9 @@ and drop it once upstream carries an equivalent fix.
   longer ran anywhere. Nightly now calls it and its `qualification` requires it.
   It also runs on demand, on `ubuntu-latest`, because this repository has no
   larger hosted runners.
-- Guard: `scripts/ci/tests/test_portable.py`
-  (`test_every_reusable_only_workflow_has_a_caller`).
+- The same retirement (#62) deleted `.github/actions/retry`, which this suite
+  and `live-providers.yml` still use, so both failed at their first install
+  step. The upstream composite action is restored unchanged.
+- Guards: `scripts/ci/tests/test_portable.py`
+  (`test_every_reusable_only_workflow_has_a_caller`,
+  `test_every_local_action_reference_resolves`).
