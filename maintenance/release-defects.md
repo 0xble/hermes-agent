@@ -357,3 +357,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   holds the chat's send lock across its wait and arms the shared window for it, releasing only its own
   window before the retry.
 - Regression coverage: `test_telegram_flood_coherence.py::test_short_media_flood_wait_holds_other_outbound_traffic`.
+
+## Hindsight empty prefetch, unbounded status poll and unapplied bank missions
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- A newer prefetch whose recall came back empty did not replace an older worker's buffered result, so
+  the next turn injected memories from the superseded query. Advancing the generation now clears the
+  buffer, and the current generation publishes its result even when empty.
+- The retain-drain deadline was checked only between retain-op status requests; each request ran with
+  the full provider timeout (120s default), so a hung status endpoint overran the 10s prefetch drain.
+  The remaining budget now bounds each status request and poll sleep.
+- `bank_mission`/`bank_retain_mission` were stored but never sent (inherited from upstream, where the
+  README says "Applied via Banks API"). They are now applied once per resolved bank through the Banks
+  API before its first retain or reflect, best effort.
+- Regression coverage: `test_hindsight_provider.py`
+  (`test_empty_newer_recall_does_not_inject_older_query_memories`,
+  `test_drain_budget_bounds_the_status_request_itself`, `TestMissionConfig`).

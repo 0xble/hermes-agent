@@ -891,6 +891,24 @@ class TestPrefetchServerRetainVisibility:
             "second prefetch re-polled dropped ops — eviction regressed"
         )
 
+    def test_drain_budget_bounds_the_status_request_itself(self, provider_with_config):
+        """The drain deadline must bound each status request, not only the loop checks: a hung
+        status endpoint otherwise holds the prefetch for the full request timeout (120s default)."""
+        p = provider_with_config(timeout=30)
+
+        async def _hung(*, bank_id, operation_id):
+            await asyncio.sleep(10)
+            return SimpleNamespace(status="completed")
+
+        p._client.operations = MagicMock()
+        p._client.operations.get_operation_status = AsyncMock(side_effect=_hung)
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "test-bank")
+
+        start = time.monotonic()
+        assert p._wait_for_retains_drained(0.3) is False
+        assert time.monotonic() - start < 2.5
+        assert p._pending_retain_ops == set()
+
     def test_operation_notfound_treated_as_complete(self, provider):
         """A NotFound (completed+evicted) op is treated as done, not pending."""
         exceptions = pytest.importorskip(
@@ -918,6 +936,7 @@ class TestPrefetchServerRetainVisibility:
         provider._client = client
 
         assert provider._is_retain_op_complete("bank", "op-1") is False
+
 
 
 # ---------------------------------------------------------------------------
@@ -954,6 +973,57 @@ class TestPrefetchSupersession:
         assert not old_worker.is_alive()
         assert "new memory" in provider._prefetch_result
         assert "old memory" not in provider._prefetch_result
+
+    def test_empty_newer_recall_does_not_inject_older_query_memories(self, provider):
+        """An older worker's result buffered after prefetch()'s capped join must not survive a
+        newer query that found nothing: the next turn would get the older query's memories."""
+        async def _recall(**kwargs):
+            if kwargs.get("query") == "old":
+                return SimpleNamespace(results=[SimpleNamespace(text="old memory")])
+            return SimpleNamespace(results=[])
+
+        provider._client.arecall = AsyncMock(side_effect=_recall)
+        provider._prefetch_waits_for_retain = False
+        provider.queue_prefetch("old")
+        provider._prefetch_thread.join(timeout=5.0)
+        assert "old memory" in provider._prefetch_result  # landed, never consumed
+        provider.queue_prefetch("new")
+        provider._prefetch_thread.join(timeout=5.0)
+        assert "old memory" not in provider.prefetch("new")
+
+class TestMissionConfig:
+    def test_configured_missions_are_applied_once_per_bank_before_retain(self, provider_with_config):
+        """``bank_mission``/``bank_retain_mission`` are documented as applied via the Banks API;
+        they must reach the bank (each resolved bank once), not only sit on the provider."""
+        p = provider_with_config(bank_mission="Reflect framing", bank_retain_mission="Extract decisions")
+        p._client.acreate_bank = AsyncMock(return_value=SimpleNamespace())
+        p._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(operation_id=None, operation_ids=None))
+
+        p._retain_batch({"content": "a"}, bank_id="bank-a")
+        p._retain_batch({"content": "b"}, bank_id="bank-a")
+        p._retain_batch({"content": "c"}, bank_id="bank-b")
+
+        calls = [c.kwargs for c in p._client.acreate_bank.await_args_list]
+        assert calls == [
+            {"bank_id": "bank-a", "reflect_mission": "Reflect framing", "retain_mission": "Extract decisions"},
+            {"bank_id": "bank-b", "reflect_mission": "Reflect framing", "retain_mission": "Extract decisions"},
+        ]
+        assert p._client.aretain_batch.await_count == 3
+
+    def test_no_missions_configured_makes_no_bank_calls(self, provider):
+        provider._client.acreate_bank = AsyncMock()
+        provider._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(operation_id=None, operation_ids=None))
+        provider._retain_batch({"content": "a"}, bank_id="bank-a")
+        provider._client.acreate_bank.assert_not_awaited()
+
+    def test_mission_failure_does_not_block_retain(self, provider_with_config):
+        p = provider_with_config(bank_retain_mission="Extract decisions")
+        p._client.acreate_bank = AsyncMock(side_effect=RuntimeError("banks api down"))
+        p._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(operation_id=None, operation_ids=None))
+        p._retain_batch({"content": "a"}, bank_id="bank-a")
+        p._retain_batch({"content": "b"}, bank_id="bank-a")
+        assert p._client.aretain_batch.await_count == 2
+        assert p._client.acreate_bank.await_count == 1  # best effort, not retried every retain
 
 
 class TestRecallStatus:
