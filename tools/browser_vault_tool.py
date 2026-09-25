@@ -249,6 +249,23 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _browser_account_refusal(backend, task_id: str) -> Optional[str]:
+    """A backend pinned to a named browser account fills only into a task bound to that account."""
+    required = getattr(backend, "browser_account", "")
+    if not isinstance(required, str) or not required:
+        return None
+    from tools.browser_camofox import get_session_account, is_camofox_mode
+    # The binding lives in the Camofox session map; it says nothing about a CDP/local browser that
+    # would actually receive the fill, so a pinned backend fills only while Camofox is the browser.
+    bound = get_session_account(task_id) if is_camofox_mode() else None
+    if bound == required:
+        return None
+    return json.dumps({"success": False, "error_type": "browser_account_mismatch",
+                       "error": (f"{backend.display_name} logins fill only in the {required!r} browser account; this "
+                                 f"task's browser is {bound or 'the default identity'}. Navigate with "
+                                 f"account={required!r} in a new task first.")})
+
+
 def browser_vault_list() -> str:
     """List login handles + metadata across every enabled backend. Passwords are never included.
 
@@ -281,6 +298,9 @@ def browser_vault_list() -> str:
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
+            pinned = getattr(backend, "browser_account", "")
+            if isinstance(pinned, str) and pinned:
+                entry["browser_account"] = pinned
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
@@ -369,10 +389,14 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     socket and never enters the conversation."""
     from agent.redact import register_vault_redaction_value
     from agent.vault_backends import backend_for_handle
+    from agent.vault_backends.base import MissingCredential
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
 
     effective_task_id = task_id or "default"
+    backend = backend_for_handle(handle) if handle else None
+    if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
+        return refusal
     _focus_bound_origin(effective_task_id, "", "otp")
     origin = _current_page_origin(effective_task_id)
     if not origin:
@@ -392,10 +416,11 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     code: Optional[str] = None
     source = "user"
-    backend = backend_for_handle(handle) if handle else None
     if backend is not None:
         try:
             code = backend.resolve_otp(handle)
+        except MissingCredential as exc:
+            return json.dumps({"success": False, "error_type": "credential_missing", "error": str(exc)[:200]})
         except Exception:
             code = None
         if code:
@@ -412,6 +437,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                                "error": "The user did not enter a code. Do not ask again this turn."})
 
     register_vault_redaction_value(code)
+    if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
+        return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     fills = build_otp_fills(otp_controls, code)
     result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
     del code
@@ -451,6 +478,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     effective_task_id = task_id or "default"
     backend = backend_for_handle(handle)
+    if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
+        return refusal
     if backend is not None and backend.needs_unlock and not backend.is_unlocked():
         unlocked = json.loads(browser_vault_unlock(backend.name))
         if not unlocked.get("success"):
@@ -567,6 +596,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
         register_vault_redaction_value(value)
 
+    if refusal := _browser_account_refusal(backend, effective_task_id):
+        return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     try:
         fill_result = _eval_js_secret(
             effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)

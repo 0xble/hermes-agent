@@ -42,6 +42,12 @@ the browser vault fill tool, or the 1Password backends.
   `resolve_secret` onto the local-vault `PAYMENT_FIELDS` shape. A manager's card binds to the
   current page origin at fill time and the existing payment confirmation names that origin;
   local-vault cards keep their saved-origin binding. A card handle never resolves as a login.
+- Additional 1Password accounts (`vault.onepassword.accounts`) are separate backend instances
+  named `onepassword@<alias>` with `op@<alias>:<item-id>` handles. Each authenticates only
+  with its own service-account token env (never the primary's, never Connect, never an
+  interactive session); a missing token raises instead of listing empty. Invalid, duplicate,
+  or token-sharing entries are skipped. `browser_account` pins fills and one-time codes to a
+  task bound to that named Camofox account, checked before any secret is resolved.
 
 ## Provenance and patches
 
@@ -52,7 +58,10 @@ the browser vault fill tool, or the 1Password backends.
   and `camofox-stale-tab-recovery`
   (adopted design from [upstream PR 93249](https://github.com/NousResearch/hermes-agent/pull/93249)
   at `b5e999a5b52b70e286f6e55ec8dc8ec6e872ac8a`, related
-  [issue 80276](https://github.com/NousResearch/hermes-agent/issues/80276)).
+  [issue 80276](https://github.com/NousResearch/hermes-agent/issues/80276)), and
+  `vault-op-multi-account` (own fork feature; upstream
+  [PR 71596](https://github.com/NousResearch/hermes-agent/pull/71596) covers only the
+  `secrets.onepassword` loader, not vault logins, as of 2026-09-24).
   The fork adaptation adds vault evaluation, preserves a no-session branch, and classifies
   404 by its tab-missing payload; revisit when upstream ships equivalent behavior.
 - Adopted upstream sources, all open on 2026-09-19:
@@ -71,6 +80,7 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_connect.py`, `tests/agent/test_vault_backends.py`,
 `tests/agent/test_vault_onepassword_selector.py`, `tests/agent/test_vault_onepassword_cards.py`,
 `tests/agent/test_vault_onepassword_subprocess.py` (real subprocess, fake `op`),
+`tests/agent/test_vault_onepassword_accounts.py` (multi-account, real config + fake `op`),
 `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome). Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
@@ -86,4 +96,7 @@ shadow-DOM commit touches only `agent/vault_login_classifier.py`,
 `tools/browser_vault_tool.py`, and vault tests; revert it alone to roll back. Retire the
 card listing when a released upstream lists manager cards with equivalent per-fill
 confirmation; the card commit touches only `agent/vault_backends/onepassword.py`, the
-no-origin branch of `browser_vault_fill`, and vault tests.
+no-origin branch of `browser_vault_fill`, and vault tests. Retire `vault-op-multi-account`
+when a released upstream lists logins from several 1Password accounts with per-account
+token isolation; its commit touches only `agent/vault_backends/`, the vault tool's
+browser-account check, `get_session_account`, the config default, docs, and its test file.
