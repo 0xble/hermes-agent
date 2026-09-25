@@ -89,6 +89,41 @@ and drop it once upstream carries an equivalent fix.
 - Guard: `tests/gateway/test_update_lifecycle_notifications.py`
   (`test_slash_update_final_outcome_follows_the_detached_wrapper`).
 
+## Deferred command races a queued follow-up
+
+- Fork patch identity: `deferred-command-drain-order`.
+- When both a deferred control command (`/compress`, `/undo`) and ordinary
+  follow-up text were queued behind a turn, the in-band handoff started the
+  follow-up first, and turn cleanup then started the command as a second task
+  on the same session. The command ran after the prompt it was meant to precede,
+  concurrently with it. The handoff now takes deferred commands first, and
+  cleanup never spawns while a live successor owns the session.
+- Guard: `tests/gateway/test_cancel_background_drain.py`
+  (`test_deferred_command_runs_before_queued_prompt_with_one_session_owner`).
+
+## CI baseline and source guard read the wrong state
+
+- Fork patch identity: `ci-exact-head-baseline-and-new-source`.
+- The release-baseline exemption for exact-head plugin admission read
+  MAINTENANCE.md from the working tree and checked ancestry against the current
+  HEAD, so uncommitted metadata could exempt a committed head's catalog entries.
+  An explicit revision now reads its own committed MAINTENANCE.md and ancestry.
+- The CI source mutation guard re-fingerprinted only the initial file list, so
+  source created during setup or checks went unnoticed. It now re-enumerates.
+- Guards: `scripts/ci/tests/test_plugin_admission.py`
+  (`test_exact_head_baseline_comes_from_the_checked_revision_not_the_working_tree`),
+  `scripts/ci/tests/test_portable.py` (`test_source_guard_detects_source_created_during_ci`).
+
+## Fork-patch check fails on a separate-checkout gateway
+
+- Fork patch identity: `fork-patch-check-external-fleet`.
+- `scripts/check_fork_patches.py` compared every update-receipt fleet row's
+  `code_sha` with the checkout, including rows the updater marks `external`
+  (gateways serving a separate checkout it did not touch). The live fleet probe
+  excludes those rows, so a successful update beside a legitimate second
+  checkout always failed. External rows are now skipped.
+- Guard: `tests/scripts/test_candidate_scripts.py`
+  (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
 ## Portable CI lost the WAL-capable SQLite guard
 
 - Fork patch identity: `ci-wal-capable-sqlite`.
@@ -105,3 +140,4 @@ and drop it once upstream carries an equivalent fix.
   (`test_python_lanes_require_a_wal_capable_sqlite`,
   `test_workflows_install_the_pinned_python`,
   `test_uv_pin_is_consistent_across_installers`).
+
