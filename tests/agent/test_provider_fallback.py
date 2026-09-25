@@ -14,7 +14,7 @@ from agent.error_classifier import FailoverReason
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
-def _make_agent(fallback_model=None):
+def _make_agent(fallback_model=None, reasoning_config=None):
     """Create a minimal AIAgent with optional fallback config."""
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
@@ -28,6 +28,7 @@ def _make_agent(fallback_model=None):
             skip_context_files=True,
             skip_memory=True,
             fallback_model=fallback_model,
+            reasoning_config=reasoning_config,
         )
         agent.client = MagicMock()
         return agent
@@ -98,6 +99,64 @@ class TestFallbackChainAdvancement:
     def test_exhausted_returns_false(self):
         agent = _make_agent(fallback_model=None)
         assert agent._try_activate_fallback() is False
+
+    def test_fallback_entry_reasoning_effort_overrides_current_config(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o", "reasoning_effort": "high"}],
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            assert agent._try_activate_fallback() is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+
+    def test_fallback_entry_reasoning_effort_invalid_uses_configured_resolution(self, caplog):
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o", "reasoning_effort": "warp9"}],
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={"agent": {"reasoning_effort": "low"}},
+        ):
+            assert agent._try_activate_fallback() is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+        assert "invalid reasoning_effort" in caplog.text
+
+    def test_fallback_entry_reasoning_effort_false_disables_reasoning(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o", "reasoning_effort": False}],
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            assert agent._try_activate_fallback() is True
+        assert agent.reasoning_config == {"enabled": False}
+
+    def test_next_fallback_without_effort_does_not_inherit_previous_route(self):
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "openai", "model": "gpt-4o", "reasoning_effort": False},
+                {"provider": "zai", "model": "glm-4.7"},
+            ],
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(_mock_client(), "gpt-4o"), (_mock_client(), "glm-4.7")],
+        ), patch("hermes_cli.config.load_config", return_value={}):
+            assert agent._try_activate_fallback() is True
+            assert agent.reasoning_config == {"enabled": False}
+            assert agent._try_activate_fallback() is True
+        assert agent.model == "glm-4.7"
+        assert agent.reasoning_config is None
 
     def test_advances_index(self):
         fbs = [
