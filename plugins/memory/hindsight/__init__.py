@@ -538,6 +538,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _get_client(self):
         """Return the cached Hindsight client (created once, reused)."""
+        if self._mode == "disabled":
+            # Never fall through to the cloud client for a provider that disabled itself.
+            raise RuntimeError("Hindsight is disabled (local runtime unavailable)")
         if self._client is None:
             self._client = self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
         return self._client
@@ -972,6 +975,8 @@ class HindsightMemoryProvider(MemoryProvider):
             _log(f"\n=== Daemon startup failed: {e} ===\n" + traceback.format_exc())
 
     def system_prompt_block(self) -> str:
+        if self._mode == "disabled":
+            return ""  # Don't advertise memory that can't be reached.
         mode = self._memory_mode if self._memory_mode in _SYSTEM_PROMPT_TAILS else "hybrid"
         label = "" if mode == "hybrid" else f" ({mode} mode)"
         return f"# Hindsight Memory\nActive{label}. Bank: {self._bank_id}, budget: {self._budget}.\n{_SYSTEM_PROMPT_TAILS[mode]}"
@@ -980,7 +985,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _recall_disabled(self) -> bool:
         """Guards shared by the async and synchronous recall paths."""
-        why = ("tools-only mode" if self._memory_mode == "tools" else "auto_recall disabled" if not self._auto_recall
+        why = ("provider disabled" if self._mode == "disabled"
+               else "tools-only mode" if self._memory_mode == "tools" else "auto_recall disabled" if not self._auto_recall
                else "shutting down" if self._shutting_down.is_set() else None)
         if why:
             logger.debug("Prefetch: skipped (%s)", why)
@@ -1232,7 +1238,8 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._cron_skipped:
             logger.debug("sync_turn: skipped (cron context)")
             return
-        why = "auto_retain disabled" if not self._auto_retain else "shutting down" if self._shutting_down.is_set() else None
+        why = ("provider disabled" if self._mode == "disabled" else "auto_retain disabled" if not self._auto_retain
+               else "shutting down" if self._shutting_down.is_set() else None)
         if why:
             logger.debug("sync_turn: skipped (%s)", why)
             return
@@ -1286,7 +1293,7 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if self._memory_mode == "context":
+        if self._memory_mode == "context" or self._mode == "disabled":
             return []
         if self._cron_skipped:
             return [RECALL_SCHEMA, REFLECT_SCHEMA]
@@ -1326,6 +1333,8 @@ class HindsightMemoryProvider(MemoryProvider):
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if self._mode == "disabled":
+            return tool_error("Hindsight is disabled (local runtime unavailable).")
         if self._cron_skipped and tool_name == "hindsight_retain":
             return tool_error("Hindsight retain is disabled in cron context.")
         if tool_name not in self._TOOL_HANDLERS:
@@ -1443,6 +1452,13 @@ class HindsightMemoryProvider(MemoryProvider):
             with contextlib.suppress(Exception):
                 self._close_client()
             self._client = None
+        # Drop the bound atexit callback: it strongly references this provider, so an evicted
+        # gateway session (and its transcript buffers) would otherwise live until process exit.
+        # A later retain re-registers through _register_atexit().
+        if self._atexit_registered:
+            with contextlib.suppress(Exception):
+                atexit.unregister(self._atexit_shutdown)
+            self._atexit_registered = False
         # The module-global loop is intentionally NOT stopped: it's shared by every
         # provider in the process (one per gateway chat session); stopping it would
         # strand siblings' aiohttp sessions ("Unclosed client session"). Daemon
