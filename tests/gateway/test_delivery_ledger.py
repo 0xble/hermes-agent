@@ -847,6 +847,20 @@ class TestFloodDeadlineExactness:
         assert dl.sweep_failed_for_runtime("telegram", now=1000.0) == []
         assert _row("ob-1")["state"] == "abandoned"
 
+    def test_absurd_penalty_is_abandoned_when_the_failure_is_recorded(self, caplog):
+        """The runtime timer only sweeps rows with a deadline, so the failure write itself must abandon.
+
+        Without this, a lone absurd refusal stays 'failed' with no warning: pending_retries() skips it,
+        the redelivery timer exits, and sweep_failed_for_runtime() never runs to abandon it.
+        """
+        _record(platform="telegram")
+        with caplog.at_level("WARNING", logger=dl.logger.name):
+            dl.mark_failed("ob-1", "Flood control exceeded. Retry in 90000 seconds")
+
+        assert _row("ob-1")["state"] == "abandoned"
+        assert dl.pending_retries() == []
+        assert any("abandoned" in r.getMessage() and "90000" in r.getMessage() for r in caplog.records)
+
     def test_a_long_but_sane_penalty_is_still_retried(self):
         """The bound must not swallow an ordinary multi-minute penalty."""
         _record(platform="telegram")
