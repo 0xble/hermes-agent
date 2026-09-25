@@ -6,6 +6,7 @@ turn counting, tags), and schema completeness.
 """
 
 import importlib.util
+import asyncio
 import json
 import os
 import re
@@ -350,6 +351,11 @@ class TestConfig:
     def test_recall_types_default_is_observation_only(self, provider):
         """Auto-recall must filter to observation by default."""
         assert provider._recall_types == ["observation"]
+
+    def test_explicit_empty_recall_types_disables_the_filter(self, provider_with_config):
+        """Only an unset key gets the observation default; ``[]`` matches the empty string."""
+        assert provider_with_config(recall_types=[])._recall_types == []
+        assert provider_with_config(recall_types="")._recall_types == []
 
 
     def test_observation_scopes_keyword_config(self, provider_with_config):
@@ -2055,6 +2061,99 @@ class TestRetainRetry:
         p.sync_turn("only question", "only answer")
         assert self._wait_for(lambda: len(calls) == 2)
         assert self._wait_for(lambda: not p._retain_backlog)
+
+    def test_timed_out_write_that_lands_is_not_sent_again(self, provider, monkeypatch):
+        """A timeout stops the wait, not the write: a retry must not append the same turns twice."""
+        p = self._append_provider(provider, monkeypatch)
+        p._timeout = 0.2
+        writes = []
+
+        async def _slow_success(**kwargs):
+            await asyncio.sleep(0.5)
+            writes.append(kwargs["items"][0]["content"])
+            return SimpleNamespace(ok=True)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_slow_success)
+        p.sync_turn("slow question", "slow answer")
+        assert self._wait_for(lambda: p._client.aretain_batch.await_count >= 1 and not p._retain_backlog, timeout=10.0)
+        time.sleep(0.8)
+        assert len(writes) == 1
+        assert p._client.aretain_batch.await_count == 1
+
+    def test_wait_timeout_racing_completion_still_hands_over_the_future(self, monkeypatch):
+        """A send that completes right as the wait times out must still be kept, not resent blind."""
+        import concurrent.futures
+        import plugins.memory.hindsight as hindsight_mod
+
+        class _CompletesAsTheWaitTimesOut(concurrent.futures.Future):
+            def result(self, timeout=None):
+                if not self.done():
+                    self.set_result("landed")
+                    raise TimeoutError()
+                return super().result(timeout)
+
+        racy = _CompletesAsTheWaitTimesOut()
+
+        def _schedule(coro, loop, **kwargs):
+            coro.close()
+            return racy
+
+        monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", _schedule)
+        kept = []
+
+        async def _noop():
+            return None
+
+        with pytest.raises(TimeoutError):
+            hindsight_mod._run_sync(_noop(), timeout=0.01, keep_pending=kept.append)
+        assert kept == [racy]
+
+    def test_retry_judges_the_earlier_send_by_its_outcome_not_the_wait(self, provider, monkeypatch):
+        """The earlier send finishing as the retry's wait times out is a success: no second send."""
+        import concurrent.futures
+
+        p = self._append_provider(provider, monkeypatch)
+        p._timeout = 0.01
+        earlier = concurrent.futures.Future()
+        sends = []
+
+        def _retain_batch(item, *, keep_pending=None, **kwargs):
+            sends.append(item)
+            keep_pending(earlier)
+            raise TimeoutError()
+
+        monkeypatch.setattr(p, "_retain_batch", _retain_batch)
+        job = p._make_turn_retain_job(["turn"], document_id="doc", update_mode="append", label="retain")
+        with pytest.raises(TimeoutError):
+            job()
+
+        real_wait = concurrent.futures.wait
+
+        def _wait_that_races(fs, timeout=None, **kwargs):
+            earlier.set_result(SimpleNamespace(ok=True))  # lands exactly as the wait gives up
+            return real_wait(fs, timeout=0)
+
+        monkeypatch.setattr(concurrent.futures, "wait", _wait_that_races)
+        job()
+        assert len(sends) == 1
+
+    def test_timed_out_write_that_failed_is_sent_again(self, provider, monkeypatch):
+        p = self._append_provider(provider, monkeypatch)
+        p._timeout = 0.2
+        writes = []
+
+        async def _slow_then_fast(**kwargs):
+            if not getattr(_slow_then_fast, "slow_done", False):
+                _slow_then_fast.slow_done = True
+                await asyncio.sleep(0.5)
+                raise ConnectionError("hindsight dropped the request")
+            writes.append(kwargs["items"][0]["content"])
+            return SimpleNamespace(ok=True)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_slow_then_fast)
+        p.sync_turn("retry question", "retry answer")
+        assert self._wait_for(lambda: len(writes) == 1 and not p._retain_backlog, timeout=10.0)
+        assert "retry question" in writes[0]
 
     def test_persistent_failure_is_bounded(self, provider, monkeypatch):
         p = self._append_provider(provider, monkeypatch)

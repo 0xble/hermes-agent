@@ -297,3 +297,20 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_link_with_title_keeps_its_url`, `test_angle_bracket_destination_keeps_its_url`,
   `test_citation_with_title_does_not_put_the_title_in_the_url`,
   `test_citation_with_unsupported_target_degrades_to_its_number`).
+
+## Hindsight timed-out retains resent and empty recall_types overridden
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- `_run_sync()` stops waiting at the provider timeout but leaves the coroutine running on the shared
+  loop, so the retain backlog could resend an append that later landed, writing the same turns twice.
+  A timed-out send is now always kept with its job (even if it completed as the wait timed out): the
+  retry first lets it settle (one more timeout) and judges it by its own outcome, skipping the resend if
+  it landed, resending only if it failed, and otherwise failing the attempt and backing off. An
+  explicit `recall_types: []` was also replaced with `["observation"]`, unlike the equivalent empty
+  string; only an unset key now gets the default.
+- Guard: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_timed_out_write_that_lands_is_not_sent_again`, `test_timed_out_write_that_failed_is_sent_again`,
+  `test_wait_timeout_racing_completion_still_hands_over_the_future`,
+  `test_retry_judges_the_earlier_send_by_its_outcome_not_the_wait`,
+  `test_explicit_empty_recall_types_disables_the_filter`).
+
