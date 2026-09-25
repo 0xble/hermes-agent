@@ -225,10 +225,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `all images failed to send` with no `retry_after`, so the caller saw a permanent failure. The album
   path now arms the per-chat window, skips the futile fallback, and answers a wholly undelivered album
   with `flood_control:<s>`, using the longer of the window and the platform's own remaining deadline
-  (the window caps at 300s, so a multi-hour penalty still reaches the ledger intact). `_telegram_retry_after()` also honours a
+  (the window caps at 300s, so a multi-hour penalty still reaches the ledger intact). Every refusal
+  records that deadline per chat, so per-image fallback and animation refusals report it too. `_telegram_retry_after()` also honours a
   `timedelta` `retry_after` (PTB_TIMEDELTA) instead of shrinking it to one second.
 - Guard: `tests/gateway/test_telegram_flood_coherence.py`
   (`test_album_inside_an_armed_window_returns_the_flood_contract`,
   `test_album_refused_by_the_platform_returns_the_flood_contract`,
   `test_timedelta_retry_after_keeps_the_full_penalty`,
-  `test_album_reports_the_platform_penalty_beyond_the_local_window_cap`).
+  `test_album_reports_the_platform_penalty_beyond_the_local_window_cap`,
+  `test_album_fallback_route_reports_the_platform_penalty`,
+  `test_animation_only_album_reports_the_platform_penalty`).
