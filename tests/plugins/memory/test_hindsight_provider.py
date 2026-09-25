@@ -44,6 +44,11 @@ from plugins.memory.hindsight.settings import _sanitize_bank_segment
 # ---------------------------------------------------------------------------
 
 
+import tools.lazy_deps as _lazy_deps_at_import
+
+_REAL_INSTALL_SPECS = _lazy_deps_at_import.install_specs
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(tmp_path, monkeypatch):
     """Ensure no stale env vars or Windows home state leak between tests."""
@@ -66,6 +71,13 @@ def _clean_env(tmp_path, monkeypatch):
     # These tests provide client doubles, so they must not attempt a network
     # install merely because the optional SDK is absent from the test env.
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
+    # initialize() auto-upgrades an outdated installed SDK through install_specs; a mocked test must
+    # never download or mutate the running environment. The dedicated upgrade tests override this.
+    # (Setup-wizard tests reach install_specs too; they get a successful no-op, not a real install.)
+    import tools.lazy_deps as _lazy_deps
+
+    monkeypatch.setattr(_lazy_deps, "install_specs",
+                        lambda *args, **kwargs: _lazy_deps.InstallSpecsResult(ok=True))
 
     # The update_mode='append' capability is cached process-wide per (API URL, key), and every
     # fixture here shares one URL and key: a capability test's mocked answer would otherwise decide
@@ -882,12 +894,13 @@ class TestPrefetchServerRetainVisibility:
             "unresolved ops must be evicted at deadline, not retained"
         )
 
-        # A later prefetch with nothing pending must be near-instant.
-        start = time.monotonic()
+        # A later prefetch must not poll the dropped op again (counted, not timed).
+        polls = p._client.operations.get_operation_status.await_count
         p.queue_prefetch("q2")
         if p._prefetch_thread:
             p._prefetch_thread.join(timeout=5.0)
-        assert time.monotonic() - start < 0.25, (
+            assert not p._prefetch_thread.is_alive()
+        assert p._client.operations.get_operation_status.await_count == polls, (
             "second prefetch re-polled dropped ops — eviction regressed"
         )
 
@@ -2167,6 +2180,20 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         provider = HindsightMemoryProvider()
         provider.initialize(session_id="s", hermes_home=str(tmp_path), platform="cli")
         return calls
+
+    def test_default_fixture_never_installs_for_an_outdated_sdk(self, tmp_path, monkeypatch):
+        """Mocked tests must not reach a real install even when the installed SDK looks outdated:
+        the autouse fixture replaces install_specs, so initialize()'s auto-upgrade is absorbed."""
+        import importlib.metadata as md
+        import tools.lazy_deps as lazy_deps_mod
+
+        assert lazy_deps_mod.install_specs is not _REAL_INSTALL_SPECS
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({"mode": "cloud"}))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(md, "version", lambda name: "0.0.1")
+        HindsightMemoryProvider().initialize(session_id="s", hermes_home=str(tmp_path), platform="cli")
 
     def test_upgrade_uses_install_specs_not_subprocess(self, tmp_path, monkeypatch):
         from plugins.memory.hindsight import _MIN_CLIENT_VERSION

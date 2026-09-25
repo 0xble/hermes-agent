@@ -409,5 +409,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   still ran, and `_get_client()` fell through to the cloud client against the configured endpoint.
   Disabled now short-circuits recall, auto-retain, tool calls, tool schemas and the system prompt
   block, and `_get_client()` refuses to build a client.
+- The test module's autouse fixture stubbed `lazy_deps.ensure` but not `install_specs`, so with an
+  outdated installed SDK, mocked tests ran `initialize()`'s auto-upgrade for real (download, env
+  mutation). The fixture now stubs `install_specs`; upgrade tests still override it. The eviction test's
+  250ms wall-clock bound is replaced by a poll count.
 - Regression coverage: `test_hindsight_provider.py`
-  (`test_disabled_provider_makes_no_network_calls`, `test_shutdown_unregisters_the_atexit_callback`).
+  (`test_disabled_provider_makes_no_network_calls`, `test_shutdown_unregisters_the_atexit_callback`,
+  `test_default_fixture_never_installs_for_an_outdated_sdk`).
