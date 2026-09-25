@@ -377,7 +377,12 @@ def test_tui_gateway_model_switch_routing(tmp_path: Path, request: pytest.Fixtur
             pool_state["fail"] = leg.host == "pool" and not leg.ok
             done = gw.turn(sid, f"turn {i}")
             if i == 0:
-                gw.seen_or_wait(gw.event("session.title", sid), timeout=120)  # first-turn aux call settles
+                gw.seen_or_wait(gw.event("session.title", sid), timeout=120)
+                # The instant title emits ``session.title`` at turn start, before the model upgrade.
+                # On a ``custom`` main route the upgrade is deferred past the turn (#117296) and
+                # goes to ``main`` with main's key. Wait for that request so it stays in leg 0's
+                # log. Otherwise it can land after leg 1's marks and read as a leak to ``main``.
+                fleet.servers["main"].wait_for_requests(1, timeout=120, kind="aux")
             log = fleet.since(marks)
             payload = (done.get("params") or {}).get("payload") or {}
             ctx = f"leg {i} ({leg.value!r} -> {leg.host}): {done.get('params', {}).get('type')} {str(payload)[:300]}\n{describe(log)}"
