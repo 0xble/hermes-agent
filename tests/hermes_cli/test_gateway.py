@@ -827,6 +827,31 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         assert killed_pids == []  # the standalone gateway survived
 
 
+class TestReaperHomeScope:
+    def test_desktop_reaper_does_not_signal_another_home(self, monkeypatch, tmp_path):
+        import psutil
+        from types import SimpleNamespace
+
+        own_home = tmp_path / "desktop" / ".hermes"
+        foreign_home = tmp_path / "tenant" / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(own_home))
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "_reaper_exclusion_pids", lambda _extra: set())
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda exclude_pids: [12341, 12342])
+        monkeypatch.setattr(gateway, "_reaper_candidate_is_supervisor_owned", lambda _pid: False)
+        monkeypatch.setattr(psutil, "Process", lambda pid: SimpleNamespace(
+            environ=lambda: {"HERMES_HOME": str(foreign_home if pid == 12341 else own_home)},
+        ))
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda _pid: None)
+        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda _pid: None)
+        monkeypatch.setattr(gateway, "_await_gateway_exit", lambda _pids, **_kwargs: [])
+        signalled = []
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, _sig: signalled.append(pid))
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        assert signalled == [12342]
+
+
 class TestReaperCandidateIsSupervisorOwned:
     """Regression for the Windows pidfile-less supervisor-owned case (#83683).
 

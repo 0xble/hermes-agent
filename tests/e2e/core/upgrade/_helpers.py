@@ -101,6 +101,8 @@ def isolated_env(
     env.update(
         HOME=str(home),
         HERMES_HOME=str(hermes_home),
+        # The pytest ancestor marks this child as guarded; its HOME is already the sandbox.
+        HERMES_STATE_DB_GUARD_BYPASS="1",
         XDG_RUNTIME_DIR=str(root / "run"),
         XDG_CONFIG_HOME=str(home / ".config"),
         XDG_DATA_HOME=str(home / ".local" / "share"),
