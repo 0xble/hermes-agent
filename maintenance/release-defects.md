@@ -125,6 +125,57 @@ and drop it once upstream carries an equivalent fix.
 - Guard: `tests/scripts/test_candidate_scripts.py`
   (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
 
+## Portable CI lost the WAL-capable SQLite guard
+
+- Fork patch identity: `ci-wal-capable-sqlite`.
+- Retiring `tests.yml` dropped its "Check SQLite runs WAL" step while the
+  replacement gate and nightly pinned uv 0.9.28 and CPython 3.11.14, whose
+  every published build links WAL-reset-vulnerable SQLite 3.50.4. Hermes then
+  runs DELETE mode and the WAL test arms skip, so CI could pass without
+  exercising WAL. The pins are now uv 0.12.13 and CPython 3.11.16 (SQLite
+  3.53.1), the pair upstream's retired workflow used; uv 0.9.28 cannot download
+  any newer 3.11 patch. The Linux uv artifact checksums match the published
+  `.sha256` files. Every portable Python lane fails closed on a vulnerable
+  interpreter before running tests.
+- Guards: `scripts/ci/tests/test_portable.py`
+  (`test_python_lanes_require_a_wal_capable_sqlite`,
+  `test_workflows_install_the_pinned_python`,
+  `test_uv_pin_is_consistent_across_installers`).
+
+## Launchd wrapped-child test predates update home scoping
+
+- Fork patch identity: `launchd-child-test-home-scope`.
+- `test_launchd_exclusion_protects_real_wrapped_process` (fork #52) predates
+  upstream #93349, which stops only manual gateways whose live home the update
+  owns. Its synthetic manual gateway had no readable home, so it was correctly
+  left running and the test failed on macOS. The test now binds both candidates
+  to the updating home, so the wrapped child survives only through the
+  service-ancestry exclusion (verified: removing that exclusion fails the test).
+- Guard: `tests/hermes_cli/test_gateway_launchd_supervised_child.py`.
+
+## Desktop core E2E lost its only caller
+
+- Fork patch identity: `ci-desktop-core-nightly`.
+- Retiring `ci.yaml` removed the only caller of `e2e-desktop-core.yml`, a
+  `workflow_call`-only workflow, so the deterministic Desktop core suite
+  (transcript integrity, backend lifecycle and orphans, clarify/approval) no
+  longer ran anywhere. Nightly now calls it and its `qualification` requires it.
+  It also runs on demand, on `ubuntu-latest`, because this repository has no
+  larger hosted runners.
+- The same retirement (#62) deleted `.github/actions/retry`, which this suite
+  and `live-providers.yml` still use, so both failed at their first install
+  step. The upstream composite action is restored unchanged.
+- Guards: `scripts/ci/tests/test_portable.py`
+  (`test_every_reusable_only_workflow_has_a_caller`,
+  `test_every_local_action_reference_resolves`).
+
+## Media send checks flood cooldown after chat lock acquisition
+
+- Fork patch identity: `telegram-media-flood-under-lock`.
+- A media send checked the shared flood cooldown before entering the per-chat send lock. When it queued behind a text send that armed a 120-second window, it later acquired the lock and uploaded anyway. Media sends now recheck the cooldown inside the serialization boundary before the API call and before the topic-anchor retry.
+- Guard: `tests/gateway/test_telegram_flood_coherence.py`
+  (`test_media_queued_behind_send_lock_rechecks_flood_cooldown`).
+
 ## Hindsight session lifecycle loses bank isolation, buffered turns, and recall scope
 
 - Fork patch identity: `hindsight-session-lifecycle`.

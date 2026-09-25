@@ -192,3 +192,24 @@ async def test_other_media_senders_return_typed_flood_result(tmp_path, monkeypat
     result = await getattr(adapter, sender)("4242", str(path), **kwargs)
     assert result.success is False
     assert (result.error or "").startswith("flood_control:"), result.error
+
+
+@pytest.mark.asyncio
+async def test_media_queued_behind_send_lock_rechecks_flood_cooldown(tmp_path):
+    """A queued media send refuses after a text send arms the shared flood window."""
+    adapter = _adapter()
+    adapter._bot.send_animation = AsyncMock()
+    path = tmp_path / "clip.gif"
+    path.write_bytes(b"GIF89a")
+
+    async with adapter._chat_send_lock("4242"):
+        pending = asyncio.create_task(adapter.send_animation("4242", str(path)))
+        await asyncio.sleep(0)
+        assert not pending.done()
+        adapter._record_send_flood_cooldown("4242", 120.0)
+
+    result = await pending
+
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:")
+    adapter._bot.send_animation.assert_not_awaited()
