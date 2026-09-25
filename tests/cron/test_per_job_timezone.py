@@ -213,3 +213,28 @@ class TestDueScanDispatchesInTheJobZone:
         assert jobs.get_due_jobs() == []
         stored = datetime.fromisoformat(jobs.get_job(job["id"])["next_run_at"])
         assert stored.astimezone(ZoneInfo("Asia/Manila")).strftime("%H:%M") == "09:00"
+
+
+def test_a_zone_edit_supersedes_an_unclaimed_occurrence_from_the_old_zone(store, monkeypatch):
+    """An occurrence the dispatcher took off the schedule but never claimed belongs to the old
+    wall clock. After a zone edit the due scan must not restore it over the recomputed run: that
+    fires the job at the old zone's hour (08:00 New York = 20:00 Manila), not at 08:00 Manila."""
+    from cron.occurrences import pending_slot_stamp
+
+    now = datetime.fromisoformat("2026-06-10T08:00:30-04:00")
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(prompt="moving", schedule="0 8 * * *", deliver="local")
+    raw = jobs.load_jobs()
+    for record in raw:
+        if record["id"] == job["id"]:
+            record["next_run_at"] = "2026-06-11T08:00:00-04:00"  # advanced past the slot below
+            record["pending_slot"] = pending_slot_stamp("2026-06-10T08:00:00-04:00", now)
+    jobs.save_jobs(raw)
+
+    edited = jobs.update_job(job["id"], {"timezone": "Asia/Manila"})
+    assert edited["next_run_at"] == "2026-06-11T08:00:00+08:00"
+
+    assert jobs.get_due_jobs() == []
+    stored = jobs.get_job(job["id"])
+    assert stored["next_run_at"] == "2026-06-11T08:00:00+08:00"
+    assert "pending_slot" not in stored
