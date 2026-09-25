@@ -115,6 +115,75 @@ async def test_reason_progress_and_final_survive_restart_and_delivery_failure(tm
     assert all(str(c.kwargs["metadata"]["thread_id"]) == "77" for c in adapter.send.call_args_list)
 
 
+@pytest.mark.asyncio
+async def test_stream_retry_only_sends_unsent_chunk(tmp_path):
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_text("A" * 3500 + "B" * 50, encoding="utf-8")
+    calls = []
+    failed = False
+
+    async def send(_chat, text, **_kwargs):
+        nonlocal failed
+        if text.startswith("```"):
+            calls.append(text)
+            if "B" in text and not failed:
+                failed = True
+                return SimpleNamespace(success=False)
+        return SimpleNamespace(success=True)
+
+    adapter = SimpleNamespace(send=send)
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        watcher = asyncio.create_task(runner._watch_update_progress(
+            poll_interval=.01, stream_interval=.01, timeout=10))
+        try:
+            for _ in range(300):
+                if failed and read_pending(tmp_path)[1].get("output_offset") == output.stat().st_size:
+                    break
+                await asyncio.sleep(.01)
+            assert failed
+            assert read_pending(tmp_path)[1]["output_offset"] == output.stat().st_size
+        finally:
+            watcher.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await watcher
+    assert sum("A" in text for text in calls) == 1
+    assert sum("B" in text for text in calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_final_retry_only_sends_unsent_chunk_and_then_final(tmp_path):
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_bytes(("A" * 3500 + "B" * 49 + "é").encode() + b"\xff")
+    finalize_update(tmp_path)
+    calls = []
+    failed = False
+
+    async def send(_chat, text, **_kwargs):
+        nonlocal failed
+        calls.append(text)
+        if text.startswith("```") and "B" in text and not failed:
+            failed = True
+            return SimpleNamespace(success=False)
+        return SimpleNamespace(success=True)
+
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=send)}
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is False
+        assert read_pending(tmp_path)[1]["output_offset"] == 3500
+        assert not any(text.startswith("✅") for text in calls)
+        assert await runner._send_update_notification() is True
+    chunks = [text for text in calls if text.startswith("```")]
+    assert sum("A" in text for text in chunks) == 1
+    assert sum("B" in text for text in chunks) == 2
+    assert sum(text.startswith("✅") for text in calls) == 1
+    assert read_pending(tmp_path) is None
+
+
 @pytest.mark.parametrize("case", ["pre_restart", "missing", "stale", "partial", "unknown", "pending_restart", "malformed", "failed", "success", "legacy"])
 def test_final_success_requires_completed_matching_receipt_and_runtime(tmp_path, case):
     data = pending(tmp_path, reason=case != "legacy")
