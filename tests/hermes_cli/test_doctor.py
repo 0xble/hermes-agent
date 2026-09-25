@@ -10,6 +10,7 @@ from argparse import Namespace
 
 import pytest
 
+import hermes_constants
 from hermes_cli import config as config_mod
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor_config import _has_provider_env_config
