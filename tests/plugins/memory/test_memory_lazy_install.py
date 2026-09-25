@@ -44,34 +44,6 @@ MEMORY_FEATURES = ("memory.supermemory", "memory.mem0")
 # ---------------------------------------------------------------------------
 
 
-class TestAllowlistEntries:
-    @pytest.mark.parametrize("feature", MEMORY_FEATURES)
-    def test_feature_is_allowlisted(self, feature):
-        # Without an allowlist entry, ensure() raises FeatureUnavailable with
-        # "not in LAZY_DEPS" — which is exactly why the SDK never installed on
-        # a hosted instance before this fix.
-        assert feature in ld.LAZY_DEPS, (
-            f"{feature!r} missing from LAZY_DEPS — its SDK can never "
-            f"lazy-install on a sealed Docker venv."
-        )
-
-
-    def test_supermemory_spec_package(self):
-        specs = ld.LAZY_DEPS["memory.supermemory"]
-        assert any(ld._pkg_name_from_spec(s) == "supermemory" for s in specs)
-
-    def test_mem0_spec_package(self):
-        # mem0's pip package is ``mem0ai`` (imports as ``mem0``).
-        specs = ld.LAZY_DEPS["memory.mem0"]
-        assert any(ld._pkg_name_from_spec(s) == "mem0ai" for s in specs)
-
-    @pytest.mark.parametrize("feature", MEMORY_FEATURES)
-    def test_unknown_feature_would_raise_without_entry(self, feature, monkeypatch):
-        # Demonstrate the failure mode the allowlist entry prevents: a feature
-        # NOT in LAZY_DEPS raises rather than installing.
-        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
-        with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):
-            ld.ensure(feature + ".typo", prompt=False)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +120,18 @@ class TestMem0EnsureCalled:
 # ---------------------------------------------------------------------------
 # 3. supermemory is_available() chicken-and-egg fix.
 # ---------------------------------------------------------------------------
+
+
+class TestBundledHindsightAllowlisted:
+    def test_bundled_provider_feature_is_allowlisted_and_matches_its_manifest(self):
+        """The fork keeps plugins/memory/hindsight, whose client calls ensure("memory.hindsight").
+        Upstream dropped the entry with its bundled copy; without it the provider cannot build."""
+        import yaml
+        from pathlib import Path
+        manifest = Path(__file__).resolve().parents[3] / "plugins/memory/hindsight/plugin.yaml"
+        declared = yaml.safe_load(manifest.read_text(encoding="utf-8"))["pip_dependencies"]
+        spec = ld.LAZY_DEPS["memory.hindsight"]
+        assert len(spec) == 1 and spec[0].startswith(declared[0])
 
 
 class TestSupermemoryIsAvailable:

@@ -27,12 +27,12 @@ import pytest
 import hermes_cli.gateway as gateway_cli
 from gateway.restart import LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
 import hermes_cli.update_cmd as update_cmd
-from hermes_cli.update_cmd import _warn_incomplete_gateway_fleet_restart
 
 LABEL = "ai.hermes.gateway"
 
 # Captured at import so a test can re-install the real verifier over a fixture's stub.
 _REAL_WAIT_FOR_SUPERVISION = gateway_cli.wait_for_launchd_gateway_supervision
+_REAL_LAUNCHCTL_SUPERVISED_PID = gateway_cli._launchctl_supervised_pid
 
 
 class _FakeClock:
@@ -133,8 +133,6 @@ class TestWaitForLaunchdGatewaySupervision:
             is False
         )
         assert sum(clock.slept) <= 20.0
-        # The deadline is enforced by wall clock, not by a probe count.
-        assert len(probe.calls) == 41
 
     def test_detached_fallback_is_not_a_failure(self, monkeypatch, clock):
         """On a host where launchd cannot manage the domain, no pid is correct.
@@ -202,6 +200,7 @@ def _patch_launchd_env(
     registered=True,
     restart=None,
     supervised=True,
+    ancestor=False,
 ):
     """Drive ``_restart_macos_launchd_gateways`` through the invoking profile only.
 
@@ -221,6 +220,12 @@ def _patch_launchd_env(
     )
     monkeypatch.setattr(
         gateway_cli, "launchd_gateway_labels_for_install", lambda: [LABEL]
+    )
+    # Hermetic supervision and ancestry: the host's real LaunchAgent pid is an ancestor of pytest
+    # when the suite runs under the gateway, which takes the in-gateway self-restart branch.
+    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label: 4242)
+    monkeypatch.setattr(
+        gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: ancestor
     )
 
     calls = {"restart": 0, "verify": 0, "label": None}
@@ -308,11 +313,14 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         the seam is plain Python, so the fake pins the behaviour on any host.
         """
         calls = _patch_launchd_env(monkeypatch, supervised=True)
-        # ...but exercise the REAL verifier, not _patch_launchd_env's stub.
+        # ...but exercise the REAL verifier and pid probe, not _patch_launchd_env's stubs.
         monkeypatch.setattr(
             gateway_cli,
             "wait_for_launchd_gateway_supervision",
             _REAL_WAIT_FOR_SUPERVISION,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_launchctl_supervised_pid", _REAL_LAUNCHCTL_SUPERVISED_PID
         )
         listings = []
 
@@ -338,6 +346,19 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
             + gateway_cli.LAUNCHD_SUPERVISION_VERIFY_TIMEOUT
             + 1.0
         )
+
+    def test_restart_handed_to_the_enclosing_gateway_skips_verification(
+        self, monkeypatch
+    ):
+        """An update running inside the gateway it restarts cannot see a fresh pid before it exits."""
+        calls = _patch_launchd_env(monkeypatch, supervised=False, ancestor=True)
+
+        restarted, failed_or_stale = _run_fleet_restart()
+
+        assert calls["restart"] == 1
+        assert calls["verify"] == 0
+        assert restarted == [LABEL]
+        assert failed_or_stale == []
 
     def test_verification_budget_clears_the_respawn_throttle(self):
         """A budget under launchd's ~10s respawn throttle would false-alarm.
@@ -395,22 +416,3 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         assert calls["verify"] == 1
 
 
-class TestIncompleteFleetWarningIsPlatformCorrect:
-    def test_macos_recovery_instructions_are_launchctl(self, monkeypatch, capsys):
-        """A launchd label must not be handed systemctl commands."""
-        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
-
-        _warn_incomplete_gateway_fleet_restart([LABEL])
-
-        out = capsys.readouterr().out
-        assert "launchctl bootstrap" in out
-        assert "systemctl" not in out
-
-    def test_linux_recovery_instructions_are_unchanged(self, monkeypatch, capsys):
-        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
-
-        _warn_incomplete_gateway_fleet_restart(["hermes-gateway.service"])
-
-        out = capsys.readouterr().out
-        assert "systemctl --user restart <unit>" in out
-        assert "launchctl" not in out

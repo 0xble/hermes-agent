@@ -64,7 +64,7 @@ def source_child_env() -> Dict[str, str]:
 
 class ErrorKind(str, Enum):
     """Failure taxonomy for :class:`FetchResult.error`; lets the orchestrator apply
-    kind-dependent policy once (stale-cache fallback on NETWORK/TIMEOUT, never AUTH_FAILED)."""
+    kind-dependent policy once (stale-cache fallback on NETWORK/TIMEOUT/RATE_LIMITED, never AUTH_FAILED)."""
 
     NOT_CONFIGURED = "not_configured"    # enabled but missing token/project/map
     BINARY_MISSING = "binary_missing"    # helper CLI not found / not installed
@@ -74,6 +74,7 @@ class ErrorKind(str, Enum):
     NETWORK = "network"                  # transport-level failure
     EMPTY_VALUE = "empty_value"          # backend returned nothing for a ref
     TIMEOUT = "timeout"                  # fetch exceeded its wall-clock budget
+    RATE_LIMITED = "rate_limited"        # backend quota exhausted; clears on its own
     INTERNAL = "internal"                # anything else (bug, unexpected shape)
 
 
@@ -136,6 +137,7 @@ _GENERIC_REMEDIATION = {
     ErrorKind.AUTH_EXPIRED: "Credentials expired — run `hermes secrets {name} setup` to re-authenticate.",
     ErrorKind.NETWORK: "Network problem reaching the secrets backend — check connectivity and retry.",
     ErrorKind.TIMEOUT: "Backend was slow — raise secrets.{name}.timeout_seconds if this recurs.",
+    ErrorKind.RATE_LIMITED: "Secrets backend rate limit reached — it resets on its own; avoid restarts until then.",
 }
 
 

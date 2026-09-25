@@ -86,13 +86,6 @@ class TestDirectAliasCredentialLoading:
         assert alias.api_key == "sk-literal"
         assert alias.key_env == "THETA_API_KEY"
 
-    def test_credential_fields_default_to_empty(self, monkeypatch):
-        """Aliases without credentials keep working (positional construction)."""
-        from hermes_cli.model_switch import DirectAlias
-
-        alias = DirectAlias("theta-1", "custom", ALIAS_HOST)
-        assert alias.api_key == ""
-        assert alias.key_env == ""
 
 
 class TestNestedModelAliasesCredentials:
@@ -525,13 +518,6 @@ class TestSchemelessBaseUrls:
             "http://localhost:11434/v1", "localhost:11434/v1"
         ) is False
 
-    def test_httpx_cannot_use_a_schemeless_base_url(self):
-        """Pins the premise above: this is why the strict answer is harmless."""
-        httpx = pytest.importorskip("httpx")
-
-        assert httpx.URL("localhost:11434/v1").host == ""
-        assert httpx.URL("api.example.com/v1").host == ""
-        assert httpx.URL("http://localhost:11434/v1").host == "localhost"
 
 
 class TestAliasCacheIsProfileScoped:

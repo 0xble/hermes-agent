@@ -32,6 +32,14 @@ def _fresh_structured_output_memo(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_onepassword_listing_cache(monkeypatch):
+    """1Password item listings are reused process-wide for a short window; a listing one test's
+    fake ``op`` produced must not answer the next test's backend."""
+    from agent.vault_backends import onepassword
+    monkeypatch.setattr(onepassword, "_LISTING_CACHE", {})
+
+
+@pytest.fixture(autouse=True)
 def _fast_retry_backoff(request, monkeypatch):
     """Short-circuit retry backoff for all tests in this directory.
 

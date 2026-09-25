@@ -25,6 +25,10 @@ class UnlockRequired(Exception):
         self.backend = backend
 
 
+class MissingCredential(RuntimeError):
+    """The backend's own credential is not configured; never silently treated as an empty result."""
+
+
 class LoginBackend(ABC):
     name: str                # config key: local | onepassword | bitwarden
     display_name: str        # user-facing
@@ -33,6 +37,8 @@ class LoginBackend(ABC):
     # Cards from an external manager have no site of their own: the browser fill binds them to the page it
     # is on and the user confirms that origin per fill. Local-vault cards keep their saved-origin binding.
     binds_cards_to_page: bool = False
+    # Named Camofox browser account this backend's items may be filled into ("" = any browser).
+    browser_account: str = ""
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)
@@ -134,7 +140,11 @@ def enabled_backends() -> List[LoginBackend]:
     for cls in external_backend_classes():
         if is_enabled(cls.name):
             section = cfg.get(cls.name) or {}
-            out.append(cls(section if isinstance(section, dict) else {}))
+            section = section if isinstance(section, dict) else {}
+            out.append(cls(section))
+            # Password managers with several accounts (1Password) add one backend per extra account.
+            if extra := getattr(cls, "additional_accounts", None):
+                out.extend(extra(section))
     return out
 
 

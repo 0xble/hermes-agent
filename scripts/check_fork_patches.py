@@ -45,8 +45,9 @@ EXPECTED_CONFIG = {
     "delegation.model": None,
     "auxiliary.review.model": None,
 }
-# Accepted upstream baseline: explicit GPT-6 adoption exception in MAINTENANCE.md.
-DEFAULT_BASELINE = "38c289c0146ed8c8b2b767eca1fff6f5b7e6382e"
+# Fallback only: the accepted baseline is read from MAINTENANCE.md (scripts/ci/release_baseline.py),
+# so a release sync that records its baseline there needs no second edit here.
+DEFAULT_BASELINE = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
 # Last published commit whose fork behavior is documented by a maintenance unit. Every later
 # commit must carry its own ``Fork-Patch:`` trailer. A sync may rewrite this SHA, so the floor
 # is also located by its exact subject when the SHA is gone.
@@ -109,6 +110,18 @@ def _owned_identities() -> set[str] | None:
             if in_identity_block:
                 owned.update(t.strip() for t in _OWNED_TOKEN.findall(stripped))
     return owned
+
+
+def _recorded_baseline() -> str | None:
+    """The checkout's own accepted baseline, when it ships the shared reader."""
+    reader = REPO / "scripts/ci/release_baseline.py"
+    if not reader.is_file():
+        return None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("release_baseline", reader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.accepted_release_baseline(REPO)
 
 
 def _is_ancestor(sha: str) -> bool:
@@ -323,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", type=Path, help="explicit source checkout for candidate verification")
     ap.add_argument("--source-only", action="store_true", help="check source ownership only, without asserting runtime promotion")
     ap.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser())
-    ap.add_argument("--baseline", default=DEFAULT_BASELINE, help="upstream release baseline commit")
+    ap.add_argument("--baseline", help="upstream release baseline commit (default: MAINTENANCE.md)")
     ap.add_argument("--trailer-floor", default=DEFAULT_TRAILER_FLOOR,
                     help="last commit whose history is classified by the maintenance units; later commits need "
                          "trailers. Located by exact subject when a sync has rewritten the SHA.")
@@ -331,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.repo:
         REPO = args.repo.resolve()
+    if not args.baseline:
+        args.baseline = _recorded_baseline() or DEFAULT_BASELINE
     if not _is_git_checkout():
         # A package-managed install has no history to check; say so instead of tracebacking.
         print(f"FAIL {REPO} is not a git checkout; the trailer and receipt checks need the source checkout")

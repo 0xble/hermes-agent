@@ -201,7 +201,7 @@ fallback_providers:
 | Messaging gateway (Telegram, Discord, etc.) | ✔ |
 | Desktop app / TUI chats | ✔ (a chain added or edited while a chat is open applies from its next turn) |
 | Subagent delegation | ✔ (`delegation.fallback_providers` when set; otherwise only unpinned children inherit the parent chain; `[]` disables) |
-| Cron jobs | ✔ (cron agents inherit configured fallback providers) |
+| Cron jobs | ✔ (unpinned jobs inherit the configured chain; a job with its own provider/model/base_url never falls back to it) |
 | Auxiliary tasks on `provider: auto` | ✔ (try per-task fallback, then the main fallback chain before built-in aux discovery) |
 
 :::tip
@@ -427,7 +427,7 @@ See [Subagent Delegation](./delegation.md) for full configuration details.
 
 ## Cron Job Providers
 
-Cron jobs inherit your configured `fallback_providers` chain (or legacy `fallback_model`) by default. Set `cron.fallback_providers` to replace that chain for cron agents only, or `[]` to disable cron provider fallback. Missing or `null` inherits the global chain. See [cron provider recovery](cron.md#provider-recovery) for an example. To use a different primary provider for a cron job, configure `provider` and `model` overrides on the cron job itself:
+Unpinned cron jobs inherit your configured `fallback_providers` chain (or legacy `fallback_model`) by default. A job pinned to its own `provider`, `model`, or `base_url` does not inherit it. Set `cron.fallback_providers` to replace the global chain for cron agents, including pinned jobs, or `[]` to disable cron provider fallback. Missing or `null` inherits the global chain only for unpinned jobs. See [cron provider recovery](cron.md#provider-recovery) for an example. To use a different primary provider for a cron job, configure `provider` and `model` overrides on the cron job itself:
 
 ```python
 cronjob(
@@ -439,7 +439,7 @@ cronjob(
 )
 ```
 
-See [Scheduled Tasks (Cron)](./cron.md) for full configuration details.
+To keep fallback for a job, leave it unpinned and choose its model with `cron.model` / `cron.model_provider` instead. See [Scheduled Tasks (Cron)](./cron.md#provider-recovery) for details.
 
 ---
 
@@ -458,4 +458,4 @@ See [Scheduled Tasks (Cron)](./cron.md) for full configuration details.
 | Title generation | Layered (see above) | `auxiliary.title_generation` |
 | Triage specifier | Layered (see above) | `auxiliary.triage_specifier` |
 | Delegation | Uses `delegation.fallback_providers` when declared; otherwise only unpinned children inherit the parent chain | `delegation.provider` / `delegation.model` / `delegation.fallback_providers` |
-| Cron jobs | `cron.fallback_providers` when declared, otherwise the global chain | `cron.fallback_providers`; per-job primary `provider` / `model` |
+| Cron jobs | `cron.fallback_providers` when declared (even for pinned jobs); otherwise the global chain for unpinned jobs only | `cron.fallback_providers`; per-job primary `provider` / `model` / `base_url` |
