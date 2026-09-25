@@ -13,6 +13,7 @@ import contextlib
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from typing import Optional
 
@@ -36,27 +37,46 @@ def active_memory_provider(config: Optional[dict]) -> Optional[str]:
     return name
 
 
+def _is_regular(path: Path, want: int) -> bool:
+    """True when *path* itself (not a symlink target) has file type *want*."""
+    try:
+        return stat.S_IFMT(os.lstat(path).st_mode) == want
+    except OSError:
+        return False
+
+
+def _copy_owner_only(src: Path, dst: Path) -> None:
+    shutil.copy2(src, dst, follow_symlinks=False)
+    with contextlib.suppress(OSError):
+        os.chmod(str(dst), 0o600)
+
+
 def clone_memory_provider_config(source_dir: Path, profile_dir: Path, provider: Optional[str]) -> bool:
     """Copy ``<provider>/`` and/or ``<provider>.json`` from *source_dir* into *profile_dir* when
     present. Files land owner-only like ``.env``: they can hold an API key. Returns True when
-    anything was copied."""
+    anything was copied.
+
+    Only real files and directories inside the source profile travel. A symlink is never
+    followed: it could point anywhere, and following it would turn a config clone into a copy
+    of unrelated data. Sockets, FIFOs and other special files are skipped rather than aborting
+    the clone."""
     if not provider:
         return False
     copied = False
     src_dir = source_dir / provider
-    if src_dir.is_dir():
-        shutil.copytree(src_dir, profile_dir / provider, dirs_exist_ok=True)
-        for root, _dirs, files in os.walk(profile_dir / provider):
+    if _is_regular(src_dir, stat.S_IFDIR):
+        for root, dirs, files in os.walk(src_dir, followlinks=False):
+            rel = Path(root).relative_to(src_dir)
+            dirs[:] = [d for d in dirs if _is_regular(Path(root) / d, stat.S_IFDIR)]
+            (profile_dir / provider / rel).mkdir(parents=True, exist_ok=True)
             for filename in files:
-                with contextlib.suppress(OSError):
-                    os.chmod(os.path.join(root, filename), 0o600)
+                src = Path(root) / filename
+                if _is_regular(src, stat.S_IFREG):
+                    _copy_owner_only(src, profile_dir / provider / rel / filename)
         copied = True
     src_file = source_dir / f"{provider}.json"
-    if src_file.is_file():
-        dst = profile_dir / f"{provider}.json"
-        shutil.copy2(src_file, dst)
-        with contextlib.suppress(OSError):
-            os.chmod(str(dst), 0o600)
+    if _is_regular(src_file, stat.S_IFREG):
+        _copy_owner_only(src_file, profile_dir / f"{provider}.json")
         copied = True
     return copied
 

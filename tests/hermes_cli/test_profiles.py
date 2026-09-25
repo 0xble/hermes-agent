@@ -238,6 +238,44 @@ class TestCreateProfile:
             assert stat.S_IMODE(cloned.stat().st_mode) == 0o600
         assert not (profile_dir / "mem0.json").exists()
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="symlinks and sockets need a POSIX filesystem")
+    def test_clone_config_never_follows_symlinks_out_of_the_provider_dir(self, profile_env):
+        """A symlink inside ``<provider>/`` (or a symlinked ``<provider>.json``) must not pull its
+        target's data into the clone, and a socket there must not abort the clone."""
+        import socket
+
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "private.txt").write_text("not profile config")
+        provider = default_home / "hindsight"
+        provider.mkdir()
+        (provider / "config.json").write_text('{"bank_id": "hermes"}')
+        (provider / "linked_dir").symlink_to(outside, target_is_directory=True)
+        (provider / "linked_file.txt").symlink_to(outside / "private.txt")
+        (default_home / "hindsight.json").symlink_to(outside / "private.txt")
+        sock = socket.socket(socket.AF_UNIX)
+        sock_path = provider / "s"
+        try:
+            sock.bind(str(sock_path))
+        except OSError:  # socket path too long for this temp dir
+            sock.close()
+            sock = None
+
+        try:
+            profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+        finally:
+            if sock is not None:
+                sock.close()
+
+        assert (profile_dir / "hindsight" / "config.json").read_text() == '{"bank_id": "hermes"}'
+        assert not os.path.lexists(profile_dir / "hindsight" / "linked_dir")
+        assert not os.path.lexists(profile_dir / "hindsight" / "linked_file.txt")
+        assert not os.path.lexists(profile_dir / "hindsight" / "s")
+        assert not os.path.lexists(profile_dir / "hindsight.json")
+
     @pytest.mark.parametrize("provider", ["../outside", "a/b", "..", "hind sight"])
     def test_clone_config_ignores_unsafe_memory_provider_names(self, profile_env, provider):
         """A hand-edited ``memory.provider`` must never aim the copy outside the source profile."""

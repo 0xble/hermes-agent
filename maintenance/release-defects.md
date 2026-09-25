@@ -1,7 +1,8 @@
 # Upstream release defects
 
 Load this unit when changing gateway status for parked profiles, Bot Desktop
-teardown during profile delete and rename, or the workspace snapshot pin.
+teardown during profile delete and rename, the workspace snapshot pin, or
+memory-provider config cloning.
 
 These are narrow fixes for defects that shipped in upstream `v2026.9.24` and
 were still present on upstream `main` when the fork synced. Offer each upstream
@@ -39,3 +40,14 @@ and drop it once upstream carries an equivalent fix.
   compared as canonical paths.
 - Guard: `tests/agent/test_compaction_prompt_rebuild.py`
   (`test_symlinked_spelling_of_the_launch_dir_replays_the_pin`).
+
+## Provider config clone follows symlinks
+
+- Fork patch identity: `clone-memory-config-no-symlinks`.
+- `--clone` copied the active memory provider's `<provider>/` directory with
+  `shutil.copytree`, which follows symlinks. A link inside it pulled the target's
+  files into the clone, and a socket aborted the clone. Only real files and
+  directories inside the source profile are copied now. Links and special files
+  are skipped.
+- Guard: `tests/hermes_cli/test_profiles.py`
+  (`test_clone_config_never_follows_symlinks_out_of_the_provider_dir`).
