@@ -189,3 +189,19 @@ def test_fork_patch_check_verifies_the_checkout_it_runs_from(tmp_path):
     spec.loader.exec_module(module)
     import hermes_cli
     assert module.REPO == Path(hermes_cli.__file__).resolve().parents[1]
+
+
+def test_check_receipt_ignores_gateways_on_a_separate_checkout(tmp_path, monkeypatch):
+    """A fleet row in the updater's ``external`` state serves a checkout this update did not touch."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    _receipt(tmp_path, fleet=[
+        {"profile": "default", "pid": 9, "code_sha": head, "state": "current"},
+        {"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "external", "code_root": "/srv/other"},
+    ])
+    assert mod.check_receipt(tmp_path) == []
+    # An ordinary row on other code still fails; only the external state is exempt.
+    _receipt(tmp_path, fleet=[{"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "current"}])
+    assert any("'lpg'" in p for p in mod.check_receipt(tmp_path))

@@ -88,3 +88,14 @@ and drop it once upstream carries an equivalent fix.
   clears a stale completion marker and refuses a second concurrent request.
 - Guard: `tests/gateway/test_update_lifecycle_notifications.py`
   (`test_slash_update_final_outcome_follows_the_detached_wrapper`).
+
+## Fork-patch check fails on a separate-checkout gateway
+
+- Fork patch identity: `fork-patch-check-external-fleet`.
+- `scripts/check_fork_patches.py` compared every update-receipt fleet row's
+  `code_sha` with the checkout, including rows the updater marks `external`
+  (gateways serving a separate checkout it did not touch). The live fleet probe
+  excludes those rows, so a successful update beside a legitimate second
+  checkout always failed. External rows are now skipped.
+- Guard: `tests/scripts/test_candidate_scripts.py`
+  (`test_check_receipt_ignores_gateways_on_a_separate_checkout`).
