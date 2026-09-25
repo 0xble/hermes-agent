@@ -266,6 +266,16 @@ try {
                         source.write_text('unexpected generated output', encoding='utf-8')
             self.assertEqual(source.read_text(encoding='utf-8'), 'unexpected generated output')
 
+    def test_source_guard_detects_source_created_during_ci(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(['git', 'init', '-q', str(root)], env=clean_git_env(), check=True)
+            (root / 'existing.py').write_text('x = 1\n', encoding='utf-8')
+            with patch.object(ci, 'ROOT', root):
+                with self.assertRaisesRegex(RuntimeError, 'new_source.py'):
+                    with ci.source_unchanged():
+                        (root / 'new_source.py').write_text('y = 2\n', encoding='utf-8')
+
     def test_tool_version_handles_node_v_prefix_and_rejects_wrong_pin(self):
         with patch.object(ci.subprocess, 'check_output', return_value='v' + ci.PINS['node'] + '\n'):
             ci.require_tools(('node',), {})

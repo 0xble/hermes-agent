@@ -107,12 +107,12 @@ def fingerprints(root: Path, paths: list[str]) -> dict[str, str]:
 
 @contextmanager
 def source_unchanged() -> Iterator[None]:
-    paths = source_files()
-    before = fingerprints(ROOT, paths)
+    before = fingerprints(ROOT, source_files(ROOT))
     try:
         yield
     finally:
-        after = fingerprints(ROOT, paths)
+        # Re-enumerate: source created during CI is a mutation too, not only edits to known files.
+        after = fingerprints(ROOT, source_files(ROOT))
         changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
         if changed:
             raise RuntimeError('CI modified source files: ' + ', '.join(changed))

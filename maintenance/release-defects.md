@@ -88,3 +88,16 @@ and drop it once upstream carries an equivalent fix.
   clears a stale completion marker and refuses a second concurrent request.
 - Guard: `tests/gateway/test_update_lifecycle_notifications.py`
   (`test_slash_update_final_outcome_follows_the_detached_wrapper`).
+
+## CI baseline and source guard read the wrong state
+
+- Fork patch identity: `ci-exact-head-baseline-and-new-source`.
+- The release-baseline exemption for exact-head plugin admission read
+  MAINTENANCE.md from the working tree and checked ancestry against the current
+  HEAD, so uncommitted metadata could exempt a committed head's catalog entries.
+  An explicit revision now reads its own committed MAINTENANCE.md and ancestry.
+- The CI source mutation guard re-fingerprinted only the initial file list, so
+  source created during setup or checks went unnoticed. It now re-enumerates.
+- Guards: `scripts/ci/tests/test_plugin_admission.py`
+  (`test_exact_head_baseline_comes_from_the_checked_revision_not_the_working_tree`),
+  `scripts/ci/tests/test_portable.py` (`test_source_guard_detects_source_created_during_ci`).

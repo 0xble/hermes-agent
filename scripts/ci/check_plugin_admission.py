@@ -80,7 +80,7 @@ def _matches_release(root: Path, name: str, head_sha: str | None) -> bool:
     A release sync brings upstream-admitted entries, whose pins may no longer be
     fetchable anonymously. Fork CI admits fork changes only.
     """
-    release = accepted_release_baseline(root)
+    release = accepted_release_baseline(root, head_sha)
     if not release:
         return False
     try:
