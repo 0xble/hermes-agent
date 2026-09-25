@@ -66,6 +66,14 @@ def _clean_env(tmp_path, monkeypatch):
     # install merely because the optional SDK is absent from the test env.
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
+    # The update_mode='append' capability is cached process-wide per (API URL, key), and every
+    # fixture here shares one URL and key: a capability test's mocked answer would otherwise decide
+    # later tests' document IDs. Give each test a fresh cache, and a default probe that reports a
+    # legacy API instead of contacting whatever listens on the fixture URL. Tests that need a modern
+    # API patch the probe themselves.
+    monkeypatch.setattr("plugins.memory.hindsight._append_capability_cache", {})
+    monkeypatch.setattr("plugins.memory.hindsight._fetch_hindsight_api_version", lambda *a, **kw: None)
+
     # The retain-operation path imports this exception solely to classify a
     # fake client's response. Supply the smallest matching SDK surface so the
     # mocked tests remain runnable without the optional Hindsight extra.
@@ -1388,6 +1396,18 @@ class TestSessionSwitchBufferFlush:
 # ---------------------------------------------------------------------------
 # update_mode='append' capability probe + retain dispatch
 # ---------------------------------------------------------------------------
+
+
+def test_capability_cache_does_not_leak_between_tests_first():
+    """Pairs with the next test: a cached modern answer here must not reach it."""
+    from plugins.memory import hindsight
+    hindsight._append_capability_cache[("http://localhost:9999", None)] = True
+    hindsight._append_capability_cache[("http://localhost:9999", "leak")] = True
+
+
+def test_capability_cache_does_not_leak_between_tests_second():
+    from plugins.memory import hindsight
+    assert hindsight._append_capability_cache == {}
 
 
 class TestUpdateModeAppendCapability:
