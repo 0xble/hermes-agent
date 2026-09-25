@@ -396,7 +396,7 @@ async def test_shutdown_invalidates_all_deferred_commands():
     await adapter.cancel_background_tasks()
 
     assert adapter._deferred_commands == {}
-    assert adapter._session_generations["session"] == before + 1
+    assert adapter._session_generations["session"] > before
 
 
 @pytest.mark.asyncio

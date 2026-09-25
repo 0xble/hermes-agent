@@ -166,3 +166,30 @@ async def test_deferred_command_runs_before_queued_prompt_with_one_session_owner
         await asyncio.sleep(0.01)
     assert order == ["turn", "/compress", "/undo", "follow-up"]
     assert not overlap
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_discards_deferred_command_behind_live_owner():
+    """Adapter teardown fences deferred commands before cancelling the owner that would drain them.
+
+    Cancelling the owner does not set its interrupt event, so its cleanup drained the queued
+    command and ran a transcript mutation during teardown.
+    """
+    adapter = _make_adapter()
+    sk = build_session_key(SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm"))
+    started = asyncio.Event()
+    ran: list[str] = []
+
+    async def handler(event):
+        ran.append(event.text)
+        if event.text == "turn":
+            started.set()
+            await asyncio.Event().wait()
+
+    adapter._message_handler = handler
+    await adapter.handle_message(_event("turn"))
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    adapter.defer_command_until_idle(sk, _event("/undo"))
+    await adapter.cancel_background_tasks()
+    await asyncio.sleep(0.05)
+    assert ran == ["turn"]
