@@ -1192,6 +1192,18 @@ def _cron_zone(timezone_name: Optional[str]):
     return get_timezone()
 
 
+def _in_job_zone(dt: datetime, job: Dict[str, Any]) -> datetime:
+    """*dt* expressed in a zoned job's own cron zone; unchanged for a job that follows the profile.
+
+    The due scan compares stored wall clocks and cron lattices. A zoned job's stored offset is its
+    native representation, so reading it in the profile zone mistakes it for a migration or an
+    expression edit and skips due occurrences."""
+    if not job.get("timezone"):
+        return dt
+    zone = _cron_zone(job.get("timezone"))
+    return dt.astimezone(zone) if zone is not None else dt
+
+
 def compute_next_run(
     schedule: Dict[str, Any], last_run_at: Optional[str] = None, job_timezone: Optional[str] = None,
 ) -> Optional[str]:
@@ -2965,7 +2977,7 @@ class _DueJob:
     scan: _DueScan
     next_run: str  # stored ISO string, compared string-exact against manual_run_at
     raw_next_run_dt: datetime  # as stored (may carry a pre-migration offset)
-    next_run_dt: datetime  # normalized to the configured tz
+    next_run_dt: datetime  # normalized to the job's cron zone (its own, else the profile's)
 
     @property
     def schedule(self) -> Dict[str, Any]:
@@ -2989,8 +3001,9 @@ def _repair_timezone_shifted_cron(d: _DueJob) -> bool:
     next_run_at is an absolute instant but the expr means local wall clock, so a TZ change can make
     it look due hours early. If the stored wall clock is still in the future, recompute so we fire
     at the intended local time. True when re-anchored (caller skips this tick). TRADE-OFF: a DST
-    offset change meeting the same conditions SKIPS the pending occurrence; accepted as rare."""
-    now = d.scan.now
+    offset change meeting the same conditions SKIPS the pending occurrence; accepted as rare. A zoned
+    job is compared in its own zone: its offset legitimately differs from the profile's."""
+    now = _in_job_zone(d.scan.now, d.job)
     if not (
         _instant_at_or_before(d.next_run_dt, now)
         and _timezone_offset_mismatch(d.raw_next_run_dt, now)
@@ -3206,7 +3219,7 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     if not next_run:
         return False
     raw_next_run_dt = datetime.fromisoformat(next_run)
-    d = _DueJob(job, scan, next_run, raw_next_run_dt, _ensure_aware(raw_next_run_dt))
+    d = _DueJob(job, scan, next_run, raw_next_run_dt, _in_job_zone(_ensure_aware(raw_next_run_dt), job))
     kind = d.kind
     recurring = kind in {"cron", "interval"}
     # Intentionally string-exact on raw stored values: trigger_job stamps the SAME isoformat string
