@@ -188,3 +188,14 @@ and drop it once upstream carries an equivalent fix.
   (`test_session_template_rotates_bank_without_redirecting_queued_writes`,
   `test_shutdown_flushes_buffered_tail`,
   `test_slow_old_prefetch_cannot_repopulate_new_session`).
+
+## Alias-cache isolation guard scanned nothing from a worktree
+
+- Fork patch identity: `alias-cache-guard-discovery`.
+- The DIRECT_ALIASES in-place-write guard skipped any path whose absolute parts
+  contained `.worktrees`, so from a linked worktree (the fork's standard review
+  and sync checkout) it scanned zero production files and passed vacuously.
+  Discovery now filters repository-relative parts, and a coverage assertion
+  requires the scan to reach the alias-cache owner.
+- Guard: `tests/hermes_cli/test_model_alias_credentials.py`
+  (`test_the_scan_covers_the_alias_cache_owner`).
