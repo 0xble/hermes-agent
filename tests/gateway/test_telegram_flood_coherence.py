@@ -256,3 +256,20 @@ def test_timedelta_retry_after_keeps_the_full_penalty():
     err = _FloodError(0)
     err.retry_after = timedelta(seconds=90)
     assert _telegram_retry_after(err) == 90.0
+
+
+@pytest.mark.asyncio
+async def test_album_reports_the_platform_penalty_beyond_the_local_window_cap(monkeypatch):
+    """The per-chat window caps at 300s; the album result must still carry Telegram's full deadline."""
+    adapter = _adapter()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+    adapter._bot.send_media_group = AsyncMock(side_effect=_FloodError(3600.0))
+    adapter._bot.send_photo = AsyncMock()
+
+    result = await adapter.send_multiple_images(
+        "4242", [("https://example.com/a.png", "a"), ("https://example.com/b.png", "b")])
+
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:"), result.error
+    assert result.retry_after is not None and result.retry_after > 3500
+    adapter._bot.send_photo.assert_not_awaited()

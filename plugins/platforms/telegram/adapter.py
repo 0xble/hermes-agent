@@ -5651,11 +5651,14 @@ class TelegramAdapter(BasePlatformAdapter):
         animations = [img for img in images if is_anim(img[0])]
         photos = [img for img in images if not is_anim(img[0])]
         delivered = False
+        # Loop-time deadline of the longest platform flood penalty seen. The per-chat window is capped
+        # at 300s, so an undelivered album must report the platform's own deadline, not the window.
+        flood_deadline: Optional[float] = None
         if animations:
             anim_result = await super().send_multiple_images(chat_id, animations, metadata, human_delay=human_delay)
             delivered = anim_result.success
         if not photos:
-            return self._album_result(chat_id, delivered)
+            return self._album_result(chat_id, delivered, flood_deadline)
         from urllib.parse import unquote as _unquote
         CHUNK = 10  # Telegram's album limit
         chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
@@ -5707,6 +5710,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     # A platform flood refusal: arm the per-chat window instead of firing a per-image
                     # fallback into the same penalty.
                     self._record_send_flood_cooldown(chat_id, wait)
+                    deadline = asyncio.get_running_loop().time() + wait
+                    flood_deadline = deadline if flood_deadline is None else max(flood_deadline, deadline)
                     logger.warning(
                         "[%s] media group refused for flood control (chunk %d/%d, retry_after=%.1fs)", self.name,
                         chunk_idx + 1, len(chunks), wait)
@@ -5723,16 +5728,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 for tmp in temp_paths:
                     with contextlib.suppress(OSError):
                         os.remove(tmp)
-        return self._album_result(chat_id, delivered)
+        return self._album_result(chat_id, delivered, flood_deadline)
 
-    def _album_result(self, chat_id: str, delivered: bool) -> SendResult:
-        """A wholly undelivered album answers with the flood contract while the chat's window is
-        armed (an album refusal or a per-image fallback refusal both arm it), so the caller can
-        reschedule instead of reading a permanent 'all images failed to send'."""
+    def _album_result(self, chat_id: str, delivered: bool, flood_deadline: Optional[float] = None) -> SendResult:
+        """A wholly undelivered album answers with the flood contract while the chat is penalised
+        (an album refusal or a per-image fallback refusal both arm the window), so the caller can
+        reschedule instead of reading a permanent 'all images failed to send'. The wait is the
+        longer of the local window and the platform's own remaining deadline: the window is capped
+        at 300s, and reporting it for a multi-hour penalty would redeliver early and hide an absurd
+        penalty from the delivery ledger."""
         if not delivered:
-            cooldown = self._send_flood_cooldown_remaining(chat_id)
-            if cooldown is not None:
-                return _flood_cap_result(cooldown)
+            waits = [w for w in (self._send_flood_cooldown_remaining(chat_id),) if w is not None]
+            if flood_deadline is not None:
+                remaining = flood_deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    waits.append(remaining)
+            if waits:
+                return _flood_cap_result(max(waits))
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     async def send_image_file(
