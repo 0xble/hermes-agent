@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import collections
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -221,7 +222,8 @@ def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT, *, keep_pending: Callable
     try:
         return future.result(timeout=timeout)
     except TimeoutError:
-        if keep_pending is not None and not future.done():
+        # Keep it even if it finished just now: done() racing the timeout says nothing about success.
+        if keep_pending is not None:
             keep_pending(future)
         raise
 
@@ -1121,24 +1123,20 @@ class HindsightMemoryProvider(MemoryProvider):
         def _job() -> None:
             if in_flight:
                 earlier = in_flight[0]
-                try:
-                    # Give the earlier send one more timeout to settle; if it is still running,
-                    # this attempt fails and the backlog backs off again without resending.
-                    resp = earlier.result(timeout=self._timeout)
-                except TimeoutError:
-                    if not earlier.done():
-                        raise TimeoutError(f"Hindsight {label} from an earlier attempt is still in flight") from None
-                    in_flight.clear()
-                    logger.debug("Hindsight %s earlier attempt timed out server-side; sending again", label)
-                except Exception as exc:  # the earlier attempt failed: sending again is safe
-                    in_flight.clear()
-                    logger.debug("Hindsight %s earlier attempt failed; sending again: %s", label, exc)
-                else:
-                    in_flight.clear()
+                # Give the earlier send one more timeout to settle, then judge it by its own outcome
+                # (never by a wait's TimeoutError, which can race its completion). Still running:
+                # fail this attempt so the backlog backs off without resending.
+                concurrent.futures.wait([earlier], timeout=self._timeout)
+                if not earlier.done():
+                    raise TimeoutError(f"Hindsight {label} from an earlier attempt is still in flight")
+                in_flight.clear()
+                failure = BaseException("cancelled") if earlier.cancelled() else earlier.exception()
+                if failure is None:
                     if retain_async and track_ops:
-                        self._track_retain_ops(resp, bank_id)
+                        self._track_retain_ops(earlier.result(), bank_id)
                     logger.debug("Hindsight %s landed after its timeout; not resending", label)
                     return
+                logger.debug("Hindsight %s earlier attempt failed; sending again: %s", label, failure)
             item = self._build_retain_kwargs(content, context=retain_context, metadata=metadata,
                                              tags=tags, update_mode=update_mode)
             logger.debug("Hindsight %s: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",

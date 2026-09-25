@@ -2052,6 +2052,63 @@ class TestRetainRetry:
         assert len(writes) == 1
         assert p._client.aretain_batch.await_count == 1
 
+    def test_wait_timeout_racing_completion_still_hands_over_the_future(self, monkeypatch):
+        """A send that completes right as the wait times out must still be kept, not resent blind."""
+        import concurrent.futures
+        import plugins.memory.hindsight as hindsight_mod
+
+        class _CompletesAsTheWaitTimesOut(concurrent.futures.Future):
+            def result(self, timeout=None):
+                if not self.done():
+                    self.set_result("landed")
+                    raise TimeoutError()
+                return super().result(timeout)
+
+        racy = _CompletesAsTheWaitTimesOut()
+
+        def _schedule(coro, loop, **kwargs):
+            coro.close()
+            return racy
+
+        monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", _schedule)
+        kept = []
+
+        async def _noop():
+            return None
+
+        with pytest.raises(TimeoutError):
+            hindsight_mod._run_sync(_noop(), timeout=0.01, keep_pending=kept.append)
+        assert kept == [racy]
+
+    def test_retry_judges_the_earlier_send_by_its_outcome_not_the_wait(self, provider, monkeypatch):
+        """The earlier send finishing as the retry's wait times out is a success: no second send."""
+        import concurrent.futures
+
+        p = self._append_provider(provider, monkeypatch)
+        p._timeout = 0.01
+        earlier = concurrent.futures.Future()
+        sends = []
+
+        def _retain_batch(item, *, keep_pending=None, **kwargs):
+            sends.append(item)
+            keep_pending(earlier)
+            raise TimeoutError()
+
+        monkeypatch.setattr(p, "_retain_batch", _retain_batch)
+        job = p._make_turn_retain_job(["turn"], document_id="doc", update_mode="append", label="retain")
+        with pytest.raises(TimeoutError):
+            job()
+
+        real_wait = concurrent.futures.wait
+
+        def _wait_that_races(fs, timeout=None, **kwargs):
+            earlier.set_result(SimpleNamespace(ok=True))  # lands exactly as the wait gives up
+            return real_wait(fs, timeout=0)
+
+        monkeypatch.setattr(concurrent.futures, "wait", _wait_that_races)
+        job()
+        assert len(sends) == 1
+
     def test_timed_out_write_that_failed_is_sent_again(self, provider, monkeypatch):
         p = self._append_provider(provider, monkeypatch)
         p._timeout = 0.2
