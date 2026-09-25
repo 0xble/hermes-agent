@@ -224,9 +224,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Hindsight test fixture shares one URL and key. A capability test's mocked "modern API" answer
   therefore decided later tests' document IDs, making `TestSyncTurn` order-dependent, and tests
   that never patched the probe contacted whatever listened on the fixture URL. The autouse
-  fixture now gives each test a fresh cache and a legacy-API default probe.
+  fixture now gives each test a fresh cache and a legacy-API default probe. Providers were also never
+  shut down, so their retain writer threads (23 after a full module run) outlived the test and, with
+  the retry backlog, kept retrying queued jobs under restored globals; the autouse
+  `_stop_retain_writers` fixture joins every provider's writer while the test's patches still apply.
 - Guard: `tests/plugins/memory/test_hindsight_provider.py`
-  (`test_capability_cache_does_not_leak_between_tests_first`/`_second`).
+  (`test_capability_cache_does_not_leak_between_tests_first`/`_second`; `_stop_retain_writers` fails
+  a test whose writer does not stop).
 
 ## Telegram album flood refusal read as a permanent failure
 
@@ -300,3 +304,34 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_malformed_bank_id_template_falls_back`, `test_csv_recall_tags_reach_the_sdk_as_a_list`,
   `TestRetainRetry`, including `test_queued_jobs_do_not_bypass_the_retry_delay` and
   `test_prefetch_barrier_waits_for_a_pending_retry`).
+
+## Telegram legacy links lost titled or angle-bracket destinations
+
+- Fork patch identity: `telegram-link-targets`.
+- The unsupported-link scrubber parses CommonMark destinations (`[t](url "Title")`, `[t](<url>)`) with
+  `_markdown_link_target()` and keeps such links, but the legacy MarkdownV2 converters in
+  `format_message()` re-validated the raw group: an ordinary link with a title or angle brackets lost
+  its URL and became plain text, and an explicit numeric citation shipped the title inside the Telegram
+  URL. Both converters now validate and emit the parsed destination, and a citation with an unsupported
+  target degrades to its number.
+- Guard: `tests/gateway/test_telegram_unsupported_link_targets.py`
+  (`test_link_with_title_keeps_its_url`, `test_angle_bracket_destination_keeps_its_url`,
+  `test_citation_with_title_does_not_put_the_title_in_the_url`,
+  `test_citation_with_unsupported_target_degrades_to_its_number`).
+
+## Hindsight timed-out retains resent and empty recall_types overridden
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- `_run_sync()` stops waiting at the provider timeout but leaves the coroutine running on the shared
+  loop, so the retain backlog could resend an append that later landed, writing the same turns twice.
+  A timed-out send is now always kept with its job (even if it completed as the wait timed out): the
+  retry first lets it settle (one more timeout) and judges it by its own outcome, skipping the resend if
+  it landed, resending only if it failed, and otherwise failing the attempt and backing off. An
+  explicit `recall_types: []` was also replaced with `["observation"]`, unlike the equivalent empty
+  string; only an unset key now gets the default.
+- Guard: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_timed_out_write_that_lands_is_not_sent_again`, `test_timed_out_write_that_failed_is_sent_again`,
+  `test_wait_timeout_racing_completion_still_hands_over_the_future`,
+  `test_retry_judges_the_earlier_send_by_its_outcome_not_the_wait`,
+  `test_explicit_empty_recall_types_disables_the_filter`).
+

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import collections
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -208,13 +209,23 @@ def _get_loop() -> asyncio.AbstractEventLoop:
         return _loop
 
 
-def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
-    """Schedule *coro* on the shared loop and block until done."""
+def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT, *, keep_pending: Callable[[Any], None] | None = None):
+    """Schedule *coro* on the shared loop and block until done.
+
+    A timeout stops the wait, not the coroutine. *keep_pending* receives the still-running
+    future on timeout so a caller that must not repeat a write can observe its outcome.
+    """
     from agent.async_utils import safe_schedule_threadsafe
     future = safe_schedule_threadsafe(coro, _get_loop())
     if future is None:
         raise RuntimeError("Hindsight loop unavailable")
-    return future.result(timeout=timeout)
+    try:
+        return future.result(timeout=timeout)
+    except TimeoutError:
+        # Keep it even if it finished just now: done() racing the timeout says nothing about success.
+        if keep_pending is not None:
+            keep_pending(future)
+        raise
 
 
 RETAIN_SCHEMA = {
@@ -525,15 +536,15 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
         return self._client
 
-    def _run_sync(self, coro):
+    def _run_sync(self, coro, *, keep_pending: Callable[[Any], None] | None = None):
         """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+        return _run_sync(coro, timeout=self._timeout, keep_pending=keep_pending)
 
-    def _run_hindsight_operation(self, operation):
+    def _run_hindsight_operation(self, operation, *, keep_pending: Callable[[Any], None] | None = None):
         """Run an async client operation; for local_embedded, a stale-daemon
         connection failure recreates the client and retries once."""
         try:
-            return self._run_sync(operation(self._get_client()))
+            return self._run_sync(operation(self._get_client()), keep_pending=keep_pending)
         except Exception as exc:
             text = f"{type(exc).__name__}: {exc}".lower()
             if self._mode != "local_embedded" or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
@@ -541,7 +552,7 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.info("Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s", exc)
             self._client = None
             self._client = client = self._get_client()
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), keep_pending=keep_pending)
 
     # -- retain writer thread + server-side visibility -------------------------
 
@@ -865,7 +876,8 @@ class HindsightMemoryProvider(MemoryProvider):
         if isinstance(configured_types, str):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
-            self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
+            # Only an unset key gets the default; an explicit empty list disables the filter.
+            self._recall_types = ["observation"] if configured_types is None else list(configured_types)
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
@@ -1088,12 +1100,12 @@ class HindsightMemoryProvider(MemoryProvider):
         return item
 
     def _retain_batch(self, item: dict, *, bank_id: str, document_id: str | None = None,
-                      retain_async: bool | None = None):
+                      retain_async: bool | None = None, keep_pending: Callable[[Any], None] | None = None):
         """Dispatch one item via aretain_batch (bank_id/document_id/retain_async are
         call-level args, never item keys)."""
         kwargs: Dict[str, Any] = {"bank_id": bank_id, "items": [item], "document_id": document_id, "retain_async": retain_async}
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs))
+        return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs), keep_pending=keep_pending)
 
     def _make_turn_retain_job(self, turns: list[str], *, document_id: str, update_mode: str | None,
                               label: str, track_ops: bool = True) -> Callable[[], None]:
@@ -1104,13 +1116,33 @@ class HindsightMemoryProvider(MemoryProvider):
         lineage = (("session", self._session_id), ("parent", self._parent_session_id))
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
         bank_id, retain_async, retain_context = self._bank_id, self._retain_async, self._retain_context
+        # A timed-out send keeps running on the shared loop. Re-sending it while it may still land
+        # would append the same turns twice, so a retry first settles the earlier attempt.
+        in_flight: list = []
 
         def _job() -> None:
+            if in_flight:
+                earlier = in_flight[0]
+                # Give the earlier send one more timeout to settle, then judge it by its own outcome
+                # (never by a wait's TimeoutError, which can race its completion). Still running:
+                # fail this attempt so the backlog backs off without resending.
+                concurrent.futures.wait([earlier], timeout=self._timeout)
+                if not earlier.done():
+                    raise TimeoutError(f"Hindsight {label} from an earlier attempt is still in flight")
+                in_flight.clear()
+                failure = BaseException("cancelled") if earlier.cancelled() else earlier.exception()
+                if failure is None:
+                    if retain_async and track_ops:
+                        self._track_retain_ops(earlier.result(), bank_id)
+                    logger.debug("Hindsight %s landed after its timeout; not resending", label)
+                    return
+                logger.debug("Hindsight %s earlier attempt failed; sending again: %s", label, failure)
             item = self._build_retain_kwargs(content, context=retain_context, metadata=metadata,
                                              tags=tags, update_mode=update_mode)
             logger.debug("Hindsight %s: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
                          label, bank_id, document_id, update_mode, retain_async, len(content), len(turns))
-            resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async)
+            resp = self._retain_batch(item, bank_id=bank_id, document_id=document_id, retain_async=retain_async,
+                                      keep_pending=in_flight.append)
             # Async retains are only *accepted* here; track the op id(s) so the
             # next-turn prefetch can wait for true server-side completion.
             if retain_async and track_ops:

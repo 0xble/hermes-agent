@@ -74,6 +74,27 @@ class TestLegacyMarkdownV2LinkDegrade:
         assert r"[1234567](https://github.com/acme/project/commit/1234567)" in result
         assert r"[\[1234567\]]" not in result
 
+    def test_link_with_title_keeps_its_url(self):
+        result = self._adapter().format_message('See [Docs](https://example.com/x "Title").')
+        assert "[Docs](https://example.com/x)" in result
+        assert "Title" not in result
+
+    def test_angle_bracket_destination_keeps_its_url(self):
+        result = self._adapter().format_message("See [Docs](<https://example.com/x>).")
+        assert "[Docs](https://example.com/x)" in result
+
+    def test_citation_with_title_does_not_put_the_title_in_the_url(self):
+        result = self._adapter().format_message(
+            'A grounded claim.[[3](https://example.com/source "Source")]'
+        )
+        assert r"[\[3\]](https://example.com/source)" in result
+        assert "Source" not in result
+
+    def test_citation_with_unsupported_target_degrades_to_its_number(self):
+        result = self._adapter().format_message("A claim.[[3](@session:default/abc)]")
+        assert "](" not in result
+        assert "@session:" not in result
+
 
 class TestRichMessageLinkDegrade:
     """_rich_message_payload feeds rich sends, final edits, and drafts."""

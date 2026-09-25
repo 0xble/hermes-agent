@@ -6177,17 +6177,24 @@ class TelegramAdapter(BasePlatformAdapter):
         # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.
         text = _degrade_unsupported_markdown_links(text, preserve_citation_brackets=False)
 
+        # Validate and emit the parsed destination, not the raw group: a CommonMark title
+        # (``(url "Title")``) or angle-bracket destination (``(<url>)``) is otherwise either
+        # rejected as unsupported or shipped inside the Telegram URL.
         def _convert_citation(m):
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
+            target = _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
+                return _ph(_escape_mdv2(m.group(1)))
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[\\[{_escape_mdv2(m.group(1))}\\]]({url})')
 
         text = _EXPLICIT_NUMERIC_CITATION_RE.sub(_convert_citation, text)
 
         def _convert_link(m):
             display = _escape_mdv2(m.group(1))
-            if not _tg_link_target_supported(m.group(2)):
+            target = _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
                 return _ph(display)
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{display}]({url})')
 
         text = _MD_LINK_RE.sub(_convert_link, text)
