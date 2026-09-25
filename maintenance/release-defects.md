@@ -416,3 +416,17 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Regression coverage: `test_hindsight_provider.py`
   (`test_disabled_provider_makes_no_network_calls`, `test_shutdown_unregisters_the_atexit_callback`,
   `test_default_fixture_never_installs_for_an_outdated_sdk`).
+
+## Hindsight shared-loop startup race and stale parent on session switch
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- `_get_loop()` released its lock as soon as the loop thread was started, before the loop ran. A
+  caller in that window saw `is_running()` False and replaced the loop, so one cached async client
+  could span two event loops and an untracked loop thread stayed behind. Initialization now waits for
+  the loop to signal it is running before releasing ownership.
+- `on_session_switch()` only updated the parent when one was supplied, so switching from a branch to
+  an unrelated session kept the old parent and later retains tagged it with the wrong lineage. An
+  explicit empty parent on a switch to a different session now clears it; a rewind of the same
+  session keeps it.
+- Regression coverage: `test_hindsight_provider.py` (`test_shared_loop_is_not_replaced_during_startup`,
+  `test_switch_to_unrelated_session_clears_the_old_parent`, `test_rewind_of_the_same_session_keeps_its_parent`).
