@@ -7,8 +7,8 @@ scope: parked-profile gateway status and restart, Bot Desktop teardown, the work
 snapshot pin, memory-provider config cloning, `/update` reporting, deferred slash
 commands, portable CI and its source guards, launchd test scoping, desktop E2E
 wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
-session lifecycle, the alias-cache isolation guard, and gateway orphan-reaper
-home scoping.
+session lifecycle, the alias-cache isolation guard, gateway orphan-reaper
+home scoping, and per-run cron terminal isolation.
 
 Each section is a narrow fix for a defect found while syncing to upstream
 `v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
@@ -476,3 +476,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_self_restart_pending_is_judged_by_the_replacement_gateway`), plus a replay of the
   2026-09-25 10:09 receipt: the old code reports failure, the patched code reports success
   (`b6fb36d94a21`).
+
+## Concurrent cron runs share one local shell
+
+- Fork patch identity: `cron-run-terminal-isolation`.
+- Cron runs carry no session key, so every session-less run collapsed onto the shared `"default"`
+  local terminal environment, whose shell snapshot keeps exports between commands. On 2026-09-24 a
+  fork-sync cron job exported `PATH=~/Repos/hermes-agent/.venv/bin:$PATH`; the concurrent
+  `curate-skills` run's bare `hermes` then resolved to that stale checkout and rejected
+  `hermes observations` as an unknown command. `_CronRunScope` now registers its run task id, and on
+  the local backend a registered session-less run keys its own environment; its `delegate_task`
+  children still share it through the container alias. Docker, SSH and other sandboxed backends keep
+  their shared or profile container contract. Upstream `main` still collapses these runs; retire
+  this when upstream keys session-less scheduled runs separately.
+- Regression coverage: `tests/tools/test_shared_container_task_id.py`
+  (`test_cron_run_does_not_see_another_runs_exports`,
+  `test_concurrent_cron_runs_get_distinct_environments`,
+  `test_cron_subagent_shares_its_parent_run_environment`,
+  `test_persistent_docker_cron_run_keeps_the_profile_container`).
