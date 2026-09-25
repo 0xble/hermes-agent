@@ -252,6 +252,34 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
             os.chdir(old_cwd)
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_symlinked_spelling_of_the_launch_dir_replays_the_pin(self):
+        """The launch dir comes from os.getcwd() (symlinks resolved); a later build binding a
+        symlinked spelling of that same directory is still one workspace and replays the pin."""
+        import os, tempfile, shutil
+        from pathlib import Path
+        from agent.system_prompt import build_system_prompt, invalidate_system_prompt
+
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-alias-")).resolve()
+        old_cwd = os.getcwd()
+        try:
+            repo = _init_repo(tmp / "proj", "init commit")
+            alias = tmp / "alias"
+            alias.symlink_to(repo, target_is_directory=True)
+            os.chdir(repo)
+            agent = self._pin_agent()
+            with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                 patch("agent.prompt_builder.build_environment_hints", return_value="ENV HINTS"):
+                with patch("agent.system_prompt.resolve_context_cwd", return_value=None):
+                    p1 = build_system_prompt(agent)
+                self.assertIn("Status: clean", p1)
+                (repo / "untracked.txt").write_text("wip\n")
+                invalidate_system_prompt(agent)
+                with patch("agent.system_prompt.resolve_context_cwd", return_value=alias):
+                    self.assertEqual(build_system_prompt(agent), p1)
+        finally:
+            os.chdir(old_cwd)
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_agent_that_did_not_build_the_prompt_replays_the_persisted_snapshot(self):
         """Resume / gateway / TUI shape: a fresh agent rebuilds (compaction, a first /compress) after
         the repo moved and replays the snapshot its session row already holds — unless that prompt
@@ -260,7 +288,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-resume-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-resume-")).resolve()  # git reports canonical roots
         try:
             repo, other = _init_repo(tmp / "proj", "init commit"), _init_repo(tmp / "other", "init other")
 
@@ -290,7 +318,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-empty-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-empty-")).resolve()  # git reports canonical roots
         try:
             repo = _init_repo(tmp / "proj", "init commit")
             stored = f"Host: x\nUser home directory: /h\nCurrent working directory: {repo}\n\nBODY"

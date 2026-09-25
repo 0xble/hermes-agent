@@ -1,7 +1,7 @@
 # Upstream release defects
 
-Load this unit when changing gateway status for parked profiles or Bot Desktop
-teardown during profile delete and rename.
+Load this unit when changing gateway status for parked profiles, Bot Desktop
+teardown during profile delete and rename, or the workspace snapshot pin.
 
 These are narrow fixes for defects that shipped in upstream `v2026.9.24` and
 were still present on upstream `main` when the fork synced. Offer each upstream
@@ -27,3 +27,15 @@ and drop it once upstream carries an equivalent fix.
   screen is stopped.
 - Guard: `tests/hermes_cli/test_profiles.py`
   (`test_profile_rename_clears_a_stale_human_lease_when_the_screen_was_already_stopped`).
+
+## Workspace pin misses a symlinked cwd
+
+- Fork patch identity: `workspace-pin-canonical-cwd`.
+- The workspace snapshot pin compared cwd spellings. The launch dir comes from
+  `os.getcwd()`, which resolves symlinks (`/private/var` on macOS), while a
+  bound cwd keeps its configured spelling (`/var`). One directory produced two
+  keys, so a compaction rebuild re-probed git and changed the prompt bytes.
+  Both the pin key and the persisted `Current working directory` are now
+  compared as canonical paths.
+- Guard: `tests/agent/test_compaction_prompt_rebuild.py`
+  (`test_symlinked_spelling_of_the_launch_dir_replays_the_pin`).

@@ -596,9 +596,10 @@ def _alibaba_identity_part(agent: Any) -> List[str]:
 def _workspace_pin_key() -> str:
     """The directory the workspace probe inspects, which is also the prompt's ``Current working
     directory``: a build with no cwd bound (launch dir) and a later one binding that same dir
-    (TUI ``/compress``) are one workspace, not two."""
+    (TUI ``/compress``) are one workspace, not two.  Canonical, because the launch dir comes from
+    ``os.getcwd()`` (symlinks resolved) while a bound cwd keeps its configured spelling."""
     try:
-        return str(resolve_context_cwd() or resolve_agent_cwd())
+        return os.path.realpath(resolve_context_cwd() or resolve_agent_cwd())
     except OSError:  # deleted cwd
         return ""
 
@@ -648,7 +649,7 @@ def _seed_workspace_pin(agent: Any, key: str) -> None:
     if not prompt:
         return
     stored_cwd = runtime_host_value(prompt, "Current working directory")
-    if stored_cwd and stored_cwd != key:
+    if stored_cwd and os.path.realpath(stored_cwd) != key:
         return
     block = _persisted_workspace_block(prompt, key)
     # Only a real snapshot is adopted: a prompt without one (built on a surface without the
