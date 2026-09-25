@@ -1512,6 +1512,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Retry stale private-topic media replies once without the topic anchor. Serialized per chat with
         ``send()`` so a file upload cannot land between two chunks of the text it accompanies."""
         async with self._chat_send_lock(send_kwargs.get("chat_id")):
+            cooldown = self._send_flood_cooldown_remaining(send_kwargs.get("chat_id"))
+            if cooldown is not None:
+                logger.warning(
+                    "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing %s upload without an API call",
+                    self.name, send_kwargs.get("chat_id"), cooldown, media_label)
+                raise _MediaFloodRefusal(cooldown)
             try:
                 return await _await_with_thread_deadline(
                     send_fn(**send_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
@@ -1527,6 +1533,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 retry_kwargs["reply_to_message_id"] = None
                 retry_kwargs.pop("message_thread_id", None)
                 retry_kwargs.pop("direct_messages_topic_id", None)
+                cooldown = self._send_flood_cooldown_remaining(retry_kwargs.get("chat_id"))
+                if cooldown is not None:
+                    logger.warning(
+                        "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing %s upload without an API call",
+                        self.name, retry_kwargs.get("chat_id"), cooldown, media_label)
+                    raise _MediaFloodRefusal(cooldown)
                 return await _await_with_thread_deadline(
                     send_fn(**retry_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
 
