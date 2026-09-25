@@ -1,12 +1,19 @@
 # Upstream release defects
 
-Load this unit when changing gateway status for parked profiles, Bot Desktop
-teardown during profile delete and rename, the workspace snapshot pin, or
-memory-provider config cloning, or restarting a parked profile.
+Load this unit before changing any file named in a section's guard or description
+below, when a sync review finds a defect in upstream or fork code, and when deciding
+whether a fix here can retire because upstream now carries an equivalent. Current
+scope: parked-profile gateway status and restart, Bot Desktop teardown, the workspace
+snapshot pin, memory-provider config cloning, `/update` reporting, deferred slash
+commands, portable CI and its source guards, launchd test scoping, desktop E2E
+wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
+session lifecycle, and the alias-cache isolation guard.
 
-These are narrow fixes for defects that shipped in upstream `v2026.9.24` and
-were still present on upstream `main` when the fork synced. Offer each upstream
-and drop it once upstream carries an equivalent fix.
+Each section is a narrow fix for a defect found while syncing to upstream
+`v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
+records its patch identity and guard test. Offer upstream-origin fixes upstream and
+drop each once upstream carries an equivalent fix. Append new defects as sections
+here; move a section into a behavior-specific unit when that unit starts owning it.
 
 ## Parked status hides a live gateway
 
