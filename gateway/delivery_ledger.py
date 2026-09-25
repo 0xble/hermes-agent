@@ -330,6 +330,14 @@ def mark_delivered(obligation_id: str) -> None:
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
+    if flood_wait_is_absurd(error):
+        # No timer ever sweeps a row with no retry deadline (pending_retries skips it), so a multi-hour
+        # penalty must be abandoned here, visibly, rather than left 'failed' until the staleness sweep.
+        logger.warning(
+            "Delivery %s abandoned: flood penalty of %.0fs exceeds the automatic redelivery bound",
+            obligation_id, flood_wait_seconds(error))
+        _update_state(obligation_id, "abandoned", error=error)
+        return
     _update_state(obligation_id, "failed", error=error)
 
 

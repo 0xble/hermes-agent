@@ -199,3 +199,13 @@ and drop it once upstream carries an equivalent fix.
   requires the scan to reach the alias-cache owner.
 - Guard: `tests/hermes_cli/test_model_alias_credentials.py`
   (`test_the_scan_covers_the_alias_cache_owner`).
+
+## Absurd flood penalty stranded a failed delivery row
+
+- Fork patch identity: `delivery-ledger-absurd-flood-at-failure`.
+- A multi-hour flood refusal has no retry deadline, so `pending_retries()` skipped the row, the
+  redelivery timer exited, and `sweep_failed_for_runtime()` never ran to abandon it: the row stayed
+  `failed` with no warning. `mark_failed()` now abandons such a row and logs the bounded failure at
+  the moment the refusal is recorded.
+- Guard: `tests/gateway/test_delivery_ledger.py`
+  (`test_absurd_penalty_is_abandoned_when_the_failure_is_recorded`).
