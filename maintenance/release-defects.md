@@ -261,3 +261,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_whitespace_only_trailing_output_does_not_hold_the_final_notice`) and
   `tests/gateway/test_update_result_heading.py`
   (`test_same_revision_with_verified_restart_is_not_reported_as_noop`).
+
+## Hindsight config parsing and failed append retains
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- Three defects in the Hindsight provider. `recall_tags` stayed a string although the schema documents
+  comma-separated tags, so the SDK's `RecallRequest` rejected every recall (auto and tool); it is now
+  normalized like `retain_tags`. `_resolve_bank_id_template()` caught only `KeyError`/`IndexError`, so a
+  template with unmatched braces raised `ValueError` and stopped initialization instead of using the
+  fallback bank. The writer discarded a failed retain job although append mode had already dropped
+  those turns from `_session_turns`, so a transient outage lost conversation memory permanently. Failed
+  jobs now stay in an ordered, bounded backlog (5 attempts with exponential backoff, at most 50 jobs)
+  that retries oldest-first once its backoff expires (newer jobs queue behind it, never forcing an
+  early retry), with one last attempt at shutdown. The prefetch drain barrier counts that backlog, so
+  recall does not read before a pending retain lands.
+- Guard: `tests/plugins/memory/test_hindsight_provider.py`
+  (`test_malformed_bank_id_template_falls_back`, `test_csv_recall_tags_reach_the_sdk_as_a_list`,
+  `TestRetainRetry`, including `test_queued_jobs_do_not_bypass_the_retry_delay` and
+  `test_prefetch_barrier_waits_for_a_pending_retry`).

@@ -25,6 +25,10 @@ strategy and cron-exclusion behavior.
   a typo degrades quietly rather than failing.
 - `retain_context` stays configurable. It carries the attribution boundary telling
   extraction that assistant turns are agent-generated and not the user's decisions.
+- A queued append-mode retain is the only copy of its turns (`sync_turn` drops them from
+  `_session_turns` once queued), so the writer keeps a failed job in an ordered, bounded
+  backlog and retries it instead of discarding it (`TestRetainRetry`). Tag settings
+  (`retain_tags`, `recall_tags`) accept comma-separated strings and reach the SDK as lists.
 
 ## Proof surface
 

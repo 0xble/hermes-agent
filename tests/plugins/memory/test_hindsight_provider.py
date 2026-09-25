@@ -1948,3 +1948,123 @@ def test_append_mode_trims_retained_turns_without_dropping_any(provider, monkeyp
     assert len(provider._session_turns) == 1  # only the un-retained tail (turn 7)
     assert provider._last_retained_turn_count == 0
     assert len(shipped) == 6 and len(set(shipped)) == 6
+
+
+# ---------------------------------------------------------------------------
+# Config normalization and retain durability (v0.21.5 sync review)
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_bank_id_template_falls_back():
+    """Unmatched braces raise ValueError from str.format; the documented fallback applies."""
+    assert _resolve_bank_id_template("hermes-{profile", "hermes", profile="default") == "hermes"
+    assert _resolve_bank_id_template("hermes-{profile:!}", "hermes", profile="default") == "hermes"
+
+
+def test_csv_recall_tags_reach_the_sdk_as_a_list(provider_with_config):
+    """The schema documents comma-separated recall_tags; RecallRequest rejects a string."""
+    p = provider_with_config(recall_tags="project-a, project-b,project-a")
+    assert p._recall_tags == ["project-a", "project-b"]
+    p._recall("what changed?")
+    kwargs = p._client.arecall.call_args.kwargs
+    assert kwargs["tags"] == ["project-a", "project-b"]
+    recall_request = pytest.importorskip("hindsight_client_api.models").RecallRequest
+    recall_request(query="what changed?", tags=kwargs["tags"])  # real SDK validation boundary
+
+
+def test_list_recall_tags_are_preserved(provider_with_config):
+    assert provider_with_config(recall_tags=["a", "b"])._recall_tags == ["a", "b"]
+    assert provider_with_config(recall_tags="")._recall_tags is None
+
+
+class TestRetainRetry:
+    """A queued append delta is the only copy of those turns: a transient failure must not lose it."""
+
+    def _append_provider(self, provider, monkeypatch):
+        monkeypatch.setattr("plugins.memory.hindsight._fetch_hindsight_api_version", lambda *a, **kw: "0.5.6")
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_RETRY_BASE_S", 0.0)
+        return provider
+
+    def _wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return predicate()
+
+    def test_failed_append_turn_is_retried_in_order(self, provider, monkeypatch):
+        p = self._append_provider(provider, monkeypatch)
+        shipped = []
+
+        async def _flaky(**kwargs):
+            if not shipped and not getattr(_flaky, "failed", False):
+                _flaky.failed = True
+                raise ConnectionError("hindsight unreachable")
+            shipped.append(kwargs["items"][0]["content"])
+            return SimpleNamespace(ok=True)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_flaky)
+        p.sync_turn("first question", "first answer")
+        p._retain_queue.join()
+        assert shipped == []  # the first attempt failed and was kept, not discarded
+        p.sync_turn("second question", "second answer")
+        assert self._wait_for(lambda: len(shipped) == 2)
+        assert "first question" in shipped[0] and "second question" in shipped[1]
+        assert not p._retain_backlog
+
+    def test_backlog_retries_on_idle_without_new_turns(self, provider, monkeypatch):
+        p = self._append_provider(provider, monkeypatch)
+        calls = []
+
+        async def _fail_once(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise ConnectionError("hindsight unreachable")
+            return SimpleNamespace(ok=True)
+
+        p._client.aretain_batch = AsyncMock(side_effect=_fail_once)
+        p.sync_turn("only question", "only answer")
+        assert self._wait_for(lambda: len(calls) == 2)
+        assert self._wait_for(lambda: not p._retain_backlog)
+
+    def test_persistent_failure_is_bounded(self, provider, monkeypatch):
+        p = self._append_provider(provider, monkeypatch)
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_MAX_ATTEMPTS", 3)
+        p._client.aretain_batch = AsyncMock(side_effect=ConnectionError("down"))
+        p.sync_turn("q", "a")
+        assert self._wait_for(lambda: p._client.aretain_batch.await_count >= 3 and not p._retain_backlog)
+        time.sleep(0.3)
+        assert p._client.aretain_batch.await_count == 3
+        started = time.monotonic()
+        p.shutdown()
+        assert time.monotonic() - started < 12.0
+
+    def test_queued_jobs_do_not_bypass_the_retry_delay(self, provider, monkeypatch):
+        """Newer jobs queue behind a failed head inside its backoff instead of retrying it."""
+        p = self._append_provider(provider, monkeypatch)
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_RETRY_BASE_S", 30.0)
+        p._client.aretain_batch = AsyncMock(side_effect=ConnectionError("down"))
+        p.sync_turn("q1", "a1")
+        p._retain_queue.join()
+        for i in range(2, 6):
+            p.sync_turn(f"q{i}", f"a{i}")
+        p._retain_queue.join()
+        assert p._client.aretain_batch.await_count == 1  # no retry burst inside the 30s backoff
+        assert len(p._retain_backlog) == 5
+        assert p._retain_backlog[0][1] == 1
+
+    def test_prefetch_barrier_waits_for_a_pending_retry(self, provider, monkeypatch):
+        """A failed retain awaiting retry is not recall-visible, so the drain barrier holds."""
+        p = self._append_provider(provider, monkeypatch)
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_RETRY_BASE_S", 30.0)
+        p._client.aretain_batch = AsyncMock(side_effect=ConnectionError("down"))
+        p.sync_turn("q", "a")
+        p._retain_queue.join()
+        assert p._retain_queue.unfinished_tasks == 0 and len(p._retain_backlog) == 1
+        assert p._wait_for_retains_drained(0.2) is False
+        # Once the retry succeeds the barrier releases.
+        p._client.aretain_batch = AsyncMock(return_value=SimpleNamespace(ok=True))
+        p._retain_backlog_next_at = 0.0
+        assert self._wait_for(lambda: not p._retain_backlog)
+        assert p._wait_for_retains_drained(2.0) is True

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import collections
 import contextlib
 import json
 import logging
@@ -50,6 +51,12 @@ from .settings import (
 logger = logging.getLogger(__name__)
 
 _LOCAL_MODES = {"local", "local_embedded"}
+# Retain retry bounds: a failed job is retried with exponential backoff up to this many
+# attempts; the backlog holds at most this many jobs (oldest dropped with a warning).
+_RETAIN_MAX_ATTEMPTS = 5
+_RETAIN_BACKLOG_MAX = 50
+_RETAIN_RETRY_BASE_S = 5.0
+_RETAIN_RETRY_MAX_S = 300.0
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
@@ -351,6 +358,11 @@ class HindsightMemoryProvider(MemoryProvider):
         # drains sequentially (ad-hoc threads raced interpreter shutdown:
         # "cannot schedule new futures" / "Unclosed client session").
         self._retain_queue: queue.Queue = queue.Queue()
+        # Failed retain jobs, oldest first, as [job, attempts]. Writer-thread only. A job leaves
+        # the backlog on success or after _RETAIN_MAX_ATTEMPTS; new jobs queue behind it so
+        # append-mode deltas still reach the document in order.
+        self._retain_backlog: collections.deque = collections.deque()
+        self._retain_backlog_next_at = 0.0
         self._writer_thread: threading.Thread | None = None
         self._sync_thread = None  # legacy alias external callers may join; points at the writer
         self._shutting_down = threading.Event()
@@ -552,22 +564,58 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _writer_loop(self) -> None:
         """Drain the retain queue serially until the sentinel. A failing job can't
-        kill the writer; task_done() always fires so queue.join() works."""
+        kill the writer; task_done() always fires so queue.join() works. A failed job
+        is kept (bounded) and retried in order instead of being discarded: append-mode
+        deltas are dropped from ``_session_turns`` once queued, so the job is the only copy."""
         while True:
             try:
                 job = self._retain_queue.get(timeout=1.0)
             except queue.Empty:
                 if self._shutting_down.is_set():
                     return
+                if self._retain_backlog and time.monotonic() >= self._retain_backlog_next_at:
+                    self._drain_retain_backlog()
                 continue
             try:
                 if job is _WRITER_SENTINEL:
+                    if self._retain_backlog:
+                        self._drain_retain_backlog()  # one last attempt before exit
+                    if self._retain_backlog:
+                        logger.warning("Hindsight shutting down with %d unretained job(s) after retries",
+                                       len(self._retain_backlog))
                     return
-                job()
-            except Exception as exc:
-                logger.warning("Hindsight retain failed: %s", exc, exc_info=True)
+                if len(self._retain_backlog) >= _RETAIN_BACKLOG_MAX:
+                    self._retain_backlog.popleft()
+                    logger.warning("Hindsight retain backlog full (%d); dropped the oldest failed retain",
+                                   _RETAIN_BACKLOG_MAX)
+                waiting = bool(self._retain_backlog) and time.monotonic() < self._retain_backlog_next_at
+                self._retain_backlog.append([job, 0])
+                # Behind a failed job still inside its backoff, a new job just queues (order is
+                # preserved); only the idle poll or shutdown retries the head.
+                if not waiting:
+                    self._drain_retain_backlog()
             finally:
                 self._retain_queue.task_done()
+
+    def _drain_retain_backlog(self) -> None:
+        """Run backlog jobs oldest-first; stop at the first failure to keep their order."""
+        while self._retain_backlog:
+            entry = self._retain_backlog[0]
+            try:
+                entry[0]()
+            except Exception as exc:
+                entry[1] += 1
+                if entry[1] >= _RETAIN_MAX_ATTEMPTS:
+                    self._retain_backlog.popleft()
+                    logger.warning("Hindsight retain failed %d times; giving up on it: %s",
+                                   entry[1], exc, exc_info=True)
+                    continue
+                delay = min(_RETAIN_RETRY_MAX_S, _RETAIN_RETRY_BASE_S * 2 ** (entry[1] - 1))
+                self._retain_backlog_next_at = time.monotonic() + delay
+                logger.warning("Hindsight retain failed (attempt %d/%d, %d pending); retrying in %.0fs: %s",
+                               entry[1], _RETAIN_MAX_ATTEMPTS, len(self._retain_backlog), delay, exc)
+                return
+            self._retain_backlog.popleft()
 
     def _atexit_shutdown(self) -> None:
         try:
@@ -611,12 +659,14 @@ class HindsightMemoryProvider(MemoryProvider):
         durability). False on timeout/shutdown."""
         deadline = None if timeout <= 0 else time.monotonic() + timeout
         expired = lambda: deadline is not None and time.monotonic() >= deadline  # noqa: E731
-        while self._retain_queue.unfinished_tasks > 0:
+        # A failed retain leaves the queue (task_done) but stays in the retry backlog until it
+        # succeeds or is abandoned, so the backlog is part of the barrier too.
+        while self._retain_queue.unfinished_tasks > 0 or self._retain_backlog:
             if self._shutting_down.is_set():
                 return False
             if expired():
-                logger.debug("Prefetch: retain drain timed out after %.1fs (%d pending)",
-                             timeout, self._retain_queue.unfinished_tasks)
+                logger.debug("Prefetch: retain drain timed out after %.1fs (%d queued, %d awaiting retry)",
+                             timeout, self._retain_queue.unfinished_tasks, len(self._retain_backlog))
                 return False
             time.sleep(0.05)
         return self._wait_for_server_retain_ops(expired, timeout)
@@ -800,7 +850,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
-        self._recall_tags = cfg.get("recall_tags") or None
+        # The schema documents a comma-separated string; the SDK's RecallRequest needs a list.
+        self._recall_tags = _normalize_retain_tags(cfg.get("recall_tags")) or None
         self._recall_tags_match = cfg.get("recall_tags_match", "any")
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
@@ -1213,15 +1264,11 @@ class HindsightMemoryProvider(MemoryProvider):
                                              update_mode=old_update_mode, label="flush-on-switch",
                                              track_ops=False)
 
-            def _flush():
-                try:
-                    job()
-                except Exception as e:
-                    logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
             # Same writer queue as sync_turn: FIFO behind queued old-session retains,
             # no two threads racing aretain_batch on one document, shutdown drain intact.
+            # Failures propagate to the writer, which keeps and retries the job.
             if not self._shutting_down.is_set():
-                self._enqueue_retain(_flush)
+                self._enqueue_retain(job)
 
         # 2. Drain the old session's in-flight prefetch and drop its result.
         self._join_prefetch(3.0)
