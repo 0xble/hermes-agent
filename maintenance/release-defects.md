@@ -335,3 +335,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_retry_judges_the_earlier_send_by_its_outcome_not_the_wait`,
   `test_explicit_empty_recall_types_disables_the_filter`).
 
+## Telegram short media flood retry let other traffic into the penalty
+
+- Fork patch identity: `telegram-media-flood-under-lock`.
+- A media upload refused with a short `retry_after` (within the 5s inline cap) slept and retried in place,
+  but the sleep ran after the per-chat send lock was released and armed no shared window, so a concurrent
+  text send, edit or typing request could reach Telegram inside the penalty and lengthen it. The retry now
+  holds the chat's send lock across its wait and arms the shared window for it, releasing only its own
+  window before the retry.
+- Regression coverage: `test_telegram_flood_coherence.py::test_short_media_flood_wait_holds_other_outbound_traffic`.
