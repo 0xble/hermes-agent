@@ -293,17 +293,27 @@ def _get_parent_pid(pid: int) -> int | None:
 
 def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
     """Return True when ``target_pid`` is this process or one of its ancestors."""
+    return bool(_ancestor_chain_to(target_pid))
+
+
+def _ancestor_chain_to(target_pid: int) -> list[int]:
+    """PIDs from ``target_pid`` down to (excluding) this process when ``target_pid`` is an
+    ancestor, else ``[]``. A supervisor may own a wrapper (launchd's ``osascript`` →
+    ``stderr_timestamp`` → gateway), so the supervised pid and the gateway that stamps its
+    code identity are different processes on the same chain."""
     if target_pid <= 0:
-        return False
+        return []
 
     pid = os.getpid()
+    chain: list[int] = []
     seen: set[int] = set()
     while pid and pid not in seen:
         if pid == target_pid:
-            return True
+            return [pid, *reversed(chain[1:])] if chain else [pid]
         seen.add(pid)
+        chain.append(pid)
         pid = _get_parent_pid(pid) or 0
-    return False
+    return []
 
 
 def _request_gateway_self_restart(pid: int) -> bool:
