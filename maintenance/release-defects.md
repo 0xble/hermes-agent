@@ -398,3 +398,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Regression coverage: `test_hindsight_provider.py`
   (`test_empty_newer_recall_does_not_inject_older_query_memories`,
   `test_drain_budget_bounds_the_status_request_itself`, `test_embedded_reconnect_*`, `TestMissionConfig`).
+
+## Hindsight atexit pin and disabled mode reaching the network
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- `shutdown()` left the bound `_atexit_shutdown` registered, so every evicted gateway session's
+  provider (transcript buffers, callbacks) stayed reachable until process exit. Shutdown now
+  unregisters it; a later retain re-registers.
+- `_mode = "disabled"` (local runtime unavailable, or root) gated nothing: recall, retain and tools
+  still ran, and `_get_client()` fell through to the cloud client against the configured endpoint.
+  Disabled now short-circuits recall, auto-retain, tool calls, tool schemas and the system prompt
+  block, and `_get_client()` refuses to build a client.
+- The test module's autouse fixture stubbed `lazy_deps.ensure` but not `install_specs`, so with an
+  outdated installed SDK, mocked tests ran `initialize()`'s auto-upgrade for real (download, env
+  mutation). The fixture now stubs `install_specs`; upgrade tests still override it. The eviction test's
+  250ms wall-clock bound is replaced by a poll count.
+- Regression coverage: `test_hindsight_provider.py`
+  (`test_disabled_provider_makes_no_network_calls`, `test_shutdown_unregisters_the_atexit_callback`,
+  `test_default_fixture_never_installs_for_an_outdated_sdk`).
