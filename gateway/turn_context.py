@@ -36,6 +36,7 @@ class TurnContext:
     agent_holder: list = field(default_factory=lambda: [None])
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
+    _status_delivery: Any = None
     _cleanup_msg_ids: List[str] = field(default_factory=list)
     _bubble_cleanup_registered: bool = False
     _post_delivery_adapter: Any = None

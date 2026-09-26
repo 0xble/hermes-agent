@@ -4114,10 +4114,13 @@ class GatewayTurnMixin:
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Register turn-local deletion, awaited after confirmed final delivery."""
         ids, key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
+        delivery = turn_ctx._status_delivery
+        if delivery is not None:
+            delivery.closed = True
         if turn_ctx._bubble_cleanup_registered:
             return
         if not (
-            turn_ctx._cleanup_progress and _cleanup_adapter is not None and ids and key
+            turn_ctx._cleanup_progress and _cleanup_adapter is not None and (ids or delivery is not None) and key
             and isinstance(response, dict) and not response.get("failed")
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
@@ -4128,12 +4131,14 @@ class GatewayTurnMixin:
         chat_id = turn_ctx.source.chat_id
 
         async def cleanup() -> None:
+            if delivery is not None:
+                delivery.cleaned = True
             snapshot = list(dict.fromkeys(ids))
             deleted = 0
             failures = []
             for mid in snapshot:
                 try:
-                    live = self._delivery_adapter_for(turn_ctx.source) or _cleanup_adapter
+                    live = (delivery.owners.get(mid) if delivery is not None else None) or self._delivery_adapter_for(turn_ctx.source) or _cleanup_adapter
                     if await live.delete_message(chat_id, mid):
                         deleted += 1
                     else:

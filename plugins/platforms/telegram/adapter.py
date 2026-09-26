@@ -784,7 +784,7 @@ class _PollingStallError(RuntimeError):
 class TelegramAdapter(BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
-    # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
+    # Bound for the per-(chat_id, thread_id, status_key) status-message cache; FIFO half-trim on overflow.
     _STATUS_MESSAGE_IDS_MAX = 2000
 
     MAX_MESSAGE_LENGTH = 4096
@@ -4258,14 +4258,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send a status message, or edit the previous one with the same ``(chat_id, status_key)``; if the
+        """Send a status message, or edit the previous one with the same chat, topic and key; if the
         edit fails (deleted, too old, …) the cached id is dropped and a fresh message is sent.
 
         Issue #30045: progress/status callbacks (context-pressure, lifecycle, compression, etc.) used to
         append a fresh bubble on every call. With this method, the first call sends and the message id is
         remembered; subsequent calls with the same (chat_id, status_key) edit that same message in place.
         """
-        key = (str(chat_id), str(status_key))
+        thread_id = self._metadata_thread_id(metadata)
+        key = (str(chat_id), str(thread_id) if thread_id is not None else "", str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
