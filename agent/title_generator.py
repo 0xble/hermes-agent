@@ -270,7 +270,8 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     title grammar/completion into the main turn: the user's reply arrives as ``{"title": ...}``, is
     persisted as a genuine assistant row and replayed, and the model adopts the format (#117296).
     Running the title call after the turn settles keeps the two requests off the wire at once.
-    Hosted providers multiplex requests independently and keep the turn-start timing.
+    Hosted providers multiplex requests independently and keep the turn-start timing, as does a
+    self-hosted server whose provider entry declares ``capabilities.concurrent_requests: true``.
     """
     provider = str((main_runtime or {}).get("provider") or "").strip().lower()
     if not _is_self_hosted_provider(provider):
@@ -282,10 +283,27 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
         if pinned_provider not in ("", "auto") and not _title_pin_may_share_endpoint(
                 pinned_provider, provider, main_base_url):
             return False
+        if _endpoint_declares_concurrent_requests(main_base_url):
+            return False
     except Exception:
         return True
     pinned_base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
     return not pinned_base_url or pinned_base_url == main_base_url
+
+
+def _endpoint_declares_concurrent_requests(base_url: str) -> bool:
+    """A configured provider serving ``base_url`` declares ``capabilities.concurrent_requests: true``.
+
+    Keyed by endpoint, not route name: the slot count belongs to the server, and every route to it
+    (``custom``, ``custom:<name>``, a display-name pin) shares that one answer.
+    """
+    if not base_url:
+        return False
+    from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+    return any(
+        entry.get("base_url", "").strip().rstrip("/") == base_url
+        and (entry.get("capabilities") or {}).get("concurrent_requests") is True
+        for entry in get_compatible_custom_providers(load_config_readonly()))
 
 
 def _is_self_hosted_provider(provider: str) -> bool:

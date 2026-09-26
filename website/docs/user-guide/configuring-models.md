@@ -228,6 +228,16 @@ providers:
       openai_native_compaction: true
 ```
 
+**`concurrent_requests`** — set this capability to `true` for a self-hosted or proxy endpoint that serves several requests at once (a multi-slot llama.cpp/vLLM server, or a routing proxy). By default Hermes holds the session-title request until the turn finishes whenever it would hit the turn's own self-hosted server, because a single-slot server can serve the title into the reply. The declaration lets the title start with the turn instead. Leave it unset for single-slot servers:
+
+```yaml
+providers:
+  local-proxy:
+    api: http://127.0.0.1:8317/v1
+    capabilities:
+      concurrent_requests: true
+```
+
 For a gateway that resolves a bare model alias only after receiving the
 request, opt the alias into prompt-cache markers with the per-model
 `prompt_caching` capability:
