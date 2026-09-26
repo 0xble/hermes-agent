@@ -53,6 +53,9 @@ def _doctor_fix(tmp_path, monkeypatch, cfg):
     home = cfg.get_hermes_home()
     monkeypatch.setattr(doctor, "HERMES_HOME", home)
     monkeypatch.setattr(doctor, "PROJECT_ROOT", root)
+    # The 0600 guarantee is for ordinary hosts: container volume mounts intentionally
+    # skip chmod so gateway/dashboard processes with different UIDs can read them.
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
     assert _check_config_file(True).fixed == 1
     if os.name == "posix":
         assert (home / "config.yaml").stat().st_mode & 0o777 == 0o600
