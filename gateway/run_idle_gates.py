@@ -53,6 +53,12 @@ def profile_has_active_loop(profile_home: Path) -> bool:
     return _gate(profile_home, store_has_active_loop)
 
 
+def profile_has_parked_goal(profile_home: Path) -> bool:
+    from hermes_cli.goals import store_has_parked_goal
+
+    return _gate(profile_home, store_has_parked_goal)
+
+
 def profile_has_pending_handoff(profile_home: Path) -> bool:
     return _gate(profile_home, lambda db: db.has_pending_handoffs())
 

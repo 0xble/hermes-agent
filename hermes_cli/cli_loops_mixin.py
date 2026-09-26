@@ -548,18 +548,16 @@ class CLILoopsMixin:
             if not self._pending_input.empty():
                 return
             mgr = self._get_goal_manager()
-            state = getattr(mgr, "state", None) if mgr is not None else None
-            if state is None or state.status != "active":
+            if mgr is None or not mgr.is_parked():
                 return
-            if not (state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until):
-                return  # not parked
-            if mgr.is_waiting():
-                return  # barrier still holds (is_waiting() also applies the age cap)
-            prompt = mgr.next_continuation_prompt()
+            # None while the barrier holds (the age cap applies); the prompt notes a killed process.
+            prompt = mgr.lifted_barrier_prompt()
             if prompt:
                 from cli import _DIM, _RST, _cprint
                 _cprint(f"  {_DIM}▶ Goal barrier lifted — resuming.{_RST}")
+                since = mgr.state.waiting_since
                 self._pending_input.put(prompt)
+                mgr.clear_lifted_wait(since)
         except Exception as exc:
             logging.debug("parked-goal resume check failed: %s", exc)
 
