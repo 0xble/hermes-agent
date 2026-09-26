@@ -12,6 +12,7 @@ pathspec against the pre-pull SHA; mocking git would assert our idea of what
 git prints rather than what it does.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -20,6 +21,13 @@ import pytest
 from hermes_cli.update_cmd import _editable_install_is_current
 
 GIT = ["git"]
+
+
+@pytest.fixture(autouse=True)
+def isolated_git_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
 
 
 @pytest.fixture

@@ -858,21 +858,33 @@ class GatewaySessionCommandsMixin:
             return t("gateway.shared.warn_passthrough", error=e)
         if not sanitized:
             return t("gateway.title.empty_after_clean")
+        topic_lane = self._is_telegram_topic_lane(source)
         try:
-            if self._is_telegram_topic_lane(source) and hasattr(self._session_db, "set_session_title_in_lineage"):
+            if topic_lane and hasattr(self._session_db, "set_session_title_in_lineage"):
                 stored_title = await self._session_db.set_session_title_in_lineage(session_id, sanitized)
                 if stored_title != sanitized:
                     logger.info("Telegram topic title %r reserved internal lineage alias %r", sanitized, stored_title)
             elif not await self._session_db.set_session_title(session_id, sanitized):
                 return t("gateway.title.not_found")
+            else:
+                stored_title = sanitized
         except ValueError as e:
             return t("gateway.shared.warn_passthrough", error=e)
-        # Mirror the title onto the Telegram forum topic name (auto titles already do this).
+        reply = t("gateway.title.set_to", title=stored_title)
+        if topic_lane:
+            # An explicit request needs the Bot API result before we claim the visible name changed.
+            renamed = await self._rename_telegram_topic_explicit(source, session_id, sanitized)
+            if not renamed:
+                return reply + "\nTelegram topic rename failed; the session title was stored."
+            if stored_title != sanitized:
+                return reply + f"\nTelegram topic name: **{sanitized}**."
+            return reply
+        # Other paths keep their existing best-effort scheduling behavior.
         try:
             await asyncio.to_thread(self._schedule_telegram_topic_title_rename, source, session_id, sanitized)
         except Exception:
             logger.debug("Failed to rename Telegram topic from /title", exc_info=True)
-        return t("gateway.title.set_to", title=sanitized)
+        return reply
 
     # -------------------------------------------------------------- /resume, /sessions
 

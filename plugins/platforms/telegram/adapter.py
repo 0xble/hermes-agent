@@ -10,6 +10,7 @@ import os
 import html as _html
 import re
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -150,11 +151,12 @@ from gateway.platforms.base import (
 _UNAUTHORIZED = unauthorized_action_notice(Platform.TELEGRAM)
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from plugins.platforms.telegram.rich_messages import project_rich_message
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
-from utils import env_float, env_int
+from utils import env_float, env_int, is_truthy_value
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
@@ -438,6 +440,44 @@ def _rich_is_prose_line(line: str) -> bool:
     return not bool(re.fullmatch(r"(?:[-*_]\s*){3,}", stripped))
 
 
+# CommonMark lets an ordered list interrupt a paragraph only when it starts at 1.
+_RICH_INTERRUPTING_ORDERED_ITEM_RE = re.compile(r" {0,3}(?!1[.)])\d{1,9}[.)][ \t]+\S")
+_RICH_CONTAINER_LINE_RE = re.compile(r" {0,3}(?:>|[-+*][ \t]|\d{1,9}[.)][ \t])")
+_RICH_FENCE_LINE_RE = re.compile(r" {0,3}(?:```|~~~)")
+
+
+def _rich_separate_ordered_lists(text: str) -> str:
+    """Open a new block before an ordered list that directly follows a paragraph.
+
+    ``**Label**\\n7. item`` is otherwise one paragraph, so the numbers render as
+    literal text without list layout. Lines continuing a list item or quote
+    are left alone because a list there already nests or ends correctly.
+    Closed fences never reach here; an unclosed one in a draft frame is skipped.
+    """
+    out: list[str] = []
+    state = None  # None, "paragraph", "container", or "fence" for the current block
+    for line in text.split("\n"):
+        if _RICH_FENCE_LINE_RE.match(line):
+            state = None if state == "fence" else "fence"
+        elif state == "fence":
+            pass
+        elif not line.strip():
+            state = None
+        elif state == "paragraph" and _RICH_INTERRUPTING_ORDERED_ITEM_RE.match(line):
+            out.append("")
+            state = "container"
+        elif _RICH_CONTAINER_LINE_RE.match(line):
+            state = "container"
+        elif line[:1].isspace():
+            pass  # indented continuation keeps the current block
+        elif _rich_is_prose_line(line):
+            state = state or "paragraph"
+        else:
+            state = None
+        out.append(line)
+    return "\n".join(out)
+
+
 def _rich_materialize_prose_paragraphs(text: str) -> str:
     """Render authored prose breaks as one explicit blank Rich Message row.
 
@@ -552,11 +592,11 @@ def _rich_normalize_linebreaks(text: str) -> str:
     # by the single-newline regex on each prose run.
     pos = 0
     for m in _RICH_PARAGRAPH_PROTECTED_REGION_RE.finditer(text):
-        prose = _rich_materialize_prose_paragraphs(text[pos:m.start()])
+        prose = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(text[pos:m.start()]))
         out.append(_RICH_SINGLE_LINEBREAK_RE.sub('  \n', prose))
         out.append(m.group(0))  # protected region kept verbatim
         pos = m.end()
-    tail = _rich_materialize_prose_paragraphs(text[pos:])
+    tail = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(text[pos:]))
     out.append(_RICH_SINGLE_LINEBREAK_RE.sub('  \n', tail))
     return ''.join(out)
 
@@ -1447,6 +1487,16 @@ class TelegramAdapter(BasePlatformAdapter):
     def _is_thread_not_found_error(error: Exception) -> bool:
         return "thread not found" in str(error).lower()
 
+    def _mark_dm_topic_stale(self, chat_id: Any, thread_id: Any) -> None:
+        stale = getattr(self, "_stale_dm_topic_ids", None)
+        if stale is None:
+            stale = set()
+            self._stale_dm_topic_ids = stale
+        stale.add((str(chat_id), str(thread_id)))
+
+    def is_dm_topic_stale(self, chat_id: Any, thread_id: Any) -> bool:
+        return (str(chat_id), str(thread_id)) in getattr(self, "_stale_dm_topic_ids", set())
+
     def _prune_stale_dm_topic_binding(self, chat_id: Any, thread_id: Any, *, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Drop the stale ``telegram_dm_topic_bindings`` row for a topic Telegram confirmed deleted, else
         ``_recover_telegram_topic_thread_id`` keeps steering inbound to the dead thread. Best-effort.
@@ -2084,12 +2134,42 @@ class TelegramAdapter(BasePlatformAdapter):
         # First proof getUpdates is flowing for this generation: flip a
         # published "retrying" (degraded connect, reconnect stamp, or the
         # mid-session recovery below) back to "connected" (#101391).
-        if self._send_path_degraded and getattr(self, "_running", False) and not self.has_fatal_error:
+        recovered = self._send_path_degraded and getattr(self, "_running", False) and not self.has_fatal_error
+        if recovered:
             self._write_runtime_status_safe(
                 "connected", platform_state="connected", error_code=None, error_message=None,
             )
         self._send_path_degraded = False
+        if recovered:
+            self._schedule_recovered_delivery_sweep()
         return True
+
+    def _schedule_recovered_delivery_sweep(self) -> None:
+        """Wake the owning runner's ledger after confirmed in-place polling recovery."""
+        runner = getattr(self, "gateway_runner", None)
+        redeliver = getattr(runner, "_redeliver_failed_obligations_for_platform", None)
+        if not callable(redeliver):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def sweep() -> None:
+            try:
+                # A replacement owns its own recovery signal; an obsolete adapter's late
+                # getUpdates response must not wake a different bot's replay lane.
+                if runner._authorization_adapter(self.platform, getattr(self, "_owner_profile", None)) is not self:
+                    return
+                await redeliver(self.platform, profile=getattr(self, "_owner_profile", None))
+            except Exception:
+                logger.debug("[%s] Failed to sweep recovered delivery ledger", self.name, exc_info=True)
+
+        task = loop.create_task(sweep())
+        tracked = getattr(self, "_background_tasks", None)
+        if tracked is not None:
+            tracked.add(task)
+            task.add_done_callback(tracked.discard)
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result (purely observational: PTB still
@@ -3124,6 +3204,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._setup_dm_topics()
             except Exception as topics_err:
                 logger.warning("[%s] DM topics setup failed (non-fatal): %s", self.name, topics_err, exc_info=True)
+            # Warm the icon catalog so the first auto-titled topic after a restart gets a model-chosen
+            # icon; the title call only offers icons once this cache is populated.
+            if is_truthy_value((self.config.extra or {}).get("auto_topic_icons")):
+                await self.get_forum_topic_icon_options()
         except asyncio.CancelledError:
             raise
         finally:
@@ -3291,6 +3375,13 @@ class TelegramAdapter(BasePlatformAdapter):
             for extra_filter in topic_filters[1:]:
                 combined = combined | extra_filter
             app.add_handler(TelegramMessageHandler(combined, self._handle_forum_topic_service_message))
+        # PTB 22.8 predates Bot API 10.1 Rich Messages: a formatted paste carries no text and keeps
+        # its body in Message.api_kwargs, so every filter above misses it. After text/media, so a
+        # mixed payload keeps its established handler.
+        app.add_handler(TelegramMessageHandler(self._rich_message_filter(), self._handle_rich_message))
+        # Last in group 0 (PTB runs the first match per group): a message family nothing above
+        # claims is logged instead of vanishing without a trace.
+        app.add_handler(TelegramMessageHandler(filters.ALL, self._handle_unmatched_message))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
@@ -6502,9 +6593,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _entity_sources(message: Message):
-        """``(text, entities)`` pairs for the message text and caption."""
+        """``(text, entities)`` pairs for the message text, caption, and Rich Message body."""
         yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
         yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
+        rich_text = TelegramAdapter._rich_message_text(message)
+        if rich_text:
+            yield rich_text, []
 
     @staticmethod
     def _entity_type(entity) -> str:
@@ -6649,7 +6743,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         return any(
             pattern.search(candidate)
-            for candidate in (getattr(message, "text", None), getattr(message, "caption", None)) if candidate
+            for candidate in (
+                getattr(message, "text", None), getattr(message, "caption", None), self._rich_message_text(message))
+            if candidate
             for pattern in self._mention_patterns)
 
     def _is_guest_mention(self, message: Message) -> bool:
@@ -7070,6 +7166,83 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         await self.handle_message(self._apply_telegram_group_observe_attribution(event))
+
+    async def _handle_rich_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Normalize one inbound Bot API Rich Message into the ordinary text pipeline."""
+        msg = self._effective_update_message(update)
+        if msg is None or not self._is_rich_message_update(msg):
+            return
+        if not self._is_user_authorized_from_message(msg):
+            self._log_blocked_user(msg, what="unauthorized Rich Message user")
+            return
+        payload, source = self._inbound_rich_message_payload(msg)
+        projection = project_rich_message(payload)
+        if not projection.text:
+            logger.warning(
+                "[%s] Rich Message has no readable content update_id=%s message_id=%s block_count=%s block_types=%s",
+                self.name, getattr(update, "update_id", None), getattr(msg, "message_id", None),
+                projection.block_count, list(projection.block_types))
+            return
+        update_id = getattr(update, "update_id", None)
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update_id)
+        event.text = projection.text
+        event.metadata = {**(event.metadata or {}), "telegram_rich_message": {
+            "block_count": projection.block_count, "block_types": list(projection.block_types),
+            "source": source, "truncated": projection.truncated}}
+        if not self._should_process_message(msg):
+            if self._should_observe_unmentioned_group_message(msg):
+                self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update_id, event=event)
+            return
+        await self._ensure_forum_commands(msg)
+        from plugins.platforms.telegram.telegram_context import group_trigger_text
+        event.text = group_trigger_text(self, msg, event.text)
+        await self._cache_replied_media(msg, event)
+        logger.info("[%s] Received Rich Message as Markdown (%d chars, %d blocks)",
+                    self.name, len(event.text or ""), projection.block_count)
+        self._enqueue_text_event(self._apply_telegram_group_observe_attribution(event))
+
+    @staticmethod
+    def _unmatched_message_fields(message: Any) -> List[str]:
+        """Bounded payload field names only, never values."""
+        ignored = {
+            "message_id", "date", "chat", "from_user", "from", "sender_chat", "business_connection_id",
+            "message_thread_id", "is_topic_message", "reply_to_message", "quote", "entities",
+            "caption_entities", "text", "caption", "api_kwargs"}
+
+        def _present(value: Any) -> bool:
+            if value is None or value is False:
+                return False
+            if isinstance(value, (str, bytes, list, tuple, dict, set)):
+                return bool(value)
+            return True
+
+        fields: Set[str] = set()
+        to_dict = getattr(message, "to_dict", None)
+        if callable(to_dict):
+            try:
+                serialized = to_dict()
+            except Exception:
+                serialized = None
+            if isinstance(serialized, dict):
+                fields.update(str(k) for k, v in serialized.items() if k not in ignored and _present(v))
+        api_kwargs = getattr(message, "api_kwargs", None)
+        if isinstance(api_kwargs, Mapping):
+            fields.update(str(k) for k, v in api_kwargs.items() if _present(v))
+        return sorted(fields)[:32]
+
+    async def _handle_unmatched_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Surface message families no handler claims (content never logged). Edits and service
+        messages also land here, so this only logs and never dispatches."""
+        msg = self._effective_update_message(update)
+        if msg is None or getattr(update, "edited_message", None) is not None:
+            return
+        fields = self._unmatched_message_fields(msg)
+        if not fields:
+            return
+        logger.warning(
+            "[%s] Unhandled Telegram message update_id=%s message_id=%s chat_type=%s payload_fields=%s",
+            self.name, getattr(update, "update_id", None), getattr(msg, "message_id", None),
+            str(getattr(getattr(msg, "chat", None), "type", "unknown"))[:32], fields)
 
     # -- Text message aggregation (handles Telegram client-side splits) --
 
@@ -7517,59 +7690,68 @@ class TelegramAdapter(BasePlatformAdapter):
         """Return a custom icon observed from a user topic event, if any."""
         return getattr(self, "_manual_topic_icons", {}).get(f"{chat_id}:{thread_id}")
 
-    @classmethod
-    def _flatten_rich_inline_text(cls, value: Any) -> str:
-        """Best-effort plaintext flattener for Bot API rich-message inline nodes."""
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return "".join(cls._flatten_rich_inline_text(item) for item in value)
-        if isinstance(value, dict):
-            for key in ("text", "children"):
-                if value.get(key) is not None:
-                    return cls._flatten_rich_inline_text(value[key])
-        return ""
+    @staticmethod
+    def _inbound_rich_message_payload(message: Any) -> tuple[Any, Optional[str]]:
+        """``(payload, source)`` for a Rich Message: a future typed PTB attribute first, else the
+        PTB 22.8 ``api_kwargs`` copy of the unknown Bot API field."""
+        native = getattr(message, "rich_message", None)
+        if isinstance(native, Mapping) or (
+                native is not None and type(native).__module__.startswith("telegram")
+                and callable(getattr(native, "to_dict", None))):
+            return native, "attribute"
+        getter = getattr(getattr(message, "api_kwargs", None), "get", None)
+        if callable(getter):
+            payload = getter("rich_message")
+            if payload is not None:
+                return payload, "api_kwargs"
+        return None, None
 
     @classmethod
-    def _flatten_rich_blocks(cls, blocks: Any) -> str:
-        """Best-effort plaintext flattener for Bot API rich-message blocks."""
-        if not isinstance(blocks, list):
-            return ""
-        lines: List[str] = []
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "list":
-                for item in block.get("items", []):
-                    if not isinstance(item, dict):
-                        continue
-                    item_lines = cls._flatten_rich_blocks(item.get("blocks")).splitlines()
-                    if not item_lines:
-                        continue
-                    label = item.get("label")
-                    lines.append(f"{label} {item_lines[0]}".strip() if label else item_lines[0])
-                    lines.extend(item_lines[1:])
-                continue
-            text = cls._flatten_rich_inline_text(block.get("text"))
-            if text:
-                lines.extend(text.splitlines())
-        return "\n".join(line.rstrip() for line in lines if line)
+    def _rich_message_text(cls, message: Any) -> Optional[str]:
+        """Bounded Markdown projection of a message's Rich Message body, or None."""
+        try:
+            payload, _source = cls._inbound_rich_message_payload(message)
+            if payload is None:
+                return None
+            return project_rich_message(payload).text.strip() or None
+        except Exception:
+            return None
 
     @classmethod
     def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
-        """Return plaintext echoed by Telegram's rich_message reply payload."""
-        try:
-            getter = getattr(getattr(reply_to_message, "api_kwargs", None), "get", None)
-            if not callable(getter):
-                return None
-            rich_getter = getattr(getter("rich_message"), "get", None)
-            if not callable(rich_getter):
-                return None
-            return cls._flatten_rich_blocks(rich_getter("blocks")).strip() or None
-        except Exception:
-            return None
+        """Return bounded Markdown echoed by Telegram's rich_message reply payload."""
+        return cls._rich_message_text(reply_to_message)
+
+    @classmethod
+    def _is_rich_message_update(cls, message: Any) -> bool:
+        """Only rich-only messages: text, caption, and media stay with their established handlers."""
+        if message is None or getattr(message, "text", None) or getattr(message, "caption", None):
+            return False
+        if any(getattr(message, attr, None) for attr in ("photo", "document", "video", "audio", "voice", "sticker")):
+            return False
+        payload, _source = cls._inbound_rich_message_payload(message)
+        if payload is None:
+            return False
+        if isinstance(payload, Mapping):
+            return payload.get("blocks") is not None
+        getter = getattr(payload, "get", None)
+        if callable(getter):
+            try:
+                return getter("blocks") is not None
+            except Exception:
+                return False
+        return getattr(payload, "blocks", None) is not None
+
+    @classmethod
+    def _rich_message_filter(cls):
+        """PTB filter built lazily so the module stays importable without python-telegram-bot."""
+        adapter_cls = cls
+
+        class _RichMessageFilter(filters.MessageFilter):
+            def filter(self, message: Message) -> bool:
+                return adapter_cls._is_rich_message_update(message)
+
+        return _RichMessageFilter(name="RichMessage")
 
     def _resolve_topic_binding(self, message: Message, chat_type: str, thread_id_str: Optional[str]) -> tuple:
         """Return ``(chat_topic, topic_skill)`` for a DM topic or bound forum topic (else Nones)."""

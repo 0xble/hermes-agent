@@ -337,7 +337,7 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
     chat_id, message = adapter.send.await_args.args
     assert chat_id == "parent-42"
     assert message
-    assert adapter.send.await_args.kwargs == {"metadata": {"thread_id": "topic-7"}}
+    assert adapter.send.await_args.kwargs == {"metadata": {"thread_id": "topic-7", "_interim_send": True}}
 
 
 @pytest.mark.asyncio

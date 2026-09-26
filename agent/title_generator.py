@@ -270,7 +270,8 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     title grammar/completion into the main turn: the user's reply arrives as ``{"title": ...}``, is
     persisted as a genuine assistant row and replayed, and the model adopts the format (#117296).
     Running the title call after the turn settles keeps the two requests off the wire at once.
-    Hosted providers multiplex requests independently and keep the turn-start timing.
+    Hosted providers multiplex requests independently and keep the turn-start timing, as does a
+    self-hosted server whose provider entry declares ``capabilities.concurrent_requests: true``.
     """
     provider = str((main_runtime or {}).get("provider") or "").strip().lower()
     if not _is_self_hosted_provider(provider):
@@ -282,10 +283,27 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
         if pinned_provider not in ("", "auto") and not _title_pin_may_share_endpoint(
                 pinned_provider, provider, main_base_url):
             return False
+        if _endpoint_declares_concurrent_requests(main_base_url):
+            return False
     except Exception:
         return True
     pinned_base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
     return not pinned_base_url or pinned_base_url == main_base_url
+
+
+def _endpoint_declares_concurrent_requests(base_url: str) -> bool:
+    """A configured provider serving ``base_url`` declares ``capabilities.concurrent_requests: true``.
+
+    Keyed by endpoint, not route name: the slot count belongs to the server, and every route to it
+    (``custom``, ``custom:<name>``, a display-name pin) shares that one answer.
+    """
+    if not base_url:
+        return False
+    from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
+    return any(
+        entry.get("base_url", "").strip().rstrip("/") == base_url
+        and (entry.get("capabilities") or {}).get("concurrent_requests") is True
+        for entry in get_compatible_custom_providers(load_config_readonly()))
 
 
 def _is_self_hosted_provider(provider: str) -> bool:
@@ -582,11 +600,11 @@ def generate_title(
     icon_allowed = list(icon_options or [])
     icon_rule = ""
     if icon_allowed:
-        from agent.topic_icons import fresh_allowed_icons
-        candidates = fresh_allowed_icons(icon_allowed, recent_icons)
-        icon_rule = f"- Also pick one icon for the topic from exactly this list: {' '.join(candidates)}"
-        if icon_instructions:
-            icon_rule += f" Icon guidance: {str(icon_instructions).strip()[:1000]}"
+        from agent.topic_icons import DEFAULT_ICON_GUIDANCE, allowed_icon_list
+        # The whole catalog every time: withholding recently used icons made the best match
+        # unavailable and forced unrelated picks.
+        icon_rule = f"- Also pick one icon for the topic from exactly this list: {' '.join(allowed_icon_list(icon_allowed))}"
+        icon_rule += f" Icon guidance: {(str(icon_instructions or '').strip() or DEFAULT_ICON_GUIDANCE)[:1000]}"
         icon_rule += " The icon must not change the title."
     prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs, icon_rule=icon_rule)
     try:
@@ -630,9 +648,13 @@ def generate_title(
         title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
         if icon_allowed and icon_callback is not None:
             from agent.topic_icons import choose_topic_icon_deterministic, validate_model_icon
-            icon = validate_model_icon(payload.get("icon") if isinstance(payload, dict) else None, icon_allowed)
+            proposed = payload.get("icon") if isinstance(payload, dict) else None
+            icon = validate_model_icon(proposed, icon_allowed)
+            icon_source = "model"
             if icon is None:
                 icon = choose_topic_icon_deterministic(title or "", user_snippet, icon_allowed, recent_icons)
+                icon_source = "keyword" if icon else "none"
+            logger.info("Topic icon %s via %s (model proposed %r)", icon, icon_source, proposed)
             with suppress(Exception):
                 icon_callback(icon, "llm" if title else "fallback")
         if title is None or not any(char.isalnum() for char in title):

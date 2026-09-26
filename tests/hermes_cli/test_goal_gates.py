@@ -1,6 +1,7 @@
 """Tests for /goal quality gates (GoalGate, run_gate, GoalManager gate flow)."""
 
 import json
+import os
 import subprocess
 import sys
 from unittest.mock import patch
@@ -199,6 +200,9 @@ def test_gate_retry_exhaustion_pauses_goal():
 def test_failed_gate_reruns_when_untracked_file_content_changes(tmp_path, monkeypatch):
     """#110649: `git status --porcelain` reports the same `?? untracked/` for `before` and
     `after`, so a status-based cache replayed the stale failure; the gate must execute again."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     for argv in (["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "T"],
                  ["commit", "-q", "--allow-empty", "-m", "baseline"]):
         subprocess.run(["git", *argv], cwd=tmp_path, check=True, capture_output=True)

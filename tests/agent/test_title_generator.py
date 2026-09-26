@@ -497,6 +497,31 @@ class TestMaybeAutoTitle:
                 patch("hermes_cli.config.load_config_readonly", return_value=keyed):
             assert tg.title_upgrade_must_wait_for_turn(main_runtime) is deferred
 
+    @pytest.mark.parametrize(
+        "main_provider, providers, deferred",
+        [
+            # The route's own entry declares a multi-slot server: the title call may share it.
+            ("custom:proxy", {"proxy": {"api": "http://127.0.0.1:8317/v1", "capabilities": {"concurrent_requests": True}}}, False),
+            # Another entry naming the same server declares it (bare `custom` route to that URL).
+            ("custom", {"proxy": {"api": "http://127.0.0.1:8317/v1/", "capabilities": {"concurrent_requests": True}}}, False),
+            # Undeclared or explicitly single-slot keeps the #117296 deferral.
+            ("custom:proxy", {"proxy": {"api": "http://127.0.0.1:8317/v1"}}, True),
+            ("custom:proxy", {"proxy": {"api": "http://127.0.0.1:8317/v1", "capabilities": {"concurrent_requests": False}}}, True),
+            # A declaration on a different server says nothing about the turn's server.
+            ("custom", {"other": {"api": "http://10.0.0.2:8317/v1", "capabilities": {"concurrent_requests": True}}}, True),
+        ],
+    )
+    def test_declared_concurrent_endpoint_keeps_turn_start_timing(self, main_provider, providers, deferred):
+        """#117296 guards single-slot servers. An endpoint whose provider entry declares
+        ``capabilities.concurrent_requests`` serves the title and the turn in separate slots, so the title
+        request goes out at turn start even though both share one base_url."""
+        from agent import title_generator as tg
+
+        main_runtime = {"provider": main_provider, "base_url": "http://127.0.0.1:8317/v1"}
+        with patch.object(tg, "_title_config", return_value={}), \
+                patch("hermes_cli.config.load_config_readonly", return_value={"providers": providers}):
+            assert tg.title_upgrade_must_wait_for_turn(main_runtime) is deferred
+
     def test_kanban_worker_is_named_after_its_card_without_the_llm_thread(self, tmp_path, monkeypatch):
         """A worker's session takes the board card's title synchronously; no auxiliary model call (#111166)."""
         from hermes_cli import kanban_db, kanban_db_connect
@@ -956,3 +981,30 @@ class TestForkTitleContracts:
         assert prompt.rstrip().endswith('{"title": "...", "icon": "..."}')
         assert 'Good: {"title": "iCloud+ 2TB Subscription Review"}' in prompt
         assert "subscription review" not in prompt  # sentence-case pairs are not mixed in
+
+    def test_icon_request_offers_the_whole_catalog_even_when_icons_were_used_recently(self):
+        """Withholding recent icons made the best match unavailable; recency must not shrink the choice."""
+        response = MagicMock(); response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Airbnb Refund", "icon": "💸"}'
+        catalog = [{"emoji": e, "custom_emoji_id": e} for e in ["💸", "🏠", "💻", "📚", "🔥", "📈", "💡", "🧪", "🤖"]]
+        chosen = []
+        with patch("agent.title_generator.call_llm", return_value=response) as call:
+            generate_title("refund for the airbnb stay", icon_options=catalog, recent_icons=["💸", "🏠"],
+                           icon_callback=lambda icon, _how: chosen.append(icon))
+        prompt = call.call_args.kwargs["messages"][0]["content"]
+        icon_line = next(line for line in prompt.splitlines() if "pick one icon" in line)
+        assert all(item["emoji"] in icon_line for item in catalog)
+        assert chosen == ["💸"]
+
+    def test_operator_icon_guidance_replaces_the_default(self):
+        response = MagicMock(); response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Topic", "icon": "💻"}'
+        prompts = []
+        for guidance in ("", "Use food icons only."):
+            with patch("agent.title_generator.call_llm", return_value=response) as call:
+                generate_title("some topic", icon_options=["💻", "🍕"], icon_instructions=guidance,
+                               icon_callback=lambda *_: None)
+            prompts.append(call.call_args.kwargs["messages"][0]["content"])
+        from agent.topic_icons import DEFAULT_ICON_GUIDANCE
+        assert DEFAULT_ICON_GUIDANCE in prompts[0]
+        assert "Use food icons only." in prompts[1] and DEFAULT_ICON_GUIDANCE not in prompts[1]

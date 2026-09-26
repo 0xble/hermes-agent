@@ -205,3 +205,19 @@ def test_check_receipt_ignores_gateways_on_a_separate_checkout(tmp_path, monkeyp
     # An ordinary row on other code still fails; only the external state is exempt.
     _receipt(tmp_path, fleet=[{"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "current"}])
     assert any("'lpg'" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
+    """Background review is an owner choice; enabling it must not fail the fork-patch check."""
+    mod = _load("check_fork_patches")
+    assert "auxiliary.background_review.enabled" not in mod.EXPECTED_CONFIG
+    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m",
+              "auxiliary.background_review.enabled": "true"}
+
+    def fake_run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+    values["memory.write_approval"] = "true"
+    assert mod.check_config(tmp_path) == ["config memory.write_approval = 'true', expected 'false'"]

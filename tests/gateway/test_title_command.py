@@ -109,6 +109,39 @@ class TestHandleTitleCommand:
         db.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("renamed", [True, False])
+    async def test_topic_collision_reports_stored_alias_and_actual_rename(self, tmp_path, renamed):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("other_session", "telegram")
+        db.set_session_title("other_session", "Shared Topic")
+        db.create_session("test_session_123", "telegram")
+        runner = _make_runner(session_db=db)
+        runner._is_telegram_topic_lane = lambda source: True
+        runner._session_db.get_telegram_topic_binding = AsyncMock(
+            return_value={"session_id": "test_session_123"}
+        )
+        adapter = SimpleNamespace(rename_dm_topic=AsyncMock(return_value=renamed))
+        runner._delivery_adapter_for = lambda source: adapter
+        event = _make_event(text="/title Shared Topic")
+        event.source.chat_type = "dm"
+        event.source.thread_id = "42"
+
+        reply = await runner._handle_title_command(event)
+
+        assert db.get_session_title("test_session_123") == "Shared Topic #2"
+        assert "Shared Topic #2" in reply
+        adapter.rename_dm_topic.assert_awaited_once_with(
+            chat_id="67890", thread_id="42", name="Shared Topic"
+        )
+        if renamed:
+            assert "failed" not in reply.lower()
+        else:
+            assert "failed" in reply.lower() and "stored" in reply.lower()
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_show_title_does_not_rename_topic(self, tmp_path):
         """Showing the title (no arg) must not trigger a topic rename."""
         from hermes_state import SessionDB

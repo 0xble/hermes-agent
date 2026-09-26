@@ -1557,27 +1557,16 @@ def _create_quick_snapshot_locked(
     # directories and 32 GB, still climbing, every one of them ALSO missing that database —
     # so the guard was preserving snapshots that did not contain the thing it was protecting.
     #
-    # Keep any snapshot that holds a database this one had to skip, and prune the rest.
-    if failed_dbs:
-        logger.warning(
-            "Skipping snapshot prune because %d DB(s) failed to capture "
-            "— preserving older snapshots as recovery source", len(failed_dbs))
-    else:
-        if oversized_skipped:
-            print("  ⚠ Snapshot omits oversized file(s): " + ", ".join(oversized_skipped))
-            logger.warning("Quick snapshot skipped oversized file(s): %s", ", ".join(oversized_skipped))
-        # Never the one just published. Ordering is by NAME, and ids recycle once a prune
-        # frees a timestamp, so two snapshots in the same second can sort such that the
-        # newest is the one deleted. Excluding it makes that unreachable.
-        candidates = [d for d in _snapshot_dirs(root) if d.name != snap_id]
-        prunable = [d for d in candidates if not _holds_any(d, oversized_skipped)]
-        protected = len(candidates) - len(prunable)
-        if protected:
-            logger.info("Snapshot prune protecting %d snapshot(s) that still hold %s",
-                        protected, ", ".join(oversized_skipped))
-        # keep counts the new snapshot, which is no longer in the list.
-        _prune_oldest(prunable, max(0, (_QUICK_DEFAULT_KEEP if keep is None else keep) - 1),
-                      shutil.rmtree, "snapshot")
+    # Incomplete captures still need a bounded recovery window; pruning validates
+    # older payloads before allowing one to stand in for a missed database.
+    if oversized_skipped:
+        print("  ⚠ Snapshot omits oversized file(s): " + ", ".join(oversized_skipped))
+        logger.warning("Quick snapshot skipped oversized file(s): %s", ", ".join(oversized_skipped))
+    _prune_quick_snapshots(
+        root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep,
+        namespace="pre-update" if label == "pre-update" else "manual",
+        newest=root / snap_id,
+    )
     logger.info("quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
                 snap_id, len(manifest), sum(manifest.values()))
     return snap_id
@@ -1909,9 +1898,76 @@ def _prune_oldest(newest_first: List[Path], keep: int, remove, what: str) -> int
     return deleted
 
 
+def _prune_quick_snapshots(
+    root: Path, keep: int, *, namespace: Optional[str] = None, newest: Optional[Path] = None,
+) -> int:
+    """Bound recent generations while retaining verified database recovery copies."""
+    if not root.exists():
+        return 0
+
+    def usable(directory: Path, rel: str, size: Any) -> bool:
+        relative = Path(rel)
+        if relative.is_absolute() or ".." in relative.parts or type(size) is not int or size < 0:
+            return False
+        path = directory / relative
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
+                return False
+        except OSError:
+            return False
+        return not rel.endswith(".db") or verify_sqlite_integrity(path)["valid"]
+
+    candidates = []
+    for directory in _snapshot_dirs(root):
+        try:
+            with (directory / "manifest.json").open(encoding="utf-8") as stream:
+                meta = json.load(stream)
+        except (OSError, ValueError):
+            continue  # Unknown ownership: never remove an unrecognized directory.
+        if not isinstance(meta, dict) or not isinstance(meta.get("files"), dict):
+            continue
+        family = "pre-update" if meta.get("label") == "pre-update" else "manual"
+        if namespace is None or family == namespace:
+            candidates.append((directory, meta))
+    candidates.sort(key=lambda item: item[0].stat().st_mtime_ns, reverse=True)
+    if newest is not None:
+        candidates.sort(key=lambda item: item[0] == newest, reverse=True)
+    retained = {directory for directory, _ in candidates[:max(keep, 0)]}
+    if newest is not None:
+        retained.add(newest)  # Never prune a snapshot in the same publication call.
+    omissions: set[str] = set()
+    found_complete = False
+    for directory, meta in candidates:
+        files = meta["files"]
+        failed = meta.get("failed_dbs") or []
+        oversized = meta.get("oversized_skipped") or []
+        if not isinstance(failed, list) or not isinstance(oversized, list):
+            continue
+        omissions.update(rel for rel in failed + oversized if isinstance(rel, str))
+        valid = {rel for rel, size in files.items() if isinstance(rel, str) and usable(directory, rel, size)}
+        if not found_complete and not failed and not oversized and len(valid) == len(files):
+            retained.add(directory)
+            found_complete = True
+        omissions.update(rel for rel in files if isinstance(rel, str) and rel.endswith(".db") and rel not in valid)
+    for rel in omissions:
+        for directory, meta in candidates:
+            if rel in meta["files"] and usable(directory, rel, meta["files"][rel]):
+                retained.add(directory)
+                break
+    deleted = 0
+    for directory, _ in candidates:
+        if directory not in retained:
+            try:
+                shutil.rmtree(directory)
+                deleted += 1
+            except OSError as exc:
+                logger.warning("Failed to prune snapshot %s: %s", directory.name, exc)
+    return deleted
+
+
 def prune_quick_snapshots(keep: int = _QUICK_DEFAULT_KEEP, hermes_home: Optional[Path] = None) -> int:
-    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
-    return _prune_oldest(_snapshot_dirs(_quick_snapshot_root(hermes_home)), keep, shutil.rmtree, "snapshot")
+    """Remove old quick snapshots, preserving usable recovery generations."""
+    return _prune_quick_snapshots(_quick_snapshot_root(hermes_home), keep)
 
 
 def run_quick_backup(args) -> None:
