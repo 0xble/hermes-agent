@@ -653,6 +653,35 @@ def save_goal(session_id: str, state: GoalState) -> None:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
 
+def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[bool, Optional[GoalState]]:
+    """Atomically clear the wait barrier iff the durable row is still the active wait parked at
+    ``waiting_since``. Read, compare and write run in one ``BEGIN IMMEDIATE`` transaction, so a
+    concurrent re-park, pause or clear (resumed turn, goal command) can never be overwritten by a
+    stale snapshot. Returns ``(cleared, row_as_seen)``."""
+    db = _get_session_db()
+    if not session_id or db is None:
+        return False, None
+    key = _meta_key(session_id)
+
+    def _txn(conn) -> Tuple[bool, Optional[GoalState]]:
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None or not row[0]:
+            return False, None
+        state = GoalState.from_json(row[0])
+        has_wait = state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until
+        if state.status != "active" or not has_wait or state.waiting_since != waiting_since:
+            return False, state
+        state.clear_wait()
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
+        return True, state
+
+    try:
+        return db._execute_write(_txn)
+    except Exception as exc:
+        logger.warning("GoalManager: conditional wait clear failed for %s: %s", session_id, exc)
+        return False, None
+
+
 def clear_goal(session_id: str) -> None:
     """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
     state = load_goal(session_id)
@@ -730,6 +759,123 @@ def _session_waiting(session_id: str) -> bool:
         return bool(process_registry.is_session_waiting(session_id))
     except Exception:
         return False
+
+
+def _process_outcome(session_id: str) -> Optional[Dict[str, Any]]:
+    """Terminal facts for a process_registry session: the live registry first, then the durable
+    receipt under ``logs/process-results``. None when neither knows it (outcome unknown)."""
+    try:
+        from tools.process_registry import process_registry
+
+        session = process_registry.get(session_id)
+        if session is not None and session.id == session_id:
+            if not session.exited:
+                return {"running": True}
+            return {"exit_code": session.exit_code, "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source}
+    except Exception:
+        pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "logs" / "process-results" / f"{session_id}.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        return {k: record.get(k) for k in ("exit_code", "completion_reason", "termination_source")}
+    except Exception:
+        return None
+
+
+# An idle surface defers this long after a tracked notify_on_complete process exits, so its own
+# completion turn (which re-judges the goal with the output in hand) wins instead of racing it.
+_COMPLETION_NOTICE_GRACE_S = 120.0
+
+
+def _completion_notice_pending(session_id: str) -> bool:
+    """True while THIS process still holds a recently exited notify_on_complete session whose
+    completion turn has not had time to run. A process killed by a previous gateway is absent from
+    the live registry, so it never defers."""
+    try:
+        from tools.process_registry import process_registry
+
+        with process_registry._lock:
+            session = process_registry._finished.get(session_id)
+        return bool(session is not None and session.notify_on_complete
+                    and not process_registry.is_completion_consumed(session_id)
+                    and time.time() - (session.exited_at or 0.0) < _COMPLETION_NOTICE_GRACE_S)
+    except Exception:
+        return False
+
+
+def _barrier_lift_note(state: Optional["GoalState"]) -> str:
+    """One factual line appended to an idle-woken continuation, so the agent does not assume the
+    awaited work succeeded. Never asks for a rerun: interrupted work may have side effects."""
+    if state is None:
+        return ""
+    if state.waiting_on_session:
+        sid = state.waiting_on_session
+        outcome = _process_outcome(sid)
+        if outcome is None:
+            return (f"[Goal wait lifted: background process {sid} is no longer tracked, most likely because "
+                    "the gateway restarted. Its outcome is unknown; verify the real state before relying on it "
+                    "and do not assume it succeeded.]")
+        if outcome.get("running"):
+            return (f"[Goal wait lifted: background process {sid} is still running after "
+                    f"{_MAX_BARRIER_WAIT_S // 60} minutes. Check its progress before waiting again.]")
+        if outcome.get("completion_reason") == "killed":
+            cause = ("a gateway restart or shutdown" if outcome.get("termination_source") == "kill_all"
+                     else "an explicit kill")
+            return (f"[Goal wait lifted: background process {sid} was killed by {cause} before it finished "
+                    f"(exit {outcome.get('exit_code')}). Its result is incomplete; check it with the process "
+                    "tool and verify the real state before deciding whether to restart that work.]")
+        return (f"[Goal wait lifted: background process {sid} finished "
+                f"({outcome.get('completion_reason') or 'exited'}, exit {outcome.get('exit_code')}). "
+                "Read its output with the process tool before continuing.]")
+    if state.waiting_on_pid:
+        if _pid_alive(state.waiting_on_pid):
+            return (f"[Goal wait lifted: pid {state.waiting_on_pid} is still running after "
+                    f"{_MAX_BARRIER_WAIT_S // 60} minutes. Check its progress before waiting again.]")
+        return f"[Goal wait lifted: pid {state.waiting_on_pid} has exited. Verify its result before continuing.]"
+    return ""
+
+
+def list_parked_goals() -> List[Tuple[str, "GoalState"]]:
+    """``[(session_id, GoalState)]`` for every ACTIVE goal carrying a wait barrier in the current
+    profile's store; ``[]`` on any DB error. Used by the gateway's idle wakeup ticker."""
+    db = _get_session_db()
+    if db is None:
+        return []
+    out: List[Tuple[str, GoalState]] = []
+    try:
+        rows = db.list_meta_prefix("goal:")
+    except Exception as exc:
+        logger.debug("GoalManager: list_meta_prefix failed: %s", exc)
+        return []
+    for key, raw in rows:
+        if not raw or '"active"' not in raw:
+            continue
+        try:
+            state = GoalState.from_json(raw)
+        except Exception:
+            continue
+        if state.status == "active" and (
+                state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until):
+            out.append((key[len("goal:"):], state))
+    return out
+
+
+def store_has_parked_goal(db: Any) -> bool:
+    """True when *db* holds an active goal with a wait barrier. Propagates read errors so an idle
+    gate can tell "empty" from "unavailable" (callers fail open)."""
+    for _key, raw in db.list_meta_prefix("goal:"):
+        if raw and '"active"' in raw:
+            try:
+                state = GoalState.from_json(raw)
+            except Exception:
+                return True
+            if state.status == "active" and (
+                    state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until):
+                return True
+    return False
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
@@ -1403,12 +1549,23 @@ class GoalManager:
         self._save()
         return True
 
-    def is_waiting(self) -> bool:
-        """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
-        (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
-        also expires after ``_MAX_BARRIER_WAIT_S``: a watcher or poller that never exits would
-        otherwise park the goal indefinitely (one run sat 3 h 22 min on a poller that outlived
-        the work it was polling)."""
+    def clear_lifted_wait(self, waiting_since: float) -> bool:
+        """Clear the barrier an idle surface just resumed, only if it is still that same wait
+        (matched by ``waiting_since`` on the durable row). The resumed turn may already have finished
+        and parked again; a blind ``stop_waiting`` would erase that newer barrier."""
+        cleared, current = clear_goal_wait_if_since(self.session_id, waiting_since)
+        if current is not None:
+            self._state = current
+        return cleared
+
+    def is_parked(self) -> bool:
+        """True when an active goal carries a wait barrier, whether or not it still holds."""
+        s = self._state
+        return bool(s is not None and s.status == "active" and (
+            s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until))
+
+    def _barrier_holds(self) -> bool:
+        """Pure check: True iff a barrier is set AND not yet satisfied (never mutates state)."""
         s = self._state
         if s is None:
             return False
@@ -1429,9 +1586,40 @@ class GoalManager:
             logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
                         self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
             still = False
+        return still
+
+    def is_waiting(self) -> bool:
+        """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
+        (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
+        also expires after ``_MAX_BARRIER_WAIT_S``: a watcher or poller that never exits would
+        otherwise park the goal indefinitely (one run sat 3 h 22 min on a poller that outlived
+        the work it was polling)."""
+        s = self._state
+        if s is None or not (s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until):
+            return False
+        still = self._barrier_holds()
         if not still:
             self.stop_waiting()
         return still
+
+    def lifted_barrier_prompt(self) -> Optional[str]:
+        """Continuation prompt for a parked goal whose barrier has lifted, else None. Pure: the
+        caller clears the barrier (``stop_waiting``) only after the prompt was admitted, so a failed
+        injection is retried instead of leaving an active goal with nothing left to drive it.
+
+        Idle surfaces (CLI idle hook, gateway wakeup ticker) call this because the post-turn judge
+        only runs after a turn: a barrier whose completion notice never arrives (a gateway restart
+        killed the process, notify_on_complete was off, a timed wait elapsed) otherwise parks the
+        goal until an unrelated message happens to arrive."""
+        if not self.is_parked() or self._barrier_holds():
+            return None
+        if self._state.waiting_on_session and _completion_notice_pending(self._state.waiting_on_session):
+            return None
+        prompt = self.next_continuation_prompt()
+        if not prompt:
+            return None
+        note = _barrier_lift_note(self._state)
+        return f"{prompt}\n\n{note}" if note else prompt
 
     # --- the main entry point called after every turn -----------------
 

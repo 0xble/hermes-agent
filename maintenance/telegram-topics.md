@@ -21,8 +21,15 @@ its optional icon, and the durable alias can be observed through one Telegram to
   omits `name`, so Telegram keeps the visible name; resending the saved session title
   reverted an earlier `--title` rename. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
-- Icon choice favors relevance over variety. The model is always offered the whole catalog;
-  withholding recently used icons made the obvious icon unavailable and forced unrelated picks.
+- Icon choice favors relevance, with variety only among relevant icons. The model is always
+  offered the whole catalog; withholding recently used icons made the obvious icon unavailable and
+  forced unrelated picks. The model returns up to three ranked icons (`icons`, with the older
+  single `icon` still accepted), and `pick_ranked_icon` takes the best one outside the chat's last
+  `ICON_COOLDOWN` (5) automatic icons, falling back to the top pick when all are recent. It never
+  selects an icon the model did not rank, so the cooldown cannot reintroduce unrelated picks. The
+  structured-output schema must list `icons` when icons are requested, or providers that enforce
+  the schema silently drop them. Prompt wording that asked for extras "only if" they clearly fit
+  made the live title model return a single icon almost every time, which disables the cooldown.
   Without operator `topic_icon_instructions`, `DEFAULT_ICON_GUIDANCE` asks for the most specific
   recognizable icon. The keyword fallback uses recency only to break ties and returns no icon
   (the topic keeps its current one) when nothing matches. The adapter warms the icon catalog
