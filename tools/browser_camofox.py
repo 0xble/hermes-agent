@@ -540,12 +540,28 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
         return tool_error(str(exc), success=False)
 
 
+def _navigate_title(session: Dict[str, Any], data: dict) -> str:
+    """Return the navigation title, looking up only this task's owned account and tab."""
+    response_title = data.get("title")
+    if isinstance(response_title, str) and response_title:
+        return response_title
+    try:
+        tabs = _get("/tabs", params=_user_params(session)).get("tabs", [])
+        for tab in tabs if isinstance(tabs, list) else []:
+            if isinstance(tab, dict) and tab.get("tabId") == session["tab_id"]:
+                title = tab.get("title")
+                return title if isinstance(title, str) else ""
+    except Exception as exc:
+        logger.debug("Camofox title lookup failed for tab %s: %s", session.get("tab_id"), exc)
+    return ""
+
+
 def camofox_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
         session, data = _navigate_tab(task_id, browser_url, account)
-        result = {"success": True, "url": data.get("url", browser_url), "title": data.get("title", "")}
+        result = {"success": True, "url": data.get("url", browser_url), "title": _navigate_title(session, data)}
         if session.get("account") is not None:
             result["account"] = session["account"]
         if rewrite_info:

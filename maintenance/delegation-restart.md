@@ -15,11 +15,7 @@ or how an interrupted child reports why it stopped.
   `agent.restart_after_turn_timeout`. Each kind has its own entry-fixed deadline; a
   stuck kind cannot borrow the other's budget, and `restart_after_turn_timeout=0`
   still enters forced drain immediately for non-delegation work.
-- The CLI exit-wait budget is `drain + max(after_turn, delegation) + headroom`
-  (`resolve_restart_exit_wait_budget`), read from the `gateway.*` section on the CLI
-  side, so `hermes update` never `kickstart -k`s a gateway that is legitimately
-  holding for a delegation. With this fork's live config (after_turn=30, drain=5)
-  the budget is 920s, not 50s.
+- The CLI exit-wait budget is `max(after_turn, delegation) + resolve_systemd_timeout_stop_sec(chat_drain, cron_drain) + observer_headroom` (`resolve_restart_exit_wait_budget`), read from the `gateway.*` and `agent.*` sections on the CLI side. The stop envelope includes cron cleanup reserve, service headroom and floor; explicit cron zero opts out. This keeps `hermes update` from expiring while a healthy gateway drains a cron or delegation, without stacking the concurrent phase deadlines. See [Restart verification truth](restart-verification-truth.md) for the separate cron-aware patch.
 - The drain report names delegations (`delegation deleg_x (12s)`) and cites the
   config knob that caps each kind.
 - A child interrupted by shutdown or `/stop` carries the reason:

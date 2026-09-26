@@ -11,6 +11,7 @@ material is fingerprinted, never stored).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -19,7 +20,9 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from agent.secret_sources._cache import CachedFetch, SecretCache, fingerprint as _fingerprint
+from agent.secret_sources._cache import (
+    CachedFetch, SecretCache, atomic_write_json, fingerprint as _fingerprint, resolve_cache_home,
+)
 from agent.secret_sources.base import (
     ErrorKind, FetchResult, SecretSource, classify_cli_error, coerce_float,
     get_source_environment, is_valid_env_name, run_cli,
@@ -125,6 +128,49 @@ def _refs_fingerprint(references: Dict[str, str]) -> str:
     return _fingerprint("\n".join(f"{name}={references[name]}" for name in sorted(references)))
 
 
+# A 429 from a service account means the identity's hourly budget or the account's shared
+# daily budget is spent. Neither refills in seconds, and 1Password does not document whether
+# refused requests are counted, so later processes hold off instead of re-probing on every start.
+_RATE_LIMIT_COOLDOWN_SECONDS = 15 * 60
+_COOLDOWN_BASENAME = "op_rate_limit.json"
+
+
+def _cooldown_key(auth_fp: str, account: str) -> str:
+    # Scoped to the identity (token fingerprint + account), not the reference set: the quota
+    # belongs to the token, so a different env map under the same token is equally refused.
+    return _fingerprint(f"{auth_fp}|{account}")
+
+
+def _cooldown_path(home_path: Optional[Path] = None) -> Path:
+    return resolve_cache_home(home_path) / "cache" / _COOLDOWN_BASENAME
+
+
+def _read_cooldowns(home_path: Optional[Path]) -> Dict[str, float]:
+    try:
+        payload = json.loads(_cooldown_path(home_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {k: float(v) for k, v in payload.items() if isinstance(k, str) and isinstance(v, (int, float))}
+
+
+def _rate_limit_cooldown_active(key: str, home_path: Optional[Path]) -> bool:
+    until = _read_cooldowns(home_path).get(key)
+    return until is not None and time.time() < until
+
+
+def _record_rate_limit_cooldown(key: str, home_path: Optional[Path]) -> None:
+    now = time.time()
+    # Keep other identities' live cooldowns; drop expired ones so the file stays small.
+    cooldowns = {k: v for k, v in _read_cooldowns(home_path).items() if v > now}
+    cooldowns[key] = now + _RATE_LIMIT_COOLDOWN_SECONDS
+    try:
+        atomic_write_json(_cooldown_path(home_path), cooldowns)
+    except OSError:
+        pass  # best-effort: without the marker the next start just probes once and stops
+
+
 def find_op(binary_path: str = "") -> Optional[Path]:
     """Resolve a usable ``op`` binary, or None. A pinned ``binary_path`` is used
     verbatim — pinned-but-missing returns None rather than falling back to PATH."""
@@ -222,14 +268,28 @@ def fetch_onepassword_secrets(
 
     secrets: Dict[str, str] = dict(prefetched)
     failure_kinds: List[ErrorKind] = []
-    for name in sorted(valid):
-        if name in secrets:
-            continue  # carried over from the cache entry; don't pay for it again
-        try:
-            secrets[name] = _run_op_read(op, valid[name], account=account, token_value=token_value)
-        except RuntimeError as exc:
-            warnings.append(str(exc))
-            failure_kinds.append(_classify_op_error(str(exc)))
+    cooldown_key = _cooldown_key(cache_key[0], cache_key[1])
+    if use_cache and _rate_limit_cooldown_active(cooldown_key, home_path):
+        # Another process was refused within the cooldown: every read now would be refused
+        # too, and may still count against the quota. Go straight to the last-good path.
+        failure_kinds.append(ErrorKind.RATE_LIMITED)
+        warnings.append("1Password rate-limit cooldown active; skipping live reads")
+    else:
+        for name in sorted(valid):
+            if name in secrets:
+                continue  # carried over from the cache entry; don't pay for it again
+            try:
+                secrets[name] = _run_op_read(op, valid[name], account=account, token_value=token_value)
+            except RuntimeError as exc:
+                warnings.append(str(exc))
+                kind = _classify_op_error(str(exc))
+                failure_kinds.append(kind)
+                if kind is ErrorKind.RATE_LIMITED:
+                    # The quota is per identity, not per item: every remaining read would be
+                    # refused the same way. Stop, and tell sibling processes to hold off.
+                    if use_cache:
+                        _record_rate_limit_cooldown(cooldown_key, home_path)
+                    break
 
     # An IDENTITY rejection fails every read it is asked to make; a single item the
     # identity may not read is a permission on that item, and `op` reports both as
@@ -418,6 +478,10 @@ def clear_caches(home_path: Optional[Path] = None) -> None:
     """Drop in-process AND disk caches (after a token rotation, so the next
     startup resolves fresh instead of serving values cached under the old token)."""
     _STORE.clear(home_path)
+    try:
+        _cooldown_path(home_path).unlink()
+    except OSError:
+        pass
 
 
 _reset_cache_for_tests = clear_caches

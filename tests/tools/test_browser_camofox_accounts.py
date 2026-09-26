@@ -81,6 +81,41 @@ def test_aliases_select_distinct_sessions_and_echo_only_alias(tmp_path, monkeypa
     assert bodies[0]["userId"] != bodies[2]["userId"]
 
 
+def test_navigation_title_lookup_uses_bound_named_account_and_exact_tab(tmp_path, monkeypatch):
+    from tools.browser_camofox import camofox_navigate
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    seen = []
+
+    def post(url, **kwargs):
+        if url.endswith("/tabs"):
+            tab = "tab-brian" if not seen else "tab-lpg"
+            seen.append(kwargs["json"]["userId"])
+            return _response({"tabId": tab, "url": "https://example.com"})
+        return _response({"ok": True, "url": "https://example.com"})
+
+    def get(url, **kwargs):
+        user_id = kwargs["params"]["userId"]
+        assert url.endswith("/tabs")
+        title = "Brian title" if user_id == seen[0] else "LPG title"
+        tab = "tab-brian" if user_id == seen[0] else "tab-lpg"
+        return _response({"tabs": [{"tabId": "unrelated", "title": "Wrong title"},
+                                   {"tabId": tab, "title": title}]})
+
+    with (patch("tools.browser_camofox.requests.post", side_effect=post),
+          patch("tools.browser_camofox.requests.get", side_effect=get) as lookup,
+          patch("tools.browser_camofox.get_vnc_url", return_value=None),
+          patch("tools.browser_camofox._fetch_snapshot", return_value=("", 0))):
+        brian = json.loads(camofox_navigate("https://example.com", task_id="named-a", account="brianle"))
+        lpg = json.loads(camofox_navigate("https://example.com", task_id="named-b", account="lpg"))
+
+    assert brian["title"] == "Brian title"
+    assert lpg["title"] == "LPG title"
+    assert seen[0] != seen[1]
+    assert [call.kwargs["params"]["userId"] for call in lookup.call_args_list] == seen
+
+
 def test_unknown_alias_is_refused_without_http(tmp_path, monkeypatch):
     from tools.browser_camofox import camofox_navigate
 

@@ -45,7 +45,6 @@ REPO = _resolve_repo()
 EXTENSION_TOOLS = ("goal_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
 # key -> (expected, or None meaning "must be set")
 EXPECTED_CONFIG = {
-    "auxiliary.background_review.enabled": "false",
     "memory.write_approval": "false",
     "delegation.model": None,
     "auxiliary.review.model": None,

@@ -18,6 +18,19 @@ Failed or interrupted model turns do not run completion judging.
   tracked by [issue #118334](https://github.com/NousResearch/hermes-agent/issues/118334).
   Fixes all three authoritative-input truncation sites. Related response-excerpt
   PR #70701 is intentionally separate and does not fix missing criteria.
+- Fork patch identity: `goal-blocker-semantics`. Native judge BLOCKED covers both
+  impossible outcomes and recoverable external dependencies; neither is DONE.
+  Prompt judgment prefers available authorized work before pausing, while the
+  pause reason and notice no longer call every block unachievable. Old blocked
+  pause records still resume on admitted real user input. Archived provenance:
+  HERMES-071 (goals-and-turn-authority); upstream contribution
+  [PR #123859](https://github.com/NousResearch/hermes-agent/pull/123859)
+  at `222b6591a0c0`, not yet released. Regression:
+  `scripts/run_tests.sh -j 6 tests/hermes_cli/test_goal_resolvable_blocker.py
+  tests/hermes_cli/test_goals.py`; retire when the selected release passes this
+  proof without the local prompt/notice adaptation. Rollback reverts only this
+  identity's prompt, pause-label and compatibility changes, preserving blocked
+  goal state and the independent recovery behavior.
 - Fork patch identity: `goal-blocked-recovery`. Adopted source:
   [PR #104380](https://github.com/NousResearch/hermes-agent/pull/104380), head
   `87bdf180e17edad1eff2a60b71a771660bbe0008`, authored by Zeus-Deus.

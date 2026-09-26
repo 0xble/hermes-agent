@@ -633,7 +633,16 @@ def test_already_up_to_date_runs_pending_restart_when_marker_present(
     assert seen["ran"] is True
     assert not update_cmd_fleet._fleet_restart_obligation_armed()
     out = capsys.readouterr().out
-    assert "did not restart running gateways" in out
+    assert "pending gateway-restart obligation" in out
+    assert "did not restart running gateways" not in out
+
+
+def test_pending_restart_warning_is_historical_not_a_live_failure(capsys):
+    update_cmd_fleet._warn_pending_fleet_restart(startup=True)
+    warning = capsys.readouterr().err
+    assert "did not restart running gateways" not in warning
+    assert "previous" in warning.lower()
+    assert "may" in warning.lower()
 
 
 def test_already_up_to_date_runs_pending_restart_when_receipt_skewed(
@@ -689,7 +698,7 @@ def test_already_up_to_date_runs_pending_restart_when_receipt_skewed(
 
     assert seen["ran"] is True
     out = capsys.readouterr().out
-    assert "did not restart running gateways" in out
+    assert "pending gateway-restart obligation" in out
 
 
 def test_already_up_to_date_skips_restart_when_nothing_pending(
@@ -720,8 +729,9 @@ def test_startup_warn_prints_when_marker_present(capsys):
     update_cmd._write_fleet_restart_pending_marker()
     update_cmd._warn_pending_fleet_restart_on_startup()
     err = capsys.readouterr().err
-    assert "did not restart running gateways" in err
-    assert "hermes gateway restart" in err
+    assert "pending gateway-restart obligation" in err
+    assert "hermes update --plan" in err
+    assert "if gateways are stale" in err
 
 
 def test_startup_warn_silent_when_nothing_pending(capsys):
@@ -865,7 +875,7 @@ def test_startup_warn_kept_when_inventory_holds_unclassified_serve(monkeypatch, 
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -888,7 +898,7 @@ def test_startup_warn_kept_without_positive_evidence(monkeypatch, capsys, disk_s
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -951,7 +961,7 @@ def test_obligation_kept_when_gateway_serves_stale_code_on_carried_checkout(monk
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -985,7 +995,7 @@ def test_startup_warn_kept_when_receipt_owed_gateway_is_down(monkeypatch, capsys
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -1104,7 +1114,7 @@ def test_startup_warn_kept_when_inventory_less_marker_fleet_stale(monkeypatch, c
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 # ── Empty-inventory marker: a pull that recorded no gateway owes nothing (#115311) ──

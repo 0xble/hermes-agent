@@ -165,3 +165,39 @@ def test_rich_limit_counts_materialized_paragraph_payload(adapter):
         adapter.RICH_MESSAGE_MAX_CHARS
     )
     assert adapter._content_fits_rich_limits(content) is False
+
+
+class TestRichOrderedListAfterProse:
+    """CommonMark lets an ordered list interrupt a paragraph only when it starts
+    at 1, so ``Label\\n7. item`` renders as one paragraph with literal numbers."""
+
+    @pytest.mark.parametrize(
+        "content, items",
+        [
+            ("**Facts and Evidence**\n7. **Verbs.** Is.\n8. **Dates.** As of.", 2),
+            ("Intro\n\nNext steps:\n2) second\n3) third\n4) fourth", 3),
+        ],
+    )
+    def test_ordered_list_after_prose_line_parses_as_list(self, adapter, content, items):
+        from markdown_it import MarkdownIt
+
+        md = adapter._rich_message_payload(content)["markdown"]
+        tokens = MarkdownIt("commonmark").parse(md)
+
+        assert [t.type for t in tokens].count("ordered_list_open") == 1
+        assert [t.type for t in tokens].count("list_item_open") == items
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "1. a\n2. b\n3. c",
+            "- a\n7. b",
+            "1. a\n   continued\n2. b",
+            "```text\nLabel\n7. literal\n```",
+            "Streaming draft\n```text\nLabel\n7. literal",
+        ],
+    )
+    def test_lists_and_code_gain_no_blank_line(self, adapter, content):
+        md = adapter._rich_message_payload(content)["markdown"]
+
+        assert md.count("\n\n") == content.count("\n\n")

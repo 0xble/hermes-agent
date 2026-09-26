@@ -492,10 +492,11 @@ def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: l
 def _warn_pending_fleet_restart(*, startup: bool = False) -> None:
     """Print the specific interrupted-update fleet-restart warning."""
     stream = sys.stderr if startup else sys.stdout
-    print("⚠ A previous `hermes update` pulled new code but did not restart running gateways.", file=stream)
-    print("  Gateways may still be serving pre-update modules (mixed sys.modules).", file=stream)
+    print("⚠ A previous `hermes update` recorded a pending gateway-restart obligation.", file=stream)
+    print("  This saved history alone does not prove whether the live gateways restarted.", file=stream)
+    print("  Some gateways may still be serving pre-update modules (mixed sys.modules).", file=stream)
     if startup:
-        print("  Run `hermes update` or `hermes gateway restart`.", file=stream)
+        print("  Inspect with `hermes update --plan`; if gateways are stale, run `hermes update` or `hermes gateway restart`.", file=stream)
 
 
 def _warn_pending_fleet_restart_on_startup() -> None:
@@ -1846,6 +1847,16 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
         # and never came back", not "nothing was running"; None fails closed.
         try:
             out.pre_restart_gateway_pids = _scoped_manual_gateway_pids(find_gateway_pids(all_profiles=True), quiet=True)
+            # The cleanup scan omits updater ancestors, but the pre-update plan
+            # retains their gateway identity. Only augment verification, not kill targets.
+            for runtime in getattr(_pre_update_plan, "runtimes", ()) or ():
+                pid = getattr(runtime, "pid", None)
+                if (
+                    getattr(runtime, "kind", None) == "gateway"
+                    and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+                    and pid not in out.pre_restart_gateway_pids
+                ):
+                    out.pre_restart_gateway_pids.append(pid)
         except Exception:
             out.pre_restart_gateway_pids = None
 

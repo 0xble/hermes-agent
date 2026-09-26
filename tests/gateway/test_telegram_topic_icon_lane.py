@@ -39,8 +39,8 @@ def _runner(tmp_path, *, extra: dict, session_id: str = "sess-1"):
     adapter._bot = None
     adapter.rename_dm_topic = AsyncMock(return_value=True)
     adapter.get_forum_topic_icon_options = AsyncMock(return_value=[
-        {"emoji": "🐛", "custom_emoji_id": "id-bug"},
-        {"emoji": "📊", "custom_emoji_id": "id-chart"},
+        {"emoji": "🔥", "custom_emoji_id": "id-bug"},
+        {"emoji": "📈", "custom_emoji_id": "id-chart"},
     ])
     adapter._forum_topic_icon_options = None
     type(adapter).get_manual_topic_icon = None  # not a TelegramAdapter; no manual-icon source
@@ -63,7 +63,7 @@ async def test_icon_lane_reads_and_writes_through_the_real_async_facade(tmp_path
     assert kwargs["icon_custom_emoji_id"] == "id-bug", "name and icon must ride one Bot API call"
     # State and history landed only after the confirmed rename, and are readable via the sync DB.
     assert db.get_telegram_topic_icon_state(CHAT, THREAD)["owner"] == "auto"
-    assert db.list_recent_telegram_topic_icons(CHAT) == ["🐛"]
+    assert db.list_recent_telegram_topic_icons(CHAT) == ["🔥"]
 
 
 @pytest.mark.anyio
@@ -79,7 +79,7 @@ async def test_failed_rename_records_no_icon_state(tmp_path):
 async def test_model_icon_wins_over_heuristic_when_allowed(tmp_path):
     runner, adapter, _ = _runner(tmp_path, extra={"auto_topic_icons": True})
     await runner._rename_telegram_topic_for_session_title(
-        _source(), "sess-1", "Fix auth bug", user_message="debug", model_icon="📊")
+        _source(), "sess-1", "Fix auth bug", user_message="debug", model_icon="📈")
     assert adapter.rename_dm_topic.await_args.kwargs["icon_custom_emoji_id"] == "id-chart"
 
 
@@ -94,7 +94,26 @@ def test_icon_context_is_none_until_the_adapter_has_cached_the_catalog(tmp_path)
     runner, adapter, _ = _runner(tmp_path, extra={"auto_topic_icons": True,
                                                   "topic_icon_instructions": "playful"})
     assert runner._telegram_topic_icon_context(_source()) is None
-    adapter._forum_topic_icon_options = [{"emoji": "🐛", "custom_emoji_id": "id-bug"}]
+    adapter._forum_topic_icon_options = [{"emoji": "🔥", "custom_emoji_id": "id-bug"}]
     ctx = runner._telegram_topic_icon_context(_source())
-    assert ctx["options"] == [{"emoji": "🐛", "custom_emoji_id": "id-bug"}]
+    assert ctx["options"] == [{"emoji": "🔥", "custom_emoji_id": "id-bug"}]
     assert ctx["instructions"] == "playful"
+
+
+@pytest.mark.anyio
+async def test_unmatched_topic_keeps_its_icon_instead_of_getting_an_arbitrary_one(tmp_path):
+    runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
+    await runner._rename_telegram_topic_for_session_title(_source(), "sess-1", "Quiet Afternoon", user_message="hello")
+    kwargs = adapter.rename_dm_topic.await_args.kwargs
+    assert kwargs["name"] == "Quiet Afternoon"
+    assert "icon_custom_emoji_id" not in kwargs
+    assert db.get_telegram_topic_icon_state(CHAT, THREAD) is None
+
+
+@pytest.mark.anyio
+async def test_recently_used_icon_is_still_chosen_when_it_is_the_match(tmp_path):
+    runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
+    db.record_telegram_topic_icon_history(CHAT, emoji="🔥", custom_emoji_id="id-bug")
+    await runner._rename_telegram_topic_for_session_title(
+        _source(), "sess-1", "Fix auth bug", user_message="debug the crash")
+    assert adapter.rename_dm_topic.await_args.kwargs["icon_custom_emoji_id"] == "id-bug"

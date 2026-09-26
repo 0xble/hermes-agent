@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.fast_mode import effective_request_overrides
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
@@ -177,3 +178,49 @@ async def test_safe_commands_reach_handler_during_active_turn(command):
     assert runner._running_agents[key] is agent
     agent.interrupt.assert_not_called()
     assert not runner._pending_messages
+
+
+def test_busy_inference_changes_reach_live_agents_next_request():
+    runner = _make_runner()
+    key = build_session_key(_make_source())
+    agent = runner._running_agents[key]
+    agent.reasoning_config = {"enabled": True, "effort": "low"}
+    agent.service_tier = None
+    agent.model = "gpt-5.1"
+    agent.provider = "openai"
+    agent.base_url = "https://api.openai.com/v1"
+    agent.request_overrides = {"extra_body": {"custom": "keep"}, "temperature": 0.3}
+    agent._gateway_base_request_overrides = dict(agent.request_overrides)
+    runner._agent_cache = {key: (agent,)}
+
+    runner._apply_reasoning_selection(key, "telegram", "high")
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    assert runner._running_agents[key] is agent
+    assert runner._agent_cache[key][0] is agent
+
+    built_request = effective_request_overrides(agent)
+    runner._apply_fast_selection(key, "fast")
+    assert built_request == {"extra_body": {"custom": "keep"}, "temperature": 0.3}
+    assert effective_request_overrides(agent) == {
+        "extra_body": {"custom": "keep"}, "temperature": 0.3, "service_tier": "priority",
+    }
+    runner._apply_fast_selection(key, "normal")
+    assert effective_request_overrides(agent) == built_request
+    assert runner._running_agents[key] is agent
+    assert runner._agent_cache[key][0] is agent
+
+
+def test_busy_controls_reset_from_an_initial_fast_request():
+    runner = _make_runner()
+    key = build_session_key(_make_source())
+    agent = runner._running_agents[key]
+    agent.model, agent.provider, agent.base_url = "gpt-5.1", "openai", "https://api.openai.com/v1"
+    agent.reasoning_config = {"enabled": True, "effort": "high"}
+    agent._gateway_base_request_overrides = {"extra_body": {"keep": True}}
+    agent.request_overrides = {**agent._gateway_base_request_overrides, "service_tier": "priority"}
+    agent.service_tier = "priority"
+    runner._load_reasoning_config = lambda model="": {"enabled": True, "effort": "medium"}
+    runner._apply_fast_selection(key, "normal")
+    runner._apply_reasoning_selection(key, "telegram", "reset")
+    assert effective_request_overrides(agent) == {"extra_body": {"keep": True}}
+    assert agent.reasoning_config == {"enabled": True, "effort": "medium"}

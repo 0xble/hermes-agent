@@ -147,6 +147,15 @@ additionally included in both bounded and full fork validation.
 
 ## Verification and retirement
 
+The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`
+adds real-process Kanban and tenancy fixtures. Their OS home is separate from
+their explicit Hermes home so native service discovery assigns a unique profile
+label instead of finding the developer's host-wide default launchd gateway.
+The service-ownership guard remains active. The approval-boundary matrix runs
+GNU `rm` long flags on Linux, where that syntax is executable, while retaining
+the portable destructive-command variants on macOS. These are test-harness
+adaptations under `fork-ci-reliability`, not runtime-policy changes.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.

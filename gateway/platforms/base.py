@@ -1951,6 +1951,7 @@ class BasePlatformAdapter(ABC):
         # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
         # callback)`` so a stale run can't clear a fresher run's callback.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        self._post_delivery_callbacks_by_generation: Dict[Tuple[str, int], Callable] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
@@ -3485,17 +3486,26 @@ class BasePlatformAdapter(ABC):
         fresher slot."""
         if not session_key or not callable(callback):
             return
-        existing = self._post_delivery_callbacks.get(session_key)
-        if existing is not None:
-            existing_gen, existing_cb = _split_post_delivery_entry(existing)
-            if existing_gen is not None and generation is not None and int(generation) < int(existing_gen):
+        owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+        if generation is None:
+            existing = self._post_delivery_callbacks.get(session_key)
+        else:
+            generation = int(generation)
+            existing = owned.get((session_key, generation))
+            # An older turn can extend its existing lane while it unwinds, but cannot
+            # register a new stale callback after a newer generation owns the session.
+            if existing is None and any(
+                key == session_key and gen > generation for key, gen in owned
+            ):
                 return
-            # Same-or-newer generation: chain so both fire in registration order.
-            if callable(existing_cb) and (
-                existing_gen is None or generation is None or int(existing_gen) == int(generation)):
+        if existing is not None:
+            _, existing_cb = _split_post_delivery_entry(existing)
+            if callable(existing_cb):
                 callback = self._chain_callbacks(existing_cb, callback)
-        self._post_delivery_callbacks[session_key] = (
-            callback if generation is None else (int(generation), callback))
+        if generation is None:
+            self._post_delivery_callbacks[session_key] = callback
+        else:
+            owned[(session_key, generation)] = callback
 
     @staticmethod
     def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
@@ -3514,8 +3524,20 @@ class BasePlatformAdapter(ABC):
     def pop_post_delivery_callback(
         self, session_key: str, *, generation: int | None = None) -> Callable | None:
         """Pop a deferred callback, optionally requiring generation ownership."""
-        entry = self._post_delivery_callbacks.get(session_key) if session_key else None
+        if not session_key:
+            return None
+        owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
+        if generation is not None:
+            callback = owned.pop((session_key, int(generation)), None)
+            if callback is not None:
+                return callback if callable(callback) else None
+        entry = self._post_delivery_callbacks.get(session_key)
         if entry is None:
+            if generation is None:
+                keys = [key for key in owned if key[0] == session_key]
+                if len(keys) == 1:
+                    callback = owned.pop(keys[0])
+                    return callback if callable(callback) else None
             return None
         entry_generation, callback = _split_post_delivery_entry(entry)
         if generation is not None and (entry_generation is None or int(entry_generation) != int(generation)):
@@ -3757,6 +3779,43 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+        # A completed reply to a deleted private Telegram topic cannot be repaired by
+        # formatting fallback: that keeps both the dead thread and its reply anchor.
+        # Never move interim output (or an ambiguous timeout) into the parent DM.
+        topic_meta = metadata if isinstance(metadata, dict) else {}
+        if (
+            self.platform == Platform.TELEGRAM
+            and topic_meta.get("notify") and not topic_meta.get("_interim_send")
+            and topic_meta.get("telegram_dm_topic_reply_fallback")
+            and not topic_meta.get("telegram_stale_topic_recovery")
+            and (topic_meta.get("thread_id") or topic_meta.get("message_thread_id"))
+            and not self._is_timeout_error(error_str)
+            and any(marker in " ".join(error_str.lower().split()) for marker in (
+                "thread not found", "topic deleted", "topic closed", "topic not found"))
+        ):
+            thread_id = topic_meta.get("thread_id") or topic_meta.get("message_thread_id")
+            mark_stale = getattr(self, "_mark_dm_topic_stale", None)
+            if callable(mark_stale):
+                mark_stale(chat_id, thread_id)
+            prune = getattr(self, "_prune_stale_dm_topic_binding", None)
+            if callable(prune):
+                prune(chat_id, thread_id, metadata=topic_meta)
+            root_meta = {key: value for key, value in topic_meta.items() if key not in {
+                "thread_id", "message_thread_id", "direct_messages_topic_id",
+                "telegram_direct_messages_topic_id", "telegram_reply_to_message_id",
+                "reply_to_message_id", "telegram_dm_topic_reply_fallback",
+                "telegram_dm_topic_created_for_send",
+            }}
+            root_meta["telegram_stale_topic_recovery"] = True
+            partial = self._is_partial_delivery(result)
+            root_content = (
+                "A response was partially delivered before its Telegram topic was deleted. "
+                "The complete response remains in Hermes session history."
+                if partial else "Recovered response from a deleted Telegram topic:\n\n" + content)
+            logger.warning("[%s] Recovering completed reply from deleted Telegram topic chat=%s thread=%s",
+                           self.name, chat_id, thread_id)
+            return await self.send(chat_id=chat_id, content=root_content, reply_to=None, metadata=root_meta)
+
         # Non-network / post-retry formatting failure: try plain text as fallback. A
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
@@ -4276,11 +4335,10 @@ class BasePlatformAdapter(ABC):
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
         delivery_adapter: "BasePlatformAdapter") -> None:
-        """Mark the ledger row delivered/failed (best-effort). On ``send_path_degraded`` with a
-        replacement adapter live, trigger another redelivery sweep (the watcher's may have run
-        before this failure landed; atomic claiming keeps it idempotent). On any other rejection arm
-        the runner's timed redelivery, so the reply goes out once the flood penalty or the retry
-        backoff has passed instead of waiting for the next restart (#91653)."""
+        """Mark the ledger row delivered/failed (best-effort). A degraded refusal
+        persisted after either a replacement or an in-place recovery needs another sweep:
+        the health sweep can run before this failure write. Other rejections use the
+        runner's timed redelivery, preserving flood and permanent-error policy."""
         try:
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
@@ -4293,7 +4351,10 @@ class BasePlatformAdapter(ABC):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
                 live = self._final_delivery_adapter(event.source)
-                if live is not delivery_adapter and callable(redeliver):
+                if callable(redeliver) and (
+                    live is not delivery_adapter
+                    or (live.is_connected and not live.send_path_degraded)
+                ):
                     await redeliver(event.source.platform,
                                     profile=getattr(delivery_adapter, "_owner_profile", None))
             elif classify_dead_error(error) is None:  # a dead chat is never retried: no timer to wake
@@ -4524,12 +4585,11 @@ class BasePlatformAdapter(ABC):
             text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
-    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
-        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
-        would let stale runs fire a fresher run's callbacks."""
-        _post_cb = self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
+    async def _fire_post_delivery_callback(
+        self, session_key: str, generation: int | None,
+    ) -> None:
+        """Run the one-shot callback for the generation captured after this handler returned."""
+        _post_cb = self.pop_post_delivery_callback(session_key, generation=generation)
         if callable(_post_cb):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
@@ -4599,10 +4659,12 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        delivery_generation = None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4705,7 +4767,7 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
+            await self._fire_post_delivery_callback(session_key, delivery_generation)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
