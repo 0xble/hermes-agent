@@ -140,13 +140,25 @@ async def test_explicit_title_changes_icon_in_the_same_rename(tmp_path, monkeypa
 
 
 @pytest.mark.anyio
-async def test_explicit_title_keeps_a_manually_chosen_icon(tmp_path, monkeypatch):
+async def test_explicit_title_replaces_a_manually_chosen_icon(tmp_path, monkeypatch):
     runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
     db.record_telegram_topic_icon_state(CHAT, THREAD, custom_emoji_id="id-bug", emoji="🔥", owner="manual")
+    type(adapter).get_manual_topic_icon = lambda self, chat, thread: "id-bug"
     monkeypatch.setattr("agent.title_generator.pick_topic_icon", lambda *a, **k: "📈")
     assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Quarterly Revenue") is True
-    assert "icon_custom_emoji_id" not in adapter.rename_dm_topic.await_args.kwargs
-    assert db.get_telegram_topic_icon_state(CHAT, THREAD)["owner"] == "manual"
+    assert adapter.rename_dm_topic.await_args.kwargs["icon_custom_emoji_id"] == "id-chart"
+    state = db.get_telegram_topic_icon_state(CHAT, THREAD)
+    assert (state["emoji"], state["owner"]) == ("📈", "auto")
+
+
+@pytest.mark.anyio
+async def test_automatic_rename_still_keeps_a_manually_chosen_icon(tmp_path):
+    runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
+    db.record_telegram_topic_icon_state(CHAT, THREAD, custom_emoji_id="id-bug", emoji="🔥", owner="manual")
+    icon_id, _, _, owner = await runner._select_telegram_topic_icon(
+        _source(), adapter, "Quarterly Revenue", model_icon="📈",
+        options=await adapter.get_forum_topic_icon_options())
+    assert icon_id is None and owner == "auto"
 
 
 @pytest.mark.anyio

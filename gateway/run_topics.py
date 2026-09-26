@@ -459,7 +459,8 @@ class GatewayTopicThreadsMixin:
         """Report whether an explicit /title reached the bound Telegram topic.
 
         The icon follows the new name under the same rules as an automatic rename (override, model
-        pick, keyword fallback, manual icons preserved) and rides the same Bot API call.
+        pick, keyword fallback) and rides the same Bot API call. Unlike an automatic rename it also
+        replaces a manually chosen icon: /title is the user saying the topic's subject changed.
         """
         if not source.chat_id or not source.thread_id:
             return False
@@ -476,7 +477,8 @@ class GatewayTopicThreadsMixin:
                 icon_id, state_record, history_record, owner = None, None, None, "auto"
                 if options:
                     icon_id, state_record, history_record, owner = await self._select_telegram_topic_icon(
-                        source, adapter, topic_name, model_icon=model_icon, options=options)
+                        source, adapter, topic_name, model_icon=model_icon, options=options,
+                        preserve_manual=False)
                 # The icon pick awaits the model; the topic may have been rebound meanwhile.
                 if not await self._telegram_topic_bound_to(source, session_id):
                     return False
@@ -620,11 +622,12 @@ class GatewayTopicThreadsMixin:
         user_message: str = "",
         model_icon: Optional[str] = None,
         options: Optional[list] = None,
+        preserve_manual: bool = True,
     ) -> tuple:
         """``(custom_emoji_id, state_record, history_record, owner)`` for a topic rename.
 
         Override, then model proposal, then keyword fallback; a manually chosen icon is kept when
-        ``preserve_manual_topic_icons`` is on. Records are persisted by the caller only after
+        ``preserve_manual_topic_icons`` is on and the caller has not waived it (``preserve_manual``). Records are persisted by the caller only after
         Telegram accepts the edit. Returns no icon when ``auto_topic_icons`` is off.
         """
         icon_custom_emoji_id = None
@@ -664,7 +667,8 @@ class GatewayTopicThreadsMixin:
                 None,
             )
             icon_custom_emoji_id = selected.get("custom_emoji_id") if selected else None
-            preserve_manual = is_truthy_value(extra.get("preserve_manual_topic_icons", True), default=True)
+            preserve_manual = preserve_manual and is_truthy_value(
+                extra.get("preserve_manual_topic_icons", True), default=True)
             manual_icon_id = None
             manual_icon_getter = getattr(type(adapter), "get_manual_topic_icon", None)
             if preserve_manual and callable(manual_icon_getter):
