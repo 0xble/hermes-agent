@@ -35,6 +35,7 @@ from plugins.memory.hindsight import (
     _normalize_retain_tags,
     _resolve_bank_id_template,
     _WRITER_SENTINEL,
+    filter_retain_messages,
 )
 from plugins.memory.hindsight.settings import _sanitize_bank_segment
 
@@ -1247,6 +1248,47 @@ class TestRecallStatus:
 
 
 class TestSyncTurn:
+    @pytest.mark.parametrize("notice", [
+        "[ASYNC DELEGATION BATCH COMPLETE — batch-1]",
+        "[ASYNC DELEGATION COMPLETE — child-1]",
+        "[ASYNC DELEGATION TASK FAILED — batch-1, task 1/2]",
+        "[NATIVE REVIEW COMPLETE — candidate-1]",
+        "[SUBAGENT child-1] finished",
+    ])
+    def test_retain_filter_drops_injected_notice_but_keeps_real_user_message(self, notice):
+        assert filter_retain_messages("Keep this decision", notice) == ("Keep this decision", None)
+
+    def test_retain_filter_drops_recalled_context_and_status_only_assistant(self):
+        user, assistant = filter_retain_messages(
+            "<memory-context>old recalled fact</memory-context>Keep this request",
+            "[SILENT]",
+        )
+        assert (user, assistant) == ("Keep this request", None)
+
+    def test_retain_filter_keeps_substantive_one_line_status_report(self):
+        assert filter_retain_messages("Question", "Status: deployment failed because the database is unavailable.") == (
+            "Question",
+            "Status: deployment failed because the database is unavailable.",
+        )
+
+    def test_retain_filter_preserves_user_followup_and_drops_unterminated_context_tail(self):
+        user, assistant = filter_retain_messages(
+            "[ASYNC DELEGATION COMPLETE — child-1]\nPlease investigate the result",
+            "<memory-context>recalled text without a closing tag",
+        )
+        assert user == "[ASYNC DELEGATION COMPLETE — child-1]\nPlease investigate the result"
+        assert assistant is None
+        assert filter_retain_messages(
+            "[ASYNC DELEGATION COMPLETE — child-1]\nA background subagent has finished.\nStatus: completed",
+            "answer",
+        )[0] is None
+        assert filter_retain_messages(
+            "[ASYNC DELEGATION COMPLETE — child-1]\nSummarize the result.", "[SILENT]"
+        )[0] == "[ASYNC DELEGATION COMPLETE — child-1]\nSummarize the result."
+        assert filter_retain_messages("What does a literal <memory-context> tag do?", "answer")[0] == (
+            "What does a literal <memory-context> tag do?"
+        )
+
     def test_cron_context_does_not_auto_retain(self, provider_with_config):
         p = provider_with_config()
         p.initialize(session_id="cron_job-1", agent_context="cron", platform="cron")
