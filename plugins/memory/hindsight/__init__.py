@@ -1224,7 +1224,16 @@ class HindsightMemoryProvider(MemoryProvider):
         metadata = self._build_metadata(message_count=message_count, turn_index=self._turn_index)
         lineage = (("session", self._session_id), ("parent", self._parent_session_id))
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
-        bank_id, retain_async, retain_context = self._bank_id, self._retain_async, self._retain_context
+        bank_id, retain_async = self._bank_id, self._retain_async
+        # This item is a chat transcript, not an explicit hindsight_retain call.
+        # Context is per item, so these instructions do not alter other bank uses.
+        retain_context = (
+            f"{self._retain_context}\n\nChat-session extraction: Keep confirmed decisions, "
+            "stable user preferences, facts about the world, and concrete outcomes. "
+            "Attribute claims to the speaker; an assistant proposal is not a user decision. "
+            "Skip delegation/reviewer/process notices, acknowledgements, transient status, "
+            "recalled context, and procedural tool chatter unless they establish an outcome."
+        )
         # A timed-out send keeps running on the shared loop. Re-sending it while it may still land
         # would append the same turns twice, so a retry first settles the earlier attempt.
         in_flight: list = []

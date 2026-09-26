@@ -1355,7 +1355,9 @@ class TestSyncTurn:
         assert call_kwargs["retain_async"] is True
         assert len(call_kwargs["items"]) == 1
         item = call_kwargs["items"][0]
-        assert item["context"] == "conversation between Hermes Agent and the User"
+        assert item["context"].startswith("conversation between Hermes Agent and the User\n\nChat-session extraction:")
+        assert "confirmed decisions" in item["context"]
+        assert "assistant proposal is not a user decision" in item["context"]
         assert item["tags"] == ["conv", "session1", "session:session-1"]
         content = json.loads(item["content"])
         assert len(content) == 1
