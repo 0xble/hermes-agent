@@ -1424,6 +1424,15 @@ No background `auto-title` thread starts and no automatic title-model request is
 explicit repair command `hermes sessions retitle-skills` still calls the model. `enabled: false`
 still disables both stages.
 
+When the opening message contains a link, the model title is informed by that page. Only the
+first `http(s)` link is used, and only its title and description metadata are read, never the
+body. The request runs in the background title thread with a 4-second budget, sends no cookies
+or credentials, refuses private and internal addresses even when `security.allow_private_urls`
+is on, honors the website blocklist, and skips links that look side-effecting (login, reset,
+verification, unsubscribe, invite) or carry credential-named query parameters. Any refusal or
+failure titles from the text alone. Set `auxiliary.title_generation.link_context: false` to
+disable it.
+
 On a `custom` main provider (llama.cpp, Ollama, vLLM, LM Studio and other self-hosted
 OpenAI-compatible servers) the title model call is sent **after** the turn's reply has
 arrived, not concurrently with it, unless `auxiliary.title_generation` is pinned to another
@@ -1571,6 +1580,7 @@ auxiliary:
   title_generation:
     enabled: true              # set false to disable auto-title generation
     model_upgrade_enabled: true  # set false to keep the instant derived title, never call a model
+    link_context: true         # set false to stop using the first link's page title/description
     provider: "auto"
     model: ""
     base_url: ""

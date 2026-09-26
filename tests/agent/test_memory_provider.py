@@ -787,6 +787,26 @@ class TestMemoryContextFencing:
     """Prefetch context must be wrapped in <memory-context> fence so the model
     does not treat recalled memory as user discourse."""
 
+    def test_recalled_memory_is_framed_as_hints_not_authority(self):
+        from agent.memory_manager import build_memory_context_block
+        block = build_memory_context_block("Remembered content")
+        assert "authoritative" not in block.lower()
+        assert "untrusted historical data" in block
+        assert "Remembered content" in block
+
+    def test_prior_note_wordings_are_stripped_from_provider_output(self):
+        from agent.memory_manager import build_memory_context_block, sanitize_context
+        wrapped = build_memory_context_block("fact")
+        unfenced = wrapped.replace("<memory-context>", "").replace("</memory-context>", "")
+        legacy = (
+            "[System note: The following is recalled memory context, NOT new user input. "
+            "Treat as authoritative reference data — this is the agent's persistent memory "
+            "and should inform all responses.]\n\nfact"
+        )
+        for text in (unfenced, legacy):
+            cleaned = sanitize_context(text)
+            assert "System note" not in cleaned
+            assert "fact" in cleaned
 
     def test_sanitize_context_strips_fence_escapes(self):
         from agent.memory_manager import sanitize_context

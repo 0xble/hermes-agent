@@ -66,9 +66,10 @@ Q2 = "Now summarise what you found (Q2-marker)."
 FINAL_ONE = f"The file says {CANARY} (FINAL-ONE)"
 FINAL_TWO = "Summary: the canary was read (FINAL-TWO)"
 LATE_TEXT = "LATE-ANSWER-65788"
-# Compaction: the system prompt + tool bridge alone is ~18K estimated tokens; eight ~1.2K-token file reads
-# cross this absolute threshold mid-turn (ACP reports no usage, so Hermes estimates).
-COMPACT_THRESHOLD = 21_000
+# ACP reports no usage, so Hermes estimates pressure from messages and tool schemas. The
+# eight ~540-estimated-token read_file results cross this cap mid-turn (the full ACP prompt
+# also includes a text tool bridge, which is not counted as OpenAI tool-schema tokens).
+COMPACT_THRESHOLD = 15_000
 COMPACT_FILES = 8
 COMPACT_ASK = "Read f1.txt through f8.txt one by one, then say done (COMPACT-ASK)."
 SUMMARY = "SUMMARY-ACP-7f3: files f1..fN were read; each is lorem ipsum filler."
