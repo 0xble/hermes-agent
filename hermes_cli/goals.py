@@ -48,7 +48,8 @@ DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 # ``paused_reason`` prefix of the judge's BLOCKED auto-pause. It is the ONE pause kind a real
 # user message may undo (see ``GoalManager.resume_for_user_input``), so it must be
 # distinguishable from user/budget/judge-failure pauses that share ``status="paused"``.
-_BLOCKED_PAUSE_PREFIX = "judged unachievable: "
+_BLOCKED_PAUSE_PREFIX = "judge blocked: "
+_LEGACY_BLOCKED_PAUSE_PREFIX = "judged unachievable: "
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
@@ -130,11 +131,13 @@ JUDGE_SYSTEM_PROMPT = (
     "- The response explains the goal is genuinely unachievable (impossible, "
     "out of scope, no valid path to the deliverable), or refuses to "
     "fabricate a deliverable that cannot exist, OR\n"
-    "- The response explains progress is blocked and the next step needs "
-    "user input to proceed.\n"
-    "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
-    "a refusal, not a completion — never return BLOCKED for a goal that "
-    "was achieved.\n"
+    "- Progress needs user input or an external prerequisite to proceed, "
+    "and no authorized investigation or independent work remains right now. "
+    "This is a resolvable blocker, NOT proof the whole goal is unachievable.\n"
+    "Before choosing BLOCKED, prefer CONTINUE if the agent can investigate, "
+    "adapt its method, or do independent authorized work. Return BLOCKED "
+    "with the precise missing input or prerequisite in the reason; BLOCKED "
+    "pauses the goal rather than completing it.\n"
     "When the block is an error the agent hit (an HTTP status, an API, "
     "sign-in or token failure), quote the error text verbatim in the reason "
     "and attribute it only to a provider, service or credential the response "
@@ -1197,7 +1200,7 @@ class GoalManager:
         s = self._state
         if s is None or s.status != "paused" or s.last_verdict != "blocked":
             return False
-        if not (s.paused_reason or "").startswith(_BLOCKED_PAUSE_PREFIX):
+        if not (s.paused_reason or "").startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX)):
             return False
         self.resume(reset_budget=False)
         return True
@@ -1515,14 +1518,13 @@ class GoalManager:
             if parked is not None:
                 return parked
 
-        # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
-        # instead of burning turns on an unachievable goal or waving it through as complete.
-        # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
-        # of scope, needs user input). See #100954.
+        # BLOCKED is NOT done: pause for missing user input, an external prerequisite, or
+        # an impossible goal. A recoverable dependency must never be called unachievable.
         if verdict == "blocked":
             return self._pause_decision(
                 f"{_BLOCKED_PAUSE_PREFIX}{reason}", "blocked", reason,
-                f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
+                f"⏸ Goal blocked — paused: {reason} If input is needed, supply it to continue; "
+                "use /goal set to re-scope or /goal resume to retry.",
             )
 
         if verdict == "done":
