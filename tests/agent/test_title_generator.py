@@ -977,8 +977,8 @@ class TestForkTitleContracts:
              patch("hermes_cli.config.load_config_readonly", return_value=cfg):
             generate_title("testing topic icons", icon_options=["🧪", "📊"], icon_callback=lambda *_: None)
         prompt = call.call_args.kwargs["messages"][0]["content"]
-        assert prompt.index("pick one icon") < prompt.index("Bad: {") < prompt.index("Reply with JSON only")
-        assert prompt.rstrip().endswith('{"title": "...", "icon": "..."}')
+        assert prompt.index("pick icons") < prompt.index("Bad: {") < prompt.index("Reply with JSON only")
+        assert prompt.rstrip().endswith('{"title": "...", "icons": ["...", "..."]}')
         assert 'Good: {"title": "iCloud+ 2TB Subscription Review"}' in prompt
         assert "subscription review" not in prompt  # sentence-case pairs are not mixed in
 
@@ -992,7 +992,7 @@ class TestForkTitleContracts:
             generate_title("refund for the airbnb stay", icon_options=catalog, recent_icons=["💸", "🏠"],
                            icon_callback=lambda icon, _how: chosen.append(icon))
         prompt = call.call_args.kwargs["messages"][0]["content"]
-        icon_line = next(line for line in prompt.splitlines() if "pick one icon" in line)
+        icon_line = next(line for line in prompt.splitlines() if "pick icons" in line)
         assert all(item["emoji"] in icon_line for item in catalog)
         assert chosen == ["💸"]
 
@@ -1008,3 +1008,29 @@ class TestForkTitleContracts:
         from agent.topic_icons import DEFAULT_ICON_GUIDANCE
         assert DEFAULT_ICON_GUIDANCE in prompts[0]
         assert "Use food icons only." in prompts[1] and DEFAULT_ICON_GUIDANCE not in prompts[1]
+
+    def test_ranked_icons_skip_recent_ones_but_never_leave_the_models_picks(self):
+        """The cooldown moves to the model's next fitting pick; it never invents an unranked icon,
+        and a lone or all-recent ranking keeps the model's top choice."""
+        catalog = [{"emoji": e, "custom_emoji_id": e} for e in ["🤖", "🧠", "💻", "📚", "🔥"]]
+
+        def pick(content, recent):
+            response = MagicMock(); response.choices = [MagicMock()]
+            response.choices[0].message.content = content
+            chosen = []
+            with patch("agent.title_generator.call_llm", return_value=response) as call:
+                generate_title("agent memory recall", icon_options=catalog, recent_icons=recent,
+                               icon_callback=lambda icon, _how: chosen.append(icon))
+            return chosen[0], call.call_args.kwargs["extra_body"]["response_format"]
+
+        ranked = '{"title": "Agent Memory", "icons": ["🤖", "🧠", "📚"]}'
+        assert pick(ranked, [])[0] == "🤖"
+        assert pick(ranked, ["🤖"])[0] == "🧠"
+        assert pick(ranked, ["🤖", "🧠", "📚"])[0] == "🤖"
+        assert pick('{"title": "Agent Memory", "icons": ["🤖"]}', ["🤖"])[0] == "🤖"
+        assert pick('{"title": "Agent Memory", "icon": "🧠"}', [])[0] == "🧠"  # pre-ranking reply shape
+        # Beyond the cooldown window an icon is fresh again.
+        assert pick(ranked, ["💻", "🔥", "💻", "🔥", "💻", "🤖"])[0] == "🤖"
+        # The structured-output schema must admit the icons, or enforcing providers drop them.
+        schema = pick(ranked, [])[1]["json_schema"]["schema"]
+        assert "icons" in schema["properties"] and "icons" in schema["required"]
