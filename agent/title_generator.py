@@ -678,6 +678,52 @@ def generate_title(
         return None
 
 
+_ICON_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {"name": "topic_icon", "strict": True, "schema": {
+        "type": "object", "properties": {"icon": {"type": "string"}}, "required": ["icon"], "additionalProperties": False}},
+}
+
+
+def pick_topic_icon(title: str, icon_options, *, instructions: str = "", timeout: Optional[float] = None) -> Optional[str]:
+    """Model-chosen icon for a title the user supplied (explicit ``/title``), or None; never raises.
+
+    Same aux task and guidance as the combined title+icon call, minus the title: the user already named it.
+    """
+    allowed = list(icon_options or [])
+    title = str(title or "").strip()
+    if not allowed or not title:
+        return None
+    from agent.topic_icons import DEFAULT_ICON_GUIDANCE, allowed_icon_list, validate_model_icon
+    guidance = (str(instructions or "").strip() or DEFAULT_ICON_GUIDANCE)[:1000]
+    prompt = (
+        "You pick the icon for a chat topic from its title.\n"
+        f"Choose exactly one icon from this list: {' '.join(allowed_icon_list(allowed))}\n"
+        f"Icon guidance: {guidance}\n"
+        'Reply with JSON only: {"icon": "..."}'
+    )
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": title[:MAX_TITLE_INPUT_CHARS]}],
+            max_tokens=TITLE_MAX_TOKENS, temperature=None, timeout=timeout,
+            extra_body={"response_format": _ICON_RESPONSE_FORMAT}, reasoning_config={"enabled": False},
+        )
+        raw = str(getattr(response.choices[0].message, "content", "") or "").strip()
+        fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
+        raw = fence.group(1).strip() if fence else raw
+        proposed: Any = raw
+        with suppress(ValueError, TypeError):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                proposed = parsed.get("icon")
+        return validate_model_icon(proposed, allowed)
+    except Exception as e:
+        logger.warning("Topic icon selection failed: %s", e)
+        logger.debug("Topic icon selection traceback", exc_info=True)
+        return None
+
+
 def _has_upgraded_title(session_db, session_id: str) -> bool:
     """True when the session already carries an ``llm``/``user`` title (or the check fails)."""
     try:

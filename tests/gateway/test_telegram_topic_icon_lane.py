@@ -117,3 +117,77 @@ async def test_recently_used_icon_is_still_chosen_when_it_is_the_match(tmp_path)
     await runner._rename_telegram_topic_for_session_title(
         _source(), "sess-1", "Fix auth bug", user_message="debug the crash")
     assert adapter.rename_dm_topic.await_args.kwargs["icon_custom_emoji_id"] == "id-bug"
+
+
+@pytest.mark.anyio
+async def test_explicit_title_changes_icon_in_the_same_rename(tmp_path, monkeypatch):
+    """/title picks an icon for the user's title and sends it with the name in one Bot API call."""
+    runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
+    seen = {}
+
+    def fake_pick(title, options, **kwargs):
+        seen["title"] = title
+        return "📈"
+
+    monkeypatch.setattr("agent.title_generator.pick_topic_icon", fake_pick)
+    assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Quarterly Revenue") is True
+
+    adapter.rename_dm_topic.assert_awaited_once()
+    kwargs = adapter.rename_dm_topic.await_args.kwargs
+    assert (kwargs["name"], kwargs["icon_custom_emoji_id"]) == ("Quarterly Revenue", "id-chart")
+    assert seen["title"] == "Quarterly Revenue"
+    assert db.get_telegram_topic_icon_state(CHAT, THREAD)["emoji"] == "📈"
+
+
+@pytest.mark.anyio
+async def test_explicit_title_keeps_a_manually_chosen_icon(tmp_path, monkeypatch):
+    runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
+    db.record_telegram_topic_icon_state(CHAT, THREAD, custom_emoji_id="id-bug", emoji="🔥", owner="manual")
+    monkeypatch.setattr("agent.title_generator.pick_topic_icon", lambda *a, **k: "📈")
+    assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Quarterly Revenue") is True
+    assert "icon_custom_emoji_id" not in adapter.rename_dm_topic.await_args.kwargs
+    assert db.get_telegram_topic_icon_state(CHAT, THREAD)["owner"] == "manual"
+
+
+@pytest.mark.anyio
+async def test_explicit_title_still_renames_when_icon_lookup_fails(tmp_path):
+    runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
+    adapter.get_forum_topic_icon_options = AsyncMock(side_effect=RuntimeError("telegram down"))
+    assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Quarterly Revenue") is True
+    kwargs = adapter.rename_dm_topic.await_args.kwargs
+    assert kwargs["name"] == "Quarterly Revenue" and "icon_custom_emoji_id" not in kwargs
+    assert db.get_telegram_topic_icon_state(CHAT, THREAD) is None
+
+
+@pytest.mark.anyio
+async def test_explicit_title_skips_rename_when_topic_is_rebound_during_icon_pick(tmp_path, monkeypatch):
+    runner, adapter, db = _runner(tmp_path, extra={"auto_topic_icons": True})
+    db.create_session("replacement", source="telegram")
+
+    def pick_and_rebind(*args, **kwargs):
+        db.bind_telegram_topic(chat_id=CHAT, thread_id=THREAD, user_id=USER, session_key="k",
+                               session_id="replacement")
+        return "📈"
+
+    monkeypatch.setattr("agent.title_generator.pick_topic_icon", pick_and_rebind)
+    assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Old Title") is False
+    adapter.rename_dm_topic.assert_not_awaited()
+    assert db.get_telegram_topic_icon_state(CHAT, THREAD) is None
+
+
+@pytest.mark.anyio
+async def test_explicit_title_renames_without_icon_when_pick_overruns_deadline(tmp_path, monkeypatch):
+    import threading
+
+    import gateway.run_topics as run_topics
+    runner, adapter, _ = _runner(tmp_path, extra={"auto_topic_icons": True})
+    release = threading.Event()
+    monkeypatch.setattr(run_topics, "_EXPLICIT_TITLE_ICON_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("agent.title_generator.pick_topic_icon",
+                        lambda *a, **k: (release.wait(5), "📈")[1])  # ignores any per-request timeout
+    try:
+        assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Quarterly Revenue") is True
+    finally:
+        release.set()
+    kwargs = adapter.rename_dm_topic.await_args.kwargs
+    assert kwargs["name"] == "Quarterly Revenue" and "icon_custom_emoji_id" not in kwargs
