@@ -1982,6 +1982,11 @@ def _reresolve_fallback_reasoning_config(agent, fallback_entry: dict) -> None:
             resolved = resolve_reasoning_config(load_config() or {}, agent.model)
         # None is the resolved default, not a failure: never carry the previous route's effort.
         agent.reasoning_config = resolved
+        # Config-derived, so retire the explicit pick; keep it for restore_primary_runtime when the
+        # primary snapshot predates it (the init snapshot is taken before surfaces mark a pick).
+        if isinstance(getattr(agent, "reasoning_override", None), dict):
+            agent._pre_fallback_reasoning_override = agent.reasoning_override
+        agent.reasoning_override = None
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:
         logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)

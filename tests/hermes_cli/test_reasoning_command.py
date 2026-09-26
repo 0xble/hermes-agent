@@ -461,3 +461,47 @@ class TestReasoningShownThisTurnFlag(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReasoningExplicitMarker(unittest.TestCase):
+    """The CLI records which reasoning level is the user's explicit session pick.
+
+    Delegated children inherit only an explicit pick, so a config-derived level must never carry
+    the marker, even when it compares equal to an earlier pick.
+    """
+
+    def _run(self, stub, cmd):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        with patch("cli.save_config_value", return_value=True), patch("cli._cprint"):
+            CLICommandsMixin._handle_reasoning_command(stub, cmd)
+
+    def _stub(self):
+        return SimpleNamespace(reasoning_config={"enabled": True, "effort": "medium"},
+                               show_reasoning=False, agent=None, _reasoning_override=None)
+
+    def test_session_pick_is_marked_and_global_save_is_not(self):
+        from cli import CLI_CONFIG
+        stub = self._stub()
+        self._run(stub, "/reasoning xhigh")
+        self.assertEqual(stub._reasoning_override, {"enabled": True, "effort": "xhigh"})
+        with patch.dict(CLI_CONFIG.setdefault("agent", {}), {}):
+            self._run(stub, "/reasoning high --global")
+        self.assertIsNone(stub._reasoning_override)
+
+    def test_unknown_level_such_as_reset_changes_nothing(self):
+        """There is no CLI reset level: it is rejected, so no config value can be marked explicit."""
+        stub = self._stub()
+        stub._reasoning_override = {"enabled": True, "effort": "xhigh"}
+        self._run(stub, "/reasoning reset")
+        self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "medium"})
+        self.assertEqual(stub._reasoning_override, {"enabled": True, "effort": "xhigh"})
+
+    def test_config_re_resolution_retires_the_pick_even_at_an_equal_level(self):
+        from cli import CLI_CONFIG
+        from hermes_cli.cli_model_switch_mixin import _resolve_cli_reasoning
+        stub = SimpleNamespace(model="m", reasoning_config={"enabled": True, "effort": "xhigh"},
+                               _reasoning_override={"enabled": True, "effort": "xhigh"})
+        with patch.dict(CLI_CONFIG.setdefault("agent", {}), {"reasoning_effort": "xhigh"}):
+            _resolve_cli_reasoning(stub)
+        self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "xhigh"})
+        self.assertIsNone(stub._reasoning_override)

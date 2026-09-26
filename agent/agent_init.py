@@ -616,6 +616,7 @@ _SESSION_STATE: Dict[str, Any] = {
     # --reasoning), set by the surface; None when reasoning_config is only the configured
     # default. Delegation passes it to children (tools/delegate_tool_config.py).
     "reasoning_override": None,
+    "_pre_fallback_reasoning_override": None,  # set aside by fallback, restored with the primary
     "_last_flushed_db_idx": 0,  # DB-write cursor (prevents duplicate writes)
     "_session_db_created": False,  # DB row deferred to run_conversation()
     # False on helper agents (compression / hygiene / review forks) that hand the session to

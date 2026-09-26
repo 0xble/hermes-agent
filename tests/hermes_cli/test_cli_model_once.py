@@ -153,3 +153,25 @@ def test_cli_restore_model_runtime_prefers_primary_runtime():
     assert stub.agent.model == "old/model"
     assert stub.agent.provider == "openrouter"
     assert stub.agent.calls == []
+
+
+def test_cli_one_turn_restore_returns_the_explicit_marker_with_the_level():
+    """`/model X --reasoning xhigh --once` must not leave X's pick marked explicit afterwards."""
+    import cli as cli_mod
+
+    medium = {"enabled": True, "effort": "medium"}
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    stub.agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+    stub.agent.reasoning_override = {"enabled": True, "effort": "xhigh"}
+    stub._reasoning_override = {"enabled": True, "effort": "xhigh"}
+    snapshot = {"model": "old/model", "provider": "openrouter", "requested_provider": "openrouter",
+                "api_key": "sk-old", "explicit_api_key": "sk-old", "base_url": "", "explicit_base_url": "",
+                "api_mode": "chat_completions", "reasoning_config": dict(medium),
+                "reasoning_override": None, "cli_reasoning_override": None}
+
+    cli_mod.HermesCLI._restore_model_runtime_snapshot(stub, snapshot)
+
+    assert stub.agent.reasoning_config == medium
+    assert stub.agent.reasoning_override is None
+    assert stub._reasoning_override is None

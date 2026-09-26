@@ -1295,6 +1295,14 @@ def restore_primary_runtime(agent) -> bool:
         if "reasoning_config" in rt:
             saved_reasoning = rt["reasoning_config"]
             agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else saved_reasoning
+            # The explicit-pick marker travels with the level it describes: fallback activation set
+            # it aside (primary snapshots predate or clear it). explicit_parent_reasoning ignores it
+            # unless it equals the restored level, so a stale value can never pass as a pick.
+            saved_override = getattr(agent, "_pre_fallback_reasoning_override", None)
+            agent.reasoning_override = (
+                dict(saved_override) if isinstance(saved_override, dict) else None
+            )
+        agent._pre_fallback_reasoning_override = None
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0
@@ -2321,6 +2329,9 @@ def switch_model(
         from hermes_constants import resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
         agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+        # Config-derived: retire any explicit pick even when the new level compares equal to it.
+        # Surfaces that carry a pick across the switch (/model --reasoning) re-mark it after.
+        agent.reasoning_override = None
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
         )
