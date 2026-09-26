@@ -11,6 +11,14 @@ import pytest
 from hermes_cli import worktree_ops
 
 
+@pytest.fixture(autouse=True)
+def isolated_git_config(tmp_path, monkeypatch):
+    """Worktree fixtures must ignore the developer's signing and hook settings."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+
+
 @pytest.fixture
 def git_repo(tmp_path):
     """Create a temporary git repo for testing."""

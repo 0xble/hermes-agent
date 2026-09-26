@@ -145,6 +145,26 @@ host fixture defects addressed here. Focused reruns establish repaired fixtures;
 the original full run is not reported as green. Candidate extension files are
 additionally included in both bounded and full fork validation.
 
+## Git fixture isolation
+
+The `fork-ci-reliability` identity also covers the real-Git fixtures in
+`tests/hermes_cli/test_worktree_gc.py`, `test_worktree.py`, `test_gitlock.py`,
+`test_goal_gates.py`, and `test_update_skip_unchanged_editable_install.py`.
+A redirected `HOME` alone does not isolate an explicit `GIT_CONFIG_GLOBAL` or
+an inherited XDG config path: signing and lefthook settings can stop fixture
+commits before their behavioral assertions run. These fixtures set the global
+config to `os.devnull`, disable system config, and redirect XDG config into
+`tmp_path` for Git subprocesses and their production-code callers. The canonical
+runner retains the CI-provided safe.directory config; changing its global
+allowlist would discard that boundary and would not protect direct pytest runs.
+Upstream main at `cb3142d3257b15ac42de544bd585793567400d0f` has the same
+worktree-GC fixture leak; [upstream contribution #124019](https://github.com/NousResearch/hermes-agent/pull/124019)
+uses only the single shared test file. [Fork delivery #173](https://github.com/0xble/hermes-agent/pull/173)
+also repairs the four sibling test files that fail under the same poison config.
+A poison global config with `commit.gpgsign=true` fails setup before the patch,
+and all 95 affected tests pass after it. Retire the fork adaptation when a
+released upstream revision provides the same hermetic tests.
+
 ## Verification and retirement
 
 The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`
