@@ -76,6 +76,24 @@ def test_genuine_external_worker_crash_is_recovered_unknown(
     assert recovered["status"] == "unknown"
 
 
+@pytest.mark.macos_only
+def test_launchd_gateway_dispatches_cron_in_detached_session(monkeypatch):
+    from tools import process_registry
+
+    command = [sys.executable, "-m", "cron.scheduler"]
+    monkeypatch.setattr("gateway.restart.launchd_service_label", lambda: "ai.hermes-test.cron")
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    dispatch = process_registry.restart_safe_gateway_child_argv(
+        command, unit_suffix="cron-macos", require_restart_safe_scope=True,
+    )
+    assert dispatch.mode == "detached"
+    assert dispatch.argv is command
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: False)
+    assert process_registry.restart_safe_gateway_child_argv(
+        command, unit_suffix="cron-macos", require_restart_safe_scope=True,
+    ).mode == "in_process"
+
+
 @pytest.mark.linux_only
 def test_restart_safe_gateway_child_fails_closed_when_required(monkeypatch):
     import tools.process_registry as process_registry
@@ -768,10 +786,13 @@ def test_lost_execution_start_cas_prevents_side_effects(monkeypatch):
     run.assert_not_called()
 
 
-@pytest.mark.linux_only
+@pytest.mark.parametrize("host", [
+    pytest.param("linux", marks=pytest.mark.linux_only),
+    pytest.param("macos", marks=pytest.mark.macos_only),
+])
 @pytest.mark.live_system_guard_bypass
 def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, host
 ):
     import cron.delivery_queue as delivery_queue
     import cron.executions as executions
@@ -781,7 +802,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
     from gateway.status import _pid_exists
     from tools import process_registry
 
-    if not process_registry._systemd_run_user_scope_available():
+    if host == "linux" and not process_registry._systemd_run_user_scope_available():
         pytest.skip("systemd-run --user --scope is unavailable on this host")
 
     home = tmp_path / "profile"
@@ -855,6 +876,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         "import json, os, pathlib, time\n"
         f"os.environ['HERMES_HOME'] = {str(home)!r}\n"
         "os.environ['INVOCATION_ID'] = 'restart-fixture'\n"
+        "os.environ['HERMES_LAUNCHD_LABEL'] = 'ai.hermes-test.cron'\n"
         "from cron import scheduler\n"
         "from tools import process_registry\n"
         "process_registry._is_supervised_gateway_process = lambda: True\n"
@@ -863,7 +885,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         "    raise SystemExit('worker was not isolated')\n"
         f"pathlib.Path({str(launched)!r}).write_text('returned')\n"
     )
-    parent = subprocess.Popen([sys.executable, "-c", harness])
+    parent = subprocess.Popen([sys.executable, "-c", harness], start_new_session=True)
     worker_pid = None
     try:
         deadline = time.monotonic() + 10
@@ -881,11 +903,17 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         worker_pid = int(current["pid"])
         assert not launched.exists(), "handoff returned before execution completed"
 
-        # Replacing a managed gateway kills its old process tree. The active
-        # cron owner must remain in its transient scope and keep the same PID.
-        parent.terminate()
+        # A launchd-style process-group termination must not reach the
+        # worker's independent session. Recovery adopts its (PID, start-time)
+        # owner instead of marking the running execution unknown.
+        if host == "macos":
+            assert os.getpgid(worker_pid) != os.getpgid(parent.pid)
+        os.killpg(parent.pid, signal.SIGTERM)
         parent.wait(timeout=5)
         assert _pid_exists(worker_pid)
+        assert executions.recover_interrupted_executions() == 0
+        live_row = executions.latest_execution(job["id"])
+        assert live_row is not None and live_row["status"] == "running"
 
         release.write_text("go", encoding="utf-8")
         deadline = time.monotonic() + 10

@@ -347,13 +347,15 @@ class GatewayChildDispatch(NamedTuple):
 
     ``in_process``: not a managed systemd gateway, ``argv is command``, the caller
     keeps its in-process path.  ``scoped``: ``argv`` is the systemd-run wrapper.
+    ``detached``: a launchd-managed macOS gateway; the cron caller launches
+    ``argv`` with ``start_new_session=True`` outside the gateway process group.
     ``degraded``: no user scope could be created; ``argv`` is the direct command but
     the caller MUST still launch it as an external subprocess — the distinct mode
     exists so this case can never collapse into ``in_process`` and recreate the
     restart interruption #101940 closed.
     """
 
-    mode: Literal["in_process", "scoped", "degraded"]
+    mode: Literal["in_process", "scoped", "detached", "degraded"]
     argv: List[str]
 
 
@@ -402,6 +404,16 @@ def restart_safe_gateway_child_argv(
     ``Type=simple`` sequencer without linger keeps working. A cron job blocks its
     caller until it finishes and never needs this.
     """
+    if platform.system() == "Darwin":
+        # launchd bootout kills the gateway's process group. The cron caller
+        # already uses start_new_session=True when spawning this direct argv;
+        # only the verified launchd gateway needs an external handoff.
+        from gateway.restart import launchd_service_label
+
+        if (not outlives_parent and launchd_service_label()
+                and _is_supervised_gateway_process()):
+            return GatewayChildDispatch("detached", command)
+        return GatewayChildDispatch("in_process", command)
     if not _IS_LINUX:
         return GatewayChildDispatch("in_process", command)
     if not os.environ.get("INVOCATION_ID"):
