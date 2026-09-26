@@ -475,18 +475,65 @@ class GatewayGoalsMixin:
             with suppress(Exception):
                 mgr.abandon_tick()
 
+    async def _goal_wakeup_fire_one(self, sid: str) -> None:
+        """Resume one idle parked /goal whose wait barrier has lifted.
+
+        The post-turn judge is the only other path that re-evaluates a barrier, and it needs a turn.
+        A process killed by a gateway restart, a process started without notify_on_complete, or an
+        elapsed timed wait produces no turn, so without this the goal stays parked until an
+        unrelated message arrives. The barrier is cleared only after the adapter admitted the
+        continuation; a busy or unroutable session keeps it for the next scan."""
+        from hermes_cli.goals import GoalManager
+
+        store = getattr(self, "session_store", None)
+        entry = store.lookup_by_session_id(sid) if store is not None else None
+        if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
+            return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
+        if getattr(entry, "resume_pending", False):
+            return  # restart auto-resume owns this chat; its turn's judge re-evaluates the barrier
+        source = self._restored_source(entry)
+        adapter = self._delivery_adapter_for(source) if source is not None else None
+        if adapter is None or not getattr(adapter, "_message_handler", None):
+            return
+        key = entry.session_key
+        if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
+                or self._queue_depth(key, adapter=adapter) > 0):
+            return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
+        max_turns = self._goal_max_turns_from_config()
+
+        def _check():
+            mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+            return mgr, mgr.lifted_barrier_prompt()
+
+        mgr, prompt = await self._run_in_executor_with_context(_check)
+        if not prompt:
+            return
+        since = mgr.state.waiting_since
+        logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
+                    sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
+        event = self._synthetic_prompt_event(source, prompt)
+        event.metadata["gateway_session_key"] = key
+        with suppress(Exception):
+            await self._send_goal_status_notice(source, "▶ Goal wait ended — resuming.")
+        await adapter.handle_message(event)
+        await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
+
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
-        """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
-        (SessionDB ``loop:*`` rows) and injects each due prompt via the synthetic-message path.
+        """Fire due /loop wakeups and resume lifted /goal waits for idle gateway sessions: a coarse
+        ticker scans persisted loops (SessionDB ``loop:*`` rows) and parked goals (``goal:*`` rows
+        with a wait barrier) and injects each prompt via the synthetic-message path.
         Deferrals: session running a turn (FIFO would race the live turn); active non-parked /goal
         (goal owns the idle boundary); no routing metadata (one-time warning).
+
+        One ticker owns both kinds of idle injection so a future generation fence (overlapping
+        gateways) has a single admission owner to transfer.
 
         Multiplex: one gateway-wide task, so ``list_active_loops`` alone reads only the launch home's
         store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
         and each hit is fired against that profile's adapters."""
         from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
-        from gateway.run_idle_gates import profile_has_active_loop
+        from gateway.run_idle_gates import profile_has_active_loop, profile_has_parked_goal
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 
@@ -498,7 +545,11 @@ class GatewayGoalsMixin:
             from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
             return async_launch_profile_scope_if_multiplexed()
 
+        def _has_idle_work(profile_home) -> bool:
+            return profile_has_active_loop(profile_home) or profile_has_parked_goal(profile_home)
+
         async def _scan_one_store(profile_name: Optional[str]) -> None:
+            from hermes_cli.goals import list_parked_goals
             from hermes_cli.loops import list_active_loops
 
             # Warm once per scan: the scan reads every persisted loop and a cold cache would
@@ -509,14 +560,19 @@ class GatewayGoalsMixin:
             now = time.time()
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
+            for sid, _state in await self._run_in_executor_with_context(list_parked_goals):
+                try:
+                    await self._goal_wakeup_fire_one(sid)
+                except Exception as exc:
+                    logger.warning("goal wakeup failed for %s: %s", sid, exc)
 
         while self._running:
             try:
                 for profile_name, profile_home in _handoff_watch_scopes(self):
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
-                    # no active loop. The root scan (None) is unscoped and stays cheap.
+                    # no active loop or parked goal. The root scan (None) is unscoped and stays cheap.
                     if profile_home is not None and not await self._run_in_executor_with_context(
-                            profile_has_active_loop, profile_home):
+                            _has_idle_work, profile_home):
                         continue
                     async with _scope(profile_home):
                         await _scan_one_store(profile_name)
