@@ -637,11 +637,14 @@ class GatewayTopicThreadsMixin:
                     else []
                 )
                 from agent.topic_icons import choose_topic_icon_deterministic, resolve_override, validate_model_icon
-                icon_emoji = (
-                    resolve_override(topic_name, extra.get("topic_icon_overrides"), options)
-                    or validate_model_icon(model_icon, options)
-                    or choose_topic_icon_deterministic(topic_name, user_message, options, recent)
-                )
+                icon_via = "override"
+                icon_emoji = resolve_override(topic_name, extra.get("topic_icon_overrides"), options)
+                if not icon_emoji:
+                    icon_via, icon_emoji = "model", validate_model_icon(model_icon, options)
+                if not icon_emoji:
+                    icon_via, icon_emoji = "keyword", choose_topic_icon_deterministic(topic_name, user_message, options, recent)
+                logger.info("Telegram topic %s icon %s via %s (model proposed %r)",
+                            source.thread_id, icon_emoji, icon_via if icon_emoji else "none", model_icon)
                 selected = next(
                     (item for item in options if item.get("emoji") == icon_emoji),
                     None,

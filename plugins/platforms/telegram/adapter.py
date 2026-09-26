@@ -156,7 +156,7 @@ from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
-from utils import env_float, env_int
+from utils import env_float, env_int, is_truthy_value
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
@@ -3194,6 +3194,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._setup_dm_topics()
             except Exception as topics_err:
                 logger.warning("[%s] DM topics setup failed (non-fatal): %s", self.name, topics_err, exc_info=True)
+            # Warm the icon catalog so the first auto-titled topic after a restart gets a model-chosen
+            # icon; the title call only offers icons once this cache is populated.
+            if is_truthy_value((self.config.extra or {}).get("auto_topic_icons")):
+                await self.get_forum_topic_icon_options()
         except asyncio.CancelledError:
             raise
         finally:

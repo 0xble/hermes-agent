@@ -3,8 +3,47 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 from typing import Any, Mapping, Optional
+
+# Default model guidance when the operator sets none. Relevance beats variety: excluding recently
+# used icons from the choice pushed picks toward unrelated ones once the obvious icon was taken.
+# Naming the generic icons keeps a small title model from defaulting to 💻 for every technical topic.
+DEFAULT_ICON_GUIDANCE = (
+    "Pick the icon that most specifically depicts the topic's subject, the one a reader would "
+    "recognize at a glance. Choose a specific icon over a generic one such as 💻, 🤖 or 💬 "
+    "whenever one fits. Reusing an icon another topic already has is fine."
+)
+
+# Keyword hints for the fallback chooser. Keys are icons from Telegram's native topic-icon catalog
+# (getForumTopicIconStickers); a key outside that catalog can never be selected.
+_SEMANTIC_HINTS: dict[str, frozenset[str]] = {
+    emoji: frozenset(words.split())
+    for emoji, words in {
+        "💻": "code coding software app cli repo repos api plugin script scripts sdk deploy github",
+        "🤖": "agent agents hermes bot bots model models llm ai gpt claude codex subagent",
+        "🧪": "test tests testing eval evals experiment benchmark qa",
+        "🔎": "investigate investigation search research find audit why diagnose",
+        "📚": "docs documentation wiki wikis knowledge learn study skill skills guide",
+        "📝": "note notes draft write writing form register registration checklist",
+        "📆": "cron crons schedule scheduled calendar timezone meeting meetings deadline",
+        "💰": "money finance budget tax taxes price pricing cost costs expense expenses savings",
+        "💸": "payment payments statement card billing spend refund invoice",
+        "📈": "growth metrics analytics report reports data dashboard stats",
+        "💬": "message messages chat reply slack telegram sms imessage whatsapp",
+        "🏠": "home house apartment rent landlord",
+        "✈": "travel flight flights trip hotel",
+        "🛒": "buy shopping order orders amazon product purchase",
+        "🔥": "bug bugs error errors fix broken incident outage crash failure debug",
+        "⚡": "performance speed fast slow latency optimize",
+        "🧠": "memory memories recall remember hindsight",
+        "🩺": "health doctor medical fitness",
+        "🎨": "design ui ux logo brand rebrand",
+        "📱": "iphone phone mobile ios android",
+        "🪪": "identity login logins account accounts auth password oauth credential credentials",
+        "💼": "business client clients company",
+        "💡": "idea ideas plan proposal brainstorm",
+    }.items()
+}
 
 
 def _emoji_value(item: Any) -> str:
@@ -20,41 +59,30 @@ def _tokens(text: str) -> set[str]:
     return {token.lower() for token in re.findall(r"[\w]+", str(text or ""), flags=re.UNICODE) if len(token) > 1}
 
 
-def fresh_allowed_icons(allowed_emojis: Iterable[Any], recent_emojis: Iterable[Any] | None) -> list[str]:
-    """Allowed emojis not in recent history, unless that leaves fewer than 8 (then the full list)."""
-    allowed = [_emoji_value(item) for item in allowed_emojis if _emoji_value(item)]
-    recent = {normalize_emoji(item) for item in (recent_emojis or [])}
-    fresh = [item for item in allowed if normalize_emoji(item) not in recent]
-    return fresh if len(fresh) >= 8 else allowed
+def allowed_icon_list(allowed_emojis: Any) -> list[str]:
+    """The allowed emoji strings, in catalog order."""
+    return [value for value in (_emoji_value(item) for item in allowed_emojis or []) if value]
 
 
 def choose_topic_icon_deterministic(
     title: str, user_message: str, allowed_emojis: list[Any], recent_emojis: Optional[list[Any]] = None,
 ) -> Optional[str]:
-    """Choose a stable semantic candidate, rotating away from recent icons when possible."""
-    candidates = fresh_allowed_icons(allowed_emojis, recent_emojis)
-    if not candidates:
-        return None
+    """Best keyword match, or None when nothing matches so the topic keeps its current icon.
+
+    Recent icons only break ties between equally good matches; they never displace a better one.
+    """
     signal = _tokens(title) | _tokens(user_message)
-    semantic_hints = {
-        "🐛": {"bug", "error", "fix", "debug", "issue", "test"}, "💻": {"code", "coding", "software", "app"},
-        "📊": {"data", "metric", "report", "analytics", "chart"}, "💡": {"idea", "plan", "design"},
-        "🔒": {"auth", "security", "password", "login"}, "📚": {"learn", "study", "research", "docs"},
-        "🚀": {"deploy", "release", "launch", "ship"}, "✈": {"travel", "flight", "trip"},
-        "🛒": {"buy", "shopping", "order", "product"}, "💰": {"money", "finance", "budget", "tax"},
-    }
-    scored = []
-    for index, emoji in enumerate(candidates):
-        hints = _tokens(emoji) | semantic_hints.get(normalize_emoji(emoji), set())
-        score = len(signal & hints)
-        scored.append((score, -index, emoji))
-    if any(score for score, _, _ in scored):
-        return max(scored)[2]
-    recent = [normalize_emoji(item) for item in (recent_emojis or [])]
-    for emoji in candidates:
-        if normalize_emoji(emoji) not in recent:
-            return emoji
-    return candidates[0]
+    recent = {normalize_emoji(item) for item in (recent_emojis or [])}
+    best: Optional[tuple[int, int, int]] = None
+    choice: Optional[str] = None
+    for index, emoji in enumerate(allowed_icon_list(allowed_emojis)):
+        score = len(signal & _SEMANTIC_HINTS.get(normalize_emoji(emoji), frozenset()))
+        if not score:
+            continue
+        rank = (score, int(normalize_emoji(emoji) not in recent), -index)
+        if best is None or rank > best:
+            best, choice = rank, emoji
+    return choice
 
 
 def resolve_override(title: str, overrides: Mapping[str, Any] | None, allowed: list[Any]) -> Optional[str]:
