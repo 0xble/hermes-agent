@@ -137,8 +137,8 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   The archive is still kept and still returned: a partial rollback point beats none. Whether an
   incomplete one should block an update is a separate decision, unchanged here.
   Retire it if the automatic path adopts the interactive path's structured report.
-- Upstream contributions are recorded per behavior below. The full-ZIP recovery
-  gap for databases above the conversation-copy cap is tracked in
+- Upstream contributions are recorded per behavior below. Truncated but CRC-valid
+  ZIP members after partial source-read failures, and incomplete-archive retention, are tracked in
   [issue #124564](https://github.com/NousResearch/hermes-agent/issues/124564).
   The two adopted backup fixes retire when the candidate release retains them.
 - `backup-zip-timestamps`: both full ZIP writers use the standard library's timestamp
