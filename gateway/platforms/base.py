@@ -4841,9 +4841,19 @@ class BasePlatformAdapter(ABC):
                                self.name, sum(not t.done() for t in tasks))
                 break
         self._invalidate_all_deferred_commands()
-        with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+        # The gateway knows each key's runtime profile even when a shared primary bot received it.
+        # Its first shutdown pass normally emptied these slots; retry leftovers through the same
+        # owner-scoped writer rather than silently depositing them in the launch home's spool.
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None and hasattr(runner, "_flush_owned_pending"):
+            for key, value in list(self._pending_messages.items()):
+                with contextlib.suppress(Exception):
+                    runner._flush_owned_pending(key, value, reason="adapter_shutdown",
+                                                adapter_profile=getattr(self, "_owner_profile", None))
+        else:
+            with contextlib.suppress(Exception):
+                from gateway.shutdown_flush import flush_pending_to_file
+                flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,

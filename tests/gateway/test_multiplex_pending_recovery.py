@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 from hermes_constants import get_hermes_home
 from gateway import run as gateway_run
 from gateway.run_pending_recovery import recover_pending_shutdown_flush
-from gateway.shutdown_flush import flush_pending_to_file
 
 
 def test_startup_recovers_secondary_spool_after_shared_bot_shutdown(tmp_path, monkeypatch):
@@ -16,14 +15,15 @@ def test_startup_recovers_secondary_spool_after_shared_bot_shutdown(tmp_path, mo
     primary.mkdir()
     secondary.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(primary))
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._primary_profile_name = "default"
+    runner._served_profile_homes = {"default": primary, "other": secondary}
     dbs = {primary: MagicMock(), secondary: MagicMock()}
     keys = {primary: "agent:main:telegram:dm:1", secondary: "agent:other:telegram:dm:2"}
-    # A → B → A: simulate the shared primary adapter's two routed slots being
-    # preserved under their owning profiles, then startup back under the launch home.
-    with gateway_run._profile_runtime_scope(primary, prepared_secret_scope={}):
-        assert flush_pending_to_file({keys[primary]: "first"}) == 1
-    with gateway_run._profile_runtime_scope(secondary, prepared_secret_scope={}):
-        assert flush_pending_to_file({keys[secondary]: "second"}) == 1
+    # A → B → A: the shared primary bot has slots for two runtime profiles.
+    # The shutdown writer must scope each slot by key, not by transport owner.
+    assert runner._flush_owned_pending(keys[primary], "first", reason="adapter_shutdown") == 1
+    assert runner._flush_owned_pending(keys[secondary], "second", reason="adapter_shutdown") == 1
     with gateway_run._profile_runtime_scope(primary, prepared_secret_scope={}):
         assert Path(get_hermes_home()) == primary
 
@@ -33,10 +33,7 @@ def test_startup_recovers_secondary_spool_after_shared_bot_shutdown(tmp_path, mo
                 return None
             return f"session-{home.name}", dbs[home]
 
-        runner = SimpleNamespace(
-            session_store=SimpleNamespace(resolve_session_id_for_key=resolve),
-            _served_profile_homes={"default": primary, "other": secondary},
-        )
+        runner.session_store = SimpleNamespace(resolve_session_id_for_key=resolve)
         assert recover_pending_shutdown_flush(runner) == 2
 
     dbs[primary].append_message.assert_called_once()

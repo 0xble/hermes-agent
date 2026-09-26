@@ -1971,6 +1971,27 @@ class GatewayShutdownMixin:
             await self._notify_interrupted_cron_jobs(_interrupted_cron_jobs)
         logger.info("Shutdown phase: cron interrupt notices done at +%.2fs", ctx.elapsed())
 
+    def _flush_owned_pending(self, session_key, value, *, reason, overflow=False, adapter_profile=None):
+        """Spool a queued slot under its session's home, regardless of transport owner."""
+        from gateway.run import _profile_runtime_scope
+        from gateway.session_recovery import SessionRecoveryMixin
+        from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file
+        from hermes_constants import get_routing_process_hermes_home
+
+        owner = SessionRecoveryMixin._profile_from_session_key(session_key) or adapter_profile
+        primary = getattr(self, "_primary_profile_name", None) or "default"
+        if owner and owner != primary:
+            home = (getattr(self, "_served_profile_homes", None) or {}).get(owner)
+            if home is None:
+                logger.error("Cannot preserve pending queue: missing home for profile %s", owner)
+                return 0
+        else:
+            home = get_routing_process_hermes_home()
+        with _profile_runtime_scope(Path(home), prepared_secret_scope={}):
+            if overflow:
+                return flush_overflow_to_file({session_key: value}, reason=reason)
+            return flush_pending_to_file({session_key: value}, reason=reason)
+
     async def _stop_finalize_agents_and_adapters(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
         if self._restart_requested and self._restart_detached:
@@ -1998,9 +2019,6 @@ class GatewayShutdownMixin:
         # adapter normally flushes after its drain loop, but a slow unwind can outlast that
         # loop's timeout and skip the flush. Remove only successfully spooled slots so its
         # later flush cannot replay duplicates; failed slots remain available for retry.
-        from gateway.shutdown_flush import flush_pending_to_file
-        from gateway.run import _profile_runtime_scope
-        from gateway.session_recovery import SessionRecoveryMixin
         _profile_adapters = getattr(self, "_profile_adapters", {})
         adapters = [(platform, adapter, None) for platform, adapter in list(self.adapters.items())]
         adapters.extend((platform, adapter, profile)
@@ -2011,21 +2029,11 @@ class GatewayShutdownMixin:
             if not isinstance(pending, dict) or not pending:
                 continue
             for key, value in list(pending.items()):
-                # A shared primary bot can hold queued turns routed to a secondary profile.
-                # Choose the spool home per session key, not per transport adapter.
-                owner = SessionRecoveryMixin._profile_from_session_key(key) or profile
-                home = None
-                if owner and owner != (getattr(self, "_primary_profile_name", None) or "default"):
-                    home = (getattr(self, "_served_profile_homes", None) or {}).get(owner)
-                    if home is None:
-                        logger.error("Cannot preserve %s adapter queue: missing home for profile %s",
-                                     platform.value, owner)
-                        continue
                 try:
-                    with (_profile_runtime_scope(home, hydrate_secrets=False) if home else nullcontext()):
-                        if flush_pending_to_file({key: value}, reason="adapter_shutdown"):
-                            if pending.get(key) is value:
-                                pending.pop(key, None)
+                    if self._flush_owned_pending(key, value, reason="adapter_shutdown",
+                                                 adapter_profile=profile):
+                        if pending.get(key) is value:
+                            pending.pop(key, None)
                 except Exception:
                     logger.exception("Failed to preserve %s adapter pending message for %s", platform.value, key)
         # Only network notices share the 3s budget. Adapter teardown has its own bounded
@@ -2055,16 +2063,14 @@ class GatewayShutdownMixin:
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
-        with suppress(Exception):
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+        for session_key, value in dict(self._pending_messages).items():
+            with suppress(Exception):
+                self._flush_owned_pending(session_key, value, reason="shutdown")
         # The overflow FIFO tail lives in SessionState.conversation.queued_events — flush it too.
-        with suppress(Exception):
-            from gateway.shutdown_flush import flush_overflow_to_file
-            flush_overflow_to_file(
-                {_k: list(_v) for _k, _v in dict(getattr(self, "_queued_events", None) or {}).items() if _v},
-                reason="shutdown",
-            )
+        for session_key, events in dict(getattr(self, "_queued_events", None) or {}).items():
+            if events:
+                with suppress(Exception):
+                    self._flush_owned_pending(session_key, list(events), reason="shutdown", overflow=True)
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
         self._running_agents.clear()
         self._running_agents_ts.clear()
