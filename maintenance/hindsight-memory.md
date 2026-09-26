@@ -44,7 +44,8 @@ strategy and cron-exclusion behavior.
 ## Provenance and patches
 
 - Fork patch identities: `HERMES-122`, `hindsight-retain-strategy`,
-  `hindsight-cron-retention`, `hindsight-bundled-provider`. Local narrow patches on the `v2026.9.14` baseline.
+  `hindsight-cron-retention`, `hindsight-bundled-provider`,
+  `memory-note-not-authoritative`. Local narrow patches on the `v2026.9.14` baseline.
 - `HERMES-122` (`6878e95d58`, re-landed `65059fa22d`) defaults `_cron_skipped` in
   `__init__`. Its first landing was reverted hours later by `fc45821e1f`, a backup
   change authored in a worktree created before the fix, whose tree still held the
@@ -58,6 +59,18 @@ strategy and cron-exclusion behavior.
 - `hindsight-cron-retention` (`fdb3f2e49d`) withholds the retain tool on cron
   sessions. This is the commit that introduced the `_cron_skipped` read without the
   matching default.
+
+- `memory-note-not-authoritative` changes the note `build_memory_context_block()` puts
+  before every provider recall. The upstream note called recalled memory
+  "authoritative reference data" that "should inform all responses". That tells the
+  model to trust stale or derived memories and skip an explicit recall, which
+  contradicts the deployed evidence policy. The fork uses the wording of upstream
+  [NousResearch/hermes-agent#89283](https://github.com/NousResearch/hermes-agent/pull/89283)
+  (open), which also addresses #31584 and #66888. `_INTERNAL_NOTE_RE` still strips the
+  older wordings from provider output. Proof: `TestMemoryContextFencing` in
+  `tests/agent/test_memory_provider.py`. Retire when #89283 or an equivalent
+  non-authoritative note ships in a selected upstream release. Roll back by reverting
+  only this commit.
 
 ## Retirement condition
 
