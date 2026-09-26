@@ -85,6 +85,37 @@ def choose_topic_icon_deterministic(
     return choice
 
 
+# How many of the chat's most recent automatic icons a ranked model pick skips. Short on purpose:
+# it only has to break streaks, and every fallback is still one of the model's own fitting picks.
+ICON_COOLDOWN = 5
+MAX_RANKED_ICONS = 3
+
+
+def validate_ranked_icons(values: Any, allowed: list[Any]) -> list[str]:
+    """The model's ranked proposals that are in the catalog, best first, deduplicated, at most three."""
+    if isinstance(values, (str, Mapping)):
+        values = [values]
+    ranked: list[str] = []
+    for value in values if isinstance(values, (list, tuple)) else []:
+        icon = validate_model_icon(value, allowed)
+        if icon and normalize_emoji(icon) not in {normalize_emoji(item) for item in ranked}:
+            ranked.append(icon)
+        if len(ranked) == MAX_RANKED_ICONS:
+            break
+    return ranked
+
+
+def pick_ranked_icon(ranked: list[str], recent_emojis: Optional[list[Any]] = None) -> Optional[str]:
+    """The best-ranked icon outside the cooldown window; the top pick when every candidate is recent.
+
+    A lone candidate always wins, so a model that sees only one fitting icon is never overruled.
+    """
+    if not ranked:
+        return None
+    cooling = {normalize_emoji(item) for item in (recent_emojis or [])[:ICON_COOLDOWN]}
+    return next((icon for icon in ranked if normalize_emoji(icon) not in cooling), ranked[0])
+
+
 def resolve_override(title: str, overrides: Mapping[str, Any] | None, allowed: list[Any]) -> Optional[str]:
     """Resolve exact or case-insensitive title-substring overrides against the allow-list."""
     if not isinstance(overrides, Mapping):
