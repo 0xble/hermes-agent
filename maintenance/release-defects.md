@@ -494,3 +494,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_concurrent_cron_runs_get_distinct_environments`,
   `test_cron_subagent_shares_its_parent_run_environment`,
   `test_persistent_docker_cron_run_keeps_the_profile_container`).
+
+## Fork-patch check pins an owner-chosen setting
+
+- Fork patch identity: `fork-patch-check-owner-config`.
+- `scripts/check_fork_patches.py` required `auxiliary.background_review.enabled`
+  to be `false`. That is an owner preference, not a fork-patch invariant, and
+  the owner enabled background review on 2026-09-24, so `verify-hermes-fork`
+  failed every day on a correct config. The key is no longer pinned. The
+  remaining expectations guard fork behavior (`memory.write_approval`) or
+  required routing (`delegation.model`, `auxiliary.review.model`).
+- Guard: `tests/scripts/test_candidate_scripts.py`
+  (`test_check_config_does_not_pin_background_review`).
