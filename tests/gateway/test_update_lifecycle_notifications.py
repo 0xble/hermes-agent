@@ -45,7 +45,7 @@ def pending(home, *, reason=True):
 
 
 @pytest.mark.asyncio
-async def test_shutdown_reason_does_not_cross_conversation_boundaries(tmp_path):
+async def test_update_restart_reason_reaches_every_interrupted_conversation(tmp_path):
     from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
     data = pending(tmp_path)
     runner, adapter = make_restart_runner()
@@ -60,8 +60,28 @@ async def test_shutdown_reason_does_not_cross_conversation_boundaries(tmp_path):
     assert len(origin) == 2
     assert all(data["reason"] in text for text in origin)
     assert len(unrelated) == 1
-    assert data["reason"] not in unrelated[0]
+    assert unrelated[0].startswith("🔄 Restarting") and data["reason"] in unrelated[0]
     assert "try to resume" in unrelated[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["Activating the restart-reason fix.", None])
+async def test_direct_restart_reason_reaches_interrupted_conversations(tmp_path, reason):
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner._restart_reason = reason
+    runner._snapshot_running_agents = Mock(return_value={"other": object()})
+    other = make_restart_source(chat_id="unrelated", thread_id="other-topic")
+    runner._shutdown_notification_target = AsyncMock(return_value=(other, "telegram", "unrelated", "other-topic"))
+    with patch("gateway.run._hermes_home", tmp_path):
+        await runner._notify_active_sessions_of_shutdown()
+    [text] = [text for chat, text, _ in adapter.sent_calls if chat == "unrelated"]
+    if reason:
+        assert text.startswith("🔄 Restarting") and reason in text
+    else:
+        assert text.startswith("⚠️ Hermes is restarting")
+    assert "try to resume" in text
 
 
 @pytest.mark.asyncio
