@@ -92,3 +92,31 @@ async def test_teardown_continues_after_cancellation_swallowing_background_cance
         await asyncio.wait_for(finished.wait(), timeout=0.2)
 
 
+@pytest.mark.asyncio
+async def test_adapter_teardown_has_one_total_deadline(bare_runner):
+    """Several slow adapters must not each spend the full disconnect budget."""
+    import time
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    bare_runner._restart_requested = False
+    bare_runner._restart_detached = False
+    bare_runner.adapters = {Platform.TELEGRAM: object(), Platform.FEISHU: object()}
+    bare_runner._profile_adapters = {}
+    bare_runner._agent_cache_lock = None
+    bare_runner._agent_cache = None
+    bare_runner._finalize_shutdown_agents = AsyncMock()
+    bare_runner._cancel_process_completion_batch_tasks = AsyncMock()
+    entered = []
+
+    async def blocked_teardown(adapter, platform, *, profile=None):
+        entered.append(platform)
+        await asyncio.Event().wait()
+
+    bare_runner._bounded_adapter_teardown = blocked_teardown
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=time.monotonic())
+    start = time.monotonic()
+    await bare_runner._stop_finalize_agents_and_adapters(ctx)
+    assert set(entered) == set(bare_runner.adapters)
+    assert time.monotonic() - start < 5.0
+
+

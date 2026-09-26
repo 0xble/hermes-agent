@@ -168,6 +168,7 @@ class GatewayShutdownMixin:
         # API-server runs still live when the adapters were released; the adapter map is empty by the
         # time the SessionDB close gate runs, so the count has to be taken before ``adapters.clear()``.
         api_live: int = 0
+        notice_elapsed: float = 0.0
 
         def elapsed(self) -> float:
             return time.monotonic() - self.started_at
@@ -1867,8 +1868,16 @@ class GatewayShutdownMixin:
         if callable(stop_watchdog):
             await stop_watchdog()
         await self._cancel_secondary_profile_reconnect_tasks()
-        # Notify all chats with active agents BEFORE draining — adapters are still connected here.
-        await self._notify_active_sessions_of_shutdown()
+        # Network sends are best-effort; a slow Telegram request must not consume launchd's stop leash.
+        # Detach-on-deadline rather than wait_for: a transport may swallow cancellation.
+        from gateway.run import GatewayRunner
+        notice_started = time.monotonic()
+        notice_task = asyncio.create_task(self._notify_active_sessions_of_shutdown())
+        if not await GatewayRunner._wait_or_detach(notice_task, 3.0):
+            logger.warning("Shutdown notices exceeded 3s total; continuing teardown")
+        else:
+            await notice_task
+        ctx.notice_elapsed = time.monotonic() - notice_started
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
 
     async def _stop_drain_active_work(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:
@@ -1985,16 +1994,26 @@ class GatewayShutdownMixin:
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
-        for platform, adapter in list(self.adapters.items()):
-            await self._bounded_adapter_teardown(adapter, platform)
+        from gateway.run import GatewayRunner
+        teardown = [self._bounded_adapter_teardown(adapter, platform)
+                    for platform, adapter in list(self.adapters.items())]
         # Disconnect secondary-profile adapters (multiplex mode).
         _profile_adapters = getattr(self, "_profile_adapters", {})
         for _prof, _amap in list(_profile_adapters.items()):
-            for platform, adapter in list(_amap.items()):
-                await self._bounded_adapter_teardown(adapter, platform, profile=_prof)
+            teardown.extend(self._bounded_adapter_teardown(adapter, platform, profile=_prof)
+                            for platform, adapter in list(_amap.items()))
+        if teardown:
+            cleanup_task = asyncio.ensure_future(asyncio.gather(*teardown))
+            remaining = max(0.0, 3.0 - ctx.notice_elapsed)
+            if not await GatewayRunner._wait_or_detach(cleanup_task, remaining):
+                logger.warning("Adapter teardown exceeded remaining %.2fs of 3s notice/adapter budget; "
+                               "continuing shutdown", remaining)
+            else:
+                await cleanup_task
+        for _amap in _profile_adapters.values():
             _amap.clear()
         _profile_adapters.clear()
-        logger.info("Shutdown phase: all adapters disconnected at +%.2fs", ctx.elapsed())
+        logger.info("Shutdown phase: adapter teardown phase ended at +%.2fs", ctx.elapsed())
 
     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""

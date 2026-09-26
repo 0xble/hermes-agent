@@ -311,6 +311,43 @@ def test_flush_overflow_noop_on_empty():
     assert flush_overflow_to_file({"k": []}) == 0
 
 
+def test_empty_pending_text_is_never_spooled(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    assert flush_pending_to_file({"key": "", "other": _overflow_event("")}) == 0
+    assert flush_overflow_to_file({"key": [_overflow_event(""), _overflow_event("kept")]}) == 1
+    files = list(flush_dir.glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["data"]["text"] == "kept"
+
+
+def test_draining_follow_up_is_spooled_for_startup_recovery(tmp_path, monkeypatch):
+    from gateway.run_turn import GatewayTurnMixin
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    class Runner(GatewayTurnMixin):
+        _draining = True
+
+        def _promote_queued_event(self, key, adapter, event):
+            return event
+
+        def _pending_event_audio_paths(self, event):
+            return []
+
+    monkeypatch.setattr("gateway.run._dequeue_pending_event", lambda adapter, key: _overflow_event("next turn"))
+    import asyncio
+    runner = Runner()
+    event, text = asyncio.run(runner._run_agent_drain_pending(
+        {"final_response": "done"}, object(), MagicMock(), "agent:main:telegram:dm:1"))
+    assert event is None and text is None
+    db = MagicMock()
+    assert recover_pending_to_db(db) == 1
+    assert db.append_message.call_args.kwargs["content"] == "next turn"
+    assert list(flush_dir.glob("*.json")) == []
+
+
 def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monkeypatch):
     """A scalar/list JSON spool file must not abort the drain; the healthy payload still replays."""
     from gateway.shutdown_flush import drain_transcript_spool, spool_dropped_transcript_message

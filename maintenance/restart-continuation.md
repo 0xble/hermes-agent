@@ -21,6 +21,7 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   archived fork's original regression.
 - When a real user message arrives while resume is pending, the note addresses
   that message first regardless of policy.
+- A follow-up dequeued as a turn finishes during shutdown is flushed through `gateway/shutdown_flush.py` before its local reference is cleared, so startup recovery can restore its user message. Empty text is not written as an invalid pending payload; errors are logged rather than silently claiming preservation.
 
 ## Provenance and patches
 
