@@ -31,6 +31,7 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `slice-12-per-job-timezone`, `slice-12 truthful-contention` (the space is the trailer's
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
   `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
+  `cron-profile-timezone-reanchor`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
   `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
   `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
@@ -157,6 +158,22 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `SQLITE_BUSY`/`SQLITE_LOCKED` statuses but did not cover successful page copies repeatedly
   restarted by concurrent WAL commits. Retire when a selected upstream release passes the
   concurrent-writer snapshot contract.
+- `cron-profile-timezone-reanchor`: an unpinned cron job's future `next_run_at`
+  can retain the old profile timezone until the old instant becomes due after a
+  profile move, because `get_due_jobs` only repaired shifted offsets at due time.
+  Re-anchor future legal civil-time slots during the isolated due scan, comparing
+  the stored offset with the governing zone's offset *at that instant*, not the
+  scan-time offset (which legitimately differs across DST). Keep overdue and
+  already-passed wall-clock slots eligible for the existing catch-up path;
+  preserve pinned jobs, manual triggers, and edited-expression handling.
+  Related upstream [PR #97491](https://github.com/NousResearch/hermes-agent/pull/97491)
+  proposes explicit schedule timezone stamps; it is open, not a released replacement.
+  Proof: `scripts/run_tests.sh tests/cron/test_cron_timezone_migration_catchup.py
+  tests/cron/test_per_job_timezone.py --file-retries 0` and the full `tests/cron/`
+  suite. Retire if a selected upstream release re-anchors future unpinned jobs
+  after a profile timezone change without losing due slots. Roll back only
+  `_reanchor_future_timezone_shifted_cron`, its due-scan call, the two regression
+  tests, and this record; retain the older due-time migration catch-up.
 
 ## Verification
 

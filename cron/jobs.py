@@ -3025,6 +3025,29 @@ def _repair_timezone_shifted_cron(d: _DueJob) -> bool:
     return True
 
 
+def _reanchor_future_timezone_shifted_cron(d: _DueJob) -> bool:
+    """Re-anchor a future civil-time slot after the profile/job zone changes.
+
+    The due-only repair leaves old-zone instants in the store until they become due;
+    a move west can leave the displayed next run hours early. Compare the offset
+    at the *scheduled instant*, not at scan time: a legitimate upcoming DST change
+    also differs from today's offset. A stale expression edit is not a zone move.
+    """
+    if not (
+        _instant_after(d.next_run_dt, d.scan.now)
+        and _timezone_offset_mismatch(d.raw_next_run_dt, d.next_run_dt)
+        and _stored_wall_clock_is_future(d.raw_next_run_dt, _in_job_zone(d.scan.now, d.job))
+        and _cron_next_run_matches_expr(d.schedule, d.raw_next_run_dt)
+    ):
+        return False
+    new_next = d.recompute_next()
+    if not new_next:
+        return False
+    d.scan.persist(d.job["id"], next_run_at=new_next)
+    logger.info("Job '%s' re-anchored a future cron run to its current zone: %s", d.label, new_next)
+    return True
+
+
 def _rearm_stale_error_recurring(d: _DueJob) -> datetime:
     """Re-arm a recurring job wedged in persisted last_status=error; returns the effective
     next_run_dt.
@@ -3239,6 +3262,8 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     manual_run = job.get("manual_run_at") == next_run
     from cron.occurrences import completed_occurrence, scheduled_instant
 
+    if kind == "cron" and not manual_run and _reanchor_future_timezone_shifted_cron(d):
+        return False
     if not manual_run and completed_occurrence(job, next_run):
         new_next = d.recompute_next() if recurring else None
         if new_next:
