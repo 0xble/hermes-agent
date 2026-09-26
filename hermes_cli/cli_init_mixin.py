@@ -257,6 +257,9 @@ class CLIInitMixin:
         from hermes_constants import resolve_reasoning_config
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         self._explicit_reasoning_config = None
+        # The user's explicit session pick (--reasoning, /reasoning, /model --reasoning); built
+        # agents carry it as ``reasoning_override`` so delegated children inherit it.
+        self._reasoning_override = None
         # --reasoning wins for this run only (never persisted); unparseable -> warn and ignore.
         if reasoning is not None and str(reasoning).strip():
             _cli_reasoning = _parse_reasoning_config(reasoning)
@@ -265,6 +268,7 @@ class CLIInitMixin:
             else:
                 self.reasoning_config = _cli_reasoning
                 self._explicit_reasoning_config = _cli_reasoning
+                self._reasoning_override = _cli_reasoning
         self.service_tier = _parse_service_tier_config(CLI_CONFIG["agent"].get("service_tier", ""))
 
         pr = CLI_CONFIG.get("provider_routing", {}) or {}

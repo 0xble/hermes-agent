@@ -133,6 +133,7 @@ gateway:
     unknown_arg:           "⚠️ 未知參數：`{arg}`\n\n**有效選項：** normal、fast、status"
     saved:                 "⚡ ✓ Priority Processing：**{label}**（已儲存到設定）\n_（下一則訊息生效）_"
     session_only:          "⚡ ✓ Priority Processing：**{label}**（僅本次工作階段）"
+    route_ignored:         "⚠️ This route does not receive fast-mode parameters (only the first-party API does), so it has no effect here."
     label_fast:            "FAST"
     label_normal:          "NORMAL"
     status_fast:           "fast"

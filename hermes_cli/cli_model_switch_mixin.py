@@ -42,6 +42,8 @@ def _resolve_cli_reasoning(cli) -> None:
     from hermes_constants import resolve_reasoning_config
     # getattr: tests drive /new unbound on a SimpleNamespace without ``model`` (blank -> config default).
     cli.reasoning_config = resolve_reasoning_config(CLI_CONFIG, getattr(cli, "model", None) or "")
+    # Config-derived, so no explicit pick survives it (delegation must not treat an equal value as one).
+    cli._reasoning_override = None
 
 
 def stored_session_route(session_meta, *, current_model, current_provider):
@@ -223,8 +225,11 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool) -> 
     if parsed is None:
         return
     cli.reasoning_config = parsed
+    cli._reasoning_override = None if persist_global else parsed
     if cli.agent is not None:
         cli.agent.reasoning_config = parsed
+        cli.agent.reasoning_override = cli._reasoning_override
+        cli.agent._pre_fallback_reasoning_override = None  # supersedes a pick set aside by fallback
     saved = persist_global and save_config_value("agent.reasoning_effort", effort)
     if saved:
         CLI_CONFIG.setdefault("agent", {})["reasoning_effort"] = effort
@@ -572,6 +577,8 @@ class CLIModelSwitchMixin:
         return {
             **_runtime_fields(self),
             "reasoning_config": copy.deepcopy(getattr(self, "reasoning_config", None)),
+            "reasoning_override": copy.deepcopy(getattr(agent, "reasoning_override", None)),
+            "cli_reasoning_override": copy.deepcopy(getattr(self, "_reasoning_override", None)),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None}
@@ -586,10 +593,19 @@ class CLIModelSwitchMixin:
                 setattr(self, key, snapshot.get(key))
 
         agent = getattr(self, "agent", None)
+        if "cli_reasoning_override" in snapshot:
+            self._reasoning_override = copy.deepcopy(snapshot["cli_reasoning_override"])
         if agent is None:
             return
-        if "reasoning_config" in snapshot:
-            agent.reasoning_config = snapshot["reasoning_config"]
+
+        def _restore_reasoning() -> None:
+            # The level and its explicit-pick marker leave together with the one-turn model.
+            if "reasoning_config" in snapshot:
+                agent.reasoning_config = snapshot["reasoning_config"]
+                agent.reasoning_override = copy.deepcopy(snapshot.get("reasoning_override"))
+                agent._pre_fallback_reasoning_override = None
+
+        _restore_reasoning()
         primary = snapshot.get("agent_primary_runtime")
         if primary and hasattr(agent, "_restore_primary_runtime"):
             try:
@@ -597,6 +613,7 @@ class CLIModelSwitchMixin:
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
+                    _restore_reasoning()
                     return
             except Exception:
                 logger.debug("CLI one-turn model restore via primary runtime failed", exc_info=True)
@@ -607,8 +624,7 @@ class CLIModelSwitchMixin:
                     api_key=snapshot.get("api_key", ""), base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
                     capabilities=snapshot.get("capabilities"))
-                if "reasoning_config" in snapshot:
-                    agent.reasoning_config = snapshot["reasoning_config"]
+                _restore_reasoning()
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
 

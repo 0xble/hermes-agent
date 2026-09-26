@@ -31,7 +31,8 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_request_overrides, _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_child_request_overrides, _resolve_child_runtime, _resolve_child_service_tier,
+    _resolve_delegation_credentials, explicit_parent_reasoning,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -257,6 +258,7 @@ def _build_child_agent(
                 ),
                 session_db=child_session_db, parent_session_id=parent_sid,
                 request_overrides=request_overrides or {},
+                service_tier=_resolve_child_service_tier(parent_agent, override_request_overrides),
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
             )
@@ -268,6 +270,10 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # An inherited explicit pick stays explicit, so an orchestrator's own children keep it too.
+    if explicit_parent_reasoning(parent_agent) is not None:
+        rc = child.reasoning_config
+        child.reasoning_override = dict(rc) if isinstance(rc, dict) else rc
     _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent

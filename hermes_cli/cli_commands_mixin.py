@@ -2615,6 +2615,8 @@ class CLICommandsMixin:
                        _dim_line('Display:      show, hide'),
                        _dim_line('Scope:        session-scoped by default, --global to persist'))
         self.reasoning_config = parsed
+        # A --global save makes the level the configured default, not a session choice.
+        self._reasoning_override = None if explicit_global else parsed
         _retire_agent(self)  # Force agent re-init with new reasoning config
         saved = explicit_global and _save("agent.reasoning_effort", arg)
         if saved:
@@ -2677,6 +2679,10 @@ class CLICommandsMixin:
         saved = explicit_global and _save("agent.service_tier", saved_value)
         outcome = _scope_outcome(explicit_global, saved)
         _cp(_accent_line(f"✓ {feature_name} set to {saved_value.upper()} {outcome}"))
+        if self.service_tier and _probe("hermes_cli.models", "fast_mode_route_ignored", False, model,
+                                        getattr(self, "provider", None), getattr(self, "base_url", None)):
+            _cp(_dim_line("⚠ This route does not receive fast-mode parameters (only the first-party API "
+                          "does), so it has no effect here."))
 
     # ---- /debug, /update, /voice, /wake ---------------------------------------------------
     def _handle_debug_command(self, cmd_original: str = ""):

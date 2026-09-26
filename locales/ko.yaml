@@ -133,6 +133,7 @@ gateway:
     unknown_arg:           "⚠️ 알 수 없는 인수: `{arg}`\n\n**유효한 옵션:** normal, fast, status"
     saved:                 "⚡ ✓ Priority Processing: **{label}** (설정에 저장됨)\n_(다음 메시지부터 적용됩니다)_"
     session_only:          "⚡ ✓ Priority Processing: **{label}** (이 세션에만 적용)"
+    route_ignored:         "⚠️ This route does not receive fast-mode parameters (only the first-party API does), so it has no effect here."
     label_fast:            "FAST"
     label_normal:          "NORMAL"
     status_fast:           "fast"

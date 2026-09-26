@@ -1293,8 +1293,26 @@ def restore_primary_runtime(agent) -> bool:
         )
         # Older snapshots have no reasoning_config; an explicit None is a saved default.
         if "reasoning_config" in rt:
+            # A marker is a live pick only while it equals the level it was set with
+            # (explicit_parent_reasoning's rule); read it BEFORE the snapshot overwrites that level.
+            live_pick = getattr(agent, "reasoning_override", None)
+            if live_pick != getattr(agent, "reasoning_config", None):
+                live_pick = None
             saved_reasoning = rt["reasoning_config"]
             agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else saved_reasoning
+            # The explicit pick travels with the level it describes. Fallback activation cleared the
+            # marker and set a valid pick aside; a pick re-marked since then (the gateway does every
+            # turn) is newer and wins. The primary snapshot can predate either (a live /reasoning,
+            # an init-time snapshot), so restore the pick as BOTH level and marker rather than
+            # pairing it with the snapshot's stale level.
+            saved_pick = getattr(agent, "_pre_fallback_reasoning_override", None)
+            pick = live_pick if isinstance(live_pick, dict) else saved_pick
+            if isinstance(pick, dict):
+                agent.reasoning_config = dict(pick)
+                agent.reasoning_override = dict(pick)
+            else:
+                agent.reasoning_override = None
+        agent._pre_fallback_reasoning_override = None
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0
@@ -2321,6 +2339,9 @@ def switch_model(
         from hermes_constants import resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
         agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+        # Config-derived: retire any explicit pick even when the new level compares equal to it.
+        # Surfaces that carry a pick across the switch (/model --reasoning) re-mark it after.
+        agent.reasoning_override = None
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
         )

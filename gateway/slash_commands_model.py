@@ -656,6 +656,8 @@ class GatewayModelCommandsMixin:
                 session_key=session_key, model=getattr(agent, "model", ""),
             )
             agent.reasoning_config = dict(effective) if isinstance(effective, dict) else effective
+            agent.reasoning_override = None if value is None else dict(value)
+            agent._pre_fallback_reasoning_override = None  # supersedes a pick set aside by fallback
         else:
             self._evict_idle_agent_after_session_control(session_key)
 
@@ -812,11 +814,26 @@ class GatewayModelCommandsMixin:
         if persist and self._save_gateway_config_key("agent.service_tier", saved_value):
             self._set_session_service_tier_override(session_key, None, clear=True)  # global wins
             self._apply_live_service_tier(session_key, tier)
-            return t("gateway.fast.saved", label=label)
+            return t("gateway.fast.saved", label=label) + self._fast_route_ignored_note(session_key, tier)
         # Session override — also the fallback after a failed config write (as /reasoning --global).
         self._set_session_service_tier_override(session_key, tier)
         self._apply_live_service_tier(session_key, tier)
-        return t("gateway.fast.session_only", label=label)
+        return t("gateway.fast.session_only", label=label) + self._fast_route_ignored_note(session_key, tier)
+
+    def _fast_route_ignored_note(self, session_key: str, tier: str | None) -> str:
+        """A warning when the session's route never receives fast-mode params (a proxy): /fast is
+        accepted but changes nothing, so the reply must not imply it applied."""
+        if not tier:
+            return ""
+        from hermes_cli.models import fast_mode_route_ignored
+
+        try:
+            model, runtime = self._resolve_session_agent_runtime(session_key=session_key)
+        except Exception:
+            return ""
+        if not fast_mode_route_ignored(model, runtime.get("provider"), runtime.get("base_url")):
+            return ""
+        return "\n" + t("gateway.fast.route_ignored")
 
     async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /fast — the CLI Priority Processing toggle; session-scoped unless ``--global``

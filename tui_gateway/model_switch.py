@@ -19,6 +19,7 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+            "reasoning_override": copy.deepcopy(getattr(agent, "reasoning_override", None)),
             "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
 
 
@@ -26,10 +27,17 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
+
+    def _restore_reasoning() -> None:
+        # The level and its explicit-pick marker leave together with the one-turn model.
+        if "reasoning_config" in snapshot:
+            agent.reasoning_config = snapshot["reasoning_config"]
+            agent.reasoning_override = copy.deepcopy(snapshot.get("reasoning_override"))
+            agent._pre_fallback_reasoning_override = None
+
     # `/model X --reasoning high --once`: the effort leaves with the model. Set before the
     # runtime restore paths below (primary_runtime may predate a session /reasoning change).
-    if "reasoning_config" in snapshot:
-        agent.reasoning_config = snapshot["reasoning_config"]
+    _restore_reasoning()
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
@@ -37,8 +45,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
-                if "reasoning_config" in snapshot:
-                    agent.reasoning_config = snapshot["reasoning_config"]
+                _restore_reasoning()
                 return
         except Exception:
             logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
@@ -47,8 +54,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         agent.switch_model(
             new_model=model, new_provider=provider, api_key=api_key, base_url=base_url,
             api_mode=api_mode, capabilities=snapshot.get("capabilities"))
-        if "reasoning_config" in snapshot:
-            agent.reasoning_config = snapshot["reasoning_config"]
+        _restore_reasoning()
 
 
 def _profile_runtime_scope_tokens(profile_home, *, hydrate_secrets: bool = True) -> "_TurnScopes":
@@ -359,6 +365,10 @@ def _apply_switch_reasoning(sid: str, session, agent, effort: str, *, persist_gl
         return
     if agent is not None:
         agent.reasoning_config = parsed
+        # Explicit for delegation too; the --once restore swaps reasoning_config back, which
+        # retires the marker (explicit_parent_reasoning requires it to match the live level).
+        agent.reasoning_override = None if persist_global and not one_turn else parsed
+        agent._pre_fallback_reasoning_override = None  # supersedes a pick set aside by fallback
     if one_turn or not isinstance(session, dict):
         return
     if persist_global:

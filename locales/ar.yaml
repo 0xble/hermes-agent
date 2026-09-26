@@ -156,6 +156,7 @@ gateway:
     unknown_arg:           "⚠️ وسيط غير معروف: `{arg}`\n\n**الخيارات الصالحة:** normal, fast, status"
     saved:                 "⚡ ✓ المعالجة ذات الأولوية: **{label}** (حُفظت في الإعدادات)\n_(تسري على الرسالة التالية)_"
     session_only:          "⚡ ✓ المعالجة ذات الأولوية: **{label}** (هذه الجلسة فقط)"
+    route_ignored:         "⚠️ This route does not receive fast-mode parameters (only the first-party API does), so it has no effect here."
     label_fast:            "سريع"
     label_normal:          "عادي"
     status_fast:           "fast"

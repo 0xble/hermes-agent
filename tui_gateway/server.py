@@ -2478,6 +2478,8 @@ def _make_agent(
     if fallback_notice:
         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice
+    # A session-scoped /reasoning pick is explicit; delegated children inherit it.
+    agent.reasoning_override = reasoning_config_override
     return agent
 
 

@@ -701,6 +701,8 @@ class CLIAgentSetupMixin:
             # ``cli._active_agent_ref`` None forever — so memory shutdown never ran on /exit (#49287).
             import cli as _cli
             _cli._active_agent_ref = self.agent
+            self.agent.reasoning_override = getattr(self, "_reasoning_override", None)
+            self.agent._pre_fallback_reasoning_override = None
             # Seed the agent's once-per-lifecycle auto_load cache with the bytes the preload
             # thread rendered, so the shared prompt path never re-reads config or skill files.
             _auto_result = getattr(self, "_auto_load_skills_result", None)
