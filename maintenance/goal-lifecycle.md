@@ -41,6 +41,10 @@ Failed or interrupted model turns do not run completion judging.
   Resolve methods_prompt against the release version without importing unrelated
   upstream refactors.
 
+- Fork patch identity: `goal-pause-race`. A completion judge re-reads the durable goal before
+  any post-judge save, so concurrent pause, clear, resume, or set commands remain authoritative.
+  Regression: `scripts/run_tests.sh -j 6 tests/hermes_cli/test_goals.py -k concurrent_goal_mutation`.
+
 The initial reproduction established missing criteria and paused state after a
 repair turn. Upstream comparison confirmed both and supplied a matching recovery
 implementation. Configuration or plugin changes cannot repair these native judge
