@@ -2,7 +2,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.topic_icons import choose_topic_icon_deterministic, resolve_override, validate_model_icon
+from agent.topic_icons import (
+    choose_topic_icon_deterministic,
+    pick_ranked_icon,
+    resolve_override,
+    validate_model_icon,
+    validate_ranked_icons,
+)
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -28,6 +34,14 @@ def test_override_and_variation_selector_validation():
     assert resolve_override("Travel planning", {"travel": "✈️"}, allowed) == "✈️"
     assert validate_model_icon("✈", allowed) == "✈️"
     assert validate_model_icon("🎉", allowed) is None
+
+
+def test_ranked_proposals_keep_only_catalog_icons_in_order():
+    allowed = [{"emoji": "✈️", "custom_emoji_id": "flight"}, "🤖", "🧠", "📚", "💻"]
+    assert validate_ranked_icons(["🎉", "✈", "🤖", "✈️", "🧠", "📚"], allowed) == ["✈️", "🤖", "🧠"]
+    assert validate_ranked_icons("🤖", allowed) == ["🤖"]
+    assert validate_ranked_icons(None, allowed) == []
+    assert pick_ranked_icon([], ["🤖"]) is None
 
 
 @pytest.mark.anyio
