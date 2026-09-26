@@ -255,15 +255,20 @@ def complete_auto_resume_trigger(delegation_id: str, claim_id: str) -> bool:
         ).rowcount == 1
 
 
+AUTO_RESUME_NOTICE_OPEN = "[IMPORTANT: An interrupted single-task background delegation "
+
+
 def build_auto_resume_notice(record: Dict[str, Any]) -> str:
     """Build a bounded parent instruction; never include task context or credentials."""
+    from tools.process_registry_notifications import PROCESS_NOTIFICATION_END
     delegation_id = str(record.get("delegation_id") or "")
     return (
-        "[IMPORTANT: An interrupted single-task background delegation is eligible for conservative recovery. "
+        AUTO_RESUME_NOTICE_OPEN + "is eligible for conservative recovery. "
         f"Delegation ID: {delegation_id}. Do not execute the original task directly and do not assume it is "
         "safe to rerun. First call delegate_task with action='resume' and this exact subagent_id; the normal "
         "one-shot recovery gate will verify eligibility and provide a state-verification brief. If that action "
         "is refused, report the refusal rather than spawning a replacement yourself.]"
+        f"\n{PROCESS_NOTIFICATION_END}"
     )
 
 

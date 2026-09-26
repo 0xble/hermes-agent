@@ -7,6 +7,16 @@ import time
 from dataclasses import dataclass
 from contextlib import suppress
 
+# Shared with retention consumers: every process/delegation notice is framed by
+# PROCESS_NOTIFICATION_END, including the gateway's coalesced completion variant.
+PROCESS_NOTICE_OPEN = "[IMPORTANT: "
+HEARTBEAT_NOTICE_OPEN = "[Background process "
+DELEGATION_NOTICE_OPEN = "[ASYNC DELEGATION "
+PROCESS_NOTICE_OPENERS = (PROCESS_NOTICE_OPEN, HEARTBEAT_NOTICE_OPEN, DELEGATION_NOTICE_OPEN)
+WATCH_STATUS_EVENT_TYPES = ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released")
+GATEWAY_PROCESS_EVENT_TYPES = ("heartbeat", "watch_match", *WATCH_STATUS_EVENT_TYPES, "async_delegation")
+PROCESS_NOTIFICATION_EVENT_TYPES = ("completion", *GATEWAY_PROCESS_EVENT_TYPES)
+
 _DONE = ("completed", "success")
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
@@ -27,7 +37,7 @@ class ProcessNotificationBatch:
             return None
         if len(messages) == 1:
             return messages[0]
-        header = (f"[IMPORTANT: {len(messages)} background processes completed. "
+        header = (f"{PROCESS_NOTICE_OPEN}{len(messages)} background processes completed. "
                   "Treat these results as one batch and give one consolidated response; "
                   "preserve failures and actionable results.]")
         return "\n\n".join((header, *messages))
@@ -176,7 +186,7 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     goal = goals[idx] if idx < len(goals) else r.get("goal", "")
     err = str(r.get("error") or "").strip().replace("\n", " ")[:400]
     lines = [
-        f"[ASYNC DELEGATION TASK FAILED — {deleg_id}, task {idx + 1}/{n}]",
+        f"{DELEGATION_NOTICE_OPEN}TASK FAILED — {deleg_id}, task {idx + 1}/{n}]",
         "One subagent in a background fan-out you dispatched has failed while its siblings are still running. "
         "The batch's consolidated results will still arrive when the last sibling finishes; this is an early "
         "warning so you can re-dispatch or investigate now instead of then.",
@@ -214,7 +224,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     unit = f"group '{group}' ({n_unit} subagent(s))" if group is not None else f"{n_unit} subagent(s)"
     lines = _preamble(
         evt,
-        f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+        f"{DELEGATION_NOTICE_OPEN}BATCH COMPLETE — {deleg_id}]",
         f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
         "below. Any other units from the same delegate_task call report separately as they finish. You may have "
         "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
@@ -288,7 +298,7 @@ def _format_async_delegation(evt: dict) -> str:
     truncated = _is_truncated(evt)
     lines = _preamble(
         evt,
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
+        f"{DELEGATION_NOTICE_OPEN}COMPLETE — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
         "have moved on since dispatching it; the task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
@@ -423,8 +433,8 @@ def _format_process_notification_payload(evt: dict) -> "str | None":
     # watch_disabled and overflow events carry their own human-readable `message`;
     # otherwise overflow events would fall through to the completion formatter as a
     # phantom "process exited (exit code ?)".
-    if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released"):
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+    if evt_type in WATCH_STATUS_EVENT_TYPES:
+        return f"{PROCESS_NOTICE_OPEN}{evt.get('message', '')}]"
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
     _sid, _cmd = evt.get("session_id", "unknown"), evt.get("command", "unknown")
@@ -435,14 +445,14 @@ def _format_process_notification_payload(evt: dict) -> "str | None":
     if evt_type == "heartbeat":
         _out = evt.get("output") or "(no new output since the last heartbeat)"
         return (
-            f"[Background process {_sid} heartbeat #{evt.get('seq', '?')} — still running after "
+            f"{HEARTBEAT_NOTICE_OPEN}{_sid} heartbeat #{evt.get('seq', '?')} — still running after "
             f"{_format_age(float(evt.get('elapsed') or 0))} (next in {evt.get('interval', '?')}s; "
             f"you will also be told when it exits).\n"
             f"{attribution}Command: {_cmd}\nOutput since last heartbeat:\n{_out}]")
     if evt_type == "watch_match":
         _sup = evt.get("suppressed", 0)
         return (
-            f"[IMPORTANT: Background process {_sid} matched watch pattern \"{evt.get('pattern', '?')}\".\n"
+            f"{PROCESS_NOTICE_OPEN}Background process {_sid} matched watch pattern \"{evt.get('pattern', '?')}\".\n"
             f"{attribution}Command: {_cmd}\nMatched output:\n{evt.get('output', '')}"
             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
     _exit = evt.get("exit_code", "?")
@@ -460,7 +470,7 @@ def _format_process_notification_payload(evt: dict) -> "str | None":
         _out = (f"...(first {evt['output_cut']} characters cut — process(action=\"log\", "
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
     return (
-        f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
+        f"{PROCESS_NOTICE_OPEN}Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
         f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
 
 

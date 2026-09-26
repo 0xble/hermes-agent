@@ -38,6 +38,7 @@ from plugins.memory.hindsight import (
     filter_retain_messages,
 )
 from plugins.memory.hindsight.settings import _sanitize_bank_segment
+from tools.process_registry_notifications import PROCESS_NOTIFICATION_EVENT_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -1290,6 +1291,51 @@ class TestSyncTurn:
         assert filter_retain_messages(notice, "[SILENT]") == (None, None)
         request = "Remember the design decision about the database."
         assert filter_retain_messages(f"{notice}\n\n{request}", "[SILENT]") == (request, None)
+
+    @pytest.mark.parametrize("event_type", PROCESS_NOTIFICATION_EVENT_TYPES)
+    def test_every_registered_process_notice_variant_is_excluded(self, event_type):
+        from tools.process_registry_notifications import format_process_notification
+        from gateway.run import _format_gateway_process_notification
+
+        event = {"type": event_type, "session_id": "proc-1", "command": "review check fix",
+                 "pattern": "ready", "message": "Watch status changed", "output": "ready", "seq": 1,
+                 "delegation_id": "child-1", "goal": "Review, check and fix", "status": "completed",
+                 "summary": "Check complete.", "exit_code": 0}
+        notice = format_process_notification(event)
+        request = "Remember the database migration decision."
+        for rendered in (notice, _format_gateway_process_notification(event)):
+            if rendered is None:
+                continue  # gateway only accepts watches, heartbeat and delegations
+            assert filter_retain_messages(rendered, "[SILENT]") == (None, None)
+            assert filter_retain_messages(rendered + "\n\n" + request, "[SILENT]") == (request, None)
+
+    def test_grouped_process_and_recovery_formatters_preserve_appended_user(self):
+        from tools.process_registry_notifications import ProcessNotificationBatch, format_process_notification
+        from tools.delegation_resume import build_auto_resume_notice
+        from gateway.run_notifications import GatewayNotificationsMixin
+
+        events = [{"type": "completion", "session_id": sid, "exit_code": 0, "output": "Review check fix"}
+                  for sid in ("proc-1", "proc-2")]
+        class Registry:
+            def is_completion_consumed(self, session_id):
+                return False
+
+        import asyncio
+
+        rendered = [(evt, format_process_notification(evt)) for evt in events]
+        assert all(text is not None for _evt, text in rendered)
+        notices = [
+            ProcessNotificationBatch(tuple((evt, str(text)) for evt, text in rendered)).render(Registry()),
+            GatewayNotificationsMixin._format_coalesced_process_completions(
+                [(str(text), evt, asyncio.Future()) for evt, text in rendered]),
+            build_auto_resume_notice({"delegation_id": "child-1"}),
+        ]
+        request = "Remember the database migration decision."
+        for notice in notices:
+            assert filter_retain_messages(notice, "[SILENT]") == (None, None)
+            assert filter_retain_messages(notice + "\n\n" + request, "[SILENT]") == (request, None)
+        assert filter_retain_messages("[IMPORTANT: Please review my proposal]", "answer") == (
+            "[IMPORTANT: Please review my proposal]", "answer")
 
     def test_retain_filter_preserves_plain_user_and_out_of_band_steer(self):
         from agent.prompt_builder import format_steer_marker
