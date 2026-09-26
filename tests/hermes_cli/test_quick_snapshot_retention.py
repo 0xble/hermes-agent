@@ -31,6 +31,17 @@ def test_repeated_failed_captures_are_bounded_without_losing_complete_recovery(t
     assert backup.verify_sqlite_integrity(root / complete / "state.db")["valid"]
 
 
+def test_manual_and_pre_update_snapshots_have_independent_retention(tmp_path):
+    home = _home(tmp_path)
+    manual = backup.create_quick_snapshot(hermes_home=home, label="manual", keep=1)
+    automatic = backup.create_quick_snapshot(hermes_home=home, label="pre-update", keep=1)
+    latest = backup.create_quick_snapshot(hermes_home=home, label="pre-update", keep=1)
+    root = home / "state-snapshots"
+    assert (root / manual).exists()
+    assert (root / latest).exists()
+    assert not (root / automatic).exists()
+
+
 def test_unusable_claimed_copy_cannot_replace_complete_generation(tmp_path, monkeypatch):
     home = _home(tmp_path)
     complete = backup.create_quick_snapshot(hermes_home=home, label="pre-update", keep=1)
