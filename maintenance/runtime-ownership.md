@@ -28,9 +28,9 @@ The personal profile's script jobs and optional sync helper use regular files un
 `scripts/install_candidate_extensions.py --maintenance-only --home <profile>` installs
 sync/verifier forwarding entry points without changing plugins or configuration.
 When `<profile>/scripts` is a real directory, it preserves the existing flat
-entrypoint paths. When it is a symlink to a domain-organized scripts checkout,
-the three generated entrypoints live under `scripts/hermes/` instead; cron
-references must be migrated to those paths separately before that cutover.
+entrypoint paths. When it is a symlink to a source-controlled scripts checkout,
+the installer refuses before writing; generated files do not belong in that checkout.
+Versioned thin entrypoints and cron path changes must be prepared separately before cutover.
 They execute procedures in `<profile>/hermes-agent/scripts`, so native promotion
 updates their implementation too. Profile plugin source is maintained in the external
 `agents` repository. Review
