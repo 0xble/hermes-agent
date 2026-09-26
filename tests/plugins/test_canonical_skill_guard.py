@@ -48,3 +48,20 @@ def test_non_skill_tools_are_ignored(monkeypatch):
     plugin = _load_plugin()
     monkeypatch.setattr(plugin, "_external_skill_names", lambda: {"deploy"})
     assert plugin._on_pre_tool_call(tool_name="write_file", args={"path": "deploy/SKILL.md"}) is None
+
+
+def test_manifest_declares_every_registered_hook():
+    import yaml
+
+    plugin = _load_plugin()
+    registered: list[str] = []
+
+    class _Ctx:
+        def register_hook(self, name, _callback):
+            registered.append(name)
+
+    plugin.register(_Ctx())
+    manifest = yaml.safe_load((PLUGIN.parent / "plugin.yaml").read_text(encoding="utf-8"))
+
+    assert registered
+    assert set(registered) <= set(manifest.get("provides_hooks") or [])
