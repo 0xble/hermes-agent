@@ -202,8 +202,6 @@ surfaces before candidate publication. Source-only ownership verification keeps
 unpromoted candidate checks separate from installed update receipts.
 `tests/scripts/test_sync_fork_candidate.py` exercises local Git remotes, stale refs,
 new releases, candidate-only publication, failure refusal, and worktree recovery.
-Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; maintenance-tooling
-
 The maintenance-only compatibility installer verifies entry points follow promoted
 code without changing config; it preserves flat paths for regular directories
 and refuses linked scripts checkouts without any writes. The linked-layout check
