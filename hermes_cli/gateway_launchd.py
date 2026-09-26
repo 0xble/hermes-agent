@@ -750,6 +750,17 @@ def launchd_restart():
     from gateway.status import get_running_pid
     try:
         pid = get_running_pid()
+        if pid is not None:
+            # The gateway may have zero configured wait or may exit before the first
+            # periodic progress report. Name the work before requesting any restart.
+            from hermes_cli.update_cmd_drain_report import read_active_work, describe_active_work_unit
+            work = read_active_work()
+            if work:
+                print(f"⚠ Planned restart with {len(work)} active work unit(s). "
+                      "Zero/expired wait budgets can interrupt them. Background processes do not hold the drain:",
+                      flush=True)
+                for unit in work:
+                    print(f"  • {describe_active_work_unit(unit)}", flush=True)
         if pid is not None and _gw()._request_gateway_self_restart(pid):
             _launchd_ok("✓ Service restart requested")
             return

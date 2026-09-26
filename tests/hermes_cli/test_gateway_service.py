@@ -1288,8 +1288,11 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "probe_gateway_loop_liveness",
                             lambda pid, **kw: gateway_cli.GATEWAY_LOOP_ALIVE)
         monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 15.0)
-        monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1",
-                            lambda pid, budget, **kw: False)
+        seen_before_signal = []
+        def restart_signal(pid, budget, **kw):
+            seen_before_signal.append(capsys.readouterr().out)
+            return False
+        monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", restart_signal)
         monkeypatch.setattr(report, "read_active_work", lambda: [
             {"kind": "delegation", "delegation_id": "deleg_123", "elapsed_s": 42}])
         monkeypatch.setattr(gateway_cli, "_wait_for_api_server_port_free", lambda: None)
@@ -1298,7 +1301,8 @@ class TestGatewaySystemServiceRouting:
 
         gateway_cli.launchd_restart()
         output = capsys.readouterr().out
-        assert output.index("delegation deleg_123") < output.index("forcing launchd restart")
+        assert "delegation deleg_123" in seen_before_signal[0]
+        assert "forcing launchd restart" in output
         assert "work still running may be interrupted" in output
 
     @pytest.mark.macos_only
