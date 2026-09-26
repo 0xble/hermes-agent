@@ -1,8 +1,8 @@
 """1Password (`op` CLI) secret source.
 
 Users map env-var names to ``op://vault/item/field`` references in
-``secrets.onepassword.env``; each is resolved with one ``op read -- <ref>``
-call using whatever auth the user's ``op`` already has (``OP_SERVICE_ACCOUNT_TOKEN``
+``secrets.onepassword.env``; refs are resolved in one ``op run`` batch with
+per-reference ``op read`` fallback using whatever auth the user's ``op`` already has (``OP_SERVICE_ACCOUNT_TOKEN``
 headless, ``OP_SESSION_*`` interactive) — Hermes never authenticates on the
 user's behalf, and failures never block startup. Complete pulls are cached
 in-process and under ``<hermes_home>/cache/op_cache.json`` (values only; auth
@@ -16,6 +16,8 @@ import logging
 import os
 import shutil
 import subprocess  # noqa: F401 — tests monkeypatch ``op.subprocess.run``
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -197,6 +199,56 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     return env
 
 
+def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
+                  token_value: str = "") -> Dict[str, str]:
+    """Resolve unique refs in one op invocation, never putting values on stdout.
+
+    The temporary directory is private; both files are 0600 and removed on every
+    path. The child receives only synthetic env keys, not Hermes's other secrets.
+    """
+    if any("\n" in ref or "\r" in ref for ref in references.values()):
+        raise RuntimeError("op run cannot encode a newline in a secret reference")
+    unique = list(dict.fromkeys(references.values()))
+    names = [f"HERMES_OP_BATCH_{i}" for i in range(len(unique))]
+    scratch = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
+    with tempfile.TemporaryDirectory(prefix="op_batch_", dir=scratch) as directory:
+        env_file = Path(directory) / "refs.env"
+        output = Path(directory) / "resolved.json"
+        for path in (env_file, output):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                if path == env_file:
+                    stream.write("".join(f"{name}={ref}\n" for name, ref in zip(names, unique)))
+        # No stdout/stderr values: op run masks those streams, but a JSON file
+        # preserves multiline and arbitrary printable secret content unchanged.
+        child = (
+            "import json, os, sys; "
+            "names = sys.argv[2:]; "
+            "values = {n: os.environ[n] for n in names}; "
+            "f = open(sys.argv[1], 'w', encoding='utf-8'); "
+            "json.dump(values, f); f.close()"
+        )
+        cmd = [str(op), "run", "--env-file", str(env_file)]
+        if account:
+            cmd += ["--account", account]
+        cmd += ["--", sys.executable, "-c", child, str(output), *names]
+        proc = run_cli(cmd, env=_op_child_env(token_value), timeout=_OP_RUN_TIMEOUT,
+                       label="op", timeout_message=f"op run timed out after {_OP_RUN_TIMEOUT}s", stdin=None)
+        if proc.returncode != 0:
+            err = _scrub(proc.stderr or "")[-300:]
+            raise RuntimeError(f"op run failed: {err or f'exited {proc.returncode}'}")
+        try:
+            payload = json.loads(output.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("op run did not produce a valid result") from exc
+        if not isinstance(payload, dict) or any(
+            not isinstance(payload.get(name), str) or not payload[name].strip() for name in names
+        ):
+            raise RuntimeError("op run returned an empty or incomplete result")
+        values = dict(zip(unique, (payload[name] for name in names)))
+        return {name: values[ref] for name, ref in references.items()}
+
+
 def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: str = "") -> str:
     """Resolve one ``op://`` reference; raises ``RuntimeError`` on any failure, including
     an exit-0 empty value (applying it would clobber a good credential with ``""``)."""
@@ -275,21 +327,32 @@ def fetch_onepassword_secrets(
         failure_kinds.append(ErrorKind.RATE_LIMITED)
         warnings.append("1Password rate-limit cooldown active; skipping live reads")
     else:
-        for name in sorted(valid):
-            if name in secrets:
-                continue  # carried over from the cache entry; don't pay for it again
+        pending = {name: valid[name] for name in sorted(valid) if name not in secrets}
+        if pending:
             try:
-                secrets[name] = _run_op_read(op, valid[name], account=account, token_value=token_value)
-            except RuntimeError as exc:
-                warnings.append(str(exc))
+                secrets.update(_run_op_batch(op, pending, account=account, token_value=token_value))
+            except (RuntimeError, OSError) as exc:
                 kind = _classify_op_error(str(exc))
-                failure_kinds.append(kind)
                 if kind is ErrorKind.RATE_LIMITED:
-                    # The quota is per identity, not per item: every remaining read would be
-                    # refused the same way. Stop, and tell sibling processes to hold off.
+                    # A 429 is identity-wide. Do not spend another request on fallback.
+                    warnings.append(str(exc))
+                    failure_kinds.append(kind)
                     if use_cache:
                         _record_rate_limit_cooldown(cooldown_key, home_path)
-                    break
+                else:
+                    # One invalid ref makes op run fail wholesale; isolate the failure
+                    # with the existing per-ref path and preserve partial cache semantics.
+                    for name, ref in pending.items():
+                        try:
+                            secrets[name] = _run_op_read(op, ref, account=account, token_value=token_value)
+                        except RuntimeError as read_exc:
+                            warnings.append(str(read_exc))
+                            read_kind = _classify_op_error(str(read_exc))
+                            failure_kinds.append(read_kind)
+                            if read_kind is ErrorKind.RATE_LIMITED:
+                                if use_cache:
+                                    _record_rate_limit_cooldown(cooldown_key, home_path)
+                                break
 
     # An IDENTITY rejection fails every read it is asked to make; a single item the
     # identity may not read is a permission on that item, and `op` reports both as

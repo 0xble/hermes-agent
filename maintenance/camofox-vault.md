@@ -65,6 +65,13 @@ the browser vault fill tool, or the 1Password backends.
 
 ## Provenance and patches
 
+- Fork patch identities: `op-batched-secret-loader` (one `op run` over distinct
+  refs, private JSON handoff, per-ref fallback except on 429). Upstream
+  [PR 116616](https://github.com/NousResearch/hermes-agent/pull/116616) proposes
+  `op inject`; this fork uses `op run` to retain multiline values without parsing
+  an injected text template and preserves the existing cooldown and partial cache.
+  Retire when a released upstream batches refs with equivalent failure isolation,
+  last-good behavior, and safe handling of multiline values.
 - Fork patch identities: `slice-8-camofox-accounts` (local, no upstream submission),
   `slice-8-camofox-visible-handoff` (fork-only shared-window handoff; upstream does not
   expose these server endpoints); `slice-9-vault-camofox`, `slice-9-vault-shadow-dom`,
