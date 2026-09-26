@@ -3232,6 +3232,16 @@ def _is_overloaded_error(exc: Exception) -> bool:
     return _contains_any(str(exc).lower(), _OVERLOADED_PATTERNS)
 
 
+def _is_auxiliary_overload_error(exc: Exception) -> bool:
+    """Classify provider overloads through the shared error taxonomy for auxiliary fallback."""
+    try:
+        from agent.error_classifier import FailoverReason, classify_api_error
+        return classify_api_error(exc).reason == FailoverReason.overloaded
+    except Exception:
+        logger.debug("Auxiliary overload classification failed", exc_info=True)
+        return False
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     """429 rate limit (not billing/quota, which _is_payment_error owns).
 
@@ -7333,7 +7343,8 @@ class _LadderStep(NamedTuple):
 # wins, so a payment-flavoured 429 reads as "payment error", not "rate limit".
 _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
     (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
-    (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
+    (_is_rate_limit_error, "rate limit"), (_is_auxiliary_overload_error, "provider overloaded"),
+    (_is_model_incompatible_error, "model incompatible with route"),
     (_is_invalid_aux_response_error, "invalid provider response"),
     # Before the connection-error rung (its superset): a full-budget timeout must be named as one, or
     # a slow local model reads as an unreachable endpoint (#89445).
@@ -7359,7 +7370,7 @@ def _param_rung_accepts(exc: Exception) -> bool:
     A 429 on the retry is the credential/provider-fallback rungs' job, so it falls
     through too (the pre-ladder max_tokens rung accepted rate limits)."""
     return (_is_payment_error(exc) or _is_connection_error(exc) or _is_auth_error(exc)
-            or _is_rate_limit_error(exc)
+            or _is_rate_limit_error(exc) or _is_auxiliary_overload_error(exc)
             or "max_tokens" in str(exc) or "unsupported_parameter" in str(exc)
             # Parameter rungs chain in any order (a reasoning-strip retry can 400 on temperature,
             # a temperature-strip retry on max_tokens), and a route-gating 400 after a strip still
