@@ -35,7 +35,9 @@ its optional icon, and the durable alias can be observed through one Telegram to
   label unsuffixed while the session row carries the alias. Non-Telegram collision behavior
   remains upstream behavior.
 - `/title X` also re-picks the icon from `X` when `auto_topic_icons` is on, through the same
-  selection helper as automatic renames; see [explicit title receipts](telegram-title-receipts.md).
+  selection helper as automatic renames, and replaces a manual icon (automatic renames never do).
+  Any icon Hermes writes clears the adapter's remembered manual icon for that topic; see
+  [explicit title receipts](telegram-title-receipts.md).
 - `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
   `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
   icon recorded there is never replaced by an automatic rename.

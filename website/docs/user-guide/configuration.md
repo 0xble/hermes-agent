@@ -1416,7 +1416,7 @@ If you do not want Hermes to auto-generate titles after the first exchange, set
 
 `auxiliary.title_generation.min_words` / `max_words` set the title word budget (defaults 3/7), `case_style` is `sentence_case` or `title_case`, `instructions` adds trusted operator guidance, and `name_aliases` restores configured display spellings (for example `onepass: 1Password`).
 
-For Telegram DM topics, `platforms.telegram.extra.auto_topic_icons` enables Bot API semantic icons. `preserve_manual_topic_icons` defaults to true; `topic_icon_instructions` and `topic_icon_overrides` customize selection. Name and icon are sent in one topic edit, and `/title` reserves a private lineage alias when a visible Telegram label is duplicated.
+For Telegram DM topics, `platforms.telegram.extra.auto_topic_icons` enables Bot API semantic icons. `preserve_manual_topic_icons` defaults to true and protects manually chosen icons from automatic renames; an explicit `/title` re-picks the icon from the new title and replaces a manual one; `topic_icon_instructions` and `topic_icon_overrides` customize selection. Name and icon are sent in one topic edit, and `/title` reserves a private lineage alias when a visible Telegram label is duplicated.
 
 To keep the instant derived title (the first line of your opening message) but never
 spend a model call upgrading it, set `auxiliary.title_generation.model_upgrade_enabled: false`.
