@@ -1295,13 +1295,19 @@ def restore_primary_runtime(agent) -> bool:
         if "reasoning_config" in rt:
             saved_reasoning = rt["reasoning_config"]
             agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else saved_reasoning
-            # The explicit-pick marker travels with the level it describes: fallback activation set
-            # it aside (primary snapshots predate or clear it). explicit_parent_reasoning ignores it
-            # unless it equals the restored level, so a stale value can never pass as a pick.
+            # The explicit-pick marker travels with the level it describes. Fallback activation cleared
+            # it and set the pick aside; a surface that re-marked a pick since then (the gateway does
+            # every turn) is newer and wins. The primary snapshot can predate either (a live
+            # /reasoning, an init-time snapshot), so restore the pick as BOTH level and marker rather
+            # than pairing it with the snapshot's stale level.
+            live_override = getattr(agent, "reasoning_override", None)
             saved_override = getattr(agent, "_pre_fallback_reasoning_override", None)
-            agent.reasoning_override = (
-                dict(saved_override) if isinstance(saved_override, dict) else None
-            )
+            pick = live_override if isinstance(live_override, dict) else saved_override
+            if isinstance(pick, dict):
+                agent.reasoning_config = dict(pick)
+                agent.reasoning_override = dict(pick)
+            else:
+                agent.reasoning_override = None
         agent._pre_fallback_reasoning_override = None
         agent._fallback_activated = False
         agent._fallback_index = 0

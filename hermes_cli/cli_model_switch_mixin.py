@@ -229,6 +229,7 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool) -> 
     if cli.agent is not None:
         cli.agent.reasoning_config = parsed
         cli.agent.reasoning_override = cli._reasoning_override
+        cli.agent._pre_fallback_reasoning_override = None  # supersedes a pick set aside by fallback
     saved = persist_global and save_config_value("agent.reasoning_effort", effort)
     if saved:
         CLI_CONFIG.setdefault("agent", {})["reasoning_effort"] = effort
@@ -602,6 +603,7 @@ class CLIModelSwitchMixin:
             if "reasoning_config" in snapshot:
                 agent.reasoning_config = snapshot["reasoning_config"]
                 agent.reasoning_override = copy.deepcopy(snapshot.get("reasoning_override"))
+                agent._pre_fallback_reasoning_override = None
 
         _restore_reasoning()
         primary = snapshot.get("agent_primary_runtime")

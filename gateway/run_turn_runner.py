@@ -1293,6 +1293,7 @@ class TurnRunner:
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
         agent.reasoning_override = runner._session_reasoning_override(ctx.session_key)
+        agent._pre_fallback_reasoning_override = None  # a live pick supersedes a set-aside one
         self._merge_turn_request_overrides(agent, turn_route)
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.

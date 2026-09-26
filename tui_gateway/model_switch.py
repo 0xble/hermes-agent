@@ -33,6 +33,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         if "reasoning_config" in snapshot:
             agent.reasoning_config = snapshot["reasoning_config"]
             agent.reasoning_override = copy.deepcopy(snapshot.get("reasoning_override"))
+            agent._pre_fallback_reasoning_override = None
 
     # `/model X --reasoning high --once`: the effort leaves with the model. Set before the
     # runtime restore paths below (primary_runtime may predate a session /reasoning change).
@@ -367,6 +368,7 @@ def _apply_switch_reasoning(sid: str, session, agent, effort: str, *, persist_gl
         # Explicit for delegation too; the --once restore swaps reasoning_config back, which
         # retires the marker (explicit_parent_reasoning requires it to match the live level).
         agent.reasoning_override = None if persist_global and not one_turn else parsed
+        agent._pre_fallback_reasoning_override = None  # supersedes a pick set aside by fallback
     if one_turn or not isinstance(session, dict):
         return
     if persist_global:

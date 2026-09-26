@@ -130,6 +130,47 @@ class TestSwitchModelReasoningOverride:
         assert restore_primary_runtime(agent) is True
         assert agent.reasoning_override == xhigh
 
+    def test_restore_primary_runtime_restores_a_pick_newer_than_the_snapshot(self):
+        """A snapshot taken before a live /reasoning pick must not pair the pick with its stale level."""
+        from agent.agent_runtime_helpers import restore_primary_runtime
+
+        xhigh = {"enabled": True, "effort": "xhigh"}
+        agent = MagicMock()
+        agent._primary_runtime = {
+            "model": "claude-opus-4.5", "provider": "anthropic", "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages", "api_key": "key", "client_kwargs": {},
+            "use_prompt_caching": True, "use_native_cache_layout": False,
+            "reasoning_config": {"enabled": True, "effort": "medium"},  # configured, pre-pick
+            "compressor_model": "claude-opus-4.5", "compressor_base_url": "", "compressor_api_key": "",
+            "compressor_provider": "", "compressor_context_length": 0, "compressor_api_mode": "",
+            "compressor_threshold_tokens": 0, "anthropic_api_key": "key",
+            "anthropic_base_url": "https://api.anthropic.com", "is_anthropic_oauth": False,
+        }
+        agent._pre_fallback_reasoning_override = dict(xhigh)
+        agent._fallback_activated = True
+        agent._fallback_index = 0
+        agent._fallback_chain = []
+        agent._fallback_model = None
+        agent._transport_cache = {}
+        agent._config_context_length = None
+        agent._rate_limited_until = 0
+        agent.model = "fallback-model"
+        agent.provider = "openai"
+        agent.reasoning_config = {"enabled": True, "effort": "low"}
+        agent.reasoning_override = None
+        agent.context_compressor = MagicMock()
+        agent.base_url = ""
+        agent._anthropic_prompt_cache_policy = MagicMock(return_value=(True, False))
+        agent._create_openai_client = MagicMock(return_value=MagicMock())
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+
+        assert restore_primary_runtime(agent) is True
+        assert agent.reasoning_config == xhigh
+        assert agent.reasoning_override == xhigh
+
+        from tools.delegate_tool_config import explicit_parent_reasoning
+        assert explicit_parent_reasoning(agent) == xhigh
+
 
 def test_switch_model_retires_explicit_marker_even_when_level_is_equal(monkeypatch):
     """A config re-resolution that lands on the SAME level as an explicit pick still retires it.
