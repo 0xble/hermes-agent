@@ -158,11 +158,12 @@ config to `os.devnull`, disable system config, and redirect XDG config into
 runner retains the CI-provided safe.directory config; changing its global
 allowlist would discard that boundary and would not protect direct pytest runs.
 Upstream main at `cb3142d3257b15ac42de544bd585793567400d0f` has the same
-worktree-GC fixture leak; its contribution uses only the single shared test file.
-The fork's sibling repairs remain fork CI adaptations. A poison global config
-with `commit.gpgsign=true` fails setup before the patch and all 95 affected tests
-pass after it. Retire the fork adaptation when a released upstream revision
-provides the same hermetic tests.
+worktree-GC fixture leak; [upstream contribution #124019](https://github.com/NousResearch/hermes-agent/pull/124019)
+uses only the single shared test file. [Fork delivery #173](https://github.com/0xble/hermes-agent/pull/173)
+also repairs the four sibling test files that fail under the same poison config.
+A poison global config with `commit.gpgsign=true` fails setup before the patch,
+and all 95 affected tests pass after it. Retire the fork adaptation when a
+released upstream revision provides the same hermetic tests.
 
 ## Verification and retirement
 
