@@ -2434,6 +2434,9 @@ DEFAULT_CONFIG = {
             "binary_path": "",      # absolute path to op; empty = PATH.
             # Env var holding a service-account token (headless auth, no unlock prompt). Unset = prompt.
             "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",
+            # Optional model-blind fields. Each entry binds one op:// reference to a supported semantic and
+            # exact HTTPS origins; the model sees only an opaque handle and can fill only that field there.
+            "protected_fields": [],
             # Additional accounts: [{alias, account, service_account_token_env, browser_account?}].
             # Each uses only its own service-account token; handles are op@<alias>:<item-id>.
             "accounts": [],

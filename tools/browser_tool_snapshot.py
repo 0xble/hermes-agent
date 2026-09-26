@@ -108,18 +108,23 @@ def _truncate_snapshot(snapshot_text: str, max_chars: Optional[int] = None) -> s
     return '\n'.join(result)
 
 
-def _redact_browser_output(value: Any) -> Any:
-    """Force-redact secrets in browser-originated data (snapshots, console, eval
-    results can carry page-rendered keys/cookies/tokens). Tool output is a model
-    boundary, so this applies even when global log redaction is disabled."""
+def _redact_browser_output(value: Any, *,
+                           vault_tab: str = "default", vault_origin: str = "") -> Any:
+    """Redact browser data under the active tab/origin rule."""
     from agent.redact import redact_sensitive_text
 
     if isinstance(value, str):
-        return redact_sensitive_text(value, force=True)
+        return redact_sensitive_text(value, force=True,
+                                     vault_tab=vault_tab, vault_origin=vault_origin)
     if isinstance(value, list):
-        return [_redact_browser_output(item) for item in value]
+        return [_redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_browser_output(item) for item in value)
+        return tuple(_redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin) for item in value)
     if isinstance(value, dict):
-        return {_redact_browser_output(key): _redact_browser_output(item) for key, item in value.items()}
-    return value
+        return {
+            _redact_browser_output(key, vault_tab=vault_tab, vault_origin=vault_origin):
+            _redact_browser_output(item, vault_tab=vault_tab, vault_origin=vault_origin)
+            for key, item in value.items()
+        }
+    from agent.redact import redact_registered_vault_number
+    return redact_registered_vault_number(value, tab=vault_tab, origin=vault_origin)

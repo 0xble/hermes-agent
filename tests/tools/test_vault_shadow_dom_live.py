@@ -14,7 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from agent.vault_login_classifier import build_fill_js, build_inspection_js
+from agent.vault_login_classifier import (
+    build_fill_js,
+    build_inspection_js,
+)
 from tools import browser_vault_tool as vault
 from tools.browser_supervisor import SUPERVISOR_REGISTRY
 from tools.browser_use_cli import _attach_vault_supervisor
@@ -175,6 +178,60 @@ def test_shadow_probe_inspection_and_nonce_fill_share_scope(browser):
     controls = json.loads(evaluate(sup, build_inspection_js('light-test')))
     fills[0]['index'] = controls[0]['index']
     assert json.loads(evaluate(sup, build_fill_js(fills, origin, 'light-test')))['filled'] == 1
+
+
+def test_birth_month_select_follows_visible_month_not_option_value(browser):
+    """Month <select>s often use zero-based values ("3" = April). The fill must pick the
+    visible month, and refuse rather than guess when the visible text is ambiguous."""
+    sup, _, origin, _ = browser
+    months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
+              'September', 'October', 'November', 'December']
+    cases = {
+        'zero-based': ''.join(f'<option value="{i}">{m}</option>' for i, m in enumerate(months)),
+        'numeric-text': ''.join(f'<option value="m{i}">{i + 1:02d}</option>' for i in range(12)),
+        'short-names': ''.join(f'<option value="x{i}">{m[:3]}.</option>' for i, m in enumerate(months)),
+    }
+    for name, options in cases.items():
+        evaluate(sup, f"""document.body.innerHTML = `<select autocomplete="bday-month">
+          <option value="">Month</option>{options}</select>`""")
+        controls = json.loads(evaluate(sup, build_inspection_js('month-' + name)))
+        fills = [{'index': controls[0]['index'], 'token': 'bday-month', 'value': '04'}]
+        result = json.loads(evaluate(sup, build_fill_js(fills, origin, 'month-' + name)))
+        assert result['filled'] == 1, name
+        label = evaluate(sup, "document.querySelector('select').selectedOptions[0].textContent")
+        assert label in ('April', '04', 'Apr.'), (name, label)
+    # A bare-number menu whose visible text never shows the month is not guessed from values.
+    evaluate(sup, """document.body.innerHTML = `<select autocomplete="bday-month">
+      <option value="">Month</option>${Array.from({length: 12}, (_, i) =>
+        `<option value="${i + 1}">&#9679;</option>`).join('')}</select>`""")
+    controls = json.loads(evaluate(sup, build_inspection_js('month-opaque')))
+    fills = [{'index': controls[0]['index'], 'token': 'bday-month', 'value': '04'}]
+    assert json.loads(evaluate(sup, build_fill_js(fills, origin, 'month-opaque')))['filled'] == 0
+    assert evaluate(sup, "document.querySelector('select').value") == ''
+
+
+def test_protected_birth_date_refuses_externally_launched_cdp_browser(browser, monkeypatch):
+    """An isolated profile is not enough: the browser was attached via CDP."""
+    from agent.vault_store import VaultItemMeta
+
+    sup, task, origin, _ = browser
+    evaluate(sup, """document.body.innerHTML = `
+      <form><label>Date of birth <input type="date" name="dob" autocomplete="bday"></label></form>`""")
+    meta = VaultItemMeta(id='op:field:external', kind='protected_field', label='Birth date',
+                         origin=origin, created_at='', allowed_origins=(origin,), field_token='bday')
+
+    class Backend:
+        name = 'onepassword'
+        needs_unlock = False
+        def get_meta(self, handle):
+            return meta if handle == meta.id else None
+        def resolve_secret(self, handle):
+            raise AssertionError('external browser must not resolve a protected field')
+
+    monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda _handle: Backend())
+    result = json.loads(registry.dispatch('browser_vault_fill', {'handle': meta.id}, task_id=task))
+    assert result['error_type'] == 'private_browser_required'
+    assert evaluate(sup, "document.querySelector('[name=dob]').value") == ''
 
 
 @pytest.mark.parametrize('aliased_root', [False, True])

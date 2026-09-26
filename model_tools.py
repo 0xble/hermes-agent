@@ -897,7 +897,9 @@ def handle_function_call(
     start = time.monotonic()
 
     def _emit(result: Any, **extra: Any) -> Any:
-        """Emit post_tool_call with this call's identity fields; returns *result*."""
+        """Scrub browser output before hooks and return the exact scrubbed value."""
+        from agent.browser_output_egress import scrub_browser_result
+        result = scrub_browser_result(function_name, result, ids.task_id)
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
@@ -958,14 +960,20 @@ def handle_function_call(
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
         duration_ms = _elapsed_ms(start)
-        _emit(result, duration_ms=duration_ms)
-        return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+        result = _emit(result, duration_ms=duration_ms)
+        transformed = _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+        from agent.browser_output_egress import scrub_browser_result
+        return scrub_browser_result(function_name, transformed, ids.task_id)
 
     except Exception as e:
-        error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.exception(error_msg)
+        from agent.browser_output_egress import scrub_browser_result
+        # Browser exceptions can quote page values: scrub before the model, hooks or logs see them.
+        detail = scrub_browser_result(function_name, str(e), ids.task_id)
+        error_msg = f"Error executing {function_name}: {detail}"
+        # A traceback repeats the raw message: omit it whenever scrubbing changed the text.
+        logger.error(error_msg, exc_info=detail == str(e))
         return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),
-                     status="error", error_type=type(e).__name__, error_message=str(e))
+                     status="error", error_type=type(e).__name__, error_message=detail)
 
 
 # =============================================================================

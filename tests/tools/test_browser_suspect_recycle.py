@@ -326,3 +326,25 @@ class TestBackendLevelFailureRecycles:
         assert len(spawns) == 1  # no retry
         assert bt._active_sessions[TASK] is session_info  # cache untouched
         assert bt._suspect_browser_sessions == {}
+
+
+def test_suspect_recycle_refuses_replacement_when_protected_close_is_unconfirmed(monkeypatch):
+    """A failed teardown of a suspect session must not start and orphan a second browser."""
+    kept = _local_session("protected-session")
+    bt._active_sessions[TASK] = kept
+    bt._suspect_browser_sessions[TASK] = "browser command timed out"
+    monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+    monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: None)
+    monkeypatch.setattr(bt_lifecycle, "_cleanup_single_browser_session", lambda _tid: None)  # close kept
+    created = []
+    monkeypatch.setattr("tools.browser_tool_session._create_local_session",
+                        lambda tid: created.append(tid) or {"session_name": "fresh"})
+    try:
+        with pytest.raises(RuntimeError, match="not confirmed"):
+            bt_session._get_session_info(TASK)
+        assert created == []
+        assert bt._active_sessions[TASK] is kept
+    finally:
+        bt._active_sessions.pop(TASK, None)
+        bt._suspect_browser_sessions.pop(TASK, None)

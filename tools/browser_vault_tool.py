@@ -10,7 +10,8 @@ tools):
   never returned.
 - ``browser_vault_fill``  → server-side fill of the CURRENT page from a vault
   handle: the password field for logins, card fields for payment items (after
-  the user confirms), address fields for address items. The secret is
+  the user confirms), address fields for address items, or one configured
+  origin-bound protected field. The secret is
   resolved locally, the page origin must EXACTLY match the item's bound
   origin (pre-checked AND re-asserted synchronously inside the fill script),
   the field is chosen by the ported login-control classifier, injection runs
@@ -56,6 +57,15 @@ _check_vault_available = no_cache_check_fn(_check_vault_available)
 # ---------------------------------------------------------------------------
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
+
+def _browser_key(task_id: str) -> str:
+    """The browser session key a vault operation targets: the one that served the task's last
+    navigation. Every page access below (focus, inspection, write, supervisor lookup) takes this
+    key, never the bare task id, so a remapped session cannot be checked on one browser and
+    written through another."""
+    from tools.browser_tool import _last_session_key
+    return _last_session_key(task_id)
+
 
 def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
@@ -235,6 +245,8 @@ _TAB_PROBES = {kind: build_form_probe_js(selector) for kind, selector in {
     "address": "input[autocomplete^=address-], [autocomplete=postal-code], [name*=address i], [name*=zip i], [name*=postal i]",
     "otp": "input[autocomplete=one-time-code], input[name*=otp i], input[name*=code i], "
            "input[id*=otp i], input[id*=code i], input[name*=totp i], input[aria-label*=code i]",
+    "protected_field": "input[autocomplete^=bday], select[autocomplete^=bday], "
+                       "input[name*=birth i], input[id*=birth i], input[name*=dob i], input[id*=dob i]",
 }.items()}
 
 
@@ -309,6 +321,8 @@ def browser_vault_list() -> str:
             if meta.identifier:
                 entry["identifier"] = meta.identifier
                 entry["identifier_type"] = meta.identifier_type
+            if meta.field_token:
+                entry["field"] = meta.field_token
             pinned = getattr(backend, "browser_account", "")
             if isinstance(pinned, str) and pinned:
                 entry["browser_account"] = pinned
@@ -360,10 +374,11 @@ def browser_vault_save_login(label: str = "", task_id: Optional[str] = None) -> 
     from agent.vault_store import get_vault_store
 
     effective_task_id = task_id or "default"
+    browser_key = _browser_key(effective_task_id)
     # The supervisor's default page session is whatever tab it attached to first (on Browser Use that is
     # the daemon's blank tab); the login form lives in the tab with a password field, so focus that one.
-    _focus_bound_origin(effective_task_id, "", "login")
-    origin = _current_page_origin(effective_task_id)
+    _focus_bound_origin(browser_key, "", "login")
+    origin = _current_page_origin(browser_key)
     if not origin:
         return json.dumps({"success": False, "error": "Open the site's login page first; the login is saved for that page's origin."})
     prompt = get_save_login_prompt_callback()
@@ -408,14 +423,15 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     backend = backend_for_handle(handle) if handle else None
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal
-    _focus_bound_origin(effective_task_id, "", "otp")
-    origin = _current_page_origin(effective_task_id)
+    browser_key = _browser_key(effective_task_id)
+    _focus_bound_origin(browser_key, "", "otp")
+    origin = _current_page_origin(browser_key)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    inspect = _eval_js(browser_key, build_inspection_js(nonce))
     raw_controls = _parse_json_result(inspect.get("result")) if inspect.get("success") else None
     if isinstance(raw_controls, str):
         raw_controls = _parse_json_result(raw_controls)
@@ -451,7 +467,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    result = _eval_js_secret(browser_key, build_fill_js(fills, expected_origin=origin, nonce=nonce))
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})
@@ -483,11 +499,17 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         classify_login_control,
         select_checkout_fills,
         select_password_fill,
+        classify_protected_field_control,
+        select_protected_field_fills,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
+    # Pin ONE browser for the whole fill: the privacy check, inspection, write and redaction must
+    # all address the session that served the task's last navigation (a hybrid task keeps its cloud
+    # supervisor under the bare task id while a private-URL local sidecar has its own key).
+    browser_key = _browser_key(effective_task_id)
     backend = backend_for_handle(handle)
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal
@@ -512,6 +534,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
+        return refusal
     if meta.kind != "login" and not meta.origin:
         if meta.kind != "payment" or not backend.binds_cards_to_page:
             return json.dumps({"success": False, "error_type": "no_origin",
@@ -520,8 +544,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         # default session may be the daemon's blank tab), so the confirmation below names the exact origin
         # the card would be written to.
         from dataclasses import replace
-        _focus_bound_origin(effective_task_id, "", "payment")
-        page_origin = _current_page_origin(effective_task_id)
+        _focus_bound_origin(browser_key, "", "payment")
+        page_origin = _current_page_origin(browser_key)
         if not page_origin:
             return json.dumps({"success": False, "error": "Could not determine the current page origin. Navigate to the checkout page first."})
         meta = replace(meta, origin=page_origin, allowed_origins=(page_origin,))
@@ -537,10 +561,10 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
     page_origin = None
     for candidate in allowed:
-        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
+        page_origin = _focus_bound_origin(browser_key, candidate, meta.kind)
         if page_origin:
             break
-    page_origin = page_origin or _current_page_origin(effective_task_id)
+    page_origin = page_origin or _current_page_origin(browser_key)
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
@@ -560,7 +584,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     # ── Inspect + classify page controls ────────────────────────────────────
     nonce = secrets.token_hex(8)  # binds this fill to THIS inspection's stamps
-    inspect = _eval_js(effective_task_id, build_inspection_js(nonce))
+    inspect = _eval_js(browser_key, build_inspection_js(nonce))
     if not inspect.get("success"):
         return json.dumps(
             {"success": False, "error": f"Could not inspect page inputs: {inspect.get('error', 'eval failed')}"}
@@ -576,7 +600,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     for raw in raw_controls:
         if not isinstance(raw, dict):
             continue
-        result = classify(LoginControl.from_dict(raw))
+        control = LoginControl.from_dict(raw)
+        result = (classify_protected_field_control(control, str(meta.field_token or ""))
+                  if meta.kind == "protected_field" else classify(control))
         if result is not None:
             classified.append(result)
     if not classified or (meta.kind == "login" and not any(
@@ -589,6 +615,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         if meta.kind == "login":
             secret = {"password": backend.resolve_password(handle)}
             fills = select_password_fill(classified, secret["password"])
+        elif meta.kind == "protected_field":
+            secret = backend.resolve_secret(handle)
+            fills = select_protected_field_fills(
+                classified, str(meta.field_token or ""), secret.get("value", "")
+            )
         else:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
@@ -604,14 +635,34 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # BEFORE they touch the page: any later browser_* result (including
     # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
     # Address values are not secrets but the card fields are: register every payment value.
-    for value in (secret.values() if meta.kind == "payment" else [secret.get("password", "")]):
+    from agent.redact import (
+        mark_vault_protected_tab, register_vault_date_component, register_vault_redaction_value,
+    )
+    for value in (secret.values() if meta.kind in ("payment", "protected_field") else [secret.get("password", "")]):
         register_vault_redaction_value(value)
+    protected_tab = effective_task_id
+    if meta.kind == "protected_field":
+        # Key protected state by the pinned browser session key, the one every reader resolves
+        # (_last_session_key): a remapped task (e.g. a hybrid sidecar) must hit the same registry
+        # entry from snapshot, eval, CDP, exec and pixel guards as the fill itself wrote to.
+        protected_tab = browser_key
+        mark_vault_protected_tab(protected_tab, page_origin)
+        # Register every component derived from the normalized protected value itself,
+        # including padded and unpadded month/day forms. This one tab/origin rule
+        # protects combined date inputs and arbitrary reads alike.
+        year, month, day = secret["value"].split("-")
+        for token, component in (("bday-year", year), ("bday-month", month), ("bday-day", day)):
+            register_vault_date_component(token, component, tab=protected_tab, origin=page_origin)
+            if token in ("bday-month", "bday-day"):
+                register_vault_date_component(token, str(int(component)), tab=protected_tab, origin=page_origin)
 
     if refusal := _browser_account_refusal(backend, effective_task_id):
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
+    if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
+        return refusal  # selection may have changed during inspection
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
+            browser_key, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -628,6 +679,26 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     parsed = _parse_json_result(fill_result.get("result"))
     if isinstance(parsed, str):
         parsed = _parse_json_result(parsed)
+    if isinstance(parsed, dict) and meta.kind == "protected_field":
+        # Internal supervisor result only; the public reply reports counts.
+        for option in parsed.get("selectedOptions", []):
+            if option.get("token") not in {f["token"] for f in fills}:
+                continue
+            label = option.get("label")
+            selected_value = option.get("value")
+            if isinstance(label, str) and label.strip() and not label.strip().isdigit():
+                register_vault_redaction_value(label.strip())
+            # The option's own value can differ from the date (zero-based "3" = April,
+            # or opaque "x3"), so a later read of el.value must be masked as well.
+            if isinstance(selected_value, str) and selected_value.strip():
+                selected_value = selected_value.strip()
+                if selected_value.isdigit():
+                    register_vault_date_component(option["token"], selected_value,
+                                                  tab=protected_tab, origin=page_origin)
+                    register_vault_date_component(option["token"], str(int(selected_value)),
+                                                  tab=protected_tab, origin=page_origin)
+                else:
+                    register_vault_redaction_value(selected_value)
     if isinstance(parsed, dict) and parsed.get("refused") == "origin_changed":
         return json.dumps(
             {
@@ -642,6 +713,11 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             }
         )
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
+    if meta.kind == "protected_field" and filled and int(filled) != len(fills):
+        # A partial date is a wrong date: report failure rather than a half-filled success.
+        return json.dumps({"success": False, "error_type": "partial_fill", "filled_fields": int(filled),
+                           "error": "Could not fill every birth-date part unambiguously; check the form "
+                                    "or use browser_handoff for the user to finish it."})
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
            "kind": meta.kind, "origin": page_origin}
@@ -673,8 +749,9 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
 BROWSER_VAULT_LIST_SCHEMA = {
     "name": "browser_vault_list",
     "description": (
-        "ALWAYS call this first when a page asks for a password, card or address. Lists saved website logins, "
-        "payment cards and addresses as handles with metadata (kind, label, backend, bound origin; logins also "
+        "ALWAYS call this first when a page asks for a password, card, address or configured protected field. "
+        "Lists saved website logins, payment cards, addresses and protected fields as handles with metadata "
+        "(kind, label, backend, bound origin; logins also "
         "carry identifier + identifier_type so you can type the username yourself with the browser's input tool; "
         "a password manager's card carries its last four digits as identifier and no origin). "
         "Secret values are NEVER returned. Sources: the local Hermes vault plus any installed password manager "
@@ -709,7 +786,8 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "Fill the CURRENT browser page from a vault handle (see browser_vault_list): a login item fills ONLY "
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
         "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
-        "fills the address fields. Values are resolved server-side and never appear in the conversation. "
+        "fills the address fields; a configured protected-field item fills only its named field on its exact "
+        "allowed origin. Values are resolved server-side and never appear in the conversation. "
         "A password manager's card has no bound origin: it is bound to the current page and that origin is shown "
         "in the user's confirmation. Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
         "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
@@ -763,6 +841,46 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
         "required": [],
     },
 }
+
+
+def _private_protected_field_refusal(task_id: str, browser_key: str) -> str | None:
+    """Only an owned, locally spawned Chromium session with no shared CDP route is safe.
+
+    ``browser_key`` is the session the fill pinned and will write to; it must still be the
+    task's selected session. Reject unknown/legacy session records, rather than inferring
+    privacy from the absence of an explicit cloud or account flag.
+    """
+    from tools import browser_tool as bt
+    from tools.browser_camofox import is_camofox_mode
+    from tools.browser_tool_cdp import _get_cdp_override
+    from tools.browser_tool_session import _shares_bot_desktop_browser
+
+    key = browser_key if bt._last_session_key(task_id) == browser_key else None
+    with bt._cleanup_lock:
+        session = bt._active_sessions.get(key) if key else None
+    features = (session or {}).get("features") or {}
+    private = (
+        not is_camofox_mode()
+        and not _get_cdp_override()
+        and session is not None
+        and session.get("session_key") == key
+        and session.get("owner_task_id") == task_id
+        and bool(session.get("session_name"))
+        and features.get("local") is True
+        and not any(features.get(flag) for flag in ("real_profile", "lightpanda", "cdp_override"))
+        and not session.get("cdp_url")
+        and not session.get("bb_session_id")
+        and not _shares_bot_desktop_browser(session)
+    )
+    if private:
+        return None
+    return json.dumps({
+        "success": False, "error_type": "private_browser_required",
+        "error": "Birth-date fills only run in a private per-task local browser. "
+                 "This browser may be shared with another task or process (Camofox accounts, "
+                 "attached/CDP, Bot Desktop, cloud and unverified sessions are refused). "
+                 "Navigate in a fresh local browser session for this task first.",
+    })
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:

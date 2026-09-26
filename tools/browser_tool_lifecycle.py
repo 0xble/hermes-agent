@@ -655,6 +655,10 @@ def _force_reap_browser_session(task_id: str) -> None:
 
     Janitor last resort after repeated cleanup failures (#100738).
     """
+    from agent.redact import has_vault_date_components
+    if has_vault_date_components(task_id):
+        _bt.logger.warning("Cannot force-reap protected browser %s without confirmed close", task_id)
+        return
     _cdp._stop_cdp_supervisor(task_id)
     with _bt._cleanup_lock:
         session_info = _bt._active_sessions.get(task_id)
@@ -667,6 +671,7 @@ def _force_reap_browser_session(task_id: str) -> None:
 
 def _cleanup_single_browser_session(task_id: str) -> None:
     """Reap a single browser session by its exact session key."""
+    from agent.redact import clear_vault_date_components, has_vault_date_components
     _cdp._stop_cdp_supervisor(task_id)  # close our WebSocket BEFORE the backend tears down the endpoint
 
     # Camofox: managed persistence keeps the profile (cookies) across tasks; skip the full
@@ -692,6 +697,11 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     _bt.logger.debug("Found session for task %s: bb_session_id=%s", task_id, session_info.get("bb_session_id", "unknown"))
     _bt._maybe_stop_recording(task_id)  # saves the file before close
 
+    protected = has_vault_date_components(task_id)
+    # Skipped/failed close does not prove the filled page is gone.
+    if protected and ((session_info.get("features") or {}).get("lightpanda") or _session_has_expired(session_info)):
+        _bt.logger.warning("Keeping protected browser session %s: close cannot be confirmed", task_id)
+        return
     # Lightpanda sessions have no daemon to ``close``; an expired cloud CDP URL cannot
     # accept one and would make _get_session_info() renew the session mid-cleanup.
     if (session_info.get("features") or {}).get("lightpanda"):
@@ -704,11 +714,18 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
     else:
         try:
-            _session._run_browser_command(task_id, "close", [], timeout=10)
+            close_result = _session._run_browser_command(task_id, "close", [], timeout=10)
+            if protected and not close_result.get("success"):
+                _bt.logger.warning("Keeping protected browser session %s: close was unsuccessful", task_id)
+                return
             _bt.logger.debug("agent-browser close command completed for task %s", task_id)
         except Exception as e:
             _bt.logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+            if protected:
+                return
 
+    if protected:
+        clear_vault_date_components(task_id)
     _release_session_resources(task_id, session_info)
     _bt.logger.debug("Removed task %s from active sessions", task_id)
 

@@ -1,4 +1,4 @@
-"""browser_vision helpers: Lightpanda pre-route, native provider vision, auxiliary-LLM screenshot analysis.
+"""browser_vision helpers: protected pixel guard, Lightpanda pre-route, native and auxiliary vision.
 
 Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt`` (``tools.browser_tool``, resolved per call) — no import cycle.
 """
@@ -12,6 +12,24 @@ from hermes_cli.config import cfg_get
 from tools.browser_tool_origin import origin as _bt
 from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_lightpanda_fallback as _lp
+
+
+def blocked_protected_date_pixels(task_id: str) -> Optional[str]:
+    """Refuse unredactable pixels for the browser session that received a protected fill.
+
+    The refusal lasts until the session closes: the focused tab's origin cannot prove
+    the filled tab is gone, because another tab may simply have been focused.
+    """
+    from agent.redact import has_vault_date_components
+    from tools.browser_tool import _last_session_key
+    task_id = _last_session_key(task_id or "default")  # same key the fill registered under
+    if has_vault_date_components(task_id):
+        from tools.registry import tool_error
+        return tool_error(
+            "Screenshot unavailable: a protected date was filled in this browser session. "
+            "Use browser_handoff for the user to see it, or browser_close to end the session.",
+            success=False)
+    return None
 
 
 def _vision_mode_label() -> str:

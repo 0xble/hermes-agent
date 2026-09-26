@@ -57,10 +57,12 @@ def _transcript():
     ]
 
 
-def _stalling_call_llm(compressor, calls, *, fail_when_pinned=False):
+def _stalling_call_llm(compressor, calls, *, fail_when_pinned=False, started=None):
     """Summary call that never streams: hangs until the host cancels the fence, like a held-open socket."""
     def _call(**kwargs):
         calls.append(kwargs.get("provider") or "primary")
+        if started is not None:
+            started.set()
         if fail_when_pinned and "provider" in kwargs:
             raise RuntimeError("fallback route exploded")
         cancelled = getattr(compressor, "_compression_cancelled_check", None)
@@ -83,7 +85,7 @@ def fast_timeouts(monkeypatch):
     monkeypatch.setattr(cc, "resolve_context_compression_timeouts", lambda compression_cfg=None: (0.4, 4.0))
 
 
-def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp_path, fast_timeouts):
+def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp_path, fast_timeouts, monkeypatch):
     """Real AIAgent + real ``compress_context`` + facade timeout wrap; only ``call_llm`` is stubbed.
     Stall 1: backoff recorded, transcript untouched. Stall 2 (after the backoff lapsed): the deterministic
     rung commits a fallback summary instead of continuing without compression."""
@@ -91,7 +93,21 @@ def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp
     compressor = agent.context_compressor
     calls = []
     live = _transcript()
-    with patch("agent.context_compressor.call_llm", side_effect=_stalling_call_llm(compressor, calls)), \
+    summary_started = threading.Event()
+    original_seconds_since_progress = cc.CompressionCommitFence.seconds_since_progress
+    monkeypatch.setattr(
+        cc.CompressionCommitFence,
+        "seconds_since_progress",
+        lambda fence: (
+            original_seconds_since_progress(fence)
+            if summary_started.is_set()
+            else 0.0
+        ),
+    )
+    with patch(
+        "agent.context_compressor.call_llm",
+        side_effect=_stalling_call_llm(compressor, calls, started=summary_started),
+    ), \
             patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
         first, _ = agent._compress_context(live, "sys", approx_tokens=50_000)
         assert first is live, "a first stall keeps the transcript and only arms the backoff"
