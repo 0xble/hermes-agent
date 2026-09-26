@@ -5,24 +5,24 @@ from __future__ import annotations
 import re
 
 from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
-from tools.process_registry_notifications import PROCESS_NOTIFICATION_END
+from tools.delegation_resume import AUTO_RESUME_NOTICE_OPEN
+from tools.process_registry_notifications import (
+    PROCESS_NOTICE_OPEN, PROCESS_NOTIFICATION_END, PROCESS_NOTICE_OPENERS,
+)
 
-# These prefixes are emitted by Hermes itself, not written as user intent or an
-# assistant answer. Keep this list deliberately narrow: dropping real content is
-# worse than retaining an occasional status line.
-_MACHINE_NOTICE_PREFIXES = (
-    "[ASYNC DELEGATION BATCH COMPLETE",
-    "[ASYNC DELEGATION COMPLETE",
-    "[ASYNC DELEGATION TASK FAILED",
+# Legacy unframed rows have no reliable payload boundary, so only these exact
+# historical forms are dropped wholesale. Framed rows use the defining
+# formatter's openers and end marker instead of a copied list of variants.
+_LEGACY_MACHINE_NOTICE_PREFIXES = (
     "[NATIVE REVIEW COMPLETE",
     "[SUBAGENT",
     "⚠ SUBAGENT",
     "[CONTEXT COMPACTION",
     "[CONTEXT SUMMARY",
     "[PRIOR CONTEXT",
-    "[IMPORTANT: Background process",
     "[System note:",
 )
+_MACHINE_NOTICE_PREFIXES = (*PROCESS_NOTICE_OPENERS, AUTO_RESUME_NOTICE_OPEN, *_LEGACY_MACHINE_NOTICE_PREFIXES)
 _MEMORY_CONTEXT_BLOCK_RE = re.compile(
     r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>",
     re.IGNORECASE,
@@ -59,6 +59,11 @@ def _user_after_machine_notice(content: str) -> str | None:
     """Keep only text after the formatter's boundary, never its untrusted payload."""
     if not content.startswith(_MACHINE_NOTICE_PREFIXES):
         return content
+    if content.startswith(PROCESS_NOTICE_OPEN) and f"\n{PROCESS_NOTIFICATION_END}" not in content:
+        # Preserve historical unframed process notices, but don't classify an
+        # arbitrary user-written [IMPORTANT: ...] as a process result.
+        if not re.match(r"\[IMPORTANT: (?:Background process |\d+ background (?:processes|subagent delegations) completed)", content):
+            return content
     # Gateway recovery notes are a closed bracket followed by a blank line
     # before any real user message (gateway.run.build_resume_recovery_note).
     if content.startswith("[System note:"):
@@ -76,7 +81,7 @@ def _user_after_machine_notice(content: str) -> str | None:
 
 
 def _is_machine_notice(content: str) -> bool:
-    return content.startswith(_MACHINE_NOTICE_PREFIXES)
+    return _user_after_machine_notice(content) is None
 
 
 def _is_assistant_status_only(content: str) -> bool:
