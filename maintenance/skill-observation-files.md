@@ -18,7 +18,8 @@ the indexed record.
 ## Provenance
 
 Fork-only. It extends the fork's observation inbox (`ce9b62321d`), which has no
-upstream counterpart. Writer: the dotfiles `skill-source-guard` plugin.
+upstream counterpart. The current writer is the profile-owned `source-guard`
+plugin in `agents/sources/plugins/source-guard/`, projected into the Hermes profile.
 
 ## Verification
 
