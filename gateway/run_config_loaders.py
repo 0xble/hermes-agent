@@ -183,11 +183,17 @@ class GatewayConfigLoadersMixin:
         empty uses ``model.default``.
         """
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
-        if resolved_session_key:
-            _r_state = self._peek_session_state(resolved_session_key)
-            if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-                return _r_state.conversation.reasoning_override
+        override = self._session_reasoning_override(resolved_session_key)
+        if override is not None:
+            return override
         return self._load_reasoning_config(model)
+
+    def _session_reasoning_override(self, session_key: Optional[str]) -> dict | None:
+        """The session's explicit ``/reasoning`` pick, or ``None`` when it runs on config."""
+        if not session_key:
+            return None
+        _r_state = self._peek_session_state(session_key)
+        return None if _r_state is None else _r_state.conversation.reasoning_override
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:
         """Set or clear the session-scoped reasoning override."""

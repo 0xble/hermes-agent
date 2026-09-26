@@ -223,8 +223,10 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool) -> 
     if parsed is None:
         return
     cli.reasoning_config = parsed
+    cli._reasoning_override = None if persist_global else parsed
     if cli.agent is not None:
         cli.agent.reasoning_config = parsed
+        cli.agent.reasoning_override = cli._reasoning_override
     saved = persist_global and save_config_value("agent.reasoning_effort", effort)
     if saved:
         CLI_CONFIG.setdefault("agent", {})["reasoning_effort"] = effort

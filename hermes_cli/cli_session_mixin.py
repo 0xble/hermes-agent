@@ -538,6 +538,7 @@ class CLISessionMixin:
         # After the model reset: the effort belongs to the model the fresh session lands on (a /reasoning
         # session override is dropped, the default model's per-model override is kept).
         _resolve_cli_reasoning(self)
+        self._reasoning_override = None
         _sync_process_session_id(self.session_id)
 
         if self.agent:

@@ -195,6 +195,8 @@ def test_busy_inference_changes_reach_live_agents_next_request():
 
     runner._apply_reasoning_selection(key, "telegram", "high")
     assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    # An explicit session pick is marked explicit so delegated children inherit it.
+    assert agent.reasoning_override == agent.reasoning_config
     assert runner._running_agents[key] is agent
     assert runner._agent_cache[key][0] is agent
 
@@ -224,3 +226,4 @@ def test_busy_controls_reset_from_an_initial_fast_request():
     runner._apply_reasoning_selection(key, "telegram", "reset")
     assert effective_request_overrides(agent) == {"extra_body": {"keep": True}}
     assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+    assert agent.reasoning_override is None  # back on config: no longer an explicit choice

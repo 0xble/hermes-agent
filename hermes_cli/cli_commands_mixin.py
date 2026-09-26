@@ -2615,6 +2615,8 @@ class CLICommandsMixin:
                        _dim_line('Display:      show, hide'),
                        _dim_line('Scope:        session-scoped by default, --global to persist'))
         self.reasoning_config = parsed
+        # A --global save makes the level the configured default, not a session choice.
+        self._reasoning_override = None if explicit_global else parsed
         _retire_agent(self)  # Force agent re-init with new reasoning config
         saved = explicit_global and _save("agent.reasoning_effort", arg)
         if saved:

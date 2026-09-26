@@ -1342,9 +1342,10 @@ DEFAULT_CONFIG = {
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
         # toolsets=["web"] doesn't strip MCP). false = strict intersection.
         "inherit_mcp_toolsets": True,
-        # When true, delegated children inherit the parent's effective Fast/normal preference.
-        # Fast fields are re-derived for the child's own provider/model route. false preserves
-        # existing child behavior while preventing transient parent service_tier/speed leakage.
+        # When true, delegated children inherit the parent's Fast mode (priority/auto/cold), also
+        # under a pinned delegation.provider. Fast fields are re-derived for the child's own route
+        # (none on a route without fast mode). false preserves existing child behavior while
+        # preventing transient parent service_tier/speed leakage.
         "inherit_service_tier": False,
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
@@ -1358,7 +1359,8 @@ DEFAULT_CONFIG = {
         # waiting on a multi-minute completion) restarts the window; a frozen one is caught.
         "child_timeout_seconds": 0,
         # Subagent effort: "ultra" | "max" | "xhigh" | "high" | "medium" | "low" | "minimal" |
-        # "none" (empty = inherit)
+        # "none" (empty = inherit). A session-scoped /reasoning (or --reasoning) pick on the
+        # parent still wins: children follow an explicit choice, this is only their default.
         "reasoning_effort": "",
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it run synchronously. Floor 1, no ceiling.

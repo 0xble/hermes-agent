@@ -45,6 +45,7 @@ def _wire(user_config):
         _ctx=ctx,
         _runner=types.SimpleNamespace(
             _service_tier=None,
+            _session_reasoning_override=lambda key: None,
             _consume_pending_turn_sidecar_notes=lambda key: [],
         ),
         _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),

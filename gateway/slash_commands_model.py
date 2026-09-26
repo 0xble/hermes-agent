@@ -656,6 +656,7 @@ class GatewayModelCommandsMixin:
                 session_key=session_key, model=getattr(agent, "model", ""),
             )
             agent.reasoning_config = dict(effective) if isinstance(effective, dict) else effective
+            agent.reasoning_override = None if value is None else dict(value)
         else:
             self._evict_idle_agent_after_session_control(session_key)
 

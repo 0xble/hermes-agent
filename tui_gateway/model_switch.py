@@ -359,6 +359,9 @@ def _apply_switch_reasoning(sid: str, session, agent, effort: str, *, persist_gl
         return
     if agent is not None:
         agent.reasoning_config = parsed
+        # Explicit for delegation too; the --once restore swaps reasoning_config back, which
+        # retires the marker (explicit_parent_reasoning requires it to match the live level).
+        agent.reasoning_override = None if persist_global and not one_turn else parsed
     if one_turn or not isinstance(session, dict):
         return
     if persist_global:
