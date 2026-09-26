@@ -364,7 +364,11 @@ On each tick Hermes:
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
 
-### Restart-safe workers under systemd
+### Restart-safe workers under managed gateways
+
+On macOS, a launchd-managed gateway hands each cron run to a detached worker in a new session, outside the gateway's process group. Stopping or restarting that gateway does not terminate the worker. The worker adopts the execution ledger claim, runs the job, and queues delivery for the replacement gateway; recovery checks both PID and process-start fingerprint before treating the owner as gone. `cron.require_restart_safe_scope: true` accepts this restart-safe launchd path; it does not require systemd on macOS. Foreground gateways and desktop-owned processes keep their existing in-process path.
+
+**Current limitation (until S2):** a worker running across an in-place `hermes update` can lazily import modules from the updated checkout while retaining older modules already loaded. Immutable per-version release directories are needed to pin every import for the lifetime of an execution. This change protects the worker from gateway termination, not from in-place code replacement.
 
 When the gateway runs as a systemd service, each due job is handed to an external worker process launched in a transient user scope (`systemd-run --user --scope`), so restarting the gateway mid-job does not kill the job. Creating that scope needs a user systemd session; hosts without one (containers, minimal LXCs, a service user without linger) cannot provide it.
 
