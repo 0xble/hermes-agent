@@ -63,8 +63,9 @@ the browser vault fill tool, or the 1Password backends.
   [PR 71596](https://github.com/NousResearch/hermes-agent/pull/71596) covers only the
   `secrets.onepassword` loader, not vault logins, as of 2026-09-24), and
   `op-quota-resilience` (own fork fix: last-good 1Password secrets on rate limit or
-  outage, a display-only listing cache, and https for bare-host websites; no upstream
-  issue or PR as of 2026-09-24).
+  outage, a display-only listing cache, https for bare-host websites, and a stop at the
+  first 429 with a 15-minute per-identity cooldown shared across processes; no upstream
+  issue or PR as of 2026-09-25).
   The fork adaptation adds vault evaluation, preserves a no-session branch, and classifies
   404 by its tab-missing payload; revisit when upstream ships equivalent behavior.
 - Adopted upstream sources, all open on 2026-09-19:
@@ -84,7 +85,8 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_onepassword_selector.py`, `tests/agent/test_vault_onepassword_cards.py`,
 `tests/agent/test_vault_onepassword_subprocess.py` (real subprocess, fake `op`),
 `tests/agent/test_vault_onepassword_accounts.py` (multi-account, real config + fake `op`),
-`tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification),
+`tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
+first-429 stop and cross-process cooldown),
 `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome). Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.

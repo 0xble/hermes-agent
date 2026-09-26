@@ -567,6 +567,128 @@ def test_expired_values_carry_a_start_through_a_1password_outage(monkeypatch, tm
     assert json.loads(op._STORE.disk.path(tmp_path).read_text())["fetched_at"] == expired_stamp
 
 
+def _counting_op(monkeypatch, tmp_path, *, rate_limited):
+    """Fake `op` that records every read and answers 429 while ``rate_limited['on']``."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls = []
+
+    def fake_run(argv, *a, **k):
+        calls.append(argv[-1])
+        if rate_limited["on"]:
+            return _err(1, "[ERROR] Too many requests. Your client has been rate-limited. Try again in  seconds")
+        return _ok("value-" + argv[-1].split("/")[3])
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    return fake_op, calls
+
+
+def test_a_rate_limit_stops_the_remaining_reads(monkeypatch, tmp_path):
+    """Every read after the first 429 would also be refused, so it must not be made."""
+    refs = {n: f"op://V/{n.lower()}/F" for n in ("A", "B", "C", "D")}
+    limited = {"on": False}
+    fake_op, calls = _counting_op(monkeypatch, tmp_path, rate_limited=limited)
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    _expire_disk_entry(tmp_path, refs)
+
+    limited["on"] = True
+    calls.clear()
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert len(calls) == 1
+    assert secrets == {n: "value-" + n.lower() for n in refs}, "the unread refs still get their last good value"
+    assert any("last good cache" in w for w in warnings)
+
+
+def test_a_rate_limit_cools_down_later_processes(monkeypatch, tmp_path):
+    """A new process during the cooldown serves last good values without asking 1Password."""
+    refs = {"A": "op://V/a/F", "B": "op://V/b/F"}
+    limited = {"on": False}
+    fake_op, calls = _counting_op(monkeypatch, tmp_path, rate_limited=limited)
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    _expire_disk_entry(tmp_path, refs)
+
+    limited["on"] = True
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    op._CACHE.clear()  # a separate process shares only the disk
+    calls.clear()
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert calls == []
+    assert secrets == {"A": "value-a", "B": "value-b"}
+    assert any("cooldown" in w for w in warnings)
+
+
+def test_the_cooldown_expires(monkeypatch, tmp_path):
+    refs = {"A": "op://V/a/F"}
+    limited = {"on": False}
+    fake_op, calls = _counting_op(monkeypatch, tmp_path, rate_limited=limited)
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    _expire_disk_entry(tmp_path, refs)
+    limited["on"] = True
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+
+    limited["on"] = False
+    op._CACHE.clear()
+    calls.clear()
+    real_time = time.time
+    monkeypatch.setattr(op.time, "time", lambda: real_time() + op._RATE_LIMIT_COOLDOWN_SECONDS + 1)
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert calls == ["op://V/a/F"]
+    assert secrets == {"A": "value-a"}
+
+
+def test_the_cooldown_is_scoped_to_one_identity(monkeypatch, tmp_path):
+    """Another token has its own quota, so one token's cooldown must not silence it."""
+    refs = {"A": "op://V/a/F"}
+    limited = {"on": True}
+    fake_op, calls = _counting_op(monkeypatch, tmp_path, rate_limited=limited)
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "token-one")
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+
+    limited["on"] = False
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "token-two")
+    calls.clear()
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert calls == ["op://V/a/F"]
+    assert secrets == {"A": "value-a"}
+
+
+def test_a_fresh_cache_hit_ignores_the_cooldown(monkeypatch, tmp_path):
+    """The cooldown only suppresses provider calls; fresh cached values are served as usual."""
+    refs = {"A": "op://V/a/F"}
+    limited = {"on": False}
+    fake_op, calls = _counting_op(monkeypatch, tmp_path, rate_limited=limited)
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    op._record_rate_limit_cooldown(op._cooldown_key(op._auth_fingerprint("OP_SERVICE_ACCOUNT_TOKEN"), ""), tmp_path)
+    op._CACHE.clear()
+    calls.clear()
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert calls == [] and secrets == {"A": "value-a"} and warnings == []
+
+
+def test_the_cooldown_marker_holds_no_secret_material(monkeypatch, tmp_path):
+    refs = {"A": "op://V/a/F"}
+    limited = {"on": True}
+    fake_op, _ = _counting_op(monkeypatch, tmp_path, rate_limited=limited)
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "ops_super-secret-token")
+    op._reset_cache_for_tests(tmp_path)
+    op.fetch_onepassword_secrets(references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    marker = op._cooldown_path(tmp_path)
+    assert marker.exists()
+    text = marker.read_text()
+    assert "ops_super-secret-token" not in text and "op://" not in text
+    assert (marker.stat().st_mode & 0o777) == 0o600
+
+
 def test_rejected_identity_never_falls_back_to_expired_values(monkeypatch, tmp_path):
     """A revoked or wrong token is a real credential problem, not an outage to paper over."""
     fake_op = tmp_path / "op"
