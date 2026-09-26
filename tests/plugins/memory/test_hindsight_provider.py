@@ -1271,23 +1271,40 @@ class TestSyncTurn:
             "Status: deployment failed because the database is unavailable.",
         )
 
-    def test_retain_filter_preserves_user_followup_and_drops_unterminated_context_tail(self):
-        user, assistant = filter_retain_messages(
-            "[ASYNC DELEGATION COMPLETE — child-1]\nPlease investigate the result",
-            "<memory-context>recalled text without a closing tag",
-        )
-        assert user == "[ASYNC DELEGATION COMPLETE — child-1]\nPlease investigate the result"
-        assert assistant is None
-        assert filter_retain_messages(
-            "[ASYNC DELEGATION COMPLETE — child-1]\nA background subagent has finished.\nStatus: completed",
-            "answer",
-        )[0] is None
-        assert filter_retain_messages(
-            "[ASYNC DELEGATION COMPLETE — child-1]\nSummarize the result.", "[SILENT]"
-        )[0] == "[ASYNC DELEGATION COMPLETE — child-1]\nSummarize the result."
-        assert filter_retain_messages("What does a literal <memory-context> tag do?", "answer")[0] == (
-            "What does a literal <memory-context> tag do?"
-        )
+    @pytest.mark.parametrize("event", [
+        {"type": "async_delegation", "delegation_id": "child-1", "goal": "Review, check, fix and run changes",
+         "status": "completed", "summary": "Review complete; run the check again."},
+        {"type": "async_delegation", "delegation_id": "batch-1", "is_batch": True,
+         "goals": ["Review and fix the changes"],
+         "results": [{"task_index": 0, "status": "completed", "summary": "Run the check."}]},
+        {"type": "async_delegation", "delegation_id": "batch-1", "task_failure_notice": True,
+         "goals": ["Review and fix the changes"], "n_tasks": 1,
+         "results": [{"task_index": 0, "status": "failed", "error": "Run the check."}]},
+        {"type": "completion", "session_id": "proc-1", "command": "run review check",
+         "exit_code": 0, "output": "Fix it and run the check."},
+    ])
+    def test_retain_filter_separates_formatter_notice_from_user_text(self, event):
+        from tools.process_registry_notifications import format_process_notification
+
+        notice = format_process_notification(event)
+        assert filter_retain_messages(notice, "[SILENT]") == (None, None)
+        request = "Remember the design decision about the database."
+        assert filter_retain_messages(f"{notice}\n\n{request}", "[SILENT]") == (request, None)
+
+    def test_retain_filter_preserves_plain_user_and_out_of_band_steer(self):
+        from agent.prompt_builder import format_steer_marker
+        from tools.process_registry_notifications import format_process_notification
+
+        request = "What does a literal <memory-context> tag do?"
+        assert filter_retain_messages(request, "answer") == (request, "answer")
+        notice = format_process_notification({"type": "async_delegation", "delegation_id": "child-2",
+                                              "goal": "Review the changes", "summary": "Check the result."})
+        assert filter_retain_messages(notice + format_steer_marker(request), "[SILENT]") == (request, None)
+        from gateway.run import build_resume_recovery_note
+        assert filter_retain_messages(build_resume_recovery_note("shutdown_timeout"), "[SILENT]") == (None, None)
+        assert filter_retain_messages(build_resume_recovery_note("shutdown_timeout", request), "[SILENT]") == (
+            request, None)
+        assert filter_retain_messages("<memory-context>recalled text without a closing tag", "[SILENT]") == (None, None)
 
     def test_cron_context_does_not_auto_retain(self, provider_with_config):
         p = provider_with_config()

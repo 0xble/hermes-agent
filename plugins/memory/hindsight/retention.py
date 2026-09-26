@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+from tools.process_registry_notifications import PROCESS_NOTIFICATION_END
 
 # These prefixes are emitted by Hermes itself, not written as user intent or an
 # assistant answer. Keep this list deliberately narrow: dropping real content is
@@ -19,12 +21,7 @@ _MACHINE_NOTICE_PREFIXES = (
     "[CONTEXT SUMMARY",
     "[PRIOR CONTEXT",
     "[IMPORTANT: Background process",
-)
-_USER_FOLLOWUP_RE = re.compile(
-    r"\b(?:please|can you|could you|would you|i want|i need|investigate|remember|keep|fix|add|"
-    r"remove|change|explain|summari[sz]e|review|check|look at|tell me|describe|compare|help|"
-    r"show|run|write|make|continue|proceed|what do you think|should we)\b",
-    re.IGNORECASE,
+    "[System note:",
 )
 _MEMORY_CONTEXT_BLOCK_RE = re.compile(
     r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>",
@@ -58,15 +55,28 @@ def _clean_message(content: str, *, preserve_unmatched_literal: bool = False) ->
     return cleaned.strip()
 
 
-def _is_machine_notice(content: str, *, user_message: bool = False) -> bool:
+def _user_after_machine_notice(content: str) -> str | None:
+    """Keep only text after the formatter's boundary, never its untrusted payload."""
     if not content.startswith(_MACHINE_NOTICE_PREFIXES):
-        return False
-    if not user_message:
-        return True
-    # Hermes may place a generated notification in the user slot. Drop a
-    # standalone notice, but keep a real request appended by the user.
-    suffix = content.splitlines()[1:]
-    return not _USER_FOLLOWUP_RE.search("\n".join(suffix))
+        return content
+    # Gateway recovery notes are a closed bracket followed by a blank line
+    # before any real user message (gateway.run.build_resume_recovery_note).
+    if content.startswith("[System note:"):
+        _, boundary, suffix = content.partition("]\n\n")
+        return suffix.strip() or None if boundary else None
+    # A legacy, unframed notice has no provable end: it cannot yield a
+    # trustworthy suffix, even if the goal/result contains request-like words.
+    _, boundary, suffix = content.rpartition(f"\n{PROCESS_NOTIFICATION_END}")
+    if not boundary:
+        return None
+    suffix = suffix.strip()
+    if suffix.startswith(STEER_MARKER_OPEN + "\n") and suffix.endswith("\n" + STEER_MARKER_CLOSE):
+        suffix = suffix[len(STEER_MARKER_OPEN): -len(STEER_MARKER_CLOSE)].strip()
+    return suffix or None
+
+
+def _is_machine_notice(content: str) -> bool:
+    return content.startswith(_MACHINE_NOTICE_PREFIXES)
 
 
 def _is_assistant_status_only(content: str) -> bool:
@@ -83,10 +93,9 @@ def filter_retain_messages(user_content: str, assistant_content: str) -> tuple[s
     prefixes are dropped. Assistant text loses only exact silence markers and a
     small, explicit set of one-line status-only responses.
     """
-    user = _clean_message(user_content, preserve_unmatched_literal=True)
+    user = _user_after_machine_notice(user_content.strip())
+    user = _clean_message(user, preserve_unmatched_literal=True) or None if user else None
     assistant = _clean_message(assistant_content)
-    if not user or _is_machine_notice(user, user_message=True):
-        user = None
     if not assistant or _is_machine_notice(assistant) or _is_assistant_status_only(assistant):
         assistant = None
     return user, assistant
