@@ -981,3 +981,30 @@ class TestForkTitleContracts:
         assert prompt.rstrip().endswith('{"title": "...", "icon": "..."}')
         assert 'Good: {"title": "iCloud+ 2TB Subscription Review"}' in prompt
         assert "subscription review" not in prompt  # sentence-case pairs are not mixed in
+
+    def test_icon_request_offers_the_whole_catalog_even_when_icons_were_used_recently(self):
+        """Withholding recent icons made the best match unavailable; recency must not shrink the choice."""
+        response = MagicMock(); response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Airbnb Refund", "icon": "💸"}'
+        catalog = [{"emoji": e, "custom_emoji_id": e} for e in ["💸", "🏠", "💻", "📚", "🔥", "📈", "💡", "🧪", "🤖"]]
+        chosen = []
+        with patch("agent.title_generator.call_llm", return_value=response) as call:
+            generate_title("refund for the airbnb stay", icon_options=catalog, recent_icons=["💸", "🏠"],
+                           icon_callback=lambda icon, _how: chosen.append(icon))
+        prompt = call.call_args.kwargs["messages"][0]["content"]
+        icon_line = next(line for line in prompt.splitlines() if "pick one icon" in line)
+        assert all(item["emoji"] in icon_line for item in catalog)
+        assert chosen == ["💸"]
+
+    def test_operator_icon_guidance_replaces_the_default(self):
+        response = MagicMock(); response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Topic", "icon": "💻"}'
+        prompts = []
+        for guidance in ("", "Use food icons only."):
+            with patch("agent.title_generator.call_llm", return_value=response) as call:
+                generate_title("some topic", icon_options=["💻", "🍕"], icon_instructions=guidance,
+                               icon_callback=lambda *_: None)
+            prompts.append(call.call_args.kwargs["messages"][0]["content"])
+        from agent.topic_icons import DEFAULT_ICON_GUIDANCE
+        assert DEFAULT_ICON_GUIDANCE in prompts[0]
+        assert "Use food icons only." in prompts[1] and DEFAULT_ICON_GUIDANCE not in prompts[1]

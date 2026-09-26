@@ -600,11 +600,11 @@ def generate_title(
     icon_allowed = list(icon_options or [])
     icon_rule = ""
     if icon_allowed:
-        from agent.topic_icons import fresh_allowed_icons
-        candidates = fresh_allowed_icons(icon_allowed, recent_icons)
-        icon_rule = f"- Also pick one icon for the topic from exactly this list: {' '.join(candidates)}"
-        if icon_instructions:
-            icon_rule += f" Icon guidance: {str(icon_instructions).strip()[:1000]}"
+        from agent.topic_icons import DEFAULT_ICON_GUIDANCE, allowed_icon_list
+        # The whole catalog every time: withholding recently used icons made the best match
+        # unavailable and forced unrelated picks.
+        icon_rule = f"- Also pick one icon for the topic from exactly this list: {' '.join(allowed_icon_list(icon_allowed))}"
+        icon_rule += f" Icon guidance: {(str(icon_instructions or '').strip() or DEFAULT_ICON_GUIDANCE)[:1000]}"
         icon_rule += " The icon must not change the title."
     prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs, icon_rule=icon_rule)
     try:
@@ -648,9 +648,13 @@ def generate_title(
         title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
         if icon_allowed and icon_callback is not None:
             from agent.topic_icons import choose_topic_icon_deterministic, validate_model_icon
-            icon = validate_model_icon(payload.get("icon") if isinstance(payload, dict) else None, icon_allowed)
+            proposed = payload.get("icon") if isinstance(payload, dict) else None
+            icon = validate_model_icon(proposed, icon_allowed)
+            icon_source = "model"
             if icon is None:
                 icon = choose_topic_icon_deterministic(title or "", user_snippet, icon_allowed, recent_icons)
+                icon_source = "keyword" if icon else "none"
+            logger.info("Topic icon %s via %s (model proposed %r)", icon, icon_source, proposed)
             with suppress(Exception):
                 icon_callback(icon, "llm" if title else "fallback")
         if title is None or not any(char.isalnum() for char in title):
