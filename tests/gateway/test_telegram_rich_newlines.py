@@ -82,6 +82,7 @@ class TestRichMessageNewlineNormalization:
         assert "`/new` -- Start  \n`/model` -- Switch  \n`/reset` -- Reset" in md
 
 
+
 class TestRichMessageTableProtection:
     """Hard-break injection must not corrupt GFM tables (rendered natively)."""
 
