@@ -477,6 +477,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   2026-09-25 10:09 receipt: the old code reports failure, the patched code reports success
   (`b6fb36d94a21`).
 
+## Restart notices hid the reason from other interrupted chats
+
+- Fork patch identity: `update-lifecycle`.
+- An agent-requested update stored a reason, but only the originating conversation saw it. Every
+  other chat interrupted by the same restart received a generic notice, and a direct agent restart
+  (`request_restart`) had no way to carry a reason at all. By owner decision, the reason is not
+  private: the shutdown notice now leads with `🔄 Restarting` and the reason in every interrupted
+  chat. `request_restart()` accepts an optional `reason` for direct restarts. Without a reason
+  the notice is unchanged.
+- Regression coverage: `test_update_lifecycle_notifications.py`
+  (`test_update_restart_reason_reaches_every_interrupted_conversation`,
+  `test_direct_restart_reason_reaches_interrupted_conversations`). Both fail on the base.
+
 ## Concurrent cron runs share one local shell
 
 - Fork patch identity: `cron-run-terminal-isolation`.
@@ -494,3 +507,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_concurrent_cron_runs_get_distinct_environments`,
   `test_cron_subagent_shares_its_parent_run_environment`,
   `test_persistent_docker_cron_run_keeps_the_profile_container`).
+
+## Fork-patch check pins an owner-chosen setting
+
+- Fork patch identity: `fork-patch-check-owner-config`.
+- `scripts/check_fork_patches.py` required `auxiliary.background_review.enabled`
+  to be `false`. That is an owner preference, not a fork-patch invariant, and
+  the owner enabled background review on 2026-09-24, so `verify-hermes-fork`
+  failed every day on a correct config. The key is no longer pinned. The
+  remaining expectations guard fork behavior (`memory.write_approval`) or
+  required routing (`delegation.model`, `auxiliary.review.model`).
+- Guard: `tests/scripts/test_candidate_scripts.py`
+  (`test_check_config_does_not_pin_background_review`).

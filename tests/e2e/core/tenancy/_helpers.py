@@ -7,8 +7,9 @@ text, SOUL text, terminal cwd and a cron prompt. Each tenant also owns its own l
 WHO sent it. The invariant shared by every scenario is ``leaks(...) == []``: no tenant's canary may
 appear in another tenant's provider request, tool-subprocess env snapshot, or on-disk file.
 
-Hermes runs for real in child processes with HOME=<tmp>/home and HERMES_HOME=<tmp>/home/.hermes
-(profiles resolve under $HOME, never the real install), every credential env var stripped.
+Hermes runs for real in child processes with HOME=<tmp>/home/os-user and
+HERMES_HOME=<tmp>/home/.hermes, every credential env var stripped. Both roots are
+isolated from the real install and the profile gets a distinct native service label.
 """
 
 from __future__ import annotations
@@ -53,9 +54,13 @@ def real_user_home() -> Path:
 
 
 def hermetic_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Child env: fake HOME (profile root anchor) + HERMES_HOME under it, nothing credential-shaped."""
+    """Child env: separate scratch OS/profile homes, nothing credential-shaped."""
     home = home.resolve()
     assert home != real_user_home() and home / ".hermes" != real_user_home() / ".hermes", home
+    # A fake native-default HOME/.hermes still names the host's bare launchd
+    # service. An explicit non-default profile receives a unique service label.
+    os_home = home / "os-user"
+    os_home.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items()
            if not (k.endswith(_STRIP_SUFFIXES) or k.startswith(_STRIP_PREFIXES))}
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "XDG_STATE_HOME",
@@ -65,7 +70,7 @@ def hermetic_env(home: Path, extra: dict[str, str] | None = None) -> dict[str, s
                 "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"):
         env.pop(var, None)
     env.update(
-        HOME=str(home),
+        HOME=str(os_home),
         HERMES_HOME=str(home / ".hermes"),
         XDG_STATE_HOME=str(home / ".local" / "state"),
         PYTHONPATH=str(REPO_ROOT),

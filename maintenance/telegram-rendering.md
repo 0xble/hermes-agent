@@ -44,6 +44,14 @@ fenced code (including an unfinished fence in a streaming draft), and display
 math stay untouched. The escape runs first in `_rich_message_payload`, before
 currency protection and linebreak normalization, and is idempotent.
 
+CommonMark lets an ordered list interrupt a paragraph only when it starts at 1,
+so `**Label**\n7. item` renders as one paragraph whose numbers are literal text
+with hard breaks and no list layout. `_rich_separate_ordered_lists` inserts one
+blank line before such a list when it directly follows a paragraph line. Lines
+continuing a list item or blockquote, indented lines, fenced code (including an
+unfinished fence in a draft frame), and lists starting at 1 are unchanged. The
+insertion is idempotent and counted in the rich length check.
+
 Telegram only renders HTTP(S) and `tg://` link targets as clickable text. Models
 can emit Desktop-only `@session:` links or schemeless `[Title](Title)` links,
 which Telegram otherwise exposes as raw Markdown. `_degrade_unsupported_markdown_links`
@@ -56,7 +64,8 @@ Ordinary numeric commit or PR links are not converted into citation markers.
 ## Provenance and adoption
 
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
-  `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`.
+  `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
+  `telegram-ordered-list-separation`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -91,6 +100,13 @@ head `9bcf0ff987a680731e48167a064af0995dd099d3`, open when adopted on 2026-09-20
 same helper as HERMES-127 (archived commit `6a2dfadcc70d`). The fork adds one
 regression for `always`-mode prose opening with a PR number, which upstream
 cannot express without an `always` mode.
+
+Ordered-list separation: fork-authored on 2026-09-26 from a live message whose
+`**Facts and Evidence**` label preceded items 7 to 10. Upstream searches found
+no issue for this case. Open [upstream PR 76368](https://github.com/NousResearch/hermes-agent/pull/76368)
+touches the same function but only stops hard-break markers next to block lines.
+The paragraph still absorbs a list not starting at 1, so it does not replace
+this patch.
 
 Telegram unsupported link targets: adopted from the archived fork's HERMES-065
 implementation (commits `8c4f3b73129d` and `326aed0f3d21`, scoped citation brackets)
@@ -130,7 +146,9 @@ upstream `_rich_message_payload` passes the currency regression cases in
 `tests/gateway/test_telegram_rich_messages.py` without the fork functions.
 Retire the literal-hash part when PR 105487 merges and the candidate tag
 contains it: compare `rich_markdown.py` and the hash regression tests against
-that merge, then drop the fork copy.
+that merge, then drop the fork copy. Retire ordered-list separation when a
+released upstream rich payload makes the `TestRichOrderedListAfterProse`
+regressions pass without `_rich_separate_ordered_lists`.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,

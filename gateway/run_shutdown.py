@@ -1017,6 +1017,8 @@ class GatewayShutdownMixin:
     ) -> bool:
         """``adapter.send`` whose failure is debug-logged as ``fmt % (platform, chat, error)`` — ``fail_fmt``
         for success=False, ``raise_fmt`` (default ``fail_fmt``) for a raise; True only on a delivered send."""
+        from gateway.run import _interim_metadata
+        kw["metadata"] = _interim_metadata(kw.get("metadata"))
         try:
             result = await adapter.send(chat_id, msg, **kw)
         except Exception as e:
@@ -1039,20 +1041,25 @@ class GatewayShutdownMixin:
             await self._send_update_phase("updating")
             update_notified = await self._send_update_phase("restarting")
         restart_source = self._restart_command_source if self._restart_requested else None
-        msg = (
-            "⚠️ Hermes is shutting down — your current task will be interrupted. "
-            "When it is back online, send any message and I'll try to pick up where we left off."
-        )
-        if self._restart_requested:
-            msg = (
-                "⚠️ Hermes is restarting — your current task will be interrupted. "
-                "Send any message after the restart and I'll try to resume where you left off."
-            )
-        if update_record:
-            # The reason belongs to the exact originating conversation only; other active chats
-            # receive the ordinary restart notice without private context.
-            msg = notice("🔄 Restarting", {}, "Your current task may be interrupted. "
-                         "Send any message after restart and I'll try to resume where you left off.")
+        # Every interrupted chat learns why, whether the restart came from an update or a direct request.
+        reason = (update_record[1] if update_record else {}).get("reason") or getattr(self, "_restart_reason", None)
+
+        def shutdown_message(adapter):
+            from gateway.run import resolve_restart_resume_policy
+            automatic = resolve_restart_resume_policy(self.config, adapter) == "continue"
+            if self._restart_requested and (update_record or reason):
+                guidance = ("I'll try to resume automatically after restart." if automatic else
+                            "Send any message after restart and I'll try to resume where you left off.")
+                return notice("🔄 Restarting", {"reason": reason}, "Your current task may be interrupted. " + guidance)
+            if self._restart_requested:
+                guidance = ("I'll try to resume automatically after the restart." if automatic else
+                            "Send any message after the restart and I'll try to resume where you left off.")
+                return "⚠️ Hermes is restarting — your current task will be interrupted. " + guidance
+            guidance = ("I'll try to resume automatically where we left off." if automatic else
+                        "send any message and I'll try to pick up where we left off.")
+            return ("⚠️ Hermes is shutting down — your current task will be interrupted. "
+                    "When it is back online, " + guidance)
+
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):
@@ -1060,6 +1067,8 @@ class GatewayShutdownMixin:
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        # A DM topic reaches its private parent, but a forum topic does not replace a group broadcast.
+        private_topic_parents: set[tuple[int, str]] = set()
         if update_notified and update_record:
             data = update_record[1]
             notified.add(_notice_target_key(str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id")))
@@ -1101,9 +1110,13 @@ class GatewayShutdownMixin:
             # shape as the stall watcher). The requester's own chat on an in-chat /restart is the
             # requested outcome of that command and is never suppressed.
             async def _send_active(adapter=adapter, chat_id=chat_id, platform_str=platform_str,
-                                   metadata=metadata, dedup_key=dedup_key):
-                if await self._send_shutdown_notice(adapter, chat_id, msg, "active chat", platform_str, metadata=metadata):
+                                   metadata=metadata, dedup_key=dedup_key,
+                                   private_topic=platform == Platform.TELEGRAM and thread_id is not None
+                                   and getattr(source, "chat_type", None) in {"dm", "private"}):
+                if await self._send_shutdown_notice(adapter, chat_id, shutdown_message(adapter), "active chat", platform_str, metadata=metadata):
                     notified.add(dedup_key)
+                    if private_topic:
+                        private_topic_parents.add((id(adapter), chat_id))
             from gateway.warning_notifications import present_notification
             from gateway.run import _async_profile_runtime_scope
             scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
@@ -1133,7 +1146,10 @@ class GatewayShutdownMixin:
             if not self._notice_allowed(platform, "home channel"):
                 continue
             dedup_key = _notice_target_key(platform.value, home.chat_id, home.thread_id)
-            if dedup_key in notified:
+            if dedup_key in notified or (
+                platform == Platform.TELEGRAM and home.thread_id is None
+                and (id(adapter), str(home.chat_id)) in private_topic_parents
+            ):
                 continue
             try:
                 metadata = self._thread_metadata_for_target(platform, home.chat_id, home.thread_id, adapter=adapter)
@@ -1145,7 +1161,7 @@ class GatewayShutdownMixin:
             # Home channels omit ``metadata=`` when empty (adapter doubles may not accept the kwarg).
             async def _send_home(adapter=adapter, home=home, platform=platform, metadata=metadata):
                 if await self._send_shutdown_notice(
-                    adapter, str(home.chat_id), msg, "home channel", platform.value,
+                    adapter, str(home.chat_id), shutdown_message(adapter), "home channel", platform.value,
                     **({"metadata": metadata} if metadata else {}),
                 ):
                     notified.add(dedup_key)
@@ -1679,9 +1695,11 @@ class GatewayShutdownMixin:
         logger.info("Restart deferred wait complete - active work drained; proceeding to stop()")
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def request_restart(self, *, detached: bool = False, via_service: bool = False,
+                        reason: Optional[str] = None) -> bool:
         if self._restart_task_started:
             return False
+        self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service

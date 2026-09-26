@@ -3611,6 +3611,7 @@ class GatewayRunner(
         self._restart_requested = self._signal_initiated_shutdown = self._restart_task_started = False
         self._restart_detached = self._restart_via_service = self._detached_restart_helper_started = False
         self._restart_command_source: Optional[SessionSource] = None
+        self._restart_reason: Optional[str] = None
         # Construction clock: bounds the /restart redelivery guard's window (missing dedup marker = stale).
         self._startup_time: float = time.time()
         # True when booted from a chat /restart (.restart_notify.json existed). One-shot signal so the

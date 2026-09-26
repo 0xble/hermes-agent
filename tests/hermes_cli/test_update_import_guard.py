@@ -17,6 +17,7 @@ and the syntax guard reported the update as successful.
 from __future__ import annotations
 
 import sys
+import venv as venv_module
 from pathlib import Path
 
 import pytest
@@ -407,9 +408,7 @@ def test_import_probe_sees_a_stale_editable_finder_instead_of_the_checkout_cwd(m
     (tmp_path / "hermes_probe_pkg").mkdir()
     (tmp_path / "hermes_probe_pkg" / "__init__.py").write_text("")
     venv = tmp_path / "venv"
-    python = venv / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    python.symlink_to(sys.executable)
+    venv_module.EnvBuilder(with_pip=False, symlinks=True).create(venv)
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("hermes_probe_pkg",))
     monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("hermes_probe_pkg",))
     monkeypatch.setattr(update_cmd_deps, "project_venv_dir", lambda root: venv)
@@ -418,7 +417,7 @@ def test_import_probe_sees_a_stale_editable_finder_instead_of_the_checkout_cwd(m
     assert update_cmd_deps._critical_module_import_failures(tmp_path) == {}  # dev checkout: cwd vouches
 
     site = venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
-    site.mkdir(parents=True)
+    site.mkdir(parents=True, exist_ok=True)
     finder = site / "__editable___hermes_agent_0_21_0_finder.py"
     finder.write_text("MAPPING = {}\n", encoding="utf-8")  # stale: no hermes_probe_pkg
     monkeypatch.setattr(update_cmd_deps, "_editable_finder_files", lambda v: [finder])
