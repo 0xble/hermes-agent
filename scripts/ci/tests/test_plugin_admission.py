@@ -145,6 +145,44 @@ class PluginAdmissionTests(unittest.TestCase):
                 self.admit(self.entry(sha=symlink_pin))
             self.assertEqual(list(self.clones.iterdir()), [])
 
+    def test_entries_identical_to_the_accepted_release_are_not_readmitted(self):
+        directory = self.catalog / "plugin-catalog"
+        directory.mkdir()
+        (directory / "keep.yaml").write_text(yaml.safe_dump(self.entry(sha="f" * 40)), encoding="utf-8")
+        base = self.commit(self.catalog)
+        (directory / "upstream.yaml").write_text(yaml.safe_dump(self.entry(sha="e" * 40)), encoding="utf-8")
+        (directory / "forked.yaml").write_text(yaml.safe_dump(self.entry(sha="d" * 40)), encoding="utf-8")
+        release = self.commit(self.catalog)
+        (directory / "forked.yaml").write_text(yaml.safe_dump(self.entry()), encoding="utf-8")
+        (self.catalog / "MAINTENANCE.md").write_text(
+            f"Accepted release baseline:\n`vTEST`, `{release}`.\n", encoding="utf-8")
+        head = self.commit(self.catalog)
+        self.assertEqual(admission.changed_entries(self.catalog, base, head),
+                         (head, ["plugin-catalog/forked.yaml"]))
+        (directory / "upstream.yaml").write_text("invalid dirty entry\n", encoding="utf-8")
+        self.assertEqual(admission.changed_entries(self.catalog, base, None),
+                         (None, ["plugin-catalog/forked.yaml", "plugin-catalog/upstream.yaml"]))
+        self.git(self.catalog, "checkout", "-q", "--", "plugin-catalog/upstream.yaml")
+        self.assertEqual(admission.changed_entries(self.catalog, base, None),
+                         (None, ["plugin-catalog/forked.yaml"]))
+        (self.catalog / "MAINTENANCE.md").write_text("no baseline\n", encoding="utf-8")
+        unrecorded = self.commit(self.catalog)
+        self.assertEqual(admission.changed_entries(self.catalog, base, unrecorded)[1],
+                         ["plugin-catalog/forked.yaml", "plugin-catalog/upstream.yaml"])
+
+    def test_exact_head_baseline_comes_from_the_checked_revision_not_the_working_tree(self):
+        directory = self.catalog / "plugin-catalog"
+        directory.mkdir()
+        (directory / "keep.yaml").write_text(yaml.safe_dump(self.entry(sha="f" * 40)), encoding="utf-8")
+        base = self.commit(self.catalog)
+        (directory / "forked.yaml").write_text(yaml.safe_dump(self.entry()), encoding="utf-8")
+        head = self.commit(self.catalog)
+        self.assertEqual(admission.changed_entries(self.catalog, base, head)[1], ["plugin-catalog/forked.yaml"])
+        # Uncommitted metadata naming the checked head as the release must not exempt its entries.
+        (self.catalog / "MAINTENANCE.md").write_text(
+            f"Accepted release baseline:\n`vTEST`, `{head}`.\n", encoding="utf-8")
+        self.assertEqual(admission.changed_entries(self.catalog, base, head)[1], ["plugin-catalog/forked.yaml"])
+
     def test_working_tree_checks_modified_and_untracked_entries(self):
         directory = self.catalog / "plugin-catalog"
         directory.mkdir()

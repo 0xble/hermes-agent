@@ -115,6 +115,75 @@ async def test_reason_progress_and_final_survive_restart_and_delivery_failure(tm
     assert all(str(c.kwargs["metadata"]["thread_id"]) == "77" for c in adapter.send.call_args_list)
 
 
+@pytest.mark.asyncio
+async def test_stream_retry_only_sends_unsent_chunk(tmp_path):
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_text("A" * 3500 + "B" * 50, encoding="utf-8")
+    calls = []
+    failed = False
+
+    async def send(_chat, text, **_kwargs):
+        nonlocal failed
+        if text.startswith("```"):
+            calls.append(text)
+            if "B" in text and not failed:
+                failed = True
+                return SimpleNamespace(success=False)
+        return SimpleNamespace(success=True)
+
+    adapter = SimpleNamespace(send=send)
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        watcher = asyncio.create_task(runner._watch_update_progress(
+            poll_interval=.01, stream_interval=.01, timeout=10))
+        try:
+            for _ in range(300):
+                if failed and read_pending(tmp_path)[1].get("output_offset") == output.stat().st_size:
+                    break
+                await asyncio.sleep(.01)
+            assert failed
+            assert read_pending(tmp_path)[1]["output_offset"] == output.stat().st_size
+        finally:
+            watcher.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await watcher
+    assert sum("A" in text for text in calls) == 1
+    assert sum("B" in text for text in calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_final_retry_only_sends_unsent_chunk_and_then_final(tmp_path):
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_bytes(("A" * 3500 + "B" * 49 + "é").encode() + b"\xff")
+    finalize_update(tmp_path)
+    calls = []
+    failed = False
+
+    async def send(_chat, text, **_kwargs):
+        nonlocal failed
+        calls.append(text)
+        if text.startswith("```") and "B" in text and not failed:
+            failed = True
+            return SimpleNamespace(success=False)
+        return SimpleNamespace(success=True)
+
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=send)}
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is False
+        assert read_pending(tmp_path)[1]["output_offset"] == 3500
+        assert not any(text.startswith("✅") for text in calls)
+        assert await runner._send_update_notification() is True
+    chunks = [text for text in calls if text.startswith("```")]
+    assert sum("A" in text for text in chunks) == 1
+    assert sum("B" in text for text in chunks) == 2
+    assert sum(text.startswith("✅") for text in calls) == 1
+    assert read_pending(tmp_path) is None
+
+
 @pytest.mark.parametrize("case", ["pre_restart", "missing", "stale", "partial", "unknown", "pending_restart", "malformed", "failed", "success", "legacy"])
 def test_final_success_requires_completed_matching_receipt_and_runtime(tmp_path, case):
     data = pending(tmp_path, reason=case != "legacy")
@@ -171,6 +240,34 @@ def test_already_up_to_date_is_success_without_runtime_to_verify(tmp_path, case)
         assert result[0] is False
 
 
+@pytest.mark.parametrize("live", ["replacement_current", "replacement_old_code", "not_back_yet", "down", "other_row_stale"])
+def test_self_restart_pending_is_judged_by_the_replacement_gateway(tmp_path, live):
+    """An in-gateway update (request_update) finalizes before its own gateway restarts, so the receipt
+    row is ``restart_pending`` with the OLD pid and sha. The notice must wait for the replacement and
+    judge it: the new code running is success, old code is failure, not-yet-back is still pending.
+    Rendering every such row as a failure sent a false "Update Failed" after each promotion."""
+    data = pending(tmp_path)
+    finalize_update(tmp_path, fleet_state="restart_pending")
+    path = tmp_path / "logs" / "update_receipts" / "latest.json"
+    receipt = json.loads(path.read_text())
+    receipt["fleet"][0]["code_sha"] = "b" * 40  # the pre-update code the enclosing gateway still ran
+    if live == "other_row_stale":
+        receipt["fleet"].append({"profile": "ops", "pid": 4321, "state": "stale", "code_sha": "b" * 40})
+    path.write_text(json.dumps(receipt))
+    live_pid = {"replacement_current": 5678, "replacement_old_code": 5678, "not_back_yet": 1234,
+                "down": None, "other_row_stale": 5678}[live]
+    runtime_sha = "b" * 40 if live == "replacement_old_code" else "a" * 40
+    (tmp_path / "gateway_state.json").write_text(json.dumps({"pid": live_pid, "code_sha": runtime_sha}))
+    with patch("gateway.status.live_gateway_pid_for_home", return_value=live_pid):
+        result = final_outcome(tmp_path, data)
+    if live == "replacement_current":
+        assert result is not None and result[0] is True and "a" * 12 in result[1]
+    elif live in {"not_back_yet", "down"}:
+        assert result is None
+    else:
+        assert result is not None and result[0] is False
+
+
 @pytest.mark.asyncio
 async def test_already_up_to_date_request_reports_already_latest(tmp_path):
     data = pending(tmp_path)
@@ -219,3 +316,59 @@ async def test_missing_adapter_retries_then_expires_without_success_claim(tmp_pa
         assert await runner._send_update_notification() is True
     assert read_pending(tmp_path) is None
     assert "adapter never connected" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass  # Fixed python -c only: no updater, git, service or runtime access.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX detached wrapper")
+async def test_slash_update_final_outcome_follows_the_detached_wrapper(tmp_path):
+    """A /update request and the wrapper it spawns must agree on the completion marker.
+
+    The wrapper reports only ``.update_process_exit_code`` and deletes ``.update_exit_code``,
+    so a request still waiting on the legacy marker never sees the updater finish.
+    """
+    from tests.gateway.test_update_command import _make_event
+    runner = _make_runner()
+    event = _make_event(platform=Platform.TELEGRAM, chat_id="42")
+    fake_root = tmp_path / "project"
+    (fake_root / ".git").mkdir(parents=True)
+    (fake_root / "gateway").mkdir()
+    (fake_root / "gateway" / "run.py").touch()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".update_process_exit_code").write_text("0", encoding="utf-8")  # stale, from an earlier update
+    failing = [sys.executable, "-c", "print('updater ran', flush=True); raise SystemExit(7)"]
+    with patch("gateway.run._hermes_home", home), \
+         patch("gateway.run.__file__", str(fake_root / "gateway" / "run.py")), \
+         patch("gateway.run._resolve_hermes_bin", return_value=failing), \
+         patch("gateway.slash_commands._systemd_scope_wrap_if_supervised", side_effect=lambda argv: (argv, None)), \
+         patch.object(runner, "_schedule_update_notification_watch"):
+        await runner._handle_update_command(event)
+    record = read_pending(home)[1]
+    deadline = time.monotonic() + 10
+    outcome = None
+    while outcome is None and time.monotonic() < deadline:
+        outcome = final_outcome(home, record)
+        time.sleep(.05)
+    assert outcome is not None and outcome[0] is False and "code 7" in outcome[1]
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_trailing_output_does_not_hold_the_final_notice(tmp_path):
+    """A trailing newline after the last flush must not delay completion to the deadline."""
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_text("\n")
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        # The watcher deadline is 30s; completion must arrive well before it.
+        await asyncio.wait_for(
+            runner._watch_update_progress(poll_interval=.01, stream_interval=.01, timeout=30.0), 5
+        )
+    messages = [c.args[1] for c in adapter.send.call_args_list]
+    assert messages[-1].startswith("✅ Update Complete")
+    assert not any("timed out" in m.lower() or "still running" in m.lower() for m in messages)
+    assert read_pending(tmp_path) is None

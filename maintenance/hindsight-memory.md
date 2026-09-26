@@ -25,6 +25,10 @@ strategy and cron-exclusion behavior.
   a typo degrades quietly rather than failing.
 - `retain_context` stays configurable. It carries the attribution boundary telling
   extraction that assistant turns are agent-generated and not the user's decisions.
+- A queued append-mode retain is the only copy of its turns (`sync_turn` drops them from
+  `_session_turns` once queued), so the writer keeps a failed job in an ordered, bounded
+  backlog and retries it instead of discarding it (`TestRetainRetry`). Tag settings
+  (`retain_tags`, `recall_tags`) accept comma-separated strings and reach the SDK as lists.
 
 ## Proof surface
 
@@ -40,7 +44,7 @@ strategy and cron-exclusion behavior.
 ## Provenance and patches
 
 - Fork patch identities: `HERMES-122`, `hindsight-retain-strategy`,
-  `hindsight-cron-retention`. Local narrow patches on the `v2026.9.14` baseline.
+  `hindsight-cron-retention`, `hindsight-bundled-provider`. Local narrow patches on the `v2026.9.14` baseline.
 - `HERMES-122` (`6878e95d58`, re-landed `65059fa22d`) defaults `_cron_skipped` in
   `__init__`. Its first landing was reverted hours later by `fc45821e1f`, a backup
   change authored in a worktree created before the fix, whose tree still held the
@@ -62,3 +66,15 @@ Retire `HERMES-122` only if upstream moves the `get_tool_schemas()` call to afte
 `hindsight-retain-strategy` when #4570 ships in a released integration version.
 Re-run the proof surface against the selected upstream release before retiring
 either, without the local implementation present.
+
+## Bundled provider after v2026.9.24
+
+Upstream v2026.9.24 moved Hindsight to an external catalog plugin and removed
+`memory.hindsight` from `tools/lazy_deps.LAZY_DEPS`. The fork keeps the bundled
+`plugins/memory/hindsight` provider because the catalog version lacks
+`retain_strategy: agent-session` and the cron retention exclusion. The provider's
+client construction calls `ensure("memory.hindsight")`, so `hindsight-bundled-provider`
+keeps that allowlist entry, mirroring the range in its `plugin.yaml`. Without it every
+client build raises `FeatureUnavailable` and retain and recall stop.
+`tests/plugins/memory/test_memory_lazy_install.py` guards the entry. Drop this patch
+only together with the bundled provider.

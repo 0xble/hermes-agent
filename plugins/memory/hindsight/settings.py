@@ -125,7 +125,7 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
         return fallback
     try:
         rendered = template.format(**{k: _sanitize_bank_segment(v) for k, v in placeholders.items()})
-    except (KeyError, IndexError) as exc:
+    except (KeyError, IndexError, ValueError) as exc:  # ValueError: unmatched braces, bad spec
         logger.warning("Invalid bank_id_template %r: %s — using fallback %r",
                        template, exc, fallback)
         return fallback

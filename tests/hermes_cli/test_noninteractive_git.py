@@ -48,7 +48,6 @@ class TestNoninteractiveGitEnv:
         assert env["HERMES_TEST_SENTINEL"] == "xyz"
         assert env["GIT_TERMINAL_PROMPT"] == "0"
         # Never mutates the live process environment.
-        assert os.environ.get("GIT_TERMINAL_PROMPT") != "0" or True
         assert "GCM_INTERACTIVE" not in os.environ or os.environ["GCM_INTERACTIVE"] == env["GCM_INTERACTIVE"]
 
 
@@ -116,6 +115,8 @@ class TestNoninteractiveGitEnv:
         )
         monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+        # The contract is about the system scope, so a hermetic runner's NOSYSTEM must not hide it.
+        monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
 
         # Ambient GIT_CONFIG_KEY_n=safe.directory must not be laundered through alongside the
         # user's own entries -- only the config files are a trust source.

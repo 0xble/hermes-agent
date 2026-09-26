@@ -161,3 +161,47 @@ def test_rollback_reinstall_failure_reaches_recovery(tmp_path):
     assert run.returncode == 1 and "RECOVERED" in run.stdout and "UNREACHABLE" not in run.stdout
     real = (SCRIPTS / "rollback_fork_runtime.sh").read_text()
     assert "if reinstall 2>&1 | tail -3; then" in real and "PIPESTATUS" not in real
+
+
+def test_fork_patch_check_verifies_the_checkout_it_runs_from(tmp_path):
+    """A candidate worktree shares the primary checkout's venv, whose editable hermes_cli resolves
+    to the primary checkout; the check must still verify the worktree it was launched from."""
+    import importlib.util
+
+    checkout = tmp_path / "candidate"
+    (checkout / "hermes_cli").mkdir(parents=True)
+    (checkout / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    (checkout / "scripts").mkdir()
+    script = checkout / "scripts" / "check_fork_patches.py"
+    script.write_text((SCRIPTS / "check_fork_patches.py").read_text(encoding="utf-8"), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("candidate_fork_patch_check", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.REPO == checkout.resolve()
+
+    # Copied out of a checkout (the cron --script root), it still falls back to the installed package.
+    loose = tmp_path / "home" / "scripts"
+    loose.mkdir(parents=True)
+    copied = loose / "check_fork_patches.py"
+    copied.write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("loose_fork_patch_check", copied)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    import hermes_cli
+    assert module.REPO == Path(hermes_cli.__file__).resolve().parents[1]
+
+
+def test_check_receipt_ignores_gateways_on_a_separate_checkout(tmp_path, monkeypatch):
+    """A fleet row in the updater's ``external`` state serves a checkout this update did not touch."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    _receipt(tmp_path, fleet=[
+        {"profile": "default", "pid": 9, "code_sha": head, "state": "current"},
+        {"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "external", "code_root": "/srv/other"},
+    ])
+    assert mod.check_receipt(tmp_path) == []
+    # An ordinary row on other code still fails; only the external state is exempt.
+    _receipt(tmp_path, fleet=[{"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "current"}])
+    assert any("'lpg'" in p for p in mod.check_receipt(tmp_path))

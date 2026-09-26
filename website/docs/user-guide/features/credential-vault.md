@@ -107,6 +107,28 @@ vault:
     enabled: false
 ```
 
+### Several 1Password accounts
+
+A service-account token reads every vault it was granted, but only in its own
+account. To add logins from another account (a business account next to a
+personal one), list it under `accounts` with its own service-account token:
+
+```yaml
+vault:
+  onepassword:
+    accounts:
+      - alias: business                       # handles become op@business:<item-id>
+        account: business.1password.com
+        service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN_BUSINESS
+        browser_account: work                 # optional: fill only in this Camofox account
+```
+
+Each additional account authenticates only with its own token, never with
+1Password Connect or an unlocked desktop session, so a handle can never resolve
+under another account's credential. An entry without a unique alias, an account,
+and a token variable of its own is ignored. `browser_account` limits fills and
+one-time codes to tasks whose browser uses that named account.
+
 ## What this does and does not guarantee
 
 **Does:** the password never enters the model's context through Hermes: not in

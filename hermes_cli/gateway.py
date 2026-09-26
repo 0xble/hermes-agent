@@ -293,17 +293,27 @@ def _get_parent_pid(pid: int) -> int | None:
 
 def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
     """Return True when ``target_pid`` is this process or one of its ancestors."""
+    return bool(_ancestor_chain_to(target_pid))
+
+
+def _ancestor_chain_to(target_pid: int) -> list[int]:
+    """PIDs from ``target_pid`` down to (excluding) this process when ``target_pid`` is an
+    ancestor, else ``[]``. A supervisor may own a wrapper (launchd's ``osascript`` →
+    ``stderr_timestamp`` → gateway), so the supervised pid and the gateway that stamps its
+    code identity are different processes on the same chain."""
     if target_pid <= 0:
-        return False
+        return []
 
     pid = os.getpid()
+    chain: list[int] = []
     seen: set[int] = set()
     while pid and pid not in seen:
         if pid == target_pid:
-            return True
+            return [pid, *reversed(chain[1:])] if chain else [pid]
         seen.add(pid)
+        chain.append(pid)
         pid = _get_parent_pid(pid) or 0
-    return False
+    return []
 
 
 def _request_gateway_self_restart(pid: int) -> bool:
@@ -1578,14 +1588,9 @@ def _print_gateway_process_mismatch(snapshot: GatewayRuntimeSnapshot) -> None:
 
 def _print_multiplex_standalone_reason() -> None:
     """The boot guard kept an unset-default gateway standalone: say so in status, with the remedy."""
-    try:
-        from gateway.status import read_runtime_status
-        reason = (read_runtime_status() or {}).get("multiplex_standalone_reason")
-    except Exception:
-        return
-    if reason:
-        print(f"⚠ Serving the default profile only: {reason}")
-        print("  Fold every profile onto this gateway: hermes gateway migrate --multiplex")
+    from hermes_cli.gateway_multiplex_mode import recorded_standalone_warning_lines
+    for line in recorded_standalone_warning_lines():
+        print(line)
 
 
 def _print_served_ingress_urls(profile: str | None = None) -> None:
@@ -1746,6 +1751,25 @@ def _reaper_candidate_is_supervisor_owned(pid: int) -> bool:
     return False
 
 
+def _reaper_candidate_matches_home(pid: int) -> bool:
+    """Reject a gateway explicitly launched under another home before sending signals.
+
+    Process argv does not carry an inherited HERMES_HOME. Keep the old best-effort
+    behavior when process environment inspection is unavailable or no override exists.
+    """
+    import psutil
+    try:
+        candidate_home = psutil.Process(pid).environ().get("HERMES_HOME", "").strip()
+    except Exception:
+        # A restricted or already-exited process cannot supply an identity;
+        # preserve the existing reaper behavior rather than claiming a match.
+        return True
+    if not candidate_home:
+        return True
+    from hermes_constants import get_process_hermes_home
+    return Path(candidate_home).expanduser().resolve() == get_process_hermes_home().resolve()
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see. On WSL/no-systemd hosts
     the restart fallback runs the gateway in-process under a ``gateway restart`` argv; a stale pidfile
@@ -1776,9 +1800,13 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     from gateway.status import _pid_exists, get_process_start_time, write_planned_stop_marker
     own = _reaper_exclusion_pids(extra_exclude)
     try:
-        # On Windows also drop Task Scheduler-owned candidates (the pidfile-less gap).
+        # Cmdlines of ordinary `gateway run` children do not name their HERMES_HOME.
+        # The process-table fallback otherwise sweeps healthy gateways belonging to
+        # another isolated home (including a concurrent desktop backend's test).
         orphans = [
-            p for p in find_gateway_pids(exclude_pids=own) if p and p > 0 and not _reaper_candidate_is_supervisor_owned(p)
+            p for p in find_gateway_pids(exclude_pids=own)
+            if p and p > 0 and _reaper_candidate_matches_home(p)
+            and not _reaper_candidate_is_supervisor_owned(p)
         ]
     except Exception:
         return False
@@ -4754,7 +4782,7 @@ def _cmd_install(args):
             sys.exit(1)
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
-        launchd_install(force)
+        launchd_install(force, start_now=getattr(args, "start_now", None) is not False)
     elif backend == "windows":
         _gw_windows().install(
             force=force,
@@ -4818,6 +4846,9 @@ def _print_unfolded_gateway_note(owner) -> None:
 
 
 def _cmd_start(args):
+    from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
+    if profile_lifecycle("start", args):
+        return
     system = getattr(args, "system", False)
     start_all = getattr(args, "all", False)
     force = getattr(args, "force", False)
@@ -4850,13 +4881,14 @@ def _cmd_start(args):
 
 def _cmd_stop(args):
     _refuse_from_inside_gateway("stop", "restart loops")
+    from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
+    if profile_lifecycle("stop", args):
+        return
     stop_all = getattr(args, "all", False)
     system = getattr(args, "system", False)
     if not stop_all and not find_gateway_pids() and (
             _served_by_another_host_gateway() or named_profile_served_by_running_multiplexer()):
-        # A served profile owns no gateway to stop; "No gateway running for this profile" (exit 0) would
-        # contradict `gateway status` ("running via the host multiplexer") on the same profile.
-        # A `--force`-started separate gateway HAS a pid of its own and is stopped normally.
+        # The launch/default-profile lifecycle still names the whole host.
         owner = _served_by_another_host_gateway()
         print_error(
             f"The host gateway serves profile '{_current_profile_name()}' — there is no separate "
@@ -4961,6 +4993,9 @@ def _restart_all(system: bool) -> None:
 
 def _cmd_restart(args):
     _refuse_from_inside_gateway("restart", "restart loops")
+    from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
+    if profile_lifecycle("restart", args):
+        return
     system = getattr(args, "system", False)
     restart_all = getattr(args, "all", False)
     force = getattr(args, "force", False)
@@ -5068,10 +5103,14 @@ def _status_host_kind() -> str:
 
 
 def _cmd_status(args):
+    from hermes_cli.gateway_profile_lifecycle import print_parked_status
     deep = getattr(args, "deep", False)
     full = getattr(args, "full", False)
     system = getattr(args, "system", False)
     snapshot = get_gateway_runtime_snapshot(system=system)
+    # A --force gateway bypasses parking and leaves the marker: report it, not only "parked".
+    if print_parked_status() and not snapshot.running:
+        return
     from hermes_cli.profiles import get_active_profile_name, profile_is_standalone
 
     active_standalone = ((get_active_profile_name() or "default") != "default"

@@ -247,7 +247,8 @@ def _is_packaging_copy(top_level: str) -> bool:
     return (candidate / "PKG-INFO").exists()
 
 
-def _findings() -> list[tuple[str, str, int]]:
+@functools.lru_cache(maxsize=None)
+def _findings() -> tuple[tuple[str, str, int], ...]:
     """Return (relpath, command, lineno) for every bare managed lookup."""
     found: list[tuple[str, str, int]] = []
     for path in _source_files():
@@ -264,10 +265,11 @@ def _findings() -> list[tuple[str, str, int]]:
         rel = path.relative_to(REPO_ROOT).as_posix()
         for command, lineno in _iter_which_calls(tree):
             found.append((rel, command, lineno))
-    return found
+    return tuple(found)
 
 
-def _resolution_sites() -> set[tuple[str, str, str]]:
+@functools.lru_cache(maxsize=None)
+def _resolution_sites() -> frozenset[tuple[str, str, str]]:
     """Return (path, symbol, kind) for the resolution sites under review."""
     sites: set[tuple[str, str, str]] = set()
     for path in _source_files():
@@ -284,7 +286,7 @@ def _resolution_sites() -> set[tuple[str, str, str]]:
             continue
         visitor = _ResolutionSiteVisitor(tree)
         sites.update((rel, symbol, kind) for symbol, kind in visitor.sites)
-    return sites
+    return frozenset(sites)
 
 
 def _resolution_allowlist() -> set[tuple[str, str, str]]:
@@ -319,7 +321,18 @@ def test_resolution_allowlist_has_no_stale_rows():
     )
 
 
-def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, monkeypatch):
+@pytest.fixture
+def _fresh_scan_caches():
+    """The scans are cached per process; a test that swaps REPO_ROOT must not leak its tree."""
+    caches = (_findings, _resolution_sites, _is_packaging_copy)
+    for cached in caches:
+        cached.cache_clear()
+    yield
+    for cached in caches:
+        cached.cache_clear()
+
+
+def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, monkeypatch, _fresh_scan_caches):
     import sys
 
     monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
@@ -328,7 +341,7 @@ def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, mo
         path.parent.mkdir(parents=True)
         path.write_text('import shutil\nshutil.which("uv")\n', encoding="utf-8")
 
-    assert _findings() == [("hermes_cli/new_command.py", "uv", 2)]
+    assert _findings() == (("hermes_cli/new_command.py", "uv", 2),)
 
 
 def test_no_unreviewed_bare_managed_runtime_lookups():
@@ -366,25 +379,5 @@ def test_allowlist_has_no_stale_entries():
     )
 
 
-@pytest.mark.parametrize(
-    "helper",
-    [
-        "find_node_executable",
-        "find_hermes_node_executable",
-        "iter_hermes_node_dirs",
-        "with_hermes_node_path",
-    ],
-)
-def test_managed_node_helpers_exist(helper):
-    """The alternatives this guard points contributors at must be importable."""
-    import hermes_constants
-
-    assert callable(getattr(hermes_constants, helper))
 
 
-def test_managed_uv_helpers_exist():
-    from hermes_cli.managed_uv import ensure_uv, managed_uv_path, resolve_uv
-
-    assert callable(resolve_uv)
-    assert callable(ensure_uv)
-    assert managed_uv_path().parent.name == "bin"

@@ -326,6 +326,13 @@ def _resolve_account(account: Optional[str]) -> Optional[str]:
     return alias
 
 
+def get_session_account(task_id: Optional[str]) -> Optional[str]:
+    """The named account the task's Camofox session is bound to, or None (default/unbound)."""
+    with _sessions_lock:
+        session = _sessions.get(task_id or "default")
+        return session.get("account") if session else None
+
+
 def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[str, Any]:
     """Get or create the task's session. Identity precedence: external override
     (CAMOFOX_USER_ID / config) → profile-scoped identity when managed persistence

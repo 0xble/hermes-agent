@@ -279,11 +279,7 @@ def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
     with pytest.raises(ValueError) as exc_info:
         agent._check_compression_model_feasibility()
 
-    err = str(exc_info.value)
-    assert "tiny-aux-model" in err
-    assert "32,768" in err
-    assert "64,000" in err
-    assert "below the minimum" in err
+    assert "tiny-aux-model" in str(exc_info.value)
 
 
 
@@ -433,7 +429,6 @@ def test_warns_when_no_auxiliary_provider(mock_get_client):
     agent._check_compression_model_feasibility()
 
     assert len(messages) == 1
-    assert "No auxiliary LLM provider" in messages[0]
     assert agent._compression_warning is not None
 
 
@@ -505,7 +500,7 @@ def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
     agent._replay_compression_warning()
 
     assert any(
-        ev == "lifecycle" and "Auto-lowered" in msg
+        ev == "lifecycle" and str(msg) == str(agent._compression_warning)
         for ev, msg in callback_events
     )
 

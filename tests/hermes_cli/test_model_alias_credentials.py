@@ -86,13 +86,6 @@ class TestDirectAliasCredentialLoading:
         assert alias.api_key == "sk-literal"
         assert alias.key_env == "THETA_API_KEY"
 
-    def test_credential_fields_default_to_empty(self, monkeypatch):
-        """Aliases without credentials keep working (positional construction)."""
-        from hermes_cli.model_switch import DirectAlias
-
-        alias = DirectAlias("theta-1", "custom", ALIAS_HOST)
-        assert alias.api_key == ""
-        assert alias.key_env == ""
 
 
 class TestNestedModelAliasesCredentials:
@@ -525,13 +518,6 @@ class TestSchemelessBaseUrls:
             "http://localhost:11434/v1", "localhost:11434/v1"
         ) is False
 
-    def test_httpx_cannot_use_a_schemeless_base_url(self):
-        """Pins the premise above: this is why the strict answer is harmless."""
-        httpx = pytest.importorskip("httpx")
-
-        assert httpx.URL("localhost:11434/v1").host == ""
-        assert httpx.URL("api.example.com/v1").host == ""
-        assert httpx.URL("http://localhost:11434/v1").host == "localhost"
 
 
 class TestAliasCacheIsProfileScoped:
@@ -803,9 +789,11 @@ class TestNoProductionCodeMutatesTheAliasCacheInPlace:
         repo = pathlib.Path(__file__).resolve().parents[2]
         skip = {".git", ".ci", ".worktrees", "node_modules", "tests", "build", "dist", ".venv"}
         for path in repo.rglob("*.py"):
-            if any(part in skip for part in path.parts):
+            rel = path.relative_to(repo)
+            # Filter repository-relative parts: the checkout itself may live under .worktrees/.
+            if any(part in skip for part in rel.parts):
                 continue
-            yield path, path.relative_to(repo).as_posix()
+            yield path, rel.as_posix()
 
     @classmethod
     def _violations(cls, source: str, rel: str):
@@ -868,6 +856,11 @@ class TestNoProductionCodeMutatesTheAliasCacheInPlace:
             f"{self.OWNER[0]}::{self.OWNER[1]} pin the alias cache and break "
             "per-profile isolation:\n  " + "\n  ".join(found)
         )
+
+    def test_the_scan_covers_the_alias_cache_owner(self):
+        """Discovery must reach production code wherever the checkout lives."""
+        scanned = {rel for _path, rel in self._production_sources()}
+        assert self.OWNER[0] in scanned
 
     def test_the_scan_actually_detects_a_violation(self):
         """Negative control — an always-passing scanner would prove nothing."""

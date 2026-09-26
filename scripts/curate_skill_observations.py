@@ -2,9 +2,13 @@
 """Index and disposition Markdown skill observations in a local SQLite store.
 
 Supported commands are intentionally small: ``index`` imports top-level
-``<skill>.md`` files, ``disposition`` records an explicit decision, ``archive``
+observation files, ``disposition`` records an explicit decision, ``archive``
 moves only dispositioned files, and ``list`` reports indexed rows. The former
 worktree/PR curation interface is not supported by this command.
+
+Each observation is one immutable file named ``<skill>@<suffix>.md``; writers
+never append to an indexed file, so every record can be dispositioned and
+archived on its own. The legacy ``<skill>.md`` form is still indexed.
 """
 
 from __future__ import annotations
@@ -117,6 +121,11 @@ def _files(observations: Path) -> Iterable[Path]:
     return sorted(path for path in observations.glob("*.md") if path.is_file())
 
 
+def _skill_for(source: Path) -> str:
+    """Skill named by an observation file: the stem before ``@`` (``<skill>@<suffix>.md``)."""
+    return source.stem.partition("@")[0]
+
+
 def index_observations(observations: Path, db: Path) -> IndexResult:
     """Index source Markdown files idempotently, leaving them in place."""
     observations = observations.expanduser().resolve()
@@ -124,7 +133,7 @@ def index_observations(observations: Path, db: Path) -> IndexResult:
     result = IndexResult()
     with _connect(db) as conn:
         for source in _files(observations):
-            skill = source.stem
+            skill = _skill_for(source)
             if not _SKILL_NAME.fullmatch(skill):
                 result = IndexResult(result.imported, result.existing, result.skipped + 1)
                 continue
