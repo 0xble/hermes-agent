@@ -29,6 +29,45 @@ def _receipt(home: Path, **fields):
     (directory / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+@pytest.mark.parametrize("linked", [False, True])
+def test_maintenance_installer_preserves_flat_profiles_and_nests_linked_scripts(tmp_path, linked):
+    """A linked script root must not receive flat generated files in the source checkout."""
+    mod = _load("install_candidate_extensions")
+    home = tmp_path / "profile"
+    home.mkdir()
+    scripts = home / "scripts"
+    if linked:
+        source = tmp_path / "checkout" / "src"
+        source.mkdir(parents=True)
+        scripts.symlink_to(source, target_is_directory=True)
+        # Existing flat file is not replaced in a future scripts checkout.
+        (source / "sync_fork_candidate.py").write_text("untouched", encoding="utf-8")
+    else:
+        scripts.mkdir()
+    expected = scripts / "hermes" if linked else scripts
+    installed = mod.install_maintenance(home)
+    assert installed == ["sync_fork_candidate.py", "check_fork_patches.py", "sync_fork_candidate_job.sh"]
+    assert all((expected / name).is_file() for name in installed)
+    assert all((expected / name).stat().st_mode & stat.S_IXUSR for name in installed)
+    if linked:
+        assert (scripts / "sync_fork_candidate.py").read_text(encoding="utf-8") == "untouched"
+        assert not (scripts / "check_fork_patches.py").exists()
+        assert not (scripts / "sync_fork_candidate_job.sh").exists()
+    shell = (expected / "sync_fork_candidate_job.sh").read_text(encoding="utf-8")
+    assert f'$profile_home/scripts/{"hermes/" if linked else ""}sync_fork_candidate.py' in shell
+
+    # No HERMES_HOME: the generated forwarder still locates the installing profile
+    # when moved from the flat directory into the versioned checkout's domain.
+    runtime_scripts = home / "hermes-agent" / "scripts"
+    runtime_scripts.mkdir(parents=True)
+    (runtime_scripts / "sync_fork_candidate.py").write_text("print('forwarded')\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.pop("HERMES_HOME", None)
+    completed = subprocess.run([sys.executable, str(expected / "sync_fork_candidate.py")],
+                               env=env, capture_output=True, text=True, check=True)
+    assert completed.stdout.strip() == "forwarded"
+
+
 def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     head = "b" * 40
