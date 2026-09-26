@@ -13,6 +13,18 @@ one sync and personal-runtime promotion. It contains released baseline
 commits, with successful upstream CI run `36022678358` and over 24 hours of age.
 This one-run non-release exception does not change recurring release selection
 or waive fork tests, independent review, protected landing, or backup safeguards.
+
+Brian separately accepted the *historical* protected-landing bypass for
+[PR #135](https://github.com/0xble/hermes-agent/pull/135) on 2026-09-26.
+That PR merged at 2026-09-25T09:59:40Z before its required App 15368
+`qualification` check completed successfully at 2026-09-25T10:03:49Z on
+exactly the merged head `a0da116ac96ab9c14debbce8b7d2a85c8f0430cb`
+(merge commit `6e3f8b41ff1f803d6d3147096afac9f3a9ee2127`). This resolves
+only the acceptance of that already-landed bypass. It does not retroactively
+make the merge protected, waive future required checks, authorize another
+admin bypass, or qualify any later `origin/main` candidate; each later
+candidate needs its own exact-revision evidence before protected landing.
+
 This replacement fork was established on 2026-09-19. The former fork is preserved
 as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
