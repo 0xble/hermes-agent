@@ -21,6 +21,14 @@ its optional icon, and the durable alias can be observed through one Telegram to
   omits `name`, so Telegram keeps the visible name; resending the saved session title
   reverted an earlier `--title` rename. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
+- Icon choice favors relevance over variety. The model is always offered the whole catalog;
+  withholding recently used icons made the obvious icon unavailable and forced unrelated picks.
+  Without operator `topic_icon_instructions`, `DEFAULT_ICON_GUIDANCE` asks for the most specific
+  recognizable icon. The keyword fallback uses recency only to break ties and returns no icon
+  (the topic keeps its current one) when nothing matches. The adapter warms the icon catalog
+  after connect so the first topic after a restart also gets a model pick. Each choice logs
+  its path (`override`, `model`, `keyword`, or `none`) at INFO. Verify guidance changes by
+  sampling the configured title model on real opening messages against the live catalog.
 - `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
   such as `X #2` only when that exact text is held by another session; the visible Telegram
   topic is renamed to the unsuffixed label. Auto-titles that collide likewise keep the visible

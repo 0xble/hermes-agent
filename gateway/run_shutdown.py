@@ -1041,15 +1041,16 @@ class GatewayShutdownMixin:
             await self._send_update_phase("updating")
             update_notified = await self._send_update_phase("restarting")
         restart_source = self._restart_command_source if self._restart_requested else None
+        # Every interrupted chat learns why, whether the restart came from an update or a direct request.
+        reason = (update_record[1] if update_record else {}).get("reason") or getattr(self, "_restart_reason", None)
 
         def shutdown_message(adapter):
             from gateway.run import resolve_restart_resume_policy
             automatic = resolve_restart_resume_policy(self.config, adapter) == "continue"
-            if update_record:
+            if self._restart_requested and (update_record or reason):
                 guidance = ("I'll try to resume automatically after restart." if automatic else
                             "Send any message after restart and I'll try to resume where you left off.")
-                # The reason belongs to the exact originating conversation only.
-                return notice("🔄 Restarting", {}, "Your current task may be interrupted. " + guidance)
+                return notice("🔄 Restarting", {"reason": reason}, "Your current task may be interrupted. " + guidance)
             if self._restart_requested:
                 guidance = ("I'll try to resume automatically after the restart." if automatic else
                             "Send any message after the restart and I'll try to resume where you left off.")
@@ -1694,9 +1695,11 @@ class GatewayShutdownMixin:
         logger.info("Restart deferred wait complete - active work drained; proceeding to stop()")
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def request_restart(self, *, detached: bool = False, via_service: bool = False,
+                        reason: Optional[str] = None) -> bool:
         if self._restart_task_started:
             return False
+        self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
