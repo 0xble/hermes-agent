@@ -37,6 +37,9 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
   their review fallback), `slice-14-request-update` (the parent-only native update request).
   `maintenance-contract` is owned by the root contract.
+Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
+  The inherited `1887e31a` installer-path fix lacked a trailer; its stable
+  patch ID classifies exactly that published content without rewriting main.
 - `config-backup-content`: config backup deduplication reads current bytes rather
   than reusing `filecmp` results cached by paths and stat signatures. Same-size
   edits with preserved mtimes must produce a new backup. The existing config

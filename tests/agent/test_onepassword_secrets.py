@@ -34,6 +34,16 @@ def _reset_caches():
 
 
 @pytest.fixture(autouse=True)
+def _legacy_read_fixtures(monkeypatch, request):
+    # Existing subprocess mocks model only `op read`; exercise that fallback
+    # without mistaking the batch's argv for a secret-reference argument.
+    if not request.node.name.startswith("test_batch_"):
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("op run unavailable in read-only fixture")
+        monkeypatch.setattr(op, "_run_op_batch", unavailable)
+
+
+@pytest.fixture(autouse=True)
 def _clean_op_env(monkeypatch):
     """Start every test from a known 1Password auth state."""
     for key in list(os.environ):
@@ -733,6 +743,86 @@ def test_rejection_that_also_mentions_a_rate_limit_is_a_rejection():
     assert op._classify_op_error("[ERROR] 401 Unauthorized: too many requests") == op.ErrorKind.AUTH_FAILED
     assert op._classify_op_error(
         "[ERROR] 2026/09/24 19:40:01 Too many requests. Your client has been rate-limited.") == op.ErrorKind.RATE_LIMITED
+
+
+def _fake_batch_binary(tmp_path, *, failure=""):
+    """Executable fake op: supports run and read without network or stdout secrets."""
+    binary = tmp_path / "op"
+    binary.write_text('''#!/usr/bin/env python3
+import json, os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+with (Path(__file__).parent / "calls.jsonl").open("a") as log:
+    log.write(json.dumps(args[:2]) + "\\n")
+if args[0] == "run":
+    if (Path(__file__).parent / "failure.txt").exists():
+        print((Path(__file__).parent / "failure.txt").read_text(), file=sys.stderr)
+        sys.exit(1)
+    path = args[args.index("--env-file") + 1]
+    mapping = dict(line.split("=", 1) for line in Path(path).read_text().splitlines())
+    assert (Path(path).stat().st_mode & 0o777) == 0o600
+    assert (Path(args[args.index("--") + 4]).stat().st_mode & 0o777) == 0o600
+    assert len(mapping) == 2  # duplicate refs are fetched only once
+    values = {name: {"op://V/I/a": "first\\nsecond", "op://V/I/b": "other"}.get(ref, "")
+              for name, ref in mapping.items()}
+    if not all(values.values()):
+        print("missing field", file=sys.stderr)
+        sys.exit(1)
+    child = args[args.index("--") + 1:]
+    sys.exit(subprocess.call(child, env={**os.environ, **values}))
+if args[0] == "read":
+    ref = args[-1]
+    value = {"op://V/I/a": "first\\nsecond", "op://V/I/b": "other"}.get(ref)
+    if value is None:
+        print("missing field", file=sys.stderr)
+        sys.exit(1)
+    print(value)
+''')
+    binary.chmod(0o755)
+    return binary
+
+
+def _fake_calls(tmp_path):
+    return [json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()]
+
+
+def test_batch_success_multiline_duplicate_refs_and_private_files(monkeypatch, tmp_path):
+    binary = _fake_batch_binary(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    refs = {"A": "op://V/I/a", "COPY": "op://V/I/a", "B": "op://V/I/b"}
+    secrets, warnings = op.fetch_onepassword_secrets(references=refs, binary=binary, use_cache=False)
+    assert secrets == {"A": "first\nsecond", "COPY": "first\nsecond", "B": "other"}
+    assert warnings == []
+    assert len(_fake_calls(tmp_path)) == 1
+    assert _fake_calls(tmp_path)[0][0] == "run"
+    assert list(scratch.iterdir()) == []
+
+
+def test_batch_failure_falls_back_to_per_ref(monkeypatch, tmp_path):
+    binary = _fake_batch_binary(tmp_path)
+    (tmp_path / "failure.txt").write_text("missing field")
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"A": "op://V/I/a", "BAD": "op://V/I/missing"}, binary=binary, use_cache=False)
+    assert secrets == {"A": "first\nsecond"}
+    assert len(warnings) == 1 and "missing" in warnings[0]
+    assert [call[0] for call in _fake_calls(tmp_path)] == ["run", "read", "read"]
+
+
+def test_batch_rate_limit_does_not_fall_back_and_cools_down(monkeypatch, tmp_path):
+    binary = _fake_batch_binary(tmp_path)
+    (tmp_path / "failure.txt").write_text("Too many requests. Your client has been rate-limited")
+    refs = {"A": "op://V/I/a", "B": "op://V/I/b"}
+    first, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=binary, home_path=tmp_path)
+    assert first == {} and any("rate-limited" in w for w in warnings)
+    assert [call[0] for call in _fake_calls(tmp_path)] == ["run"]
+    second, warnings = op.fetch_onepassword_secrets(
+        references=refs, binary=binary, home_path=tmp_path)
+    assert second == {} and any("cooldown" in w for w in warnings)
+    assert len(_fake_calls(tmp_path)) == 1
+    assert (op._cooldown_path(tmp_path).stat().st_mode & 0o777) == 0o600
 
 
 def test_reason_survives_a_long_item_path(monkeypatch, tmp_path):
