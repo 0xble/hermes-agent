@@ -366,16 +366,18 @@ def resolve_restart_exit_wait_budget(
     after_turn_timeout: float,
     *,
     delegation_timeout: float = 0.0,
+    cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     headroom: float = 15.0,
 ) -> float:
-    """Seconds a CLI should wait for the gateway PID to exit after SIGUSR1.
+    """Bound the observer's wait for an outgoing gateway to exit after SIGUSR1.
 
-    In-band restart may defer ``stop()`` until turns or delegations finish, then spend
-    ``drain_timeout`` inside it. The turn and delegation waits run concurrently, so cover
-    the longer one plus the drain and headroom.
+    Turns and delegations defer stop concurrently. Stop itself may then spend the
+    cron drain plus cleanup reserve, even when the chat drain is short. Reuse the
+    service stop envelope (including its floor and cleanup headroom), so the
+    observer cannot expire before a healthy supervised shutdown completes.
     """
     return (
-        _seconds(drain_timeout)
-        + max(_seconds(after_turn_timeout), _seconds(delegation_timeout))
+        max(_seconds(after_turn_timeout), _seconds(delegation_timeout))
+        + resolve_systemd_timeout_stop_sec(drain_timeout, cron_drain_timeout)
         + _seconds(headroom)
     )

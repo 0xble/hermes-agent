@@ -3779,6 +3779,43 @@ class BasePlatformAdapter(ABC):
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
+        # A completed reply to a deleted private Telegram topic cannot be repaired by
+        # formatting fallback: that keeps both the dead thread and its reply anchor.
+        # Never move interim output (or an ambiguous timeout) into the parent DM.
+        topic_meta = metadata if isinstance(metadata, dict) else {}
+        if (
+            self.platform == Platform.TELEGRAM
+            and topic_meta.get("notify") and not topic_meta.get("_interim_send")
+            and topic_meta.get("telegram_dm_topic_reply_fallback")
+            and not topic_meta.get("telegram_stale_topic_recovery")
+            and (topic_meta.get("thread_id") or topic_meta.get("message_thread_id"))
+            and not self._is_timeout_error(error_str)
+            and any(marker in " ".join(error_str.lower().split()) for marker in (
+                "thread not found", "topic deleted", "topic closed", "topic not found"))
+        ):
+            thread_id = topic_meta.get("thread_id") or topic_meta.get("message_thread_id")
+            mark_stale = getattr(self, "_mark_dm_topic_stale", None)
+            if callable(mark_stale):
+                mark_stale(chat_id, thread_id)
+            prune = getattr(self, "_prune_stale_dm_topic_binding", None)
+            if callable(prune):
+                prune(chat_id, thread_id, metadata=topic_meta)
+            root_meta = {key: value for key, value in topic_meta.items() if key not in {
+                "thread_id", "message_thread_id", "direct_messages_topic_id",
+                "telegram_direct_messages_topic_id", "telegram_reply_to_message_id",
+                "reply_to_message_id", "telegram_dm_topic_reply_fallback",
+                "telegram_dm_topic_created_for_send",
+            }}
+            root_meta["telegram_stale_topic_recovery"] = True
+            partial = self._is_partial_delivery(result)
+            root_content = (
+                "A response was partially delivered before its Telegram topic was deleted. "
+                "The complete response remains in Hermes session history."
+                if partial else "Recovered response from a deleted Telegram topic:\n\n" + content)
+            logger.warning("[%s] Recovering completed reply from deleted Telegram topic chat=%s thread=%s",
+                           self.name, chat_id, thread_id)
+            return await self.send(chat_id=chat_id, content=root_content, reply_to=None, metadata=root_meta)
+
         # Non-network / post-retry formatting failure: try plain text as fallback. A
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.

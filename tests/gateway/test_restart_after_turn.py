@@ -10,6 +10,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     parse_restart_after_turn_timeout,
     resolve_restart_exit_wait_budget,
+    resolve_systemd_timeout_stop_sec,
 )
 from gateway.run import GatewayRunner
 
@@ -26,11 +27,13 @@ def test_parse_restart_after_turn_timeout_defaults_and_clamps():
 
 
 def test_resolve_restart_exit_wait_budget_covers_both_phases():
-    assert resolve_restart_exit_wait_budget(0, 0, headroom=15) == 15.0
-    assert resolve_restart_exit_wait_budget(180, 21600, headroom=15) == 180 + 21600 + 15
-    assert resolve_restart_exit_wait_budget(180, 60, delegation_timeout=21600, headroom=15) == 180 + 21600 + 15
-    assert resolve_restart_exit_wait_budget(180, 21600, delegation_timeout=0, headroom=15) == 180 + 21600 + 15
-    assert resolve_restart_exit_wait_budget("bad", "bad", headroom="x") == 0.0
+    stop = resolve_systemd_timeout_stop_sec(0, 0)
+    assert resolve_restart_exit_wait_budget(0, 0, cron_drain_timeout=0, headroom=15) == stop + 15
+    stop = resolve_systemd_timeout_stop_sec(180, 0)
+    assert resolve_restart_exit_wait_budget(180, 21600, cron_drain_timeout=0, headroom=15) == stop + 21600 + 15
+    assert resolve_restart_exit_wait_budget(180, 60, delegation_timeout=21600, cron_drain_timeout=0, headroom=15) == stop + 21600 + 15
+    assert resolve_restart_exit_wait_budget(180, 21600, delegation_timeout=0, cron_drain_timeout=0, headroom=15) == stop + 21600 + 15
+    assert resolve_restart_exit_wait_budget("bad", "bad", cron_drain_timeout=0, headroom="x") == resolve_systemd_timeout_stop_sec(0, 0)
 
 
 def test_load_restart_after_turn_timeout_preserves_zero(tmp_path, monkeypatch):
