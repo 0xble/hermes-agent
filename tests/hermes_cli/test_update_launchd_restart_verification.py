@@ -32,6 +32,7 @@ LABEL = "ai.hermes.gateway"
 
 # Captured at import so a test can re-install the real verifier over a fixture's stub.
 _REAL_WAIT_FOR_SUPERVISION = gateway_cli.wait_for_launchd_gateway_supervision
+_REAL_LAUNCHCTL_SUPERVISED_PID = gateway_cli._launchctl_supervised_pid
 
 class _FakeClock:
     """Monotonic clock that only advances when the code under test sleeps.
@@ -193,6 +194,7 @@ def _patch_launchd_env(
     registered=True,
     restart=None,
     supervised=True,
+    ancestor=False,
 ):
     """Drive ``_restart_macos_launchd_gateways`` through the invoking profile only.
 
@@ -212,6 +214,12 @@ def _patch_launchd_env(
     )
     monkeypatch.setattr(
         gateway_cli, "launchd_gateway_labels_for_install", lambda: [LABEL]
+    )
+    # Pin host probes: running tests below a real supervised gateway otherwise
+    # takes the in-gateway self-restart branch instead of the intended branch.
+    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label: 4242)
+    monkeypatch.setattr(
+        gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: ancestor
     )
 
     calls = {"restart": 0, "verify": 0, "label": None}
@@ -297,11 +305,14 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         the seam is plain Python, so the fake pins the behaviour on any host.
         """
         calls = _patch_launchd_env(monkeypatch, supervised=True)
-        # ...but exercise the REAL verifier, not _patch_launchd_env's stub.
+        # Exercise the real verifier and PID probe over the fake launchctl below.
         monkeypatch.setattr(
             gateway_cli,
             "wait_for_launchd_gateway_supervision",
             _REAL_WAIT_FOR_SUPERVISION,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_launchctl_supervised_pid", _REAL_LAUNCHCTL_SUPERVISED_PID
         )
         listings = []
 
@@ -327,6 +338,19 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
             + gateway_cli.LAUNCHD_SUPERVISION_VERIFY_TIMEOUT
             + 1.0
         )
+
+    def test_restart_handed_to_the_enclosing_gateway_skips_verification(
+        self, monkeypatch
+    ):
+        """An enclosing gateway cannot expose its replacement before it exits."""
+        calls = _patch_launchd_env(monkeypatch, supervised=False, ancestor=True)
+
+        restarted, failed_or_stale = _run_fleet_restart()
+
+        assert calls["restart"] == 1
+        assert calls["verify"] == 0
+        assert restarted == [LABEL]
+        assert failed_or_stale == []
 
     def test_verification_budget_clears_the_respawn_throttle(self):
         """A budget under launchd's ~10s respawn throttle would false-alarm.
