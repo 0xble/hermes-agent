@@ -440,6 +440,44 @@ def _rich_is_prose_line(line: str) -> bool:
     return not bool(re.fullmatch(r"(?:[-*_]\s*){3,}", stripped))
 
 
+# CommonMark lets an ordered list interrupt a paragraph only when it starts at 1.
+_RICH_INTERRUPTING_ORDERED_ITEM_RE = re.compile(r" {0,3}(?!1[.)])\d{1,9}[.)][ \t]+\S")
+_RICH_CONTAINER_LINE_RE = re.compile(r" {0,3}(?:>|[-+*][ \t]|\d{1,9}[.)][ \t])")
+_RICH_FENCE_LINE_RE = re.compile(r" {0,3}(?:```|~~~)")
+
+
+def _rich_separate_ordered_lists(text: str) -> str:
+    """Open a new block before an ordered list that directly follows a paragraph.
+
+    ``**Label**\\n7. item`` is otherwise one paragraph, so the numbers render as
+    literal text without list layout. Lines continuing a list item or quote
+    are left alone because a list there already nests or ends correctly.
+    Closed fences never reach here; an unclosed one in a draft frame is skipped.
+    """
+    out: list[str] = []
+    state = None  # None, "paragraph", "container", or "fence" for the current block
+    for line in text.split("\n"):
+        if _RICH_FENCE_LINE_RE.match(line):
+            state = None if state == "fence" else "fence"
+        elif state == "fence":
+            pass
+        elif not line.strip():
+            state = None
+        elif state == "paragraph" and _RICH_INTERRUPTING_ORDERED_ITEM_RE.match(line):
+            out.append("")
+            state = "container"
+        elif _RICH_CONTAINER_LINE_RE.match(line):
+            state = "container"
+        elif line[:1].isspace():
+            pass  # indented continuation keeps the current block
+        elif _rich_is_prose_line(line):
+            state = state or "paragraph"
+        else:
+            state = None
+        out.append(line)
+    return "\n".join(out)
+
+
 def _rich_materialize_prose_paragraphs(text: str) -> str:
     """Render authored prose breaks as one explicit blank Rich Message row.
 
@@ -554,11 +592,11 @@ def _rich_normalize_linebreaks(text: str) -> str:
     # by the single-newline regex on each prose run.
     pos = 0
     for m in _RICH_PARAGRAPH_PROTECTED_REGION_RE.finditer(text):
-        prose = _rich_materialize_prose_paragraphs(text[pos:m.start()])
+        prose = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(text[pos:m.start()]))
         out.append(_RICH_SINGLE_LINEBREAK_RE.sub('  \n', prose))
         out.append(m.group(0))  # protected region kept verbatim
         pos = m.end()
-    tail = _rich_materialize_prose_paragraphs(text[pos:])
+    tail = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(text[pos:]))
     out.append(_RICH_SINGLE_LINEBREAK_RE.sub('  \n', tail))
     return ''.join(out)
 

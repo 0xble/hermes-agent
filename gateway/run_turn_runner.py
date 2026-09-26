@@ -1151,7 +1151,9 @@ class TurnRunner:
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=True,
         )
-        agent._gateway_base_request_overrides = dict(turn_route["base_request_overrides"])
+        base_overrides = turn_route.get("base_request_overrides")
+        if base_overrides is not None:
+            agent._gateway_base_request_overrides = dict(base_overrides)
         return agent
 
     def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):
