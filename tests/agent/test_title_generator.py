@@ -497,6 +497,31 @@ class TestMaybeAutoTitle:
                 patch("hermes_cli.config.load_config_readonly", return_value=keyed):
             assert tg.title_upgrade_must_wait_for_turn(main_runtime) is deferred
 
+    @pytest.mark.parametrize(
+        "main_provider, providers, deferred",
+        [
+            # The route's own entry declares a multi-slot server: the title call may share it.
+            ("custom:proxy", {"proxy": {"api": "http://127.0.0.1:8317/v1", "capabilities": {"concurrent_requests": True}}}, False),
+            # Another entry naming the same server declares it (bare `custom` route to that URL).
+            ("custom", {"proxy": {"api": "http://127.0.0.1:8317/v1/", "capabilities": {"concurrent_requests": True}}}, False),
+            # Undeclared or explicitly single-slot keeps the #117296 deferral.
+            ("custom:proxy", {"proxy": {"api": "http://127.0.0.1:8317/v1"}}, True),
+            ("custom:proxy", {"proxy": {"api": "http://127.0.0.1:8317/v1", "capabilities": {"concurrent_requests": False}}}, True),
+            # A declaration on a different server says nothing about the turn's server.
+            ("custom", {"other": {"api": "http://10.0.0.2:8317/v1", "capabilities": {"concurrent_requests": True}}}, True),
+        ],
+    )
+    def test_declared_concurrent_endpoint_keeps_turn_start_timing(self, main_provider, providers, deferred):
+        """#117296 guards single-slot servers. An endpoint whose provider entry declares
+        ``capabilities.concurrent_requests`` serves the title and the turn in separate slots, so the title
+        request goes out at turn start even though both share one base_url."""
+        from agent import title_generator as tg
+
+        main_runtime = {"provider": main_provider, "base_url": "http://127.0.0.1:8317/v1"}
+        with patch.object(tg, "_title_config", return_value={}), \
+                patch("hermes_cli.config.load_config_readonly", return_value={"providers": providers}):
+            assert tg.title_upgrade_must_wait_for_turn(main_runtime) is deferred
+
     def test_kanban_worker_is_named_after_its_card_without_the_llm_thread(self, tmp_path, monkeypatch):
         """A worker's session takes the board card's title synchronously; no auxiliary model call (#111166)."""
         from hermes_cli import kanban_db, kanban_db_connect

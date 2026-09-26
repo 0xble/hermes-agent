@@ -29,11 +29,18 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
   `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
   icon recorded there is never replaced by an automatic rename.
+- The model title starts with the turn when the turn's self-hosted endpoint is declared
+  multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. Upstream
+  #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
+  which delays a new topic's name and icon by the whole first turn on a routing proxy. The
+  declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`
+  endpoint keeps the deferral. Patch identity: `title-concurrent-endpoint`.
 
 ## Provenance and patches
 
 - **Identity and status:** active fork adaptations `slice-15-title-config`,
-  `slice-16-topic-icons`, `slice-17-topic-lineage`, and `slice-9-telegram-topic-edit`.
+  `slice-16-topic-icons`, `slice-17-topic-lineage`, `slice-9-telegram-topic-edit`, and
+  `title-concurrent-endpoint`.
 - **Source / fork refs:** baseline upstream release `v2026.9.14`, fork base
   `origin/main` `a0f8f3996dae`; source designs are NousResearch/hermes-agent PR
   [#66353](https://github.com/NousResearch/hermes-agent/pull/66353) and the
@@ -45,7 +52,9 @@ its optional icon, and the durable alias can be observed through one Telegram to
   attachment forwarding, or new environment variables. Icon selection falls back
   deterministically when the model field is absent or invalid.
 - **Upstream disposition:** source PRs are open design references, not released
-  equivalent behavior.
+  equivalent behavior. `title-concurrent-endpoint` has no upstream equivalent; open
+  NousResearch PRs #120571 and #120627 only widen the deferral. Retire it when a released
+  tag lets a provider declare concurrent capacity for the title gate.
 - **Fork delivery:** landed on fork `main` as one squash-merged PR whose commit carries the
   `Fork-Patch:` trailer slices above. This unit is the owner of those identities;
   `scripts/check_fork_patches.py` verifies the trailer on every commit after the floor.
@@ -66,3 +75,5 @@ and `ruff check` on changed Python files. If rollback is required, revert the la
 squash commit (found by its `Fork-Patch:` trailer) as one unit and retain the two icon tables
 (`telegram_topic_icon_state`, `telegram_topic_icon_history`) before starting a process on the
 rolled-back code; never edit the operator's live config as part of source rollback.
+`title-concurrent-endpoint` rolls back alone by reverting its commit: an unread
+`concurrent_requests` capability is ignored, so titles on that endpoint simply defer again.
