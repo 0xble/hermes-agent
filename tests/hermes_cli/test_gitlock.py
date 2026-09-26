@@ -30,6 +30,13 @@ from hermes_cli.gitlock import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_git_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A real, tiny git repo with two commits (no network)."""

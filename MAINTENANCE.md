@@ -37,7 +37,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
-| Fork CI | Reproducible patch proof surfaces and complete-suite access on bounded runners | CI, test harness, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |
+| Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |
 | Goal lifecycle | Complete judge criteria and conversational recovery of blocker pauses | Goal judging, admission, or continuation changes | [Goal lifecycle](maintenance/goal-lifecycle.md) |
 | Telegram rendering | Preserve rich mode selection and prompt/delivery agreement | Telegram rendering changes and every upstream sync; also load runtime ownership before promotion | [Telegram rendering](maintenance/telegram-rendering.md) |
 | Session-link rendering | Keep internal session references on Desktop only while preserving Telegram link-target safety | Session-search result or platform dispatch changes | [Session-link rendering](maintenance/session-link-rendering.md) |
