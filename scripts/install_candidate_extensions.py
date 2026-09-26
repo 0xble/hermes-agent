@@ -30,14 +30,16 @@ def install_maintenance(home: Path) -> list[str]:
     """Keep scheduler entry points stable while the native updater owns their code."""
     home = home.expanduser().resolve()
     scripts = home / "scripts"
-    # A linked root is a domain-organized scripts checkout. Keep existing real-directory
-    # profiles flat until their cron paths are deliberately migrated.
-    linked = scripts.is_symlink()
+    # A linked root is a source-controlled scripts checkout. Generated files belong
+    # neither at its root nor in a domain: the scripts repository must supply
+    # versioned entrypoints before the profile's cron paths are migrated.
+    if scripts.is_symlink():
+        raise ValueError(
+            f"refusing to install generated maintenance scripts into linked checkout: {scripts}; "
+            "migrate versioned entrypoints and cron paths first"
+        )
     scripts.mkdir(parents=True, exist_ok=True)
-    destination = scripts / "hermes" if linked else scripts
-    if destination.is_symlink():
-        raise ValueError(f"refusing to install through linked maintenance directory: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
+    destination = scripts
     names = ["sync_fork_candidate.py", "check_fork_patches.py"]
     for name in names:
         content = (
@@ -55,11 +57,6 @@ def install_maintenance(home: Path) -> list[str]:
         os.replace(tmp.name, destination / name)
     wrapper = "sync_fork_candidate_job.sh"
     content = (_repo_root() / "scripts" / wrapper).read_bytes()
-    if linked:
-        old_path = b'$profile_home/scripts/sync_fork_candidate.py'
-        if content.count(old_path) != 1:
-            raise ValueError("sync wrapper no longer has the expected flat maintenance path")
-        content = content.replace(old_path, b'$profile_home/scripts/hermes/sync_fork_candidate.py')
     with tempfile.NamedTemporaryFile(dir=destination, delete=False) as tmp:
         tmp.write(content)
     Path(tmp.name).chmod(0o700)
