@@ -4276,11 +4276,10 @@ class BasePlatformAdapter(ABC):
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
         delivery_adapter: "BasePlatformAdapter") -> None:
-        """Mark the ledger row delivered/failed (best-effort). On ``send_path_degraded`` with a
-        replacement adapter live, trigger another redelivery sweep (the watcher's may have run
-        before this failure landed; atomic claiming keeps it idempotent). On any other rejection arm
-        the runner's timed redelivery, so the reply goes out once the flood penalty or the retry
-        backoff has passed instead of waiting for the next restart (#91653)."""
+        """Mark the ledger row delivered/failed (best-effort). A degraded refusal
+        persisted after either a replacement or an in-place recovery needs another sweep:
+        the health sweep can run before this failure write. Other rejections use the
+        runner's timed redelivery, preserving flood and permanent-error policy."""
         try:
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
@@ -4293,7 +4292,10 @@ class BasePlatformAdapter(ABC):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)
                 live = self._final_delivery_adapter(event.source)
-                if live is not delivery_adapter and callable(redeliver):
+                if callable(redeliver) and (
+                    live is not delivery_adapter
+                    or (live.is_connected and not live.send_path_degraded)
+                ):
                     await redeliver(event.source.platform,
                                     profile=getattr(delivery_adapter, "_owner_profile", None))
             elif classify_dead_error(error) is None:  # a dead chat is never retried: no timer to wake
