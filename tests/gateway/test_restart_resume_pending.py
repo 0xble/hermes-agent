@@ -941,6 +941,89 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_type", "home_chat", "home_thread", "expected_targets"),
+    [
+        ("dm", "parent", None, [("parent", "topic-7")]),
+        ("private", "parent", None, [("parent", "topic-7")]),
+        ("group", "parent", None, [("parent", "topic-7"), ("parent", None)]),
+        ("dm", "parent", "home-topic", [("parent", "topic-7"), ("parent", "home-topic")]),
+        ("dm", "other", None, [("parent", "topic-7"), ("other", None)]),
+    ],
+)
+async def test_shutdown_notice_suppresses_only_unthreaded_private_parent_broadcast(
+    chat_type, home_chat, home_thread, expected_targets
+):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="parent", chat_type=chat_type, thread_id="topic-7")
+    key = runner._session_key_for_source(source)
+    runner.session_store._entries[key] = MagicMock(origin=source)
+    runner._running_agents[key] = object()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id=home_chat, name="Home", thread_id=home_thread,
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert [(chat, (metadata or {}).get("thread_id")) for chat, _, metadata in adapter.sent_calls] == expected_targets
+
+
+@pytest.mark.asyncio
+async def test_shutdown_private_topics_remain_distinct_and_failed_delivery_keeps_home():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="parent", name="Home",
+    )
+    for topic in ("topic-7", "topic-8"):
+        source = make_restart_source(chat_id="parent", thread_id=topic)
+        key = runner._session_key_for_source(source)
+        runner.session_store._entries[key] = MagicMock(origin=source)
+        runner._running_agents[key] = object()
+    await runner._notify_active_sessions_of_shutdown()
+    assert [(metadata or {}).get("thread_id") for _, _, metadata in adapter.sent_calls] == [
+        "topic-7", "topic-8",
+    ]
+
+    adapter.sent_calls.clear()
+    async def fail_topic(chat_id, content, reply_to=None, metadata=None):
+        adapter.sent_calls.append((chat_id, content, metadata))
+        return SendResult(success=metadata.get("thread_id") is None)
+    adapter.send = fail_topic
+    await runner._notify_active_sessions_of_shutdown()
+    assert [(metadata or {}).get("thread_id") for _, _, metadata in adapter.sent_calls] == [
+        "topic-7", "topic-8", None,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy,override,manual",
+    [("ask", None, True), ("continue", None, False), ("ask", "continue", False)],
+)
+async def test_shutdown_advisories_are_interim_and_match_continuation_policy(policy, override, manual):
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner.config.restart_resume_policy = policy
+    if override is not None:
+        adapter.config.extra["restart_resume_policy"] = override
+    source = make_restart_source(chat_id="active", thread_id="topic-7")
+    key = runner._session_key_for_source(source)
+    runner.session_store._entries[key] = MagicMock(origin=source)
+    runner._running_agents[key] = object()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="home", name="Home",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 2
+    assert all((metadata or {}).get("_interim_send") is True for _, _, metadata in adapter.sent_calls)
+    assert all(("Send any message" in text) is manual for _, text, _ in adapter.sent_calls)
+    if not manual:
+        assert all("resume automatically" in text for _, text, _ in adapter.sent_calls)
+
+
+@pytest.mark.asyncio
 async def test_restart_home_channel_notification_not_deduped_across_threads():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
@@ -964,8 +1047,8 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 2
-    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
+    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7", "_interim_send": True}
+    assert adapter.sent_calls[1][2] == {"_interim_send": True}
 
 
 # ---------------------------------------------------------------------------
