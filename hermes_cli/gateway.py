@@ -3196,6 +3196,7 @@ def _get_restart_exit_wait_budget() -> float:
         delegation_timeout=_gateway_timeout_setting(
             "HERMES_RESTART_DELEGATION_TIMEOUT", "restart_delegation_timeout", parse_restart_delegation_timeout
         ),
+        cron_drain_timeout=_get_cron_drain_timeout(),
     )
 
 
