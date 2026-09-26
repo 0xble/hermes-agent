@@ -6,10 +6,13 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.24`, `f97608f178d1ffeca59860195ab7da295f7c8e5f`.
-The operator authorized age-only adoption of this release on 2026-09-24. The
-exception waives release age only, not verification, independent review,
-protected landing, or backup safeguards.
+`v2026.9.24 + qualified checkpoint`, `ca6782850432927f33df4775cb6dd45bb51460d2`.
+Brian explicitly selected this exact upstream checkpoint on 2026-09-25 for
+one sync and personal-runtime promotion. It contains released baseline
+`v2026.9.24` (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) plus 256 upstream
+commits, with successful upstream CI run `36022678358` and over 24 hours of age.
+This one-run non-release exception does not change recurring release selection
+or waive fork tests, independent review, protected landing, or backup safeguards.
 This replacement fork was established on 2026-09-19. The former fork is preserved
 as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
