@@ -1981,11 +1981,15 @@ def _reresolve_fallback_reasoning_config(agent, fallback_entry: dict) -> None:
         else:
             resolved = resolve_reasoning_config(load_config() or {}, agent.model)
         # None is the resolved default, not a failure: never carry the previous route's effort.
+        # A marker is a live pick only while it equals its level (explicit_parent_reasoning's rule).
+        prior_pick = getattr(agent, "reasoning_override", None)
+        if not (isinstance(prior_pick, dict) and prior_pick == getattr(agent, "reasoning_config", None)):
+            prior_pick = None
         agent.reasoning_config = resolved
-        # Config-derived, so retire the explicit pick; keep it for restore_primary_runtime when the
-        # primary snapshot predates it (the init snapshot is taken before surfaces mark a pick).
-        if isinstance(getattr(agent, "reasoning_override", None), dict):
-            agent._pre_fallback_reasoning_override = agent.reasoning_override
+        # Config-derived, so retire the explicit pick; set a live one aside for restore_primary_runtime
+        # (the primary snapshot can predate it: the init snapshot is taken before surfaces mark a pick).
+        if prior_pick is not None:
+            agent._pre_fallback_reasoning_override = dict(prior_pick)
         agent.reasoning_override = None
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:

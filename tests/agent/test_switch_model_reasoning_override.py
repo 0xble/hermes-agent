@@ -193,3 +193,42 @@ def test_switch_model_retires_explicit_marker_even_when_level_is_equal(monkeypat
         pass  # MagicMock agent: only the reasoning re-resolution step matters here
     assert agent.reasoning_config == xhigh
     assert agent.reasoning_override is None
+
+
+def test_restore_primary_runtime_does_not_resurrect_a_retired_marker():
+    """A marker that no longer matches the live level is retired, not a newer pick to restore."""
+    from agent.agent_runtime_helpers import restore_primary_runtime
+
+    medium = {"enabled": True, "effort": "medium"}
+    agent = MagicMock()
+    agent._primary_runtime = {
+        "model": "claude-opus-4.5", "provider": "anthropic", "base_url": "https://api.anthropic.com",
+        "api_mode": "anthropic_messages", "api_key": "key", "client_kwargs": {},
+        "use_prompt_caching": True, "use_native_cache_layout": False,
+        "reasoning_config": dict(medium),
+        "compressor_model": "claude-opus-4.5", "compressor_base_url": "", "compressor_api_key": "",
+        "compressor_provider": "", "compressor_context_length": 0, "compressor_api_mode": "",
+        "compressor_threshold_tokens": 0, "anthropic_api_key": "key",
+        "anthropic_base_url": "https://api.anthropic.com", "is_anthropic_oauth": False,
+    }
+    agent._pre_fallback_reasoning_override = None
+    agent._fallback_activated = True
+    agent._fallback_index = 0
+    agent._fallback_chain = []
+    agent._fallback_model = None
+    agent._transport_cache = {}
+    agent._config_context_length = None
+    agent._rate_limited_until = 0
+    agent.model = "fallback-model"
+    agent.provider = "openai"
+    agent.reasoning_config = {"enabled": True, "effort": "low"}          # config-derived level
+    agent.reasoning_override = {"enabled": True, "effort": "xhigh"}      # stale, retired marker
+    agent.context_compressor = MagicMock()
+    agent.base_url = ""
+    agent._anthropic_prompt_cache_policy = MagicMock(return_value=(True, False))
+    agent._create_openai_client = MagicMock(return_value=MagicMock())
+    agent._ensure_lmstudio_runtime_loaded = MagicMock()
+
+    assert restore_primary_runtime(agent) is True
+    assert agent.reasoning_config == medium
+    assert agent.reasoning_override is None
