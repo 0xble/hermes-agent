@@ -328,3 +328,25 @@ class TestAnthropicFastModeAdapter(unittest.TestCase):
 
 
 
+
+
+class TestFastRouteIgnoredWarning(unittest.TestCase):
+    """`/fast` on a route that never receives fast params warns instead of implying it applied."""
+
+    def _run(self, provider, base_url, arg="fast"):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(service_tier=None, provider=provider, requested_provider=provider,
+                               base_url=base_url, model="gpt-5.4", _fast_command_available=lambda: True,
+                               agent=None)
+        with patch.object(cli_mod, "_cprint") as mock_cprint, patch.object(cli_mod, "save_config_value"):
+            cli_mod.HermesCLI._handle_fast_command(stub, f"/fast {arg}")
+        return " ".join(str(c) for c in mock_cprint.call_args_list)
+
+    def test_proxy_route_warns(self):
+        self.assertIn("no effect", self._run("custom:codex-proxy", "http://127.0.0.1:8317/v1"))
+
+    def test_first_party_route_does_not_warn(self):
+        self.assertNotIn("no effect", self._run("openai", "https://api.openai.com/v1"))
+
+    def test_turning_fast_off_never_warns(self):
+        self.assertNotIn("no effect", self._run("custom:codex-proxy", "http://127.0.0.1:8317/v1", "normal"))

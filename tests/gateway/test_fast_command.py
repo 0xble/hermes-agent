@@ -174,3 +174,24 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
 
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_url, provider, warned", [
+    ("http://127.0.0.1:8317/v1", "custom:codex-proxy", True),   # proxy: params never sent
+    ("https://api.openai.com/v1", "openai", False),              # first-party: fast applies
+])
+async def test_fast_warns_when_the_route_never_receives_fast_params(monkeypatch, tmp_path, base_url, provider, warned):
+    """`/fast` on a route that strips fast params must say it has no effect, not imply it applied."""
+    runner = _make_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    runner._resolve_session_agent_runtime = lambda **_: ("gpt-5.4", {"provider": provider, "base_url": base_url})
+
+    response = await runner._handle_fast_command(_make_event("/fast fast"))
+    assert "FAST" in response
+    assert ("no effect" in response) is warned
+
+    off = await runner._handle_fast_command(_make_event("/fast normal"))
+    assert "no effect" not in off

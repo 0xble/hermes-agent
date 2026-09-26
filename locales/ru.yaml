@@ -133,6 +133,7 @@ gateway:
     unknown_arg:           "⚠️ Неизвестный аргумент: `{arg}`\n\n**Допустимые варианты:** normal, fast, status"
     saved:                 "⚡ ✓ Priority Processing: **{label}** (сохранено в конфигурации)\n_(вступит в силу со следующего сообщения)_"
     session_only:          "⚡ ✓ Priority Processing: **{label}** (только этот сеанс)"
+    route_ignored:         "⚠️ This route does not receive fast-mode parameters (only the first-party API does), so it has no effect here."
     label_fast:            "FAST"
     label_normal:          "NORMAL"
     status_fast:           "fast"

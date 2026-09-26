@@ -1180,6 +1180,13 @@ def _fast_mode_route_supported(
     return not host or host in allowed.values()
 
 
+def fast_mode_route_ignored(
+    model_id: Optional[str], provider: Optional[str], base_url: Optional[str]) -> bool:
+    """The model has a fast mode but this route never receives its params (a proxy or reseller),
+    so ``/fast`` is accepted yet changes nothing. Surfaces warn instead of implying it applied."""
+    return model_supports_fast_mode(model_id) and not _fast_mode_route_supported(model_id, provider, base_url)
+
+
 def resolve_fast_mode_overrides(
     model_id: Optional[str], *, provider: Optional[str] = None, base_url: Optional[str] = None
 ) -> dict[str, Any] | None:
