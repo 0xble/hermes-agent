@@ -1487,6 +1487,16 @@ class TelegramAdapter(BasePlatformAdapter):
     def _is_thread_not_found_error(error: Exception) -> bool:
         return "thread not found" in str(error).lower()
 
+    def _mark_dm_topic_stale(self, chat_id: Any, thread_id: Any) -> None:
+        stale = getattr(self, "_stale_dm_topic_ids", None)
+        if stale is None:
+            stale = set()
+            self._stale_dm_topic_ids = stale
+        stale.add((str(chat_id), str(thread_id)))
+
+    def is_dm_topic_stale(self, chat_id: Any, thread_id: Any) -> bool:
+        return (str(chat_id), str(thread_id)) in getattr(self, "_stale_dm_topic_ids", set())
+
     def _prune_stale_dm_topic_binding(self, chat_id: Any, thread_id: Any, *, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Drop the stale ``telegram_dm_topic_bindings`` row for a topic Telegram confirmed deleted, else
         ``_recover_telegram_topic_thread_id`` keeps steering inbound to the dead thread. Best-effort.
