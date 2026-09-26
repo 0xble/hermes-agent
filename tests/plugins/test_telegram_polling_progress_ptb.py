@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-pytest.importorskip("telegram", reason="python-telegram-bot not installed")
+pytest.importorskip("telegram.error", reason="python-telegram-bot not installed")
 from telegram.error import Conflict, TelegramError
 from telegram.request import BaseRequest
 
