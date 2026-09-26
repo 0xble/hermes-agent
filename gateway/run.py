@@ -3073,29 +3073,10 @@ def _format_concise_process_notification(
 
 def _format_gateway_process_notification(evt: dict) -> "str | None":
     """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
-    evt_type = evt.get("type", "completion")
-    _sid = evt.get("session_id", "unknown")
-    _cmd = evt.get("command", "unknown")
-
-    # watch_disabled / overflow events carry their summary in `message` (process_registry formatter).
-    if evt_type in ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released"):
-        return f"[IMPORTANT: {evt.get('message', '')}]"
-
-    if evt_type == "watch_match":
-        _pat = evt.get("pattern", "?")
-        _out = evt.get("output", "")
-        _sup = evt.get("suppressed", 0)
-        text = (
-            f"[IMPORTANT: Background process {_sid} matched "
-            f"watch pattern \"{_pat}\".\n"
-            f"Command: {_cmd}\nMatched output:\n{_out}")
-        if _sup:
-            text += f"\n({_sup} earlier matches were suppressed by rate limit)"
-        text += "]"
-        return text
-
-    if evt_type in ("async_delegation", "heartbeat"):
-        from tools.process_registry_notifications import format_process_notification
+    from tools.process_registry_notifications import (
+        GATEWAY_PROCESS_EVENT_TYPES, format_process_notification,
+    )
+    if evt.get("type", "completion") in GATEWAY_PROCESS_EVENT_TYPES:
         return format_process_notification(evt)
 
     return None

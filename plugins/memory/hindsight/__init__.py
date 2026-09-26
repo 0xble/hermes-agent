@@ -48,6 +48,7 @@ from .settings import (
     _normalize_observation_scopes, _normalize_retain_tags, _parse_int_setting,
     _resolve_bank_id_template,
 )
+from .retention import filter_retain_messages
 
 logger = logging.getLogger(__name__)
 
@@ -1152,9 +1153,18 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- retain ------------------------------------------------------------------
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
+        user_content, assistant_content = filter_retain_messages(user_content, assistant_content)
+        if not user_content and not assistant_content:
+            return []
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
-        return [{"role": role, "content": f"{prefix}: {content}", "timestamp": now} for role, prefix, content in
-                (("user", self._retain_user_prefix, user_content), ("assistant", self._retain_assistant_prefix, assistant_content))]
+        messages: List[Dict[str, str]] = []
+        for role, prefix, content in (
+            ("user", self._retain_user_prefix, user_content),
+            ("assistant", self._retain_assistant_prefix, assistant_content),
+        ):
+            if content:
+                messages.append({"role": role, "content": f"{prefix}: {content}", "timestamp": now})
+        return messages
 
     def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
         metadata: Dict[str, str] = {
@@ -1203,10 +1213,27 @@ class HindsightMemoryProvider(MemoryProvider):
         """Writer job shipping *turns* as one document. Inputs are snapshotted NOW: the
         writer runs after later sync_turn() calls mutate _session_turns/_turn_index/_session_id."""
         content = "[" + ",".join(turns) + "]"
-        metadata = self._build_metadata(message_count=len(turns) * 2, turn_index=self._turn_index)
+        message_count = 0
+        for turn in turns:
+            try:
+                message_count += len(json.loads(turn))
+            except (TypeError, json.JSONDecodeError):
+                # Keep the helper usable for tests and legacy callers that
+                # supply opaque turn labels instead of serialized messages.
+                message_count += 2
+        metadata = self._build_metadata(message_count=message_count, turn_index=self._turn_index)
         lineage = (("session", self._session_id), ("parent", self._parent_session_id))
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
-        bank_id, retain_async, retain_context = self._bank_id, self._retain_async, self._retain_context
+        bank_id, retain_async = self._bank_id, self._retain_async
+        # This item is a chat transcript, not an explicit hindsight_retain call.
+        # Context is per item, so these instructions do not alter other bank uses.
+        retain_context = (
+            f"{self._retain_context}\n\nChat-session extraction: Keep confirmed decisions, "
+            "stable user preferences, facts about the world, and concrete outcomes. "
+            "Attribute claims to the speaker; an assistant proposal is not a user decision. "
+            "Skip delegation/reviewer/process notices, acknowledgements, transient status, "
+            "recalled context, and procedural tool chatter unless they establish an outcome."
+        )
         # A timed-out send keeps running on the shared loop. Re-sending it while it may still land
         # would append the same turns twice, so a retry first settles the earlier attempt.
         in_flight: list = []
@@ -1256,7 +1283,11 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        self._session_turns.append(json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False))
+        messages = self._build_turn_messages(user_content, assistant_content)
+        if not messages:
+            logger.debug("sync_turn: skipped (no durable messages after retain filtering)")
+            return
+        self._session_turns.append(json.dumps(messages, ensure_ascii=False))
         self._turn_counter = self._turn_index = self._turn_counter + 1
         if remainder := self._turn_counter % self._retain_every_n_turns:
             logger.debug("sync_turn: buffered turn %d (will retain at turn %d)",

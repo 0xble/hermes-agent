@@ -781,6 +781,10 @@ def test_same_tick_async_batch_coalesces_into_one_turn_and_acks_all_rows(
     adapter.handle_message.assert_awaited_once()
     delivered = adapter.handle_message.await_args.args[0]
     assert "3 background subagent delegations" in delivered.text
+    from plugins.memory.hindsight.retention import filter_retain_messages
+    request = "Remember the review decision."
+    assert filter_retain_messages(delivered.text, "[SILENT]") == (None, None)
+    assert filter_retain_messages(delivered.text + "\n\n" + request, "[SILENT]") == (request, None)
     for i in range(3):
         assert f"Result for deleg_batch_{i}" in delivered.text
     for event in events:
