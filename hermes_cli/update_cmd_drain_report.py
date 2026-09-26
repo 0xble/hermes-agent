@@ -68,6 +68,8 @@ def describe_active_work_unit(unit: dict, home: Optional[Path] = None) -> str:
         delegation_id = str(unit.get("delegation_id") or "?")
         elapsed_text = f" ({_fmt_elapsed(elapsed)})" if elapsed is not None else ""
         return f"delegation {delegation_id}{elapsed_text}"
+    if kind == "process":
+        return f"background process {unit.get('session_id') or '?'}{pid_part}{elapsed_part}"
     return f"{kind} run{pid_part}{elapsed_part}"
 
 
@@ -93,9 +95,13 @@ def format_drain_report(work: Optional[list], *, remaining_s: float, home: Optio
     else:
         lines.append(f"     waiting on {len(work)} active work unit(s):")
         lines.extend(f"       • {describe_active_work_unit(u, home)}" for u in work)
-        lines.append("     finish or kill the work above to release the drain now; "
-                     "agent.restart_after_turn_timeout caps turn/cron waits, and "
-                     "gateway.restart_delegation_timeout caps delegation waits")
+        if remaining_s > 0:
+            lines.append("     finish or kill the work above to release the drain now; "
+                         "agent.restart_after_turn_timeout caps turn/cron waits, "
+                         "gateway.restart_delegation_timeout caps delegation waits; "
+                         "background processes do not hold the drain")
+        else:
+            lines.append("     the wait budget expired; work still running may be interrupted now")
     return "\n".join(lines)
 
 

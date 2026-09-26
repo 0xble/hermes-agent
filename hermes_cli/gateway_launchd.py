@@ -774,6 +774,10 @@ def launchd_restart():
                     return
                 print("⚠ launchd did not revive the gateway after its graceful exit — forcing restart")
             else:
+                from hermes_cli.update_cmd_drain_report import format_drain_report, read_active_work
+                work = read_active_work()
+                if work:
+                    print(format_drain_report(work, remaining_s=0))
                 print(f"⚠ Gateway drain timed out after {wait_budget:.0f}s — forcing launchd restart")
         # Captured: an unloaded job (3/113/125) is the expected case below, which
         # prints its own ↻ line — and e.stderr feeds the update_cmd failure diagnostic.

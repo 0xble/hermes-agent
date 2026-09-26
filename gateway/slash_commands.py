@@ -609,6 +609,28 @@ class GatewaySlashCommandsMixin(
         # so a delayed Telegram redelivery is still detectable. Overwritten on every /restart.
         await _write_marker(".restart_last_processed.json", _dedup_payload, "dedup marker")
         active_agents = self._running_agent_count()
+        # Do not expose session/delegation identifiers from other profiles in a chat reply. The
+        # updater's local drain report can show identities, but the requester gets kind counts and
+        # the actual wait budgets (including explicit zeroes) before a planned restart proceeds.
+        from collections import Counter
+        work = Counter(unit.get("kind") for unit in getattr(self, "_describe_active_work")())
+        work_notice = ""
+        if work:
+            names = {"chat": "chat turn", "cron": "cron job", "delegation": "delegation",
+                     "process": "background process", "api": "API run", "deferred": "deferred worker"}
+            summary = ", ".join(
+                f"{count} {names.get(kind, 'work unit')}{'' if count == 1 else 's'}"
+                for kind, count in sorted(work.items())
+            )
+            turn_wait = float(getattr(self, "_restart_after_turn_timeout", 0) or 0)
+            delegation_wait = float(getattr(self, "_restart_delegation_timeout", 0) or 0)
+            work_notice = (
+                f"\nActive work: {summary}. Turn wait: up to {turn_wait:g}s. "
+                f"Delegation wait: up to {delegation_wait:g}s. Cron may also use a "
+                "separate shutdown drain. Background processes are reported but do not "
+                "hold the restart (they may be killed). Wedged work or work still active "
+                "after its budget may be interrupted."
+            )
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
@@ -619,8 +641,8 @@ class GatewaySlashCommandsMixin(
         # counter increments for sessions that were running. If a session hits the threshold (3 consecutive
         # restarts while active), the next startup auto-suspends it — breaking the loop.
         if active_agents:
-            return t("gateway.draining", count=active_agents)
-        return EphemeralReply(t("gateway.restart.restarting"))
+            return t("gateway.draining", count=active_agents) + work_notice
+        return EphemeralReply(t("gateway.restart.restarting") + work_notice)
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""

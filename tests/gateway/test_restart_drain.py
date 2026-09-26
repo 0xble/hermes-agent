@@ -45,7 +45,11 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     result = await runner._handle_message(event)
 
     expected = t("gateway.draining", count=1)
-    assert result == expected
+    assert isinstance(result, str)
+    assert result.startswith(expected)
+    assert "1 chat turn" in result
+    assert session_key not in result  # other profiles' session keys must not leak
+    assert "interrupted" in result.lower()
     # Guard against the silent-degradation regression in #22266: if the i18n
     # catalog cannot be resolved (e.g. xdist workers losing the locales path)
     # then ``t("gateway.draining", count=1)`` returns the bare key
@@ -130,6 +134,23 @@ def test_load_signal_interrupt_grace_timeout_from_typed_config(
         gateway_run.GatewayRunner._load_signal_interrupt_grace_timeout()
         == DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
     )
+
+
+@pytest.mark.asyncio
+async def test_restart_reports_background_process_without_waiting_for_daemon(monkeypatch):
+    from tools.process_registry import process_registry
+
+    runner, _ = make_restart_runner()
+    runner._restart_after_turn_timeout = 0.3
+    running = [{"session_id": "proc_1", "pid": 42, "uptime_seconds": 12}]
+    monkeypatch.setattr(process_registry, "snapshot_running_for_restart", lambda: list(running))
+    # A preview server may intentionally run forever. Report its fate without pinning the restart.
+    assert runner._active_work_count() == 0
+    from hermes_cli.update_cmd_drain_report import describe_active_work_unit
+    unit = next(unit for unit in runner._describe_active_work() if unit["kind"] == "process")
+    assert "background process proc_1 pid 42" in describe_active_work_unit(unit)
+    assert await runner._await_active_work_before_restart() is True
+    assert running
 
 
 @pytest.mark.asyncio

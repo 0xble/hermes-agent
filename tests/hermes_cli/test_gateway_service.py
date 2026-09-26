@@ -1278,6 +1278,29 @@ class TestGatewaySystemServiceRouting:
         assert "did not revive" in out
         assert "✓ Service restarted" in out
 
+    def test_launchd_timeout_names_work_before_forced_restart(self, monkeypatch, capsys):
+        import hermes_cli.update_cmd_drain_report as report
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 654)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "probe_gateway_loop_liveness",
+                            lambda pid, **kw: gateway_cli.GATEWAY_LOOP_ALIVE)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 15.0)
+        monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1",
+                            lambda pid, budget, **kw: False)
+        monkeypatch.setattr(report, "read_active_work", lambda: [
+            {"kind": "delegation", "delegation_id": "deleg_123", "elapsed_s": 42}])
+        monkeypatch.setattr(gateway_cli, "_wait_for_api_server_port_free", lambda: None)
+        monkeypatch.setattr(gateway_cli.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+        monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+
+        gateway_cli.launchd_restart()
+        output = capsys.readouterr().out
+        assert output.index("delegation deleg_123") < output.index("forcing launchd restart")
+        assert "work still running may be interrupted" in output
+
     @pytest.mark.macos_only
     def test_gateway_restart_does_not_fallback_to_foreground_when_launchd_restart_fails(self, tmp_path, monkeypatch):
         """macOS-gated: the branch under test is ``elif is_macos() and

@@ -2277,6 +2277,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """O(1) running count for status-bar polling; dict ``len()`` is atomic, no lock."""
         return len(self._running)
 
+    def snapshot_running_for_restart(self) -> list[dict]:
+        """Read-only, non-reconciling snapshot for a planned restart warning.
+
+        A process may outlive a turn indefinitely (preview servers), so this snapshot
+        informs the operator but does not hold the gateway's bounded turn drain.
+        Do not call list_sessions() from the event loop: it performs I/O while
+        reconciling detached completion state.
+        """
+        with self._lock:
+            return [{"session_id": s.id, "pid": s.pid,
+                     "uptime_seconds": max(0, int(time.time() - s.started_at))}
+                    for s in self._running.values() if not s.exited]
+
     def list_sessions(self, task_id: str = None, session_key: str = None, *, include_retained: bool = False) -> list:
         """Running and recently-finished processes for ``task_id`` and/or ``session_key``;
         cross-task entries sharing the gateway session (a forgotten preview server

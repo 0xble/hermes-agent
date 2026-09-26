@@ -187,6 +187,15 @@ class GatewayShutdownMixin:
         )
 
     @staticmethod
+    def _active_background_process_records() -> list[dict]:
+        """Live terminal subprocesses for warning only; long-lived servers must not pin a restart."""
+        try:
+            from tools.process_registry import process_registry
+            return process_registry.snapshot_running_for_restart()
+        except Exception:
+            return []
+
+    @staticmethod
     def _running_cron_job_count() -> int:
         # The FULL work aggregate, not _running_agent_count(): cron jobs run on the scheduler's own thread
         # pool and API-server runs live on the adapter — both outside _running_agents (the #60432 blind
@@ -1593,6 +1602,9 @@ class GatewayShutdownMixin:
                 "kind": "delegation", "delegation_id": record.get("delegation_id"),
                 "elapsed_s": elapsed, "pid": os.getpid(),
             })
+        for record in self._active_background_process_records():
+            units.append({"kind": "process", "session_id": record.get("session_id"),
+                          "elapsed_s": record.get("uptime_seconds"), "pid": record.get("pid")})
         return units
 
     async def _await_active_work_before_restart(self) -> bool:
@@ -1621,7 +1633,7 @@ class GatewayShutdownMixin:
         if turn_deadline is None and delegation_deadline is None:
             logger.warning(
                 "Restart requested with %d active work unit(s), but no work has a configured wait budget; "
-                "proceeding to stop()/drain", active,
+                "proceeding to stop()/drain. Active work: %s", active, self._describe_active_work(),
             )
             return False
         logger.info(

@@ -33,6 +33,22 @@ or how an interrupted child reports why it stopped.
   `gateway.restart_resume_policy`. Neither unit resumes a killed child
   automatically; explicit parent-driven recovery is the section below.
 
+- `restart-work-visibility` extends the existing native restart owner rather than a
+  plugin. Active terminal subprocesses are reported but do not hold a restart
+  because long-lived servers can run indefinitely. The chat requester
+  sees per-kind counts and actual timeout settings without other profiles' identifiers,
+  and the local updater prints named work before launchd's forced fallback. A zero
+  timeout remains an explicit opt-out, so work may still be interrupted. The September
+  25 incidents exposed live `agent.restart_after_turn_timeout: 0`,
+  `gateway.restart_delegation_timeout: 0`, and `agent.cron_drain_timeout: 0`.
+  Upstream PRs #115190 and #96955 overlap delegation draining and manual force,
+  but neither supplies this process accounting and zero-budget requester warning.
+  Tests: `tests/gateway/test_restart_drain.py`,
+  `tests/gateway/test_drain_active_work_report.py`, and
+  `tests/hermes_cli/test_gateway_service.py`. Retire when upstream reports and
+  waits for processes and warns the requester about zero-budget work. Revert
+  this patch's changes without removing the pre-existing delegation wait.
+
 ## Explicit one-shot recovery (slice 2, narrow form)
 
 - `delegate_task(action='resume', subagent_id=<delegation_id>)` is a control
@@ -75,7 +91,8 @@ or how an interrupted child reports why it stopped.
 ## Provenance and patches
 
 - Fork patch identities: `restart-delegation-drain` (gateway wait, CLI budget, drain
-  report), `delegation-interrupt-reason` (reason plumbing),
+  report), `restart-work-visibility` (background-process warning and timeout report),
+  `delegation-interrupt-reason` (reason plumbing),
   `delegation-stall-reason` (truthful stall reason on the stale-monitor interrupt),
   and `delegation-explicit-resume` (one-shot recovery claim and the
   `action='resume'` control path). All are upstream contribution candidates; no
