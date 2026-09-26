@@ -3938,7 +3938,7 @@ class GatewayTurnMixin:
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
-                _post_delivery_adapter=turn_ctx._post_delivery_adapter or adapter,
+                _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
