@@ -138,7 +138,7 @@ _TITLE_PROMPT_TEMPLATE = (
     "__REPLY_RULE__"
 )
 _REPLY_TITLE_ONLY = 'Reply with JSON only: {"title": "..."}'
-_REPLY_TITLE_AND_ICON = 'Reply with JSON only: {"title": "...", "icon": "..."}'
+_REPLY_TITLE_AND_ICON = 'Reply with JSON only: {"title": "...", "icons": ["...", "..."]}'
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
@@ -148,6 +148,14 @@ _TITLE_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {"name": "session_title", "strict": True, "schema": {
         "type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"], "additionalProperties": False}},
+}
+# With icons requested, a strict title-only schema would make enforcing providers drop the icons field.
+_TITLE_AND_ICONS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {"name": "session_title_and_icons", "strict": True, "schema": {
+        "type": "object",
+        "properties": {"title": {"type": "string"}, "icons": {"type": "array", "items": {"type": "string"}}},
+        "required": ["title", "icons"], "additionalProperties": False}},
 }
 
 # Control-tag wrappers around machine-authored content inside a nominal "user" message (Codex CLI's
@@ -650,10 +658,13 @@ def generate_title(
     if icon_allowed:
         from agent.topic_icons import DEFAULT_ICON_GUIDANCE, allowed_icon_list
         # The whole catalog every time: withholding recently used icons made the best match
-        # unavailable and forced unrelated picks.
-        icon_rule = f"- Also pick one icon for the topic from exactly this list: {' '.join(allowed_icon_list(icon_allowed))}"
+        # unavailable and forced unrelated picks. Ranked alternatives let code skip recently used
+        # icons without ever landing on one the model did not judge relevant.
+        icon_rule = ("- Also pick icons for the topic from exactly this list: "
+                     f"{' '.join(allowed_icon_list(icon_allowed))}")
         icon_rule += f" Icon guidance: {(str(icon_instructions or '').strip() or DEFAULT_ICON_GUIDANCE)[:1000]}"
-        icon_rule += " The icon must not change the title."
+        icon_rule += (" Return up to 3 icons ranked best fit first; after the best one, add the next icons that"
+                      " also depict this topic's subject, skipping any that would not. The icons must not change the title.")
     has_link_context = bool(isinstance(link_context, str) and link_context.strip()
                             and not (isinstance(title_preview, str) and title_preview.strip()))
     prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs,
@@ -673,7 +684,7 @@ def generate_title(
             # replies that would have been garbage anyway. temperature=None: omitted from the wire so
             # default-only reasoning models accept the first request (#72351).
             max_tokens=TITLE_MAX_TOKENS, temperature=None, timeout=timeout, main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            extra_body={"response_format": _TITLE_AND_ICONS_RESPONSE_FORMAT if icon_allowed else _TITLE_RESPONSE_FORMAT},
             # The module contract above promises thinking-disabled operation,
             # but nothing enforced it: with the aux default reasoning_effort
             # "" (provider default), Gemini enables internal thinking and
@@ -698,10 +709,14 @@ def generate_title(
         title_value = payload.get("title") if isinstance(payload, dict) else None
         title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
         if icon_allowed and icon_callback is not None:
-            from agent.topic_icons import choose_topic_icon_deterministic, validate_model_icon
-            proposed = payload.get("icon") if isinstance(payload, dict) else None
-            icon = validate_model_icon(proposed, icon_allowed)
-            icon_source = "model"
+            from agent.topic_icons import choose_topic_icon_deterministic, pick_ranked_icon, validate_ranked_icons
+            proposed = None
+            if isinstance(payload, dict):
+                # "icon" is the pre-ranking single-pick shape; a model may still answer that way.
+                proposed = payload.get("icons") if payload.get("icons") else payload.get("icon")
+            ranked = validate_ranked_icons(proposed, icon_allowed)
+            icon = pick_ranked_icon(ranked, recent_icons)
+            icon_source = "model" if icon == (ranked[0] if ranked else None) else "model-alternate"
             if icon is None:
                 icon = choose_topic_icon_deterministic(title or "", user_snippet, icon_allowed, recent_icons)
                 icon_source = "keyword" if icon else "none"
