@@ -412,8 +412,13 @@ def _completion_status(evt: dict) -> str:
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
 
 
-def format_process_notification(evt: dict) -> "str | None":
-    """Format a completion_queue event into an ``[IMPORTANT: ...]`` message."""
+# A completion's payload can contain arbitrary goals, summaries, and process output.
+# Delimit the generated text so downstream consumers never guess where user text begins.
+PROCESS_NOTIFICATION_END = "[/HERMES PROCESS NOTIFICATION]"
+
+
+def _format_process_notification_payload(evt: dict) -> "str | None":
+    """Build the notification body before adding its provenance boundary."""
     evt_type = evt.get("type", "completion")
     # watch_disabled and overflow events carry their own human-readable `message`;
     # otherwise overflow events would fall through to the completion formatter as a
@@ -457,3 +462,9 @@ def format_process_notification(evt: dict) -> "str | None":
     return (
         f"[IMPORTANT: Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
         f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+
+
+def format_process_notification(evt: dict) -> "str | None":
+    """Format a completion_queue event with an explicit end to its generated payload."""
+    payload = _format_process_notification_payload(evt)
+    return f"{payload}\n{PROCESS_NOTIFICATION_END}" if payload is not None else None
