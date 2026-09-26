@@ -452,6 +452,29 @@ class GatewayTopicThreadsMixin:
         if future is not None:
             future.add_done_callback(_log_rename_failure)
 
+    async def _rename_telegram_topic_explicit(self, source: SessionSource, session_id: str, title: str) -> bool:
+        """Report whether an explicit /title reached the bound Telegram topic."""
+        if not source.chat_id or not source.thread_id:
+            return False
+        try:
+            binding = await self._session_db.get_telegram_topic_binding(
+                chat_id=str(source.chat_id), thread_id=str(source.thread_id),
+                profile_name=self._telegram_topic_profile_name(source),
+            )
+            if not binding or str(binding.get("session_id") or "") != str(session_id):
+                return False
+            adapter = self._delivery_adapter_for(source)
+            rename = getattr(adapter, "rename_dm_topic", None) if adapter is not None else None
+            if rename is None:
+                return False
+            return await rename(
+                chat_id=str(source.chat_id), thread_id=str(source.thread_id),
+                name=self._sanitize_telegram_topic_title(title),
+            ) is True
+        except Exception:
+            logger.warning("Explicit Telegram topic rename failed after storing title", exc_info=True)
+            return False
+
     def _schedule_discord_semantic_thread_rename(self, source: SessionSource, session_id: str, title: str) -> None:
         """Schedule Discord auto-thread rename from the auto-title background thread."""
         if not title:

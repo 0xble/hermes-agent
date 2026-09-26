@@ -180,10 +180,14 @@ def test_a_snapshot_still_holding_the_oversized_db_is_never_pruned(tmp_path) -> 
     """Pruning may not drop the only copy of a database later runs had to skip."""
     home = _home_with_oversized_db(tmp_path)
     root = home / "state-snapshots"
-
-    first = create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
-    # Stand in for a snapshot taken when the database was small enough to capture.
-    (root / first / "state.db").write_bytes(b"the only copy")
+    # Capture a real, manifest-listed SQLite database before it exceeds the cap.
+    (home / "state.db").unlink()
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("CREATE TABLE evidence (value TEXT)")
+        conn.execute("INSERT INTO evidence VALUES ('recovery')")
+    first = create_quick_snapshot(hermes_home=home, keep=1)
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("INSERT INTO evidence VALUES (?)", ("x" * 4096,))
 
     for _ in range(3):
         create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
@@ -200,11 +204,11 @@ def test_an_oversized_non_database_is_protected_too(tmp_path) -> None:
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
-    (home / "auth.json").write_bytes(b"y" * 4096)
+    (home / "auth.json").write_bytes(b"the only copy")
     root = home / "state-snapshots"
 
-    first = create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
-    (root / first / "auth.json").write_bytes(b"the only copy")
+    first = create_quick_snapshot(hermes_home=home, keep=1)
+    (home / "auth.json").write_bytes(b"y" * 4096)
 
     for _ in range(3):
         create_quick_snapshot(hermes_home=home, keep=1, max_file_size=_TINY_CAP)
