@@ -20,7 +20,9 @@ These tests pin the contract:
 
 from __future__ import annotations
 
+import concurrent.futures
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -129,6 +131,86 @@ def test_stalled_summary_attempts_configured_fallback_chain():
     assert msgs == compressed, "the fallback attempt's compression must be published"
     assert prompt == "summarized-prompt"
     assert not timeouts, "no continue-without-compression degrade after a recovery"
+
+
+
+class _InlineExecutor:
+    def submit(self, fn, *args):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args))
+        except BaseException as exc:
+            future.set_exception(exc)
+        return future
+
+
+class _WorkerFirstDeadlineWorker:
+    def __init__(self, original, adopted, compressed):
+        self.original = original
+        self.adopted = adopted
+        self.compressed = compressed
+        self.routes = []
+
+    def __call__(self, fence: CompressionCommitFence):
+        route = take_pinned_summary_route()
+        self.routes.append(route)
+        if route is None:
+            fence.mark_route_deadline_abort()
+            fence._deadline = time.monotonic() - 1
+            return self.adopted, "adopted-prompt"
+        if not fence.begin_commit():
+            return self.original, "fallback-cancelled"
+        try:
+            return self.compressed, "fallback-complete"
+        finally:
+            fence.finish_commit()
+
+
+def test_worker_first_deadline_abort_still_attempts_fallback():
+    """Worker-first and host-first deadline schedules have the same fallback behavior."""
+    original = [{"role": "user", "content": "keep-me"}]
+    adopted = [*original, {"role": "user", "content": "concurrent tail"}]
+    compressed = [{"role": "user", "content": "fallback summary"}]
+    worker = _WorkerFirstDeadlineWorker(original, adopted, compressed)
+
+    with (
+        _patch_chain([CHAIN_ENTRY]),
+        patch("agent.conversation_compression._get_compress_timeout_executor", return_value=_InlineExecutor()),
+    ):
+        msgs, prompt = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=original,
+            system_prompt_fallback="degraded-prompt",
+            idle_timeout_seconds=1,
+            total_ceiling_seconds=2,
+        )
+
+    assert [route and route["model"] for route in worker.routes] == [None, "backup-summarizer"]
+    assert msgs == compressed
+    assert prompt == "fallback-complete"
+
+
+def test_worker_deadline_preserves_adopted_transcript_without_fallback():
+    """A failed deadline fallback must not replace an adopted concurrent tail with stale input."""
+    original = [{"role": "user", "content": "keep-me"}]
+    adopted = [*original, {"role": "user", "content": "concurrent tail"}]
+    worker = _WorkerFirstDeadlineWorker(original, adopted, [])
+
+    with (
+        _patch_chain([]),
+        patch("agent.conversation_compression._get_compress_timeout_executor", return_value=_InlineExecutor()),
+    ):
+        msgs, prompt = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=original,
+            system_prompt_fallback="degraded-prompt",
+            idle_timeout_seconds=1,
+            total_ceiling_seconds=2,
+        )
+
+    assert worker.routes == [None]
+    assert msgs is adopted
+    assert prompt == "adopted-prompt"
 
 
 def test_retry_runs_on_a_host_published_fence():
