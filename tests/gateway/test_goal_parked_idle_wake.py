@@ -49,8 +49,13 @@ class _Adapter:
         self._active_sessions = {}
         self._pending_messages = {}
 
+    accept = True
+
     async def handle_message(self, event):
-        self.handled.append(event)
+        # Mirrors BasePlatformAdapter: a refusal returns normally with _gateway_accepted=False.
+        event._gateway_accepted = self.accept
+        if self.accept:
+            self.handled.append(event)
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append(text)
@@ -144,6 +149,20 @@ async def test_watcher_defers_when_the_chat_is_busy_or_owned(hermes_home, monkey
 
     assert adapter.handled == []
     assert goals.load_goal(SID).waiting_on_session == PROC  # kept for the next scan
+
+
+@pytest.mark.asyncio
+async def test_silent_adapter_refusal_keeps_the_barrier(hermes_home, monkeypatch):
+    """handle_message returning normally is not admission (routing refusal, key mismatch)."""
+    _park_killed(hermes_home)
+    adapter = _Adapter()
+    adapter.accept = False
+    runner = _runner(adapter, _entry())
+
+    await _one_scan(runner, monkeypatch)
+
+    assert adapter.sent == []  # no "resuming" notice for a turn that never started
+    assert goals.load_goal(SID).waiting_on_session == PROC
 
 
 @pytest.mark.asyncio

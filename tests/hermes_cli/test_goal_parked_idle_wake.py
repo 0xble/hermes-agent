@@ -128,6 +128,79 @@ def test_clear_lifted_wait_spares_a_newer_barrier(hermes_home):
     assert goals.load_goal("s-repark").waiting_on_session is None
 
 
+def test_clear_lifted_wait_respects_a_newer_repark_or_pause(hermes_home, monkeypatch):
+    """A writer that lands between the idle surface's snapshot and its persistence must win: the
+    compare and the write run in one transaction, so a stale snapshot can never be saved over it."""
+    mgr = _park_on_session("s-race", "proc_first000000")
+    since = mgr.state.waiting_since
+    stale = goals.load_goal("s-race")  # the snapshot a non-atomic clear would have written back
+
+    newer = goals.load_goal("s-race")
+    newer.waiting_since = since + 10
+    newer.waiting_on_session = "proc_second00000"
+    goals.save_goal("s-race", newer)  # the resumed turn re-parks after the snapshot was taken
+
+    assert stale.waiting_since == since
+    assert mgr.clear_lifted_wait(since) is False
+    row = goals.load_goal("s-race")
+    assert row.waiting_on_session == "proc_second00000" and row.waiting_since == since + 10
+    assert mgr.state.waiting_on_session == "proc_second00000"  # manager adopts the durable row
+
+    paused = goals.load_goal("s-race")
+    paused.status = "paused"
+    goals.save_goal("s-race", paused)
+    assert mgr.clear_lifted_wait(since + 10) is False  # a concurrent pause is never reactivated
+    assert goals.load_goal("s-race").status == "paused"
+
+
+def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch):
+    """Interleave a second writer exactly between the compare and the write: the clear holds the
+    SQLite write lock (BEGIN IMMEDIATE), so the competitor is refused and cannot be overwritten."""
+    import sqlite3
+
+    mgr = _park_on_session("s-lock", "proc_lock0000000")
+    since = mgr.state.waiting_since
+    db_path = hermes_home / "state.db"
+    outcomes = []
+    real_clear = goals.GoalState.clear_wait
+
+    def clear_with_competitor(self):
+        other = sqlite3.connect(str(db_path), timeout=0)
+        try:
+            other.execute("UPDATE state_meta SET value = value WHERE key = ?", (goals._meta_key("s-lock"),))
+            other.commit()
+            outcomes.append("landed")
+        except sqlite3.OperationalError as exc:
+            outcomes.append(str(exc))
+        finally:
+            other.close()
+        return real_clear(self)
+
+    monkeypatch.setattr(goals.GoalState, "clear_wait", clear_with_competitor)
+    assert mgr.clear_lifted_wait(since) is True
+    assert outcomes and "locked" in outcomes[0]
+    assert goals.load_goal("s-lock").waiting_on_session is None
+
+
+def test_clear_is_one_write_transaction(hermes_home):
+    mgr = _park_on_session("s-txn", "proc_txn00000000")
+    db = goals._get_session_db()
+    calls = []
+    real = db._execute_write
+
+    def spy(fn, *a, **k):
+        calls.append(fn)
+        return real(fn, *a, **k)
+
+    db._execute_write = spy
+    try:
+        assert mgr.clear_lifted_wait(mgr.state.waiting_since) is True
+    finally:
+        db._execute_write = real
+    assert len(calls) == 1
+    assert goals.load_goal("s-txn").waiting_on_session is None
+
+
 def test_list_parked_goals_and_store_gate(hermes_home):
     _park_on_session("s-parked", "proc_a00000000000")
     goals.GoalManager("s-active").set("unparked goal")

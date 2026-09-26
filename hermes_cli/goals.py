@@ -653,6 +653,35 @@ def save_goal(session_id: str, state: GoalState) -> None:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
 
+def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[bool, Optional[GoalState]]:
+    """Atomically clear the wait barrier iff the durable row is still the active wait parked at
+    ``waiting_since``. Read, compare and write run in one ``BEGIN IMMEDIATE`` transaction, so a
+    concurrent re-park, pause or clear (resumed turn, goal command) can never be overwritten by a
+    stale snapshot. Returns ``(cleared, row_as_seen)``."""
+    db = _get_session_db()
+    if not session_id or db is None:
+        return False, None
+    key = _meta_key(session_id)
+
+    def _txn(conn) -> Tuple[bool, Optional[GoalState]]:
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None or not row[0]:
+            return False, None
+        state = GoalState.from_json(row[0])
+        has_wait = state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until
+        if state.status != "active" or not has_wait or state.waiting_since != waiting_since:
+            return False, state
+        state.clear_wait()
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
+        return True, state
+
+    try:
+        return db._execute_write(_txn)
+    except Exception as exc:
+        logger.warning("GoalManager: conditional wait clear failed for %s: %s", session_id, exc)
+        return False, None
+
+
 def clear_goal(session_id: str) -> None:
     """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
     state = load_goal(session_id)
@@ -1524,11 +1553,10 @@ class GoalManager:
         """Clear the barrier an idle surface just resumed, only if it is still that same wait
         (matched by ``waiting_since`` on the durable row). The resumed turn may already have finished
         and parked again; a blind ``stop_waiting`` would erase that newer barrier."""
-        current = load_goal(self.session_id)
-        if current is None or current.status != "active" or current.waiting_since != waiting_since:
-            return False
-        self._state = current
-        return self.stop_waiting()
+        cleared, current = clear_goal_wait_if_since(self.session_id, waiting_since)
+        if current is not None:
+            self._state = current
+        return cleared
 
     def is_parked(self) -> bool:
         """True when an active goal carries a wait barrier, whether or not it still holds."""

@@ -513,10 +513,18 @@ class GatewayGoalsMixin:
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
         event = self._synthetic_prompt_event(source, prompt)
         event.metadata["gateway_session_key"] = key
+        from gateway.wake import WakeNotAccepted, admit_internal_event
+
+        try:
+            # A normal return from handle_message is not admission (routing refusal, session-key
+            # mismatch); only the adapter's receipt proves a continuation was scheduled.
+            await admit_internal_event(adapter, event)
+        except WakeNotAccepted:
+            logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
+            return
+        await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
         with suppress(Exception):
             await self._send_goal_status_notice(source, "▶ Goal wait ended — resuming.")
-        await adapter.handle_message(event)
-        await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups and resume lifted /goal waits for idle gateway sessions: a coarse
