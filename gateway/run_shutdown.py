@@ -1994,22 +1994,45 @@ class GatewayShutdownMixin:
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
-        from gateway.run import GatewayRunner
-        teardown = [self._bounded_adapter_teardown(adapter, platform)
-                    for platform, adapter in list(self.adapters.items())]
-        # Disconnect secondary-profile adapters (multiplex mode).
+        # Preserve each adapter's queue BEFORE any cancellable background-task cleanup. The
+        # adapter normally flushes after its drain loop, but a slow unwind can outlast that
+        # loop's timeout and skip the flush. Remove only successfully spooled slots so its
+        # later flush cannot replay duplicates; failed slots remain available for retry.
+        from gateway.shutdown_flush import flush_pending_to_file
+        from gateway.run import _profile_runtime_scope
+        from gateway.session_recovery import SessionRecoveryMixin
         _profile_adapters = getattr(self, "_profile_adapters", {})
-        for _prof, _amap in list(_profile_adapters.items()):
-            teardown.extend(self._bounded_adapter_teardown(adapter, platform, profile=_prof)
-                            for platform, adapter in list(_amap.items()))
-        if teardown:
-            cleanup_task = asyncio.ensure_future(asyncio.gather(*teardown))
-            remaining = max(0.0, 3.0 - ctx.notice_elapsed)
-            if not await GatewayRunner._wait_or_detach(cleanup_task, remaining):
-                logger.warning("Adapter teardown exceeded remaining %.2fs of 3s notice/adapter budget; "
-                               "continuing shutdown", remaining)
-            else:
-                await cleanup_task
+        adapters = [(platform, adapter, None) for platform, adapter in list(self.adapters.items())]
+        adapters.extend((platform, adapter, profile)
+                        for profile, amap in list(_profile_adapters.items())
+                        for platform, adapter in list(amap.items()))
+        for platform, adapter, profile in adapters:
+            pending = getattr(adapter, "_pending_messages", None)
+            if not isinstance(pending, dict) or not pending:
+                continue
+            for key, value in list(pending.items()):
+                # A shared primary bot can hold queued turns routed to a secondary profile.
+                # Choose the spool home per session key, not per transport adapter.
+                owner = SessionRecoveryMixin._profile_from_session_key(key) or profile
+                home = None
+                if owner and owner != (getattr(self, "_primary_profile_name", None) or "default"):
+                    home = (getattr(self, "_served_profile_homes", None) or {}).get(owner)
+                    if home is None:
+                        logger.error("Cannot preserve %s adapter queue: missing home for profile %s",
+                                     platform.value, owner)
+                        continue
+                try:
+                    with (_profile_runtime_scope(home, hydrate_secrets=False) if home else nullcontext()):
+                        if flush_pending_to_file({key: value}, reason="adapter_shutdown"):
+                            if pending.get(key) is value:
+                                pending.pop(key, None)
+                except Exception:
+                    logger.exception("Failed to preserve %s adapter pending message for %s", platform.value, key)
+        # Only network notices share the 3s budget. Adapter teardown has its own bounded
+        # per-operation timeouts and must run through disconnect (token-lock release).
+        if adapters:
+            await asyncio.gather(*(self._bounded_adapter_teardown(adapter, platform, profile=profile)
+                                   for platform, adapter, profile in adapters))
         for _amap in _profile_adapters.values():
             _amap.clear()
         _profile_adapters.clear()

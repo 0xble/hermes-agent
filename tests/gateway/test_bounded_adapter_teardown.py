@@ -93,30 +93,81 @@ async def test_teardown_continues_after_cancellation_swallowing_background_cance
 
 
 @pytest.mark.asyncio
-async def test_adapter_teardown_has_one_total_deadline(bare_runner):
-    """Several slow adapters must not each spend the full disconnect budget."""
+async def test_adapter_teardown_bounds_each_operation_without_skipping_disconnect(bare_runner, monkeypatch):
+    """Several wedged adapters use parallel per-operation bounds, not an aggregate notice clock."""
     import time
     from gateway.run_shutdown import GatewayShutdownMixin
 
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
     bare_runner._restart_requested = False
     bare_runner._restart_detached = False
-    bare_runner.adapters = {Platform.TELEGRAM: object(), Platform.FEISHU: object()}
+    async def hang_cancel():
+        await asyncio.Event().wait()
+
+    adapters = {}
+    for platform in (Platform.TELEGRAM, Platform.FEISHU):
+        adapter = MagicMock()
+        adapter._pending_messages = {}
+        adapter.cancel_background_tasks = AsyncMock(side_effect=hang_cancel)
+        adapter.disconnect = AsyncMock()
+        adapters[platform] = adapter
+    bare_runner.adapters = adapters
     bare_runner._profile_adapters = {}
     bare_runner._agent_cache_lock = None
     bare_runner._agent_cache = None
     bare_runner._finalize_shutdown_agents = AsyncMock()
     bare_runner._cancel_process_completion_batch_tasks = AsyncMock()
-    entered = []
-
-    async def blocked_teardown(adapter, platform, *, profile=None):
-        entered.append(platform)
-        await asyncio.Event().wait()
-
-    bare_runner._bounded_adapter_teardown = blocked_teardown
     ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=time.monotonic())
     start = time.monotonic()
-    await bare_runner._stop_finalize_agents_and_adapters(ctx)
-    assert set(entered) == set(bare_runner.adapters)
-    assert time.monotonic() - start < 5.0
+    await asyncio.wait_for(bare_runner._stop_finalize_agents_and_adapters(ctx), timeout=2.0)
+    assert time.monotonic() - start < 2.0
+    for adapter in adapters.values():
+        adapter.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_notice_budget_cannot_cancel_adapter_flush_or_disconnect(bare_runner, tmp_path, monkeypatch):
+    """Pending adapter messages survive even when notices spent nearly the entire network budget."""
+    import json
+    import time
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir()
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    bare_runner._restart_requested = False
+    bare_runner._restart_detached = False
+    bare_runner._agent_cache_lock = None
+    bare_runner._agent_cache = None
+    bare_runner._finalize_shutdown_agents = AsyncMock()
+    bare_runner._cancel_process_completion_batch_tasks = AsyncMock()
+    adapter = MagicMock()
+    adapter._pending_messages = {"agent:main:telegram:dm:1": "follow-up"}
+    unwinding = asyncio.Event()
+
+    async def cancel_background_tasks():
+        # Cancellation during unwind used to skip the adapter's final synchronous flush.
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            unwinding.set()
+            raise
+        from gateway.shutdown_flush import flush_pending_to_file
+        flush_pending_to_file(adapter._pending_messages, reason="adapter_shutdown")
+        adapter._pending_messages.clear()
+
+    adapter.cancel_background_tasks = AsyncMock(side_effect=cancel_background_tasks)
+    adapter.disconnect = AsyncMock()
+    bare_runner.adapters = {Platform.TELEGRAM: adapter}
+    bare_runner._profile_adapters = {}
+    ctx = GatewayShutdownMixin._StopContext(
+        deferred_count=lambda: 0, started_at=time.monotonic(), notice_elapsed=2.95,
+    )
+    await asyncio.wait_for(bare_runner._stop_finalize_agents_and_adapters(ctx), timeout=2.0)
+    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in flush_dir.glob("*.json")]
+    assert [payload["data"]["text"] for payload in payloads] == ["follow-up"]
+    assert adapter._pending_messages == {}
+    adapter.disconnect.assert_awaited_once()
+    assert not unwinding.is_set()
 
 

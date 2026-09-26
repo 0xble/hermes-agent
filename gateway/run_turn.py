@@ -3710,11 +3710,17 @@ class GatewayTurnMixin:
             # Media-only events can have no text even after transcription; persist the resolved
             # user-turn placeholder instead of writing an unrecoverable empty-text event.
             spool_value = pending_event if pending_event and pending_event.text else pending
-            if flush_pending_to_file({session_key or "": spool_value}, reason="shutdown_follow_up"):
-                logger.info("Preserved pending follow-up for session %s during gateway shutdown", session_key)
+            try:
+                preserved = flush_pending_to_file({session_key or "": spool_value}, reason="shutdown_follow_up")
+            except Exception:
+                logger.exception("Failed to preserve pending follow-up for session %s during gateway shutdown",
+                                 session_key)
             else:
-                logger.error("Failed to preserve pending follow-up for session %s during gateway shutdown",
-                             session_key)
+                if preserved:
+                    logger.info("Preserved pending follow-up for session %s during gateway shutdown", session_key)
+                else:
+                    logger.error("Failed to preserve pending follow-up for session %s during gateway shutdown",
+                                 session_key)
             pending_event = None
             pending = None
         return pending_event, pending

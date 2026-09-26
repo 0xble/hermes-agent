@@ -348,6 +348,32 @@ def test_draining_follow_up_is_spooled_for_startup_recovery(tmp_path, monkeypatc
     assert list(flush_dir.glob("*.json")) == []
 
 
+def test_draining_follow_up_spool_initialization_failure_does_not_abort_turn(monkeypatch, caplog):
+    """A failed spool mkdir must not replace an already-completed agent turn with an exception."""
+    from gateway.run_turn import GatewayTurnMixin
+
+    class Runner(GatewayTurnMixin):
+        _draining = True
+
+        def _promote_queued_event(self, key, adapter, event):
+            return event
+
+        def _pending_event_audio_paths(self, event):
+            return []
+
+    def fail_spool_init():
+        raise OSError("spool directory unavailable")
+
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", fail_spool_init)
+    monkeypatch.setattr("gateway.run._dequeue_pending_event", lambda adapter, key: _overflow_event("next turn"))
+    import asyncio
+    with caplog.at_level("ERROR"):
+        event, text = asyncio.run(Runner()._run_agent_drain_pending(
+            {"final_response": "done"}, object(), MagicMock(), "agent:main:telegram:dm:1"))
+    assert event is None and text is None
+    assert "Failed to preserve pending follow-up" in caplog.text
+
+
 def test_drain_transcript_spool_skips_parseable_non_dict_payload(tmp_path, monkeypatch):
     """A scalar/list JSON spool file must not abort the drain; the healthy payload still replays."""
     from gateway.shutdown_flush import drain_transcript_spool, spool_dropped_transcript_message
