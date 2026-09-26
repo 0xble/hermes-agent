@@ -6,6 +6,7 @@ Load for gateway shutdown advisories, destination deduplication, and restart-con
 
 - A successful Telegram private DM-topic advisory suppresses only the unthreaded home broadcast to the same parent *through the same adapter*. Separate DM topics each receive their own notice. A forum/group parent, explicit home topic, different home chat or adapter, and a failed active send retain their home delivery.
 - All shutdown advisories are interim sends, not a turn-final stream seal. The configured per-adapter restart continuation policy determines whether the notice asks for a message (`ask`) or says Hermes will try to resume automatically (`continue`). No policy or delivery state is created here.
+- `gateway_restart_notification: false` suppresses per-session shutdown advisories as well as home-channel broadcasts. Network notice sends and adapter teardown share a three-second total best-effort budget; a stuck transport cannot consume the launchd stop leash once per chat or adapter.
 
 ## Provenance and patches
 

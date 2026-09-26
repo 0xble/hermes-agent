@@ -3704,10 +3704,17 @@ class GatewayTurnMixin:
                         pending = None
 
         if self._draining and (pending_event or pending):
-            logger.info(
-                "Discarding pending follow-up for session %s during gateway %s",
-                session_key or "?", self._status_action_label(),
-            )
+            # The adapter slot was already dequeued; the shutdown snapshot cannot see it now.
+            # Spool before dropping the local reference so startup recovery can replay it.
+            from gateway.shutdown_flush import flush_pending_to_file
+            # Media-only events can have no text even after transcription; persist the resolved
+            # user-turn placeholder instead of writing an unrecoverable empty-text event.
+            spool_value = pending_event if pending_event and pending_event.text else pending
+            if flush_pending_to_file({session_key or "": spool_value}, reason="shutdown_follow_up"):
+                logger.info("Preserved pending follow-up for session %s during gateway shutdown", session_key)
+            else:
+                logger.error("Failed to preserve pending follow-up for session %s during gateway shutdown",
+                             session_key)
             pending_event = None
             pending = None
         return pending_event, pending
