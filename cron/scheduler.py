@@ -3513,6 +3513,14 @@ def _launch_external_cron_worker(job: dict) -> bool:
         "--ack-file",
         str(ack_path),
     ]
+    # Resolve the release once at launch. A later current-pointer flip must not alter
+    # this worker's executable, cwd, or import path.
+    from hermes_cli.immutable_releases import resolved_release
+    pinned_release = resolved_release(_get_hermes_home())
+    if pinned_release:
+        pinned_python = pinned_release / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python")
+        if pinned_python.exists():
+            command[0] = str(pinned_python)
 
     from agent.secret_scope import (
         build_profile_secret_scope,
@@ -3595,7 +3603,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
     # `-m cron.scheduler` has no hermes_cli.main bootstrap; pin this checkout explicitly
     # (PYTHONSAFEPATH / stale editable mapping, #112729). See cron/scheduler_worker_env.py.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = pinned_release or Path(__file__).resolve().parent.parent
     worker_env = pin_hermes_tree_on_pythonpath(worker_env, repo_root)
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

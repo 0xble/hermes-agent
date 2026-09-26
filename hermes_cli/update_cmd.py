@@ -121,6 +121,25 @@ def _m():
     return main
 
 
+def _activate_immutable_release() -> bool:
+    """Stage and promote the fetched checkout through the normal update receipt."""
+    from hermes_cli.immutable_releases import promote, release_sha, stage_release
+    home = get_hermes_home()
+    try:
+        sha = release_sha(_m().PROJECT_ROOT)
+        if not sha:
+            _record_update_step("immutable_release", True, "skipped: no git revision in mocked/non-git checkout")
+            return True
+        candidate, action = stage_release(_m().PROJECT_ROOT, home, sha=sha)
+        result = promote(home, candidate)
+        _record_update_step("immutable_release", True, f"{action}: {result['current']}")
+        return True
+    except Exception as exc:
+        _record_update_step("immutable_release", False, str(exc))
+        logger.exception("Immutable release staging failed; current pointer was not changed")
+        return False
+
+
 def _updates_config() -> dict:
     """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors."""
     from hermes_cli.config import load_config
@@ -1315,6 +1334,11 @@ def _finish_already_up_to_date(
             _write_gateway_update_exit_code(False)
         _finalize_receipt("partial", 'Update receipt finalize (current checkout) failed: %s')
         sys.exit(1)
+    if not _activate_immutable_release():
+        if gateway_mode:
+            _write_gateway_update_exit_code(False)
+        _finalize_receipt("partial", "Immutable release migration failed: %s")
+        sys.exit(1)
 
 
 def _apply_pulled_update(
@@ -1504,6 +1528,11 @@ def _finish_pulled_update(
         git_cmd, branch, pre_pull_sha, active_lazy_features=opts.active_lazy_features,
         active_tool_dependencies=opts.active_tool_dependencies,
         _windows_gateway_resume=_windows_gateway_resume)
+    if not _activate_immutable_release():
+        if gateway_mode:
+            _write_gateway_update_exit_code(False)
+        _finalize_receipt("partial", "Immutable release staging failed: %s")
+        sys.exit(1)
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
@@ -1565,6 +1594,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # A child spawned off hermes.exe already outwaited its parent in ``cmd_update`` (before the
     # update lock, so the lock it now holds is its own — the parent's marker left with it).
     from hermes_cli.update_handoff import adopt_handed_off_gateway_resume
+
+    if getattr(args, "rollback", False):
+        from hermes_cli.immutable_releases import rollback
+        result = rollback(get_hermes_home())
+        print(f"✓ Rolled back current release to {result['current']}")
+        restart = _restart_gateway_fleet_after_update(None, gateway_mode)
+        if getattr(restart, "incomplete", False):
+            if gateway_mode:
+                _write_gateway_update_exit_code(False)
+            sys.exit(1)
+        if gateway_mode:
+            _write_gateway_update_exit_code(True)
+        return
 
     if getattr(args, "post_swap", None):
         # Second half of a run whose pre-pull interpreter stopped at the code swap.

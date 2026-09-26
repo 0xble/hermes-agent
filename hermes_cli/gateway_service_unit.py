@@ -65,6 +65,13 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     """Build PATH directory list for service units, excluding non-existent dirs."""
     if project_root is None:
         project_root = _gw().PROJECT_ROOT
+    try:
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(_gw().get_hermes_home())
+        if release and release.is_dir():
+            project_root = release
+    except Exception:
+        pass
 
     def _is_dir(path: Path) -> bool:
         try:
@@ -93,6 +100,10 @@ def _stable_service_working_dir() -> str:
     (status=200) before Python loads, so the unit self-heal never runs and Restart=always crash-loops."""
     try:
         home = _gw().get_hermes_home()
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(Path(home))
+        if release and release.is_dir():
+            return str(release)
         if home and Path(home).is_dir():
             return str(Path(home).resolve())
     except Exception:
@@ -147,7 +158,14 @@ def _append_node_dir_for_service(path_entries: list[str], hermes_root: Path | No
 
 
 def _service_venv_dir() -> str:
-    """VIRTUAL_ENV baked into service definitions: detected venv, else ``_gw().PROJECT_ROOT/venv``."""
+    """VIRTUAL_ENV baked into service definitions, preferring the active immutable release."""
+    try:
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(_gw().get_hermes_home())
+        if release and (release / ".venv").is_dir():
+            return str(release / ".venv")
+    except Exception:
+        pass
     detected_venv = _gw()._detect_venv_dir()
     return str(detected_venv) if detected_venv else str(_gw().PROJECT_ROOT / "venv")
 

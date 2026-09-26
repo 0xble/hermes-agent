@@ -2950,6 +2950,15 @@ def _detect_venv_dir() -> Path | None:
 
 
 def get_python_path() -> str:
+    try:
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(get_hermes_home())
+        if release:
+            candidate = release / (".venv/Scripts/python.exe" if is_windows() else ".venv/bin/python")
+            if candidate.exists():
+                return str(candidate)
+    except Exception:
+        pass
     venv = _detect_venv_dir()
     if venv is not None:
         try:
