@@ -127,3 +127,16 @@ async def test_post_connect_housekeeping_warms_the_icon_catalog_only_when_auto_i
         adapter.get_forum_topic_icon_options = AsyncMock(return_value=[])
         await TelegramAdapter._run_post_connect_housekeeping(adapter)
         assert adapter.get_forum_topic_icon_options.await_count == int(enabled)
+
+
+@pytest.mark.anyio
+async def test_icon_write_clears_the_remembered_manual_icon():
+    adapter = object.__new__(TelegramAdapter)
+    adapter._manual_topic_icons = {"42:7": "user-id"}
+    adapter._auto_topic_icons_written = {}
+    adapter._bot = type("Bot", (), {"edit_forum_topic": AsyncMock()})()
+    adapter.platform = type("P", (), {"value": "telegram"})()
+    await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage")
+    assert TelegramAdapter.get_manual_topic_icon(adapter, "42", "7") == "user-id"  # name-only edit keeps it
+    await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage", icon_custom_emoji_id="auto-id")
+    assert TelegramAdapter.get_manual_topic_icon(adapter, "42", "7") is None

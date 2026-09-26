@@ -1008,3 +1008,22 @@ class TestForkTitleContracts:
         from agent.topic_icons import DEFAULT_ICON_GUIDANCE
         assert DEFAULT_ICON_GUIDANCE in prompts[0]
         assert "Use food icons only." in prompts[1] and DEFAULT_ICON_GUIDANCE not in prompts[1]
+
+
+def test_pick_topic_icon_accepts_only_catalog_icons():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from agent.title_generator import pick_topic_icon
+
+    options = [{"emoji": "📈", "custom_emoji_id": "a"}, {"emoji": "🔥", "custom_emoji_id": "b"}]
+
+    def reply(content):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    with patch("agent.title_generator.call_llm", return_value=reply('{"icon": "📈"}')):
+        assert pick_topic_icon("Quarterly Revenue", options) == "📈"
+    with patch("agent.title_generator.call_llm", return_value=reply('{"icon": "🦄"}')):
+        assert pick_topic_icon("Quarterly Revenue", options) is None
+    with patch("agent.title_generator.call_llm", side_effect=RuntimeError("down")):
+        assert pick_topic_icon("Quarterly Revenue", options) is None
