@@ -131,9 +131,11 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         raise RuntimeError(f"candidate interpreter missing: {python}")
     plugin_dir = plugin_dir or home / "plugins"
     code = (
-        "from hermes_cli.plugins import discover_plugins; "
+        "from hermes_cli.plugins import discover_plugins, get_plugin_manager; "
         "discover_plugins(); "
-        "print('plugin smoke ok')"
+        "failed = [f'{name}: {plugin.error}' for name, plugin in get_plugin_manager()._plugins.items() "
+        "if plugin.enabled and plugin.error]; "
+        "assert not failed, '; '.join(failed)"
     )
     env = os.environ.copy()
     env.update({"HERMES_HOME": str(home), "HERMES_PLUGIN_HOME": str(plugin_dir)})
