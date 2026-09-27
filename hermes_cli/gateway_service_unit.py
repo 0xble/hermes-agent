@@ -69,7 +69,7 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
         from hermes_cli.immutable_releases import resolved_release
         release = resolved_release(_gw().get_hermes_home())
         if release and release.is_dir():
-            project_root = release
+            project_root = _gw().get_hermes_home() / "current"
     except Exception:
         pass
 
@@ -80,7 +80,7 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
             return False
 
     candidates = []
-    venv_bin = project_root / "venv" / "bin"
+    venv_bin = project_root / (".venv" if (project_root / ".venv" / "bin").is_dir() else "venv") / "bin"
     if _is_dir(venv_bin):
         candidates.append(str(venv_bin))
     elif sys.prefix != sys.base_prefix:
@@ -103,7 +103,7 @@ def _stable_service_working_dir() -> str:
         from hermes_cli.immutable_releases import resolved_release
         release = resolved_release(Path(home))
         if release and release.is_dir():
-            return str(release)
+            return str(Path(home) / "current")
         if home and Path(home).is_dir():
             return str(Path(home).resolve())
     except Exception:
@@ -163,7 +163,7 @@ def _service_venv_dir() -> str:
         from hermes_cli.immutable_releases import resolved_release
         release = resolved_release(_gw().get_hermes_home())
         if release and (release / ".venv").is_dir():
-            return str(release / ".venv")
+            return str(_gw().get_hermes_home() / "current" / ".venv")
     except Exception:
         pass
     detected_venv = _gw()._detect_venv_dir()

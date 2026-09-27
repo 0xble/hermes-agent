@@ -2954,7 +2954,9 @@ def get_python_path() -> str:
         from hermes_cli.immutable_releases import resolved_release
         release = resolved_release(get_hermes_home())
         if release:
-            candidate = release / (".venv/Scripts/python.exe" if is_windows() else ".venv/bin/python")
+            # Service definitions must keep the lexical pointer: launchd resolves it
+            # afresh at each spawn, while the worker launcher pins the resolved path.
+            candidate = get_hermes_home() / "current" / (".venv/Scripts/python.exe" if is_windows() else ".venv/bin/python")
             if candidate.exists():
                 return str(candidate)
     except Exception:
