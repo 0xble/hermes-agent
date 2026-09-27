@@ -2417,10 +2417,14 @@ def _update_preflight_handled(args) -> bool:
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
     if not (PROJECT_ROOT / ".git").exists():
-        from hermes_cli.immutable_releases import source_checkout_python, update_source_checkout
-        source = update_source_checkout(get_hermes_home(), PROJECT_ROOT)
+        from hermes_cli.immutable_releases import resolved_release, source_checkout_python, update_source_checkout
+        home = get_hermes_home()
+        source = update_source_checkout(home, PROJECT_ROOT)
+        if source is None and resolved_release(home) == PROJECT_ROOT.resolve():
+            raise RuntimeError(f"Cannot resolve the source checkout for release-origin update in {home}; "
+                               "repair release-layout.json and retry.")
         if source is not None:
-            python = source_checkout_python(get_hermes_home(), source)
+            python = source_checkout_python(home, source)
             # Re-enter before acquiring the update lock or opening a receipt.
             # The release code and venv remain untouched throughout the update.
             script = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('hermes_cli.main',run_name='__main__')"

@@ -157,6 +157,22 @@ def test_source_interpreter_missing_fails_loudly(tmp_path, monkeypatch):
         main.cmd_update(object())
 
 
+def test_release_with_unreadable_migration_journal_fails_loudly(tmp_path, monkeypatch):
+    from gateway import run as gateway_run
+    from hermes_cli import main
+    home = tmp_path / "profile"
+    release = home / "releases" / "A"
+    _fake_release(release, "A")
+    releases.promote(home, release)
+    monkeypatch.setattr(gateway_run, "__file__", str(release / "gateway" / "run.py"))
+    monkeypatch.setattr(main, "PROJECT_ROOT", release)
+    monkeypatch.setattr(main, "get_hermes_home", lambda: home)
+    with pytest.raises(RuntimeError, match="repair release-layout.json"):
+        gateway_run._resolve_update_hermes_bin(home)
+    with pytest.raises(RuntimeError, match="repair release-layout.json"):
+        main.cmd_update(object())
+
+
 def test_candidate_retains_active_optional_feature_from_local_wheel(tmp_path, monkeypatch):
     import venv
     import zipfile
