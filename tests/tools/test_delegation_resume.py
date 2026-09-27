@@ -95,6 +95,18 @@ def test_running_delegation_is_not_resumable():
     assert reason == dr.INELIGIBLE_STATE
 
 
+def test_boot_limit_counts_eligible_rows_not_older_ineligible_rows():
+    for index in range(40):
+        did = _dispatch_row(f"batch-{index}", is_batch=True)
+        _mark(did, "unknown")
+    expected = [_dispatch_row(f"eligible-{index}") for index in range(3)]
+    for did in expected:
+        _mark(did, "unknown")
+    assert dr.list_boot_candidates(0) == []
+    assert [row["delegation_id"] for row in dr.list_boot_candidates(2)] == expected[:2]
+    assert [row["delegation_id"] for row in dr.list_boot_candidates()] == expected
+
+
 def test_completed_delegation_is_not_resumable():
     did = _dispatch_row("deleg_done")
     _mark(did, "completed")

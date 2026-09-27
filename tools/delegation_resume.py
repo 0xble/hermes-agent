@@ -160,8 +160,12 @@ def list_boot_candidates(limit: int = 32) -> list[Dict[str, Any]]:
     injection, after the gateway has proved that the original parent is live and
     routable. Repeated gateways therefore cannot manufacture duplicate notices.
     """
+    limit = max(0, int(limit))
+    if limit == 0:
+        return []
     ad = _ad()
     now = time.time()
+    candidates = []
     with ad._DB_LOCK, ad._transaction() as conn:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id, parent_session_id,
@@ -173,20 +177,20 @@ def list_boot_candidates(limit: int = 32) -> list[Dict[str, Any]]:
                 AND parent_session_id IS NOT NULL AND parent_session_id != ''
                 AND (auto_resume_state='none' OR
                      (auto_resume_state='claimed' AND auto_resume_claimed_at < ?))
-              ORDER BY updated_at ASC, delegation_id ASC LIMIT ?""",
-            (now - AUTO_RESUME_CLAIM_TTL_SECONDS, max(0, int(limit))),
-        ).fetchall()
-    candidates = []
-    for row in rows:
-        record = _row_to_record(row)
-        # Keep the explicit action's narrow eligibility as the single source of truth.
-        if _eligibility(record) is not None:
-            continue
-        # A boot notice needs a parent route. API sessions use origin_session_id;
-        # messaging sessions use origin_session/session_key.
-        if not (record["session_key"] or record["origin_session_id"]):
-            continue
-        candidates.append(record)
+              ORDER BY updated_at ASC, delegation_id ASC""",
+            (now - AUTO_RESUME_CLAIM_TTL_SECONDS,),
+        )
+        # Stream until the eligible result limit, not the raw-row limit. Otherwise
+        # old unresumable rows permanently starve later recoverable work on every boot.
+        for row in rows:
+            record = _row_to_record(row)
+            if _eligibility(record) is not None:
+                continue
+            if not (record["session_key"] or record["origin_session_id"]):
+                continue
+            candidates.append(record)
+            if len(candidates) >= limit:
+                break
     return candidates
 
 

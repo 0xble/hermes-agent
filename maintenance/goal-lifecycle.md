@@ -41,9 +41,15 @@ Failed or interrupted model turns do not run completion judging.
   Resolve methods_prompt against the release version without importing unrelated
   upstream refactors.
 
-- Fork patch identity: `goal-pause-race`. A completion judge re-reads the durable goal before
-  any post-judge save, so concurrent pause, clear, resume, or set commands remain authoritative.
-  Regression: `scripts/run_tests.sh -j 6 tests/hermes_cli/test_goals.py -k concurrent_goal_mutation`.
+- Fork patch identity: `goal-pause-race`. Evaluation runs on an isolated snapshot and atomically
+  compares that snapshot with the durable row before committing any verdict. Every durable
+  mutation carries a fresh token, including pause/resume cycles returning to equal values.
+  Stale evaluations and failed persistence never authorize continuation. Commands remain
+  authoritative before evaluation, during gates/judging, and at the final write boundary.
+  This completes the narrower read-before-write guard in our upstream
+  [PR #124017](https://github.com/NousResearch/hermes-agent/pull/124017).
+  Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_evaluation_atomic.py
+  tests/hermes_cli/test_goals.py tests/hermes_cli/test_goal_gates.py`.
 
 - Fork patch identity: `goal-judge-evidence`. Own fork patch, no upstream PR yet.
   The judge receives an evidence ledger: up to 8 recent non-bookkeeping tool
@@ -89,7 +95,8 @@ negative admission and failure paths. They do not contact Telegram or a live LLM
 
 Retire each patch when the accepted upstream release includes equivalent behavior
 and passes its regressions. Revert its source change to roll back. No schema or
-goal migration is introduced. Landing is not runtime promotion or activation.
+goal migration is introduced. The optional mutation token defaults empty on older rows.
+Landing is not runtime promotion or activation.
 
 The v2026.9.21 integration preserves trusted user-turn admission across upstream
 prompt metadata and compute-host changes. Title previews remain presentation data,
