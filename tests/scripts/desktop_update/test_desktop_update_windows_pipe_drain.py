@@ -112,7 +112,10 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         # how long the leaking grandchild lives. hold >> grace is what makes a
         # regression measurable rather than lucky.
         "HERMES_UPDATE_PIPE_DRAIN_SECONDS": "3",
-        "HERMES_UPDATE_STEP_IDLE_SECONDS": "3",
+        # Only the stall arm uses the short idle bound. PowerShell startup and
+        # grandchild creation in the leak arm can exceed three seconds on a
+        # loaded runner before the step emits its first byte; that is not a
+        # post-exit pipe leak. The self-test scopes the short bound to stall.
         "HERMES_SELFTEST_HOLD_SECONDS": "45",
     }
 
@@ -136,14 +139,35 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         cwd=str(REPO_ROOT),
     )
 
-    assert "PIPE-DRAIN SELF-TEST: PASS" in result.stdout, (
-        "The Windows update hand-off's step drain regressed: it either waited "
-        "on a descendant holding the pipe open (the Desktop parks on 'Updating "
-        "Hermes' forever) or metered a chatty step (backpressure on the running "
-        f"update). Fixture diagnosis follows.\n--- stdout ---\n{result.stdout}\n"
-        f"--- stderr ---\n{result.stderr}"
-    )
-    assert result.returncode == 0, (
-        f"-SelfTestPipeDrain exited {result.returncode}.\n"
-        f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    def diagnosis() -> str:
+        # The flood arm captures 8 MiB. A failure must not copy those bytes
+        # into the assertion and then into the slow hosted Windows job log.
+        def bounded(name: str, text: str) -> str:
+            data = text.encode("utf-8", errors="replace")
+            tail = data[-4096:].decode("utf-8", errors="replace")
+            return f"--- {name}: {len(data)} bytes; last 4096 bytes ---\n{tail}"
+
+        return (
+            "The Windows update hand-off's step drain regressed. "
+            "Fixture diagnosis follows.\n"
+            f"{bounded('stdout', result.stdout)}\n"
+            f"{bounded('stderr', result.stderr)}"
+        )
+
+    # pytest's assert introspection would also render the entire 8 MiB stdout
+    # operand; fail explicitly so only the bounded diagnosis is reported.
+    if "PIPE-DRAIN SELF-TEST: PASS" not in result.stdout:
+        pytest.fail(diagnosis(), pytrace=False)
+    if result.returncode != 0:
+        pytest.fail(
+            f"-SelfTestPipeDrain exited {result.returncode}.\n{diagnosis()}",
+            pytrace=False,
+        )
+    if len(result.stdout.encode("utf-8", errors="replace")) >= 65536:
+        pytest.fail(f"Fixture replayed excessive output to its host.\n{diagnosis()}", pytrace=False)
+    if "pipeflood|" in result.stdout:
+        pytest.fail(f"Fixture replayed flood content to its host.\n{diagnosis()}", pytrace=False)
+    handoff_log = tmp_path / "logs" / "desktop-update-handoff.log"
+    assert handoff_log.stat().st_size >= 8192 * 1024, (
+        "Flood output was not preserved in the durable hand-off log"
     )
