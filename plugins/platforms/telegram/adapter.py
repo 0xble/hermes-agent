@@ -3063,6 +3063,8 @@ class TelegramAdapter(BasePlatformAdapter):
             if written is None:
                 written = self._auto_topic_icons_written = {}
             written[f"{chat_id}:{int(thread_id)}"] = str(icon_custom_emoji_id)
+            # The topic now shows the icon Hermes wrote, so any earlier manual choice no longer applies.
+            getattr(self, "_manual_topic_icons", {}).pop(f"{chat_id}:{int(thread_id)}", None)
         logger.info("[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'", self.name, chat_id, thread_id, name)
         return True
 
