@@ -96,13 +96,56 @@ def test_prepare_venv_changed_lock_builds_fresh(tmp_path, monkeypatch):
     assert called == [new]
 
 
-def test_prepare_venv_identical_lock_copies_without_symlink(tmp_path, monkeypatch):
+def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch):
     old, new = tmp_path / "old", tmp_path / "new"
     _fake_release(old, "same", lock="same")
     _fake_release(new, "same", lock="same")
-    monkeypatch.setattr(releases, "_python_version", lambda _python: "3.13.0")
-    monkeypatch.setattr(sys, "executable", str(old / ".venv" / "bin" / "python"))
+    called = []
+    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv": called.append(release))
     _target, mode = releases.prepare_venv(new, old)
-    assert mode == "cloned"
-    assert not (new / ".venv").is_symlink()
-    assert not (new / ".venv" / "bin" / "python").is_symlink()
+    assert mode == "built"
+    assert called == [new]
+
+
+def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
+    home = tmp_path / "profile"
+    release_paths = [home / "releases" / str(i) for i in range(9)]
+    for i, path in enumerate(release_paths):
+        _fake_release(path, str(i))
+        os.utime(path, (i, i))
+    releases.promote(home, release_paths[8])
+    releases.promote(home, release_paths[7])
+    receipts = home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "recovery.json").write_text(json.dumps({"release_path": str(release_paths[1])}))
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=release_paths[0])
+    try:
+        import psutil
+        assert Path(psutil.Process(worker.pid).cwd()).resolve() == release_paths[0].resolve()
+        assert release_paths[0].resolve() in releases._live_process_pins(home)
+        removed = releases.retain(home)
+        assert release_paths[0].exists() and release_paths[1].exists()
+        assert release_paths[8].exists() and release_paths[7].exists()
+        assert len([path for path in release_paths[2:7] if path.exists()]) >= 3
+        assert release_paths[0] not in removed and release_paths[1] not in removed
+    finally:
+        worker.terminate()
+        worker.wait(timeout=5)
+
+
+def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profile(tmp_path):
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "candidate-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [candidate-test]\n")
+    (plugin / "plugin.yaml").write_text("name: candidate-test\nversion: '1.0'\n")
+    source = Path(__file__).resolve().parents[2]
+    (plugin / "__init__.py").write_text(
+        "from hermes_cli.symbol_that_does_not_exist import broken\n"
+    )
+    with pytest.raises(RuntimeError, match="candidate plugin smoke failed"):
+        releases.smoke_plugins(source, home)
+    assert not (home / "logs").exists()
+    (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
+    releases.smoke_plugins(source, home)
+    assert not (home / "logs").exists()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import shutil
 import subprocess
 import sys
@@ -99,29 +100,9 @@ def _build_venv(release: Path, *, uv: str = "uv") -> None:
 
 
 def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv") -> tuple[Path, str]:
-    """Create a private venv; clone only for an exact dependency/interpreter match.
-
-    The clone is a physical copy, never a symlink.  The old release is therefore
-    immutable while its processes continue to run.
-    """
-    target = release / ".venv"
-    old_digest = _content_digest(previous) if previous else None
-    new_digest = _content_digest(release)
-    old_python = _release_python(previous) if previous is not None else None
-    can_clone = bool(previous is not None and old_python is not None and old_python.exists() and old_digest == new_digest)
-    if can_clone:
-        assert old_python is not None
-        try:
-            can_clone = _python_version(old_python) == _python_version(Path(sys.executable))
-        except (OSError, subprocess.CalledProcessError):
-            can_clone = False
-    if can_clone:
-        assert old_python is not None
-        shutil.rmtree(target, ignore_errors=True)
-        shutil.copytree(old_python.parent.parent, target, symlinks=True)
-        return target, "cloned"
+    """Build at the final release path: venv scripts and metadata are not relocatable."""
     _build_venv(release, uv=uv)
-    return target, "built"
+    return release / ".venv", "built"
 
 
 def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) -> None:
@@ -130,20 +111,55 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
     if not python.exists():
         raise RuntimeError(f"candidate interpreter missing: {python}")
     plugin_dir = plugin_dir or home / "plugins"
-    code = (
-        "from hermes_cli.plugins import discover_plugins, get_plugin_manager; "
-        "discover_plugins(); "
-        "failed = [f'{name}: {plugin.error}' for name, plugin in get_plugin_manager()._plugins.items() "
-        "if plugin.enabled and plugin.error]; "
-        "assert not failed, '; '.join(failed)"
-    )
-    env = os.environ.copy()
-    env.update({"HERMES_HOME": str(home), "HERMES_PLUGIN_HOME": str(plugin_dir)})
-    result = subprocess.run([str(python), "-c", code], cwd=release, env=env,
-                            capture_output=True, text=True)
-    if result.returncode:
-        detail = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"candidate plugin smoke failed: {detail}")
+    # Never let an import probe run against the real profile: plugin module bodies are
+    # arbitrary Python, even when register() itself is deliberately not called.
+    with tempfile.TemporaryDirectory(prefix="hermes-plugin-smoke-") as sandbox:
+        isolated = Path(sandbox)
+        if (home / "config.yaml").exists():
+            shutil.copy2(home / "config.yaml", isolated / "config.yaml")
+        if plugin_dir.exists():
+            if any(path.is_symlink() for path in plugin_dir.rglob("*")):
+                raise RuntimeError("plugin smoke refuses symlinks in shared plugin tree")
+            shutil.copytree(plugin_dir, isolated / "plugins")
+        env = os.environ.copy()
+        env.update({"HERMES_HOME": str(isolated), "PYTHONDONTWRITEBYTECODE": "1"})
+        env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
+        result = subprocess.run(
+            [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
+            cwd=release, env=env, capture_output=True, text=True, timeout=90,
+        )
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(f"candidate plugin smoke failed: {detail}")
+
+
+def _smoke_imports() -> None:
+    """Import enabled directory plugins without invoking their register() methods."""
+    from hermes_cli.config import load_config
+    from hermes_cli.plugins import get_plugin_manager
+    from hermes_cli.plugins_discovery import scan_directory, gate_manifest
+    config = load_config() or {}
+    plugin_config = config.get("plugins") or {}
+    enabled = plugin_config.get("enabled")
+    enabled = set(enabled) if enabled is not None else None
+    disabled = set(plugin_config.get("disabled") or ())
+    manager = get_plugin_manager()
+    for manifest in scan_directory(Path(os.environ["HERMES_HOME"]) / "plugins", "user"):
+        gate = gate_manifest(manifest, disabled, enabled)
+        if gate.action == "placeholder" and not gate.enabled:
+            if enabled and (manifest.name in enabled or manifest.key in enabled):
+                raise RuntimeError(f"enabled plugin {manifest.name}: {gate.error}")
+            continue
+        if gate.action not in {"load", "load_now"}:
+            continue
+        if manifest.source == "entrypoint":
+            manager._load_entrypoint_module(manifest)
+        else:
+            manager._load_directory_module(manifest)
+
+
+if __name__ == "__main__" and "--smoke-imports" in sys.argv:
+    _smoke_imports()
 
 
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
@@ -151,18 +167,26 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
-    if target.exists():
+    if target.exists() and (target / ".release-ready").exists():
+        smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
         return target, "existing"
     paths.releases.mkdir(parents=True, exist_ok=True)
     staging = paths.releases / f".{sha}.staging-{os.getpid()}"
+    published = False
     try:
         _copy_tree(source, staging)
-        previous = read_pointer(paths.current)
-        prepare_venv(staging, previous=previous, uv=uv)
-        smoke_plugins(staging, paths.home, plugin_dir=plugin_dir)
+        if target.exists():
+            # A crashed build never becomes an apparently usable release.
+            shutil.rmtree(target)
         os.replace(staging, target)
+        published = True
+        prepare_venv(target, previous=read_pointer(paths.current), uv=uv)
+        smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
+        (target / ".release-ready").write_text(sha + "\n")
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
+        if published:
+            shutil.rmtree(target, ignore_errors=True)
         raise
     return target, "staged"
 
@@ -189,6 +213,11 @@ def _receipt_pins(home: Path) -> set[Path]:
         raw = data.get("release") or data.get("release_path")
         if raw:
             pins.add(Path(raw).resolve())
+        for step in data.get("steps", []):
+            if isinstance(step, dict):
+                for field in ("release", "release_path"):
+                    if step.get(field):
+                        pins.add(Path(step[field]).resolve())
     return pins
 
 
@@ -198,12 +227,14 @@ def _live_process_pins(home: Path) -> set[Path]:
     root = (home / "releases").resolve()
     try:
         import psutil
-        for proc in psutil.process_iter(["cmdline", "environ"]):
+        for proc in psutil.process_iter(["cmdline", "environ", "cwd", "exe"]):
             try:
                 env = proc.info.get("environ") or {}
                 values = list(env.values()) + list(proc.info.get("cmdline") or [])
+                values.extend([proc.info.get("cwd"), proc.info.get("exe")])
             except (psutil.Error, OSError):
-                continue
+                # Unknown process identity cannot justify deleting a release.
+                return {p.resolve() for p in root.iterdir() if p.is_dir()}
             for value in values:
                 if not isinstance(value, str):
                     continue
@@ -213,7 +244,7 @@ def _live_process_pins(home: Path) -> set[Path]:
                     if relative.parts:
                         pins.add(root / relative.parts[0])
     except ImportError:
-        return pins
+        return {p.resolve() for p in root.iterdir() if p.is_dir()}
     return pins
 
 
@@ -224,7 +255,9 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     keep = {p.resolve() for p in (read_pointer(paths.current), read_pointer(paths.previous)) if p}
     keep.update(p.resolve() for p in extra_pins)
     keep.update(_live_process_pins(paths.home))
-    keep.update(p.resolve() for p in releases[: rollback_count + 2])
+    keep.update(_receipt_pins(paths.home))
+    current_previous = {p.resolve() for p in (read_pointer(paths.current), read_pointer(paths.previous)) if p}
+    keep.update(p.resolve() for p in [p for p in releases if p.resolve() not in current_previous][:rollback_count])
     removed = []
     for release in releases:
         if release.resolve() in keep:
