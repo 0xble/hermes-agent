@@ -138,6 +138,10 @@ class PortableGateTests(unittest.TestCase):
             }
             with patch.dict(os.environ, poisoned, clear=True), patch.object(ci, 'STATE', state):
                 env = ci.environment(state / 'isolated')
+                self.assertNotIn('RUSTUP_HOME', env)
+                (state / 'rustup').mkdir()
+                env_with_rustup = ci.environment(state / 'isolated-rust')
+                self.assertEqual(env_with_rustup['RUSTUP_HOME'], str(state / 'rustup'))
             for key in ('OPENAI_API_KEY', 'PYTEST_PLUGINS', 'HERMES_TEST_PATHS', 'HERMES_TEST_SLICE', 'NODE_OPTIONS'):
                 self.assertNotIn(key, env)
             self.assertEqual(env['HOME'], str(state / 'isolated'))
@@ -153,6 +157,30 @@ class PortableGateTests(unittest.TestCase):
                 env=env, text=True,
             ).splitlines()
             self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
+
+    def test_windows_appdata_stays_inside_isolated_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / 'isolated'
+            result = ci.windows_appdata_environment(home)
+            self.assertEqual(result, {
+                'LOCALAPPDATA': str(home / 'AppData' / 'Local'),
+                'APPDATA': str(home / 'AppData' / 'Roaming'),
+                'PSModuleAnalysisCachePath': str(home / 'AppData' / 'Local' / 'Microsoft' / 'Windows' / 'PowerShell' / 'ModuleAnalysisCache'),
+            })
+            self.assertTrue(Path(result['LOCALAPPDATA']).is_dir())
+            self.assertTrue(Path(result['APPDATA']).is_dir())
+
+    def test_msvc_linker_environment_rejects_git_link_and_retains_sdk_libraries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory) / 'VC/Tools/MSVC/14.51'
+            linker = tools / 'bin/Hostx64/x64/link.exe'
+            with self.assertRaisesRegex(RuntimeError, 'MSVC linker missing'):
+                ci.msvc_linker_environment(tools, {'PATH': '/git/usr/bin', 'LIB': 'sdk'})
+            linker.parent.mkdir(parents=True)
+            linker.touch()
+            env = ci.msvc_linker_environment(tools, {'PATH': '/git/usr/bin', 'LIB': 'sdk', 'INCLUDE': 'headers'})
+            self.assertEqual(env, {'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER': str(linker),
+                                   'LIB': 'sdk', 'INCLUDE': 'headers'})
 
     def test_python_file_runner_preserves_only_isolated_git_config(self):
         # The shell runner clears its environment before spawning pytest. The
@@ -334,6 +362,28 @@ try {
         with patch.object(ci.subprocess, 'check_output', return_value='v0.0.0\n'):
             with self.assertRaisesRegex(RuntimeError, 'require'):
                 ci.require_tools(('node',), {})
+
+    def test_windows_npm_cmd_is_resolved_for_version_check_and_execution(self):
+        with patch.object(ci.os, 'name', 'nt'), \
+                patch.object(ci.shutil, 'which', return_value='C:\\node\\npm.cmd') as which, \
+                patch.object(ci.subprocess, 'check_output', return_value='12.0.0\n') as check, \
+                patch.object(ci.subprocess, 'run') as execute:
+            env = {'PATH': 'C:\\node'}
+            ci.require_tools(('npm',), env)
+            ci.run(['npm', 'ci'], env=env)
+            which.assert_any_call('npm.cmd', path=env['PATH'])
+            self.assertEqual(check.call_args.args[0], ['C:\\node\\npm.cmd', '--version'])
+            self.assertEqual(execute.call_args.args[0], ['C:\\node\\npm.cmd', 'ci'])
+
+    def test_windows_checkout_owned_executable_resolves_against_child_path(self):
+        with patch.object(ci.os, 'name', 'nt'), \
+                patch.object(ci.shutil, 'which', side_effect=[None, 'D:\\checkout\\.ci\\toolchain\\bin\\rg.exe']) as which, \
+                patch.object(ci.subprocess, 'check_output', return_value='ripgrep 15.1.0\n') as check:
+            env = {'PATH': 'D:\\checkout\\.ci\\toolchain\\bin'}
+            ci.require_tools(('rg',), env)
+            self.assertEqual(which.call_args_list[0].args, ('rg',))
+            self.assertEqual(which.call_args_list[1].args, ('rg.exe',))
+            self.assertEqual(check.call_args.args[0][0], 'D:\\checkout\\.ci\\toolchain\\bin\\rg.exe')
 
     def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
