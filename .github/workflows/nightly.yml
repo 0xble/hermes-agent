@@ -99,10 +99,7 @@ jobs:
           rustup default 1.96.1
       - name: Qualify native OS at exact SHA
         shell: bash
-        run: |
-          git status --short
-          git diff --numstat
-          ./bin/ci nightly-native '${{ github.sha }}'
+        run: ./bin/ci nightly-native '${{ github.sha }}'
   desktop-core:
     # The deterministic Desktop core E2E suite (transcript integrity, backend
     # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.

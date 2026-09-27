@@ -335,6 +335,18 @@ try {
             with self.assertRaisesRegex(RuntimeError, 'require'):
                 ci.require_tools(('node',), {})
 
+    def test_windows_npm_cmd_is_resolved_for_version_check_and_execution(self):
+        with patch.object(ci.os, 'name', 'nt'), \
+                patch.object(ci.shutil, 'which', return_value='C:\\node\\npm.cmd') as which, \
+                patch.object(ci.subprocess, 'check_output', return_value='12.0.0\n') as check, \
+                patch.object(ci.subprocess, 'run') as execute:
+            env = {'PATH': 'C:\\node'}
+            ci.require_tools(('npm',), env)
+            ci.run(['npm', 'ci'], env=env)
+            which.assert_any_call('npm.cmd', path=env['PATH'])
+            self.assertEqual(check.call_args.args[0], ['C:\\node\\npm.cmd', '--version'])
+            self.assertEqual(execute.call_args.args[0], ['C:\\node\\npm.cmd', 'ci'])
+
     def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             toolchain = Path(directory) / 'toolchain'

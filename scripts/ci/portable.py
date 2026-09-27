@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / '.ci'
@@ -84,7 +84,15 @@ def preflight() -> None:
 
 
 
+def windows_command(name: str, env: Mapping[str, str]) -> str:
+    # CreateProcess does not apply PATHEXT to a bare npm name; Node ships npm.cmd.
+    if os.name == 'nt' and name == 'npm':
+        return shutil.which('npm.cmd', path=env.get('PATH')) or 'npm.cmd'
+    return name
+
+
 def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
+    argv = [windows_command(argv[0], env or os.environ), *argv[1:]]
     print('+ ' + ' '.join(map(str, argv)), flush=True)
     subprocess.run(argv, cwd=cwd, env=env, check=True)
 
@@ -160,7 +168,7 @@ def environment(home: Path) -> dict[str, str]:
 
 def require_tools(names: tuple[str, ...], env: dict[str, str]) -> None:
     for name in names:
-        output = subprocess.check_output([name, '--version'], env=env, text=True, encoding='utf-8', errors='replace')
+        output = subprocess.check_output([windows_command(name, env), '--version'], env=env, text=True, encoding='utf-8', errors='replace')
         match = re.search(r'(?<!\d)(\d+\.\d+\.\d+)\b', output)
         if not match or match.group(1) != PINS[name]:
             raise RuntimeError(f'{name}: require {PINS[name]}, found {output.strip()} (see scripts/ci/toolchain.json)')
