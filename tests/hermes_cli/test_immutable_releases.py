@@ -255,8 +255,9 @@ def test_active_locked_extra_is_passed_to_frozen_uv_sync(tmp_path, monkeypatch):
     assert extras == ["messaging"]
     calls = []
     monkeypatch.setattr(releases.subprocess, "run", lambda argv, **kwargs: calls.append(argv))
-    releases._build_venv(project, extras=extras)
+    releases._build_venv(project, extras=extras, python=Path(sys.executable))
     assert calls[0][-2:] == ["--extra", "messaging"]
+    assert calls[0][calls[0].index("--python") + 1] == sys.executable
     assert "--frozen" in calls[0]
 
 
@@ -679,7 +680,7 @@ def test_prepare_venv_changed_lock_builds_fresh(tmp_path, monkeypatch):
     _fake_release(old, "old", lock="old")
     _fake_release(new, "new", lock="new")
     called = []
-    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv", extras=(): called.append(release))
+    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv", extras=(), python=None: called.append(release))
     _target, mode = releases.prepare_venv(new, old)
     assert mode == "built"
     assert called == [new]
@@ -690,7 +691,7 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     _fake_release(old, "same", lock="same")
     _fake_release(new, "same", lock="same")
     called = []
-    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv", extras=(): called.append(release))
+    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv", extras=(), python=None: called.append(release))
     _target, mode = releases.prepare_venv(new, old)
     assert mode == "built"
     assert called == [new]

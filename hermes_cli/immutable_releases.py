@@ -254,8 +254,9 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
     return sorted(selected)
 
 
-def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = ()) -> None:
-    cmd = [uv, "sync", "--frozen", "--python", sys.executable]
+def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = (),
+                python: Path | None = None) -> None:
+    cmd = [uv, "sync", "--frozen", "--python", str(python or sys.executable)]
     for extra in extras:
         cmd.extend(("--extra", extra))
     subprocess.run(cmd, cwd=release, env=_release_subprocess_env(release), check=True)
@@ -330,7 +331,7 @@ def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
         extras = _active_locked_extras(source_python, release)
     else:
         extras = []
-    _build_venv(release, uv=uv, extras=extras)
+    _build_venv(release, uv=uv, extras=extras, python=source_python)
     if source is not None:
         restore_active_distributions(source, release, uv=uv, source_python=source_python)
     return release / ".venv", "built"
