@@ -3159,6 +3159,7 @@ def _run_one_job_body(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
     delivery_attempted = False
     delivery_error = None
+    committed = False
     from agent.secret_scope import (
         build_profile_secret_scope, reset_secret_scope, set_secret_scope)
 
@@ -3243,13 +3244,6 @@ def _run_one_job_body(
             _teardown_deferred()
             raise
 
-        # The detached worker must win against the watchdog before any result
-        # side effect, including output writes and delivery enqueue. Claiming at
-        # final finish_execution is too late: descendant teardown can take 3s.
-        if hard_wall_fence is not None and not hard_wall_fence.claim_completion():
-            _teardown_deferred()
-            return False
-
         if _fire_claim_ownership_lost():
             _teardown_deferred()
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
@@ -3263,6 +3257,22 @@ def _run_one_job_body(
             marker_error = _cron_failure_marker_error(final_response)
             if marker_error is not None:
                 success, error, agent_declared = False, marker_error, True
+
+        if hard_wall_fence is not None:
+            # The execution ledger is the sole completion/timeout arbiter. Commit
+            # the final run result before output, notification, or agent teardown.
+            if success and _is_interrupted(job["id"], execution_token):
+                success = False
+                error = "Interrupted by gateway shutdown before the run finished."
+            if success and not final_response.strip():
+                success = False
+                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            if finish_execution(execution_id, success=success, error=error,
+                                require_running=True) is None:
+                # The watchdog already committed failed(timeout); even teardown
+                # can hang, so leave it to the watchdog's bounded cleanup.
+                return False
+            committed = True
 
         # Agent is still live through delivery; wrap ALL of save/compose/deliver in try/finally so a
         # raise anywhere still tears the deferred agent down.
@@ -3327,10 +3337,14 @@ def _run_one_job_body(
         # and no error. Owner fencing still applies: a stale worker must not record over a replacement claim
         # owner.
         _err_text = str(e) or type(e).__name__
-        if hard_wall_fence is not None and not hard_wall_fence.claim_completion():
-            # Timeout already owns the terminal result; no failure/success notice
-            # or job-store bookkeeping may be written by this losing thread.
+        if committed:
+            logger.error("Cron post-commit side effect failed for job %s: %s", job["id"], _err_text)
             return False
+        if hard_wall_fence is not None:
+            if finish_execution(execution_id, success=False, error=_err_text,
+                                require_running=True) is None:
+                return False
+            committed = True
         logger.error(
             "Error processing job %s: %s",
             job["id"],

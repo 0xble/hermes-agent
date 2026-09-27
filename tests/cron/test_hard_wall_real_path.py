@@ -45,11 +45,19 @@ def traced_mark(*args, **kwargs):
     Path(marker).write_text('mark returned')
     return result
 scheduler.mark_job_run = traced_mark
+if mode == 'commit-in-flight':
+    original_finish = scheduler.finish_execution
+    def slow_finish(*args, **kwargs):
+        if kwargs.get('require_running'):
+            Path(marker).write_text('completion entered; commit not started')
+            time.sleep(float(wall) * 2)
+        return original_finish(*args, **kwargs)
+    scheduler.finish_execution = slow_finish
 if mode == 'completion-in-flight':
     original = scheduler.save_job_output
     def slow_save(*args, **kwargs):
         Path(marker).write_text('completion claimed; persistence entered')
-        time.sleep(float(wall) * 1.5)
+        time.sleep(float(wall) * 3)
         return original(*args, **kwargs)
     scheduler.save_job_output = slow_save
 result = scheduler.run_one_job(job, hard_wall_fence=fence)
@@ -132,17 +140,24 @@ def test_completion_wins_and_persists_result_before_wall(tmp_path):
 
 
 @pytest.mark.macos_only
-def test_completion_claimed_before_wall_cannot_be_killed_mid_persistence(tmp_path):
-    # Regression (c): the watchdog used to exit 1 while completion held its
-    # claim but was saving output, leaving the SQLite execution row running.
+def test_completion_commits_then_teardown_hangs_past_cap_plus_grace(tmp_path):
     code, row, queued, stored, outputs, recovered, out, err, marker = _run(
         tmp_path, "completion-in-flight")
-    assert code == 0, (code, row["status"], row["error"],
-                       marker.read_text() if marker.exists() else None, out, err)
-    assert row["status"] == "completed" and row["error"] is None, (row['error'], stored.get('last_status'), err)
-    assert queued is not None and queued["status"] == "pending"
-    assert len(outputs) == 1
-    assert stored["last_status"] in ("ok", "delivery_queued")
+    assert code == 0, (code, row["status"], row["error"], err)
+    assert row["status"] == "completed" and row["error"] is None
+    assert queued is None and outputs == []
+    assert "persistence entered" in marker.read_text()
+    assert recovered == 0
+
+
+@pytest.mark.macos_only
+def test_completion_not_committed_at_cap_timeout_wins(tmp_path):
+    code, row, queued, stored, outputs, recovered, out, err, marker = _run(
+        tmp_path, "commit-in-flight")
+    assert code == 124, (code, row["status"], row["error"], err)
+    assert row["status"] == "failed" and "hard wall-clock timeout" in row["error"]
+    assert queued is None and outputs == []
+    assert "commit not started" in marker.read_text()
     assert recovered == 0
 
 

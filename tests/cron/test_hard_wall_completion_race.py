@@ -8,27 +8,8 @@ from pathlib import Path
 import pytest
 
 from cron import delivery_queue, executions
-from cron.scheduler_detached_worker import HardWallFence
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-
-def test_losing_scheduler_completion_skips_success_delivery_and_bookkeeping(monkeypatch):
-    """The actual run_one_job boundary must consult the shared fence before delivery."""
-    from cron import scheduler
-
-    calls = []
-    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_: True)
-    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_: {"status": "running"})
-    monkeypatch.setattr(scheduler, "run_job", lambda *a, **kw: (True, "out", "success", None))
-    monkeypatch.setattr(scheduler, "save_job_output", lambda *a, **kw: calls.append("save"))
-    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **kw: calls.append("deliver"))
-    monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **kw: calls.append("mark"))
-    monkeypatch.setattr(scheduler, "finish_execution", lambda *a, **kw: calls.append("finish"))
-    fence = HardWallFence()
-    fence.timed_out = True  # watchdog already committed its running->failed CAS
-    job = {"id": "race", "name": "race", "execution_id": "claimed-by-watchdog"}
-    assert scheduler.run_one_job(job, hard_wall_fence=fence) is False
-    assert calls == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires POSIX SIGTERM handling")
@@ -74,9 +55,8 @@ def complete():
             if open(marker).read() == 'signaled': break
             time.sleep(.005)
         else: raise RuntimeError('watchdog did not begin descendant cleanup')
-    if fence.claim_completion():
+    if executions.finish_execution(run, success=True, require_running=True) is not None:
         delivery_queue.enqueue(run, {'id': 'race'}, 'SUCCESS')
-        assert executions.finish_execution(run, success=True) is not None
 thread = threading.Thread(target=complete)
 thread.start()
 thread.join(timeout=4)

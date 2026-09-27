@@ -335,7 +335,9 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?,
+                   delivery_status=CASE WHEN owner_kind='detached' AND delivery_status IS NULL
+                                        THEN 'unknown' ELSE delivery_status END
                WHERE id=? AND status IN ('claimed','running')
                  AND (?=0 OR status='running')
                  AND process_id=? AND pid=?""",
@@ -463,8 +465,9 @@ def record_delivery_status(execution_id: str, status: str) -> None:
         conn.execute(
             "UPDATE executions SET delivery_status=? WHERE id=? "
             "AND (delivery_status IS NULL OR delivery_status NOT IN "
-            "('delivered','failed','unknown','suppressed'))",
-            (status, execution_id),
+            "('delivered','failed','suppressed') AND "
+            "(delivery_status!='unknown' OR ?='pending'))",
+            (status, execution_id, status),
         )
 
 

@@ -63,24 +63,13 @@ def _terminate_owned_descendants(pid: int, started_at: int) -> bool:
 
 
 class HardWallFence:
-    """Serialize completion's side effects against the watchdog's durable timeout CAS."""
+    """Lifetime timer only; the SQLite execution row is the sole result fence."""
 
     def __init__(self) -> None:
         self.stopped = threading.Event()
-        self.lock = threading.Lock()
-        self.timed_out = False
-        self.completion_claimed = False
 
     def set(self) -> None:
         self.stopped.set()
-
-    def claim_completion(self) -> bool:
-        """Claim before saving output or enqueuing/sending a result."""
-        with self.lock:
-            if self.timed_out:
-                return False
-            self.completion_claimed = True
-            return True
 
 
 def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> HardWallFence:
@@ -102,20 +91,17 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
         try:
             timeout_won = False
             try:
-                # Claim timeout BEFORE descendant teardown. A completion claim
-                # fences the result, never disarms the process lifetime cap.
-                with fence.lock:
-                    if not fence.completion_claimed and _owner_identity(pid, fingerprint) == "live":
-                        timeout_won = finish_execution(
-                            execution_id, success=False,
-                            error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
-                            require_running=True,
-                        ) is not None
-                        if timeout_won:
-                            fence.timed_out = True
+                if _owner_identity(pid, fingerprint) == "live":
+                    timeout_won = finish_execution(
+                        execution_id, success=False,
+                        error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+                        require_running=True,
+                    ) is not None
+                # The terminal winner can enqueue and tear down, but cannot hold
+                # this process indefinitely. Derived from the configured wall cap.
+                if not timeout_won:
+                    fence.stopped.wait(min(60.0, max(1.0, seconds)))
             finally:
-                # Cleanup is best effort, including when ledger I/O fails; never
-                # let an inaccessible child keep the abandoned worker alive.
                 try:
                     _terminate_owned_descendants(pid, fingerprint)
                 finally:
@@ -125,8 +111,15 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
                             record = get_execution(execution_id)
                             if record and record["status"] == "completed":
                                 exit_code = 0
+                            elif record and record["status"] == "running":
+                                # Database errors on the first claim must not strand
+                                # the row while the worker is being killed.
+                                finish_execution(
+                                    execution_id, success=False,
+                                    error="Detached cron worker could not complete before termination.",
+                                    require_running=True)
                         except Exception:
-                            pass  # no durable terminal result can be proven
+                            pass
                     os._exit(exit_code)
         finally:
             reset_hermes_home_override(home_token)
