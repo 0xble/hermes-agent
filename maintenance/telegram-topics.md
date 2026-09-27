@@ -64,7 +64,8 @@ its optional icon, and the durable alias can be observed through one Telegram to
 
 - **Identity and status:** active fork adaptations `slice-15-title-config`,
   `slice-16-topic-icons`, `slice-17-topic-lineage`, `slice-9-telegram-topic-edit`, and
-  `title-concurrent-endpoint`.
+  `title-concurrent-endpoint`. The audit follow-up commit uses the owned identity
+  `slice-7-aux-title-routing` for endpoint normalization and conflicting capacity declarations.
 - **Source / fork refs:** baseline upstream release `v2026.9.14`, fork base
   `origin/main` `a0f8f3996dae`; source designs are NousResearch/hermes-agent PR
   [#66353](https://github.com/NousResearch/hermes-agent/pull/66353) and the
