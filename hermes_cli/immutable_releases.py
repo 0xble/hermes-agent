@@ -175,7 +175,10 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
     from packaging.utils import canonicalize_name
     from packaging.markers import default_environment
 
-    groups = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))["project"].get("optional-dependencies", {})
+    project_data = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+    groups = project_data["project"].get("optional-dependencies", {})
+    lock = tomllib.loads((project / "uv.lock").read_text(encoding="utf-8"))
+    packages = {canonicalize_name(p["name"]): p for p in lock["package"]}
     installed = set(_active_distributions(source_python))
     declared: dict[str, set[str]] = {}
     for extra, requirements in groups.items():
@@ -192,8 +195,51 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
             declared[extra] = direct
     unique = {name for extra, names in declared.items() for name in names
               if sum(name in other for other in declared.values()) == 1}
-    return sorted(extra for extra, names in declared.items()
-                  if names <= installed or bool(names & installed & unique))
+    selected = {extra for extra, names in declared.items()
+                if names <= installed or bool(names & installed & unique)}
+
+    def closure(extra: str) -> set[str]:
+        pending = list(declared[extra])
+        seen: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for dep in packages.get(name, {}).get("dependencies", []):
+                pending.append(canonicalize_name(dep["name"]))
+        return seen
+
+    closure_by_extra = {extra: closure(extra) for extra in declared}
+    covered = set().union(*(closure_by_extra[e] for e in selected)) if selected else set()
+    # A source may retain a locked transitive dependency after its parent was
+    # removed. Bring it in through its lockfile extra, never an unpinned pip restore.
+    remaining = (installed & packages.keys()) - covered - {"hermes-agent"}
+    base = set()
+    for req in project_data["project"].get("dependencies", []):
+        dep = Requirement(req)
+        if dep.marker is None or dep.marker.evaluate():
+            base.add(canonicalize_name(dep.name))
+    pending = list(base)
+    while pending:
+        name = pending.pop()
+        if name in base and name not in packages:
+            continue
+        for dep in packages.get(name, {}).get("dependencies", []):
+            child = canonicalize_name(dep["name"])
+            if child not in base:
+                base.add(child)
+                pending.append(child)
+    remaining -= base
+    while remaining:
+        options = [(len(remaining & names), extra) for extra, names in closure_by_extra.items()
+                   if extra not in selected]
+        count, extra = max(options, default=(0, ""))
+        if not count:
+            break  # subsequent parity check names every uncovered distribution
+        selected.add(extra)
+        remaining -= closure_by_extra[extra]
+    return sorted(selected)
 
 
 def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = ()) -> None:
@@ -709,6 +755,11 @@ def update_source_checkout(home: Path, running_root: Path) -> Path | None:
 def detached_worker_env(home: Path, release: Path, base: dict[str, str] | None = None) -> dict[str, str]:
     """Pin worker executable/cwd/import path to a resolved release, not ``current``."""
     env = dict(base or os.environ)
-    env.update({"HERMES_RELEASE": str(release.resolve()),
-                "PYTHONPATH": str(release.resolve()) + os.pathsep + env.get("PYTHONPATH", "")})
+    root = release.resolve()
+    venv = root / ".venv"
+    binary = str(venv / ("Scripts" if os.name == "nt" else "bin"))
+    previous = env.get("PATH", "").split(os.pathsep)
+    env.update({"HERMES_RELEASE": str(root), "VIRTUAL_ENV": str(venv),
+                "PATH": os.pathsep.join([binary] + [p for p in previous if p and p != binary]),
+                "PYTHONPATH": str(root) + os.pathsep + env.get("PYTHONPATH", "")})
     return env

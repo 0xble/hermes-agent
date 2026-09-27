@@ -634,7 +634,7 @@ def test_prepare_venv_changed_lock_builds_fresh(tmp_path, monkeypatch):
     _fake_release(old, "old", lock="old")
     _fake_release(new, "new", lock="new")
     called = []
-    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv": called.append(release))
+    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv", extras=(): called.append(release))
     _target, mode = releases.prepare_venv(new, old)
     assert mode == "built"
     assert called == [new]
@@ -645,7 +645,7 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     _fake_release(old, "same", lock="same")
     _fake_release(new, "same", lock="same")
     called = []
-    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv": called.append(release))
+    monkeypatch.setattr(releases, "_build_venv", lambda release, uv="uv", extras=(): called.append(release))
     _target, mode = releases.prepare_venv(new, old)
     assert mode == "built"
     assert called == [new]
