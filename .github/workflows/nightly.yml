@@ -72,6 +72,10 @@ jobs:
       OPENAI_API_KEY: ''
       NOUS_API_KEY: ''
     steps:
+      - name: Keep Windows checkout LF under isolated Git config
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -100,6 +104,12 @@ jobs:
       - name: Qualify native OS at exact SHA
         shell: bash
         run: ./bin/ci nightly-native '${{ github.sha }}'
+      - name: Diagnose Windows checkout if native qualification fails
+        if: failure() && matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          git status --short
+          git diff --numstat
   desktop-core:
     # The deterministic Desktop core E2E suite (transcript integrity, backend
     # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.
