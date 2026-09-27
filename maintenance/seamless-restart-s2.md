@@ -18,6 +18,17 @@ This is the fork's core update/launchd/cron release boundary, not a plugin: atom
 
 The live profile has no installed Hermes entry-point plugins. Candidate smoke imports enabled entry-point manifests, but an installed entry-point integration proof is outside S2 on this machine. S1 (#187) established real detached-worker survival across gateway process-group termination; the separate parent launchd coalition probe confirmed bootout does not kill a setsid double-fork. S2 does not redo that worker-topology proof.
 
+## Runtime-environment parity audit
+
+| Runtime surface | Candidate treatment and gate |
+|---|---|
+| Active extras and transitive packages | Infer installed optional leaf groups and orphan locked dependency closure from source interpreter and candidate `pyproject.toml`/`uv.lock`; `uv sync --frozen --extra` uses candidate lock pins. Restore source packages absent from lock with `uv pip --no-deps`; fail staging if **any** source distribution is missing (except project itself), if an unlocked version changes, or if installed plugin entry points disappear. `Provides-Extra` lists availability, not the install's selected extras. |
+| Shared `~/.hermes/plugins` | Never copy mutable plugins into releases. Smoke-import enabled directory and installed entry-point plugins with candidate Python under a copied disposable home; candidate dependency parity prevents missing installed plugin requirements, though plugin `register()` remains outside this pre-activation smoke. |
+| Console scripts, editable `.pth`, native artifacts | Build a fresh venv within unique staging, rewrite text paths including entry-point shebangs and `.pth`, remove regenerable compiled `__pycache__/*.pyc` with staging paths, fail for any other binary containing one. `UV_COMPILE_BYTECODE=0` explicitly leaves uv bytecode compilation to runtime; smoke can independently generate caches. Native wheels come from locked uv platform resolution, not copied source binaries. Qualification exercises relocated `hermes` and imports after publication. |
+| Node/web assets and ignored generated files | Update prerequisite builds `web_dist`; Git archive stages tracked sources and grafts only source `hermes_cli/web_dist`. The dashboard requires `index.html` and assets; the release smoke must check them when the source has a bundle. `tui_dist` and `hermes_cli/scripts` are absent from this live source and not required by the gateway. Unknown ignored generated state is deliberately not archived. |
+| Supervisor and cron env | Launchd resolves `current` for executable, cwd and venv PATH. Detached cron pins physical release Python/cwd, `HERMES_RELEASE`, `PYTHONPATH`, `VIRTUAL_ENV`, and leading venv-bin PATH, so subsequent pointer flips cannot change its subprocess interpreter. |
+| Config and secrets | Shared `$HERMES_HOME/config.yaml`, `.env`, skills, cron and memory remain profile state outside the archived code. The live source has no code-root `.env` or `cli-config.yaml`; a future source-local file is not copied into releases and must be migrated to shared profile before activation. |
+
 ## Pre-activation inventory (read-only)
 
 ```bash

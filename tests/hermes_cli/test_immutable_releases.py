@@ -215,6 +215,51 @@ def test_source_unchanged_head_dirty_blocks_migration_rollback(tmp_path):
     assert (source / "tracked.txt").read_text(encoding="utf-8") == "dirty"
 
 
+def test_worker_env_pins_physical_venv_and_subprocess_path(tmp_path):
+    home = tmp_path / "home"
+    physical = home / "releases" / "A"
+    env = releases.detached_worker_env(home, physical, {
+        "VIRTUAL_ENV": str(home / "current" / ".venv"),
+        "PATH": str(home / "current" / ".venv" / "bin") + os.pathsep + "/usr/bin",
+    })
+    assert env["VIRTUAL_ENV"] == str(physical / ".venv")
+    assert env["PATH"].split(os.pathsep)[0] == str(physical / ".venv" / "bin")
+    assert env["HERMES_RELEASE"] == str(physical)
+
+
+def test_missing_web_index_aborts_before_candidate_publish(tmp_path, monkeypatch):
+    source, home = tmp_path / "source", tmp_path / "home"
+    (source / "hermes_cli" / "web_dist").mkdir(parents=True)
+    (source / "hermes_cli" / "immutable_releases.py").write_text("# test\n", encoding="utf-8")
+    (source / "hermes_cli" / "web_dist" / "asset.js").write_text("build", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "hermes_cli/immutable_releases.py"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "A"], check=True)
+    with pytest.raises(RuntimeError, match="web_dist lacks index.html"):
+        releases.stage_release(source, home)
+    assert not (home / "releases" / releases.release_sha(source)).exists()
+
+
+def test_active_locked_extra_is_passed_to_frozen_uv_sync(tmp_path, monkeypatch):
+    project = tmp_path / "candidate"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname='hermes-agent'\nversion='0.1.0'\n"
+        "[project.optional-dependencies]\nmessaging=['python-telegram-bot==22.8']\n",
+        encoding="utf-8")
+    (project / "uv.lock").write_text(
+        '[[package]]\nname = "python-telegram-bot"\nversion = "22.8"\n', encoding="utf-8")
+    monkeypatch.setattr(releases, "_active_distributions", lambda _: {"python-telegram-bot": "22.8"})
+    extras = releases._active_locked_extras(Path(sys.executable), project)
+    assert extras == ["messaging"]
+    calls = []
+    monkeypatch.setattr(releases.subprocess, "run", lambda argv, **kwargs: calls.append(argv))
+    releases._build_venv(project, extras=extras)
+    assert calls[0][-2:] == ["--extra", "messaging"]
+    assert "--frozen" in calls[0]
+
+
 def test_missing_locked_extra_fails_closed(tmp_path, monkeypatch):
     import venv
     import zipfile

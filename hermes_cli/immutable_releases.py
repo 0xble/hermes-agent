@@ -197,6 +197,18 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
               if sum(name in other for other in declared.values()) == 1}
     selected = {extra for extra, names in declared.items()
                 if names <= installed or bool(names & installed & unique)}
+    # Editable/direct-url metadata can preserve an explicit extras selector.
+    # Provides-Extra alone is only the list of *available* groups, not evidence
+    # that every group was installed.
+    metadata_script = ("import importlib.metadata as m,json,re; "
+                       "print(json.dumps(sorted(set(x.strip() for d in m.distributions() "
+                       "if d.metadata.get('Name','').lower().replace('_','-')=='hermes-agent' "
+                       "for text in [d.read_text('direct_url.json') or ''] "
+                       "for group in re.findall(r'hermes-agent\\[([^]]+)\\]', text) "
+                       "for x in group.split(',')))))")
+    metadata_result = subprocess.run([str(source_python), "-c", metadata_script], check=True,
+                                     capture_output=True, text=True, env=_release_subprocess_env())
+    selected.update(extra for extra in json.loads(metadata_result.stdout) if extra in declared)
 
     def closure(extra: str) -> set[str]:
         pending = list(declared[extra])
@@ -466,6 +478,8 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
             bundle = source / "hermes_cli" / "web_dist"
             if bundle.is_dir():
                 shutil.copytree(bundle, staging / "hermes_cli" / "web_dist", dirs_exist_ok=True)
+                if not (staging / "hermes_cli" / "web_dist" / "index.html").is_file():
+                    raise RuntimeError("candidate web_dist lacks index.html")
         else:
             _copy_tree(source, staging, home=paths.home)
         if not (staging / "hermes_cli" / "immutable_releases.py").is_file():
