@@ -8,14 +8,20 @@ The vault tool descriptions and the vault note appended to the browser input too
 (`browser_type`, `fill_input` inside `browser_exec`) let the agent type a password or
 one-time code it fetched itself from an authorized store for that service. Authorized stores
 are the `credential` CLI, the 1Password CLI including its TOTP field, and the newest
-verification email or SMS from the expected sender in the intended mailbox or phone. The
-vault stays first: `browser_vault_fill` and `browser_vault_enter_code` are still called before
-any typed fallback.
+verification email or SMS from the expected sender in the intended mailbox or phone. Order:
+
+- Passwords: `browser_vault_fill` first, then a self-fetched value, then
+  `browser_vault_save_login`.
+- Codes: `browser_vault_enter_code` first only when `browser_vault_list` reports
+  `two_factor` exactly `automatic` for the handle. Otherwise the agent fetches the code itself first,
+  because `browser_vault_enter_code` prompts the user synchronously when it cannot mint one.
+  It calls `browser_vault_enter_code` only when no self-fetch source exists.
 
 Unchanged boundaries:
 
-- A value shown on the page, returned in a tool result, or given by the user in chat is
-  never a source. The agent never asks for or accepts a secret in chat and never repeats
+- A value shown on the page, appearing incidentally in unrelated tool output, or given by
+  the user in chat is never a source. Only a value deliberately fetched from an authorized
+  store for that service counts. The agent never asks for or accepts a secret in chat and never repeats
   one in a reply.
 - Card numbers and CVCs go only through `browser_vault_fill`, with its per-fill
   confirmation.

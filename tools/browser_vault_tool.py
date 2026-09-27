@@ -833,10 +833,12 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     "description": (
         "The page asks for a one-time / verification / 2FA code after the password: call this. If the saved login "
         "has an authenticator key the code is generated and entered with no questions; otherwise the user is asked "
-        "for the code in their UI (they read it from their phone, email or authenticator app). Before prompting, "
-        "prefer a code you can fetch yourself (TOTP field via the 1Password CLI, the newest verification email or "
-        "SMS from the expected sender in the intended mailbox or phone) and type it with the browser's input tool. "
-        "Never ask for a code in chat or type one shown elsewhere on the page. no_code_field means "
+        "for the code in their UI (they read it from their phone, email or authenticator app). Calling this without "
+        "a stored authenticator key prompts the user immediately, so when browser_vault_list does not show "
+        "two_factor exactly \"automatic\", first fetch the code yourself (TOTP field via the 1Password CLI, or the newest "
+        "verification email or SMS from the expected sender in the intended mailbox or phone), type it with the "
+        "browser's input tool, and call this only when you have no such source. Never ask for a code in chat or "
+        "type one shown elsewhere on the page. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
         "for the page to move on."
     ),
