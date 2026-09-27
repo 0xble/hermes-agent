@@ -2681,8 +2681,8 @@ class CLICommandsMixin:
         _cp(_accent_line(f"✓ {feature_name} set to {saved_value.upper()} {outcome}"))
         if self.service_tier and _probe("hermes_cli.models", "fast_mode_route_ignored", False, model,
                                         getattr(self, "provider", None), getattr(self, "base_url", None)):
-            _cp(_dim_line("⚠ This route does not receive fast-mode parameters (only the first-party API "
-                          "does), so it has no effect here."))
+            _cp(_dim_line("⚠ This route does not receive fast-mode parameters (only the first-party API, "
+                          "or a provider that sets capabilities.fast_mode, does), so it has no effect here."))
 
     # ---- /debug, /update, /voice, /wake ---------------------------------------------------
     def _handle_debug_command(self, cmd_original: str = ""):

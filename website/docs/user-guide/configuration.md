@@ -1976,7 +1976,7 @@ agent:
 
 `/fast normal|fast|auto|cold` switches the mode for the session; add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode.
 
-**Cost note:** both providers bill fast requests at a multiplier on standard rates (Anthropic: $8 / $40 per MTok in/out on Opus 5.5, $10 / $50 on Opus 5 and Opus 4.8), stacking with prompt-cache pricing. Hermes prices each Anthropic response from the speed the API reports in `usage.speed`. `auto`/`cold` bound that premium to the window only. Fast params are only sent to the first-party endpoint that supports them (`api.openai.com` / Codex subscription, `api.anthropic.com`, `api.x.ai`); OpenRouter, Nous Portal, Copilot, Azure, Bedrock, and custom `base_url` routes never receive them in any mode.
+**Cost note:** both providers bill fast requests at a multiplier on standard rates (Anthropic: $8 / $40 per MTok in/out on Opus 5.5, $10 / $50 on Opus 5 and Opus 4.8), stacking with prompt-cache pricing. Hermes prices each Anthropic response from the speed the API reports in `usage.speed`. `auto`/`cold` bound that premium to the window only. Fast params are only sent to the first-party endpoint that supports them (`api.openai.com` / Codex subscription, `api.anthropic.com`, `api.x.ai`); OpenRouter, Nous Portal, Copilot, Azure, Bedrock, and custom `base_url` routes never receive them in any mode, unless a custom provider opts in with `capabilities.fast_mode` (below).
 
 **Prompt cache:** only the per-request parameter changes between requests; the system prompt, tools, and messages stay byte-identical. Anthropic keeps a separate prompt cache for each speed, so on Anthropic every `auto`/`cold` window boundary re-writes the conversation prefix at the new speed. For long Anthropic sessions, `fast` or `normal` keeps a single warm cache.
 
@@ -1999,6 +1999,27 @@ providers:
 ```
 
 Differences from `agent.service_tier`: the tier is always on for that provider (no `auto`/`cold` window), `/fast` does not toggle it, and Hermes does not validate the value — the gateway decides what it accepts and what it bills.
+
+#### Proxies that forward the vendor's own fast mode
+
+A local proxy that forwards requests to OpenAI (Codex) or Anthropic with your own credentials, such as a subscription proxy, can pass the vendor's fast mode through. Opt that provider in with `capabilities.fast_mode: true`, and `/fast`, `agent.service_tier`, and inherited subagent Fast mode then send the same fields they send first-party (`service_tier: priority` for OpenAI and xAI models, `speed: fast` plus the fast-mode beta for Anthropic models):
+
+```yaml
+providers:
+  codex-proxy:
+    api: http://127.0.0.1:8317/v1
+    api_mode: codex_responses
+    capabilities:
+      fast_mode: true
+```
+
+The opt-in is a billing decision, so it fails closed:
+
+- Only an explicit `true` opts in. Nothing changes until fast mode is also turned on.
+- It covers only models whose fast fields travel on the provider's own transport: Anthropic models on `api_mode: anthropic_messages`, OpenAI and xAI models on every other transport.
+- When several providers share one URL (one per transport on the same proxy), a request known only by its URL is opted in only if every same-transport provider at that URL opts in.
+
+Check how your vendor bills fast mode before opting in. Anthropic bills it to usage credits beyond the plan from the first token, and OpenAI's Codex plans draw on usage faster.
 
 ## Tool-Use Enforcement
 

@@ -238,6 +238,8 @@ providers:
       concurrent_requests: true
 ```
 
+**`fast_mode`** — set this capability to `true` on a proxy that forwards to OpenAI (Codex) or Anthropic with your own account, so `/fast` and `agent.service_tier` send the vendor's fast-mode fields to it. It is a billing opt-in and fails closed; see [Fast tiers behind a gateway or proxy](./configuration.md#proxies-that-forward-the-vendors-own-fast-mode).
+
 For a gateway that resolves a bare model alias only after receiving the
 request, opt the alias into prompt-cache markers with the per-model
 `prompt_caching` capability:
