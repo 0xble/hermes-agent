@@ -73,6 +73,11 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
     plist.pop("LimitLoadToSessionType", None)
     path = tmp_path / f"{label}.plist"
     path.write_bytes(plistlib.dumps(plist))
+    probe_plist = path.read_bytes()
+    # The updater renders the target definition before rollback. Preserve the
+    # probe payload while letting it exercise the real plist transaction/reload.
+    monkeypatch.setattr(gateway, "generate_launchd_plist",
+                        lambda release_target=None: probe_plist.decode("utf-8"))
 
     def observed(name, old_pid=None):
         deadline = time.monotonic() + 20
@@ -162,6 +167,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         assert rolled_back["pid"] != b["pid"]
         assert (home / "current").resolve() == home / "releases" / sha_a
         assert (home / "previous").resolve() == home / "releases" / sha_b
+        assert path.read_bytes() == probe_plist
         assert (home / "releases" / sha_b).is_dir()
         receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
         assert receipt["outcome"] == "success"
@@ -183,7 +189,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
 @pytest.mark.macos_only
 def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_path, monkeypatch):
     """Updater promotion and reversal reload one throwaway job, never the live label."""
-    from hermes_cli import immutable_releases as releases, update_cmd, update_receipt
+    from hermes_cli import gateway_launchd, immutable_releases as releases, update_cmd, update_receipt
 
     home = tmp_path / "profile"
     home.mkdir()
@@ -257,7 +263,8 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: label)
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist_path)
-    monkeypatch.setattr(gateway, "generate_launchd_plist", lambda: replacement.decode("utf-8"))
+    monkeypatch.setattr(gateway, "generate_launchd_plist",
+                        lambda release_target=None: replacement.decode("utf-8"))
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist_path.read_bytes() == replacement)
     monkeypatch.setattr(gateway, "_launchd_domain", lambda: domain)
     # Only the throwaway plist is in scope; preserve production's temp-home guard.
@@ -285,40 +292,45 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=15)
         a = observed("source")
         assert a["api"] == "old_api"
-        # Inject failure after the candidate plist is written, before launchd
-        # adopts it. Both durable bytes and pointers must return to old state.
-        real_refresh = gateway.refresh_launchd_plist_if_needed
-        def failed_refresh():
-            plist_path.write_bytes(replacement)
-            return False
-        monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", failed_refresh)
+        # Fail only the launchd reload callback: the durable intent, plist and
+        # pointers move forward, while the live job still runs the old source.
+        real_reload = gateway_launchd._reload_installed_launchd_plist
+        monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: False)
         update_receipt.begin_update_receipt()
         assert update_cmd._activate_immutable_release() is False
         failed_receipt = update_receipt.finalize_update_receipt("partial")
         assert failed_receipt is not None
-        assert plist_path.read_bytes() == original
-        assert not (home / "current").exists()
-        assert not (home / "previous").exists()
-        recovered = observed("source", a["pid"])
-        assert Path(recovered["cwd"]).resolve() == source
+        assert (home / "release-txn.json").is_file()
+        assert plist_path.read_bytes() == replacement
+        assert (home / "current").resolve() == b
+        assert (home / "previous").resolve() == source
+        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0
+        assert json.loads(output.read_text(encoding="utf-8"))["pid"] == a["pid"]
+        import psutil
+        assert Path(psutil.Process(a["pid"]).cwd()).resolve() == source
         journal = json.loads((home / "release-layout.json").read_text(encoding="utf-8"))
         assert journal["source_sha"] == sha_a
         assert releases.release_sha(source) == sha_a
-        monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", real_refresh)
+        assert distributions(source_python) == source_distributions
+        assert subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True).strip() == source_tree
+        monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", real_reload)
         update_receipt.begin_update_receipt()
         assert update_cmd._activate_immutable_release(sha=sha_b)
         updated_receipt = update_receipt.finalize_update_receipt("success")
         assert updated_receipt is not None
         recorded = json.loads(updated_receipt.read_text(encoding="utf-8"))
-        assert any(s["name"] == "immutable_release" and "migration=True" in s["detail"]
+        # Recovery completes the pending migration before the updater records
+        # its step; that receipt classifies the already-moved pointer as promotion.
+        assert any(s["name"] == "immutable_release" and "migration=False" in s["detail"]
                    and sha_b in s["detail"] for s in recorded["steps"])
         assert recorded["release_transition"] == {
             "from_sha": sha_a, "to_sha": sha_b, "from_path": str(source),
-            "to_path": str(b), "kind": "migration",
+            "to_path": str(b), "kind": "promotion",
         }
         assert (home / "current").resolve() == b
         assert (home / "previous").resolve() == source
         assert plist_path.read_bytes() == replacement
+        assert not (home / "release-txn.json").exists()
         promoted = observed(sha_b, a["pid"])
         assert promoted["api"] == "new_api"
         assert releases.release_sha(source) == sha_a
