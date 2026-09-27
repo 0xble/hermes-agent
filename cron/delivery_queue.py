@@ -132,6 +132,22 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
     )
+    add_column_if_missing(
+        conn, "deliveries", "projected",
+        "projected INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(
+        conn, "delivery_tombstones", "projected",
+        "projected INTEGER NOT NULL DEFAULT 0",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_deliveries_terminal_projection "
+        "ON deliveries(status, projected, finished_at, execution_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_tombstones_projection "
+        "ON delivery_tombstones(projected, finished_at, execution_id)"
+    )
 
 
 def _connect() -> sqlite3.Connection:
@@ -174,29 +190,86 @@ def _reflect_terminal_deliveries(execution_ids: list[str], status: str) -> None:
         _reflect_execution_delivery(execution_id, status)
 
 
+def _mark_terminal_projected(execution_ids: list[str]) -> None:
+    """Mark receipts only after their execution-ledger projection committed."""
+    clean = [(str(execution_id),) for execution_id in execution_ids]
+    if not clean:
+        return
+    with _transaction() as conn:
+        conn.executemany(
+            "UPDATE deliveries SET projected=1 WHERE execution_id=? AND projected=0",
+            clean,
+        )
+        conn.executemany(
+            "UPDATE delivery_tombstones SET projected=1 "
+            "WHERE execution_id=? AND projected=0",
+            clean,
+        )
+
+
 def reconcile_terminal_deliveries() -> int:
-    """Repair execution projections for every committed terminal queue receipt.
+    """Repair execution projections for unprojected terminal queue receipts.
 
     The queue and execution ledger are separate SQLite stores.  A process crash
     between their commits can leave the queue terminal while the ledger still
-    says ``pending``.  Reading both live rows and tombstones makes the repair
-    idempotent and does not re-open a delivery for sending.
+    says ``pending``.  The queue's indexed projection marker makes successful
+    receipts cheap to skip while retaining retries when either database write
+    fails.  The execution ledger is opened exactly once for this batch.
     """
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT execution_id, status FROM deliveries "
-            "WHERE status IN ('delivered','failed','unknown','suppressed')"
+            "SELECT execution_id, status, 0 AS is_tombstone FROM deliveries "
+            "WHERE status IN ('delivered','failed','unknown','suppressed') "
+            "AND projected=0 "
+            "UNION ALL SELECT execution_id, terminal_status AS status, 1 AS is_tombstone "
+            "FROM delivery_tombstones "
+            "WHERE projected=0"
         ).fetchall()
-        tombstones = conn.execute(
-            "SELECT execution_id, terminal_status AS status FROM delivery_tombstones"
-        ).fetchall()
-    terminal_statuses = {str(row["execution_id"]): str(row["status"]) for row in rows}
-    terminal_statuses.update(
-        {str(row["execution_id"]): str(row["status"]) for row in tombstones}
-    )
-    for execution_id, status in terminal_statuses.items():
-        _reflect_execution_delivery(execution_id, status)
-    return len(terminal_statuses)
+    if not rows:
+        return 0
+
+    from cron import executions
+    from hermes_cli.sqlite_util import transaction
+
+    # Commit the ledger projection first.  If marking the queue receipt fails,
+    # the next drain repeats an idempotent ledger update rather than losing the
+    # repair.  Marking projected before this commit would lose it permanently.
+    ledger = executions._connect()
+    with transaction(ledger) as ledger_conn:
+        ledger_conn.executemany(
+            "UPDATE executions SET delivery_status=? WHERE id=? "
+            "AND (delivery_status IS NULL OR delivery_status NOT IN "
+            "('delivered','failed','unknown','suppressed'))",
+            [
+                (str(row["status"]), str(row["execution_id"]))
+                for row in rows
+            ],
+        )
+
+    with _transaction() as conn:
+        deliveries = [
+            (str(row["execution_id"]),)
+            for row in rows
+            if not row["is_tombstone"]
+        ]
+        tombstones = [
+            (str(row["execution_id"]),)
+            for row in rows
+            if row["is_tombstone"]
+        ]
+        if deliveries:
+            conn.executemany(
+                "UPDATE deliveries SET projected=1 "
+                "WHERE execution_id=? AND projected=0",
+                deliveries,
+            )
+        if tombstones:
+            conn.executemany(
+                "UPDATE delivery_tombstones SET projected=1 "
+                "WHERE execution_id=? AND projected=0",
+                tombstones,
+            )
+    return len(rows)
 
 
 def enqueue(
@@ -317,6 +390,7 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
         _prune_terminal_unlocked(conn)
     if cur.rowcount == 1:
         _reflect_terminal_deliveries([execution_id], status)
+        _mark_terminal_projected([execution_id])
     return cur.rowcount == 1
 
 
@@ -357,6 +431,7 @@ def recover_abandoned() -> int:
                 terminal_ids.append(row["execution_id"])
         _prune_terminal_unlocked(conn)
     _reflect_terminal_deliveries(terminal_ids, "unknown")
+    _mark_terminal_projected(terminal_ids)
     return changed
 
 
@@ -428,6 +503,7 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
         _prune_terminal_unlocked(conn)
     if cur.rowcount:
         _reflect_terminal_deliveries([str(execution_id)], "unknown")
+        _mark_terminal_projected([str(execution_id)])
     if row is None:
         return "timed out waiting for live gateway delivery"
     if row["status"] in {"delivered", "suppressed"}:

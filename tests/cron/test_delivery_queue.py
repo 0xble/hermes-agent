@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -203,6 +204,137 @@ def test_terminal_queue_commit_reconciles_execution_projection_without_resend(
         send.assert_called_once_with({"id": "job-reconcile"}, "result", False)
         assert executions.get_execution(run["id"])["delivery_status"] == "delivered"
         assert queue.get_status(run["id"])["status"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_terminal_projection_retries_after_execution_ledger_failure(
+    tmp_path, monkeypatch
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        run = executions.create_execution("job-retry-projection", source="builtin")
+        queue.enqueue(run["id"], {"id": "job-retry-projection"}, "result")
+        assert queue.claim_next() is not None
+        original_reflect = queue._reflect_terminal_deliveries
+        monkeypatch.setattr(
+            queue,
+            "_reflect_terminal_deliveries",
+            Mock(side_effect=OSError("ledger unavailable")),
+        )
+        with pytest.raises(OSError, match="ledger unavailable"):
+            queue._finish(run["id"], error=None)
+
+        original_connect = executions._connect
+        monkeypatch.setattr(queue, "_reflect_terminal_deliveries", original_reflect)
+        monkeypatch.setattr(executions, "_connect", Mock(side_effect=OSError("ledger unavailable")))
+        with pytest.raises(OSError, match="ledger unavailable"):
+            queue.reconcile_terminal_deliveries()
+
+        with sqlite3.connect(queue.queue_path()) as conn:
+            projection = conn.execute(
+                "SELECT projected FROM deliveries WHERE execution_id=?", (run["id"],)
+            ).fetchone()
+            assert projection is not None
+            assert projection[0] == 0
+
+        monkeypatch.setattr(executions, "_connect", original_connect)
+        assert queue.reconcile_terminal_deliveries() == 1
+        assert executions.get_execution(run["id"])["delivery_status"] == "delivered"
+        assert queue.reconcile_terminal_deliveries() == 0
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_terminal_receipt_reconciliation_uses_projection_index_and_skips_projected_rows(
+    tmp_path, monkeypatch
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        delivery_db = home / "cron" / "deliveries.db"
+        execution_db = home / "cron" / "executions.db"
+        monkeypatch.setattr(queue, "DELIVERY_DB", delivery_db)
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", execution_db)
+        run = executions.create_execution("job-indexed", source="builtin")
+
+        with queue._transaction() as conn:
+            conn.execute(
+                "INSERT INTO deliveries "
+                "(execution_id, job_json, content, status, created_at, finished_at) "
+                "VALUES (?, '{}', '', 'delivered', ?, ?)",
+                (run["id"], "2026-09-26T00:00:00+00:00", "2026-09-26T00:00:01+00:00"),
+            )
+
+        assert queue.reconcile_terminal_deliveries() == 1
+        assert queue.reconcile_terminal_deliveries() == 0
+        with sqlite3.connect(delivery_db) as conn:
+            assert conn.execute(
+                "SELECT projected FROM deliveries WHERE execution_id=?", (run["id"],)
+            ).fetchone()[0] == 1
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_reconcile_10k_tombstones_under_one_second(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_cli.sqlite_util import transaction
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        delivery_db = home / "cron" / "deliveries.db"
+        execution_db = home / "cron" / "executions.db"
+        monkeypatch.setattr(queue, "DELIVERY_DB", delivery_db)
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", execution_db)
+        count = 10_000
+        ids = [f"exec-tombstone-{index}" for index in range(count)]
+        ledger = executions._connect()
+        with transaction(ledger) as conn:
+            conn.executemany(
+                "INSERT INTO executions "
+                "(id, job_id, source, process_id, pid, status, claimed_at) "
+                "VALUES (?, ?, 'builtin', 'test', 1, 'completed', ?)",
+                [(execution_id, execution_id, "2026-09-26T00:00:00+00:00") for execution_id in ids],
+            )
+        with queue._transaction() as conn:
+            conn.executemany(
+                "INSERT INTO delivery_tombstones "
+                "(execution_id, terminal_status, finished_at) VALUES (?, 'delivered', ?)",
+                [(execution_id, "2026-09-26T00:00:01+00:00") for execution_id in ids],
+            )
+
+        original_connect = executions._connect
+        ledger_connects = []
+
+        def counted_connect():
+            ledger_connects.append(True)
+            return original_connect()
+
+        monkeypatch.setattr(executions, "_connect", counted_connect)
+        started = time.perf_counter()
+        assert queue.reconcile_terminal_deliveries() == count
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 1.0
+        assert queue.reconcile_terminal_deliveries() == 0
+        assert len(ledger_connects) == 1
+        with sqlite3.connect(delivery_db) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM delivery_tombstones WHERE projected=1"
+            ).fetchone()[0] == count
     finally:
         reset_hermes_home_override(token)
 
