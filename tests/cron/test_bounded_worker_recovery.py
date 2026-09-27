@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from cron import delivery_queue, executions
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from cron import delivery_queue, executions, scheduler
+from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
 
 
 def _home(path):
@@ -17,7 +17,7 @@ def _home(path):
     return set_hermes_home_override(path)
 
 
-def test_gateway_down_delivery_receipt_survives_restart_and_profile_switch(tmp_path):
+def test_gateway_down_delivery_receipt_survives_restart_and_profile_switch(tmp_path, monkeypatch):
     home_a, home_b = tmp_path / "a", tmp_path / "b"
     token = _home(home_a)
     try:
@@ -45,16 +45,22 @@ assert executions.finish_execution(run, success=True, delivery_outcome='queued')
 
     other = _home(home_b)
     try:
-        assert delivery_queue.drain(lambda *_: pytest.fail("wrong profile")) == 0
+        assert scheduler.drain_delivery_queue({}, None) == 0
     finally:
         reset_hermes_home_override(other)
 
     token = _home(home_a)
     try:
         sent = []
-        assert delivery_queue.drain(lambda job, content, failure: sent.append((job["id"], content)) or None) == 1
+        def send(job, content, *, adapters, loop, for_failure):
+            assert get_hermes_home().resolve() == home_a.resolve()
+            assert adapters == {"owner": "a"}
+            sent.append((job["id"], content))
+            return None
+        monkeypatch.setattr(scheduler, "_deliver_result", send)
+        assert scheduler.drain_delivery_queue({"owner": "a"}, None) == 1
         assert sent == [("brief", "finished")]
-        assert delivery_queue.drain(lambda *_: pytest.fail("duplicate send")) == 0
+        assert scheduler.drain_delivery_queue({"owner": "a"}, None) == 0
         after = executions.get_execution(run["id"])
         assert after["status"] == "completed"
         assert after["delivery_status"] == "delivered"
