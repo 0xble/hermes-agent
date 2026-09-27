@@ -2232,6 +2232,7 @@ from gateway.run_plugin_rewire import GatewayPluginRewireMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
+    _telegram_reply_anchor,
     _terminal_sentinel_start,
 )
 from gateway.platforms.event import MessageEvent, MessageType
@@ -4240,8 +4241,9 @@ class GatewayRunner(
             tid = str(thread_id)
             if tid and tid not in {"", "1"}:
                 metadata["direct_messages_topic_id"] = tid
-            if reply_to_message_id is not None:
-                metadata["telegram_reply_to_message_id"] = str(reply_to_message_id)
+            anchor = _telegram_reply_anchor(reply_to_message_id)
+            if anchor is not None:
+                metadata["telegram_reply_to_message_id"] = anchor
         if platform == Platform.SLACK and reply_to_message_id is not None:
             # Slack's reply_in_thread=false path uses message_id to tell real threads from synthetic keys.
             metadata["message_id"] = str(reply_to_message_id)
