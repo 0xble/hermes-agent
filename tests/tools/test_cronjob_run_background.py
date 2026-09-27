@@ -96,6 +96,7 @@ class TestBackgroundDispatch:
         with _bound_session_key("agent:main:telegram:dm:777"):
             with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
+                 patch("cron.executions.get_execution", return_value={"status": "completed", "output": "bg run"}), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None,
                                      "next_run_at": "2026-08-07T09:00:00"}):
@@ -128,6 +129,7 @@ class TestBackgroundDispatch:
         with _bound_session_key("agent:main:telegram:dm:778"):
             with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("cron.scheduler.run_one_job", return_value=True), \
+                 patch("cron.executions.get_execution", return_value={"status": "failed", "error": "provider exploded"}), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "error",
                                      "last_error": "provider exploded"}):

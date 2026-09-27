@@ -10,15 +10,15 @@ This is a core scheduler/dispatch invariant; a plugin or skill cannot atomically
 
 ## Proof and limitation
 
-Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_recovery.py`, `tests/cron/test_delivery_queue.py`, `tests/cron/test_hard_wall_real_path.py` and `tests/cron/test_hard_wall_completion_race.py` on macOS, then `./bin/ci preflight` and the exact-SHA `gate`. The SQLite execution row is the sole completion fence: completion commits result and output before output-file writes, notification enqueue or teardown; at the cap the watchdog CAS-writes failed(timeout) only if the row remains running. When completion won, the watchdog grants a config-derived, finite post-commit allowance (up to 60s including descendant cleanup), then exits with the recorded result. A completion that has not committed cannot suppress timeout. An abandoned executor never disarms the cap. The commit-to-enqueue gap deliberately records `delivery_status='unknown'` in the terminal transaction and **does not replay** an absent queue item: this favors a missed notice over duplicate send. Once a queue receipt exists its status may replace the unknown marker. Only unprojected terminal queue receipts/tombstones are reconciled, in one indexed scan and one execution-ledger connection per drain. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job.
+Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_recovery.py`, `tests/cron/test_delivery_queue.py`, `tests/cron/test_hard_wall_real_path.py`, `tests/cron/test_double_fork_sweep.py` and `tests/cron/test_hard_wall_completion_race.py` on macOS, then `./bin/ci preflight` and the exact-SHA `gate`. The SQLite execution row is the sole completion fence: worker output is composed and, for gateway-queued notices, an idempotent gated queue item is admitted before the terminal result commits. The gateway cannot claim a gated item until that result commits with a matching outcome. At the cap the watchdog CAS-writes failed(timeout) only if the row remains running. A pre-committed success notice is suppressed when timeout wins, and the occurrence is never retried. When completion won, the watchdog grants a config-derived, finite post-commit allowance (up to 60s including descendant cleanup), then exits with the recorded result. An abandoned executor never disarms the cap. Once a queue receipt exists its status projects onto the execution row; an eligible delivery survives a worker exit after terminal commit and drains once. Only unprojected terminal queue receipts/tombstones are reconciled, in one indexed scan and one execution-ledger connection per drain. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job.
 
 ## Cross-store state machine
 
 | Boundary | Durable transition | Crash recovery |
 | --- | --- | --- |
 | Gateway dispatch → worker adoption | `claimed`/handoff → `running` CAS | Dead owner becomes `unknown`; live detached owner retains claim. |
-| Worker result ↔ hard wall | Exactly one `running` → `completed`/`failed` CAS; result/output/error committed first | Watchdog writes failed(timeout) if still running; if terminal, allows bounded grace then exits by recorded status. |
-| Terminal ledger → delivery queue | Ledger delivery status `unknown` → idempotent queue insert keyed by execution ID → `pending` | No queue receipt means **no resend**; status remains `unknown`. Existing receipt is never inserted twice. |
+| Worker result ↔ hard wall | Exactly one `running` → `completed`/`failed` CAS after preparation | Watchdog writes failed(timeout) if still running; if terminal, allows bounded grace then exits by recorded status. |
+| Delivery preparation → terminal ledger | Gated idempotent queue insert keyed by execution ID → `running` → `completed`/`failed` CAS | Pending queue row cannot be sent before the matching terminal result. A timeout/unknown result suppresses contradictory content. A committed eligible result drains once after worker death. Legacy already-queued notices remain on their established path. |
 | Queue pending → delivering | Gateway atomically claims one pending item | Dead delivery owner becomes `unknown`, never retried after possible send. |
 | Queue terminal → ledger projection | Queue receipt commits → execution `delivery_status` update → receipt `projected=1` | Unprojected indexed receipt (including tombstone) retries projection on drain; projected history is skipped. |
 | Queue retention → tombstone | Terminal receipt moves with `projected` preserved | Tombstone prevents re-enqueue and unprojected tombstone still retries projection. |
@@ -47,19 +47,7 @@ terminal receipt; another unknown cannot rewrite it. `finish_execution` alone
 may mark NULL → unknown(provisional) on detached terminal finish, and never
 rewrites an existing delivery state. Execution recovery updates run status only,
 not delivery status. The 48-pair SQLite matrix and the idempotent-enqueue versus
-wait-timeout interleaving exercise this contract. The worker commits its immutable
-result before delivery classification, then conditionally writes `delivery_outcome`
-exactly once while still owner-fenced by process ID and PID. That second SQL
-UPDATE uses the receipt transition predicate in the same write to resolve only
-`unknown(provisional)` when no queue receipt will arrive. A missing target
-(`not_configured`) and intentionally withheld notices (`suppressed` or
-`suppressed_acked`) resolve to terminal `suppressed`; a direct send or transport
-failure resolves to `delivered` or `failed`. Queued notices retain the queue's
-`pending`/terminal receipt transition. The post-terminal update emits the final
-outcome to monitoring; the earlier result-fence event can carry a NULL outcome.
-A watchdog kill between the result commit and classification deliberately leaves
-`delivery_outcome=NULL` and provisional `unknown`, with no inferred retry or send.
-In-gateway runs still classify in their single terminal `finish_execution` write.
+wait-timeout interleaving exercise this contract. The worker admits a gated queue item before its terminal CAS if a gateway delivery is eligible. The queue consumer waits for the exact execution's terminal row; a success notice whose result was superseded by timeout, or an `unknown` run, is suppressed without sending. The terminal finish may still carry `delivery_status_provisional=1` and `unknown`, but a pre-admitted queue receipt projects `pending` after the ledger commit. Worker death after terminal commit cannot lose the notice because the queue item already exists. Legacy queue inserts without the new gate retain their old claim semantics. A queue receipt is idempotent by execution ID, and the gateway claims it at most once. A watchdog kill during the short interval between enqueue and terminal commit leaves a pending gated row that is classified against the eventual ledger outcome, never an automatic run retry. The worker still records its `delivery_outcome` after classification while owner-fenced. A bot-chat-only direct send is outside this queue guarantee.
 
 The executions schema migration is additive and idempotent. Existing releases use
 named INSERT/UPDATE columns and `SELECT *` into named rows, so the new column is

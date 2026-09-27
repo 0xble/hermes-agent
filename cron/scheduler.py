@@ -2952,11 +2952,12 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    result_committed: bool = False
 
 
 def _save_compose_deliver(
     d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
-    adapters, loop, verbose: bool, execution_token,
+    adapters, loop, verbose: bool, execution_token, commit_result=None,
 ) -> None:
     """Save output, compose the notice and deliver it (both side effects run under the fire-claim
     fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the caller)."""
@@ -3011,6 +3012,8 @@ def _save_compose_deliver(
         logger.warning("Job '%s': skipping delivery after fire claim ownership loss", job["id"])
 
     if not d.should_deliver:
+        if commit_result is not None:
+            commit_result()
         return
     d.unresolved_origin = (
         _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "origin"
@@ -3021,6 +3024,21 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
+            # Queue before committing terminal: a worker killed between those
+            # writes cannot lose the notice. The gateway claims only after the
+            # ledger is terminal (delivery_queue.claim_next).
+            external_id = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
+            from cron.scheduler_delivery import BOT_CHAT_PLATFORM
+            if (commit_result is not None and external_id == str(job.get("execution_id"))
+                    and adapters is None and any(
+                        target["platform"] != BOT_CHAT_PLATFORM
+                        for target in _resolve_delivery_targets(job, for_failure=not d.success)
+                    )):
+                from cron.delivery_queue import enqueue
+                enqueue(str(external_id), job, deliver_content, for_failure=not d.success,
+                        terminal_gate=True)
+            if commit_result is not None:
+                commit_result()
             d.delivery_error = _deliver_result(
                 job,
                 deliver_content,
@@ -3280,28 +3298,28 @@ def _run_one_job_body(
                 success, error, agent_declared = False, marker_error, True
 
         if hard_wall_fence is not None:
-            # The execution ledger is the sole completion/timeout arbiter. Commit
-            # the final run result before output, notification, or agent teardown.
             if success and _is_interrupted(job["id"], execution_token):
                 success = False
                 error = "Interrupted by gateway shutdown before the run finished."
             if success and not final_response.strip():
                 success = False
                 error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-            if finish_execution(execution_id, success=success, error=error,
-                                output=output, require_running=True) is None:
-                # The watchdog already committed failed(timeout); even teardown
-                # can hang, so leave it to the watchdog's bounded cleanup.
-                return False
-            committed = True
 
-        # Agent is still live through delivery; wrap ALL of save/compose/deliver in try/finally so a
-        # raise anywhere still tears the deferred agent down.
+        def _commit_before_delivery() -> None:
+            nonlocal committed
+            if finish_execution(execution_id, success=d.success, error=d.error,
+                                output=output, require_running=True) is None:
+                raise RuntimeError("Execution already terminalized before delivery")
+            committed = d.result_committed = True
+
+        # Compose and enqueue before the detached worker commits its terminal
+        # row. A pending queue item cannot be claimed until that commit exists.
         d = _RunDelivery(job=job, success=success, error=error, agent_declared=agent_declared)
         try:
             _save_compose_deliver(
                 d, fence, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
-                execution_token=execution_token)
+                execution_token=execution_token,
+                commit_result=_commit_before_delivery if hard_wall_fence is not None else None)
         except _FireClaimLostDuringSideEffect:
             d.side_effect_ownership_lost = True
         finally:

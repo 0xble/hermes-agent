@@ -291,7 +291,8 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert records[0]["id"] == execution_id
     assert records[0]["status"] == "unknown"
     assert records[0]["finished_at"]
-    assert "restart" in records[0]["error"].lower()
+    assert "cause is not known" in records[0]["error"].lower()
+    assert "scheduler restarted" not in records[0]["error"].lower()
     # Recovery only classifies the old attempt. It must not manufacture a new
     # claimed record (which would imply an automatic retry).
     assert [r["status"] for r in records] == ["unknown"]

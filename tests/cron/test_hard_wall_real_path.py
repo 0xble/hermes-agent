@@ -49,6 +49,12 @@ def queue_delivery(job, content, **kwargs):
     job['last_delivery_queued'] = True
     return None
 scheduler._deliver_result = queue_delivery
+if mode == 'delivery-in-flight':
+    def slow_delivery(job, content, **kwargs):
+        Path(marker).write_text('terminal committed; queued delivery waiting')
+        time.sleep(float(wall) * 3)
+        return queue_delivery(job, content, **kwargs)
+    scheduler._deliver_result = slow_delivery
 if mode == 'crash':
     def crash(*args, **kwargs):
         raise RuntimeError('script crashed before completion')
@@ -160,24 +166,34 @@ def test_completion_wins_and_persists_result_before_wall(tmp_path):
 
 
 @pytest.mark.macos_only
-def test_completion_commits_then_teardown_hangs_past_cap_plus_grace(tmp_path):
+def test_terminal_commit_survives_worker_death_before_delivery_call(tmp_path):
     code, row, queued, stored, outputs, recovered, out, err, marker = _run(
-        tmp_path, "completion-in-flight")
+        tmp_path, "delivery-in-flight")
     assert code == 0, (code, row["status"], row["error"], err)
     assert row["status"] == "completed" and row["error"] is None
-    assert queued is None and outputs == []
-    assert row["delivery_status"] == "unknown"  # commit-to-enqueue gap, never replay
-    assert "persistence entered" in marker.read_text()
+    assert queued is not None and queued["status"] == "pending"
+    assert "terminal committed" in marker.read_text()
     token = set_hermes_home_override(tmp_path / "profile")
     try:
         from cron import delivery_queue
         sent = []
+        assert delivery_queue.drain(lambda *args: sent.append(args)) == 1
         assert delivery_queue.drain(lambda *args: sent.append(args)) == 0
-        assert delivery_queue.drain(lambda *args: sent.append(args)) == 0
-        assert sent == []
-        assert executions.get_execution(row["id"])["delivery_status"] == "unknown"
+        assert len(sent) == 1
+        assert executions.get_execution(row["id"])["delivery_status"] == "delivered"
     finally:
         reset_hermes_home_override(token)
+    assert recovered == 0
+
+
+@pytest.mark.macos_only
+def test_output_persistence_hang_before_commit_times_out(tmp_path):
+    code, row, queued, stored, outputs, recovered, out, err, marker = _run(
+        tmp_path, "completion-in-flight")
+    assert code == 124, (code, row["status"], row["error"], err)
+    assert row["status"] == "failed" and "hard wall-clock timeout" in row["error"]
+    assert queued is None and outputs == []
+    assert "persistence entered" in marker.read_text()
     assert recovered == 0
 
 
@@ -187,7 +203,16 @@ def test_completion_not_committed_at_cap_timeout_wins(tmp_path):
         tmp_path, "commit-in-flight")
     assert code == 124, (code, row["status"], row["error"], err)
     assert row["status"] == "failed" and "hard wall-clock timeout" in row["error"]
-    assert queued is None and outputs == []
+    assert queued is not None and queued["status"] == "pending" and outputs
+    token = set_hermes_home_override(tmp_path / "profile")
+    try:
+        from cron import delivery_queue
+        sent = []
+        assert delivery_queue.drain(lambda *args: sent.append(args)) == 0
+        assert sent == []
+        assert delivery_queue.get_status(row["id"])["status"] == "suppressed"
+    finally:
+        reset_hermes_home_override(token)
     assert "commit not started" in marker.read_text()
     assert recovered == 0
 

@@ -158,7 +158,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
         if key in record}
     try:  # where the children's terminals started; lets recovery add a git-state hint
         task_payload["owner_cwd"] = os.getcwd()
@@ -273,6 +273,45 @@ def recover_abandoned_delegations() -> int:
             if alive(pid, started):
                 continue
             task = json.loads(task_json or "{}")
+            cron_execution_id = task.get("cron_execution_id")
+            if cron_execution_id:
+                # A cron runner is merely a waiter. Its detached worker owns the
+                # execution and can outlive this process. Do not fabricate a
+                # terminal notification while that worker is still running.
+                from cron.executions import get_execution, recover_interrupted_executions
+                execution = get_execution(cron_execution_id)
+                if execution and execution["status"] not in ("completed", "failed", "unknown"):
+                    recover_interrupted_executions()
+                    execution = get_execution(cron_execution_id)
+                    if execution and execution["status"] not in ("completed", "failed", "unknown"):
+                        continue
+                if execution is None:
+                    logger.warning("Cron completion %s: execution %s is not in the ledger; deferring",
+                                   delegation_id, cron_execution_id)
+                    continue
+                from tools.cronjob_tools import _manual_run_completion
+                completed = _manual_run_completion(
+                    {}, task["cron_job_id"], task["cron_job_name"],
+                    task["cron_deliver"], dispatched_at,
+                    execution_id=cron_execution_id,
+                )
+                event = {
+                    "type": "async_delegation", "delegation_id": delegation_id,
+                    "session_key": session_key, "origin_ui_session_id": origin_ui,
+                    "origin_session_id": origin_sid or "", "parent_session_id": parent_id,
+                    "goal": task.get("goal", ""), "context": task.get("context"),
+                    "toolsets": task.get("toolsets"), "role": task.get("role"),
+                    "model": task.get("model"), **completed,
+                    "dispatched_at": dispatched_at, "completed_at": now,
+                    **{k: task[k] for k in _ROUTING_KEYS if task.get(k)},
+                }
+                conn.execute("""UPDATE async_delegations SET state=?, completed_at=?,
+                       updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                    (completed["status"], now, now, json.dumps(event),
+                     json.dumps(completed), delegation_id))
+                recovered += 1
+                continue
             error = "Delegation owner exited before recording a terminal result; outcome unknown."
             recovered_results = _recovered_results(task, result_json, error)
             if recovered_results:
@@ -682,6 +721,7 @@ def _dispatch_admitted(
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
+    cron_execution: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -703,6 +743,7 @@ def _dispatch_admitted(
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
+        **(cron_execution or {}),
         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
@@ -764,7 +805,7 @@ def dispatch_async_delegation(
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, progress_fn: Optional[Callable[[], tuple]] = None,
-    delegation_id: Optional[str] = None,
+    delegation_id: Optional[str] = None, cron_execution: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
@@ -778,6 +819,7 @@ def dispatch_async_delegation(
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
+        cron_execution=cron_execution,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or run this task synchronously (background=false). "
