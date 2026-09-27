@@ -971,6 +971,9 @@ def _live_process_pins(home: Path) -> set[Path]:
         import psutil
     except ImportError:
         return all_releases()
+    current_uid = os.getuid() if hasattr(os, "getuid") else None
+    if current_uid is None:
+        return all_releases()
     try:
         for proc in psutil.process_iter(["uids", "name", "cmdline", "environ", "cwd", "exe"]):
             info = proc.info
@@ -978,7 +981,7 @@ def _live_process_pins(home: Path) -> set[Path]:
             if uids is None:
                 # Unknown ownership is not proof that a process is safe to ignore.
                 return all_releases()
-            if uids.real != os.getuid() and uids.effective != os.getuid():
+            if uids.real != current_uid and uids.effective != current_uid:
                 continue
             env = info.get("environ")
             values = ([*env.values()] if isinstance(env, dict) else [])
