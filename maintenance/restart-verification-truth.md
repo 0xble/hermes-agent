@@ -6,6 +6,9 @@ Load when changing updater fleet restart snapshots, gateway restart observer dea
 
 - The CLI observer's bounded wait after SIGUSR1 covers the longer after-turn/delegation deferral, then the existing service stop envelope (`resolve_systemd_timeout_stop_sec`) for chat drain, configured cron drain, cron cleanup reserve, floor and headroom, plus observer headroom. Explicit cron zero remains an opt-out. It does not sum concurrent drains or change the gateway's stop policy, signal, watchdog or fleet acceptance rules.
 - The pre-restart verification snapshot includes valid gateway PIDs from the pre-update inventory even when cleanup-oriented process discovery excludes the updater's ancestor gateway. This only identifies outgoing processes for version settlement; it never adds an ancestor to manual cleanup/kill targets.
+- Intentional infinite chat or cron drain yields an infinite observer budget rather
+  than crashing during integer conversion. CLI progress formatting accepts that budget.
+  The upstream #124009 fix is adopted while retaining the fork's delegation deferral.
 - A saved pending marker or failed receipt is historical evidence of an unresolved obligation, not proof of the current fleet's state. The warning names the obligation and suggests `hermes update --plan`, with a conditional update if stale. Marker generation, conservative retention, live verification, and receipt fallback stay unchanged. A plan is not exhaustive proof of every possible holder.
 
 ## Provenance and verification

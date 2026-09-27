@@ -522,6 +522,32 @@ class TestMaybeAutoTitle:
                 patch("hermes_cli.config.load_config_readonly", return_value={"providers": providers}):
             assert tg.title_upgrade_must_wait_for_turn(main_runtime) is deferred
 
+    @pytest.mark.parametrize("pin", [
+        {"provider": "custom", "base_url": "http://LOCALHOST:80/v1"},
+        {"provider": "ollama", "base_url": "http://localhost"},
+        {"provider": "custom:alias"},
+        {"provider": "Alias Display"},
+    ])
+    def test_equivalent_title_routes_keep_single_slot_deferral(self, pin):
+        from agent import title_generator as tg
+        config = {"providers": {"alias": {"name": "Alias Display", "api": "http://LOCALHOST:80/v1"}}}
+        with patch.object(tg, "_title_config", return_value=pin), \
+                patch("hermes_cli.config.load_config_readonly", return_value=config):
+            assert tg.title_upgrade_must_wait_for_turn({"provider": "custom", "base_url": "http://localhost/v1"})
+
+    @pytest.mark.parametrize("declarations, expected", [
+        ([True, False], True), ([False, True], True), ([True, None], False),
+        ([None, False], True), (["true", None], True),
+    ])
+    @pytest.mark.parametrize("endpoint", ["http://localhost/v1", "http://LOCALHOST:80/v1/"])
+    def test_concurrency_capability_uses_normalized_endpoint_and_false_veto(self, declarations, expected, endpoint):
+        from agent import title_generator as tg
+        providers = {str(i): {"api": endpoint, "capabilities": {"concurrent_requests": value}}
+                     for i, value in enumerate(declarations)}
+        with patch.object(tg, "_title_config", return_value={}), \
+                patch("hermes_cli.config.load_config_readonly", return_value={"providers": providers}):
+            assert tg.title_upgrade_must_wait_for_turn({"provider": "custom", "base_url": "http://localhost/v1"}) is expected
+
     def test_kanban_worker_is_named_after_its_card_without_the_llm_thread(self, tmp_path, monkeypatch):
         """A worker's session takes the board card's title synchronously; no auxiliary model call (#111166)."""
         from hermes_cli import kanban_db, kanban_db_connect

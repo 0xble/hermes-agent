@@ -133,5 +133,9 @@ when a released upstream lists logins from several 1Password accounts with per-a
 token isolation; its commit touches only `agent/vault_backends/`, the vault tool's
 browser-account check, `get_session_account`, the config default, docs, and its test file.
 Retire `op-quota-resilience` when a released upstream serves last-good 1Password secrets
-on transient failures; its commit touches only `agent/secret_sources/`,
+on transient failures with a finite explicit maximum age. The default maximum total age
+is 24 hours, configurable with `cache_max_stale_seconds`; zero disables stale fallback.
+Tests cover expiry, disabled fallback and non-finite input through the registered source.
+The existing identity fingerprint and first-rate-limit cooldown remain unchanged.
+Its commit touches only `agent/secret_sources/`,
 `agent/vault_backends/onepassword.py`, and 1Password tests.

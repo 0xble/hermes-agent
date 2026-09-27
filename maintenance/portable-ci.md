@@ -187,3 +187,5 @@ success before adding behavioral regression tests and strict argument handling.
 The bounded smoke manifest remains partial. It is never substituted for these
 full Python roots. Historical outcomes in `fork-ci.md` remain historical, not
 current qualification. No installed Hermes runtime is checked or promoted here.
+
+The documentation environment bootstrap preserves its existing checkout-local venv with `uv venv --allow-existing`, so running setup before gate or repeating gate does not fail merely because `.ci/docs-venv` exists. Pinned documentation packages are installed on every setup.

@@ -376,6 +376,8 @@ def resolve_restart_exit_wait_budget(
     service stop envelope (including its floor and cleanup headroom), so the
     observer cannot expire before a healthy supervised shutdown completes.
     """
+    if not all(math.isfinite(_seconds(value)) for value in (drain_timeout, cron_drain_timeout)):
+        return math.inf
     return (
         max(_seconds(after_turn_timeout), _seconds(delegation_timeout))
         + resolve_systemd_timeout_stop_sec(drain_timeout, cron_drain_timeout)

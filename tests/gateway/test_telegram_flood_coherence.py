@@ -354,3 +354,63 @@ async def test_animation_only_album_reports_the_platform_penalty(tmp_path, monke
     assert result.success is False
     assert (result.error or "").startswith("flood_control:"), result.error
     assert result.retry_after is not None and result.retry_after > 3500
+
+
+@pytest.mark.asyncio
+async def test_drafts_controls_and_deletes_share_known_flood_window():
+    adapter = _adapter()
+    await _arm_window(adapter)
+    adapter._bot.send_message_draft = AsyncMock(return_value=True)
+    adapter._bot.send_message = AsyncMock()
+    adapter._bot.delete_message = AsyncMock(return_value=True)
+    adapter._status_message_ids = {("4242", "topic", "status"): "77"}
+    adapter._should_attempt_rich_draft = lambda _content: False
+    result = await adapter.send_draft("4242", 1, "preview")
+    assert result.error.startswith("flood_control:") and result.retry_after > 0
+    result = await adapter._send_prompt("probe", "4242", {}, lambda: ("control", None, None))
+    assert result.error.startswith("flood_control:") and result.retry_after > 0
+    assert await adapter.delete_message("4242", "77") is False
+    adapter._bot.send_message_draft.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
+    adapter._bot.delete_message.assert_not_awaited()
+    assert "77" in adapter._status_message_ids.values()
+    # The same caller can retry after the window; refusal did not erase ownership.
+    adapter._telegram_send_cooldown_until.clear()
+    adapter._telegram_platform_flood_until.clear()
+    assert await adapter.delete_message("4242", "77") is True
+    assert "77" not in adapter._status_message_ids.values()
+    # A draft queued behind another outbound call must recheck the newly armed window.
+    async with adapter._chat_send_lock("4242"):
+        queued = asyncio.create_task(adapter.send_draft("4242", 2, "later preview"))
+        await asyncio.sleep(0)
+        adapter._record_send_flood_cooldown("4242", 90)
+    assert (await queued).error.startswith("flood_control:")
+    adapter._bot.send_message_draft.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["draft", "rich_draft", "control", "delete"])
+async def test_auxiliary_outbound_flood_arms_other_surfaces_without_fallback(surface):
+    from datetime import timedelta
+    adapter = _adapter()
+    adapter._should_attempt_rich_draft = lambda _content: surface == "rich_draft"
+    refusal = _FloodError(120)
+    refusal.retry_after = timedelta(seconds=120)
+    adapter._bot.send_message_draft = AsyncMock(side_effect=refusal)
+    adapter._bot.do_api_request = AsyncMock(side_effect=refusal)
+    adapter._bot.send_message = AsyncMock(side_effect=refusal)
+    adapter._bot.delete_message = AsyncMock(side_effect=refusal)
+    if surface in ("draft", "rich_draft"):
+        result = await adapter.send_draft("4242", 1, "preview")
+        assert result.error.startswith("flood_control:") and result.retry_after > 0
+        if surface == "rich_draft":
+            adapter._bot.send_message_draft.assert_not_awaited()
+    elif surface == "control":
+        result = await adapter._send_prompt("probe", "4242", {}, lambda: ("control", None, None))
+        assert result.error.startswith("flood_control:") and result.retry_after == 120
+    else:
+        assert await adapter.delete_message("4242", "77") is False
+    adapter._bot.send_chat_action = AsyncMock()
+    await adapter.send_typing("4242")
+    adapter._bot.send_chat_action.assert_not_awaited()
+    assert adapter._send_flood_cooldown_remaining("4242") > 0
