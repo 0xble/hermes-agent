@@ -821,8 +821,15 @@ def _stage_upload_file(path: str, uploads_dir: str) -> str:
     digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
     target = root / "hermes" / digest / source.name
     if not target.exists():
+        # Publish atomically: a failed or concurrent copy must never leave a partial file at the
+        # final path, because later calls reuse whatever is there.
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+        tmp = target.parent / f".{source.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copyfile(source, tmp)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
     return str(target)
 
 

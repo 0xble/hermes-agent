@@ -130,6 +130,37 @@ def test_nt_namespace_path_rejected_before_resolve(mock_post, monkeypatch, tmp_p
     assert mock_post.call_count == calls
 
 
+def test_failed_staging_copy_leaves_nothing_reusable(monkeypatch, tmp_path):
+    import shutil
+    from tools import browser_camofox
+
+    root = tmp_path / "uploads"
+    root.mkdir()
+    src = tmp_path / "logo.png"
+    src.write_bytes(b"complete-bytes" * 100)
+    real_copy = shutil.copyfile
+
+    def partial_then_fail(a, b, *args, **kwargs):
+        with open(b, "wb") as fh:
+            fh.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(shutil, "copyfile", partial_then_fail)
+    try:
+        browser_camofox._stage_upload_file(str(src), str(root))
+    except OSError:
+        pass
+    else:
+        raise AssertionError("expected the failed copy to raise")
+    assert [p for p in (root / "hermes").rglob("*") if p.is_file()] == []
+
+    monkeypatch.setattr(shutil, "copyfile", real_copy)
+    staged = browser_camofox._stage_upload_file(str(src), str(root))
+    with open(staged, "rb") as fh:
+        assert fh.read() == src.read_bytes()
+    assert staged.rsplit("/", 1)[-1] == "logo.png"
+
+
 def test_registered_only_for_camofox_and_in_browser_toolset(monkeypatch):
     import toolsets
     from tools.registry import registry
