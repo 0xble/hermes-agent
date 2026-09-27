@@ -65,9 +65,8 @@ def test_single_profile_pending_queues_round_trip_at_launch_home(tmp_path, monke
     runner._primary_profile_name = primary_name
     runner._served_profile_homes = {primary_name: launch}
     # The primary adapter, runner's pending slot, and the conversation's overflow tail
-    # all use the same owner-scoped shutdown writer, including the adapter's fallback.
-    assert runner._flush_owned_pending(key, "adapter", reason="adapter_shutdown",
-                                       adapter_profile=primary_name) == 1
+    # all use the same owner-scoped shutdown writer.
+    assert runner._flush_owned_pending(key, "adapter", reason="adapter_shutdown") == 1
     assert runner._flush_owned_pending(key, "runner", reason="shutdown") == 1
     assert runner._flush_owned_pending(key, ["overflow"], reason="shutdown", overflow=True) == 1
     payloads = [json.loads(path.read_text(encoding="utf-8"))
@@ -100,8 +99,8 @@ def test_multiplex_pending_owner_matrix(tmp_path, monkeypatch, primary_name):
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm", profile=name)
         key = store._generate_session_key(source)
         keys[home] = key
-        assert runner._flush_owned_pending(key, name, reason="adapter_shutdown",
-                                           adapter_profile=primary_name) == 1
+        assert runner._flush_owned_pending(key, name, reason="adapter_shutdown") == 1
+
     def resolve(key, *, not_after=None):
         home = Path(get_hermes_home())
         return ("session-" + home.name, dbs[home]) if key == keys[home] else None
@@ -109,4 +108,3 @@ def test_multiplex_pending_owner_matrix(tmp_path, monkeypatch, primary_name):
     assert recover_pending_shutdown_flush(runner) == 2
     for home, db in dbs.items():
         assert db.append_message.call_args.kwargs["content"] == home.name
-

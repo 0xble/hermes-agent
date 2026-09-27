@@ -1971,7 +1971,7 @@ class GatewayShutdownMixin:
             await self._notify_interrupted_cron_jobs(_interrupted_cron_jobs)
         logger.info("Shutdown phase: cron interrupt notices done at +%.2fs", ctx.elapsed())
 
-    def _flush_owned_pending(self, session_key, value, *, reason, overflow=False, adapter_profile=None):
+    def _flush_owned_pending(self, session_key, value, *, reason, overflow=False):
         """Spool a queued slot under its session's home, regardless of transport owner."""
         from gateway.run import _profile_runtime_scope
         from gateway.run_pending_recovery import pending_home_for_key
@@ -2024,8 +2024,7 @@ class GatewayShutdownMixin:
                 continue
             for key, value in list(pending.items()):
                 try:
-                    if self._flush_owned_pending(key, value, reason="adapter_shutdown",
-                                                 adapter_profile=profile):
+                    if self._flush_owned_pending(key, value, reason="adapter_shutdown"):
                         if pending.get(key) is value:
                             pending.pop(key, None)
                 except Exception:

@@ -4848,8 +4848,7 @@ class BasePlatformAdapter(ABC):
         if runner is not None and hasattr(runner, "_flush_owned_pending"):
             for key, value in list(self._pending_messages.items()):
                 with contextlib.suppress(Exception):
-                    runner._flush_owned_pending(key, value, reason="adapter_shutdown",
-                                                adapter_profile=getattr(self, "_owner_profile", None))
+                    runner._flush_owned_pending(key, value, reason="adapter_shutdown")
         else:
             with contextlib.suppress(Exception):
                 from gateway.shutdown_flush import flush_pending_to_file
