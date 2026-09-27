@@ -66,7 +66,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        # Fixed images, not -latest aliases: a GitHub label move must arrive as
+        # a reviewed change, not as a surprise nightly failure.
+        os: [macos-26, windows-2025-vs2026]
     env:
       OPENROUTER_API_KEY: ''
       OPENAI_API_KEY: ''
@@ -76,7 +78,7 @@ jobs:
       RUSTUP_HOME: ${{ github.workspace }}/.ci/rustup
     steps:
       - name: Keep Windows checkout LF under isolated Git config
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2025-vs2026'
         shell: bash
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -100,7 +102,7 @@ jobs:
         shell: bash
         run: uv python install 3.11.16
       - name: Initialize Windows MSVC linker for Rust builds
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2025-vs2026'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
@@ -116,7 +118,7 @@ jobs:
           # processes for the hosted runner's two cores. Run Windows files
           # serially so a stalled launcher is not mistaken for a pipe leak or
           # a UI timeout; preserve the existing macOS file concurrency.
-          ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-latest' && '1' || '4' }}
+          ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-2025-vs2026' && '1' || '4' }}
   desktop-core:
     # The deterministic Desktop core E2E suite (transcript integrity, backend
     # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.

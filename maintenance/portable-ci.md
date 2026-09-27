@@ -135,7 +135,7 @@ required fork statuses. Linux success does not qualify macOS or Windows.
 ## Native and release qualification
 
 `nightly.yml` runs `bin/ci nightly-native <sha>` at the exact scheduled or
-dispatched SHA on hosted `macos-latest` and `windows-latest`; both matrix jobs
+dispatched SHA on hosted `macos-26` (arm64) and `windows-2025-vs2026`; both matrix jobs
 must pass for nightly `qualification`. The PR gate remains Linux-only. The
 native profile performs setup and selects files with `macos_only` or
 `windows_only` through `scripts/ci/list_os_marked_tests.py`, then runs the
