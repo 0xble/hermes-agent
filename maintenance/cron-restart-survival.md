@@ -10,7 +10,7 @@ This is a core scheduler/dispatch invariant; a plugin or skill cannot atomically
 
 ## Proof and limitation
 
-Run `tests/cron/test_restart_safe_worker.py` on macOS, including its real-process parent-process-group termination test, then `./bin/ci preflight` and the exact-SHA `gate`. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job.
+Run `tests/cron/test_restart_safe_worker.py` and `tests/cron/test_hard_wall_completion_race.py` on macOS, including their real-process parent-process-group and competing completion/timeout tests, then `./bin/ci preflight` and the exact-SHA `gate`. The hard-wall watchdog atomically claims a running execution's timeout before descendant cleanup; the detached completion path claims an in-process fence before output/delivery, so a losing completion cannot enqueue success, and a completion that won retains its natural result while stray descendants are reaped. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job.
 
 Until immutable per-version release directories (S2), an external worker surviving an in-place `hermes update` can lazily import modules from the new checkout after loading old ones. S1 is process survival, not an immutable code snapshot.
 

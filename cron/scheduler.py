@@ -3770,6 +3770,11 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 # still non-daemon and preventing interpreter exit; disarming here
                 # would leave the detached process unbounded. Once that work ends,
                 # normal interpreter shutdown exits without needing the watchdog.
+                if watchdog_stop.timed_out:
+                    # A losing run_job thread must not return exit 1 while the
+                    # watchdog is still reaping descendants for exit 124.
+                    threading.Event().wait(4)
+                    os._exit(124)
                 if not any(
                     thread.is_alive() and not thread.daemon
                     and thread is not threading.current_thread()

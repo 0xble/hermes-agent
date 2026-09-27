@@ -33,17 +33,26 @@ assert executions.adopt_claimed_execution(run)
 fast = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.4)'],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 slow = subprocess.Popen([sys.executable, '-c',
-    'import signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
-    'open(sys.argv[1], "w").write("ready"); time.sleep(30)', marker],
+    'import signal,sys,time; '
+    'marker=sys.argv[1]; '
+    'signal.signal(signal.SIGTERM, lambda *_: (open(marker, "w").write("signaled"), time.sleep(5))); '
+    'open(marker, "w").write("ready"); time.sleep(30)', marker],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 for _ in range(200):
     if os.path.exists(marker): break
     if slow.poll() is not None: raise RuntimeError(f'slow exited {slow.returncode}')
     time.sleep(.005)
 else: raise RuntimeError(f'slow stuck {slow.pid}')
-fence = arm_hard_wall_timeout(run, os.environ['HERMES_HOME'], .5)
+fence = arm_hard_wall_timeout(run, os.environ['HERMES_HOME'], 1.0)
 def complete():
-    time.sleep(.45 if mode == 'completion' else .7)
+    if mode == 'completion':
+        time.sleep(.1)
+    else:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if open(marker).read() == 'signaled': break
+            time.sleep(.005)
+        else: raise RuntimeError('watchdog did not begin descendant cleanup')
     if fence.claim_completion():
         delivery_queue.enqueue(run, {'id': 'race'}, 'SUCCESS')
         assert executions.finish_execution(run, success=True) is not None

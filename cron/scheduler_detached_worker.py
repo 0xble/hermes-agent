@@ -111,6 +111,7 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
                     timeout_won = finish_execution(
                         execution_id, success=False,
                         error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+                        require_running=True,
                     ) is not None
                     if timeout_won:
                         fence.timed_out = True
