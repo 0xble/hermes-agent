@@ -2345,6 +2345,9 @@ DEFAULT_CONFIG = {
         # explicit; its journal records the source SHA before checkout changes.
         # Once current points to a release, updates continue that layout.
         "immutable_releases": False,
+        # Observation-only wait after launchd reports a deferred reload. A timeout leaves
+        # release-txn.json pending and never submits a second reload.
+        "release_acknowledgement_timeout_seconds": 180.0,
         # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
         "check": True,
         # Pre-update backup. quick = snapshot small critical state (pairing JSONs, cron jobs,

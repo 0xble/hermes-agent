@@ -567,6 +567,7 @@ def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeyp
     pending = releases.recover_pending_transaction(home, reload_callback=callback)
     assert pending is not None and pending["reload_pending"]
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_release_acknowledgement_timeout", lambda: 0)
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _: callback())
     with pytest.raises(RuntimeError, match="observation-only"):
@@ -712,4 +713,37 @@ def test_no_gateway_restart_pending_txn_has_no_launchctl_or_pointer_writes(tmp_p
     assert exit_info.value.code == 1
     assert not launchctl_calls
     assert before == (txn.read_bytes(), plist.read_bytes(),
-                      releases.read_pointer(home / "current"), releases.read_pointer(home / "previous"))
+                      releases.read_pointer(home / "current"),
+                      releases.read_pointer(home / "previous"))
+
+
+@pytest.mark.macos_only
+def test_release_manager_wait_observes_delayed_ack_without_reloading(tmp_path, monkeypatch):
+    pending = tmp_path / "release-txn.json"
+    pending.write_text("{}", encoding="utf-8")
+    observations = iter([False, True])
+    seen = []
+
+    def acknowledge(home):
+        seen.append(home)
+        acknowledged = next(observations)
+        if acknowledged:
+            pending.unlink()
+        return acknowledged
+
+    monkeypatch.setattr(releases, "acknowledge_running_release", acknowledge)
+    monkeypatch.setattr(releases.time, "sleep", lambda _: None)
+    assert releases.wait_for_release_acknowledgement(tmp_path, timeout_seconds=1)
+    assert seen == [tmp_path, tmp_path]
+
+
+def test_immutable_update_ack_call_site_registry_is_complete():
+    from hermes_cli import update_cmd
+
+    assert update_cmd._IMMUTABLE_RELEASE_ACK_CALL_SITES == {
+        "_activate_immutable_release",
+        "_finish_pending_release_transaction",
+        "_catch_up_immutable_release",
+        "_cmd_update_impl.rollback",
+        "_cmd_update_impl.repair-service",
+    }

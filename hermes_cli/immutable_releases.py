@@ -15,6 +15,7 @@ import tempfile
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 import re
 import shlex
@@ -747,6 +748,24 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
     except (OSError, ValueError, KeyError, psutil.Error, subprocess.CalledProcessError):
         return False
     return False
+
+
+def wait_for_release_acknowledgement(home: Path, *, timeout_seconds: float = 180.0) -> bool:
+    """Observe one already-issued reload until its supervised gateway acknowledges it.
+
+    This is observation-only. It never calls the launchd reload callback and leaves
+    the transaction durable when the bounded wait expires.
+    """
+    pending = ReleasePaths.for_home(home).home / "release-txn.json"
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while pending.exists():
+        if acknowledge_running_release(home) or not pending.exists():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.5, remaining))
+    return True
 
 
 def _run_transaction(paths: ReleasePaths, record: dict[str, Any],

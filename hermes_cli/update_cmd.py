@@ -174,23 +174,29 @@ def _immutable_release_enabled(paths=None) -> bool:
     return bool(_updates_config().get("immutable_releases", False) or resolved_release(paths.home))
 
 
-def _await_release_acknowledgement(home: Path, *, timeout_seconds: float = 180.0) -> bool:
-    """Observe a single issued reload until the supervised gateway acknowledges it.
+_IMMUTABLE_RELEASE_ACK_CALL_SITES = frozenset({
+    "_activate_immutable_release",
+    "_finish_pending_release_transaction",
+    "_catch_up_immutable_release",
+    "_cmd_update_impl.rollback",
+    "_cmd_update_impl.repair-service",
+})
 
-    The caller is the detached updater, not the gateway's event loop. This never
-    submits a second reload. Tests can use a shorter bound via the argument.
-    """
-    from hermes_cli.immutable_releases import acknowledge_running_release
-    pending = home / "release-txn.json"
-    deadline = _time.monotonic() + timeout_seconds
-    while pending.exists():
-        if acknowledge_running_release(home) or not pending.exists():
-            return True
-        remaining = deadline - _time.monotonic()
-        if remaining <= 0:
-            return False
-        _time.sleep(min(0.5, remaining))
-    return True
+
+def _release_acknowledgement_timeout() -> float:
+    value = _updates_config().get("release_acknowledgement_timeout_seconds", 180.0)
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 180.0
+
+
+def _await_release_acknowledgement(home: Path, *, timeout_seconds: float | None = None) -> bool:
+    """Observe one issued reload through the release manager's shared wait."""
+    from hermes_cli.immutable_releases import wait_for_release_acknowledgement
+    return wait_for_release_acknowledgement(
+        home, timeout_seconds=_release_acknowledgement_timeout()
+        if timeout_seconds is None else timeout_seconds)
 
 
 def _finish_pending_release_transaction(home: Path | None = None) -> dict | None:
@@ -205,7 +211,12 @@ def _finish_pending_release_transaction(home: Path | None = None) -> dict | None
     callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist else None
     result = recover_pending_transaction(home, reload_callback=callback)
     if result and result.get("reload_pending"):
-        raise RuntimeError("release reload pending: intended launchd gateway has not acknowledged startup; recovery is observation-only after reload_issued. Inspect the label and plist; if no process exists, use an explicit operator-controlled service repair")
+        if _await_release_acknowledgement(home):
+            recovered = recover_pending_transaction(home, reload_callback=callback)
+            result = recovered or {key: value for key, value in result.items()
+                                   if key != "reload_pending"}
+        if result and result.get("reload_pending"):
+            raise RuntimeError("release reload pending: intended launchd gateway has not acknowledged startup within the configured observation window; recovery is observation-only after reload_issued. Inspect the label and plist; if no process exists, use an explicit operator-controlled service repair")
     return result
 
 
@@ -261,7 +272,8 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                                       reload_callback=reload_callback)
         if result.get("reload_pending"):
             if _await_release_acknowledgement(home):
-                result = _finish_pending_release_transaction(home) or result
+                result = _finish_pending_release_transaction(home) or {key: value for key, value in result.items()
+                                                        if key != "reload_pending"}
             else:
                 _record_update_step("immutable_release", False,
                                     f"reload issued, awaiting gateway acknowledgement: {candidate}; "
@@ -1563,9 +1575,13 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
                                       reload_callback=lambda: gateway_launchd._reload_installed_launchd_plist(plist),
                                       force_reload=True)
             if result.get("reload_pending"):
-                _record_update_step("immutable_release_catchup", False, "service reload awaiting gateway acknowledgement")
-                _finalize_receipt("partial", "Release service repair remains pending: %s")
-                raise SystemExit(1)
+                if _await_release_acknowledgement(paths.home):
+                    result = _finish_pending_release_transaction(paths.home) or {key: value for key, value in result.items()
+                                                                    if key != "reload_pending"}
+                if result.get("reload_pending"):
+                    _record_update_step("immutable_release_catchup", False, "service reload awaiting gateway acknowledgement within the configured observation window")
+                    _finalize_receipt("partial", "Release service repair remains pending: %s")
+                    raise SystemExit(1)
         if state.running not in {"none", "current"}:
             _write_fleet_restart_pending_marker(expected_sha=sha)
         _record_update_step("immutable_release_catchup", True, f"repaired service/runtime: {state}")
@@ -2049,10 +2065,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             result = rollback(home, plist_path=plist if plist and plist.exists() else None,
                               plist_body=plist_body, reload_callback=callback)
         if result.get("reload_pending"):
-            message = "Rollback reload pending: intended launchd gateway has not acknowledged the release"
-            _record_update_step("immutable_rollback", False, message)
-            _finalize_receipt("partial", "Release rollback remains pending: %s")
-            raise SystemExit(1)
+            if _await_release_acknowledgement(home):
+                result = _finish_pending_release_transaction(home) or {key: value for key, value in result.items()
+                                                        if key != "reload_pending"}
+            if result.get("reload_pending"):
+                message = ("Rollback reload pending: intended launchd gateway has not acknowledged "
+                           "the release within the configured observation window")
+                _record_update_step("immutable_rollback", False, message)
+                _finalize_receipt("partial", "Release rollback remains pending: %s")
+                raise SystemExit(1)
         current_target = result["current"]
         if current_target is None:
             raise RuntimeError("rollback produced no current target")
