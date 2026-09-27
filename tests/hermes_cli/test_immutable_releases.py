@@ -632,11 +632,11 @@ def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_pat
     assert plist.read_bytes() == b"candidate"
     assert (home / "release-txn.json").exists()
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: True)
-    assert update_cmd._activate_immutable_release()
+    assert not update_cmd._activate_immutable_release()
     assert (home / "current").resolve() == b
     assert (home / "previous").resolve() == a
     assert plist.read_bytes() == b"candidate"
-    assert not (home / "release-txn.json").exists()
+    assert (home / "release-txn.json").exists()  # Reload success is not gateway acknowledgement.
 
 
 def test_worker_environment_is_resolved_release_not_current(tmp_path):

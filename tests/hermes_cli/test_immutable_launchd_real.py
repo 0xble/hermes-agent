@@ -15,6 +15,49 @@ from hermes_cli import gateway, gateway_launchd
 from hermes_cli.immutable_releases import promote
 
 
+def _ack_observed_probe(releases, home, plist_path, output, *, gateway_pid=None):
+    """Test-only stand-in for a gateway startup ack, bound to the real throwaway job."""
+    import hashlib
+    import psutil
+
+    paths = releases.ReleasePaths.for_home(home)
+    record = releases._read_txn(paths)
+    if not record or not record.get("requires_reload"):
+        return False
+    expected = Path(record["candidate"] or record["source"]).resolve()
+    expected_sha = record["source_sha"] if record["candidate"] is None else expected.name
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        try:
+            row = json.loads(output.read_text(encoding="utf-8"))
+            supervisor = gateway_launchd._launchctl_supervised_pid(plist_path.stem)
+            if supervisor and Path(row["cwd"]).resolve() == expected:
+                proc = psutil.Process(row["pid"])
+                ancestors = {parent.pid for parent in proc.parents()}
+                if (supervisor in ancestors or supervisor == proc.pid) and (
+                    gateway_pid is None or gateway_pid == proc.pid
+                ) and Path(proc.cwd()).resolve() == expected and (
+                    Path(proc.exe()).resolve() == Path(row["exe"]).resolve()
+                ):
+                    releases._verify_transaction(paths, record)
+                    body = plist_path.read_bytes()
+                    if hashlib.sha256(body).hexdigest() != record["plist"]["intended_sha256"]:
+                        return False
+                    record["reload_ack"] = {
+                        "launchd_pid": supervisor, "gateway_pid": proc.pid,
+                        "release_root": str(expected), "code_sha": expected_sha,
+                        "plist_sha256": record["plist"]["intended_sha256"],
+                    }
+                    record["reload_done"] = True
+                    releases._write_txn(paths, record)
+                    releases._finish_txn(paths, record)
+                    return True
+        except (OSError, ValueError, KeyError, psutil.Error):
+            pass
+        time.sleep(.1)
+    return False
+
+
 @pytest.mark.macos_only
 def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch):
     home = tmp_path / "profile"
@@ -139,6 +182,8 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
                 return None
         monkeypatch.setattr(update_receipt, "_socket_identity", real_process_socket_identity)
         monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(releases, "acknowledge_running_release",
+                            lambda path_home: _ack_observed_probe(releases, path_home, path, output))
         # Real update/rollback verification must invoke retention, not only
         # unit-call retain(). Protect a live worker cwd and an explicit receipt.
         extra = []
@@ -314,6 +359,8 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         assert distributions(source_python) == source_distributions
         assert subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True).strip() == source_tree
         monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", real_reload)
+        monkeypatch.setattr(releases, "acknowledge_running_release",
+                            lambda path_home: _ack_observed_probe(releases, path_home, plist_path, output))
         update_receipt.begin_update_receipt()
         assert update_cmd._activate_immutable_release(sha=sha_b)
         updated_receipt = update_receipt.finalize_update_receipt("success")

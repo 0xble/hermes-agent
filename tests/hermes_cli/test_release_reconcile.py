@@ -111,10 +111,11 @@ def test_equal_pointer_with_stale_service_repairs_on_noop(tmp_path, monkeypatch)
     reloads = []
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
                         lambda path: reloads.append(path) or True)
-    update_cmd._catch_up_immutable_release(defer=False)
+    with pytest.raises(SystemExit, match="1"):
+        update_cmd._catch_up_immutable_release(defer=False)
     assert plist.read_text() == "release"
     assert reloads == [plist]
-    assert not (home / "release-txn.json").exists()
+    assert (home / "release-txn.json").exists()
 
 
 def test_equal_pointer_with_stale_runtime_arms_fleet_catchup(tmp_path, monkeypatch):

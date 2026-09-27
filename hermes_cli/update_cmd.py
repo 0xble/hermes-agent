@@ -1988,7 +1988,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Resolve policy before any recovery action: a cron or gateway invocation
     # may have restart disabled even when it did not spell the CLI flag itself.
     opts = None if getattr(args, "rollback", False) else _resolve_update_options(args, gateway_mode)
-    if opts is not None and opts.no_gateway_restart:
+    if opts is not None and getattr(opts, "no_gateway_restart", False):
         from hermes_cli.immutable_releases import ReleasePaths
         paths = ReleasePaths.for_home(get_hermes_home())
         if (paths.home / "release-txn.json").exists():
