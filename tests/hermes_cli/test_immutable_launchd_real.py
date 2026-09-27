@@ -15,8 +15,8 @@ from hermes_cli import gateway, gateway_launchd
 from hermes_cli.immutable_releases import promote
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="requires launchd")
-def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
+@pytest.mark.macos_only
+def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     label = f"ai.hermes.s2spike.{uuid.uuid4().hex}"
     domain = f"gui/{os.getuid()}"
@@ -27,34 +27,33 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: label)
     monkeypatch.setattr(gateway_launchd, "get_launchd_label", lambda: label)
 
+    from hermes_cli import immutable_releases as releases
+    # Both commits contain the real S2 tree. A pre-S2 fixture would be refused by
+    # the candidate smoke check and would not prove an installable release.
     source = tmp_path / "source-revisions"
-    source.mkdir()
-    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "clone", "--shared", "--quiet", "--no-local",
+                    str(Path(__file__).resolve().parents[2]), str(source)],
+                   check=True, timeout=60)
+    (source / "probe.py").write_text(
+        "import hermes_cli,json,os,pathlib,sys,time\n"
+        "p=pathlib.Path(os.environ['S2_PROBE_OUTPUT'])\n"
+        "p.write_text(json.dumps({'pid':os.getpid(),'exe':sys.executable,"
+        "'cwd':os.getcwd(),'module':hermes_cli.__file__,"
+        "'release':pathlib.Path(__file__).with_name('version.txt').read_text().strip()}))\n"
+        "time.sleep(120)\n", encoding="utf-8")
     revisions = {}
-    for name in ("A", "B"):
+    for name in ("B", "B-prime"):
         (source / "version.txt").write_text(name, encoding="utf-8")
-        subprocess.run(["git", "-C", str(source), "add", "version.txt"], check=True)
+        subprocess.run(["git", "-C", str(source), "add", "probe.py", "version.txt"], check=True)
         subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
-                        "-c", "commit.gpgsign=false", "commit", "-qm", name], check=True)
+                        "-c", "commit.gpgsign=false", "commit", "--no-verify", "-qm", name], check=True)
         revisions[name] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-    sha_a, sha_b = revisions["A"], revisions["B"]
+    sha_a, sha_b = revisions["B"], revisions["B-prime"]
+    monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
     for name, sha in revisions.items():
-        release = home / "releases" / sha
-        release.mkdir(parents=True)
-        venv.EnvBuilder(with_pip=False).create(release / ".venv")
-        package = release / "hermes_cli"
-        package.mkdir()
-        (package / "__init__.py").write_text(f"RELEASE = '{name}'\n")
-        (package / "main.py").write_text("# release identity root for fleet probe\n")
-        (release / ".release-ready").write_text(sha + "\n", encoding="utf-8")
-        (release / "probe.py").write_text(
-            "import hermes_cli, json, os, pathlib, sys, time\n"
-            "p=pathlib.Path(os.environ['S2_PROBE_OUTPUT'])\n"
-            "p.write_text(json.dumps({'pid':os.getpid(),'exe':sys.executable,"
-            "'cwd':os.getcwd(),'module':hermes_cli.__file__,"
-            "'release':hermes_cli.RELEASE}))\n"
-            "time.sleep(120)\n"
-        )
+        release, status = releases.stage_release(source, home, sha=sha)
+        assert status == "staged" and release == home / "releases" / sha
+
     promote(home, home / "releases" / sha_a)
     plist = plistlib.loads(gateway.generate_launchd_plist().encode())
     assert plist["Label"] == label
@@ -85,9 +84,10 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
                     pass
                 else:
                     if result["release"] == name and result["pid"] != old_pid:
-                        root = home / "releases" / (sha_a if name == "A" else sha_b)
-                        for key in ("exe", "cwd", "module"):
+                        root = home / "releases" / (sha_a if name == "B" else sha_b)
+                        for key in ("cwd", "module"):
                             assert Path(result[key]).resolve().is_relative_to(root)
+                        assert Path(result["exe"]) == home / "current" / ".venv" / "bin" / "python"
                         return result
             time.sleep(.1)
         raise AssertionError(f"no launchd process for {name}; logs: {list(logs.glob('*'))}")
@@ -95,10 +95,10 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
     target = f"{domain}/{label}"
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True, timeout=15)
-        a = observed("A")
+        a = observed("B")
         promote(home, home / "releases" / sha_b)
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
-        b = observed("B", a["pid"])
+        b = observed("B-prime", a["pid"])
         assert b["pid"] != a["pid"]
         assert (home / "current").resolve() == home / "releases" / sha_b
         # Exercise the updater's real fleet restart + verification + receipt path.
@@ -158,10 +158,11 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
         finally:
             worker.terminate()
             worker.wait(timeout=5)
-        rolled_back = observed("A", b["pid"])
+        rolled_back = observed("B", b["pid"])
         assert rolled_back["pid"] != b["pid"]
         assert (home / "current").resolve() == home / "releases" / sha_a
         assert (home / "previous").resolve() == home / "releases" / sha_b
+        assert (home / "releases" / sha_b).is_dir()
         receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
         assert receipt["outcome"] == "success"
         assert receipt["gateway_restart"]["restarted_services"] == [label]
@@ -179,8 +180,8 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
         assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="requires launchd")
-def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkeypatch):
+@pytest.mark.macos_only
+def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_path, monkeypatch):
     """Updater promotion and reversal reload one throwaway job, never the live label."""
     from hermes_cli import immutable_releases as releases, update_cmd, update_receipt
 
@@ -200,15 +201,22 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
         "'release': pathlib.Path(__file__).resolve().parent.name}))\n"
         "time.sleep(120)\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(source)], check=True)
-    subprocess.run(["git", "-C", str(source), "add", "probe.py"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "probe.py", "hermes_cli/__init__.py"], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
                     "-c", "commit.gpgsign=false", "commit", "-qm", "source"], check=True)
-    sha = releases.release_sha(source)
-    b = home / "releases" / sha
+    sha_a = releases.release_sha(source)
+    (source / "version.txt").write_text("B\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "version.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
+                    "-c", "commit.gpgsign=false", "commit", "-qm", "B"], check=True)
+    sha_b = releases.release_sha(source)
+    subprocess.run(["git", "-C", str(source), "reset", "--hard", sha_a], check=True, capture_output=True)
+    b = home / "releases" / sha_b
     b.mkdir(parents=True)
     venv.EnvBuilder(with_pip=False).create(b / ".venv")
     (b / "probe.py").write_text((source / "probe.py").read_text(encoding="utf-8"), encoding="utf-8")
-    (b / ".release-ready").write_text(sha + "\n", encoding="utf-8")
+    (b / ".release-ready").write_text(sha_b + "\n", encoding="utf-8")
+    (b / ".hermes_build_sha").write_text(sha_b + "\n", encoding="utf-8")
     output = home / "observed.json"
     plist_path = tmp_path / f"{label}.plist"
 
@@ -270,6 +278,9 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
         assert not (home / "previous").exists()
         recovered = observed("source", a["pid"])
         assert Path(recovered["cwd"]).resolve() == source
+        journal = json.loads((home / "release-layout.json").read_text(encoding="utf-8"))
+        assert journal["source_sha"] == sha_a
+        subprocess.run(["git", "-C", str(source), "reset", "--hard", sha_b], check=True, capture_output=True)
         monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", real_refresh)
         update_receipt.begin_update_receipt()
         assert update_cmd._activate_immutable_release()
@@ -277,15 +288,15 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
         assert updated_receipt is not None
         recorded = json.loads(updated_receipt.read_text(encoding="utf-8"))
         assert any(s["name"] == "immutable_release" and "migration=True" in s["detail"]
-                   and sha in s["detail"] for s in recorded["steps"])
+                   and sha_b in s["detail"] for s in recorded["steps"])
         assert recorded["release_transition"] == {
-            "from_sha": sha, "to_sha": sha, "from_path": str(source),
+            "from_sha": sha_a, "to_sha": sha_b, "from_path": str(source),
             "to_path": str(b), "kind": "migration",
         }
         assert (home / "current").resolve() == b
         assert (home / "previous").resolve() == source
         assert plist_path.read_bytes() == replacement
-        promoted = observed(sha, a["pid"])
+        promoted = observed(sha_b, a["pid"])
         assert Path(promoted["cwd"]).resolve() == b
         assert Path(promoted["exe"]).resolve().is_relative_to(b)
         from types import SimpleNamespace
@@ -310,11 +321,14 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
         restored = observed("source", promoted["pid"])
         assert restored["pid"] != a["pid"]
         assert Path(restored["cwd"]).resolve() == source
+        assert releases.release_sha(source) == sha_a
         assert plist_path.read_bytes() == original
+        assert (home / "previous").resolve() == b
+        assert b.is_dir()
         rollback_receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
         assert rollback_receipt["outcome"] == "success"
         assert rollback_receipt["release_transition"] == {
-            "from_sha": sha, "to_sha": sha, "from_path": str(b),
+            "from_sha": sha_b, "to_sha": sha_a, "from_path": str(b),
             "to_path": str(source), "kind": "migration_reversal",
         }
         assert any(s["name"] == "immutable_rollback" and s["ok"] for s in rollback_receipt["steps"])

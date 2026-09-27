@@ -2337,8 +2337,10 @@ DEFAULT_CONFIG = {
     },
 
     "updates": {
-        # First immutable-release migration is an explicit config decision. Once
-        # current points to a release, normal updates continue that layout.
+        # macOS launchd ONLY: enabling this on systemd, SCM, or an unmanaged
+        # platform fails closed before staging or migrating. First migration is
+        # explicit; its journal records the source SHA before checkout changes.
+        # Once current points to a release, updates continue that layout.
         "immutable_releases": False,
         # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
         "check": True,

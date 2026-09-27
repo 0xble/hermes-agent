@@ -4,7 +4,6 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -46,15 +45,20 @@ def test_detached_cron_worker_stays_on_release_A_then_fresh_B(tmp_path, monkeypa
     a, _ = stage_release(source, home, sha=revisions[0], uv=uv)
     b, _ = stage_release(source, home, sha=revisions[1], uv=uv)
     for name, release in (("A", a), ("B", b)):
+        # Git staging archives HEAD; run the candidate scheduler without committing it.
+        shutil.copy2(repo / "cron" / "scheduler.py", release / "cron" / "scheduler.py")
         (release / "cron" / "s2_release_probe.py").write_text(f"IDENTITY = {name!r}\n")
-        # sitecustomize is imported by the real worker interpreter before -m;
-        # the thread waits until the scheduler module has loaded and a barrier
-        # permits a late import, after A's pointer has moved to B.
+        # sitecustomize runs in the detached worker, not the dispatcher. Identify
+        # the job from its handoff payload so even an incorrectly selected B worker
+        # records the A job's observed release before the late import.
         (release / "sitecustomize.py").write_text(
             "import json, os, pathlib, sys, threading, time\n"
             "def probe():\n"
+            "    if '--external-worker-file' not in sys.argv: return\n"
+            "    payload=pathlib.Path(sys.argv[sys.argv.index('--external-worker-file')+1])\n"
+            "    job=json.loads(payload.read_text())['job']['name'].rsplit(' ',1)[-1]\n"
             "    home=pathlib.Path(os.environ['HERMES_HOME'])\n"
-            f"    trigger=home/'probe-{name}'\n"
+            "    trigger=home/f'probe-{job}'\n"
             "    deadline=time.monotonic()+40\n"
             "    while time.monotonic()<deadline:\n"
             "        if trigger.exists() and 'cron.scheduler' in sys.modules:\n"
@@ -62,7 +66,7 @@ def test_detached_cron_worker_stays_on_release_A_then_fresh_B(tmp_path, monkeypa
             "            from hermes_cli import immutable_releases\n"
             "            paths={k:str(sys.modules[k].__file__) for k in "
             "('cron.scheduler','cron.jobs','cron.s2_release_probe','hermes_cli.immutable_releases')}\n"
-            "            (home/'observed-" + name + ".json').write_text(json.dumps({"
+            "            (home/f'observed-{job}.json').write_text(json.dumps({"
             "'pid':os.getpid(),'exe':sys.executable,'cwd':os.getcwd(),"
             "'identity':cron.s2_release_probe.IDENTITY,'paths':paths}))\n"
             "            break\n"
@@ -92,7 +96,7 @@ def test_detached_cron_worker_stays_on_release_A_then_fresh_B(tmp_path, monkeypa
             time.sleep(.05)
         raise AssertionError(f"missing {path}")
 
-    def dispatch(name):
+    def dispatch(name, release):
         with use_cron_store(home):
             job = create_job(prompt=None, schedule="every 1h", name=f"S2 {name}",
                              script=f"s2_{name}.py", no_agent=True)
@@ -106,23 +110,37 @@ def test_detached_cron_worker_stays_on_release_A_then_fresh_B(tmp_path, monkeypa
             "from tools import process_registry\n"
             "process_registry._is_supervised_gateway_process=lambda: True\n"
             f"job=json.loads(pathlib.Path({str(payload)!r}).read_text())\n"
+            f"pathlib.Path({str(home / f'dispatcher-ready-{name}')!r}).touch()\n"
+            f"barrier=pathlib.Path({str(home / f'dispatch-{name}')!r})\n"
+            "import time\n"
+            "deadline=time.monotonic()+40\n"
+            "while not barrier.exists() and time.monotonic()<deadline: time.sleep(.05)\n"
+            "assert barrier.exists(), 'dispatch barrier timeout'\n"
             "assert scheduler.run_one_job(job,adapters=None,loop=None)\n"
         )
-        return job, subprocess.Popen([sys.executable, "-c", code],
-                                     env={**os.environ, "HERMES_HOME": str(home)},
+        # Import A through the moving symlink itself. Its loaded __file__ can
+        # retain `current/...`; dispatch must use the import-time physical root.
+        dispatch_cwd = home if name == "A" else release
+        import_root = home / "current" if name == "A" else release
+        return job, subprocess.Popen([str(release / ".venv" / "bin" / "python"), "-c", code],
+                                     cwd=dispatch_cwd,
+                                     env={**os.environ, "HERMES_HOME": str(home),
+                                          "PYTHONPATH": str(import_root)},
                                      start_new_session=True)
 
     parents = []
     worker_pids = []
     try:
-        job_a, parent_a = dispatch("A")
+        job_a, parent_a = dispatch("A", a)
         parents.append(parent_a)
+        await_file(home / "dispatcher-ready-A")
+        promote(home, b)
+        (home / "dispatch-A").touch()
         await_file(home / "started-A")
         with use_cron_store(home):
             row = latest_execution(job_a["id"])
         assert row and row["status"] == "running"
         worker_pids.append(row["pid"])
-        promote(home, b)
         (home / "probe-A").write_text("go")
         a_observed = json.loads(await_file(home / "observed-A.json").read_text())
         assert a_observed["pid"] == row["pid"]
@@ -132,12 +150,15 @@ def test_detached_cron_worker_stays_on_release_A_then_fresh_B(tmp_path, monkeypa
         await_file(home / "finished-A")
 
         (home / "probe-B").write_text("go")
-        job_b, parent_b = dispatch("B")
+        job_b, parent_b = dispatch("B", b)
         parents.append(parent_b)
+        await_file(home / "dispatcher-ready-B")
+        (home / "dispatch-B").touch()
         await_file(home / "started-B")
         b_observed = json.loads(await_file(home / "observed-B.json").read_text())
         assert b_observed["identity"] == "B"
         assert b_observed["pid"] != a_observed["pid"]
+        worker_pids.append(b_observed["pid"])
         parent_b.wait(timeout=40)
         assert parent_b.returncode == 0
         await_file(home / "finished-B")

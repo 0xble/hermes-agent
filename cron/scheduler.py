@@ -31,9 +31,13 @@ except ImportError:
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 
+# Freeze the physical code root at module import. Resolving `__file__` during a
+# later dispatch would follow a moved `current` symlink into the next release.
+_LOADED_CODE_ROOT = Path(__file__).resolve().parent.parent
+
 # Must precede repo-level imports: standalone invocations (e.g. module reload after
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(_LOADED_CODE_ROOT))
 
 from hermes_constants import get_hermes_home, hermes_home_key
 from cron.env_settings import cron_env_setting
@@ -3513,14 +3517,15 @@ def _launch_external_cron_worker(job: dict) -> bool:
         "--ack-file",
         str(ack_path),
     ]
-    # Resolve the release once at launch. A later current-pointer flip must not alter
-    # this worker's executable, cwd, or import path.
-    from hermes_cli.immutable_releases import resolved_release
-    pinned_release = resolved_release(_get_hermes_home())
-    if pinned_release:
-        pinned_python = pinned_release / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python")
-        if pinned_python.exists():
-            command[0] = str(pinned_python)
+    # The dispatcher owns the code it has already loaded, even when `current`
+    # moves before this job fires. Resolve this module's physical tree once and
+    # use its interpreter only for an immutable release (not a source checkout).
+    repo_root = _LOADED_CODE_ROOT
+    if repo_root.parent == (_get_hermes_home() / "releases").resolve():
+        pinned_python = repo_root / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python")
+        if not pinned_python.is_file():
+            raise RuntimeError(f"cron release interpreter unavailable: {pinned_python}")
+        command[0] = str(pinned_python)
 
     from agent.secret_scope import (
         build_profile_secret_scope,
@@ -3603,7 +3608,6 @@ def _launch_external_cron_worker(job: dict) -> bool:
     # `-m cron.scheduler` has no hermes_cli.main bootstrap; pin this checkout explicitly
     # (PYTHONSAFEPATH / stale editable mapping, #112729). See cron/scheduler_worker_env.py.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    repo_root = pinned_release or Path(__file__).resolve().parent.parent
     worker_env = pin_hermes_tree_on_pythonpath(worker_env, repo_root)
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

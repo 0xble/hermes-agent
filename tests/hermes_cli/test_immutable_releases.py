@@ -24,6 +24,7 @@ def _fake_release(path: Path, marker: str, *, lock: str = "same") -> None:
     python.write_text("#!/bin/sh\nexit 0\n")
     python.chmod(python.stat().st_mode | stat.S_IEXEC)
     (path / ".release-ready").write_text(path.name + "\n", encoding="utf-8")
+    (path / ".hermes_build_sha").write_text(path.name + "\n", encoding="utf-8")
 
 
 def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, monkeypatch):
@@ -36,6 +37,7 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     shutil.copy2(Path(build_info.__file__), module / "build_info.py")
     (module / "__init__.py").write_text("")
     (module / "main.py").write_text("print(__file__)\n")
+    (module / "immutable_releases.py").write_text("# staging capability probe\n")
     (source / "pyproject.toml").write_text("[project]\nname='staged-probe'\nversion='1.0'\n")
     subprocess.run(["git", "init", "-q", str(source)], check=True)
     subprocess.run(["git", "-C", str(source), "add", "hermes_cli", "pyproject.toml"], check=True)
@@ -179,6 +181,7 @@ def test_candidate_retains_active_optional_feature_from_local_wheel(tmp_path, mo
     source, candidate = tmp_path / "source", tmp_path / "candidate"
     for root in (source, candidate):
         venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    (candidate / "uv.lock").write_text("package = []\n", encoding="utf-8")
     wheel = tmp_path / "optional_s2_feature-1.0-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("optional_s2_feature/__init__.py", "VALUE = 'present'\n")
@@ -387,6 +390,8 @@ def test_failed_plugin_smoke_does_not_flip_pointer(tmp_path, monkeypatch):
     source.mkdir()
     (source / "pyproject.toml").write_text("[project]\nname='source'\n")
     (source / "uv.lock").write_text("new")
+    (source / "hermes_cli").mkdir()
+    (source / "hermes_cli" / "immutable_releases.py").write_text("# test\n")
     monkeypatch.setattr(releases, "_build_venv", lambda *args, **kwargs: None)
     monkeypatch.setattr(releases, "release_sha", lambda _source: "c")
     with pytest.raises(RuntimeError, match="bad plugin"):
@@ -444,6 +449,8 @@ def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     (source / "version.txt").write_text("B", encoding="utf-8")
+    (source / "hermes_cli").mkdir()
+    (source / "hermes_cli" / "immutable_releases.py").write_text("# test\n")
     a = home / "releases" / "A"
     _fake_release(a, "A")
     releases.promote(home, a)
@@ -771,6 +778,186 @@ def test_candidate_smoke_cannot_pass_via_inherited_stale_pythonpath(tmp_path, mo
     monkeypatch.setenv("PYTHONPATH", str(stale.parent))
     with pytest.raises(RuntimeError, match="candidate plugin broken"):
         releases.smoke_plugins(Path(__file__).resolve().parents[2], home)
+
+
+
+
+def test_incomplete_active_release_survives_failed_restaging(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    active = home / "releases" / "A"
+    _fake_release(active, "A")
+    releases.promote(home, active)
+    (active / ".release-ready").unlink()
+    source = tmp_path / "source"
+    source.mkdir()
+    with pytest.raises(RuntimeError, match="potentially pinned"):
+        releases.stage_release(source, home, sha="A")
+    assert (home / "current").resolve() == active
+    assert (active / ".hermes_build_sha").exists()
+
+
+def test_staging_failure_never_publishes_candidate(tmp_path, monkeypatch):
+    source, home = tmp_path / "source", tmp_path / "profile"
+    (source / "hermes_cli").mkdir(parents=True)
+    (source / "hermes_cli" / "immutable_releases.py").write_text("# test\n")
+    def failed_build(path, **kwargs):
+        assert path.name.startswith(".staging-B-")
+        raise RuntimeError("build failed")
+    monkeypatch.setattr(releases, "prepare_venv", failed_build)
+    with pytest.raises(RuntimeError, match="build failed"):
+        releases.stage_release(source, home, sha="B")
+    assert not (home / "releases" / "B").exists()
+    assert list((home / "releases").iterdir()) == []
+
+
+def test_locked_distribution_upgrade_survives_optional_restore(tmp_path, monkeypatch):
+    import venv
+    import zipfile
+    source, candidate = tmp_path / "source", tmp_path / "candidate"
+    for root in (source, candidate):
+        venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    (candidate / "uv.lock").write_text('[[package]]\nname = "locked.x"\nversion = "2.0"\n')
+    wheels = [("locked_x", "1.0"), ("locked_x", "2.0"), ("plugin_y", "1.0")]
+    for name, version in wheels:
+        wheel = tmp_path / f"{name}-{version}-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(f"{name}/__init__.py", f"VERSION = '{version}'\n")
+            archive.writestr(f"{name}-{version}.dist-info/METADATA",
+                             f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+            archive.writestr(f"{name}-{version}.dist-info/WHEEL",
+                             "Wheel-Version: 1.0\nGenerator: s2-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+            archive.writestr(f"{name}-{version}.dist-info/RECORD", "")
+    for env, specs in ((source, ["locked_x==1.0", "plugin_y==1.0"]),
+                       (candidate, ["locked_x==2.0"])):
+        subprocess.run(["uv", "pip", "install", "--offline", "--no-deps", "--find-links", str(tmp_path),
+                        "--python", str(releases._release_python(env)), *specs], check=True, capture_output=True)
+    monkeypatch.setenv("UV_FIND_LINKS", str(tmp_path))
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    releases.restore_active_distributions(source, candidate)
+    result = subprocess.run([str(releases._release_python(candidate)), "-c",
+                             "import locked_x,plugin_y;print(locked_x.VERSION,plugin_y.VERSION)"],
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == "2.0 1.0"
+
+
+@pytest.mark.parametrize("manager", ["linux", "win32"])
+def test_immutable_opt_in_rejects_non_launchd_before_staging(tmp_path, monkeypatch, manager):
+    from hermes_cli import update_cmd
+    home = tmp_path / "profile"
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
+    monkeypatch.setattr(update_cmd.sys, "platform", manager)
+    monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: pytest.fail("staged"))
+    with pytest.raises(RuntimeError, match="macOS launchd"):
+        update_cmd._cmd_update_impl(object(), gateway_mode=False)
+    assert not home.exists()
+
+
+def test_retention_refuses_unreadable_receipt(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    for name in ("A", "B", "C"):
+        _fake_release(home / "releases" / name, name)
+    receipts = home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "broken.json").write_text("{not-json")
+    monkeypatch.setattr(releases, "_live_process_pins", lambda _: set())
+    with pytest.raises(RuntimeError, match="unreadable update receipt"):
+        releases.retain(home, rollback_count=0)
+    assert all((home / "releases" / name).exists() for name in ("A", "B", "C"))
+
+
+def test_promote_and_rollback_refuse_mismatched_build_stamp(tmp_path):
+    home = tmp_path / "profile"
+    a, b = home / "releases" / "A", home / "releases" / "B"
+    _fake_release(a, "A")
+    _fake_release(b, "B")
+    releases.promote(home, a)
+    releases.promote(home, b)
+    (a / ".hermes_build_sha").write_text("wrong\n")
+    with pytest.raises(ValueError, match="not a complete release"):
+        releases.rollback(home)
+    assert (home / "current").resolve() == b
+    assert (home / "previous").resolve() == a
+
+
+
+
+def test_update_journals_source_sha_before_checkout_advances(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import gateway, update_cmd
+    source, home, remote = tmp_path / "source", tmp_path / "profile", tmp_path / "origin.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+    sha_a = None
+    for name in ("A", "B"):
+        (source / "version.txt").write_text(name)
+        subprocess.run(["git", "-C", str(source), "add", "version.txt"], check=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                        "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", name], check=True)
+        if name == "A":
+            sha_a = releases.release_sha(source)
+        subprocess.run(["git", "-C", str(source), "push", "-q", "origin", "main"], check=True)
+    assert sha_a is not None
+    subprocess.run(["git", "-C", str(source), "reset", "--hard", sha_a], check=True, capture_output=True)
+    monkeypatch.setattr(releases, "_source_python_valid", lambda *args: True)
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
+    monkeypatch.setattr(update_cmd._m(), "_run_pre_update_backup", lambda *args: None)
+    monkeypatch.setattr(update_cmd._m(), "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(update_cmd._m(), "_resolve_update_branch", lambda *args: "main")
+    monkeypatch.setattr(update_cmd._m(), "_warn_orphaned_update_autostashes", lambda *args: None)
+    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *args: SimpleNamespace(gw_input_fn=None, assume_yes=True, switch_branch=False))
+    monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda *args: None)
+    monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda *args: False)
+    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
+    def inspect_before_checkout(*args, **kwargs):
+        assert json.loads((home / "release-layout.json").read_text())["source_sha"] == sha_a
+        assert releases.release_sha(source) == sha_a
+        raise RuntimeError("journal observed before checkout mutation")
+    monkeypatch.setattr(update_cmd, "_prepare_checkout_for_update", inspect_before_checkout)
+    with pytest.raises(RuntimeError, match="journal observed before checkout mutation"):
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=False), gateway_mode=False)
+
+
+def test_atomic_publish_refuses_existing_empty_target(tmp_path):
+    staging, target = tmp_path / "staging", tmp_path / "B"
+    staging.mkdir()
+    target.mkdir()
+    (staging / "sentinel").write_text("new")
+    with pytest.raises(FileExistsError):
+        releases._publish_release(staging, target)
+    assert staging.is_dir() and target.is_dir()
+    assert not (target / "sentinel").exists()
+
+
+def test_real_uv_build_aside_relocates_interpreter_and_scripts(tmp_path, monkeypatch):
+    source, home = tmp_path / "source", tmp_path / "profile"
+    (source / "hermes_cli").mkdir(parents=True)
+    (source / "hermes_cli" / "immutable_releases.py").write_text("# test\n")
+    (source / "pyproject.toml").write_text(
+        "[project]\nname='s2-relocation-probe'\nversion='0.1.0'\nrequires-python='>=3.11'\n"
+        "[tool.uv]\npackage=false\n", encoding="utf-8")
+    subprocess.run(["uv", "lock", "--offline"], cwd=source, check=True, capture_output=True)
+    monkeypatch.setattr(releases, "smoke_plugins", lambda *args, **kw: None)
+    candidate, action = releases.stage_release(source, home, sha="B")
+    assert action == "staged"
+    result = subprocess.run([str(releases._release_python(candidate)), "-c",
+                             "import sys;print(sys.prefix)"], capture_output=True, text=True, check=True)
+    assert Path(result.stdout.strip()).resolve() == candidate / ".venv"
+    assert not any(p.name.startswith(".staging-") for p in (home / "releases").iterdir())
+
+
+def test_pre_s2_revision_fails_with_clear_message(tmp_path):
+    source, home = tmp_path / "source", tmp_path / "profile"
+    source.mkdir()
+    (source / "version.txt").write_text("pre-S2")
+    with pytest.raises(RuntimeError, match="predates immutable releases"):
+        releases.stage_release(source, home, sha="A")
+    assert not (home / "releases" / "A").exists()
 
 
 def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profile(tmp_path):

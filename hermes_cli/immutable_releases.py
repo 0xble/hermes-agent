@@ -15,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import uuid
+import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -146,21 +148,23 @@ def _build_venv(release: Path, *, uv: str = "uv") -> None:
 
 def _active_distributions(python: Path) -> dict[str, str]:
     script = ("import importlib.metadata as m,json; "
-              "print(json.dumps({d.metadata['Name'].lower().replace('_','-'): d.version "
+              "import re; print(json.dumps({re.sub(r'[-_.]+','-',d.metadata['Name']).lower(): d.version "
               "for d in m.distributions() if d.metadata.get('Name')}))")
     result = subprocess.run([str(python), "-c", script], check=True,
                             capture_output=True, text=True, env=_release_subprocess_env())
     return json.loads(result.stdout)
 
 
-def _active_plugin_entrypoints(python: Path) -> set[tuple[str, str, str]]:
-    script = ("import importlib.metadata as m,json; "
+def _active_plugin_entrypoints(python: Path, names: set[str] | None = None) -> set[tuple[str, str, str]]:
+    script = ("import importlib.metadata as m,json,re; "
               "groups={'hermes_agent.plugins','hermes_agent.plugin_capabilities'}; "
-              "print(json.dumps(sorted((e.group,e.name,e.value) for d in m.distributions() "
+              "print(json.dumps(sorted((re.sub(r'[-_.]+','-',d.metadata['Name']).lower(),e.group,e.name,e.value) "
+              "for d in m.distributions() if d.metadata.get('Name') "
               "for e in d.entry_points if e.group in groups)))")
     result = subprocess.run([str(python), "-c", script], check=True,
                             capture_output=True, text=True, env=_release_subprocess_env())
-    return {tuple(row) for row in json.loads(result.stdout)}
+    return {(group, name, value) for dist, group, name, value in json.loads(result.stdout)
+            if names is None or dist in names}
 
 
 def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv") -> None:
@@ -179,17 +183,28 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
         raise RuntimeError(f"source interpreter unavailable: {source_python}")
     installed = _active_distributions(source_python)
     target = _active_distributions(candidate_python)
-    missing = [f"{name}=={version}" for name, version in sorted(installed.items())
-               if name not in {"hermes-agent", "hermes-agent-cli"} and target.get(name) != version]
+    lock = candidate / "uv.lock"
+    if not lock.is_file():
+        raise RuntimeError(f"candidate lockfile missing: {lock}")
+    locked = {re.sub(r"[-_.]+", "-", p["name"]).lower()
+              for p in tomllib.loads(lock.read_text(encoding="utf-8"))["package"]}
+    locked_versions = {name: target[name] for name in locked if name in target}
+    extras = {name: version for name, version in installed.items()
+              if name not in locked and name not in {"hermes-agent", "hermes-agent-cli"}}
+    missing = [f"{name}=={version}" for name, version in sorted(extras.items())
+               if target.get(name) != version]
     if missing:
-        subprocess.run([uv, "pip", "install", "--python", str(candidate_python), *missing],
+        subprocess.run([uv, "pip", "install", "--no-deps", "--python", str(candidate_python), *missing],
                        env=_release_subprocess_env(candidate), check=True)
     target = _active_distributions(candidate_python)
-    unmatched = [name for name, version in installed.items()
-                 if name not in {"hermes-agent", "hermes-agent-cli"} and target.get(name) != version]
+    unmatched = [name for name, version in extras.items() if target.get(name) != version]
     if unmatched:
-        raise RuntimeError(f"candidate dependency parity failed: {', '.join(sorted(unmatched))}")
-    absent = _active_plugin_entrypoints(source_python) - _active_plugin_entrypoints(candidate_python)
+        raise RuntimeError(f"candidate optional distribution parity failed: {', '.join(sorted(unmatched))}")
+    changed = [name for name in locked if name in target and name in locked_versions
+               and target[name] != locked_versions[name]]
+    if changed:
+        raise RuntimeError(f"candidate lock distributions changed: {', '.join(sorted(changed))}")
+    absent = _active_plugin_entrypoints(source_python, set(extras)) - _active_plugin_entrypoints(candidate_python, set(extras))
     if absent:
         raise RuntimeError(f"candidate lost installed plugin entry points: {sorted(absent)}")
 
@@ -276,49 +291,86 @@ if __name__ == "__main__" and "--smoke-imports" in sys.argv:
     _smoke_imports()
 
 
+def _publish_release(staging: Path, target: Path) -> None:
+    """Atomic directory rename, refusing even a concurrently created empty target."""
+    if sys.platform == "darwin":
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        # renamex_np(..., RENAME_EXCL) is an atomic no-replace rename on macOS.
+        if libc.renamex_np(os.fsencode(staging), os.fsencode(target), 0x00000004) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(target))
+    elif sys.platform.startswith("linux"):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        # Test builds on Linux must also preserve the no-replace invariant.
+        if not hasattr(libc, "renameat2"):
+            raise RuntimeError("atomic no-replace release publishing is unavailable on this host")
+        if libc.renameat2(-100, os.fsencode(staging), -100, os.fsencode(target), 1) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(target))
+    else:
+        raise RuntimeError("atomic no-replace release publishing is unsupported on this platform")
+
+
+def _relocate_venv(staging: Path, target: Path) -> None:
+    """Rewrite uv's absolute script/editable paths before publishing the built tree."""
+    old, new = str(staging).encode(), str(target).encode()
+    for root, _, names in os.walk(staging / ".venv"):
+        for name in names:
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            raw = path.read_bytes()
+            if old not in raw:
+                continue
+            if b"\0" in raw:
+                raise RuntimeError(f"cannot relocate binary with staging path: {path}")
+            path.write_bytes(raw.replace(old, new))
+
+
+def _release_is_ready(path: Path, sha: str) -> bool:
+    return (path.is_dir() and all((path / name).is_file()
+            and (path / name).read_text(encoding="utf-8").strip() == sha
+            for name in (".release-ready", ".hermes_build_sha")))
+
+
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
                   uv: str = "uv", plugin_dir: Path | None = None) -> tuple[Path, str]:
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
-    if (target.is_dir() and (target / ".release-ready").is_file()
-            and (target / ".release-ready").read_text(encoding="utf-8").strip() == sha
-            and (target / ".hermes_build_sha").is_file()
-            and (target / ".hermes_build_sha").read_text(encoding="utf-8").strip() == sha):
+    if target.is_symlink():
+        raise RuntimeError(f"release target is a symlink, refusing to follow or replace: {target}")
+    if _release_is_ready(target, sha):
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
         return target, "existing"
+    if target.exists() or target.is_symlink():
+        raise RuntimeError(f"release {target} already exists but is incomplete; refusing to replace a potentially pinned release")
     paths.releases.mkdir(parents=True, exist_ok=True)
-    staging = paths.releases / f".{sha}.staging-{os.getpid()}"
-    published = False
+    staging = paths.releases / f".staging-{sha}-{uuid.uuid4().hex}"
     try:
         source = source.resolve(strict=True)
-        # Git archives contain only tracked bytes at SHA; an ignored HERMES_HOME
-        # nested in the checkout cannot enter the artifact or recurse into itself.
         if (source / ".git").exists():
             _stage_git_tree(source, staging, sha)
-            # The web bundle is generated after dependency sync, not tracked in
-            # Git. Carry only this declared build output, never arbitrary caches.
             bundle = source / "hermes_cli" / "web_dist"
             if bundle.is_dir():
                 shutil.copytree(bundle, staging / "hermes_cli" / "web_dist", dirs_exist_ok=True)
         else:
             _copy_tree(source, staging, home=paths.home)
-        if target.exists():
-            # A crashed build never becomes an apparently usable release.
-            shutil.rmtree(target)
-        os.replace(staging, target)
-        published = True
-        prepare_venv(target, previous=read_pointer(paths.current), uv=uv,
+        if not (staging / "hermes_cli" / "immutable_releases.py").is_file():
+            raise RuntimeError(f"revision {sha} predates immutable releases and cannot be staged")
+        prepare_venv(staging, previous=read_pointer(paths.current), uv=uv,
                      source=source if (source / ".git").exists() else None)
-        (target / ".hermes_build_sha").write_text(sha + "\n", encoding="utf-8")
-        if (target / ".hermes_build_sha").read_text(encoding="utf-8").strip() != sha:
-            raise RuntimeError("release identity stamp mismatch")
-        smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
-        (target / ".release-ready").write_text(sha + "\n", encoding="utf-8")
-    except Exception:
+        (staging / ".hermes_build_sha").write_text(sha + "\n", encoding="utf-8")
+        smoke_plugins(staging, paths.home, plugin_dir=plugin_dir)
+        _relocate_venv(staging, target)
+        (staging / ".release-ready").write_text(sha + "\n", encoding="utf-8")
+        if target.exists() or target.is_symlink():
+            raise RuntimeError(f"release {target} appeared during staging; refusing to replace it")
+        _publish_release(staging, target)
+    except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
-        if published:
-            shutil.rmtree(target, ignore_errors=True)
         raise
     return target, "staged"
 
@@ -326,9 +378,7 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
 def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
     candidate = candidate.resolve()
-    if (not candidate.is_dir() or candidate.parent != paths.releases.resolve()
-            or not (candidate / ".release-ready").is_file()
-            or (candidate / ".release-ready").read_text(encoding="utf-8").strip() != candidate.name):
+    if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
         raise ValueError(f"candidate is not a complete release under {paths.releases}: {candidate}")
     old = read_pointer(paths.current)
     if old == candidate:
@@ -347,8 +397,8 @@ def _receipt_pins(home: Path) -> set[Path]:
     for path in (home / "logs" / "update_receipts").glob("*.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"cannot safely prune releases: unreadable update receipt {path}: {exc}") from exc
         # Successful historical transitions are audit records, not permanent
         # rollback leases: pinning every from/to path across the receipt archive
         # would prevent pruning on every normal update. Keep unresolved/failed
@@ -515,6 +565,19 @@ def restore_source_layout(home: Path) -> dict[str, str | None]:
     source = Path(data["source"]).resolve(strict=True)
     if read_pointer(paths.previous) != source:
         raise RuntimeError("previous is not the recorded source checkout")
+    # Never point launchd at a checkout that has advanced past the saved
+    # migration revision. Refuse dirty trees before changing any pointer/plist.
+    expected_sha = data["source_sha"]
+    actual_sha = release_sha(source)
+    if actual_sha != expected_sha:
+        status = subprocess.run(["git", "-C", str(source), "status", "--porcelain"],
+                                capture_output=True, text=True, check=True)
+        if status.stdout.strip():
+            raise RuntimeError(f"source checkout is dirty; cannot restore migration revision {expected_sha}")
+        restored = subprocess.run(["git", "-C", str(source), "reset", "--hard", expected_sha],
+                                  capture_output=True, text=True)
+        if restored.returncode or release_sha(source) != expected_sha:
+            raise RuntimeError(f"could not restore source checkout revision {expected_sha}: {restored.stderr}")
     current = read_pointer(paths.current)
     if current is None:
         raise RuntimeError("there is no current release to reverse")
@@ -549,8 +612,7 @@ def resolved_release(home: Path) -> Path | None:
     release = read_pointer(paths.current)
     if release is None or release.parent != paths.releases.resolve():
         return None
-    marker = release / ".release-ready"
-    return release if marker.is_file() and marker.read_text(encoding="utf-8").strip() == release.name else None
+    return release if _release_is_ready(release, release.name) else None
 
 
 def update_source_checkout(home: Path, running_root: Path) -> Path | None:

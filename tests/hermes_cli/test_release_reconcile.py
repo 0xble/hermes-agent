@@ -101,6 +101,7 @@ def test_equal_pointer_with_stale_service_repairs_on_noop(tmp_path, monkeypatch)
     candidate = home / "releases" / "B"
     candidate.mkdir(parents=True)
     (candidate / ".release-ready").write_text("B\n")
+    (candidate / ".hermes_build_sha").write_text("B\n")
     releases.promote(home, candidate)
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
@@ -120,6 +121,7 @@ def test_equal_pointer_with_stale_runtime_arms_fleet_catchup(tmp_path, monkeypat
     candidate = home / "releases" / "B"
     candidate.mkdir(parents=True)
     (candidate / ".release-ready").write_text("B\n")
+    (candidate / ".hermes_build_sha").write_text("B\n")
     releases.promote(home, candidate)
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")

@@ -121,11 +121,22 @@ def _m():
     return main
 
 
+def _require_immutable_launchd() -> None:
+    """S2 changes service definitions only through macOS launchd."""
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer
+    home = get_hermes_home()
+    paths = ReleasePaths.for_home(home)
+    if (bool(_updates_config().get("immutable_releases", False)) or read_pointer(paths.current) is not None
+            or (paths.home / "release-layout.json").exists()) and sys.platform != "darwin":
+        raise RuntimeError("immutable releases require macOS launchd; disable updates.immutable_releases on this platform")
+
+
 def _activate_immutable_release(*, defer: bool = False) -> bool:
     """Stage an opted-in layout; only promote/reload with restart authorization."""
     from hermes_cli.immutable_releases import (
         ReleasePaths, begin_migration, promote, read_pointer, release_sha, stage_release,
     )
+    _require_immutable_launchd()
     home = get_hermes_home()
     paths = ReleasePaths.for_home(home)
     # The first migration changes launchd's executable and must be deliberate.
@@ -182,8 +193,14 @@ def _activate_immutable_release(*, defer: bool = False) -> bool:
             raise
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
+        from_sha = None
+        if first and previous:
+            import json
+            from_sha = json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8"))["source_sha"]
+        elif previous:
+            from_sha = Path(previous).name
         record_release_transition(
-            from_sha=(release_sha(Path(previous)) if first and previous else Path(previous).name if previous else None),
+            from_sha=from_sha,
             to_sha=sha, from_path=previous, to_path=str(candidate),
             kind="migration" if first else "promotion",
         )
@@ -1413,13 +1430,12 @@ def _release_running_state(paths, source, current, sha) -> str:
 
 def _catch_up_immutable_release(*, defer: bool) -> None:
     """Reconcile source, artifact, journal, service and gateway before fleet catch-up."""
-    from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha, _release_is_ready
     paths = ReleasePaths.for_home(get_hermes_home())
     current = read_pointer(paths.current)
     sha = release_sha(_m().PROJECT_ROOT)
     candidate = paths.release(sha)
-    ready = candidate / ".release-ready"
-    candidate_state = ("staged" if ready.is_file() and ready.read_text(encoding="utf-8").strip() == sha
+    candidate_state = ("staged" if _release_is_ready(candidate, sha)
                        else "failed-partial" if candidate.exists() else "none")
     journal_path = paths.home / "release-layout.json"
     journal = ("rolled-back" if current is not None and current.parent != paths.releases.resolve()
@@ -1811,6 +1827,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     if getattr(args, "rollback", False) and getattr(args, "no_gateway_restart", False):
         raise ValueError("--rollback cannot be combined with --no-gateway-restart: rollback requires a fleet restart")
+    _require_immutable_launchd()
 
     if getattr(args, "rollback", False):
         from hermes_cli.immutable_releases import ReleasePaths, migration_plist, read_pointer, rollback
@@ -1829,6 +1846,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         from hermes_cli import gateway
         plist_path = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
         plist_before = plist_path.read_bytes() if plist_path is not None and plist_path.exists() else None
+        source_head_before = None
+        if before_previous is not None and before_previous.parent != paths.releases.resolve():
+            from hermes_cli.immutable_releases import release_sha
+            source_head_before = release_sha(before_previous)
         try:
             result = rollback(home)
             current_target = result["current"]
@@ -1847,7 +1868,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         raise RuntimeError("source plist bytes differ after rollback reload")
                     _record_update_step("source_plist_restore", True, str(plist_path))
         except Exception:
-            from hermes_cli.immutable_releases import _atomic_symlink
+            from hermes_cli.immutable_releases import _atomic_symlink, release_sha
+            if source_head_before and before_previous is not None:
+                source = before_previous
+                if release_sha(source) != source_head_before:
+                    status = _git_run(["git"], ["status", "--porcelain"], cwd=source, check=True)
+                    if status.stdout.strip() or _git_run(["git"], ["reset", "--hard", source_head_before], cwd=source).returncode:
+                        raise RuntimeError("rollback failed and source checkout could not be restored to its prior revision")
             _atomic_symlink(paths.current, before)
             if before_previous is None:
                 paths.previous.unlink(missing_ok=True)
@@ -1971,6 +1998,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
         current_branch = _current_branch_name(git_cmd, check=True)
+        # Journal the running checkout before branch switching, stashing, merging,
+        # or pulling. A migration rollback must recover this exact source A.
+        if _updates_config().get("immutable_releases", False):
+            from hermes_cli.immutable_releases import ReleasePaths, begin_migration, read_pointer
+            if read_pointer(ReleasePaths.for_home(get_hermes_home()).current) is None:
+                from hermes_cli import gateway
+                begin_migration(get_hermes_home(), _m().PROJECT_ROOT,
+                                gateway.get_launchd_plist_path())
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
