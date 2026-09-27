@@ -165,7 +165,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
         subprocess.Popen(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
-             sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
+             *hermes_cmd, "update", "--gateway"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
@@ -1300,7 +1300,7 @@ class GatewaySlashCommandsMixin(
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update — spawn ``hermes update`` detached (``setsid``) so it survives the gateway
         restart it may trigger; marker files let this or the next gateway process notify the user."""
-        from gateway.run import _hermes_home, _resolve_hermes_bin
+        from gateway.run import _hermes_home, _resolve_update_hermes_bin
         from hermes_cli.config import is_managed, format_managed_message
         # Block non-messaging platforms (API server, webhooks, ACP); plugin platforms with
         # allow_update_command=True are also allowed.
@@ -1315,11 +1315,9 @@ class GatewaySlashCommandsMixin(
                 return t("gateway.update.platform_not_messaging")
         if is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
-        if not (Path(__file__).parent.parent.resolve() / '.git').exists():
-            return t("gateway.update.not_git_repo")
-        hermes_cmd = _resolve_hermes_bin()
+        hermes_cmd = _resolve_update_hermes_bin(_hermes_home)
         if not hermes_cmd:
-            return t("gateway.update.hermes_cmd_not_found")
+            return t("gateway.update.not_git_repo")
         pending = {
             "platform": src.platform.value, "chat_id": src.chat_id, "chat_type": src.chat_type,
             "user_id": src.user_id, "session_key": self._session_key_for_source(src),

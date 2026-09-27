@@ -229,6 +229,7 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
     # Only the throwaway plist is in scope; preserve production's temp-home guard.
     monkeypatch.setattr(gateway, "_refuse_temp_home_service_write", lambda *_: False)
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
     monkeypatch.setattr(releases, "stage_release", lambda *args, **kwargs: (b, "staged"))
 

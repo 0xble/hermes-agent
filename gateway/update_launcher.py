@@ -117,7 +117,8 @@ def make_agent_update_handler(
             return {"accepted": False, "error": "no session route"}
         if is_managed():
             return {"accepted": False, "error": "managed installs cannot update here"}
-        if not (Path(__file__).parent.parent.resolve() / ".git").exists():
+        hermes_cmd = resolve_hermes_bin()
+        if not hermes_cmd:
             return {"accepted": False, "error": "update requires a git checkout"}
         try:
             db = runner._session_db._db
@@ -135,9 +136,6 @@ def make_agent_update_handler(
             entry = platform_registry.get(platform.value)
             if not entry or not entry.allow_update_command:
                 return {"accepted": False, "error": "update requires a messaging session"}
-        hermes_cmd = resolve_hermes_bin()
-        if not hermes_cmd:
-            return {"accepted": False, "error": "Hermes command unavailable"}
         pending = {
             "platform": route["source"], "chat_id": route["chat_id"],
             "chat_type": route.get("chat_type"), "user_id": route.get("user_id"),

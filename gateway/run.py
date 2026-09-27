@@ -3000,6 +3000,25 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
+def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
+    """Use the migration-bound source interpreter when running from a release."""
+    from hermes_cli.immutable_releases import update_source_checkout
+    root = Path(__file__).parent.parent.resolve()
+    if (root / ".git").exists():
+        return _resolve_hermes_bin()
+    from hermes_constants import get_hermes_home
+    source = update_source_checkout(home or get_hermes_home(), root)
+    if source is None:
+        return None
+    python = source / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not python.is_file():
+        return None
+    # -c inserts the trusted checkout ahead of the running release even when
+    # the detached process inherits its cwd or PYTHONPATH from the gateway.
+    script = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('hermes_cli.main',run_name='__main__')"
+    return [str(python), "-c", script, str(source)]
+
+
 _PROFILE_ID_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
@@ -5663,7 +5682,8 @@ async def _start_gateway_start_control_socket(runner):
 
         _agent_update_handler = make_agent_update_handler(
             runner=runner, home=_hermes_home, main_loop=_main_loop,
-            resolve_hermes_bin=_resolve_hermes_bin, spawn=_spawn_detached_update, is_managed=is_managed,
+            resolve_hermes_bin=lambda: _resolve_update_hermes_bin(_hermes_home),
+            spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
         _control_server = GatewayControlServer(

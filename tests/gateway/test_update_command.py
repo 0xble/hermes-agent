@@ -85,7 +85,7 @@ class TestHandleUpdateCommand:
             (fake_root / "gateway").mkdir(parents=True)
             (fake_root / "gateway" / "slash_commands.py").touch()
 
-            with patch("gateway.slash_commands.__file__", fake_file):
+            with patch("gateway.run.__file__", str(fake_root / "gateway" / "run.py")):
                 result = await runner._handle_update_command(event)
 
         assert "Not a git repository" in result

@@ -34,9 +34,11 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     from hermes_cli import build_info
     import shutil
     shutil.copy2(Path(build_info.__file__), module / "build_info.py")
+    (module / "__init__.py").write_text("")
+    (module / "main.py").write_text("print(__file__)\n")
     (source / "pyproject.toml").write_text("[project]\nname='staged-probe'\nversion='1.0'\n")
     subprocess.run(["git", "init", "-q", str(source)], check=True)
-    subprocess.run(["git", "-C", str(source), "add", "hermes_cli/build_info.py", "pyproject.toml"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "hermes_cli", "pyproject.toml"], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
                     "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
     sha = releases.release_sha(source)
@@ -44,6 +46,9 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     (home / "cache").mkdir(parents=True)
     (home / "cache" / "private.txt").write_text("never ship")
     (source / ".worktrees" / "other").mkdir(parents=True)
+    bundle = source / "hermes_cli" / "web_dist"
+    bundle.mkdir()
+    (bundle / "index.html").write_text("fresh built asset")
     monkeypatch.setattr(releases, "prepare_venv", lambda *args, **kwargs: None)
     monkeypatch.setattr(releases, "smoke_plugins", lambda *args, **kwargs: None)
     release, action = releases.stage_release(source, home)
@@ -52,11 +57,49 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     assert not (release / "hermes_test").exists()
     assert not (release / ".worktrees").exists()
     assert not (release / ".git").exists()
+    assert (release / "hermes_cli" / "web_dist" / "index.html").read_text() == "fresh built asset"
     code = "import importlib.util, pathlib, sys; p=pathlib.Path(sys.argv[1]); s=importlib.util.spec_from_file_location('staged_build_info',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.get_code_identity(refresh=True)['sha'])"
     result = subprocess.run([sys.executable, "-c", code, str(release / "hermes_cli" / "build_info.py")],
                             check=True, capture_output=True, text=True)
     assert result.stdout.strip() == sha
     assert releases.stage_release(source, home)[1] == "existing"
+    import venv
+    venv.EnvBuilder(with_pip=False).create(source / ".venv")
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source)}))
+    releases.promote(home, release)
+    from gateway import run as gateway_run
+    monkeypatch.setattr(gateway_run, "__file__", str(release / "gateway" / "run.py"))
+    argv = gateway_run._resolve_update_hermes_bin(home)
+    assert argv is not None and argv[0] == str(source / ".venv" / "bin" / "python")
+    launched = subprocess.run([*argv, "probe"], cwd=release,
+                              capture_output=True, text=True)
+    assert launched.returncode == 0, launched.stderr
+    assert launched.stdout.strip() == str(source / "hermes_cli" / "main.py")
+
+
+def test_candidate_retains_active_optional_feature_from_local_wheel(tmp_path, monkeypatch):
+    import venv
+    import zipfile
+    source, candidate = tmp_path / "source", tmp_path / "candidate"
+    for root in (source, candidate):
+        venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    wheel = tmp_path / "optional_s2_feature-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("optional_s2_feature/__init__.py", "VALUE = 'present'\n")
+        archive.writestr("optional_s2_feature-1.0.dist-info/METADATA",
+                         "Metadata-Version: 2.1\nName: optional-s2-feature\nVersion: 1.0\n")
+        archive.writestr("optional_s2_feature-1.0.dist-info/WHEEL",
+                         "Wheel-Version: 1.0\nGenerator: s2-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        archive.writestr("optional_s2_feature-1.0.dist-info/RECORD", "")
+    subprocess.run(["uv", "pip", "install", "--python", str(releases._release_python(source)), str(wheel)],
+                   check=True, capture_output=True)
+    monkeypatch.setenv("UV_FIND_LINKS", str(tmp_path))
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    releases.restore_active_distributions(source, candidate)
+    probe = subprocess.run([str(releases._release_python(candidate)), "-c",
+                            "import optional_s2_feature; print(optional_s2_feature.VALUE)"],
+                           check=True, capture_output=True, text=True)
+    assert probe.stdout.strip() == "present"
 
 
 def test_normal_update_without_layout_opt_in_does_not_touch_release_or_plist(tmp_path, monkeypatch):
@@ -377,6 +420,8 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
                     str(remote), str(source)], check=True)
     sha = subprocess.check_output(["git", "-C", str(remote), "rev-parse", "HEAD"], text=True).strip()
     subprocess.run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], check=True)
+    # This fixture validates plugin import failure, not dependency synchronization.
+    monkeypatch.setattr(releases, "restore_active_distributions", lambda *a, **kw: None)
     home = tmp_path / "profile"
     home.mkdir()
     plugin = home / "plugins" / "candidate-test"

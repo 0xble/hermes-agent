@@ -128,9 +128,61 @@ def _build_venv(release: Path, *, uv: str = "uv") -> None:
     subprocess.run([uv, "sync", "--frozen", "--python", sys.executable], cwd=release, check=True)
 
 
-def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv") -> tuple[Path, str]:
+def _active_distributions(python: Path) -> dict[str, str]:
+    script = ("import importlib.metadata as m,json; "
+              "print(json.dumps({d.metadata['Name'].lower().replace('_','-'): d.version "
+              "for d in m.distributions() if d.metadata.get('Name')}))")
+    result = subprocess.run([str(python), "-c", script], check=True,
+                            capture_output=True, text=True)
+    return json.loads(result.stdout)
+
+
+def _active_plugin_entrypoints(python: Path) -> set[tuple[str, str, str]]:
+    script = ("import importlib.metadata as m,json; "
+              "groups={'hermes_agent.plugins','hermes_agent.plugin_capabilities'}; "
+              "print(json.dumps(sorted((e.group,e.name,e.value) for e in m.entry_points() "
+              "if e.group in groups)))")
+    result = subprocess.run([str(python), "-c", script], check=True,
+                            capture_output=True, text=True)
+    return {tuple(row) for row in json.loads(result.stdout)}
+
+
+def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv") -> None:
+    """Carry active lazy/tool/entry-point plugin packages into the candidate.
+
+    Do not claim readiness if an active package cannot be reproduced. Never
+    modify the source interpreter; uv installs against the candidate alone.
+    """
+    source_python = _release_python(source)
+    if not source_python.is_file():
+        # Git installs can use an external virtualenv; the updating process is
+        # already running from that environment, and it is the active set.
+        source_python = Path(sys.executable)
+    candidate_python = _release_python(candidate)
+    if not source_python.is_file():
+        raise RuntimeError(f"source interpreter unavailable: {source_python}")
+    installed = _active_distributions(source_python)
+    target = _active_distributions(candidate_python)
+    missing = [f"{name}=={version}" for name, version in sorted(installed.items())
+               if name not in {"hermes-agent", "hermes-agent-cli"} and target.get(name) != version]
+    if missing:
+        subprocess.run([uv, "pip", "install", "--python", str(candidate_python), *missing], check=True)
+    target = _active_distributions(candidate_python)
+    unmatched = [name for name, version in installed.items()
+                 if name not in {"hermes-agent", "hermes-agent-cli"} and target.get(name) != version]
+    if unmatched:
+        raise RuntimeError(f"candidate dependency parity failed: {', '.join(sorted(unmatched))}")
+    absent = _active_plugin_entrypoints(source_python) - _active_plugin_entrypoints(candidate_python)
+    if absent:
+        raise RuntimeError(f"candidate lost installed plugin entry points: {sorted(absent)}")
+
+
+def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
+                 source: Path | None = None) -> tuple[Path, str]:
     """Build at the final release path: venv scripts and metadata are not relocatable."""
     _build_venv(release, uv=uv)
+    if source is not None:
+        restore_active_distributions(source, release, uv=uv)
     return release / ".venv", "built"
 
 
@@ -239,7 +291,8 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
             shutil.rmtree(target)
         os.replace(staging, target)
         published = True
-        prepare_venv(target, previous=read_pointer(paths.current), uv=uv)
+        prepare_venv(target, previous=read_pointer(paths.current), uv=uv,
+                     source=source if (source / ".git").exists() else None)
         (target / ".hermes_build_sha").write_text(sha + "\n", encoding="utf-8")
         if (target / ".hermes_build_sha").read_text(encoding="utf-8").strip() != sha:
             raise RuntimeError("release identity stamp mismatch")
@@ -428,6 +481,31 @@ def resolved_release(home: Path) -> Path | None:
         return None
     marker = release / ".release-ready"
     return release if marker.is_file() and marker.read_text(encoding="utf-8").strip() == release.name else None
+
+
+def update_source_checkout(home: Path, running_root: Path) -> Path | None:
+    """Resolve the only authorized git checkout for an update from a release.
+
+    Never guess from PATH or a sibling checkout: the migration journal binds this
+    installation to the original source directory, and the current pointer must
+    actually identify the running release.
+    """
+    paths = ReleasePaths.for_home(home)
+    running_root = Path(running_root).resolve()
+    if (running_root / ".git").exists():
+        return running_root
+    if resolved_release(paths.home) != running_root:
+        return None
+    try:
+        record = json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8"))
+        source = Path(record["source"]).resolve(strict=True)
+        if source == running_root or not (source / ".git").exists():
+            return None
+        if release_sha(source) is None:
+            return None
+        return source
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError):
+        return None
 
 
 def detached_worker_env(home: Path, release: Path, base: dict[str, str] | None = None) -> dict[str, str]:
