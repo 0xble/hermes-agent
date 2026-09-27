@@ -3268,7 +3268,7 @@ def _run_one_job_body(
                 success = False
                 error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
             if finish_execution(execution_id, success=success, error=error,
-                                require_running=True) is None:
+                                output=output, require_running=True) is None:
                 # The watchdog already committed failed(timeout); even teardown
                 # can hang, so leave it to the watchdog's bounded cleanup.
                 return False

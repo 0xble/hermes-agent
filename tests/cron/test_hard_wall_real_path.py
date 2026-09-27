@@ -146,7 +146,18 @@ def test_completion_commits_then_teardown_hangs_past_cap_plus_grace(tmp_path):
     assert code == 0, (code, row["status"], row["error"], err)
     assert row["status"] == "completed" and row["error"] is None
     assert queued is None and outputs == []
+    assert row["delivery_status"] == "unknown"  # commit-to-enqueue gap, never replay
     assert "persistence entered" in marker.read_text()
+    token = set_hermes_home_override(tmp_path / "profile")
+    try:
+        from cron import delivery_queue
+        sent = []
+        assert delivery_queue.drain(lambda *args: sent.append(args)) == 0
+        assert delivery_queue.drain(lambda *args: sent.append(args)) == 0
+        assert sent == []
+        assert executions.get_execution(row["id"])["delivery_status"] == "unknown"
+    finally:
+        reset_hermes_home_override(token)
     assert recovered == 0
 
 

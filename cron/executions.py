@@ -93,6 +93,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "execution_identity", "execution_identity TEXT")
     add_column_if_missing(conn, "executions", "owner_kind", "owner_kind TEXT")
     add_column_if_missing(conn, "executions", "delivery_status", "delivery_status TEXT")
+    add_column_if_missing(conn, "executions", "output", "output TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -326,6 +327,7 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None, require_running: bool = False,
+    output: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
@@ -335,13 +337,13 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?,
+                   handoff_started_at=NULL, delivery_outcome=?, output=?,
                    delivery_status=CASE WHEN owner_kind='detached' AND delivery_status IS NULL
                                         THEN 'unknown' ELSE delivery_status END
                WHERE id=? AND status IN ('claimed','running')
                  AND (?=0 OR status='running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id,
+            (status, now, detail, delivery_outcome, output, execution_id,
              int(require_running), _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:

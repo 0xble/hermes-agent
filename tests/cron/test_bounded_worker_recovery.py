@@ -185,8 +185,6 @@ scheduler._inactivity_watchdog_loop = lambda **kw: original_idle_loop(**{**kw, '
 original_wait = concurrent.futures.wait
 concurrent.futures.wait = lambda fs, timeout=None, **kw: original_wait(fs, timeout=.02, **kw)
 scheduler._save_compose_deliver = lambda *args, **kwargs: None
-scheduler._finish_completed_run = lambda d, owner, execution_id: bool(
-    scheduler.finish_execution(execution_id, success=d.success, error=d.error))
 detached.hard_wall_timeout_seconds = lambda: 1.2
 sys.exit(0 if scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys.argv[2])) else 1)
 """

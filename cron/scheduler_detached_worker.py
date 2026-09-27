@@ -97,10 +97,12 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
                         error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
                         require_running=True,
                     ) is not None
-                # The terminal winner can enqueue and tear down, but cannot hold
-                # this process indefinitely. Derived from the configured wall cap.
+                # Reserve the final 3s for bounded descendant cleanup. The
+                # post-commit allowance is derived from the configured wall cap,
+                # with enough headroom to include cleanup inside cap+grace.
                 if not timeout_won:
-                    fence.stopped.wait(min(60.0, max(1.0, seconds)))
+                    grace = min(60.0, max(4.0, seconds))
+                    fence.stopped.wait(grace - 3.0)
             finally:
                 try:
                     _terminate_owned_descendants(pid, fingerprint)
