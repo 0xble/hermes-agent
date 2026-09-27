@@ -27,9 +27,24 @@ def test_detached_cron_worker_stays_on_release_A_then_fresh_B(tmp_path, monkeypa
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
-    source = Path(__file__).resolve().parents[2]
-    a, _ = stage_release(source, home, sha="A", uv=uv)
-    b, _ = stage_release(source, home, sha="B", uv=uv)
+    repo = Path(__file__).resolve().parents[2]
+    source = tmp_path / "source"
+    subprocess.run(["git", "clone", "--quiet", "--shared", str(repo), str(source)], check=True)
+    # Distinct real revisions: archive refuses synthetic names such as A/B.
+    probe = source / "cron" / "s2_release_probe.py"
+    revisions = []
+    for name in ("A", "B"):
+        probe.write_text(f"IDENTITY = {name!r}\n")
+        subprocess.run(["git", "-C", str(source), "add", str(probe)], check=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.name=S2",
+                        "-c", "user.email=s2@example.test", "-c", "core.hooksPath=/dev/null",
+                        "commit", "-qm", f"test release {name}"], check=True)
+        revisions.append(subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"],
+                                               text=True).strip())
+    from hermes_cli import immutable_releases as releases
+    monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
+    a, _ = stage_release(source, home, sha=revisions[0], uv=uv)
+    b, _ = stage_release(source, home, sha=revisions[1], uv=uv)
     for name, release in (("A", a), ("B", b)):
         (release / "cron" / "s2_release_probe.py").write_text(f"IDENTITY = {name!r}\n")
         # sitecustomize is imported by the real worker interpreter before -m;
@@ -126,8 +141,7 @@ def test_detached_cron_worker_stays_on_release_A_then_fresh_B(tmp_path, monkeypa
         parent_b.wait(timeout=40)
         assert parent_b.returncode == 0
         await_file(home / "finished-B")
-        for name, result in (("A", a_observed), ("B", b_observed)):
-            release = home / "releases" / name
+        for name, release, result in (("A", a, a_observed), ("B", b, b_observed)):
             assert Path(result["exe"]) == release / ".venv" / "bin" / "python"
             for path in [result["cwd"], *result["paths"].values()]:
                 assert Path(path).resolve().is_relative_to(release), (name, path)

@@ -140,8 +140,8 @@ def _active_distributions(python: Path) -> dict[str, str]:
 def _active_plugin_entrypoints(python: Path) -> set[tuple[str, str, str]]:
     script = ("import importlib.metadata as m,json; "
               "groups={'hermes_agent.plugins','hermes_agent.plugin_capabilities'}; "
-              "print(json.dumps(sorted((e.group,e.name,e.value) for e in m.entry_points() "
-              "if e.group in groups)))")
+              "print(json.dumps(sorted((e.group,e.name,e.value) for d in m.distributions() "
+              "for e in d.entry_points if e.group in groups)))")
     result = subprocess.run([str(python), "-c", script], check=True,
                             capture_output=True, text=True)
     return {tuple(row) for row in json.loads(result.stdout)}
