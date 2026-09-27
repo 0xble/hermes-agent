@@ -66,14 +66,12 @@ Q2 = "Now summarise what you found (Q2-marker)."
 FINAL_ONE = f"The file says {CANARY} (FINAL-ONE)"
 FINAL_TWO = "Summary: the canary was read (FINAL-TWO)"
 LATE_TEXT = "LATE-ANSWER-65788"
-# ACP reports no usage, so Hermes estimates pressure from messages and tool schemas. The
-# bridge/prompt makes the request reach ~17,866 tokens after the FIRST read_file result;
-# at 19,000 the fourth ~540-token result crosses the cap, leaving file 2's tool
-# pair eligible for summary. The fixed prefix is not summarizable; the default
-# protect_first_n=3 keeps the first user/assistant/tool rows verbatim, and the
-# default lean tail keeps the latest result (see ContextCompressor._protect_head_size
+# ACP reports no usage, so Hermes estimates pressure from messages and tool schemas.
+# The fixed prefix is not summarizable; set the cap above the first result's pressure
+# so several tool pairs exist before compaction. The default protected head and lean
+# tail then leave file 2 eligible for summary (see ContextCompressor._protect_head_size
 # and _find_tail_cut_by_tokens in agent/context_compressor.py).
-COMPACT_THRESHOLD = 19_000
+COMPACT_THRESHOLD = 16_000
 COMPACT_FILES = 8
 COMPACT_ASK = "Read f1.txt through f8.txt one by one, then say done (COMPACT-ASK)."
 SUMMARY = "SUMMARY-ACP-7f3: files f1..fN were read; each is lorem ipsum filler."

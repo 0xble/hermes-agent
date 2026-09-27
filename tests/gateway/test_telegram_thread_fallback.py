@@ -12,7 +12,7 @@ import sys
 import socket
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -20,10 +20,11 @@ from gateway.config import PlatformConfig, Platform
 from gateway.platforms.base import (
     SendResult,
     _reply_anchor_for_event,
+    _thread_metadata_for_event,
     _thread_metadata_for_source,
 )
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.session import build_session_key
+from gateway.session import SessionSource, build_session_key
 
 
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
@@ -278,6 +279,88 @@ async def test_private_dm_topic_reply_fallback_without_anchor_fails_loud():
     assert result.retryable is False
     assert result.error == adapter._dm_topic_missing_anchor_error()
     assert call_log == []
+
+
+@pytest.mark.asyncio
+async def test_boot_auto_resume_injection_sends_to_telegram_dm_topic_without_synthetic_reply():
+    from gateway.run import GatewayRunner
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="775566675", chat_type="dm",
+        thread_id="270453",
+    )
+    telegram = _make_adapter()
+    calls = []
+
+    async def send_message(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(message_id=270454)
+
+    telegram._bot = SimpleNamespace(send_message=send_message)
+
+    async def admit(event):
+        metadata = _thread_metadata_for_event(event)
+        sent = await telegram.send(
+            chat_id=event.source.chat_id, content=event.text,
+            reply_to=_reply_anchor_for_event(event), metadata=metadata,
+        )
+        assert sent.success
+        event._gateway_accepted = True
+
+    runner = object.__new__(GatewayRunner)
+    runner._build_process_event_source = Mock(return_value=source)
+    runner._resolve_injection_adapter = Mock(return_value=SimpleNamespace(handle_message=admit))
+    evt = {
+        "type": "delegation_auto_resume", "session_key": "agent:main:telegram:dm:775566675:270453",
+        "delegation_id": "deleg_123", "message_id": "auto-resume:deleg_123",
+    }
+    assert await runner._inject_watch_notification("Resume available", evt) is True
+    assert calls[0]["message_thread_id"] == 270453
+    assert calls[0]["reply_to_message_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_id,source_id,expected_reply", [
+    ("auto-resume:deleg_123", None, None),
+    ("async-delegation:deleg_123", None, None),
+    ("process:watch_123", "cron:delivery_123", None),
+    ("462", None, 462),
+    ("auto-resume:deleg_123", "461", 461),
+])
+async def test_telegram_topic_event_uses_only_platform_reply_ids(event_id, source_id, expected_reply):
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="775566675", chat_type="dm",
+        thread_id="270453", message_id=source_id,
+    )
+    event = MessageEvent(
+        text="boot notice", message_type=MessageType.TEXT, source=source,
+        message_id=event_id, internal=True,
+    )
+    metadata = _thread_metadata_for_event(event)
+    adapter = _make_adapter()
+    calls = []
+
+    async def mock_send_message(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(message_id=270454)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    result = await adapter.send(
+        chat_id=source.chat_id, content=event.text,
+        reply_to=_reply_anchor_for_event(event), metadata=metadata,
+    )
+    assert result.success is True
+    assert calls[0]["reply_to_message_id"] == expected_reply
+    assert calls[0]["message_thread_id"] == 270453
+    assert event.message_id == event_id  # synthetic id stays available for deduplication
+    from gateway.run import GatewayRunner
+    target_meta = GatewayRunner._thread_metadata_for_target(
+        object.__new__(GatewayRunner), Platform.TELEGRAM, source.chat_id, source.thread_id,
+        chat_type="dm", reply_to_message_id=event_id,
+    )
+    assert target_meta is not None
+    target_anchor = target_meta.get("telegram_reply_to_message_id")
+    assert target_anchor == (event_id if event_id.isascii() and event_id.isdecimal() else None)
 
 
 def test_base_gateway_metadata_marks_telegram_dm_topics_as_reply_fallback():

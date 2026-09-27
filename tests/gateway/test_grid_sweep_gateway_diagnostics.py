@@ -69,7 +69,7 @@ async def test_in_chat_restart_ack_to_requester_is_never_suppressed(tmp_path, mo
     assert len(adapter.sent_calls) == 1
     chat_id, message, metadata = adapter.sent_calls[0]
     assert chat_id == source.chat_id and "Hermes is restarting" in message
-    assert metadata["telegram_reply_to_message_id"] == "restart-command"
+    assert "telegram_reply_to_message_id" not in metadata
 
 
 @pytest.mark.asyncio

@@ -226,16 +226,20 @@ class TestWinPtyBridgeIO:
 
     @pytest.mark.asyncio
     async def test_write_sends_to_child_stdin(self):
-        # python -c reads stdin, echoes a marker, exits.  More reliable than
-        # ``cat`` (not on Windows) and doesn't depend on a particular shell.
+        # Synchronize on the child's first output before writing: ConPTY can
+        # echo input sent immediately after spawn before Python attaches stdin.
+        # See upstream #98556 and PR #98665 for the same intermittent failure.
         script = (
             "import sys; "
+            "sys.stdout.write('READY\\n'); sys.stdout.flush(); "
             "line = sys.stdin.readline().strip(); "
             "sys.stdout.write('GOT:' + line + '\\n'); "
             "sys.stdout.flush()"
         )
         bridge = WinPtyBridge.spawn([sys.executable, "-c", script])
         try:
+            ready = _read_until(bridge, b"READY")
+            assert b"READY" in ready, f"child did not attach stdin: {ready!r}"
             assert await bridge.write(b"hello-pty\r\n") is True
             output = _read_until(bridge, b"GOT:hello-pty")
             assert b"GOT:hello-pty" in output

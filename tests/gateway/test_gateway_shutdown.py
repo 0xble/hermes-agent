@@ -203,7 +203,7 @@ async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
     chat_id, message, metadata = adapter.sent_calls[0]
     assert chat_id == source.chat_id
     assert "Hermes is restarting" in message
-    assert metadata["telegram_reply_to_message_id"] == "restart-command"
+    assert "telegram_reply_to_message_id" not in metadata
 
 
 @pytest.mark.asyncio

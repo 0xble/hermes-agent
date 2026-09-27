@@ -167,6 +167,27 @@ def test_unprovisioned_detects_only_zero_limit_fast_429s():
     assert fast_mode.fast_mode_unprovisioned(RuntimeError("boom"), _FAST_KWARGS) is False
 
 
+class _FastCreditRefusal(Exception):
+    """Anthropic's fast-mode entitlement 429, as relayed by a proxy: no fast-limit headers."""
+
+    def __init__(self, message="Usage credits are required for fast mode."):
+        super().__init__(f"Error code: 429 - {message}")
+        self.status_code = 429
+        self.body = {"type": "error", "error": {"type": "rate_limit_error", "message": message}}
+        self.response = SimpleNamespace(headers={"retry-after": "1"})
+
+
+def test_unprovisioned_detects_the_usage_credit_refusal_without_limit_headers():
+    assert fast_mode.fast_mode_unprovisioned(_FastCreditRefusal(), _FAST_KWARGS) is True
+    assert fast_mode.fast_mode_unprovisioned(
+        _FastCreditRefusal("Fast mode requires usage credits: credits are required."), _FAST_KWARGS) is True
+    # A genuine rate limit never mentions fast-mode credits.
+    assert fast_mode.fast_mode_unprovisioned(
+        _FastCreditRefusal("Number of request tokens has exceeded your per-minute rate limit"), _FAST_KWARGS) is False
+    # Only a request that asked for fast speed is refused for it.
+    assert fast_mode.fast_mode_unprovisioned(_FastCreditRefusal(), {"model": "claude-opus-5"}) is False
+
+
 def test_unavailable_model_drops_speed_for_the_session_and_only_that_model():
     agent = _agent(
         service_tier="priority", model="claude-opus-5", provider="anthropic",
@@ -194,3 +215,18 @@ def test_recovery_retries_at_standard_speed_before_classification():
     assert (retry, prompt) == (True, "sys")
     assert agent._fast_mode_unavailable_models == {"claude-opus-5"}
     assert any("standard speed" in line for line in printed)
+
+
+def test_recovery_retries_a_proxied_credit_refusal_at_standard_speed():
+    from agent.turn_recovery import recover_before_classification
+
+    agent = SimpleNamespace(
+        model="claude-opus-5-5", provider="custom:claude-proxy", log_prefix="", _fast_mode_unavailable_models=set(),
+        _vprint=lambda *a, **k: None,
+    )
+    retry, _ = recover_before_classification(
+        agent, _FastCreditRefusal(), messages=[], api_messages=[],
+        api_kwargs={"model": "claude-opus-5-5", "extra_body": {"speed": "fast"}}, active_system_prompt="sys",
+    )
+    assert retry is True
+    assert agent._fast_mode_unavailable_models == {"claude-opus-5-5"}

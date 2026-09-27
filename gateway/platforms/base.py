@@ -111,6 +111,16 @@ DEFAULT_BUSY_TEXT_DEBOUNCE_SECONDS = 0.35
 DEFAULT_BUSY_TEXT_HARD_CAP_SECONDS = 1.0
 
 
+def _telegram_reply_anchor(*candidates) -> str | None:
+    """Use only Telegram message IDs as reply targets, never synthetic event keys."""
+    for candidate in candidates:
+        if candidate is not None:
+            value = str(candidate)
+            if value.isascii() and value.isdecimal():
+                return value
+    return None
+
+
 def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) -> dict | None:
     """Platform-aware thread metadata for adapter sends. Telegram DM topics route with
     ``message_thread_id`` + a reply anchor; anchorless synthetic/resumed sends fall back to
@@ -129,9 +139,9 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         metadata["telegram_dm_topic_reply_fallback"] = True
         if str(thread_id) not in {"", "1"}:
             metadata["direct_messages_topic_id"] = str(thread_id)
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        anchor = _telegram_reply_anchor(reply_to_message_id, getattr(source, "message_id", None))
         if anchor is not None:
-            metadata["telegram_reply_to_message_id"] = str(anchor)
+            metadata["telegram_reply_to_message_id"] = anchor
     # Routed profile (multiplex / profile_routes): outbound prune paths must not assume the
     # adapter's static profile stamp.
     profile = str(getattr(source, "profile", None) or "").strip()
@@ -154,11 +164,13 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
 
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics."""
-    override = getattr(event, "reply_anchor_override", None)
-    if override is not None:
-        return override  # the turn was redirected onto another message (#115001)
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
+    override = getattr(event, "reply_anchor_override", None)
+    if override is not None:
+        if platform == "telegram":
+            return _telegram_reply_anchor(override, getattr(source, "message_id", None))
+        return override  # the turn was redirected onto another message (#115001)
     thread_id = getattr(source, "thread_id", None)
     raw_message = getattr(event, "raw_message", None)
     if (platform == "slack" and isinstance(raw_message, dict)
@@ -171,7 +183,12 @@ def _reply_anchor_for_event(event) -> str | None:
         # message — replying to the topic seed/anchor can render outside the active lane.
         if getattr(source, "chat_type", None) != "dm":
             return None
-        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
+        return _telegram_reply_anchor(
+            getattr(event, "message_id", None), getattr(event, "reply_to_message_id", None),
+            getattr(source, "message_id", None),
+        )
+    if platform == "telegram":
+        return _telegram_reply_anchor(getattr(event, "message_id", None))
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)

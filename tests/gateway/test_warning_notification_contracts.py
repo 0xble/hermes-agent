@@ -56,6 +56,7 @@ def test_real_retry_producers_keep_final_failure_and_persistence(tmp_path, monke
     adapter = SimpleNamespace(send=send)
     source = SessionSource(platform=Platform.SLACK, chat_id="D1", user_id="U1")
     gateway = object.__new__(GatewayRunner)
+    gateway._delivery_adapter_for = lambda source: adapter
     ctx = TurnContext(source=source, user_config=_load_gateway_config(), _run_still_current=lambda: True,
                       _status_adapter=adapter, _status_chat_id="D1", _status_thread_metadata={})
     agent = Agent()

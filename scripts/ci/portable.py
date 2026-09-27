@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / '.ci'
@@ -84,7 +84,19 @@ def preflight() -> None:
 
 
 
+def windows_command(name: str, env: Mapping[str, str]) -> str:
+    # CreateProcess resolves bare executables against the *parent* PATH, not the
+    # isolated child's PATH. Resolve checkout-owned tools explicitly on Windows.
+    if os.name == 'nt':
+        candidate = 'npm.cmd' if name == 'npm' else name
+        return (shutil.which(candidate, path=env.get('PATH'))
+                or shutil.which(candidate + '.exe', path=env.get('PATH'))
+                or candidate)
+    return name
+
+
 def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
+    argv = [windows_command(argv[0], env or os.environ), *argv[1:]]
     print('+ ' + ' '.join(map(str, argv)), flush=True)
     subprocess.run(argv, cwd=cwd, env=env, check=True)
 
@@ -133,6 +145,20 @@ def external_temporary_directory(prefix: str, parent: Path | None = None) -> Ite
         yield Path(temporary)
 
 
+def windows_appdata_environment(home: Path) -> dict[str, str]:
+    local = home / 'AppData' / 'Local'
+    roaming = home / 'AppData' / 'Roaming'
+    local.mkdir(parents=True, exist_ok=True)
+    roaming.mkdir(parents=True, exist_ok=True)
+    return {
+        'LOCALAPPDATA': str(local), 'APPDATA': str(roaming),
+        # Windows PowerShell can derive its cache from a missing per-user
+        # special folder despite LOCALAPPDATA being set in the process env.
+        # Point both powershell.exe and pwsh explicitly outside the checkout.
+        'PSModuleAnalysisCachePath': str(local / 'Microsoft' / 'Windows' / 'PowerShell' / 'ModuleAnalysisCache'),
+    }
+
+
 def environment(home: Path) -> dict[str, str]:
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
@@ -154,13 +180,34 @@ def environment(home: Path) -> dict[str, str]:
     })
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
+    if os.name == 'nt':
+        # Windows PowerShell writes Microsoft/Windows/PowerShell/ModuleAnalysisCache
+        # relative to the checkout when LOCALAPPDATA is absent. Keep its cache
+        # and per-user application state inside the disposable isolated HOME.
+        env.update(windows_appdata_environment(home))
+    # Hosted native jobs install rustup into checkout-owned state before the
+    # isolated HOME is created. Retain that exact toolchain, not runner config.
+    if (STATE / 'rustup').is_dir():
+        env['RUSTUP_HOME'] = str(STATE / 'rustup')
+    if os.name == 'nt' and os.environ.get('VCToolsInstallDir'):
+        env.update(msvc_linker_environment(Path(os.environ['VCToolsInstallDir']), os.environ))
     env.update(git_environment(root=ROOT, base=env, config_path=home / 'gitconfig'))
     return env
 
 
+def msvc_linker_environment(tools: Path, source: Mapping[str, str]) -> dict[str, str]:
+    """Select MSVC rather than Git-for-Windows' unrelated link.exe."""
+    linker = tools / 'bin/Hostx64/x64/link.exe'
+    if not linker.is_file():
+        raise RuntimeError(f'MSVC linker missing: {linker}')
+    result = {'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER': str(linker)}
+    result.update({key: source[key] for key in ('LIB', 'INCLUDE', 'LIBPATH') if key in source})
+    return result
+
+
 def require_tools(names: tuple[str, ...], env: dict[str, str]) -> None:
     for name in names:
-        output = subprocess.check_output([name, '--version'], env=env, text=True, encoding='utf-8', errors='replace')
+        output = subprocess.check_output([windows_command(name, env), '--version'], env=env, text=True, encoding='utf-8', errors='replace')
         match = re.search(r'(?<!\d)(\d+\.\d+\.\d+)\b', output)
         if not match or match.group(1) != PINS[name]:
             raise RuntimeError(f'{name}: require {PINS[name]}, found {output.strip()} (see scripts/ci/toolchain.json)')

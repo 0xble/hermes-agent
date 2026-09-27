@@ -92,10 +92,10 @@ $script:Ui = $null
 $script:UiStage = "Hermes will open once done."   # until the first gate; matches ui.html
 $script:UiStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-function Write-HandoffLog([string]$Message) {
+function Write-HandoffLog([string]$Message, [bool]$ReplayToHost = $true) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
     try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
-    Write-Host $line
+    if ($ReplayToHost) { Write-Host $line }
 }
 
 # ── The shim: repo-owned HTML in a chromeless default-browser app window ───
@@ -1033,7 +1033,7 @@ function Step-PipeDrain($Reader, [ref]$Task, $Buffer, $Sink, [ref]$Moved) {
     return $false
 }
 
-function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
+function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag, [bool]$ReplayOutputToHost = $true) {
     # The window does not stream child output, so no line-pump: both pipes
     # drain asynchronously (no deadlock however chatty the child) while a small
     # DoEvents loop keeps the marquee animating through long silent
@@ -1169,10 +1169,10 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     $outText = $outSink.ToString()
     $errText = $errSink.ToString()
     foreach ($ln in ($outText -split "`r?`n")) {
-        if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) }
+        if ($ln.Trim()) { Write-HandoffLog ("{0}| {1}" -f $Tag, $ln) $ReplayOutputToHost }
     }
     foreach ($ln in ($errText -split "`r?`n")) {
-        if ($ln.Trim()) { Write-HandoffLog ("{0}!| {1}" -f $Tag, $ln) }
+        if ($ln.Trim()) { Write-HandoffLog ("{0}!| {1}" -f $Tag, $ln) $ReplayOutputToHost }
     }
     $all = $outText
     if ($errText) { $all += "`n" + $errText }
@@ -1307,6 +1307,10 @@ exit 5
 '@
     $stallSource = @'
 param([int]$Hold, [string]$PidFile, [string]$GrandchildPidFile)
+# Establish observable progress before the slower nested PowerShell launch;
+# the short idle bound is meant to time silent finalization, not startup.
+Write-Output "step entered silent finalization"
+[Console]::Out.Flush()
 [System.IO.File]::WriteAllText($PidFile, [string]$PID)
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = Join-Path $PSHOME "powershell.exe"
@@ -1315,8 +1319,6 @@ $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $grandchild = [System.Diagnostics.Process]::Start($psi)
 [System.IO.File]::WriteAllText($GrandchildPidFile, [string]$grandchild.Id)
-Write-Output "step entered silent finalization"
-[Console]::Out.Flush()
 Start-Sleep -Seconds $Hold
 exit 0
 '@
@@ -1341,6 +1343,12 @@ exit 3
     ) "pipedrain"
     $sw.Stop()
     $elapsed = [Math]::Round($sw.Elapsed.TotalSeconds, 2)
+    # The post-exit drain starts after the child has launched its descendant.
+    # Exclude variable PowerShell startup on a busy host from this bound.
+    $leakAfterSpawnElapsed = $null
+    if (Test-Path -LiteralPath $pidFile) {
+        $leakAfterSpawnElapsed = [Math]::Round(((Get-Date) - (Get-Item -LiteralPath $pidFile).LastWriteTime).TotalSeconds, 2)
+    }
 
     $leakPid = 0
     if (Test-Path -LiteralPath $pidFile) {
@@ -1356,18 +1364,30 @@ exit 3
     $flood = Invoke-HermesStep $powershell @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $floodPs1,
         "-Kb", [string]$floodKb
-    ) "pipeflood"
+    ) "pipeflood" $false
     $floodSw.Stop()
     $floodElapsed = [Math]::Round($floodSw.Elapsed.TotalSeconds, 2)
     $floodBytes = $flood.Output.Length
 
+    # Exercise the short live-child watchdog only on the stall arm. The leak
+    # arm tests the separate post-exit pipe deadline: on a loaded runner a new
+    # PowerShell and its grandchild can take longer than the short idle ceiling
+    # to start, before there is any output to drain. Do not let that startup
+    # race masquerade as a failure of the post-exit leak bound.
+    $savedIdleTimeoutSeconds = $script:StepIdleTimeoutSeconds
+    $selfTestIdleTimeoutSeconds = 3
+    $script:StepIdleTimeoutSeconds = $selfTestIdleTimeoutSeconds
     $stallSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $stall = Invoke-HermesStep $powershell @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $stallPs1,
-        "-Hold", [string]$hold, "-PidFile", $stallPidFile,
-        "-GrandchildPidFile", $stallGrandchildPidFile
-    ) "stepstall"
-    $stallSw.Stop()
+    try {
+        $stall = Invoke-HermesStep $powershell @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $stallPs1,
+            "-Hold", [string]$hold, "-PidFile", $stallPidFile,
+            "-GrandchildPidFile", $stallGrandchildPidFile
+        ) "stepstall"
+    } finally {
+        $stallSw.Stop()
+        $script:StepIdleTimeoutSeconds = $savedIdleTimeoutSeconds
+    }
     $stallElapsed = [Math]::Round($stallSw.Elapsed.TotalSeconds, 2)
     $stallPid = 0
     if (Test-Path -LiteralPath $stallPidFile) {
@@ -1409,13 +1429,14 @@ exit 3
     $floodBudget = 25
     $problems = @()
     if (-not $leakAlive) { $problems += "handle-holding grandchild was not alive on return (fixture did not reproduce the leak)" }
-    if ($elapsed -ge $budget) { $problems += "leak arm returned in ${elapsed}s, over the ${budget}s budget" }
+    if ($null -eq $leakAfterSpawnElapsed) { $problems += "leak arm never recorded grandchild startup" }
+    if ($null -ne $leakAfterSpawnElapsed -and $leakAfterSpawnElapsed -ge $budget) { $problems += "leak arm took ${leakAfterSpawnElapsed}s after grandchild startup, over the ${budget}s budget" }
     if ($res.Code -ne 7) { $problems += "leak arm exit code $($res.Code), expected 7" }
     if ($res.Output -notmatch "pipe-drain step output") { $problems += "leak arm step output was lost" }
     if ($floodElapsed -ge $floodBudget) { $problems += "flood arm returned in ${floodElapsed}s, over the ${floodBudget}s budget -- the drain is metering itself, which backpressures the step" }
     if ($flood.Code -ne 5) { $problems += "flood arm exit code $($flood.Code), expected 5" }
     if ($floodBytes -lt ($floodKb * 1024)) { $problems += "flood arm captured $floodBytes bytes of $($floodKb * 1024)" }
-    $stallBudget = $script:StepIdleTimeoutSeconds + 30
+    $stallBudget = $selfTestIdleTimeoutSeconds + 30
     if ($stallElapsed -ge $stallBudget) { $problems += "stall arm returned in ${stallElapsed}s, over the ${stallBudget}s budget" }
     if ($stall.Code -ne 124) { $problems += "stall arm exit code $($stall.Code), expected 124" }
     if ($stall.Output -notmatch "step entered silent finalization") { $problems += "stall arm step output was lost" }
