@@ -40,7 +40,7 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     subprocess.run(["git", "init", "-q", str(source)], check=True)
     subprocess.run(["git", "-C", str(source), "add", "hermes_cli", "pyproject.toml"], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
-                    "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"], check=True)
     sha = releases.release_sha(source)
     home = source / "hermes_test"
     (home / "cache").mkdir(parents=True)

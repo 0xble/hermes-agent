@@ -35,7 +35,7 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
         (source / "version.txt").write_text(name, encoding="utf-8")
         subprocess.run(["git", "-C", str(source), "add", "version.txt"], check=True)
         subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
-                        "commit", "-qm", name], check=True)
+                        "-c", "commit.gpgsign=false", "commit", "-qm", name], check=True)
         revisions[name] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     sha_a, sha_b = revisions["A"], revisions["B"]
     for name, sha in revisions.items():
@@ -198,7 +198,7 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
     subprocess.run(["git", "init", "-q", str(source)], check=True)
     subprocess.run(["git", "-C", str(source), "add", "probe.py"], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
-                    "commit", "-qm", "source"], check=True)
+                    "-c", "commit.gpgsign=false", "commit", "-qm", "source"], check=True)
     sha = releases.release_sha(source)
     b = home / "releases" / sha
     b.mkdir(parents=True)
