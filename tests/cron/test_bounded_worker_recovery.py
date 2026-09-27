@@ -109,6 +109,15 @@ def test_pid_reuse_and_unreadable_fingerprint_fail_closed(monkeypatch, tmp_path)
         reset_hermes_home_override(token)
 
 
+def test_code_sha_uses_immutable_release_marker_before_git(tmp_path, monkeypatch):
+    sha = "a" * 40
+    release = tmp_path / "releases" / sha
+    (release / "cron").mkdir(parents=True)
+    (release / ".release-ready").write_text(sha + "\n", encoding="utf-8")
+    monkeypatch.setattr(executions, "__file__", str(release / "cron" / "executions.py"))
+    assert executions.running_code_sha() == sha
+
+
 def test_old_schema_reader_can_insert_and_select_after_additive_migration(tmp_path, monkeypatch):
     path = tmp_path / "cron" / "executions.db"
     path.parent.mkdir(parents=True)

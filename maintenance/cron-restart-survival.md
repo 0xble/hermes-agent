@@ -1,6 +1,6 @@
 # Cron restart survival on macOS
 
-Patch identity: `cron-macos-detached`.
+Patch identities: `cron-macos-detached`, `cron-restart-survival`.
 
 ## Contract
 

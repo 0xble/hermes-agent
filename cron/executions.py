@@ -139,12 +139,19 @@ def running_code_sha() -> Optional[str]:
     Never label an unidentifiable run with the unrelated live install's revision.
     """
     root = Path(__file__).resolve().parent.parent
-    for marker in (".release_sha", "RELEASE"):
-        path = root / marker
-        if path.is_file():
-            value = path.read_text(encoding="utf-8").strip().splitlines()[0]
-            if len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower()):
-                return value.lower()
+    # S2 release directories are named by their immutable SHA and carry the
+    # `.release-ready` marker. Resolve that identity before consulting Git so a
+    # worker launched from `releases/<sha>` never reports the moving checkout.
+    release_name = root.name
+    if root.parent.name == "releases" and len(release_name) == 40 and all(
+        c in "0123456789abcdef" for c in release_name.lower()
+    ) and (root / ".release-ready").is_file():
+        return release_name.lower()
+    marker = root / ".release-ready"
+    if marker.is_file():
+        value = marker.read_text(encoding="utf-8").strip().splitlines()[0]
+        if len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower()):
+            return value.lower()
     try:
         value = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
