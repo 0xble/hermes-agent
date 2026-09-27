@@ -260,6 +260,39 @@ def _maybe_fire_tui_heartbeat_tick(sid: str, session: dict) -> None:
             mgr.abandon_fire()
 
 
+def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> None:
+    """Resume an idle TUI/Desktop/dashboard session's parked /goal once its wait barrier lifted.
+
+    The post-turn judge only re-checks a barrier after a turn, so a process killed by a restart or an
+    elapsed timed wait otherwise parks the goal until the user types. Gateway-routed conversations
+    are left to the gateway's wakeup scanner, exactly like heartbeats. The barrier is cleared only
+    after the continuation turn started, so a refused dispatch retries on the next poll."""
+    try:
+        from hermes_cli.goals import GoalManager
+    except Exception:
+        return
+    if not (sid_key := session.get("session_key") or ""):
+        return
+    mgr = GoalManager(session_id=sid_key)
+    if not mgr.is_parked() or _notif_gateway_owns_heartbeat(session, sid_key):
+        return
+    if not (prompt := mgr.lifted_barrier_prompt()):
+        return
+    since = mgr.state.waiting_since
+    if not _notif_claim_turn(session):
+        return  # busy: the running turn's judge re-evaluates the barrier
+    started = False
+    try:
+        _emit("status.update", sid, {"kind": "goal", "text": "▶ Goal wait ended — resuming."})
+        started = bool(_run_prompt_submit(f"__goal__{int(time.time() * 1000)}", sid, session, prompt))
+    except Exception as exc:
+        _notif_log_failure("goal resume dispatch failed", exc)
+    if started:
+        mgr.clear_lifted_wait(since)
+    else:
+        _notif_release_turn(session)
+
+
 def _loop_route_is_gateway_chat(state) -> bool:
     """A /loop set from a messaging chat carries the gateway's ``route`` (platform + chat_id); its wakeup scanner
     (``gateway/run_goals.py::_loop_wakeup_fire_one``) fires those and skips route-less CLI/TUI loops. Mirror it here
@@ -715,7 +748,8 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         # as kanban dispatch). An active non-parked /goal owns the idle boundary and defers the loop tick.
         if now - last_loop_poll >= _LOOP_POLL_SECONDS:
             last_loop_poll = now
-            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick)):
+            for what, fire in (("loop wakeup", _maybe_fire_tui_loop_tick), ("heartbeat", _maybe_fire_tui_heartbeat_tick),
+                               ("goal resume", _maybe_resume_tui_parked_goal)):
                 try:
                     fire(sid, session)
                 except Exception as tick_exc:

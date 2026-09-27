@@ -82,11 +82,15 @@ the browser vault fill tool, or the 1Password backends.
   [issue 80276](https://github.com/NousResearch/hermes-agent/issues/80276)), and
   `vault-op-multi-account` (own fork feature; upstream
   [PR 71596](https://github.com/NousResearch/hermes-agent/pull/71596) covers only the
-  `secrets.onepassword` loader, not vault logins, as of 2026-09-24), and
+  `secrets.onepassword` loader, not vault logins. Own proposal
+  [#124565](https://github.com/NousResearch/hermes-agent/issues/124565) covers
+  multi-account vault logins as of 2026-09-26), and
   `op-quota-resilience` (own fork fix: last-good 1Password secrets on rate limit or
   outage, a display-only listing cache, https for bare-host websites, and a stop at the
-  first 429 with a 15-minute per-identity cooldown shared across processes; no upstream
-  issue or PR as of 2026-09-25).
+  first 429 with a 15-minute per-identity cooldown shared across processes).
+  Upstream batching [PR #116616](https://github.com/NousResearch/hermes-agent/pull/116616)
+  now has [cooldown composition evidence](https://github.com/NousResearch/hermes-agent/pull/116616#issuecomment-5851006887).
+  Batching alone is not equivalent to last-good reads and shared cooldown.
   The fork adaptation adds vault evaluation, preserves a no-session branch, and classifies
   404 by its tab-missing payload; revisit when upstream ships equivalent behavior.
 - Adopted upstream sources, all open on 2026-09-19:

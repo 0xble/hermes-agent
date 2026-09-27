@@ -3443,11 +3443,12 @@ def _wait_for_external_cron_worker(
 def _launch_external_cron_worker(job: dict) -> bool:
     """Launch *job* outside the managed gateway process when required.
 
-    Returns ``False`` outside a managed systemd gateway (in-process path).  In
-    managed topology the job always goes to an external worker with the #101940
-    ownership handoff: in a transient user scope, or — when no user D-Bus
+    Returns ``False`` outside a supervised gateway (in-process path). Under
+    systemd the worker runs in a transient user scope, or — when no user D-Bus
     session exists and ``cron.require_restart_safe_scope`` is false — as a
-    direct subprocess (process separation kept, cgroup isolation lost).
+    degraded external subprocess. Under macOS launchd it runs in a detached new
+    session, outside the gateway's process group. The worker adopts the durable
+    execution claim and performs its own delivery on both platforms.
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])

@@ -10,7 +10,7 @@ Desktop session-search results retain clickable internal session references. Oth
 
 Fork patch identity: `session-link-rendering`.
 
-Adapted from archived HERMES-065 (`session-context.md`) and Brian's open upstream PR [#97535](https://github.com/NousResearch/hermes-agent/pull/97535). The archived patch also covered Telegram delivery; current fork `origin/main` already carries that guard, so only the missing session-search producer boundary is adopted. Current upstream `main` at `d0288be5b3330d2442e3907185b8e9d0958297bb` still lacks producer shaping; upstream PR #97514 covers Telegram link-target degradation independently. The upstream PR will be refreshed onto current upstream `main` before adoption.
+Adapted from archived HERMES-065 (`session-context.md`) and Brian's open upstream PR [#97535](https://github.com/NousResearch/hermes-agent/pull/97535). The archived patch also covered Telegram delivery; current fork `origin/main` already carries that guard, so only the missing session-search producer boundary is adopted. Current upstream `main` at `d0288be5b3330d2442e3907185b8e9d0958297bb` still lacks producer shaping; upstream PR #97514 covers Telegram link-target degradation independently. Own PR #97535 was refreshed to head `974d37fd1fd76fe0c0e7365805076b9394465be6` and remains open as of 2026-09-26.
 
 ## Verification
 

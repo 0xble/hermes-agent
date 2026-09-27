@@ -33,6 +33,11 @@ canonical argv matching, fleet restart ownership, snapshot locking, and truthful
 post-update receipts. The source adaptation is identical to PR #106053. Tests
 isolate live-host service discovery and add a real-process manual-sweep boundary.
 
+As of 2026-09-26, newer open [#119646](https://github.com/NousResearch/hermes-agent/pull/119646)
+covers service gateway descendants while excluding tool children. The separate
+open [#122645](https://github.com/NousResearch/hermes-agent/pull/122645) fixes
+cross-home scanner ownership. Track both contracts before retiring local guards.
+
 ## Verification and retirement
 
 Run scripts/run_tests.sh for tests/hermes_cli/test_gateway_launchd_supervised_child.py,

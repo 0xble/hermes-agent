@@ -31,6 +31,11 @@ constant to 45s. That still counts the drain, and a busier gateway can exceed it
 Our field timeline and this design were posted on that PR as
 [a comment](https://github.com/NousResearch/hermes-agent/pull/94768#issuecomment-5808286882).
 
+Own upstream [#121117](https://github.com/NousResearch/hermes-agent/pull/121117)
+contributes the separate shutdown and respawn windows. The 2026-09-26 audit
+updated its host PID/ancestry test isolation and validation, with 40 tests passing
+across the verifier and fleet-restart files. The PR remains open.
+
 ## Verification and retirement
 
 Run scripts/run_tests.sh for
