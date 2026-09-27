@@ -320,6 +320,12 @@ def _event_timestamp() -> str:
     return event_time.isoformat(timespec="seconds")
 
 
+def _lineage_parent(session_id: str, parent_session_id: object) -> str:
+    """The parent to tag, or "" when there is none or it names the session itself."""
+    parent = str(parent_session_id or "").strip()
+    return "" if parent == session_id else parent
+
+
 def _mint_document_id(session_id: str) -> str:
     """Per-process document id: reusing session_id alone overwrote the document on
     /resume (the reloaded session's first retain replaced the stored content)."""
@@ -782,7 +788,7 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs.get("agent_context", "") == "cron" or kwargs.get("platform", "") == "cron"
         )
         self._session_id = str(session_id or "").strip()
-        self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
+        self._parent_session_id = _lineage_parent(self._session_id, kwargs.get("parent_session_id"))
         # Status channel for the retain indicator (recall reports via recall_status()).
         if callable(kwargs.get("status_callback")):
             self._status_callback = kwargs["status_callback"]
@@ -1437,7 +1443,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # An explicit empty parent on a real switch clears the old lineage (an unrelated resumed
         # session must not inherit the previous branch's parent). A rewind keeps the same session,
         # and its caller passes no parent, so the existing lineage stays.
-        new_parent = str(parent_session_id or "").strip()
+        # In-place compaction reports the session as its own parent. Treat that as "no new
+        # parent": a self-parent tag would appear and vanish across compactions and restarts,
+        # and Hindsight re-consolidates a whole document whenever its tag set changes.
+        new_parent = _lineage_parent(new_id, parent_session_id)
         if new_parent or (new_id != self._session_id and not kwargs.get("rewound")):
             self._parent_session_id = new_parent
         self._session_id, self._document_id = new_id, _mint_document_id(new_id)

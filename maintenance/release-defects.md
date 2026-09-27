@@ -353,6 +353,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Regression coverage: `test_hindsight_provider.py` (`test_pending_ops_are_polled_against_their_own_bank`,
   `TestPrefetchSupersession::test_superseded_slow_worker_cannot_overwrite_newer_result`).
 
+## Hindsight self-parent lineage tag re-consolidated whole sessions
+
+- Fork patch identity: `hindsight-session-lifecycle`.
+- In-place compaction calls `on_session_switch` with the session id as its own parent, so retains
+  gained a `parent:<self>` tag that a later switch or gateway restart dropped again. Hindsight treats
+  any change to a document's tag set as a rescope: it deletes the document's observations and
+  requeues every fact without logging it. On 2026-09-27 this requeued about 6,700 already
+  consolidated facts from a few long Telegram sessions and turned the backlog drain into a rise. A
+  parent equal to the session itself is now treated as no parent, in `initialize()` and on switch.
+- Regression coverage: `test_hindsight_provider.py`
+  (`test_in_place_compaction_keeps_lineage_tags_stable`).
+
 ## Telegram short media flood retry let other traffic into the penalty
 
 - Fork patch identity: `telegram-media-flood-under-lock`.
