@@ -1688,6 +1688,28 @@ class TestSessionSwitchBufferFlush:
         p.on_session_switch("branch-sid", parent_session_id="", reset=False, rewound=True)
         assert p._parent_session_id == "root-sid"
 
+    def test_in_place_compaction_keeps_lineage_tags_stable(self, provider_with_config):
+        """In-place compaction names the session as its own parent. Retains before and after it
+        must carry the same tags: Hindsight re-consolidates a whole document when they change."""
+        p = provider_with_config(retain_async=False)
+
+        def retained_tags():
+            p._client.aretain_batch.reset_mock()
+            p.sync_turn("user", "assistant")
+            p._retain_queue.join()
+            return set(p._client.aretain_batch.call_args.kwargs["items"][0]["tags"])
+
+        before = retained_tags()
+        p.on_session_switch("test-session", parent_session_id="test-session", reset=False, reason="compression")
+        assert retained_tags() == before
+
+        # A real parent from an earlier compaction survives a later in-place one.
+        p.on_session_switch("child-sid", parent_session_id="test-session", reset=False, reason="compression")
+        lineage = retained_tags()
+        p.on_session_switch("child-sid", parent_session_id="child-sid", reset=False, reason="compression")
+        assert retained_tags() == lineage
+        assert "parent:test-session" in lineage and "parent:child-sid" not in lineage
+
     def test_buffered_turns_flushed_before_clear(self, provider_with_config):
         """retain_every_n_turns > 1 must not silently drop partial buffers
         on session switch. Whatever's in _session_turns at switch time
