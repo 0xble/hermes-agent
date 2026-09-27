@@ -331,13 +331,16 @@ def test_fleet_expected_candidate_sha_is_not_current_pointer(tmp_path, monkeypat
     _fake_release(a, "A")
     releases.promote(home, a)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(update_receipt, "_profile_homes", lambda: [])
-    # Probe overrides retain the intended SHA even while the pointer is stale.
-    # A real fleet row with code_sha=A would be classified stale against B.
-    from hermes_cli.update_receipt import _fleet_row
-    row = _fleet_row("default", 123, "A", None, "B", code_root=a, expected_root=home / "releases" / "B")
-    assert row["state"] == "stale"
-    update_receipt.collect_fleet_versions(expected_sha_override="B")
+    monkeypatch.setattr(update_receipt, "_profile_homes", lambda: [("default", home)])
+    monkeypatch.setattr(update_receipt, "_socket_identity", lambda _: (123, {"code_sha": "A"}))
+    monkeypatch.setattr(update_receipt, "_gateway_code_root", lambda pid, root: a)
+    # A real fleet row with code_sha=A must be stale against intended B, not
+    # current because the pointer still says A or external because roots differ.
+    rows = update_receipt.collect_fleet_versions(
+        expected_sha_override="B", expected_root_override=home / "releases" / "B")
+    assert len(rows) == 1
+    assert rows[0]["state"] == "stale"
+    assert rows[0]["code_sha"] == "A"
 
 
 def test_promote_is_atomic_and_rollback_round_trip(tmp_path):
