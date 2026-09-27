@@ -13,6 +13,7 @@ from gateway.session import SessionSource, SessionStore
 from hermes_constants import get_hermes_home
 from gateway import run as gateway_run
 from gateway.run_pending_recovery import recover_pending_shutdown_flush
+from gateway.shutdown_flush import flush_pending_to_file
 
 
 def test_startup_recovers_secondary_spool_after_shared_bot_shutdown(tmp_path, monkeypatch):
@@ -78,6 +79,44 @@ def test_single_profile_pending_queues_round_trip_at_launch_home(tmp_path, monke
     assert sorted(call.kwargs["content"] for call in db.append_message.call_args_list) == [
         "adapter", "overflow", "runner"]
     assert not list((launch / "pending_messages").glob("*.json"))
+
+
+@pytest.mark.parametrize("primary_name", ["default", "other"])
+def test_old_launch_spool_replays_served_secondary_but_keeps_unserved(tmp_path, monkeypatch, primary_name):
+    """Pre-upgrade shutdown wrote shared-bot secondary slots to the launch spool."""
+    launch = tmp_path / primary_name
+    secondary_name = "other" if primary_name == "default" else "satellite"
+    secondary = tmp_path / secondary_name
+    launch.mkdir()
+    secondary.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = primary_name
+    runner._served_profile_homes = {primary_name: launch, secondary_name: secondary}
+    served_key = f"agent:{secondary_name}:telegram:dm:2"
+    unserved_key = "agent:unserved:telegram:dm:3"
+    # The previous shutdown used the launch scope for both the runner queue and
+    # the shared primary adapter, regardless of the queued key's runtime owner.
+    with gateway_run._profile_runtime_scope(launch, prepared_secret_scope={}):
+        assert flush_pending_to_file({served_key: "old secondary", unserved_key: "unknown"}) == 2
+    db = MagicMock()
+    resolved = []
+
+    def resolve(key, *, not_after=None):
+        resolved.append((key, Path(get_hermes_home())))
+        return ("secondary-session", db) if key == served_key else None
+
+    runner.session_store = SimpleNamespace(resolve_session_id_for_key=resolve)
+    assert recover_pending_shutdown_flush(runner) == 1
+    assert recover_pending_shutdown_flush(runner) == 0
+    db.append_message.assert_called_once()
+    assert db.append_message.call_args.kwargs["content"] == "old secondary"
+    assert (served_key, secondary) in resolved
+    remaining = [json.loads(path.read_text(encoding="utf-8"))
+                 for path in (launch / "pending_messages").glob("*.json")]
+    assert [payload["session_key"] for payload in remaining] == [unserved_key]
+    assert not list((secondary / "pending_messages").glob("*.json"))
 
 
 @pytest.mark.parametrize("primary_name", ["default", "other"])
