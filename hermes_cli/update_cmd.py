@@ -1699,6 +1699,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Rollback does not fetch, prompt, inspect dependency options or mutate the checkout.
     from hermes_cli.update_handoff import adopt_handed_off_gateway_resume
 
+    if getattr(args, "rollback", False) and getattr(args, "no_gateway_restart", False):
+        raise ValueError("--rollback cannot be combined with --no-gateway-restart: rollback requires a fleet restart")
+
     if getattr(args, "rollback", False):
         from hermes_cli.immutable_releases import ReleasePaths, migration_plist, read_pointer, rollback
         from hermes_cli.update_receipt import begin_update_receipt
