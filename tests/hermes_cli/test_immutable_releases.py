@@ -26,6 +26,39 @@ def _fake_release(path: Path, marker: str, *, lock: str = "same") -> None:
     (path / ".release-ready").write_text(path.name + "\n", encoding="utf-8")
 
 
+def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, monkeypatch):
+    """The release is exactly tracked HEAD, not its own staging dir or profile state."""
+    source = tmp_path / "source"
+    module = source / "hermes_cli"
+    module.mkdir(parents=True)
+    from hermes_cli import build_info
+    import shutil
+    shutil.copy2(Path(build_info.__file__), module / "build_info.py")
+    (source / "pyproject.toml").write_text("[project]\nname='staged-probe'\nversion='1.0'\n")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "hermes_cli/build_info.py", "pyproject.toml"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "commit", "-qm", "fixture"], check=True)
+    sha = releases.release_sha(source)
+    home = source / "hermes_test"
+    (home / "cache").mkdir(parents=True)
+    (home / "cache" / "private.txt").write_text("never ship")
+    (source / ".worktrees" / "other").mkdir(parents=True)
+    monkeypatch.setattr(releases, "prepare_venv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(releases, "smoke_plugins", lambda *args, **kwargs: None)
+    release, action = releases.stage_release(source, home)
+    assert action == "staged"
+    assert release == home / "releases" / sha
+    assert not (release / "hermes_test").exists()
+    assert not (release / ".worktrees").exists()
+    assert not (release / ".git").exists()
+    code = "import importlib.util, pathlib, sys; p=pathlib.Path(sys.argv[1]); s=importlib.util.spec_from_file_location('staged_build_info',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.get_code_identity(refresh=True)['sha'])"
+    result = subprocess.run([sys.executable, "-c", code, str(release / "hermes_cli" / "build_info.py")],
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == sha
+    assert releases.stage_release(source, home)[1] == "existing"
+
+
 def test_promote_is_atomic_and_rollback_round_trip(tmp_path):
     home = tmp_path / ".hermes"
     a, b = home / "releases" / "a", home / "releases" / "b"

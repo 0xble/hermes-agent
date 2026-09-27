@@ -66,9 +66,38 @@ def _release_python(release: Path) -> Path:
     return release / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def _copy_tree(source: Path, target: Path) -> None:
-    ignore = shutil.ignore_patterns(".git", ".venv", "venv", "__pycache__", "*.pyc")
+def _copy_tree(source: Path, target: Path, *, home: Path | None = None) -> None:
+    """Copy a synthetic test tree without following the destination or mutable state."""
+    source, target = source.resolve(), target.resolve()
+    excluded = {target, target.parent}
+    if home is not None:
+        excluded.add(home.resolve())
+    excluded = {path for path in excluded if path != source and source in path.parents}
+    names = {".git", ".worktrees", ".venv", "venv", "__pycache__", "node_modules", "releases"}
+
+    def ignore(directory: str, entries: list[str]) -> set[str]:
+        root = Path(directory).resolve()
+        return {name for name in entries if name in names or name.endswith(".pyc")
+                or any(root / name == path or path in (root / name).parents for path in excluded)}
+
     shutil.copytree(source, target, ignore=ignore, symlinks=True)
+
+
+def _stage_git_tree(source: Path, staging: Path, sha: str) -> None:
+    """Materialize only files tracked at the exact commit, never local caches."""
+    import tarfile
+    archive = subprocess.run(["git", "-C", str(source), "archive", "--format=tar", sha],
+                             capture_output=True, check=True).stdout
+    staging.mkdir(parents=True)
+    import io
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        for member in tar.getmembers():
+            dest = (staging / member.name).resolve()
+            if staging.resolve() not in dest.parents and dest != staging.resolve():
+                raise RuntimeError("unsafe git archive path")
+            if member.issym() or member.islnk():
+                raise RuntimeError("release archive contains symlink")
+        tar.extractall(staging, filter="data")
 
 
 def _atomic_symlink(link: Path, target: Path) -> None:
@@ -183,20 +212,32 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
-    if target.exists() and (target / ".release-ready").exists():
+    if (target.is_dir() and (target / ".release-ready").is_file()
+            and (target / ".release-ready").read_text(encoding="utf-8").strip() == sha
+            and (target / ".hermes_build_sha").is_file()
+            and (target / ".hermes_build_sha").read_text(encoding="utf-8").strip() == sha):
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
         return target, "existing"
     paths.releases.mkdir(parents=True, exist_ok=True)
     staging = paths.releases / f".{sha}.staging-{os.getpid()}"
     published = False
     try:
-        _copy_tree(source, staging)
+        source = source.resolve(strict=True)
+        # Git archives contain only tracked bytes at SHA; an ignored HERMES_HOME
+        # nested in the checkout cannot enter the artifact or recurse into itself.
+        if (source / ".git").exists():
+            _stage_git_tree(source, staging, sha)
+        else:
+            _copy_tree(source, staging, home=paths.home)
         if target.exists():
             # A crashed build never becomes an apparently usable release.
             shutil.rmtree(target)
         os.replace(staging, target)
         published = True
         prepare_venv(target, previous=read_pointer(paths.current), uv=uv)
+        (target / ".hermes_build_sha").write_text(sha + "\n", encoding="utf-8")
+        if (target / ".hermes_build_sha").read_text(encoding="utf-8").strip() != sha:
+            raise RuntimeError("release identity stamp mismatch")
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
         (target / ".release-ready").write_text(sha + "\n", encoding="utf-8")
     except Exception:
