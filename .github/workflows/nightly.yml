@@ -99,6 +99,11 @@ jobs:
       - name: Install pinned checkout Python
         shell: bash
         run: uv python install 3.11.16
+      - name: Initialize Windows MSVC linker for Rust builds
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
       - name: Install pinned Rust for ripgrep provisioning
         shell: bash
         run: |
