@@ -2675,8 +2675,13 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    from hermes_cli.immutable_releases import LOADED_RELEASE_ROOT, worker_launch_spec
+    # A gateway-owned task belongs to its loaded release, not an HERMES_BIN or
+    # PATH shim that can be redirected when `current` is promoted.
+    hermes_argv = (_resolve_hermes_argv() if LOADED_RELEASE_ROOT is None else
+                   [worker_launch_spec(LOADED_RELEASE_ROOT, {})[0], "-m", "hermes_cli.main"])
     cmd = [
-        *_resolve_hermes_argv(),
+        *hermes_argv,
         "-p", profile_arg,
         # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
         # exits 0 without doing the task → "protocol violation" every attempt.
@@ -2877,11 +2882,18 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     cmd = _restart_safe_worker_argv(task, cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
+    from hermes_cli.immutable_releases import LOADED_RELEASE_ROOT, worker_launch_spec
+    if LOADED_RELEASE_ROOT is not None:
+        _, release_cwd, env = worker_launch_spec(LOADED_RELEASE_ROOT, env)
+    else:
+        release_cwd = None
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            # A task's workspace is intentionally its working directory; use
+            # the physical release cwd only when no workspace was assigned.
+            cwd=workspace if os.path.isdir(workspace) else release_cwd,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
