@@ -145,6 +145,53 @@ def test_dead_delivery_owner_becomes_unknown_and_is_not_retried(
     assert queue.get_status("exec-1")["status"] == "unknown"
 
 
+@pytest.mark.parametrize("terminal", ("unknown", "delivered", "failed", "suppressed"))
+def test_stale_enqueue_pending_cannot_replace_projected_terminal_receipt(
+    tmp_path, monkeypatch, terminal
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+        run = executions.create_execution("job-racing-projection", source="builtin")
+        original_reflect = queue._reflect_execution_delivery
+
+        def terminalize_after_enqueue_commit(execution_id, status):
+            assert execution_id == run["id"]
+            if status != "pending":
+                return original_reflect(execution_id, status)
+            # enqueue() has committed the queue row but has not projected pending.
+            # A second connection claims and terminalizes it, projecting the receipt.
+            assert queue.claim_next()["execution_id"] == execution_id
+            if terminal == "unknown":
+                assert "unknown" in queue._terminalize_wait_timeout(execution_id)
+            else:
+                assert queue._finish(
+                    execution_id,
+                    error="send failed" if terminal == "failed" else None,
+                    suppressed=terminal == "suppressed",
+                )
+            assert queue.get_status(execution_id)["status"] == terminal
+            assert executions.get_execution(execution_id)["delivery_status"] == terminal
+            with sqlite3.connect(queue.queue_path()) as conn:
+                assert conn.execute(
+                    "SELECT projected FROM deliveries WHERE execution_id=?", (execution_id,)
+                ).fetchone()[0] == 1
+            original_reflect(execution_id, status)  # stale pending projection resumes
+
+        monkeypatch.setattr(queue, "_reflect_execution_delivery", terminalize_after_enqueue_commit)
+        queue.enqueue(run["id"], {"id": "job-racing-projection"}, "result")
+        assert queue.reconcile_terminal_deliveries() == 0
+        assert executions.get_execution(run["id"])["delivery_status"] == terminal
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_terminal_recovery_and_timeout_project_execution_status(tmp_path, monkeypatch):
     from cron import delivery_queue as queue, executions
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override

@@ -464,11 +464,14 @@ def record_delivery_status(execution_id: str, status: str) -> None:
     if status not in {"pending", "delivering", "delivered", "failed", "unknown", "suppressed"}:
         raise ValueError("invalid cron delivery status")
     with _transaction() as conn:
+        # Enqueue commits before projecting pending. A terminal queue projection may
+        # win in between; its receipt must not be rolled back by stale pending.
         conn.execute(
             "UPDATE executions SET delivery_status=? WHERE id=? "
-            "AND (delivery_status IS NULL OR delivery_status NOT IN "
-            "('delivered','failed','suppressed'))",
-            (status, execution_id),
+            "AND ((?='pending' AND (delivery_status IS NULL OR delivery_status='pending')) "
+            "OR (?!='pending' AND (delivery_status IS NULL OR delivery_status NOT IN "
+            "('delivered','failed','suppressed'))))",
+            (status, execution_id, status, status),
         )
 
 
