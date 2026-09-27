@@ -162,6 +162,25 @@ def test_release_to_release_activation_reload_once(release_job, monkeypatch):
 
 
 @pytest.mark.macos_only
+def test_historical_ack_cannot_credit_dead_gateway(release_job, monkeypatch):
+    job = release_job
+    monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
+    worker = _ack_after_spawn(job, job.b, job.initial["pid"])
+    assert update_cmd._activate_immutable_release(sha=job.b.name, source=job.a)
+    worker.join(timeout=5)
+    assert update_cmd_fleet._acknowledged_release_launchd_label(job.home, job.b) == job.label
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{job.label}"], check=True)
+    assert update_cmd_fleet._acknowledged_release_launchd_label(job.home, job.b) is None
+    attempted = []
+    monkeypatch.setattr(update_cmd_fleet, "_restart_launchd_gateway_after_update",
+                        lambda **kwargs: attempted.append(kwargs) or ([], [job.label]))
+    credited, failed = [], []
+    update_cmd_fleet._restart_macos_launchd_gateways(
+        credited, failed, 0, acknowledged_label=update_cmd_fleet._acknowledged_release_launchd_label(job.home, job.b))
+    assert attempted and not credited and failed == [job.label]
+
+
+@pytest.mark.macos_only
 def test_acknowledged_release_catchup_verifies_without_second_relaunch(release_job, monkeypatch):
     job = release_job
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)

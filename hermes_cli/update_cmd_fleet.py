@@ -1011,6 +1011,7 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
     """Only the transaction's acknowledged, installed plist can exempt its own label."""
     import hashlib
     import plistlib
+    import psutil
     from hermes_cli import gateway
 
     try:
@@ -1031,8 +1032,20 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
                 or definition["Label"] != label
                 or Path(definition["EnvironmentVariables"]["HERMES_HOME"]).resolve() != home.resolve()):
             return None
+        # A durable ACK is historical. Credit it only while the very gateway it
+        # acknowledged is still in this label's live supervised process tree.
+        from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+        supervisor_pid = _launchctl_supervised_pid(label)
+        if not supervisor_pid or supervisor_pid != ack["launchd_pid"]:
+            return None
+        supervisor = psutil.Process(supervisor_pid)
+        gateway_pid = ack["gateway_pid"]
+        processes = [supervisor, *supervisor.children(recursive=True)]
+        if not any(p.pid == gateway_pid and Path(p.cwd()).resolve() == root.resolve()
+                   for p in processes):
+            return None
         return label
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, psutil.Error):
         return None
 
 
