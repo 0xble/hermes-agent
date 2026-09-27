@@ -138,12 +138,69 @@ def _release_subprocess_env(release: Path | None = None) -> dict[str, str]:
     if release is not None:
         env["UV_PROJECT_ENVIRONMENT"] = str(release.resolve() / ".venv")
     env["UV_NO_CONFIG"] = "1"
+    # Deterministically leave bytecode generation to Python on first import.
+    # Smoke imports may still create disposable __pycache__ files, removed on relocation.
+    env["UV_COMPILE_BYTECODE"] = "0"
     return env
 
 
-def _build_venv(release: Path, *, uv: str = "uv") -> None:
-    subprocess.run([uv, "sync", "--frozen", "--python", sys.executable],
-                   cwd=release, env=_release_subprocess_env(release), check=True)
+def _source_install_python(source: Path, home: Path | None = None) -> Path:
+    """Use the migration-bound interpreter, not a worktree's incidental .venv."""
+    if home is not None:
+        journal = ReleasePaths.for_home(home).home / "release-layout.json"
+        if journal.exists():
+            record = json.loads(journal.read_text(encoding="utf-8"))
+            if Path(record["source"]).resolve() != source.resolve():
+                raise RuntimeError("migration journal refers to a different checkout")
+            if record.get("source_python"):
+                python = Path(record["source_python"])
+                if not python.is_file():
+                    raise RuntimeError(f"source interpreter unavailable: {python}")
+                return python
+    for name in ("venv", ".venv"):
+        python = source / name / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if python.is_file():
+            return python
+    return Path(sys.executable)
+
+
+def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
+    """Infer selected leaf extras from installed direct requirements.
+
+    Wheel metadata lists *available*, not selected, extras. A uniquely named
+    installed requirement identifies a partially installed leaf group; groups
+    with all applicable direct requirements installed identify the remainder.
+    """
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.markers import default_environment
+
+    groups = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))["project"].get("optional-dependencies", {})
+    installed = set(_active_distributions(source_python))
+    declared: dict[str, set[str]] = {}
+    for extra, requirements in groups.items():
+        if extra in {"all", "termux", "termux-all"}:
+            continue  # composite extras are reconstructed from their leaf groups
+        direct = set()
+        for raw in requirements:
+            req = Requirement(raw)
+            if canonicalize_name(req.name) == "hermes-agent":
+                continue
+            if req.marker is None or req.marker.evaluate({**default_environment(), "extra": extra}):
+                direct.add(canonicalize_name(req.name))
+        if direct:
+            declared[extra] = direct
+    unique = {name for extra, names in declared.items() for name in names
+              if sum(name in other for other in declared.values()) == 1}
+    return sorted(extra for extra, names in declared.items()
+                  if names <= installed or bool(names & installed & unique))
+
+
+def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = ()) -> None:
+    cmd = [uv, "sync", "--frozen", "--python", sys.executable]
+    for extra in extras:
+        cmd.extend(("--extra", extra))
+    subprocess.run(cmd, cwd=release, env=_release_subprocess_env(release), check=True)
 
 
 def _active_distributions(python: Path) -> dict[str, str]:
@@ -167,17 +224,14 @@ def _active_plugin_entrypoints(python: Path, names: set[str] | None = None) -> s
             if names is None or dist in names}
 
 
-def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv") -> None:
+def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv",
+                                 source_python: Path | None = None) -> None:
     """Carry active lazy/tool/entry-point plugin packages into the candidate.
 
     Do not claim readiness if an active package cannot be reproduced. Never
     modify the source interpreter; uv installs against the candidate alone.
     """
-    source_python = _release_python(source)
-    if not source_python.is_file():
-        # Git installs can use an external virtualenv; the updating process is
-        # already running from that environment, and it is the active set.
-        source_python = Path(sys.executable)
+    source_python = source_python or _source_install_python(source)
     candidate_python = _release_python(candidate)
     if not source_python.is_file():
         raise RuntimeError(f"source interpreter unavailable: {source_python}")
@@ -197,9 +251,10 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
         subprocess.run([uv, "pip", "install", "--no-deps", "--python", str(candidate_python), *missing],
                        env=_release_subprocess_env(candidate), check=True)
     target = _active_distributions(candidate_python)
-    unmatched = [name for name, version in extras.items() if target.get(name) != version]
+    unmatched = [name for name in installed if name not in {"hermes-agent", "hermes-agent-cli"}
+                 and (name not in target or (name not in locked and target[name] != installed[name]))]
     if unmatched:
-        raise RuntimeError(f"candidate optional distribution parity failed: {', '.join(sorted(unmatched))}")
+        raise RuntimeError(f"candidate distribution parity failed: {', '.join(sorted(unmatched))}")
     changed = [name for name in locked if name in target and name in locked_versions
                and target[name] != locked_versions[name]]
     if changed:
@@ -210,11 +265,16 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
 
 
 def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
-                 source: Path | None = None) -> tuple[Path, str]:
+                 source: Path | None = None, source_python: Path | None = None) -> tuple[Path, str]:
     """Build at the final release path: venv scripts and metadata are not relocatable."""
-    _build_venv(release, uv=uv)
     if source is not None:
-        restore_active_distributions(source, release, uv=uv)
+        source_python = source_python or _source_install_python(source)
+        extras = _active_locked_extras(source_python, release)
+    else:
+        extras = []
+    _build_venv(release, uv=uv, extras=extras)
+    if source is not None:
+        restore_active_distributions(source, release, uv=uv, source_python=source_python)
     return release / ".venv", "built"
 
 
@@ -324,6 +384,9 @@ def _relocate_venv(staging: Path, target: Path) -> None:
             raw = path.read_bytes()
             if old not in raw:
                 continue
+            if path.suffix == ".pyc" and path.parent.name == "__pycache__":
+                path.unlink()  # disposable bytecode embeds the old co_filename
+                continue
             if b"\0" in raw:
                 raise RuntimeError(f"cannot relocate binary with staging path: {path}")
             path.write_bytes(raw.replace(old, new))
@@ -336,7 +399,8 @@ def _release_is_ready(path: Path, sha: str) -> bool:
 
 
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
-                  uv: str = "uv", plugin_dir: Path | None = None) -> tuple[Path, str]:
+                  uv: str = "uv", plugin_dir: Path | None = None,
+                  source_python: Path | None = None) -> tuple[Path, str]:
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
@@ -361,7 +425,9 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
         if not (staging / "hermes_cli" / "immutable_releases.py").is_file():
             raise RuntimeError(f"revision {sha} predates immutable releases and cannot be staged")
         prepare_venv(staging, previous=read_pointer(paths.current), uv=uv,
-                     source=source if (source / ".git").exists() else None)
+                     source=source if (source / ".git").exists() else None,
+                     source_python=source_python or (_source_install_python(source, paths.home)
+                                                    if (source / ".git").exists() else None))
         (staging / ".hermes_build_sha").write_text(sha + "\n", encoding="utf-8")
         smoke_plugins(staging, paths.home, plugin_dir=plugin_dir)
         _relocate_venv(staging, target)
@@ -569,11 +635,11 @@ def restore_source_layout(home: Path) -> dict[str, str | None]:
     # migration revision. Refuse dirty trees before changing any pointer/plist.
     expected_sha = data["source_sha"]
     actual_sha = release_sha(source)
+    status = subprocess.run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=normal"],
+                            capture_output=True, text=True, check=True)
+    if status.stdout.strip():
+        raise RuntimeError(f"source checkout is dirty; cannot restore migration revision {expected_sha}")
     if actual_sha != expected_sha:
-        status = subprocess.run(["git", "-C", str(source), "status", "--porcelain"],
-                                capture_output=True, text=True, check=True)
-        if status.stdout.strip():
-            raise RuntimeError(f"source checkout is dirty; cannot restore migration revision {expected_sha}")
         restored = subprocess.run(["git", "-C", str(source), "reset", "--hard", expected_sha],
                                   capture_output=True, text=True)
         if restored.returncode or release_sha(source) != expected_sha:

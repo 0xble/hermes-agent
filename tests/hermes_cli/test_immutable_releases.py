@@ -175,6 +175,63 @@ def test_release_with_unreadable_migration_journal_fails_loudly(tmp_path, monkey
         main.cmd_update(object())
 
 
+def test_relocate_removes_compiled_editable_finder_but_rejects_other_binary(tmp_path):
+    import py_compile
+    staging, target = tmp_path / ".staging-B", tmp_path / "B"
+    finder = staging / ".venv" / "lib" / "site-packages" / "__editable___probe.py"
+    finder.parent.mkdir(parents=True)
+    finder.write_text(f"ROOT = {str(staging)!r}\n", encoding="utf-8")
+    cached = Path(py_compile.compile(str(finder), doraise=True))
+    assert b"\0" in cached.read_bytes() and os.fsencode(staging) in cached.read_bytes()
+    releases._relocate_venv(staging, target)
+    assert not cached.exists()
+    assert str(target) in finder.read_text(encoding="utf-8")
+    binary = finder.parent / "native.so"
+    binary.write_bytes(b"\0" + os.fsencode(staging))
+    with pytest.raises(RuntimeError, match="cannot relocate binary"):
+        releases._relocate_venv(staging, target)
+
+
+def test_source_unchanged_head_dirty_blocks_migration_rollback(tmp_path):
+    source, home = tmp_path / "source", tmp_path / "profile"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    (source / "tracked.txt").write_text("clean", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "A"], check=True)
+    sha = releases.release_sha(source)
+    current = home / "releases" / "B"
+    _fake_release(current, "B")
+    releases.promote(home, current)
+    releases._atomic_symlink(home / "previous", source)
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source), "source_sha": sha,
+                                                           "plist": None}), encoding="utf-8")
+    (source / "tracked.txt").write_text("dirty", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="source checkout is dirty"):
+        releases.rollback(home)
+    assert (home / "current").resolve() == current
+    assert (home / "previous").resolve() == source
+    assert (source / "tracked.txt").read_text(encoding="utf-8") == "dirty"
+
+
+def test_missing_locked_extra_fails_closed(tmp_path, monkeypatch):
+    import venv
+    import zipfile
+    source, candidate = tmp_path / "source", tmp_path / "candidate"
+    for root in (source, candidate):
+        venv.EnvBuilder(with_pip=False).create(root / ".venv")
+    (candidate / "uv.lock").write_text('[[package]]\nname = "locked-extra"\nversion = "1.0"\n', encoding="utf-8")
+    wheel = tmp_path / "locked_extra-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("locked_extra/__init__.py", "")
+        archive.writestr("locked_extra-1.0.dist-info/METADATA", "Metadata-Version: 2.1\nName: locked-extra\nVersion: 1.0\n")
+        archive.writestr("locked_extra-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        archive.writestr("locked_extra-1.0.dist-info/RECORD", "")
+    subprocess.run(["uv", "pip", "install", "--python", str(releases._release_python(source)), str(wheel)], check=True)
+    with pytest.raises(RuntimeError, match="candidate distribution parity failed: locked-extra"):
+        releases.restore_active_distributions(source, candidate)
+
 def test_candidate_retains_active_optional_feature_from_local_wheel(tmp_path, monkeypatch):
     import venv
     import zipfile
