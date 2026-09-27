@@ -68,7 +68,7 @@ runtime and request-override resolution in `tools/delegate_tool_config.py`.
 ## Provenance
 
 Fork patch identities: `delegation-service-tier`, `delegation-explicit-inheritance`,
-`fast-mode-custom-provider-opt-in`.
+  `fast-mode-custom-provider-opt-in`.
 
 Fork-Patch-Backfill: 893c9262c9beacb9296f7c03f365790b2be2929e; delegation-service-tier
 
