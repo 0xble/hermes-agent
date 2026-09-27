@@ -93,6 +93,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "execution_identity", "execution_identity TEXT")
     add_column_if_missing(conn, "executions", "owner_kind", "owner_kind TEXT")
     add_column_if_missing(conn, "executions", "delivery_status", "delivery_status TEXT")
+    # 0 means an unknown status is a terminal queue projection; 1 is the
+    # detached finish-before-enqueue provisional marker.  Additive so older
+    # releases can continue using this shared DB with named-column statements.
+    add_column_if_missing(
+        conn, "executions", "delivery_status_provisional",
+        "delivery_status_provisional INTEGER NOT NULL DEFAULT 0",
+    )
     add_column_if_missing(conn, "executions", "output", "output TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
@@ -339,7 +346,10 @@ def finish_execution(
                SET status=?, finished_at=?, error=?, handoff_pending=0,
                    handoff_started_at=NULL, delivery_outcome=?, output=?,
                    delivery_status=CASE WHEN owner_kind='detached' AND delivery_status IS NULL
-                                        THEN 'unknown' ELSE delivery_status END
+                                        THEN 'unknown' ELSE delivery_status END,
+                   delivery_status_provisional=CASE
+                       WHEN owner_kind='detached' AND delivery_status IS NULL THEN 1
+                       ELSE delivery_status_provisional END
                WHERE id=? AND status IN ('claimed','running')
                  AND (?=0 OR status='running')
                  AND process_id=? AND pid=?""",
@@ -467,8 +477,9 @@ def record_delivery_status(execution_id: str, status: str) -> None:
         # Enqueue commits before projecting pending. A terminal queue projection may
         # win in between; its receipt must not be rolled back by stale pending.
         conn.execute(
-            "UPDATE executions SET delivery_status=? WHERE id=? "
-            "AND ((?='pending' AND (delivery_status IS NULL OR delivery_status='pending')) "
+            "UPDATE executions SET delivery_status=?, delivery_status_provisional=0 WHERE id=? "
+            "AND ((?='pending' AND (delivery_status IS NULL OR delivery_status='pending' "
+            "OR (delivery_status='unknown' AND delivery_status_provisional=1))) "
             "OR (?!='pending' AND (delivery_status IS NULL OR delivery_status NOT IN "
             "('delivered','failed','suppressed'))))",
             (status, execution_id, status, status),

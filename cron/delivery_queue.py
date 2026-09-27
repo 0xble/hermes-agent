@@ -54,8 +54,8 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
     if excess > 0:
         conn.execute(
             """INSERT OR IGNORE INTO delivery_tombstones
-               (execution_id, terminal_status, finished_at)
-               SELECT execution_id, status, finished_at FROM deliveries
+               (execution_id, terminal_status, finished_at, projected)
+               SELECT execution_id, status, finished_at, projected FROM deliveries
                WHERE status IN ('delivered','failed','unknown','suppressed')
                ORDER BY finished_at, created_at, execution_id
                LIMIT ?""",
@@ -237,7 +237,7 @@ def reconcile_terminal_deliveries() -> int:
     ledger = executions._connect()
     with transaction(ledger) as ledger_conn:
         ledger_conn.executemany(
-            "UPDATE executions SET delivery_status=? WHERE id=? "
+            "UPDATE executions SET delivery_status=?, delivery_status_provisional=0 WHERE id=? "
             "AND (delivery_status IS NULL OR delivery_status NOT IN "
             "('delivered','failed','suppressed'))",
             [

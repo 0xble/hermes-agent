@@ -74,7 +74,57 @@ assert executions.finish_execution(run, success=True, delivery_outcome='queued')
         reset_hermes_home_override(token)
 
 
-def test_live_detached_owner_reconciles_without_rewriting_even_if_stale(monkeypatch, tmp_path):
+def test_finish_before_enqueue_projects_pending_then_terminal_delivery(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+        run = executions.create_execution("production-order", source="builtin")
+        executions.mark_execution_handoff_pending(run["id"])
+        assert executions.adopt_claimed_execution(run["id"])
+        finished = executions.finish_execution(run["id"], success=True, output="result")
+        assert finished["delivery_status"] == "unknown"
+        assert finished["delivery_status_provisional"] == 1
+
+        queued = queue.enqueue(run["id"], {"id": "production-order"}, "result")
+        assert queued["status"] == "pending"
+        assert executions.get_execution(run["id"])["delivery_status"] == "pending"
+
+        assert queue.drain(lambda *_: None) == 1
+        assert queue.get_status(run["id"])["status"] == "delivered"
+        terminal = executions.get_execution(run["id"])
+        assert terminal["delivery_status"] == "delivered"
+        assert terminal["delivery_status_provisional"] == 0
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_killed_between_finish_and_enqueue_remains_unknown_and_is_not_resent(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+        run = executions.create_execution("killed-gap", source="builtin")
+        executions.mark_execution_handoff_pending(run["id"])
+        assert executions.adopt_claimed_execution(run["id"])
+        finished = executions.finish_execution(run["id"], success=True)
+        assert finished["delivery_status"] == "unknown"
+        assert finished["delivery_status_provisional"] == 1
+        assert queue.drain(lambda *_: pytest.fail("must not resend absent queue receipt")) == 0
+        assert executions.get_execution(run["id"])["delivery_status"] == "unknown"
+    finally:
+        reset_hermes_home_override(token)
+
     token = _home(tmp_path / "home")
     try:
         run = executions.create_execution("worker", source="builtin")

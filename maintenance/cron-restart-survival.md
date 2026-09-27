@@ -23,6 +23,24 @@ Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_re
 | Queue terminal → ledger projection | Queue receipt commits → execution `delivery_status` update → receipt `projected=1` | Unprojected indexed receipt (including tombstone) retries projection on drain; projected history is skipped. |
 | Queue retention → tombstone | Terminal receipt moves with `projected` preserved | Tombstone prevents re-enqueue and unprojected tombstone still retries projection. |
 
-Until immutable per-version release directories (S2), an external worker surviving an in-place `hermes update` can lazily import modules from the new checkout after loading old ones. S1 is process survival, not an immutable code snapshot.
+## Delivery-status transition audit
+
+`delivery_status_provisional=1` is written only atomically with the detached
+finish `unknown` marker. It distinguishes the pre-enqueue gap from a terminal
+queue projection; old releases read the status as ordinary `unknown` and ignore
+the additive column. The queue projection clears the flag in the same SQL
+UPDATE, and terminal states remain fenced.
+
+| Write site | Transitions | Guard / invariant |
+| --- | --- | --- |
+| `executions.finish_execution` | `NULL → unknown(provisional)` | Detached terminal finish only; never rewrites an existing delivery state. |
+| `executions.record_delivery_status` | `NULL/pending → pending`; `unknown(provisional) → pending`; `NULL/unknown/provisional/pending/delivering → delivered/failed/unknown/suppressed` | Conditional SQL UPDATE; pending cannot replace terminal unknown (`provisional=0`) or any terminal state; terminal write clears provisional. |
+| `delivery_queue.reconcile_terminal_deliveries` | `NULL/unknown(provisional)/pending/delivering → delivered/failed/unknown/suppressed` | Conditional SQL UPDATE; terminal statuses are immutable and projection marker is cleared atomically. |
+
+The executions schema migration is additive and idempotent. Existing releases use
+named INSERT/UPDATE columns and `SELECT *` into named rows, so the new column is
+ignored safely; the queue's existing additive tombstone `projected` column is
+also named in retention INSERT/SELECT and defaults safely for old rows.
+
 
 Related upstream PRs [#123893](https://github.com/NousResearch/hermes-agent/pull/123893) and [#123878](https://github.com/NousResearch/hermes-agent/pull/123878) concern restart identity and drain waiting; neither isolates a macOS cron worker. Roll back by reverting this patch's launchd dispatch branch and associated docs/tests, without removing the upstream Linux handoff or execution ledger.

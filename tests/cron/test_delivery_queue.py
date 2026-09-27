@@ -53,6 +53,23 @@ def test_terminal_delivery_retention_is_bounded(tmp_path, monkeypatch):
     send.assert_not_called()
 
 
+def test_pruning_preserves_projected_tombstone(tmp_path, monkeypatch):
+    import cron.delivery_queue as queue
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    monkeypatch.setattr(queue, "MAX_TERMINAL_DELIVERIES", 0, raising=False)
+    queue.enqueue("exec-projected", {"id": "job"}, "brief")
+    assert queue.claim_next()["execution_id"] == "exec-projected"
+    assert queue._finish("exec-projected", error=None)
+
+    with sqlite3.connect(queue.queue_path()) as conn:
+        projected = conn.execute(
+            "SELECT projected FROM delivery_tombstones WHERE execution_id=?",
+            ("exec-projected",),
+        ).fetchone()
+    assert projected == (1,)
+
+
 def test_failure_delivery_lane_survives_durable_handoff(tmp_path, monkeypatch):
     import cron.delivery_queue as queue
 
