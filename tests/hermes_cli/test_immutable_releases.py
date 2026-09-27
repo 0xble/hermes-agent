@@ -220,6 +220,48 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
         worker.wait(timeout=5)
 
 
+def test_successful_receipt_history_does_not_pin_every_old_release(tmp_path):
+    home = tmp_path / "profile"
+    old = home / "releases" / "old"
+    old.mkdir(parents=True)
+    receipts = home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    payload = {"outcome": "success", "release_transition": {"from_path": str(old)}}
+    (receipts / "historical.json").write_text(json.dumps(payload))
+    assert old not in releases._receipt_pins(home)
+    payload["outcome"] = "partial"
+    (receipts / "unfinished.json").write_text(json.dumps(payload))
+    assert old in releases._receipt_pins(home)
+
+
+def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypatch):
+    from hermes_cli import immutable_releases, update_cmd, update_cmd_fleet, update_receipt
+    from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
+    home = tmp_path / "profile"
+    release = home / "releases" / "current"
+    _fake_release(release, "current")
+    releases.promote(home, release)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr(update_cmd_fleet, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
+    monkeypatch.setattr(update_cmd_fleet, "_collect_fleet_snapshot", lambda *a, **kw: [])
+    monkeypatch.setattr(update_cmd_fleet, "_clear_fleet_restart_pending_marker", lambda: None)
+    monkeypatch.setattr(update_cmd_fleet, "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
+    monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
+    monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *a: [])
+    monkeypatch.setattr(immutable_releases, "retain", lambda *a: (_ for _ in ()).throw(OSError("prune blocked")))
+    restart = _GatewayRestartOutcome(incomplete=False, phase_errors=[], pre_restart_gateway_pids=[],
+        restarted_services=[], failed_or_stale_units=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set())
+    update_receipt.begin_update_receipt()
+    update_cmd_fleet._verify_fleet_after_update(restart, _pre_update_plan=None,
+        _windows_gateway_resume=None, node_failures=[], update_complete=True, rollback=True)
+    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
+    assert receipt["outcome"] == "success"
+    assert any(s["name"] == "release_retention" and not s["ok"] and
+               "prune blocked" in s["detail"] for s in receipt["steps"])
+
+
 @pytest.mark.parametrize("kind", ["standalone", "backend", "platform", "exclusive", "model-provider"])
 def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch, kind):
     """Exercise checkout -> candidate venv -> plugin probe -> updater receipt, not a mocked smoke."""

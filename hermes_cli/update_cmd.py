@@ -1645,14 +1645,45 @@ def _cmd_update_impl(args, gateway_mode: bool):
         from hermes_cli import gateway_launchd
         begin_update_receipt()
         home = get_hermes_home()
-        before = read_pointer(ReleasePaths.for_home(home).current)
+        paths = ReleasePaths.for_home(home)
+        before = read_pointer(paths.current)
+        before_previous = read_pointer(paths.previous)
         if before is None:
             raise RuntimeError("cannot roll back without a current release")
-        result = rollback(home)
-        current_target = result["current"]
-        if current_target is None:
-            raise RuntimeError("rollback produced no current target")
-        source_layout = Path(current_target).parent != ReleasePaths.for_home(home).releases.resolve()
+        # A first-migration reversal needs a new launchd definition BEFORE the
+        # fleet restart. Save both sides so a failed reload cannot strand a
+        # source pointer under the release's service definition.
+        from hermes_cli import gateway
+        plist_path = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
+        plist_before = plist_path.read_bytes() if plist_path is not None and plist_path.exists() else None
+        try:
+            result = rollback(home)
+            current_target = result["current"]
+            if current_target is None:
+                raise RuntimeError("rollback produced no current target")
+            source_layout = Path(current_target).parent != paths.releases.resolve()
+            if source_layout and plist_before is not None:
+                original = migration_plist(home)
+                if original is not None:
+                    if original[0] != plist_path:
+                        raise RuntimeError("saved source plist belongs to a different launchd path")
+                    if (plist_path.read_bytes() != original[1]
+                            and not gateway_launchd.restore_launchd_plist(original[1])):
+                        raise RuntimeError("source plist reload failed during rollback")
+                    if plist_path.read_bytes() != original[1]:
+                        raise RuntimeError("source plist bytes differ after rollback reload")
+                    _record_update_step("source_plist_restore", True, str(plist_path))
+        except Exception:
+            from hermes_cli.immutable_releases import _atomic_symlink
+            _atomic_symlink(paths.current, before)
+            if before_previous is None:
+                paths.previous.unlink(missing_ok=True)
+            else:
+                _atomic_symlink(paths.previous, before_previous)
+            if plist_before is not None and plist_path.read_bytes() != plist_before:
+                if not gateway_launchd.restore_launchd_plist(plist_before):
+                    raise RuntimeError("rollback failed and original launchd definition could not be restored")
+            raise
         from hermes_cli.update_receipt import record_release_transition
         record_release_transition(
             from_sha=before.name, to_sha=str(result.get("source_sha") or Path(current_target).name),
@@ -1664,18 +1695,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             f"to_sha={result.get('source_sha') or Path(current_target).name}")
         print(f"✓ Rolled back current release to {result['current']}")
         restart = _restart_gateway_fleet_after_update(None, gateway_mode)
-        if source_layout and sys.platform == "darwin":
-            original = migration_plist(home)
-            if original is not None:
-                from hermes_cli import gateway
-                if original[0] != gateway.get_launchd_plist_path():
-                    raise RuntimeError("saved source plist belongs to a different launchd path")
-                if (original[0].read_bytes() != original[1]
-                        and not gateway_launchd.restore_launchd_plist(original[1])):
-                    restart.incomplete = True
-                if original[0].read_bytes() != original[1]:
-                    restart.incomplete = True
-                _record_update_step("source_plist_restore", not restart.incomplete, str(original[0]))
         if gateway_mode:
             _write_gateway_update_exit_code(not restart.incomplete)
         _verify_fleet_after_update(
