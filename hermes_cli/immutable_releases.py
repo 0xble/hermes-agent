@@ -399,6 +399,42 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     return removed
 
 
+def _source_python_valid(python: Path, source: Path) -> bool:
+    """Only use interpreters which can import this checkout, not the active release."""
+    if not python.is_file():
+        return False
+    probe = ("import pathlib,sys; sys.path.insert(0,sys.argv[1]); "
+             "import hermes_cli; "
+             "assert pathlib.Path(hermes_cli.__file__).resolve().parent == "
+             "pathlib.Path(sys.argv[1]).resolve() / 'hermes_cli'")
+    try:
+        return subprocess.run([str(python), "-c", probe, str(source)],
+                              capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def source_checkout_python(home: Path, source: Path) -> Path:
+    """Resolve the migration-bound source interpreter for CLI and gateway re-entry."""
+    journal = ReleasePaths.for_home(home).home / "release-layout.json"
+    try:
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        if Path(record["source"]).resolve() != source.resolve():
+            raise RuntimeError(f"migration journal points to another checkout: {journal}")
+        recorded = record.get("source_python")
+    except (OSError, ValueError, KeyError) as exc:
+        raise RuntimeError(f"cannot read source migration record {journal}: {exc}") from exc
+    suffix = Path("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    candidates = ([Path(recorded)] if recorded else []) + [source / "venv" / suffix, source / ".venv" / suffix]
+    for python in candidates:
+        if _source_python_valid(python, source):
+            return python
+    raise RuntimeError(
+        f"No usable source checkout interpreter for {source}. Checked {', '.join(map(str, candidates))}. "
+        "Restore the recorded Python environment or create source/venv (or source/.venv) "
+        "with hermes_cli installed, then retry the update.")
+
+
 def begin_migration(home: Path, source: Path, plist_path: Path | None = None) -> bool:
     """Save the original checkout service definition before the first release flip.
 
@@ -410,12 +446,18 @@ def begin_migration(home: Path, source: Path, plist_path: Path | None = None) ->
         return False
     source = source.resolve(strict=True)
     journal = paths.home / "release-layout.json"
+    if not _source_python_valid(Path(sys.executable), source):
+        raise RuntimeError(f"migration requires an interpreter importing hermes_cli from {source}: {sys.executable}")
     if journal.exists():
         data = json.loads(journal.read_text(encoding="utf-8"))
         if Path(data["source"]).resolve() != source:
             raise RuntimeError("release migration journal refers to a different checkout")
+        # An interrupted migration may have written an older journal without the
+        # interpreter; preserve its original plist while completing that record.
+        data.setdefault("source_python", sys.executable)
     else:
-        data = {"source": str(source), "source_sha": release_sha(source), "plist": None}
+        data = {"source": str(source), "source_python": sys.executable,
+                "source_sha": release_sha(source), "plist": None}
         if plist_path is not None and plist_path.exists():
             import base64
             import plistlib
@@ -426,13 +468,13 @@ def begin_migration(home: Path, source: Path, plist_path: Path | None = None) ->
             if definition["Label"] != plist_path.stem:
                 raise RuntimeError("installed plist label does not match its path")
             data["plist"] = {"path": str(plist_path), "body": base64.b64encode(raw).decode("ascii")}
-        journal.parent.mkdir(parents=True, exist_ok=True)
-        tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
-        try:
-            tmp.write_text(json.dumps(data), encoding="utf-8")
-            os.replace(tmp, journal)
-        finally:
-            tmp.unlink(missing_ok=True)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, journal)
+    finally:
+        tmp.unlink(missing_ok=True)
     _atomic_symlink(paths.previous, source)
     return True
 

@@ -1332,6 +1332,32 @@ def _finalize_receipt(status: str, debug_message: str) -> None:
         finalize_update_receipt(status)
 
 
+def _catch_up_immutable_release(*, defer: bool) -> None:
+    """Complete a previously pulled release before any fleet catch-up restart."""
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha
+    paths = ReleasePaths.for_home(get_hermes_home())
+    current = read_pointer(paths.current)
+    # An ordinary checkout at HEAD must not opt itself into migration here.
+    if current is None or current.parent != paths.releases.resolve():
+        return
+    sha = release_sha(_m().PROJECT_ROOT)
+    if current.name == sha:
+        return
+    if defer:
+        print(f"  Release {sha} still awaits activation; --no-gateway-restart keeps {current.name} active.")
+        return
+    # An interrupted/failed stage may have no candidate, and the source web
+    # bundle may be stale. Rebuild prerequisites before reusing or staging it.
+    node_failures = _update_node_dependencies()
+    web_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    if node_failures or not web_ok or not _activate_immutable_release():
+        _record_update_step("immutable_release_catchup", False,
+                            f"candidate={sha}, node_failures={node_failures}, web_build_ok={web_ok}")
+        _finalize_receipt("partial", "Release catch-up failed: %s")
+        raise SystemExit(1)
+    _record_update_step("immutable_release_catchup", True, f"activated {sha} before fleet restart")
+
+
 def _finish_already_up_to_date(
     git_cmd, branch: str, current_branch: str, _plan, *, assume_yes: bool, gateway_mode: bool,
     gw_input_fn, pre_update_snapshot_id, had_desktop_app_before_update: bool,
@@ -1384,6 +1410,9 @@ def _finish_already_up_to_date(
     # demotes the outcome to partial, but must not strand the fleet on stale code (#91277 fleet contract —
     # the pending-restart check always executes). Under --no-gateway-restart the
     # catch-up is deferred instead (executing it would kill the cron's own gateway).
+    # A deferred/failed release promotion is a separate obligation from the
+    # pending fleet restart; never restart A when source HEAD already names B.
+    _catch_up_immutable_release(defer=no_gateway_restart)
     _apply_pending_fleet_restart_catchup(defer=no_gateway_restart)
     if not current_checkout_complete:
         if gateway_mode:
@@ -1583,6 +1612,19 @@ def _finish_pulled_update(
         _windows_gateway_resume=_windows_gateway_resume)
     node_failures = _update_node_dependencies()
     web_build_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    # In a release layout these builds are prerequisites, not advisory UI work:
+    # restarting while current=A when HEAD=B would falsely report success on A.
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha
+    release_paths = ReleasePaths.for_home(get_hermes_home())
+    current_release = read_pointer(release_paths.current)
+    release_layout = current_release is not None and current_release.parent == release_paths.releases.resolve()
+    if release_layout and (not web_build_ok or node_failures):
+        _record_update_step("immutable_release", False,
+                            f"prerequisite build failed: web={web_build_ok}, node={node_failures}")
+        if gateway_mode:
+            _write_gateway_update_exit_code(False)
+        _finalize_receipt("partial", "Immutable release prerequisite build failed: %s")
+        sys.exit(1)
     # Freeze generated assets only after the build. A failed build cannot mark a
     # potentially stale candidate ready for promotion.
     if web_build_ok and not node_failures and not _activate_immutable_release(defer=opts.no_gateway_restart):
@@ -1635,7 +1677,9 @@ def _finish_pulled_update(
     _resume_windows_gateways_and_merge_outcome(_restart, _windows_gateway_resume, gateway_mode)
     _verify_fleet_after_update(
         _restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
-        node_failures=node_failures, update_complete=update_complete)
+        node_failures=node_failures, update_complete=update_complete,
+        expected_sha=release_paths.release(release_sha(_m().PROJECT_ROOT)).name if release_layout else None,
+        expected_root=release_paths.release(release_sha(_m().PROJECT_ROOT)) if release_layout else None)
 
 
 def _cmd_update_impl(args, gateway_mode: bool):

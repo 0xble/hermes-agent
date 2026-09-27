@@ -479,7 +479,8 @@ def collect_fleet_versions(
             release = resolved_release(get_hermes_home())
             if release is not None:
                 expected_root = release
-                expected_sha = release.name
+                if expected_sha_override is None:
+                    expected_sha = release.name
     try:
         from gateway.status import (
             live_gateway_pid_for_home,

@@ -189,6 +189,8 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
     target = f"{domain}/{label}"
     source = tmp_path / "source"
     source.mkdir()
+    (source / "hermes_cli").mkdir()
+    (source / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (source / "probe.py").write_text(
         "import json, os, pathlib, sys, time\n"
         "pathlib.Path(os.environ['S2_PROBE_OUTPUT']).write_text(json.dumps("

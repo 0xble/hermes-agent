@@ -3002,7 +3002,7 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
 
 def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
     """Use the migration-bound source interpreter when running from a release."""
-    from hermes_cli.immutable_releases import update_source_checkout
+    from hermes_cli.immutable_releases import source_checkout_python, update_source_checkout
     root = Path(__file__).parent.parent.resolve()
     if (root / ".git").exists():
         return _resolve_hermes_bin()
@@ -3010,9 +3010,7 @@ def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
     source = update_source_checkout(home or get_hermes_home(), root)
     if source is None:
         return None
-    python = source / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if not python.is_file():
-        return None
+    python = source_checkout_python(home or get_hermes_home(), source)
     # -c inserts the trusted checkout ahead of the running release even when
     # the detached process inherits its cwd or PYTHONPATH from the gateway.
     script = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('hermes_cli.main',run_name='__main__')"

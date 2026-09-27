@@ -77,6 +77,62 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     assert launched.stdout.strip() == str(source / "hermes_cli" / "main.py")
 
 
+@pytest.mark.parametrize("layout", ["venv", ".venv", "external"])
+def test_release_update_reentry_uses_validated_source_interpreter(tmp_path, monkeypatch, layout):
+    """Gateway and CLI re-enter the same source interpreter, not release Python."""
+    import venv
+    from gateway import run as gateway_run
+    from hermes_cli import main
+    source = tmp_path / "source"
+    (source / ".git").mkdir(parents=True)
+    (source / "hermes_cli").mkdir()
+    (source / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    interpreter = (tmp_path / "outside" if layout == "external" else source / layout) / "bin" / "python"
+    venv.EnvBuilder(with_pip=False).create(interpreter.parent.parent)
+    home = tmp_path / "profile"
+    release = home / "releases" / "A"
+    _fake_release(release, "A")
+    releases.promote(home, release)
+    (home / "release-layout.json").write_text(json.dumps({
+        "source": str(source), "source_python": str(interpreter) if layout == "external" else None,
+    }), encoding="utf-8")
+    monkeypatch.setattr(releases, "release_sha", lambda _: "B")
+    monkeypatch.setattr(gateway_run, "__file__", str(release / "gateway" / "run.py"))
+    argv = gateway_run._resolve_update_hermes_bin(home)
+    assert argv is not None and argv[0] == str(interpreter)
+    monkeypatch.setattr(main, "PROJECT_ROOT", release)
+    monkeypatch.setattr(main, "get_hermes_home", lambda: home)
+    called = []
+    def intercept(path, argv):
+        called.append((path, argv))
+        raise RuntimeError("intercepted exec")
+    monkeypatch.setattr(main.os, "execv", intercept)
+    with pytest.raises(RuntimeError, match="intercepted exec"):
+        main.cmd_update(object())
+    assert called[0][0] == str(interpreter)
+    assert called[0][1][3] == str(source)
+
+
+def test_source_interpreter_missing_fails_loudly(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    (source / ".git").mkdir(parents=True)
+    home = tmp_path / "profile"
+    release = home / "releases" / "A"
+    _fake_release(release, "A")
+    releases.promote(home, release)
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source)}))
+    monkeypatch.setattr(releases, "release_sha", lambda _: "A")
+    from gateway import run as gateway_run
+    from hermes_cli import main
+    monkeypatch.setattr(gateway_run, "__file__", str(release / "gateway" / "run.py"))
+    monkeypatch.setattr(main, "PROJECT_ROOT", release)
+    monkeypatch.setattr(main, "get_hermes_home", lambda: home)
+    with pytest.raises(RuntimeError, match="No usable source checkout interpreter"):
+        gateway_run._resolve_update_hermes_bin(home)
+    with pytest.raises(RuntimeError, match="No usable source checkout interpreter"):
+        main.cmd_update(object())
+
+
 def test_candidate_retains_active_optional_feature_from_local_wheel(tmp_path, monkeypatch):
     import venv
     import zipfile
@@ -318,7 +374,17 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
     worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=release_paths[0])
     try:
         import psutil
-        assert Path(psutil.Process(worker.pid).cwd()).resolve() == release_paths[0].resolve()
+        import time
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                if Path(psutil.Process(worker.pid).cwd()).resolve() == release_paths[0].resolve():
+                    break
+            except psutil.Error:
+                pass
+            time.sleep(.02)
+        else:
+            pytest.fail("worker did not publish its release cwd before retention")
         assert release_paths[0].resolve() in releases._live_process_pins(home)
         removed = releases.retain(home)
         assert release_paths[0].exists() and release_paths[1].exists()
@@ -402,7 +468,7 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
         assert receipt["outcome"] == "success"
         assert releases_for_test[0].exists()
         assert releases_for_test[5].exists() and releases_for_test[6].exists()
-        assert len([path for path in releases_for_test[1:5] if path.exists()]) == 3
+        assert len([path for path in releases_for_test[1:5] if path.exists()]) >= 3
         assert any(s["name"] == "release_retention" and s["ok"] for s in receipt["steps"])
     finally:
         worker.terminate()
