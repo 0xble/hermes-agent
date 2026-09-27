@@ -27,6 +27,14 @@ from cron import scheduler, executions, delivery_queue
 from cron.scheduler_detached_worker import arm_hard_wall_timeout
 from hermes_constants import set_hermes_home_override
 home, job_file, mode, wall, marker = sys.argv[1:]
+from agent.monitoring import emitter
+class RecordingEmitter:
+    def emit(self, event):
+        with Path(marker + '.events').open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps({'status': event.status, 'delivery_outcome': event.delivery_outcome}) + '\n')
+    def flush(self, **kwargs):
+        pass
+emitter.get_emitter = lambda: RecordingEmitter()
 set_hermes_home_override(Path(home))
 job = json.loads(Path(job_file).read_text())
 assert executions.adopt_claimed_execution(job['execution_id'])
@@ -34,10 +42,17 @@ fence = arm_hard_wall_timeout(job['execution_id'], home, float(wall))
 os.environ['_HERMES_CRON_EXTERNAL_WORKER'] = job['execution_id']
 # Capture only the network transport: retain the real queue SQLite write.
 def queue_delivery(job, content, **kwargs):
+    if job.get('deliver') == 'origin':
+        return None  # unresolved origin: no queue receipt
     delivery_queue.enqueue(job['execution_id'], job, content,
                            for_failure=kwargs.get('for_failure', False))
+    job['last_delivery_queued'] = True
     return None
 scheduler._deliver_result = queue_delivery
+if mode == 'crash':
+    def crash(*args, **kwargs):
+        raise RuntimeError('script crashed before completion')
+    scheduler.run_job = crash
 original_mark = scheduler.mark_job_run
 def traced_mark(*args, **kwargs):
     Path(marker).write_text('mark entered')
@@ -70,7 +85,7 @@ sys.exit(0 if result else 2)
 '''
 
 
-def _run(tmp_path, mode, *, wall=3.0):
+def _run(tmp_path, mode, *, wall=3.0, deliver="telegram:123"):
     home = tmp_path / "profile"
     home.mkdir()
     script = home / "scripts" / "job.py"
@@ -78,12 +93,14 @@ def _run(tmp_path, mode, *, wall=3.0):
     marker = tmp_path / "worker.state"
     if mode == "timeout":
         script.write_text("import time\ntime.sleep(30)\nprint('late success')\n")
+    elif mode == "suppressed":
+        script.write_text("print('[SILENT]')\n")
     else:
         script.write_text("print('script success')\n")
     token = set_hermes_home_override(home)
     try:
         job = jobs.create_job("script run", "every 1h", script=str(script), no_agent=True,
-                              deliver="telegram:123")
+                              deliver=deliver)
         run = executions.create_execution(job["id"], source="builtin")
         assert executions.mark_execution_handoff_pending(run["id"])
     finally:
@@ -187,3 +204,80 @@ def test_timeout_result_is_immutable_across_later_recovery(tmp_path):
     finally:
         reset_hermes_home_override(token)
     assert queued is None and recovered == 0
+
+
+@pytest.mark.macos_only
+def test_detached_classifies_queued_result_then_queue_projects_delivery(tmp_path):
+    code, row, queued, _, _, _, out, err, marker = _run(tmp_path, "normal")
+    assert code == 0, (out, err)
+    assert row["delivery_outcome"] == "queued"
+    assert (row["delivery_status"], row["delivery_status_provisional"]) == ("pending", 0)
+    assert queued == {"status": "pending"}
+    events = [json.loads(line) for line in Path(str(marker) + ".events").read_text().splitlines()]
+    assert any(e == {"status": "completed", "delivery_outcome": "queued"} for e in events)
+    token = set_hermes_home_override(tmp_path / "profile")
+    try:
+        assert executions.record_delivery_outcome(row["id"], "suppressed", resolve_provisional_status="suppressed") is None
+        assert executions.get_execution(row["id"])["delivery_outcome"] == "queued"
+        from cron import delivery_queue
+        assert delivery_queue.drain(lambda *_: None) == 1
+        assert executions.get_execution(row["id"])["delivery_status"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("mode, deliver, outcome", [
+    ("suppressed", "telegram:123", "suppressed"),
+    ("normal", "origin", "not_configured"),
+])
+def test_detached_non_enqueue_resolves_provisional_status(tmp_path, mode, deliver, outcome):
+    code, row, queued, _, _, _, out, err, marker = _run(tmp_path, mode, deliver=deliver)
+    assert code == 0, (out, err)
+    assert queued is None
+    assert row["delivery_outcome"] == outcome
+    assert (row["delivery_status"], row["delivery_status_provisional"]) == ("suppressed", 0)
+    events = [json.loads(line) for line in Path(str(marker) + ".events").read_text().splitlines()]
+    assert any(e == {"status": "completed", "delivery_outcome": outcome} for e in events)
+
+
+def test_in_gateway_completion_keeps_single_finish_write(tmp_path, monkeypatch):
+    from cron import scheduler
+    home = tmp_path / "gateway-profile"
+    home.mkdir()
+    script = home / "scripts" / "job.py"
+    script.parent.mkdir()
+    script.write_text("print('script success')\n", encoding="utf-8")
+    token = set_hermes_home_override(home)
+    try:
+        job = jobs.create_job("gateway run", "every 1h", script=str(script), no_agent=True,
+                              deliver="telegram:123")
+        monkeypatch.setattr(scheduler, "_deliver_result", lambda *args, **kwargs: None)
+        finish_calls = []
+        original_finish = scheduler.finish_execution
+        def tracked_finish(*args, **kwargs):
+            finish_calls.append(kwargs)
+            return original_finish(*args, **kwargs)
+        monkeypatch.setattr(scheduler, "finish_execution", tracked_finish)
+        def not_detached(*args, **kwargs):
+            pytest.fail("in-gateway completion must use finish_execution only")
+        monkeypatch.setattr(scheduler, "record_delivery_outcome", not_detached)
+        assert scheduler.run_one_job(job) is True
+        row = executions.latest_execution(job["id"])
+        assert row is not None
+        assert row["status"] == "completed" and row["delivery_outcome"] == "delivered", row["error"]
+        assert row["delivery_status_provisional"] == 0
+        assert len(finish_calls) == 1 and finish_calls[0]["delivery_outcome"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.macos_only
+def test_detached_crash_failure_classifies_after_early_result(tmp_path):
+    code, row, queued, _, _, _, out, err, marker = _run(tmp_path, "crash")
+    assert code == 2, (out, err)
+    assert row["status"] == "failed" and "script crashed" in row["error"]
+    assert row["delivery_outcome"] == "queued"
+    assert queued == {"status": "pending"}
+    events = [json.loads(line) for line in Path(str(marker) + ".events").read_text().splitlines()]
+    assert any(e == {"status": "failed", "delivery_outcome": "queued"} for e in events)

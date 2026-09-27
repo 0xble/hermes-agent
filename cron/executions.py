@@ -473,9 +473,7 @@ def list_executions(
 # unknown(provisional=0) can only advance to a known terminal receipt;
 # delivered/failed/suppressed are final. The predicate observes current SQLite
 # state atomically with the write, not an earlier queue read.
-_DELIVERY_STATUS_UPDATE = """UPDATE executions
-   SET delivery_status=?, delivery_status_provisional=0
-   WHERE id=? AND CASE ?
+_DELIVERY_STATUS_TRANSITION = """CASE ?
      WHEN 'pending' THEN delivery_status IS NULL OR delivery_status='pending'
           OR (delivery_status='unknown' AND delivery_status_provisional=1)
      WHEN 'delivering' THEN delivery_status IS NULL
@@ -491,6 +489,9 @@ _DELIVERY_STATUS_UPDATE = """UPDATE executions
      WHEN 'suppressed' THEN delivery_status IS NULL
           OR delivery_status IN ('pending','delivering','unknown')
      ELSE 0 END"""
+_DELIVERY_STATUS_UPDATE = """UPDATE executions
+   SET delivery_status=?, delivery_status_provisional=0
+   WHERE id=? AND """ + _DELIVERY_STATUS_TRANSITION
 _DELIVERY_STATUSES = frozenset(("pending", "delivering", "unknown", "delivered", "failed", "suppressed"))
 
 
@@ -502,6 +503,48 @@ def _project_delivery_statuses(conn: sqlite3.Connection, rows: Iterable[tuple[st
             raise ValueError("invalid cron delivery status")
         parameters.append((status, execution_id, status))
     conn.executemany(_DELIVERY_STATUS_UPDATE, parameters)
+
+
+def record_delivery_outcome(
+    execution_id: str, outcome: str, *, resolve_provisional_status: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Classify an already committed detached result once, without reopening its result fence.
+
+    The same process/PID that committed the result owns this write; a replacement
+    gateway or watchdog cannot classify someone else's execution. A queue receipt
+    may have projected in the meantime, so only provisional unknown is resolved.
+    """
+    if not outcome:
+        raise ValueError("cron delivery outcome must be nonempty")
+    if resolve_provisional_status is not None and resolve_provisional_status not in (
+        "delivered", "failed", "suppressed"
+    ):
+        raise ValueError("provisional delivery resolution must be terminal")
+    eligible = (
+        "delivery_status='unknown' AND delivery_status_provisional=1 AND ("
+        + _DELIVERY_STATUS_TRANSITION + ")"
+    )
+    with _transaction() as conn:
+        # The outcome and optional status resolution are one conditional SQLite
+        # write. Reuse the receipt transition predicate, never overwrite a queue
+        # projection, and do not emit twice on an idempotent retry.
+        cur = conn.execute(
+            "UPDATE executions SET delivery_outcome=?, "
+            "delivery_status=CASE WHEN ? IS NOT NULL AND " + eligible +
+            " THEN ? ELSE delivery_status END, "
+            "delivery_status_provisional=CASE WHEN ? IS NOT NULL AND " + eligible +
+            " THEN 0 ELSE delivery_status_provisional END "
+            "WHERE id=? AND owner_kind='detached' AND status IN ('completed','failed') "
+            "AND process_id=? AND pid=? AND delivery_outcome IS NULL",
+            (outcome, resolve_provisional_status, resolve_provisional_status,
+             resolve_provisional_status, resolve_provisional_status,
+             resolve_provisional_status, execution_id, _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record, delivery_outcome=outcome)
+    return record
 
 
 def record_delivery_status(execution_id: str, status: str) -> None:

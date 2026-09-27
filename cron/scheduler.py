@@ -546,7 +546,7 @@ from cron.jobs import (
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions)
+    record_delivery_outcome, recover_interrupted_executions)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -3053,7 +3053,21 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         error="Interrupted by gateway shutdown before terminal completion.")
 
 
-def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
+def _record_committed_delivery_outcome(execution_id: str, outcome: str) -> None:
+    # No queue receipt will resolve these outcomes. 'not_configured' means no
+    # target existed, so its delivery status is suppressed, not transport-failed.
+    terminal_status = {
+        "delivered": "delivered", "failed": "failed",
+        "suppressed": "suppressed", "suppressed_acked": "suppressed",
+        "not_configured": "suppressed",
+    }.get(outcome)
+    record_delivery_outcome(
+        execution_id, outcome, resolve_provisional_status=terminal_status)
+
+
+def _finish_completed_run(
+    d: _RunDelivery, fire_owner: Optional[str], execution_id: str, *, result_committed: bool = False,
+) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
     if not d.should_deliver and job.get("last_delivery_queued"):
@@ -3098,8 +3112,11 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
-    finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    if result_committed:
+        _record_committed_delivery_outcome(execution_id, delivery_outcome)
+    else:
+        finish_execution(
+            execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
     return True
 
 
@@ -3322,7 +3339,7 @@ def _run_one_job_body(
             _finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
-        return _finish_completed_run(d, fire_owner, execution_id)
+        return _finish_completed_run(d, fire_owner, execution_id, result_committed=committed)
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
@@ -3376,8 +3393,11 @@ def _run_one_job_body(
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
         try:
-            finish_execution(
-                execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
+            if committed:
+                _record_committed_delivery_outcome(execution_id, delivery_outcome)
+            else:
+                finish_execution(
+                    execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
         except Exception as record_err:
             logger.error("Failed to finish execution record for job %s: %s", job["id"], record_err)
         if not isinstance(e, Exception):

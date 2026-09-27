@@ -47,7 +47,19 @@ terminal receipt; another unknown cannot rewrite it. `finish_execution` alone
 may mark NULL → unknown(provisional) on detached terminal finish, and never
 rewrites an existing delivery state. Execution recovery updates run status only,
 not delivery status. The 48-pair SQLite matrix and the idempotent-enqueue versus
-wait-timeout interleaving exercise this contract.
+wait-timeout interleaving exercise this contract. The worker commits its immutable
+result before delivery classification, then conditionally writes `delivery_outcome`
+exactly once while still owner-fenced by process ID and PID. That second SQL
+UPDATE uses the receipt transition predicate in the same write to resolve only
+`unknown(provisional)` when no queue receipt will arrive. A missing target
+(`not_configured`) and intentionally withheld notices (`suppressed` or
+`suppressed_acked`) resolve to terminal `suppressed`; a direct send or transport
+failure resolves to `delivered` or `failed`. Queued notices retain the queue's
+`pending`/terminal receipt transition. The post-terminal update emits the final
+outcome to monitoring; the earlier result-fence event can carry a NULL outcome.
+A watchdog kill between the result commit and classification deliberately leaves
+`delivery_outcome=NULL` and provisional `unknown`, with no inferred retry or send.
+In-gateway runs still classify in their single terminal `finish_execution` write.
 
 The executions schema migration is additive and idempotent. Existing releases use
 named INSERT/UPDATE columns and `SELECT *` into named rows, so the new column is
