@@ -1951,6 +1951,22 @@ class TestSchemaInit:
         assert db.get_meta("telegram_dm_topic_schema_version") == "3"
         db.close()
 
+    def test_telegram_topic_claim_if_unbound_keeps_the_existing_owner(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        for sid in ("owner", "claimant"):
+            db.create_session(session_id=sid, source="telegram", user_id="1")
+        db.bind_telegram_topic(chat_id="1", thread_id="7", user_id="1", session_key="k-owner", session_id="owner")
+
+        db.bind_telegram_topic(chat_id="1", thread_id="7", user_id="1", session_key="k-claim",
+                               session_id="claimant", only_if_unbound=True)
+        binding = db.get_telegram_topic_binding(chat_id="1", thread_id="7")
+        assert (binding["session_id"], binding["session_key"]) == ("owner", "k-owner")
+
+        db.bind_telegram_topic(chat_id="1", thread_id="8", user_id="1", session_key="k-claim",
+                               session_id="claimant", only_if_unbound=True)
+        assert db.get_telegram_topic_binding(chat_id="1", thread_id="8")["session_id"] == "claimant"
+        db.close()
+
 
 
 

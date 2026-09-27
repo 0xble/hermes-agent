@@ -365,15 +365,26 @@ class SessionTelegramTopicsMixin:
     def bind_telegram_topic(
         self, *, chat_id: str, thread_id: str, user_id: str, session_key: str,
         session_id: str, managed_mode: str = "auto", profile_name: str = "default",
+        only_if_unbound: bool = False,
     ) -> None:
         """Bind one Telegram DM topic thread to one Hermes session. A session may be linked to
         only one topic: rebinding the same pair is idempotent; linking the session to a
-        different topic raises ValueError."""
+        different topic raises ValueError.
+
+        ``only_if_unbound`` never replaces a topic's existing owner: the insert and the conflict
+        check share one write transaction, so a claim racing another binder cannot overwrite it.
+        Callers read the binding back to learn who won."""
         self.apply_telegram_topic_migration()
         now = time.time()
         chat_id, thread_id, user_id = str(chat_id), str(thread_id), str(user_id)
         session_key, session_id = str(session_key), str(session_id)
         profile_name = _normalize_telegram_topic_profile_name(profile_name)
+        on_conflict = "DO NOTHING" if only_if_unbound else """DO UPDATE SET
+                    user_id = excluded.user_id,
+                    session_key = excluded.session_key,
+                    session_id = excluded.session_id,
+                    managed_mode = excluded.managed_mode,
+                    updated_at = excluded.updated_at"""
 
         def _do(conn):
             existing_session = conn.execute("""
@@ -385,17 +396,12 @@ class SessionTelegramTopicsMixin:
                 linked_profile, linked_chat, linked_thread = existing_session
                 if (str(linked_profile), str(linked_chat), str(linked_thread)) != (profile_name, chat_id, thread_id):
                     raise ValueError("session is already linked to another Telegram topic")
-            conn.execute("""
+            conn.execute(f"""
                 INSERT INTO telegram_dm_topic_bindings (
                     profile_name, chat_id, thread_id, user_id, session_key, session_id,
                     managed_mode, linked_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
-                    user_id = excluded.user_id,
-                    session_key = excluded.session_key,
-                    session_id = excluded.session_id,
-                    managed_mode = excluded.managed_mode,
-                    updated_at = excluded.updated_at
+                ON CONFLICT(profile_name, chat_id, thread_id) {on_conflict}
                 """, (profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, now, now))
         self._execute_write(_do)
 
