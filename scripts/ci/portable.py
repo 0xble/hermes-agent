@@ -85,9 +85,13 @@ def preflight() -> None:
 
 
 def windows_command(name: str, env: Mapping[str, str]) -> str:
-    # CreateProcess does not apply PATHEXT to a bare npm name; Node ships npm.cmd.
-    if os.name == 'nt' and name == 'npm':
-        return shutil.which('npm.cmd', path=env.get('PATH')) or 'npm.cmd'
+    # CreateProcess resolves bare executables against the *parent* PATH, not the
+    # isolated child's PATH. Resolve checkout-owned tools explicitly on Windows.
+    if os.name == 'nt':
+        candidate = 'npm.cmd' if name == 'npm' else name
+        return (shutil.which(candidate, path=env.get('PATH'))
+                or shutil.which(candidate + '.exe', path=env.get('PATH'))
+                or candidate)
     return name
 
 

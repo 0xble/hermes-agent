@@ -363,6 +363,16 @@ try {
             self.assertEqual(check.call_args.args[0], ['C:\\node\\npm.cmd', '--version'])
             self.assertEqual(execute.call_args.args[0], ['C:\\node\\npm.cmd', 'ci'])
 
+    def test_windows_checkout_owned_executable_resolves_against_child_path(self):
+        with patch.object(ci.os, 'name', 'nt'), \
+                patch.object(ci.shutil, 'which', side_effect=[None, 'D:\\checkout\\.ci\\toolchain\\bin\\rg.exe']) as which, \
+                patch.object(ci.subprocess, 'check_output', return_value='ripgrep 15.1.0\n') as check:
+            env = {'PATH': 'D:\\checkout\\.ci\\toolchain\\bin'}
+            ci.require_tools(('rg',), env)
+            self.assertEqual(which.call_args_list[0].args, ('rg',))
+            self.assertEqual(which.call_args_list[1].args, ('rg.exe',))
+            self.assertEqual(check.call_args.args[0][0], 'D:\\checkout\\.ci\\toolchain\\bin\\rg.exe')
+
     def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             toolchain = Path(directory) / 'toolchain'
