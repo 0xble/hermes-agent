@@ -20,8 +20,10 @@ from hermes_cli import update_cmd
 
 
 def _git(root: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
-                          text=True, encoding="utf-8").stdout.strip()
+    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                            text=True, encoding="utf-8")
+    assert result.returncode == 0, f"git {args}: {result.stderr}"
+    return result.stdout.strip()
 
 
 _MULTI = "top = 1\nx = 0\ny = 0\nz = 0\nend = 1\n"
