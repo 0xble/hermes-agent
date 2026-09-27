@@ -45,19 +45,27 @@ def _opted_in(entry: Dict[str, Any]) -> bool:
 
 def custom_route_fast_mode_opted_in(
     provider: Optional[str], base_url: Optional[str], *, anthropic_model: bool) -> bool:
-    """True when the configured custom endpoint behind this route opted into fast params."""
+    """True when the configured custom endpoint behind this route opted into fast params.
+
+    Config is read through the active profile's home (``get_hermes_home``), so a multiplexed
+    request consults its own profile's providers. A named route must also still point at its
+    entry's URL: a fallback or pin that keeps the name but moves the URL is not opted in.
+    """
     from hermes_cli.providers import custom_provider_aliases
     from hermes_cli.route_identity import normalize_route_base_url
 
     requested = str(provider or "").strip().lower()
+    target = normalize_route_base_url(base_url)
     entries = _entries()
     if requested.startswith("custom:"):
         named = [entry for entry in entries
                  if requested in custom_provider_aliases(str(entry.get("name") or ""), str(entry.get("provider_key") or ""))]
-        return bool(named) and all(_opted_in(e) and _carries_model_family(e, anthropic_model) for e in named)
+        return bool(named) and all(
+            _opted_in(e) and _carries_model_family(e, anthropic_model)
+            and (not target or normalize_route_base_url(e.get("base_url")) == target)
+            for e in named)
     if requested not in ("", "custom"):
         return False
-    target = normalize_route_base_url(base_url)
     if not target:
         return False
     same_route = [entry for entry in entries

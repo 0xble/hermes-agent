@@ -1353,6 +1353,15 @@ def _consume_ephemeral_max_output(agent):
     return ephemeral_out
 
 
+def _anthropic_fast_route_opted_in(agent) -> bool:
+    """The agent's own route (named provider identity, not just the shared URL) opted into fast."""
+    from hermes_cli.models import _fast_mode_route_supported
+
+    provider = getattr(agent, "requested_provider", None) or getattr(agent, "provider", None)
+    base_url = getattr(agent, "_anthropic_base_url", None) or getattr(agent, "base_url", None)
+    return _fast_mode_route_supported(getattr(agent, "model", None), provider, base_url)
+
+
 def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides):
     ctx_len = getattr(agent, "context_compressor", None)
     ephemeral_out = _consume_ephemeral_max_output(agent)
@@ -1364,6 +1373,7 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         context_length=ctx_len.context_length if ctx_len else None,
         base_url=getattr(agent, "_anthropic_base_url", None),
         fast_mode=request_overrides.get("speed") == "fast",
+        fast_route_opted_in=request_overrides.get("speed") == "fast" and _anthropic_fast_route_opted_in(agent),
         drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
     # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.

@@ -193,13 +193,6 @@ def _forbids_sampling_params(model: str) -> bool:
     )
 
 
-def _custom_endpoint_opted_into_fast(base_url: str | None) -> bool:
-    """Every Anthropic-transport custom provider at ``base_url`` declares ``capabilities.fast_mode``."""
-    from hermes_cli.models_fast_route import custom_route_fast_mode_opted_in
-
-    return custom_route_fast_mode_opted_in("custom", base_url, anthropic_model=True)
-
-
 def _supports_fast_mode(model: str) -> bool:
     """True for models accepting ``speed: "fast"`` (Opus 4.8 / Opus 5 / Opus 5.5, Claude API only).
     The list lives in ``agent.model_metadata`` so the wire gate and the ``/fast`` toggle agree."""
@@ -613,6 +606,7 @@ def build_anthropic_kwargs(
     reasoning_config: Optional[Dict[str, Any]], tool_choice: Optional[str] = None,
     is_oauth: bool = False, preserve_dots: bool = False, context_length: Optional[int] = None,
     base_url: str | None = None, fast_mode: bool = False, drop_context_1m_beta: bool = False,
+    fast_route_opted_in: bool = False,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create(). ``max_tokens`` is the OUTPUT cap for one
     response; ``context_length`` is the TOTAL window (input + output). ``max_tokens=None`` uses the
@@ -621,7 +615,9 @@ def build_anthropic_kwargs(
     "max_tokens too large given prompt" and retry smaller (parse_available_output_tokens_from_error).
     ``is_oauth`` applies Claude Code compatibility transforms; ``preserve_dots`` keeps model-name
     dots (DashScope: qwen3.5-plus); a third-party ``base_url`` strips thinking signatures;
-    ``fast_mode`` adds ``extra_body.speed="fast"`` plus the fast-mode beta on native Anthropic only."""
+    ``fast_mode`` adds ``extra_body.speed="fast"`` plus the fast-mode beta on native Anthropic, or on
+    a custom route the caller resolved as opted in (``fast_route_opted_in``, from the route's own
+    provider identity via ``models._fast_mode_route_supported``)."""
     system, anthropic_messages = convert_messages_to_anthropic(messages, base_url=base_url, model=model)
     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
     # Nous Portal routes on its own catalog ids (``anthropic/claude-opus-4.8``); normalizing would
@@ -671,7 +667,7 @@ def build_anthropic_kwargs(
     # beta/param and Anthropic scopes it to the Claude API (not Bedrock/Vertex/Foundry). Per-request
     # extra_headers OVERRIDE the client-level anthropic-beta header, so rebuild the full beta list.
     if fast_mode and _supports_fast_mode(model) and (
-            not _is_third_party_anthropic_endpoint(base_url) or _custom_endpoint_opted_into_fast(base_url)):
+            not _is_third_party_anthropic_endpoint(base_url) or fast_route_opted_in):
         kwargs.setdefault("extra_body", {})["speed"] = "fast"
         betas = _common_betas_for_base_url(base_url, drop_context_1m_beta=drop_context_1m_beta)
         kwargs["extra_headers"] = _beta_header(betas + (_OAUTH_ONLY_BETAS if is_oauth else []) + [_FAST_MODE_BETA])

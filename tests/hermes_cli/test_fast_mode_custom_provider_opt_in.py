@@ -34,10 +34,21 @@ def _write_providers(codex_fast: bool | None, claude_fast: bool | None) -> None:
     (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
 
-def _claude_kwargs() -> dict:
+def _claude_agent(provider: str = "custom:claude-proxy", base_url: str = PROXY):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(model=CLAUDE_MODEL, provider="custom", requested_provider=provider,
+                           base_url=base_url, _anthropic_base_url=base_url)
+
+
+def _claude_kwargs(agent=None) -> dict:
+    from agent.chat_completion_helpers import _anthropic_fast_route_opted_in
+
+    agent = agent or _claude_agent()
     return build_anthropic_kwargs(
         model=CLAUDE_MODEL, messages=[{"role": "user", "content": "hi"}], tools=None,
-        max_tokens=64, reasoning_config=None, base_url=PROXY, fast_mode=True)
+        max_tokens=64, reasoning_config=None, base_url=agent._anthropic_base_url, fast_mode=True,
+        fast_route_opted_in=_anthropic_fast_route_opted_in(agent))
 
 
 def test_opted_in_codex_proxy_receives_priority_and_the_warning_stops():
@@ -108,3 +119,53 @@ def test_delegated_child_on_an_opted_in_proxy_inherits_priority(monkeypatch):
         explicit_overrides=None, inherit_parent_route=False)
     assert overrides.get("service_tier") == "priority"
     assert "speed" not in overrides
+
+
+def test_named_route_moved_to_another_url_is_not_opted_in():
+    """A fallback or pin that keeps an opted-in name but routes elsewhere must not bill fast."""
+    _write_providers(codex_fast=True, claude_fast=True)
+    elsewhere = "http://127.0.0.1:9999/v1"
+    assert resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:codex-proxy", base_url=elsewhere) is None
+    assert "speed" not in (_claude_kwargs(_claude_agent(base_url=elsewhere)).get("extra_body") or {})
+
+
+def test_named_anthropic_opt_in_survives_a_non_opted_sibling_on_the_same_url():
+    """The adapter decides from the route's own identity, not only the shared URL."""
+    from hermes_constants import get_hermes_home
+
+    config = {"providers": {
+        "claude-fast": {"base_url": PROXY, "api_mode": "anthropic_messages", "capabilities": {"fast_mode": True}},
+        "claude-std": {"base_url": PROXY, "api_mode": "anthropic_messages"},
+    }}
+    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    assert _claude_kwargs(_claude_agent("custom:claude-fast"))["extra_body"]["speed"] == "fast"
+    assert "speed" not in (_claude_kwargs(_claude_agent("custom:claude-std")).get("extra_body") or {})
+    # Known only by the shared URL, the route is ambiguous and stays closed.
+    assert "speed" not in (_claude_kwargs(_claude_agent("custom")).get("extra_body") or {})
+
+
+def test_opt_in_is_read_from_the_active_profile_home(tmp_path):
+    """Under multiplex the request's profile scope decides, A -> B -> A."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    homes = {}
+    for name, fast in (("a", True), ("b", None)):
+        home = tmp_path / name
+        home.mkdir()
+        token = set_hermes_home_override(home)
+        try:
+            _write_providers(codex_fast=fast, claude_fast=None)
+        finally:
+            reset_hermes_home_override(token)
+        homes[name] = home
+
+    def priority_in(name):
+        token = set_hermes_home_override(homes[name])
+        try:
+            return resolve_fast_mode_overrides(CODEX_MODEL, provider="custom:codex-proxy", base_url=PROXY)
+        finally:
+            reset_hermes_home_override(token)
+
+    assert priority_in("a") == {"service_tier": "priority"}
+    assert priority_in("b") is None
+    assert priority_in("a") == {"service_tier": "priority"}
