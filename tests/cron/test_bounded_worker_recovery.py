@@ -22,11 +22,23 @@ def test_gateway_down_delivery_receipt_survives_restart_and_profile_switch(tmp_p
     token = _home(home_a)
     try:
         run = executions.create_execution("brief", source="builtin")
-        executions.mark_execution_running(run["id"])
-        # The detached worker can persist the delivery without gateway adapters.
-        queued = delivery_queue.enqueue(run["id"], {"id": "brief"}, "finished")
+        executions.mark_execution_handoff_pending(run["id"])
+        # A separate detached worker finishes with no gateway or adapter process.
+        worker = """import sys
+from cron import executions, delivery_queue
+run = sys.argv[1]
+assert executions.adopt_claimed_execution(run) is not None
+assert delivery_queue.enqueue(run, {'id': 'brief'}, 'finished')['status'] == 'pending'
+assert executions.finish_execution(run, success=True, delivery_outcome='queued')['status'] == 'completed'
+"""
+        env = {**os.environ, "HERMES_HOME": str(home_a)}
+        result = subprocess.run([sys.executable, "-c", worker, run["id"]], env=env,
+                                cwd=Path(__file__).resolve().parents[2],
+                                start_new_session=True, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stderr
+        queued = delivery_queue.get_status(run["id"])
         assert queued["status"] == "pending"
-        terminal = executions.finish_execution(run["id"], success=True, delivery_outcome="queued")
+        terminal = executions.get_execution(run["id"])
         assert terminal["delivery_status"] == "pending"
     finally:
         reset_hermes_home_override(token)
