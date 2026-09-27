@@ -1768,8 +1768,9 @@ class GatewayNotificationsMixin:
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
         from gateway.run import _redact_gateway_user_facing_secrets
+        from tools.process_registry_notifications import PROCESS_NOTICE_OPEN, PROCESS_NOTIFICATION_END
         lines = [
-            f"[IMPORTANT: {len(entries)} background processes completed for this session.",
+            f"{PROCESS_NOTICE_OPEN}{len(entries)} background processes completed for this session.",
             "Treat these results as one completion batch and send at most one "
             "consolidated user-facing response.",
         ]
@@ -1793,7 +1794,7 @@ class GatewayNotificationsMixin:
                 "the process tool if they affect the conclusion."
             )
         lines.append("If a result does not change the current conclusion, absorb it silently.]")
-        return "\n".join(lines)
+        return "\n".join((*lines, PROCESS_NOTIFICATION_END))
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
         """Extend a successful primary delivery claim to its batched siblings."""
@@ -1961,8 +1962,9 @@ class GatewayNotificationsMixin:
             blocks.append(synth_text)
         if not siblings:
             return await self._deliver_completion_notification(primary_text, primary_evt)
+        from tools.process_registry_notifications import PROCESS_NOTICE_OPEN
         header = (
-            f"[IMPORTANT: {len(blocks)} background subagent delegations "
+            f"{PROCESS_NOTICE_OPEN}{len(blocks)} background subagent delegations "
             "completed for this session. Treat these results as one "
             "completion batch and send at most one consolidated user-facing "
             "response. If a result does not change the current conclusion, absorb it silently.]"
