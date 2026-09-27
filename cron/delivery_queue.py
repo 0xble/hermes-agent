@@ -168,6 +168,12 @@ def _reflect_execution_delivery(execution_id: str, status: str) -> None:
         executions.record_delivery_status(str(execution_id), status)
 
 
+def _reflect_terminal_deliveries(execution_ids: list[str], status: str) -> None:
+    """Project committed terminal transitions, including rows pruned to tombstones."""
+    for execution_id in execution_ids:
+        _reflect_execution_delivery(execution_id, status)
+
+
 def enqueue(
     execution_id: str,
     job: dict,
@@ -186,28 +192,30 @@ def enqueue(
             (str(execution_id),),
         ).fetchone()
         if tombstone is not None:
-            return {
+            result = {
                 "execution_id": str(execution_id),
                 "status": tombstone["terminal_status"],
                 "finished_at": tombstone["finished_at"],
             }
-        conn.execute(
-            """INSERT OR IGNORE INTO deliveries
-               (execution_id, job_json, content, for_failure, status, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
-            (
-                str(execution_id),
-                json.dumps(job, ensure_ascii=False, sort_keys=True),
-                str(content),
-                int(bool(for_failure)),
-                _hermes_now().isoformat(),
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM deliveries WHERE execution_id=?", (str(execution_id),)
-        ).fetchone()
-    _reflect_execution_delivery(str(execution_id), row["status"])
-    return dict(row)
+        else:
+            conn.execute(
+                """INSERT OR IGNORE INTO deliveries
+                   (execution_id, job_json, content, for_failure, status, created_at)
+                   VALUES (?, ?, ?, ?, 'pending', ?)""",
+                (
+                    str(execution_id),
+                    json.dumps(job, ensure_ascii=False, sort_keys=True),
+                    str(content),
+                    int(bool(for_failure)),
+                    _hermes_now().isoformat(),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM deliveries WHERE execution_id=?", (str(execution_id),)
+            ).fetchone()
+            result = dict(row)
+    _reflect_execution_delivery(str(execution_id), result["status"])
+    return result
 
 
 def get_status(execution_id: str) -> Optional[dict]:
@@ -283,13 +291,14 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
         )
         _prune_terminal_unlocked(conn)
     if cur.rowcount == 1:
-        _reflect_execution_delivery(execution_id, status)
+        _reflect_terminal_deliveries([execution_id], status)
     return cur.rowcount == 1
 
 
 def recover_abandoned() -> int:
     """Fence dead delivery owners as unknown; never replay uncertain sends."""
     changed = 0
+    terminal_ids: list[str] = []
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT execution_id, owner_process_id, owner_pid, owner_started_at "
@@ -319,7 +328,10 @@ def recover_abandoned() -> int:
                 ),
             )
             changed += cur.rowcount
+            if cur.rowcount:
+                terminal_ids.append(row["execution_id"])
         _prune_terminal_unlocked(conn)
+    _reflect_terminal_deliveries(terminal_ids, "unknown")
     return changed
 
 
@@ -378,7 +390,7 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
                 execution_id,
             )
             return ""
-        conn.execute(
+        cur = conn.execute(
             """UPDATE deliveries SET status='unknown', finished_at=?, error=?
                WHERE execution_id=? AND status='delivering'""",
             (now, uncertain_error, str(execution_id)),
@@ -388,6 +400,8 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
             (str(execution_id),),
         ).fetchone()
         _prune_terminal_unlocked(conn)
+    if cur.rowcount:
+        _reflect_terminal_deliveries([str(execution_id)], "unknown")
     if row is None:
         return "timed out waiting for live gateway delivery"
     if row["status"] in {"delivered", "suppressed"}:

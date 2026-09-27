@@ -144,6 +144,31 @@ def test_dead_delivery_owner_becomes_unknown_and_is_not_retried(
     assert queue.get_status("exec-1")["status"] == "unknown"
 
 
+def test_terminal_recovery_and_timeout_project_execution_status(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        for transition in ("restart", "timeout"):
+            run = executions.create_execution(f"job-{transition}", source="builtin")
+            queue.enqueue(run["id"], {"id": f"job-{transition}"}, "result")
+            assert queue.claim_next()["execution_id"] == run["id"]
+            assert executions.get_execution(run["id"])["delivery_status"] == "pending"
+            if transition == "restart":
+                monkeypatch.setattr(queue, "_PROCESS_ID", "replacement-gateway")
+                monkeypatch.setattr(queue, "_owner_is_live", lambda _pid, _started: False)
+                assert queue.recover_abandoned() == 1
+            else:
+                assert "unknown" in queue._terminalize_wait_timeout(run["id"])
+            assert queue.get_status(run["id"])["status"] == "unknown"
+            assert executions.get_execution(run["id"])["delivery_status"] == "unknown"
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_delivery_failure_is_terminal_not_retried_and_redacted(
     tmp_path, monkeypatch
 ):

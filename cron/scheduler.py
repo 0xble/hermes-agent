@@ -3751,7 +3751,17 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             try:
                 return run_one_job(job, adapters=None, loop=None, verbose=False)
             finally:
-                watchdog_stop.set()
+                # Inactivity timeout abandons a ThreadPoolExecutor future with
+                # shutdown(wait=False). run_one_job can return while its worker is
+                # still non-daemon and preventing interpreter exit; disarming here
+                # would leave the detached process unbounded. Once that work ends,
+                # normal interpreter shutdown exits without needing the watchdog.
+                if not any(
+                    thread.is_alive() and not thread.daemon
+                    and thread is not threading.current_thread()
+                    for thread in threading.enumerate()
+                ):
+                    watchdog_stop.set()
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)
                 else:

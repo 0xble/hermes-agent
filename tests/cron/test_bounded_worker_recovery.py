@@ -1,5 +1,6 @@
 """Real SQLite and detached-process regression coverage for restart-safe cron runs."""
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -138,6 +139,57 @@ def test_old_schema_reader_can_insert_and_select_after_additive_migration(tmp_pa
         old_reader.execute("INSERT INTO executions (id,job_id,source,process_id,pid,status,claimed_at) "
                            "VALUES ('rollback','job','cron','old',1,'claimed','2026-01-02')")
         assert old_reader.execute("SELECT id,status FROM executions WHERE id=?", (fresh["id"],)).fetchone() == (fresh["id"], "claimed")
+
+
+def test_external_worker_hard_wall_survives_abandoned_inactivity_future(tmp_path):
+    """An inactivity timeout can return while its executor thread remains alive."""
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = _home(home)
+    try:
+        run = executions.create_execution("wedged", source="builtin")
+        executions.mark_execution_handoff_pending(run["id"])
+    finally:
+        reset_hermes_home_override(token)
+    payload = tmp_path / "payload.json"
+    ack = tmp_path / "ack.json"
+    payload.write_text(json.dumps({"job": {"id": "wedged", "execution_id": run["id"]},
+                                   "profile_home": str(home)}), encoding="utf-8")
+    code = """import concurrent.futures,sys,time
+from pathlib import Path
+from cron import executions,scheduler
+import cron.scheduler_detached_worker as detached
+
+def timed_out_job(job, **kwargs):
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(time.sleep, 60)
+    # This is the inactivity-timeout teardown: it abandons the still-running future.
+    pool.shutdown(wait=False)
+    assert not future.done()
+    executions.finish_execution(job['execution_id'], success=False, error='inactivity timeout')
+    return False
+
+scheduler.run_one_job = timed_out_job
+detached.hard_wall_timeout_seconds = lambda: 0.5
+sys.exit(0 if scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys.argv[2])) else 1)
+"""
+    env = {**os.environ, "HERMES_HOME": str(home)}
+    process = subprocess.Popen([sys.executable, "-c", code, str(payload), str(ack)],
+                               env=env, cwd=Path(__file__).resolve().parents[2],
+                               start_new_session=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    try:
+        stdout, stderr = process.communicate(timeout=4)
+        assert process.returncode == 124, (stdout, stderr)
+        token = _home(home)
+        try:
+            assert executions.get_execution(run["id"])["status"] == "failed"
+        finally:
+            reset_hermes_home_override(token)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 @pytest.mark.macos_only
