@@ -12,6 +12,8 @@ This is the fork's core update/launchd/cron release boundary, not a plugin: atom
 
 `test_sigkill_stage_and_flip_converge_with_complete_current` kills a real child with SIGKILL after completed staging and between the `previous` and `current` atomic renames. The parent checks that `current/.release-ready` still identifies complete A, then reruns staging/promotion and observes complete B. No user-facing pause environment variable is installed; the callback is injected only by the test.
 
+`test_first_migration_and_source_plist_reversal_real_process` uses a temp home and `ai.hermes.s2migration.<uuid>`: the updater's `_activate_immutable_release` journals the original plist and source SHA, promotes a complete release, and reloads the throwaway launchd job; `_cmd_update_impl(--rollback)` restores the original plist bytes and a new source-checkout process. The test replaces the fleet-restart/verify collaborators with throwaway-label-only process probes, so it does **not** prove the full fleet pipeline (separate acceptance item below).
+
 The live profile has no installed Hermes entry-point plugins. Candidate smoke imports enabled entry-point manifests, but an installed entry-point integration proof is outside S2 on this machine. S1 (#187) established real detached-worker survival across gateway process-group termination; the separate parent launchd coalition probe confirmed bootout does not kill a setsid double-fork. S2 does not redo that worker-topology proof.
 
 ## Pre-activation inventory (read-only)

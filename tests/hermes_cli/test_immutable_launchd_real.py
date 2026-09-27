@@ -92,3 +92,119 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
     finally:
         subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
         assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires launchd")
+def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkeypatch):
+    """Updater promotion and reversal reload one throwaway job, never the live label."""
+    from hermes_cli import immutable_releases as releases, update_cmd, update_receipt
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    label = f"ai.hermes.s2migration.{uuid.uuid4().hex}"
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{label}"
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "probe.py").write_text(
+        "import json, os, pathlib, sys, time\n"
+        "pathlib.Path(os.environ['S2_PROBE_OUTPUT']).write_text(json.dumps("
+        "{'pid': os.getpid(), 'cwd': os.getcwd(), 'exe': sys.executable, "
+        "'release': pathlib.Path(__file__).resolve().parent.name}))\n"
+        "time.sleep(120)\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "probe.py"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
+                    "commit", "-qm", "source"], check=True)
+    sha = releases.release_sha(source)
+    b = home / "releases" / sha
+    b.mkdir(parents=True)
+    venv.EnvBuilder(with_pip=False).create(b / ".venv")
+    (b / "probe.py").write_text((source / "probe.py").read_text(encoding="utf-8"), encoding="utf-8")
+    (b / ".release-ready").write_text(sha + "\n", encoding="utf-8")
+    output = home / "observed.json"
+    plist_path = tmp_path / f"{label}.plist"
+
+    def definition(root, python):
+        return plistlib.dumps({
+            "Label": label, "RunAtLoad": True, "KeepAlive": False,
+            "WorkingDirectory": str(root),
+            "ProgramArguments": [str(python), str(root / "probe.py")],
+            "EnvironmentVariables": {"HERMES_HOME": str(home), "S2_PROBE_OUTPUT": str(output)},
+        })
+
+    original = definition(source, sys.executable)
+    replacement = definition(home / "current", home / "current" / ".venv/bin/python")
+    plist_path.write_bytes(original)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: label)
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist_path)
+    monkeypatch.setattr(gateway, "generate_launchd_plist", lambda: replacement.decode("utf-8"))
+    monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist_path.read_bytes() == replacement)
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: domain)
+    # Only the throwaway plist is in scope; preserve production's temp-home guard.
+    monkeypatch.setattr(gateway, "_refuse_temp_home_service_write", lambda *_: False)
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
+    monkeypatch.setattr(releases, "stage_release", lambda *args, **kwargs: (b, "staged"))
+
+    def observed(name, old_pid=None):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if output.exists():
+                try:
+                    row = json.loads(output.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    pass
+                else:
+                    if row["release"] == name and row["pid"] != old_pid:
+                        return row
+            time.sleep(.1)
+        raise AssertionError(f"{name} did not start through launchd")
+
+    try:
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=15)
+        a = observed("source")
+        update_receipt.begin_update_receipt()
+        assert update_cmd._activate_immutable_release()
+        updated_receipt = update_receipt.finalize_update_receipt("success")
+        assert updated_receipt is not None
+        recorded = json.loads(updated_receipt.read_text(encoding="utf-8"))
+        assert any(s["name"] == "immutable_release" and "migration=True" in s["detail"]
+                   and sha in s["detail"] for s in recorded["steps"])
+        assert (home / "current").resolve() == b
+        assert (home / "previous").resolve() == source
+        assert plist_path.read_bytes() == replacement
+        promoted = observed(sha, a["pid"])
+        assert Path(promoted["cwd"]).resolve() == b
+        assert Path(promoted["exe"]).resolve().is_relative_to(b)
+        from types import SimpleNamespace
+        monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *args: SimpleNamespace())
+        def restart_throwaway(*args):
+            subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+            return SimpleNamespace(incomplete=False)
+        monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update", restart_throwaway)
+        def verify_throwaway(restart, **kwargs):
+            row = observed("source", promoted["pid"])
+            assert Path(row["cwd"]).resolve() == source
+            update_receipt.finalize_update_receipt("success", fleet=[{
+                "pid": row["pid"], "observed_root": row["cwd"], "state": "probe",
+            }])
+        monkeypatch.setattr(update_cmd, "_verify_fleet_after_update", verify_throwaway)
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+        assert (home / "current").resolve() == source
+        original_plist = releases.migration_plist(home)
+        assert original_plist is not None
+        saved_path, saved_body = original_plist
+        assert saved_path == plist_path and saved_body == original
+        restored = observed("source", promoted["pid"])
+        assert restored["pid"] != a["pid"]
+        assert Path(restored["cwd"]).resolve() == source
+        assert plist_path.read_bytes() == original
+        rollback_receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
+        assert rollback_receipt["outcome"] == "success"
+        assert any(s["name"] == "immutable_rollback" and s["ok"] for s in rollback_receipt["steps"])
+    finally:
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
+        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0

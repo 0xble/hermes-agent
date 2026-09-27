@@ -527,6 +527,29 @@ def refresh_launchd_plist_if_needed() -> bool:
         return False
 
     plist_path.write_text(new_plist, encoding="utf-8")
+    return _reload_installed_launchd_plist(plist_path)
+
+
+def restore_launchd_plist(body: bytes) -> bool:
+    """Restore the original source-checkout definition and re-register its exact bytes."""
+    import plistlib
+    path = _gw().get_launchd_plist_path()
+    definition = plistlib.loads(body)
+    if (definition.get("Label") != _gw().get_launchd_label()
+            or Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve()
+            != _gw().get_hermes_home().resolve()):
+        raise RuntimeError("source plist label/home do not match this gateway")
+    temp = path.with_name(f".{path.name}.restore-{os.getpid()}")
+    try:
+        temp.write_bytes(body)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+    return _reload_installed_launchd_plist(path)
+
+
+def _reload_installed_launchd_plist(plist_path: Path) -> bool:
+    """Re-register the installed bytes (including a saved source-checkout plist)."""
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"

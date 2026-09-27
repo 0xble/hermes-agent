@@ -289,16 +289,88 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     return removed
 
 
+def begin_migration(home: Path, source: Path, plist_path: Path | None = None) -> bool:
+    """Save the original checkout service definition before the first release flip.
+
+    The migration journal and previous pointer survive a process crash; a rerun
+    never replaces the original plist with an already-migrated one.
+    """
+    paths = ReleasePaths.for_home(home)
+    if read_pointer(paths.current) is not None:
+        return False
+    source = source.resolve(strict=True)
+    journal = paths.home / "release-layout.json"
+    if journal.exists():
+        data = json.loads(journal.read_text(encoding="utf-8"))
+        if Path(data["source"]).resolve() != source:
+            raise RuntimeError("release migration journal refers to a different checkout")
+    else:
+        data = {"source": str(source), "source_sha": release_sha(source), "plist": None}
+        if plist_path is not None and plist_path.exists():
+            import base64
+            import plistlib
+            raw = plist_path.read_bytes()
+            definition = plistlib.loads(raw)
+            if Path(definition["EnvironmentVariables"]["HERMES_HOME"]).resolve() != paths.home:
+                raise RuntimeError("installed plist belongs to another Hermes home")
+            if definition["Label"] != plist_path.stem:
+                raise RuntimeError("installed plist label does not match its path")
+            data["plist"] = {"path": str(plist_path), "body": base64.b64encode(raw).decode("ascii")}
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
+        try:
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, journal)
+        finally:
+            tmp.unlink(missing_ok=True)
+    _atomic_symlink(paths.previous, source)
+    return True
+
+
+def restore_source_layout(home: Path) -> dict[str, str | None]:
+    """Reverse the first migration, preserving the candidate as previous."""
+    paths = ReleasePaths.for_home(home)
+    journal = paths.home / "release-layout.json"
+    data = json.loads(journal.read_text(encoding="utf-8"))
+    source = Path(data["source"]).resolve(strict=True)
+    if read_pointer(paths.previous) != source:
+        raise RuntimeError("previous is not the recorded source checkout")
+    current = read_pointer(paths.current)
+    if current is None:
+        raise RuntimeError("there is no current release to reverse")
+    # Keep current complete at every crash boundary, even during reversal. Once
+    # the source plist has been reloaded the pointer can be removed by a later run.
+    _atomic_symlink(paths.current, source)
+    _atomic_symlink(paths.previous, current)
+    return {"current": str(source), "previous": str(current), "source_sha": data["source_sha"]}
+
+
+def migration_plist(home: Path) -> tuple[Path, bytes] | None:
+    """Read back the exact original plist, rather than regenerating a lookalike."""
+    import base64
+    data = json.loads((ReleasePaths.for_home(home).home / "release-layout.json").read_text(encoding="utf-8"))
+    if data["plist"] is None:
+        return None
+    return Path(data["plist"]["path"]), base64.b64decode(data["plist"]["body"], validate=True)
+
+
 def rollback(home: Path) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
     previous = read_pointer(paths.previous)
     if previous is None:
         raise RuntimeError("no previous release is available")
+    if previous.parent != paths.releases.resolve():
+        return restore_source_layout(home)
     return promote(paths.home, previous)
 
 
 def resolved_release(home: Path) -> Path | None:
-    return read_pointer(ReleasePaths.for_home(home).current)
+    paths = ReleasePaths.for_home(home)
+    release = read_pointer(paths.current)
+    if release is None or release.parent != paths.releases.resolve():
+        return None
+    marker = release / ".release-ready"
+    return release if marker.is_file() and marker.read_text(encoding="utf-8").strip() == release.name else None
 
 
 def detached_worker_env(home: Path, release: Path, base: dict[str, str] | None = None) -> dict[str, str]:

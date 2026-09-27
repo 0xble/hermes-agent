@@ -1913,7 +1913,8 @@ def _print_legacy_units_warning() -> None:
     print("  (add `sudo` if any are in system scope)")
 
 
-def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
+def _collect_fleet_snapshot(restart, rows_expected: bool, *, expected_sha: str | None = None,
+                            expected_root=None) -> list:
     """Fleet version rows, polled over a bounded settle window when runtimes are expected.
 
     Gateways need time to rewrite gateway_state.json; Windows resumes DETACHED (~10s boot),
@@ -1927,14 +1928,16 @@ def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
     """
     from hermes_cli.update_receipt import collect_fleet_versions
     pending = getattr(restart, "self_restart_pending_pids", None) or None
+    expected = ({"expected_sha_override": expected_sha, "expected_root_override": expected_root}
+                if expected_sha is not None and expected_root is not None else {})
     if not rows_expected:
         return collect_fleet_versions(
-            pre_restart_pids=restart.pre_restart_gateway_pids, self_restart_pending=pending)
+            pre_restart_pids=restart.pre_restart_gateway_pids, self_restart_pending=pending, **expected)
     pre_pids = restart.pre_restart_gateway_pids
     _fleet_deadline = _time.monotonic() + _FLEET_PROBE_SETTLE_TIMEOUT_SECONDS
     while True:
         _time.sleep(2.0)
-        snapshot = collect_fleet_versions(pre_restart_pids=pre_pids, self_restart_pending=pending)
+        snapshot = collect_fleet_versions(pre_restart_pids=pre_pids, self_restart_pending=pending, **expected)
         unstamped = [row for row in snapshot if _fleet_row_identity_pending(row, pre_pids)]
         if snapshot and not unstamped and not any(row.get("state") == "down" for row in snapshot):
             return snapshot
@@ -1979,7 +1982,8 @@ def _restarted_units_gone(scoped_units) -> bool:
     return True
 
 
-def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_resume, node_failures, update_complete):
+def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_resume, node_failures, update_complete,
+                               expected_sha: str | None = None, expected_root=None, rollback: bool = False):
     """Post-restart verification: legacy-unit warning, dashboard cleanup, stale serve
     probe, fleet version matrix, plan-vs-execution reconciliation, receipt finalize.
 
@@ -2034,7 +2038,8 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
         _fleet_rows_expected = _m()._fleet_probe_expected_runtimes(
             _pre_update_plan, _pre_restart, _windows_gateway_resume, restart.restarted_services, _killed,
         )
-        _fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected)
+        _fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected, expected_sha=expected_sha,
+                                                  expected_root=expected_root)
         if print_fleet_version_matrix(_fleet_snapshot):
             restart.incomplete = True
             # A proven-stale survivor must not keep running (its ticker yields every tick and
@@ -2108,9 +2113,10 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     _clear_fleet_restart_pending_marker()
     # Fleet is healthy on the new code: fold per-profile gateways into one multiplexer when nothing
     # blocks it (deterministic; never prompts), else print the blockers and the one-liner to run later.
-    with _best_effort('Multiplex auto-migration after update failed: %s'):
-        from hermes_cli.gateway_migrate import maybe_auto_migrate_after_update
-        maybe_auto_migrate_after_update()
+    if not rollback:
+        with _best_effort('Multiplex auto-migration after update failed: %s'):
+            from hermes_cli.gateway_migrate import maybe_auto_migrate_after_update
+            maybe_auto_migrate_after_update()
 
 
 def _restart_phase_failure_is_incomplete(surviving, pre_restart_pids) -> bool:

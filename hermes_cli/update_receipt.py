@@ -429,6 +429,7 @@ _NOT_EXPECTED_STATES = {"stopped", "startup_failed"}
 
 def collect_fleet_versions(
     *, pre_restart_pids: Optional[list[int]] = None, self_restart_pending: Optional[set] = None,
+    expected_sha_override: str | None = None, expected_root_override: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Snapshot every profile's gateway code identity vs. the current tree.
 
@@ -456,8 +457,16 @@ def collect_fleet_versions(
     _pre_restart = {int(p) for p in (pre_restart_pids or []) if isinstance(p, int)}
     _pending = {int(p) for p in (self_restart_pending or ()) if isinstance(p, int)}
     results: list[dict[str, Any]] = []
-    expected_sha = _code_identity(refresh=True).get("sha")
-    expected_root = _updater_code_root()
+    expected_sha = expected_sha_override or _code_identity(refresh=True).get("sha")
+    expected_root = expected_root_override or _updater_code_root()
+    if expected_root_override is None:
+        with suppress(Exception):
+            from hermes_constants import get_hermes_home
+            from hermes_cli.immutable_releases import resolved_release
+            release = resolved_release(get_hermes_home())
+            if release is not None:
+                expected_root = release
+                expected_sha = release.name
     try:
         from gateway.status import (
             live_gateway_pid_for_home,

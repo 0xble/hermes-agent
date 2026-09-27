@@ -123,7 +123,9 @@ def _m():
 
 def _activate_immutable_release() -> bool:
     """Stage and promote the fetched checkout through the normal update receipt."""
-    from hermes_cli.immutable_releases import promote, release_sha, stage_release
+    from hermes_cli.immutable_releases import (
+        ReleasePaths, begin_migration, promote, read_pointer, release_sha, stage_release,
+    )
     home = get_hermes_home()
     try:
         sha = release_sha(_m().PROJECT_ROOT)
@@ -131,12 +133,23 @@ def _activate_immutable_release() -> bool:
             _record_update_step("immutable_release", True, "skipped: no git revision in mocked/non-git checkout")
             return True
         candidate, action = stage_release(_m().PROJECT_ROOT, home, sha=sha)
+        first = read_pointer(ReleasePaths.for_home(home).current) is None
+        plist = None
+        if first:
+            from hermes_cli import gateway
+            plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
+            begin_migration(home, _m().PROJECT_ROOT, plist)
         result = promote(home, candidate)
-        _record_update_step("immutable_release", True, f"{action}: {result['current']}")
+        if first and sys.platform == "darwin" and plist is not None and plist.exists():
+            from hermes_cli import gateway
+            if not gateway.refresh_launchd_plist_if_needed() or not gateway.launchd_plist_is_current():
+                raise RuntimeError("release pointer switched but launchd definition did not reload")
+        _record_update_step("immutable_release", True,
+                            f"{action}: from={result['previous']} to={result['current']} sha={sha} migration={first}")
         return True
     except Exception as exc:
         _record_update_step("immutable_release", False, str(exc))
-        logger.exception("Immutable release staging failed; current pointer was not changed")
+        logger.exception("Immutable release staging or activation failed; inspect current pointer and migration journal")
         return False
 
 
@@ -1588,26 +1601,53 @@ def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always restore stdio even on
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
     on the OLD checkout in an exit-2 loop); it runs right before the dependency sync."""
-    opts = _resolve_update_options(args, gateway_mode)
-    gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
-
-    # A child spawned off hermes.exe already outwaited its parent in ``cmd_update`` (before the
-    # update lock, so the lock it now holds is its own — the parent's marker left with it).
+    # Rollback does not fetch, prompt, inspect dependency options or mutate the checkout.
     from hermes_cli.update_handoff import adopt_handed_off_gateway_resume
 
     if getattr(args, "rollback", False):
-        from hermes_cli.immutable_releases import rollback
-        result = rollback(get_hermes_home())
+        from hermes_cli.immutable_releases import ReleasePaths, migration_plist, read_pointer, rollback
+        from hermes_cli.update_receipt import begin_update_receipt
+        from hermes_cli import gateway_launchd
+        begin_update_receipt()
+        home = get_hermes_home()
+        before = read_pointer(ReleasePaths.for_home(home).current)
+        if before is None:
+            raise RuntimeError("cannot roll back without a current release")
+        result = rollback(home)
+        current_target = result["current"]
+        if current_target is None:
+            raise RuntimeError("rollback produced no current target")
+        source_layout = Path(current_target).parent != ReleasePaths.for_home(home).releases.resolve()
+        _record_update_step("immutable_rollback", True,
+                            f"from={before} to={result['current']} from_sha={before.name} "
+                            f"to_sha={result.get('source_sha') or Path(current_target).name}")
         print(f"✓ Rolled back current release to {result['current']}")
         restart = _restart_gateway_fleet_after_update(None, gateway_mode)
-        if getattr(restart, "incomplete", False):
-            if gateway_mode:
-                _write_gateway_update_exit_code(False)
-            sys.exit(1)
+        if source_layout and sys.platform == "darwin":
+            original = migration_plist(home)
+            if original is not None:
+                from hermes_cli import gateway
+                if original[0] != gateway.get_launchd_plist_path():
+                    raise RuntimeError("saved source plist belongs to a different launchd path")
+                if (original[0].read_bytes() != original[1]
+                        and not gateway_launchd.restore_launchd_plist(original[1])):
+                    restart.incomplete = True
+                if original[0].read_bytes() != original[1]:
+                    restart.incomplete = True
+                _record_update_step("source_plist_restore", not restart.incomplete, str(original[0]))
         if gateway_mode:
-            _write_gateway_update_exit_code(True)
+            _write_gateway_update_exit_code(not restart.incomplete)
+        _verify_fleet_after_update(
+            restart, _pre_update_plan=None, _windows_gateway_resume=None,
+            node_failures=[], update_complete=not restart.incomplete,
+            expected_sha=result.get("source_sha") if source_layout else Path(current_target).name,
+            expected_root=Path(current_target), rollback=True,
+        )
         return
 
+    opts = _resolve_update_options(args, gateway_mode)
+    gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
+    # A child spawned off hermes.exe already outwaited its parent in ``cmd_update``.
     if getattr(args, "post_swap", None):
         # Second half of a run whose pre-pull interpreter stopped at the code swap.
         _run_post_swap_phase(args, gateway_mode)
