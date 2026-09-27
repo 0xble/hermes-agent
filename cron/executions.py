@@ -278,6 +278,8 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
     """
     pid = os.getpid()
     process_started_at = _process_start_time(pid)
+    if process_started_at is None:
+        return None  # never acknowledge a worker whose identity cannot be verified
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         cur = conn.execute(
