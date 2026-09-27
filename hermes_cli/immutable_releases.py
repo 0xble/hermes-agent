@@ -357,16 +357,26 @@ def _live_process_pins(home: Path) -> set[Path]:
     """Find release paths advertised by live Hermes processes (best effort, fail closed)."""
     pins: set[Path] = set()
     root = (home / "releases").resolve()
+    def all_releases() -> set[Path]:
+        return {p.resolve() for p in root.iterdir() if p.is_dir()}
     try:
         import psutil
+    except ImportError:
+        return all_releases()
+    try:
         for proc in psutil.process_iter(["cmdline", "environ", "cwd", "exe"]):
             try:
-                env = proc.info.get("environ") or {}
-                values = list(env.values()) + list(proc.info.get("cmdline") or [])
-                values.extend([proc.info.get("cwd"), proc.info.get("exe")])
-            except (psutil.Error, OSError):
-                # Unknown process identity cannot justify deleting a release.
-                return {p.resolve() for p in root.iterdir() if p.is_dir()}
+                info = proc.info
+                # psutil may suppress AccessDenied/NoSuchProcess and report None
+                # for requested attrs. A process whose cwd is unreadable might
+                # be executing inside the release we are about to delete.
+                if any(info.get(key) is None for key in ("cmdline", "environ", "cwd", "exe")):
+                    return all_releases()
+                env = info["environ"]
+                values = list(env.values()) + list(info["cmdline"])
+                values.extend([info["cwd"], info["exe"]])
+            except (psutil.Error, OSError, AttributeError, TypeError):
+                return all_releases()
             for value in values:
                 if not isinstance(value, str):
                     continue
@@ -375,8 +385,8 @@ def _live_process_pins(home: Path) -> set[Path]:
                     relative = candidate.relative_to(root)
                     if relative.parts:
                         pins.add(root / relative.parts[0])
-    except ImportError:
-        return {p.resolve() for p in root.iterdir() if p.is_dir()}
+    except (psutil.Error, OSError):
+        return all_releases()
     return pins
 
 

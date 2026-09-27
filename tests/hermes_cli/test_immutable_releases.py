@@ -191,6 +191,131 @@ def test_deferred_update_stages_without_promoting_or_reloading(tmp_path, monkeyp
     assert not (home / "previous").exists()
 
 
+@pytest.mark.parametrize("first_stage_fails", [False, True])
+def test_outstanding_release_is_promoted_before_catchup_restart(tmp_path, monkeypatch, first_stage_fails):
+    from hermes_cli import update_cmd
+    home = tmp_path / "profile"
+    a, b = (home / "releases" / name for name in ("A", "B"))
+    _fake_release(a, "A")
+    _fake_release(b, "B")
+    releases.promote(home, a)
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(releases, "release_sha", lambda _: "B")
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
+    attempted = []
+    def stage(*args, **kwargs):
+        attempted.append("stage")
+        if first_stage_fails and len(attempted) == 1:
+            raise RuntimeError("stage interrupted")
+        return b, "existing"
+    monkeypatch.setattr(releases, "stage_release", stage)
+    if first_stage_fails:
+        with pytest.raises(SystemExit) as exc:
+            update_cmd._catch_up_immutable_release(defer=False)
+        assert exc.value.code == 1
+        assert (home / "current").resolve() == a
+    # A deferred update leaves a complete candidate; the next normal update
+    # activates it before catch-up is permitted to restart any gateway.
+    update_cmd._catch_up_immutable_release(defer=True)
+    assert (home / "current").resolve() == a
+    update_cmd._catch_up_immutable_release(defer=False)
+    assert (home / "current").resolve() == b
+    assert (home / "previous").resolve() == a
+    assert attempted
+
+
+def test_noop_update_promotes_before_pending_restart(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import update_cmd
+    home = tmp_path / "profile"
+    a, b = (home / "releases" / name for name in ("A", "B"))
+    _fake_release(a, "A")
+    _fake_release(b, "B")
+    releases.promote(home, a)
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(releases, "release_sha", lambda _: "B")
+    monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: (b, "existing"))
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
+    monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **kw: True)
+    monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a: None)
+    def restart(*, defer):
+        assert defer is False
+        assert (home / "current").resolve() == b
+    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", restart)
+    plan = SimpleNamespace(auto_stash_ref=None, parked_branch_switched=False,
+                           upstream_checked=True)
+    update_cmd._finish_already_up_to_date(None, "main", "main", plan,
+        assume_yes=True, gateway_mode=False, gw_input_fn=None,
+        pre_update_snapshot_id=None, had_desktop_app_before_update=False,
+        active_lazy_features=[], active_tool_dependencies=[],
+        _windows_gateway_resume=None)
+    assert (home / "previous").resolve() == a
+
+
+def test_true_noop_release_does_not_stage_or_rebuild(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd
+    home = tmp_path / "profile"
+    a = home / "releases" / "A"
+    _fake_release(a, "A")
+    releases.promote(home, a)
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(releases, "release_sha", lambda _: "A")
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: pytest.fail("node rebuilt"))
+    monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: pytest.fail("release restaged"))
+    update_cmd._catch_up_immutable_release(defer=False)
+    assert (home / "current").resolve() == a
+    assert not (home / "previous").exists()
+
+
+def test_web_build_failure_is_partial_and_never_promotes(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import update_cmd, update_receipt
+    home = tmp_path / "profile"
+    a = home / "releases" / "A"
+    _fake_release(a, "A")
+    releases.promote(home, a)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(update_cmd, "_sync_python_dependencies_after_pull", lambda *a, **kw: None)
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: False)
+    monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: pytest.fail("failed web build staged"))
+    update_receipt.begin_update_receipt()
+    with pytest.raises(SystemExit) as exc:
+        update_cmd._finish_pulled_update(None, "main", "A", SimpleNamespace(
+            no_gateway_restart=False, active_lazy_features=[], active_tool_dependencies=[]),
+            gateway_mode=False, is_fork=False, desktop_dir=tmp_path,
+            had_desktop_app_before_update=False, pre_update_snapshot_id=None,
+            _pre_update_plan=None, _windows_gateway_resume=None)
+    assert exc.value.code == 1
+    assert (home / "current").resolve() == a
+    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
+    assert receipt["outcome"] == "partial"
+    assert any(s["name"] == "immutable_release" and not s["ok"] for s in receipt["steps"])
+
+
+def test_fleet_expected_candidate_sha_is_not_current_pointer(tmp_path, monkeypatch):
+    from hermes_cli import update_receipt
+    home = tmp_path / "profile"
+    a = home / "releases" / "A"
+    _fake_release(a, "A")
+    releases.promote(home, a)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_receipt, "_profile_homes", lambda: [])
+    # Probe overrides retain the intended SHA even while the pointer is stale.
+    # A real fleet row with code_sha=A would be classified stale against B.
+    from hermes_cli.update_receipt import _fleet_row
+    row = _fleet_row("default", 123, "A", None, "B", code_root=a, expected_root=home / "releases" / "B")
+    assert row["state"] == "stale"
+    update_receipt.collect_fleet_versions(expected_sha_override="B")
+
+
 def test_promote_is_atomic_and_rollback_round_trip(tmp_path):
     home = tmp_path / ".hermes"
     a, b = home / "releases" / "a", home / "releases" / "b"
@@ -240,6 +365,34 @@ def test_retention_keeps_live_and_rollback_pins(tmp_path):
     assert (home / "releases" / "6").exists()
     assert (home / "releases" / "5").exists()
     assert len(list((home / "releases").iterdir())) >= 5
+
+
+def test_unreadable_process_identity_pins_all_releases(tmp_path, monkeypatch):
+    import psutil
+    home = tmp_path / "profile"
+    for name in ("A", "B", "C", "D", "E"):
+        _fake_release(home / "releases" / name, name)
+    releases.promote(home, home / "releases" / "E")
+    class Unreadable:
+        info = {"cmdline": None, "environ": {}, "cwd": None, "exe": None}
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs: iter([Unreadable()]))
+    assert releases.retain(home, rollback_count=1) == []
+    assert all((home / "releases" / name).exists() for name in ("A", "B", "C", "D", "E"))
+
+
+def test_retention_prunes_excess_without_uncertain_processes(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    paths = [home / "releases" / str(i) for i in range(7)]
+    for i, path in enumerate(paths):
+        _fake_release(path, str(i))
+        os.utime(path, (i, i))
+    releases.promote(home, paths[-1])
+    releases.promote(home, paths[-2])
+    monkeypatch.setattr(releases, "_live_process_pins", lambda _: {paths[0].resolve()})
+    removed = releases.retain(home)
+    assert paths[0].exists()
+    assert len(removed) == 1
+    assert removed == [paths[1]]
 
 
 def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):

@@ -415,7 +415,12 @@ def _fleet_row(
     self_restart_pending: Optional[set] = None,
 ) -> dict[str, Any]:
     if state == "unknown" and code_root and expected_root and code_root != expected_root:
-        state = EXTERNAL_STATE
+        # Two immutable releases in one home are the SAME managed fleet. An A
+        # gateway is stale when B is intended, not a separately owned checkout.
+        actual, intended = Path(code_root).resolve(), Path(expected_root).resolve()
+        same_release_fleet = (actual.parent == intended.parent and actual.parent.name == "releases")
+        if not same_release_fleet:
+            state = EXTERNAL_STATE
     if state == "unknown" and code_sha and expected_sha:
         state = "current" if str(code_sha) == str(expected_sha) else "stale"
     if state == "stale" and self_restart_pending and pid in self_restart_pending:

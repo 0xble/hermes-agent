@@ -1337,14 +1337,23 @@ def _catch_up_immutable_release(*, defer: bool) -> None:
     from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha
     paths = ReleasePaths.for_home(get_hermes_home())
     current = read_pointer(paths.current)
-    # An ordinary checkout at HEAD must not opt itself into migration here.
-    if current is None or current.parent != paths.releases.resolve():
+    if current is None and not _updates_config().get("immutable_releases", False):
+        return
+    if current is not None and current.parent != paths.releases.resolve():
         return
     sha = release_sha(_m().PROJECT_ROOT)
-    if current.name == sha:
+    candidate = paths.release(sha)
+    if current is None:
+        # First migration may also have been deferred: only a complete staged
+        # artifact plus explicit opt-in can resume that transition on a no-op pull.
+        if not ((candidate / ".release-ready").is_file()
+                and (candidate / ".release-ready").read_text(encoding="utf-8").strip() == sha):
+            return
+    if current == candidate:
         return
     if defer:
-        print(f"  Release {sha} still awaits activation; --no-gateway-restart keeps {current.name} active.")
+        print(f"  Release {sha} still awaits activation; --no-gateway-restart keeps "
+              f"{current.name if current else 'the source layout'} active.")
         return
     # An interrupted/failed stage may have no candidate, and the source web
     # bundle may be stale. Rebuild prerequisites before reusing or staging it.
