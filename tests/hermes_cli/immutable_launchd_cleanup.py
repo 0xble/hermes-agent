@@ -44,7 +44,12 @@ def register_disposable_label(request, label: str, plist: Path) -> None:
 def sweep_prior_sessions(request) -> None:
     """Only reap registrations whose exact worker identity has exited."""
     base = Path(request.config._tmp_path_factory.getbasetemp()).parent.parent.parent
-    for registry in base.glob(f"r-*/pytest-of-*/pytest-*/{_REGISTRY}"):
+    try:
+        registries = list(base.glob(f"r-*/pytest-of-*/pytest-*/{_REGISTRY}"))
+    except OSError:
+        # Another isolated test runner may remove its temp tree during glob.
+        registries = []
+    for registry in registries:
         try:
             entries = [json.loads(line) for line in registry.read_text().splitlines()]
         except (OSError, ValueError):
