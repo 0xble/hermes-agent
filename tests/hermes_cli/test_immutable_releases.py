@@ -486,7 +486,7 @@ def test_repeated_rollback_is_noop_without_fleet_relaunch(tmp_path, monkeypatch,
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
     calls = []
     monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update",
-                        lambda *args: calls.append("fleet") or SimpleNamespace(incomplete=False))
+                        lambda *args, **kwargs: calls.append("fleet") or SimpleNamespace(incomplete=False))
     monkeypatch.setattr(update_cmd, "_verify_fleet_after_update", lambda *args, **kwargs: None)
     update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
     update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)

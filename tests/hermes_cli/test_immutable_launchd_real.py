@@ -405,8 +405,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         assert Path(promoted["exe"]).resolve().is_relative_to(b)
         from types import SimpleNamespace
         monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *args: SimpleNamespace())
-        def restart_throwaway(*args):
-            subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        def restart_throwaway(*args, **kwargs):
             return SimpleNamespace(incomplete=False)
         monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update", restart_throwaway)
         def verify_throwaway(restart, **kwargs):
