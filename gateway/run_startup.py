@@ -103,6 +103,8 @@ class GatewayStartupMixin:
             try:
                 source = getattr(event, "source", None)
                 adapter = self._intake_adapter_for(source)
+                if adapter is None and getattr(event, "_hermes_recovered_followup", False):
+                    adapter = self._delivery_adapter_for(source)
                 if adapter is None:
                     logger.debug(
                         "Dropping startup-restore queued message: adapter unavailable for %s",
@@ -614,7 +616,8 @@ class GatewayStartupMixin:
             _resume_state.turn.started_ts = time.time()
             self._persist_active_agents()
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
-            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
+                                 message_id=getattr(source, "message_id", None), internal=True)
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )
@@ -1650,6 +1653,13 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
+        # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
+        # interrupted session must wait as a distinct event, not enter that turn's history.
+        from gateway.run_pending_recovery import recover_pending_shutdown_flush
+        try:
+            recover_pending_shutdown_flush(self)
+        except Exception:
+            logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()

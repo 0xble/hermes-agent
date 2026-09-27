@@ -193,7 +193,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
-        for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
+        for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
             if val is not None:
@@ -206,7 +206,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
-def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
+def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_followup=None) -> int:
     """Replay flush-dir ``*.json`` files via ``SessionDB.append_message``, deleting each on success.
 
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
@@ -214,7 +214,8 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     ``SessionStore.resolve_session_id_for_key``) is required for real flush files: adapter
     ``MessageEvent`` objects carry no ``session_id``, so without it every recovery lands in the skip
     branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
-    gateways); ``None`` falls back to ``session_db``. Returns the number of messages recovered.
+    gateways); ``None`` falls back to ``session_db``. ``deferred_followup`` may claim a resolved
+    payload as a separate turn before it is appended to history. Returns the number recovered.
     """
     flush_files = sorted(_get_flush_dir().glob("*.json"))
     if not flush_files:
@@ -235,7 +236,8 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                     continue
                 if _recover_one_payload(session_db, path, payload,
-                                        session_resolver=session_resolver):
+                                        session_resolver=session_resolver,
+                                        deferred_followup=deferred_followup):
                     recovered += 1
                     path.unlink(missing_ok=True)
             except Exception as exc:
@@ -251,7 +253,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
 
 
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
-                         session_resolver=None) -> bool:
+                         session_resolver=None, deferred_followup=None) -> bool:
     """Append one flush payload to ``session_db``; False (file kept) when structurally invalid."""
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.
@@ -292,6 +294,12 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
+    if deferred_followup is not None:
+        claim = deferred_followup(session_key, session_id, data)
+        if claim is None:  # resume still pending, but its delivery adapter is offline
+            return False
+        if claim:
+            return True
     target_db.append_message(session_id=session_id, role="user", content=text,
                              timestamp=payload.get("ts", int(time.time())))
     return True

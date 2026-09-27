@@ -36,6 +36,25 @@ def recover_pending_shutdown_flush(runner) -> int:
     launch_home = Path(get_routing_process_hermes_home())
     homes = [launch_home, *((getattr(runner, "_served_profile_homes", None) or {}).values())]
     recovered = 0
+    def defer_followup(key, session_id, data):
+        # A queued message is a *future* turn. Appending it to the interrupted
+        # transcript before auto-resume makes the recovery note answer that message.
+        entry = getattr(runner.session_store, "_entries", {}).get(key)
+        if not (entry and entry.resume_pending and entry.session_id == session_id and entry.origin):
+            return False
+        source = runner._restored_source(entry)
+        if runner._delivery_adapter_for(source) is None:
+            return None
+        from gateway.platforms.event import MessageEvent, MessageType
+        from gateway.session_identity import replace_source
+        message_id = data.get("message_id")
+        source = replace_source(source, message_id=message_id)
+        event = MessageEvent(text=data["text"], message_type=MessageType.TEXT,
+                             source=source, message_id=message_id)
+        setattr(event, "_hermes_recovered_followup", True)
+        runner._queue_startup_restore_event(event)
+        return True
+
     for home in dict.fromkeys(Path(home) for home in homes):
         try:
             with _profile_runtime_scope(home, prepared_secret_scope={}):
@@ -49,7 +68,8 @@ def recover_pending_shutdown_flush(runner) -> int:
                     with _profile_runtime_scope(owner_home, prepared_secret_scope={}):
                         return runner.session_store.resolve_session_id_for_key(key, not_after=not_after)
 
-                recovered += recover_pending_to_db(session_resolver=resolve_here)
+                recovered += recover_pending_to_db(session_resolver=resolve_here,
+                                                   deferred_followup=defer_followup)
         except Exception:
             logger.warning("Pending-message recovery failed for profile home %s; spool retained", home,
                            exc_info=True)
