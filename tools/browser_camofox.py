@@ -808,8 +808,9 @@ _UPLOAD_HTTP_TIMEOUT_S = 45
 
 def _stage_upload_file(path: str, uploads_dir: str) -> str:
     """Return a path Camofox will accept: ``path`` itself when already inside ``uploads_dir``,
-    else a content-addressed copy under ``<uploads_dir>/hermes/``. The copy is kept, because the
-    page may read the file lazily after the attach returns."""
+    else a copy at ``<uploads_dir>/hermes/<digest>/<original name>``. The digest is a directory so
+    the page sees the original file name. The copy is kept, because the page may read the file
+    lazily after the attach returns."""
     import hashlib
     import shutil
     from pathlib import Path
@@ -818,7 +819,7 @@ def _stage_upload_file(path: str, uploads_dir: str) -> str:
     if source.is_relative_to(root):
         return str(source)
     digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
-    target = root / "hermes" / f"{digest}-{source.name}"
+    target = root / "hermes" / digest / source.name
     if not target.exists():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
@@ -834,6 +835,11 @@ def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[st
         return tool_error("paths must name at least one local file", success=False)
     resolved = []
     for raw in paths:
+        # The raw string is checked before anything touches the filesystem: resolving an NT/device
+        # namespace path can itself trigger outbound SMB auth, and resolving can launder it.
+        blocked = get_read_block_error(str(raw))
+        if blocked:
+            return tool_error(blocked, success=False)
         candidate = str(Path(str(raw)).expanduser().resolve())
         blocked = get_read_block_error(candidate)
         if blocked:
@@ -855,9 +861,27 @@ def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[st
         body["selector"] = selector
 
     def run(session):
+        if ref or selector:
+            # Camofox attaches to the first top-level input[type=file] before it consults the
+            # trigger, so a named trigger in a frame would be bypassed and the file would land on
+            # an unrelated field. Refuse instead of guessing; the evaluate route is optional.
+            try:
+                count = _post(_tab_path(session, "evaluate"), {
+                    "userId": session["user_id"],
+                    "expression": "document.querySelectorAll('input[type=file]').length"}).get("result")
+            except requests.HTTPError as exc:
+                if classify_camofox_http_error(exc, endpoint="evaluate") != "capability":
+                    raise
+                count = None
+            if isinstance(count, int) and count > 0:
+                return tool_error(
+                    f"The top-level page has {count} file input(s); Camofox would attach to the first "
+                    "one instead of the named trigger. Omit ref/selector if that input is the target; "
+                    "otherwise use another upload route.", success=False)
         data = _post(_tab_path(session, "upload"), {"userId": session["user_id"], **body},
                      timeout=max(_get_command_timeout(), _UPLOAD_HTTP_TIMEOUT_S))
-        return json.dumps({"success": bool(data.get("ok", True)), "attached": [Path(p).name for p in resolved],
+        return json.dumps({"success": bool(data.get("ok", True)),
+                           "attached": [Path(p).name for p in server_paths],
                            "via": data.get("via", ""),
                            "note": "Refs changed; take a fresh snapshot, then save and read back the result."})
     return _with_tab(task_id, "upload a file", run)

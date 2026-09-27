@@ -41,6 +41,8 @@ def test_stages_outside_file_into_uploads_root_and_posts_ref(mock_post, monkeypa
     assert body["ref"] == "e7" and "selector" not in body
     (staged,) = body["path"]
     assert staged.startswith(str(root.resolve()))
+    # The page sees the staged file's basename as File.name, so it must be the original name.
+    assert staged.rsplit("/", 1)[-1] == "logo.png"
     with open(staged, "rb") as fh:
         assert fh.read() == src.read_bytes()
 
@@ -91,6 +93,40 @@ def test_rejects_denied_credential_path(mock_post, monkeypatch, tmp_path):
 
     assert result.get("success") is False
     assert "denied" in json.dumps(result).lower()
+    assert mock_post.call_count == calls
+
+
+@patch("tools.browser_camofox.requests.post")
+def test_named_trigger_refused_when_top_page_has_file_input(mock_post, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.setenv("CAMOFOX_UPLOADS_DIR", str(tmp_path / "uploads"))
+    src = tmp_path / "logo.png"
+    src.write_bytes(b"x")
+    _open_tab(mock_post, "up5")
+
+    mock_post.return_value = _resp({"ok": True, "result": 1})
+    result = json.loads(camofox_upload([str(src)], selector="iframe >> internal:control=enter-frame >> #up",
+                                       task_id="up5"))
+
+    assert result.get("success") is False
+    assert "file input" in result["error"]
+    assert not mock_post.call_args.args[0].endswith("/upload")
+
+
+@patch("tools.browser_camofox.requests.post")
+def test_nt_namespace_path_rejected_before_resolve(mock_post, monkeypatch, tmp_path):
+    from pathlib import Path
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.setenv("CAMOFOX_UPLOADS_DIR", str(tmp_path / "uploads"))
+    _open_tab(mock_post, "up6")
+    calls = mock_post.call_count
+
+    def boom(self, *a, **k):
+        raise AssertionError(f"resolve() reached for {self}")
+    monkeypatch.setattr(Path, "resolve", boom)
+    result = json.loads(camofox_upload(["\\\\?\\UNC\\host\\share\\x.png"], task_id="up6"))
+
+    assert result.get("success") is False
     assert mock_post.call_count == calls
 
 

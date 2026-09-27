@@ -555,7 +555,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_upload",
-        "description": "Attach local files to the page's upload control, including one inside a cross-origin iframe, without an OS file dialog. Give the trigger that opens the chooser (the upload button itself, not menu text) as a ref from the snapshot, or as a Playwright selector; for an iframe use 'iframe[src*=\"<host>\"] >> internal:control=enter-frame >> <button selector>'. With neither, the first input[type=file] on the page is used. Afterwards take a fresh snapshot, save, and read back the persisted file.",
+        "description": "Attach local files to the page's upload control, including one inside a cross-origin iframe, without an OS file dialog. Give the trigger that opens the chooser (the upload button itself, not menu text) as a ref from the snapshot, or as a Playwright selector; for an iframe use 'iframe[src*=\"<host>\"] >> internal:control=enter-frame >> <button selector>'. With neither, the first top-level input[type=file] is used. A named trigger is refused when the top-level page has its own file input, because that input would take the file. Afterwards take a fresh snapshot, save, and read back the persisted file.",
         "parameters": {
             "type": "object",
             "properties": {
