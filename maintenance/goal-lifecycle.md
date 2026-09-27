@@ -45,6 +45,22 @@ Failed or interrupted model turns do not run completion judging.
   any post-judge save, so concurrent pause, clear, resume, or set commands remain authoritative.
   Regression: `scripts/run_tests.sh -j 6 tests/hermes_cli/test_goals.py -k concurrent_goal_mutation`.
 
+- Fork patch identity: `goal-judge-evidence`. Own fork patch, no upstream PR yet.
+  The judge receives an evidence ledger: up to 8 recent non-bookkeeping tool
+  results recorded since the goal was set (call, secret-redacted output tail,
+  age), plus every quality gate that just passed. Evidence gathered with tools
+  counts without the agent pasting it into prose. Verification items no command
+  can prove are satisfied by the response stating them. A CONTINUE verdict may
+  carry `disputed: true` when the agent asserts completion the judge rejects;
+  two in a row pause the goal with `judge disputed completion:` so the user
+  chooses `/goal clear` or `/goal resume`. A disputed pause is not revived by
+  ordinary user input. The TUI passes the agent transcript id because its goals
+  are keyed by session key. Prompts without evidence stay byte-identical.
+  Related upstream: issue #70699 and PR #70701 fix response truncation only.
+  Regression: `scripts/run_tests.sh -j 6 tests/hermes_cli/test_goal_judge_evidence.py`,
+  red without the patch. Rollback reverts the source change; old goal rows load
+  with a zero dispute counter and no schema change.
+
 The initial reproduction established missing criteria and paused state after a
 repair turn. Upstream comparison confirmed both and supplied a matching recovery
 implementation. Configuration or plugin changes cannot repair these native judge

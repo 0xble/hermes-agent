@@ -44,12 +44,30 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+# Consecutive CONTINUE verdicts the judge marks ``disputed`` (the agent asserts the goal is done,
+# the judge disagrees) before the loop pauses for the user. Re-poking an agent that believes it is
+# finished only produces restated claims, so a persistent disagreement needs a human decision.
+DEFAULT_MAX_CONSECUTIVE_DISPUTES = 2
+# Evidence ledger: recent tool results recorded while the goal was active, shown to the judge so
+# evidence gathered with tools counts without the agent pasting it into its prose reply.
+_EVIDENCE_MAX_ENTRIES = 8
+_EVIDENCE_SCAN_ROWS = 120
+_EVIDENCE_OUTPUT_CHARS = 800
+_EVIDENCE_CALL_CHARS = 240
+# Bookkeeping and retrieval tools prove nothing about the goal's outcome.
+_EVIDENCE_EXCLUDED_TOOLS = frozenset({
+    "skill_view", "skills_list", "skill_manage", "tool_search", "tool_describe", "memory",
+    "session_search", "todo", "todo_list", "clarify",
+})
+_EVIDENCE_EXCLUDED_TOOL_PREFIXES = ("hindsight_",)
 
 # ``paused_reason`` prefix of the judge's BLOCKED auto-pause. It is the ONE pause kind a real
 # user message may undo (see ``GoalManager.resume_for_user_input``), so it must be
 # distinguishable from user/budget/judge-failure pauses that share ``status="paused"``.
 _BLOCKED_PAUSE_PREFIX = "judge blocked: "
 _LEGACY_BLOCKED_PAUSE_PREFIX = "judged unachievable: "
+# ``paused_reason`` prefix of the dispute stall-breaker pause (agent says done, judge disagrees).
+_DISPUTED_PAUSE_PREFIX = "judge disputed completion: "
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
@@ -119,8 +137,11 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
-    "most recent response, and — when present — a list of background "
-    "processes the agent has running. Decide one of four verdicts.\n\n"
+    "most recent response, and — when present — tool results the runtime "
+    "recorded while the goal was active and a list of background processes "
+    "the agent has running. Recorded tool results come from the tool layer, "
+    "not the agent's prose, so they count as concrete evidence even when the "
+    "response only summarizes them. Decide one of four verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced.\n"
@@ -167,11 +188,15 @@ JUDGE_SYSTEM_PROMPT = (
     "busy-work because the agent can't progress until the async thing "
     "finishes.\n\n"
     "CONTINUE — not done, and there is a concrete next step the agent can "
-    "take right now. This is the default when in doubt.\n\n"
+    "take right now. This is the default when in doubt. When you return "
+    "CONTINUE although the response asserts the goal is already complete, "
+    "add \"disputed\": true and name the exact missing evidence in the "
+    "reason.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "blocked", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
+    '{"verdict": "continue", "disputed": true, "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_for_seconds": <int>, "reason": "<one sentence>"}\n'
@@ -191,9 +216,19 @@ JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
     "on one of these):\n{background_lines}\n\n"
 )
 
+# Judge prompt block for the evidence ledger (empty when nothing was recorded, so prompts without
+# evidence stay byte-identical).
+JUDGE_EVIDENCE_BLOCK_TEMPLATE = (
+    "Tool results recorded by the runtime while this goal was active (oldest "
+    "first; authoritative, not written by the agent). Treat them as concrete "
+    "evidence: the response does not need to repeat them. Weigh their age, "
+    "since a later change can make an earlier result stale:\n{evidence_lines}\n\n"
+)
+
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Is the goal satisfied — done, blocked, continue, or wait?"
@@ -205,14 +240,15 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Additional criteria the user added mid-loop (all must also be "
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision: For each numbered criterion above, find concrete "
-    "evidence in the agent's response that the criterion is "
+    "evidence in the agent's response or the recorded tool results that the criterion is "
     "satisfied. Do not accept generic phrases like 'all requirements "
     "met' or 'implying it was done' — require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
-    "ANY criterion lacks specific evidence in the response, the goal "
+    "ANY criterion lacks specific evidence in the response or the recorded tool results, the goal "
     "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
     "background process).\n\n"
     "Is the goal AND every additional criterion satisfied?"
@@ -224,13 +260,17 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Completion contract (the authoritative definition of done):\n"
     "{contract_block}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision rules:\n"
     "- The goal is DONE only when the Verification criterion is satisfied AND "
-    "the response shows concrete evidence of it (a command result, file "
-    "contents excerpt, test/benchmark output) — not a claim like 'done' or "
-    "'all tests pass' without evidence.\n"
+    "the response or the recorded tool results show concrete evidence of it "
+    "(a command result, file contents excerpt, test/benchmark output) — not a "
+    "claim like 'done' or 'all tests pass' with no supporting evidence.\n"
+    "- Verification items no command can prove (a human review, a report to "
+    "the user) are satisfied by the response stating them, unless the "
+    "evidence contradicts it.\n"
     "- If any stated Constraint was violated, the goal is NOT done — CONTINUE.\n"
     "- If the response shows the agent is waiting on a listed background "
     "process to satisfy the Verification criterion (e.g. CI is the "
@@ -417,6 +457,8 @@ class GoalState:
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
+    # CONTINUE verdicts in a row where the judge disputed the agent's completion claim.
+    consecutive_disputes: int = 0
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -444,7 +486,9 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations")}
+        ints = {k: int(data.get(k) or 0) for k in (
+            "turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_disputes",
+            "waiting_on_delegations")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -926,8 +970,17 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return value is True
+
+
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Parse the judge's reply, fail-open. Returns ``(verdict, reason, parse_failed, wait_directive)``.
+
+    For a ``continue`` verdict the directive is ``{"disputed": True}`` when the judge flags that the
+    agent claimed completion it could not verify, else None.
 
     ``parse_failed`` flags non-JSON output so callers can auto-pause after N in a row.
     ``wait_directive`` is ``{"session_id"}`` / ``{"pid"}`` / ``{"seconds"}`` for a ``wait``
@@ -950,6 +1003,10 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
         verdict = "done" if done else "continue"
     if verdict not in {"done", "blocked", "continue", "wait"}:
         verdict = "continue"
+    if verdict == "continue" and _truthy(data.get("disputed")):
+        # The directive slot carries the dispute flag for CONTINUE (it is only read as a wait
+        # target when verdict == "wait"), keeping the judge's 5-tuple contract unchanged.
+        return verdict, reason, False, {"disputed": True}
     if verdict != "wait":
         return verdict, reason, False, None
 
@@ -1006,6 +1063,87 @@ def _render_background_block(background_processes: Optional[List[Dict[str, Any]]
     return JUDGE_BACKGROUND_BLOCK_TEMPLATE.format(background_lines="\n".join(lines))
 
 
+def _evidence_tool_excluded(name: str) -> bool:
+    return name in _EVIDENCE_EXCLUDED_TOOLS or name.startswith(_EVIDENCE_EXCLUDED_TOOL_PREFIXES)
+
+
+def _one_line(text: Any, limit: int) -> str:
+    return _truncate(" ".join(str(text or "").split()), limit)
+
+
+def _tail(text: str, limit: int) -> str:
+    """Last ``limit`` chars: command verdicts (exit codes, pass/fail summaries) sit at the end."""
+    return text if len(text) <= limit else "[…] " + text[-limit:]
+
+
+def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
+                          max_entries: int = _EVIDENCE_MAX_ENTRIES) -> List[Dict[str, Any]]:
+    """Recent tool results from ``session_id`` recorded at or after ``since`` (oldest first).
+
+    Each entry is ``{"tool", "call", "output", "timestamp"}``: the tool name, its arguments (from the
+    matching assistant tool call), and a secret-redacted tail of the recorded output. Fail-safe: any
+    error yields ``[]`` so the judge falls back to the response alone.
+    """
+    if not session_id:
+        return []
+    db = _get_session_db()
+    if db is None:
+        return []
+    try:
+        rows = db.get_messages(session_id, limit=_EVIDENCE_SCAN_ROWS, latest=True)
+    except Exception as exc:
+        logger.debug("goal evidence: message read failed: %s", exc)
+        return []
+    calls: Dict[str, Tuple[str, str]] = {}
+    for row in rows:
+        for call in (row.get("tool_calls") or []) if row.get("role") == "assistant" else []:
+            try:
+                fn = call.get("function") or {}
+                calls[str(call.get("id") or "")] = (str(fn.get("name") or ""), str(fn.get("arguments") or ""))
+            except Exception:
+                continue
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception:  # pragma: no cover - redaction module is part of the runtime
+        redact_sensitive_text = None
+    entries: List[Dict[str, Any]] = []
+    for row in rows:
+        if row.get("role") != "tool" or float(row.get("timestamp") or 0.0) < since:
+            continue
+        name, args = calls.get(str(row.get("tool_call_id") or ""), (str(row.get("tool_name") or ""), ""))
+        name = name or str(row.get("tool_name") or "") or "tool"
+        if _evidence_tool_excluded(name):
+            continue
+        content = row.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        call_text, output = _one_line(args, _EVIDENCE_CALL_CHARS), _tail(content.strip(), _EVIDENCE_OUTPUT_CHARS)
+        if redact_sensitive_text is not None:
+            call_text = redact_sensitive_text(call_text, force=True)
+            output = redact_sensitive_text(output, force=True)
+        entries.append({"tool": name, "call": call_text, "output": output,
+                        "timestamp": float(row.get("timestamp") or 0.0)})
+    return entries[-max_entries:]
+
+
+def _render_evidence_block(evidence: Optional[List[Dict[str, Any]]], now: Optional[float] = None) -> str:
+    """Judge prompt block for the evidence ledger; empty when there is none."""
+    lines: List[str] = []
+    now = time.time() if now is None else now
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        age = max(0, int(now - float(item.get("timestamp") or now)))
+        head = f"- {item.get('tool') or 'tool'} ({age}s ago)"
+        if item.get("call"):
+            head += f": {item['call']}"
+        output = str(item.get("output") or "").strip() or "(no output)"
+        lines.append(f"{head}\n  output: {output}")
+    if not lines:
+        return ""
+    return JUDGE_EVIDENCE_BLOCK_TEMPLATE.format(evidence_lines="\n".join(lines))
+
+
 def _call_goal_judge_llm(call_llm, system_prompt: str, user_prompt: str, timeout: Optional[float]) -> str:
     """Route through call_llm so auxiliary.goal_judge.* config (provider/model, extra_body,
     reasoning_effort, retries) all apply. Returns the raw reply text."""
@@ -1031,8 +1169,12 @@ def judge_goal(
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    evidence: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
+
+    ``evidence`` is the ledger from :func:`collect_goal_evidence`: tool results the runtime recorded,
+    shown to the judge so verification gathered with tools counts without being pasted into prose.
 
     Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)``; verdict is done /
     blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
@@ -1060,6 +1202,7 @@ def judge_goal(
     common = dict(
         goal=goal,
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        evidence_block=_render_evidence_block(evidence),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
         current_time=safe_strftime(datetime.now(tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M:%S %Z"),
@@ -1329,6 +1472,7 @@ class GoalManager:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        self._state.consecutive_disputes = 0
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
@@ -1679,10 +1823,14 @@ class GoalManager:
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
+        evidence_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
-        own continuations increment ``turns_used`` — both consume model budget."""
+        own continuations increment ``turns_used`` — both consume model budget.
+
+        ``evidence_session_id`` names the transcript whose tool results feed the judge's evidence
+        ledger when it differs from the goal's key (the TUI keys goals by session key)."""
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
@@ -1703,9 +1851,18 @@ class GoalManager:
             return gate_decision
 
         persisted_before_judge = load_goal(self.session_id)
+        evidence = collect_goal_evidence(evidence_session_id or self.session_id, since=state.created_at)
+        # Gates that just passed are deterministic evidence too; before this they only vetoed DONE.
+        now = time.time()
+        evidence += [
+            {"tool": "quality gate", "call": f"$ {g.command}", "timestamp": now,
+             "output": f"exit {g.last_exit_code} (passed)\n{_tail((g.last_output_tail or '').strip(), _EVIDENCE_OUTPUT_CHARS)}".strip()}
+            for g in state.gates
+        ]
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
+            evidence=evidence or None,
         )
         concurrent_decision = self._state_changed_during_judge(persisted_before_judge)
         if concurrent_decision is not None:
@@ -1717,6 +1874,8 @@ class GoalManager:
         # separately because persistent API errors (401, DNS) mean a broken config.
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
+        disputed = verdict == "continue" and bool((wait_directive or {}).get("disputed"))
+        state.consecutive_disputes = state.consecutive_disputes + 1 if disputed else 0
 
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
@@ -1753,6 +1912,16 @@ class GoalManager:
                 f"⏸ Goal paused — the judge model ({n_parse} turns) isn't returning the required JSON verdict. "
                 "Route the judge to a stricter model in "
                 + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
+            )
+
+        # Stall breaker: the agent keeps asserting completion and the judge keeps rejecting it.
+        # Another continuation only yields a restated claim, so the user decides.
+        if state.consecutive_disputes >= DEFAULT_MAX_CONSECUTIVE_DISPUTES:
+            return self._pause_decision(
+                f"{_DISPUTED_PAUSE_PREFIX}{reason}", "disputed", reason,
+                f"⏸ Goal paused — the agent reports the goal is complete, but the judge disagreed "
+                f"{state.consecutive_disputes} turns in a row: {reason} "
+                "Use /goal clear if it is done, or /goal resume to keep going.",
             )
 
         if state.turns_used >= state.max_turns:

@@ -378,8 +378,10 @@ def _goal_followup_after_turn(
                 _active_deleg = count_active_delegations(getattr(session.get("agent"), "session_id", None))
             except Exception:
                 _bg_procs = None
+            # Goals are keyed by session_key; tool results live under the agent's transcript id.
             decision = goal_mgr.evaluate_after_turn(
-                raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+                raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg,
+                evidence_session_id=getattr(session.get("agent"), "session_id", None) or None)
             if verdict_msg := decision.get("message") or "":
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
