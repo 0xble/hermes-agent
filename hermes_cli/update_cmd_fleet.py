@@ -2038,8 +2038,9 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
         _fleet_rows_expected = _m()._fleet_probe_expected_runtimes(
             _pre_update_plan, _pre_restart, _windows_gateway_resume, restart.restarted_services, _killed,
         )
-        _fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected, expected_sha=expected_sha,
-                                                  expected_root=expected_root)
+        overrides = ({"expected_sha": expected_sha, "expected_root": expected_root}
+                     if expected_sha is not None or expected_root is not None else {})
+        _fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected, **overrides)
         if print_fleet_version_matrix(_fleet_snapshot):
             restart.incomplete = True
             # A proven-stale survivor must not keep running (its ticker yields every tick and

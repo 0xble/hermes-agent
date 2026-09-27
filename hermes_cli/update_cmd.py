@@ -121,19 +121,27 @@ def _m():
     return main
 
 
-def _activate_immutable_release() -> bool:
-    """Stage and promote the fetched checkout through the normal update receipt."""
+def _activate_immutable_release(*, defer: bool = False) -> bool:
+    """Stage an opted-in layout; only promote/reload with restart authorization."""
     from hermes_cli.immutable_releases import (
         ReleasePaths, begin_migration, promote, read_pointer, release_sha, stage_release,
     )
     home = get_hermes_home()
+    paths = ReleasePaths.for_home(home)
+    # The first migration changes launchd's executable and must be deliberate.
+    # Normal updates on an existing checkout must not create releases/ or a plist.
+    if read_pointer(paths.current) is None and not _updates_config().get("immutable_releases", False):
+        _record_update_step("immutable_release", True, "skipped: release layout not opted in")
+        return True
     try:
         sha = release_sha(_m().PROJECT_ROOT)
         if not sha:
             _record_update_step("immutable_release", True, "skipped: no git revision in mocked/non-git checkout")
             return True
         candidate, action = stage_release(_m().PROJECT_ROOT, home, sha=sha)
-        paths = ReleasePaths.for_home(home)
+        if defer:
+            _record_update_step("immutable_release", True, f"staged: {candidate}; activation deferred")
+            return True
         old_current, old_previous = read_pointer(paths.current), read_pointer(paths.previous)
         first = old_current is None
         plist = None
@@ -1382,11 +1390,8 @@ def _finish_already_up_to_date(
             _write_gateway_update_exit_code(False)
         _finalize_receipt("partial", 'Update receipt finalize (current checkout) failed: %s')
         sys.exit(1)
-    if not _activate_immutable_release():
-        if gateway_mode:
-            _write_gateway_update_exit_code(False)
-        _finalize_receipt("partial", "Immutable release migration failed: %s")
-        sys.exit(1)
+    # No new commit was pulled: never migrate/reload launchd on a repair/no-op.
+    # The pending fleet restart above remains the sole catch-up authority.
 
 
 def _apply_pulled_update(
@@ -1576,14 +1581,15 @@ def _finish_pulled_update(
         git_cmd, branch, pre_pull_sha, active_lazy_features=opts.active_lazy_features,
         active_tool_dependencies=opts.active_tool_dependencies,
         _windows_gateway_resume=_windows_gateway_resume)
-    if not _activate_immutable_release():
+    node_failures = _update_node_dependencies()
+    web_build_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    # Freeze generated assets only after the build. A failed build cannot mark a
+    # potentially stale candidate ready for promotion.
+    if web_build_ok and not node_failures and not _activate_immutable_release(defer=opts.no_gateway_restart):
         if gateway_mode:
             _write_gateway_update_exit_code(False)
         _finalize_receipt("partial", "Immutable release staging failed: %s")
         sys.exit(1)
-
-    node_failures = _update_node_dependencies()
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
     desktop_build_ok = _rebuild_desktop_after_update(
         desktop_dir, had_desktop_app_before_update=had_desktop_app_before_update)
 

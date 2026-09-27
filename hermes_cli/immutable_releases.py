@@ -227,6 +227,11 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
         # nested in the checkout cannot enter the artifact or recurse into itself.
         if (source / ".git").exists():
             _stage_git_tree(source, staging, sha)
+            # The web bundle is generated after dependency sync, not tracked in
+            # Git. Carry only this declared build output, never arbitrary caches.
+            bundle = source / "hermes_cli" / "web_dist"
+            if bundle.is_dir():
+                shutil.copytree(bundle, staging / "hermes_cli" / "web_dist", dirs_exist_ok=True)
         else:
             _copy_tree(source, staging, home=paths.home)
         if target.exists():

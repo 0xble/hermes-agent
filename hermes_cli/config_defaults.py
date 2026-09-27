@@ -2337,6 +2337,9 @@ DEFAULT_CONFIG = {
     },
 
     "updates": {
+        # First immutable-release migration is an explicit config decision. Once
+        # current points to a release, normal updates continue that layout.
+        "immutable_releases": False,
         # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
         "check": True,
         # Pre-update backup. quick = snapshot small critical state (pairing JSONs, cron jobs,

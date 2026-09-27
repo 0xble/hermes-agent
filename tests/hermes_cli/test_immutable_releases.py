@@ -59,6 +59,39 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     assert releases.stage_release(source, home)[1] == "existing"
 
 
+def test_normal_update_without_layout_opt_in_does_not_touch_release_or_plist(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd, gateway
+    home = tmp_path / "profile"
+    home.mkdir()
+    plist = tmp_path / "service.plist"
+    plist.write_bytes(b"original")
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {})
+    monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", lambda: pytest.fail("launchd touched"))
+    monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: pytest.fail("release staged"))
+    assert update_cmd._activate_immutable_release()
+    assert not (home / "releases").exists()
+    assert plist.read_bytes() == b"original"
+
+
+def test_deferred_update_stages_without_promoting_or_reloading(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd, gateway
+    home = tmp_path / "profile"
+    previous = home / "releases" / "a"
+    candidate = home / "releases" / "b"
+    _fake_release(previous, "a")
+    _fake_release(candidate, "b")
+    releases.promote(home, previous)
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(releases, "release_sha", lambda _: "b")
+    monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: (candidate, "existing"))
+    monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", lambda: pytest.fail("launchd touched"))
+    assert update_cmd._activate_immutable_release(defer=True)
+    assert (home / "current").resolve() == previous
+    assert not (home / "previous").exists()
+
+
 def test_promote_is_atomic_and_rollback_round_trip(tmp_path):
     home = tmp_path / ".hermes"
     a, b = home / "releases" / "a", home / "releases" / "b"
