@@ -22,16 +22,22 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_cli import immutable_releases as releases
+from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _sweep_disposable_jobs(request):
+    sweep_prior_sessions(request)
 
 
 # The tags are durable mutation destinations, not line numbers. Occurrence 2 of
 # release-txn.json is the post-reload acknowledgement (or migration intent).
 # Crash strictly *after* the actual syscall; no finally/exception repair runs.
 _STEPS = {
-    "promote": ("backup", "txn", "previous", "current", "plist", "loaded", "ack", "last", "delete-txn", "delete-backup"),
-    "rollback": ("backup", "txn", "previous", "current", "plist", "loaded", "ack", "last", "delete-txn", "delete-backup"),
-    "migration": ("backup", "txn", "journal", "previous", "current", "plist", "loaded", "ack", "last", "delete-txn", "delete-backup"),
-    "migration_rollback": ("backup", "txn", "current", "previous", "journal", "plist", "loaded", "ack", "last", "delete-txn", "delete-backup"),
+    "promote": ("backup", "txn", "previous", "current", "plist", "issued", "loaded", "ack", "last", "delete-txn", "delete-backup"),
+    "rollback": ("backup", "txn", "previous", "current", "plist", "issued", "loaded", "ack", "last", "delete-txn", "delete-backup"),
+    "migration": ("backup", "txn", "journal", "previous", "current", "plist", "issued", "loaded", "ack", "last", "delete-txn", "delete-backup"),
+    "migration_rollback": ("backup", "txn", "current", "previous", "journal", "plist", "issued", "loaded", "ack", "last", "delete-txn", "delete-backup"),
 }
 
 _CHILD = r'''
@@ -50,7 +56,7 @@ def hit(kind, target):
         if kind == 'unlink': tag = 'delete-txn'
         else:
             seen['txn'] = seen.get('txn', 0) + 1
-            tag = 'txn' if seen['txn'] == 1 else 'ack'
+            tag = 'txn' if seen['txn'] == 1 else 'issued' if seen['txn'] == 2 else 'ack'
     elif target == home / 'release-last-txn.json' and kind == 'replace': tag = 'last'
     elif kind == 'replace' and target == home / 'release-layout.json': tag = 'journal'
     elif target == home / 'current': tag = 'current'
@@ -209,7 +215,9 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
            *, real=False, checkpoint=None):
     from hermes_cli import gateway, gateway_launchd, update_cmd
     real_reload = gateway_launchd._reload_installed_launchd_plist
+    callbacks = []
     def reload():
+        callbacks.append(1)
         if real:
             assert real_reload(plist)
         (home / "loaded").write_bytes(plist.read_bytes())
@@ -236,6 +244,13 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: plist.stem)
     monkeypatch.setattr(gateway, "_launchd_domain", lambda: f"gui/{os.getuid()}")
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: reload())
+    if checkpoint == "issued":
+        record = releases._read_txn(releases.ReleasePaths.for_home(home))
+        assert record is not None and record["reload_issued"]["attempt"] == 1
+        pending = releases.recover_pending_transaction(home, reload_callback=reload)
+        assert pending is not None and pending["reload_pending"] and callbacks == []
+        # Explicit operator repair, not recovery, makes the target observable.
+        (home / "loaded").write_bytes(plist.read_bytes())
     if scenario in ("promote", "migration"):
         monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
         monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
@@ -245,6 +260,8 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
         assert update_cmd._activate_immutable_release(sha="B", source=source)
     else:
         releases.rollback(home, plist_path=plist, plist_body=original, reload_callback=reload)
+    assert callbacks == ([] if checkpoint in {"issued", "loaded", "ack", "last", "delete-txn", "delete-backup"}
+                         else [1])
     expected = ((b, source, "done") if scenario == "migration" else
                 (None, None, "rolled-back") if scenario == "migration_rollback" else
                 (b, a, None) if scenario == "promote" else (a, b, None))
@@ -304,7 +321,7 @@ def test_crash_after_each_durable_mutation(tmp_path, monkeypatch, scenario, chec
 @pytest.mark.parametrize("scenario,checkpoint", [("migration", "plist"), ("migration", "loaded"),
                                                  ("migration_rollback", "plist"),
                                                  ("migration_rollback", "loaded")])
-def test_disposable_launchd_first_migration_and_rollback(tmp_path, monkeypatch, scenario, checkpoint):
+def test_disposable_launchd_first_migration_and_rollback(tmp_path, monkeypatch, request, scenario, checkpoint):
     """Crash across installed-vs-loaded boundary; inspect only a UUID launchctl target."""
     home, source, plist, a, b, source_sha, original, intended = _fixture(tmp_path, scenario, real=True)
     domain = f"gui/{os.getuid()}"
@@ -317,6 +334,7 @@ def test_disposable_launchd_first_migration_and_rollback(tmp_path, monkeypatch, 
                 return
             time.sleep(.1)
         raise AssertionError(f"launchd did not load {root} for {target}")
+    register_disposable_label(request, plist.stem, plist)
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
         wait_for(source if scenario == "migration" else b)
@@ -338,7 +356,7 @@ def test_disposable_launchd_first_migration_and_rollback(tmp_path, monkeypatch, 
 @pytest.mark.macos_only
 @pytest.mark.parametrize("failure", ["submit", "bootstrap"])
 def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_starts(
-    tmp_path, monkeypatch, failure
+    tmp_path, monkeypatch, request, failure
 ):
     """A failed helper/bootout-bootstrap cannot commit a release transaction."""
     from hermes_cli import gateway, gateway_launchd
@@ -359,6 +377,7 @@ def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_sta
             time.sleep(.05)
         raise AssertionError(f"no intended process at {root} for {target}")
 
+    register_disposable_label(request, plist.stem, plist)
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
         wait_for(a)
@@ -493,8 +512,9 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
     assert releases.read_pointer(home / "previous") == a
     monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_: False)
     if reason == "unobserved":
-        again = releases.recover_pending_transaction(home, reload_callback=lambda: "deferred")
-        assert again["reload_pending"] and txn.exists()
+        repeated = []
+        again = releases.recover_pending_transaction(home, reload_callback=lambda: repeated.append(1) or "deferred")
+        assert again is not None and again["reload_pending"] and txn.exists() and repeated == []
     def observed_ack(path):
         paths = releases.ReleasePaths.for_home(path)
         record = releases._read_txn(paths)

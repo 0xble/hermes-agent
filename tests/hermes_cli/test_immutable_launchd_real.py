@@ -13,6 +13,12 @@ import pytest
 
 from hermes_cli import gateway, gateway_launchd
 from hermes_cli.immutable_releases import promote
+from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _sweep_disposable_jobs(request):
+    sweep_prior_sessions(request)
 
 
 def _ack_observed_probe(releases, home, plist_path, output, *, gateway_pid=None):
@@ -59,7 +65,7 @@ def _ack_observed_probe(releases, home, plist_path, output, *, gateway_pid=None)
 
 
 @pytest.mark.macos_only
-def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch):
+def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch, request):
     home = tmp_path / "profile"
     label = f"ai.hermes.s2spike.{uuid.uuid4().hex}"
     domain = f"gui/{os.getuid()}"
@@ -141,6 +147,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         raise AssertionError(f"no launchd process for {name}; logs: {list(logs.glob('*'))}")
 
     target = f"{domain}/{label}"
+    register_disposable_label(request, label, path)
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True, timeout=15)
         a = observed("B")
@@ -232,7 +239,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
 
 
 @pytest.mark.macos_only
-def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_path, monkeypatch):
+def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_path, monkeypatch, request):
     """Updater promotion and reversal reload one throwaway job, never the live label."""
     from hermes_cli import gateway_launchd, immutable_releases as releases, update_cmd, update_receipt
 
@@ -333,6 +340,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
             time.sleep(.1)
         raise AssertionError(f"{name} did not start through launchd")
 
+    register_disposable_label(request, label, plist_path)
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=15)
         a = observed("source")
@@ -361,8 +369,18 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", real_reload)
         monkeypatch.setattr(releases, "acknowledge_running_release",
                             lambda path_home: _ack_observed_probe(releases, path_home, plist_path, output))
+        # The failed callback already has a durable issued marker. An operator
+        # explicitly repairs this disposable label after inspecting its old PID;
+        # the updater retry must only observe, never invoke reload again.
+        assert real_reload(plist_path)
+        observed(sha_b, a["pid"])
+        repeated = []
+        monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
+                            lambda path: repeated.append(path) or False)
         update_receipt.begin_update_receipt()
         assert update_cmd._activate_immutable_release(sha=sha_b)
+        assert repeated == []
+        monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", real_reload)
         updated_receipt = update_receipt.finalize_update_receipt("success")
         assert updated_receipt is not None
         recorded = json.loads(updated_receipt.read_text(encoding="utf-8"))

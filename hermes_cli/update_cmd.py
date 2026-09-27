@@ -183,7 +183,7 @@ def _finish_pending_release_transaction(home: Path | None = None) -> dict | None
     callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist else None
     result = recover_pending_transaction(home, reload_callback=callback)
     if result and result.get("reload_pending"):
-        raise RuntimeError("release reload pending: intended launchd gateway has not acknowledged startup; retry a restart-authorized update or restart the gateway")
+        raise RuntimeError("release reload pending: intended launchd gateway has not acknowledged startup; recovery is observation-only after reload_issued. Inspect the label and plist; if no process exists, use an explicit operator-controlled service repair")
     return result
 
 
@@ -1414,19 +1414,19 @@ class _ReleaseReconcileState:
 _RELEASE_RECONCILE_TABLE = (
     (("*", "*", "*", "*", "*", "*", "*", True), "complete-transaction"),
     # Disabled legacy/reversed layouts never implicitly migrate or repair.
-    ((False, "absent", "*", "none", "*", "*", "*"), "no-op"),
-    ((False, "absent", "*", "rolled-back", "*", "*", "*"), "no-op"),
-    (("*", "equal", "none", "*", "*", "*", "*"), "fail-with-message"),
-    (("*", "equal", "failed-partial", "*", "*", "*", "*"), "fail-with-message"),
-    (("*", "equal", "*", "*", "none", "none", "*"), "no-op"),
-    (("*", "equal", "*", "*", "current", "none", "*"), "no-op"),
-    (("*", "equal", "*", "*", "none", "current", "*"), "no-op"),
-    (("*", "equal", "*", "*", "current", "current", "*"), "no-op"),
-    (("*", "equal", "*", "*", "*", "*", True), "defer-record"),
-    (("*", "equal", "*", "*", "*", "*", False), "repair-service"),
-    (("*", "*", "*", "*", "*", "*", True), "defer-record"),
-    (("*", "*", "staged", "*", "*", "*", False), "activate-staged"),
-    (("*", "*", "*", "*", "*", "*", False), "build+activate"),
+    ((False, "absent", "*", "none", "*", "*", "*", False), "no-op"),
+    ((False, "absent", "*", "rolled-back", "*", "*", "*", False), "no-op"),
+    (("*", "equal", "none", "*", "*", "*", "*", False), "fail-with-message"),
+    (("*", "equal", "failed-partial", "*", "*", "*", "*", False), "fail-with-message"),
+    (("*", "equal", "*", "*", "none", "none", "*", False), "no-op"),
+    (("*", "equal", "*", "*", "current", "none", "*", False), "no-op"),
+    (("*", "equal", "*", "*", "none", "current", "*", False), "no-op"),
+    (("*", "equal", "*", "*", "current", "current", "*", False), "no-op"),
+    (("*", "equal", "*", "*", "*", "*", True, False), "defer-record"),
+    (("*", "equal", "*", "*", "*", "*", False, False), "repair-service"),
+    (("*", "*", "*", "*", "*", "*", True, False), "defer-record"),
+    (("*", "*", "staged", "*", "*", "*", False, False), "activate-staged"),
+    (("*", "*", "*", "*", "*", "*", False, False), "build+activate"),
 )
 
 
@@ -1436,9 +1436,10 @@ def _reconcile_immutable_release(state: _ReleaseReconcileState) -> str:
             ((state.current == "absent" and (state.service == "current" or state.running == "current"))
              or (state.current == "different" and state.journal == "none"))):
         raise ValueError(f"unreachable immutable release state: {state}")
-    axes = tuple(vars(state).values())
+    fields = tuple(_ReleaseReconcileState.__dataclass_fields__)
     for pattern, action in _RELEASE_RECONCILE_TABLE:
-        if all(want == "*" or want == actual for want, actual in zip(pattern, axes)):
+        constraints = dict(zip(fields, pattern, strict=True))
+        if all(want == "*" or want == getattr(state, name) for name, want in constraints.items()):
             return action
     raise ValueError(f"unreachable immutable release state: {state}")
 
@@ -1450,7 +1451,8 @@ def _release_service_state(paths, current) -> str:
     plist = gateway.get_launchd_plist_path()
     if not plist.exists():
         return "none"
-    if current is not None and gateway.launchd_plist_is_current():
+    if current is not None and gateway.launchd_plist_is_current(
+            release_target=current if current.parent == paths.releases.resolve() else None):
         return "current" if current.parent == paths.releases.resolve() else "source"
     from hermes_cli.immutable_releases import migration_plist
     journal = paths.home / "release-layout.json"

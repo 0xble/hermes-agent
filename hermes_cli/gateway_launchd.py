@@ -209,9 +209,9 @@ def _launchd_unsupported_marker_exists() -> bool:
     return _launchd_unsupported_marker_path().exists()
 
 
-def _gateway_run_command() -> list[str]:
-    """Build ``python -m hermes_cli.main [--profile X] gateway run --replace``, honoring the active profile."""
-    return [_gw().get_python_path(), "-m", "hermes_cli.main", *_gw()._profile_arg().split(), "gateway", "run", "--replace"]
+def _gateway_run_command(*, interpreter: str | None = None) -> list[str]:
+    """Build ``python -m hermes_cli.main [--profile X] gateway run --replace``."""
+    return [interpreter or _gw().get_python_path(), "-m", "hermes_cli.main", *_gw()._profile_arg().split(), "gateway", "run", "--replace"]
 
 
 def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: Path) -> list[str]:
@@ -237,7 +237,8 @@ def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: 
     return ["/usr/bin/osascript", "-e", f'do shell script "{applescript}"']
 
 
-def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor: bool = False) -> list[str]:
+def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor: bool = False,
+                                        interpreter: str | None = None) -> list[str]:
     """Wrap gateway run so raw stderr lines are timestamped before file write. ``external_supervisor``
     (launchd ProgramArguments only) adds ``--external-supervisor`` so ``hermes update`` hands back to
     launchd, and drops ``--replace``: KeepAlive respawns would re-arm takeover, so two profiles sharing
@@ -254,12 +255,13 @@ def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor:
     bootout+bootstrap in install/refresh), which run before supervision resumes. Mirrors
     ``generate_systemd_unit``, whose ExecStart also runs ``gateway run`` without ``--replace``.
     """
-    inner = _gw()._gateway_run_command()
+    inner = (_gw()._gateway_run_command() if interpreter is None else
+             _gateway_run_command(interpreter=interpreter))
     if external_supervisor:
         inner = [part for part in inner if part != "--replace"]
         if "--external-supervisor" not in inner:
             inner.append("--external-supervisor")
-    return [_gw().get_python_path(), "-m", "hermes_cli.stderr_timestamp", "--error-log", str(error_log), "--", *inner]
+    return [interpreter or _gw().get_python_path(), "-m", "hermes_cli.stderr_timestamp", "--error-log", str(error_log), "--", *inner]
 
 
 def _spawn_detached_gateway() -> bool:
@@ -357,14 +359,10 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
-    command = (_timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
-               if release_target is None else [
-                   str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python"),
-                   "-m", "hermes_cli.stderr_timestamp", "--error-log", str(stderr_log), "--",
-                   str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python"),
-                   "-m", "hermes_cli.main", *_gw()._profile_arg().split(),
-                   "gateway", "run", "--external-supervisor",
-               ])
+    interpreter = (str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python")
+                   if release_target else None)
+    command = _timestamped_stderr_gateway_command(
+        stderr_log, external_supervisor=True, interpreter=interpreter)
     prog_args_xml = "\n        ".join(
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
     )
@@ -456,14 +454,19 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
 """
 
 
-def launchd_plist_is_current() -> bool:
-    """Check if the installed launchd plist matches the currently generated one."""
+def launchd_plist_is_current(release_target: Path | None = None) -> bool:
+    """Check installed definition against the active rendering."""
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists():
         return False
+    if release_target is None:
+        from hermes_cli.immutable_releases import resolved_release
+        release_target = resolved_release(_gw().get_hermes_home())
     installed = plist_path.read_text(encoding="utf-8")
     norm = _gw()._normalize_launchd_plist_for_comparison
-    return norm(installed) == norm(_gw().generate_launchd_plist())
+    expected = (_gw().generate_launchd_plist(release_target=release_target) if release_target
+                else _gw().generate_launchd_plist())
+    return norm(installed) == norm(expected)
 
 
 def _spawn_deferred_launchd_reload(
@@ -546,24 +549,6 @@ def refresh_launchd_plist_if_needed() -> bool | str:
 
     plist_path.write_text(new_plist, encoding="utf-8")
     return _reload_installed_launchd_plist(plist_path)
-
-
-def restore_launchd_plist(body: bytes) -> bool | str:
-    """Restore the original source-checkout definition and re-register its exact bytes."""
-    import plistlib
-    path = _gw().get_launchd_plist_path()
-    definition = plistlib.loads(body)
-    if (definition.get("Label") != _gw().get_launchd_label()
-            or Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve()
-            != _gw().get_hermes_home().resolve()):
-        raise RuntimeError("source plist label/home do not match this gateway")
-    temp = path.with_name(f".{path.name}.restore-{os.getpid()}")
-    try:
-        temp.write_bytes(body)
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
-    return _reload_installed_launchd_plist(path)
 
 
 def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:

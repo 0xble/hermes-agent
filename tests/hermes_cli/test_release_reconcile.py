@@ -106,7 +106,7 @@ def test_equal_pointer_with_stale_service_repairs_on_noop(tmp_path, monkeypatch)
     plist = tmp_path / "service.plist"
     plist.write_text("source")
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
-    monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist.read_text() == "release")
+    monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda **kwargs: plist.read_text() == "release")
     monkeypatch.setattr(gateway, "generate_launchd_plist", lambda release_target=None: "release")
     reloads = []
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",

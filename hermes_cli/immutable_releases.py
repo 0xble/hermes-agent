@@ -20,6 +20,7 @@ import re
 import tomllib
 import plistlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, Any
 
@@ -106,11 +107,12 @@ def _stage_git_tree(source: Path, staging: Path, sha: str) -> None:
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         for member in tar.getmembers():
             dest = (staging / member.name).resolve()
-            if staging.resolve() not in dest.parents and dest != staging.resolve():
-                raise RuntimeError("unsafe git archive path")
-            if member.issym() or member.islnk():
-                raise RuntimeError("release archive contains symlink")
-        tar.extractall(staging, filter="data")
+            if (member.name.startswith("/") or ".." in Path(member.name).parts
+                    or staging.resolve() not in dest.parents or not (member.isfile() or member.isdir())):
+                raise RuntimeError("unsafe git archive member")
+        # The explicit file/directory-only validation also covers Python 3.11
+        # before tarfile's data filter became available (3.11.4).
+        tar.extractall(staging)
 
 
 def _atomic_symlink(link: Path, target: Path) -> None:
@@ -745,7 +747,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
                      reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
     operation = record["operation"]
     if (record.get("requires_reload") and reload_callback is None
-            and not record.get("reload_done")
+            and not record.get("reload_done") and not record.get("reload_issued")
             and not (operation == "first-migration" and record.get("candidate") is None)):
         raise RuntimeError("pending release transaction requires its launchd refresh callback")
     plist = record.get("plist")
@@ -807,15 +809,25 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         if operation == "first-migration":
             result["source_sha"] = record["source_sha"]
     if record.get("requires_reload") and not record.get("reload_done"):
-        if reload_callback is None:
-            raise RuntimeError("pending release transaction requires its launchd refresh callback")
-        reload_status = reload_callback()
-        if reload_status not in (True, "deferred"):
-            raise RuntimeError("launchd refresh callback failed")
+        if not record.get("reload_issued"):
+            if reload_callback is None:
+                raise RuntimeError("pending release transaction requires its launchd refresh callback")
+            # Write-ahead delivery: a crash after this fsynced marker may leave
+            # the service unloaded, but cannot make a retry kill a starting job.
+            # An operator must inspect the label and explicitly repair an absent
+            # service; ordinary recovery is strictly observation-only.
+            assert plist is not None and "intended_sha256" in plist
+            record["reload_issued"] = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "plist_sha256": plist["intended_sha256"],
+                "attempt": 1,
+            }
+            _write_txn(paths, record)
+            reload_status = reload_callback()
+            if reload_status not in (True, "deferred"):
+                raise RuntimeError("launchd refresh callback failed; reload already issued, inspect service before manual repair")
         _verify_transaction(paths, record)
         if not acknowledge_running_release(paths.home):
-            # A submitted helper (or a synchronous bootstrap) is not proof of
-            # intended code running. Startup will consume the retained WAL.
             return dict(result, reload_pending=True)
     _verify_transaction(paths, record)
     if not record.get("requires_reload"):
@@ -840,7 +852,7 @@ def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] |
             _verify_transaction(paths, record)
             _finish_txn(paths, record)
             return _transaction_result(record)
-        if reload_callback is None:
+        if reload_callback is None and not record.get("reload_issued"):
             raise RuntimeError("release reload pending: restart-authorized update required")
         return _run_transaction(paths, record, reload_callback)
     return _run_transaction(paths, record, reload_callback)
@@ -960,28 +972,32 @@ def _live_process_pins(home: Path) -> set[Path]:
     except ImportError:
         return all_releases()
     try:
-        for proc in psutil.process_iter(["cmdline", "environ", "cwd", "exe"]):
-            try:
-                info = proc.info
-                # psutil may suppress AccessDenied/NoSuchProcess and report None
-                # for requested attrs. A process whose cwd is unreadable might
-                # be executing inside the release we are about to delete.
-                if any(info.get(key) is None for key in ("cmdline", "environ", "cwd", "exe")):
-                    return all_releases()
-                env = info["environ"]
-                values = list(env.values()) + list(info["cmdline"])
-                values.extend([info["cwd"], info["exe"]])
-            except (psutil.Error, OSError, AttributeError, TypeError):
+        for proc in psutil.process_iter(["uids", "name", "cmdline", "environ", "cwd", "exe"]):
+            info = proc.info
+            uids = info.get("uids")
+            if uids is None:
+                # Unknown ownership is not proof that a process is safe to ignore.
                 return all_releases()
+            if uids.real != os.getuid() and uids.effective != os.getuid():
+                continue
+            env = info.get("environ")
+            values = ([*env.values()] if isinstance(env, dict) else [])
+            values.extend(info.get("cmdline") or [])
+            values.extend((info.get("cwd"), info.get("exe")))
+            unreadable = any(info.get(key) is None for key in ("cmdline", "environ", "cwd", "exe"))
             for value in values:
                 if not isinstance(value, str):
                     continue
-                candidate = Path(value).resolve() if value.startswith(str(root)) else None
-                if candidate and root in candidate.parents:
-                    relative = candidate.relative_to(root)
-                    if relative.parts:
-                        pins.add(root / relative.parts[0])
-    except (psutil.Error, OSError):
+                if value.startswith(str(root)):
+                    candidate = Path(value).resolve()
+                    if root in candidate.parents:
+                        relative = candidate.relative_to(root)
+                        if relative.parts:
+                            pins.add(root / relative.parts[0])
+            executable = str(info.get("exe") or info.get("name") or "").lower()
+            if unreadable and "python" in Path(executable).name:
+                return all_releases()
+    except (psutil.Error, OSError, AttributeError, TypeError):
         return all_releases()
     return pins
 
@@ -1078,43 +1094,6 @@ def _migration_record(paths: ReleasePaths, source: Path, plist_path: Path | None
             "previous_intended": str(source), "journal_original": original,
             "journal_intended": data, "plist": plist,
             "requires_reload": False}
-
-
-def begin_migration(home: Path, source: Path, plist_path: Path | None = None) -> bool:
-    """Save the original checkout service definition before the first release flip.
-
-    The migration journal and previous pointer survive a process crash; a rerun
-    never replaces the original plist with an already-migrated one.
-    """
-    paths = ReleasePaths.for_home(home)
-    pending = _read_txn(paths)
-    if pending is not None:
-        if pending["operation"] != "first-migration" or pending["source"] != str(source.resolve()):
-            recover_pending_transaction(paths.home)
-            return begin_migration(paths.home, source, plist_path)
-        if pending.get("candidate") is None:
-            _run_transaction(paths, pending)
-        else:
-            recover_pending_transaction(paths.home)
-        return True
-    if read_pointer(paths.current) is not None:
-        return False
-    record = _migration_record(paths, source, plist_path)
-    _write_txn(paths, record)
-    _run_transaction(paths, record)
-    return True
-
-
-def set_migration_state(home: Path, state: str) -> None:
-    """Persist the migration phase without losing the original plist bytes."""
-    journal = ReleasePaths.for_home(home).home / "release-layout.json"
-    data = json.loads(journal.read_text(encoding="utf-8"))
-    data["state"] = state
-    pending = _read_txn(ReleasePaths.for_home(home))
-    if pending is not None and pending["operation"] == "first-migration":
-        pending["journal_intended"] = data
-        _write_txn(ReleasePaths.for_home(home), pending)
-    _atomic_json(journal, data)
 
 
 def restore_source_layout(home: Path, *, plist_path: Path | None = None,

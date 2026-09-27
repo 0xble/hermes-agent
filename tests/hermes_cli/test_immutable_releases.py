@@ -14,6 +14,51 @@ import pytest
 from hermes_cli import immutable_releases as releases
 
 
+def test_archive_fallback_rejects_unsafe_members(tmp_path, monkeypatch):
+    import io
+    import tarfile
+    from types import SimpleNamespace
+
+    def archive(name, kind):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w") as tar:
+            member = tarfile.TarInfo(name)
+            member.type = kind
+            member.size = 0
+            tar.addfile(member)
+        return raw.getvalue()
+
+    for index, (name, kind) in enumerate((("../escape", tarfile.REGTYPE), ("/absolute", tarfile.REGTYPE),
+                                          ("device", tarfile.CHRTYPE), ("link", tarfile.SYMTYPE))):
+        monkeypatch.setattr(releases.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=archive(name, kind)))
+        with pytest.raises(RuntimeError, match="unsafe git archive member"):
+            releases._stage_git_tree(tmp_path, tmp_path / f"stage-{index}", "fake")
+    monkeypatch.setattr(releases.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=archive("safe/file", tarfile.REGTYPE)))
+    releases._stage_git_tree(tmp_path, tmp_path / "stage", "fake")
+    assert (tmp_path / "stage" / "safe" / "file").is_file()
+
+
+def test_release_plist_matches_normal_command_except_release_paths(tmp_path, monkeypatch):
+    from hermes_cli import gateway
+    home = tmp_path / "profile"
+    candidate = home / "releases" / "B"
+    _fake_release(candidate, "B")
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: str(tmp_path / "source" / "venv/bin/python"))
+    normal = __import__("plistlib").loads(gateway.generate_launchd_plist().encode())
+    release = __import__("plistlib").loads(gateway.generate_launchd_plist(release_target=candidate).encode())
+    source_python = str(tmp_path / "source" / "venv/bin/python")
+    release_python = str(home / "current/.venv/bin/python")
+    assert normal["ProgramArguments"] != release["ProgramArguments"]
+    assert str(normal["ProgramArguments"]).replace(source_python, release_python) == str(release["ProgramArguments"])
+    assert normal["WorkingDirectory"] != release["WorkingDirectory"]
+    assert normal["EnvironmentVariables"]["VIRTUAL_ENV"] != release["EnvironmentVariables"]["VIRTUAL_ENV"]
+    assert {key: value for key, value in normal.items() if key not in ("ProgramArguments", "WorkingDirectory", "EnvironmentVariables")} == {
+        key: value for key, value in release.items() if key not in ("ProgramArguments", "WorkingDirectory", "EnvironmentVariables")}
+    assert {key: value for key, value in normal["EnvironmentVariables"].items() if key not in ("VIRTUAL_ENV", "PATH")} == {
+        key: value for key, value in release["EnvironmentVariables"].items() if key not in ("VIRTUAL_ENV", "PATH")}
+
+
 def _fake_release(path: Path, marker: str, *, lock: str = "same") -> None:
     path.mkdir(parents=True)
     (path / "pyproject.toml").write_text(f"[project]\nname='hermes-{marker}'\n")
@@ -131,10 +176,13 @@ def test_migration_records_source_interpreter_and_preserves_it_on_retry(tmp_path
     venv.EnvBuilder(with_pip=False).create(interpreter.parent.parent)
     home = tmp_path / "profile"
     monkeypatch.setattr(releases.sys, "executable", str(interpreter))
-    assert releases.begin_migration(home, source)
+    candidate = home / "releases" / "B"
+    _fake_release(candidate, "B")
+    result = releases.activate_release(home, candidate, source=source, source_python=interpreter)
+    assert result["source_sha"] == releases.release_sha(source)
     record = json.loads((home / "release-layout.json").read_text())
     assert record["source_python"] == str(interpreter)
-    assert releases.begin_migration(home, source)
+    assert releases.activate_release(home, candidate, source=source)["current"] == str(candidate)
     assert json.loads((home / "release-layout.json").read_text())["source_python"] == str(interpreter)
     assert releases.source_checkout_python(home, source) == interpreter
 
@@ -523,17 +571,26 @@ def test_retention_keeps_live_and_rollback_pins(tmp_path):
     assert len(list((home / "releases").iterdir())) >= 5
 
 
-def test_unreadable_process_identity_pins_all_releases(tmp_path, monkeypatch):
+@pytest.mark.parametrize("owner,executable,pins_all", [
+    ("other", "python3", False),
+    ("self", "python3", True),
+    ("self", "other-tool", False),
+])
+def test_unreadable_process_identity_scopes_retention(tmp_path, monkeypatch, owner, executable, pins_all):
     import psutil
+    from types import SimpleNamespace
     home = tmp_path / "profile"
     for name in ("A", "B", "C", "D", "E"):
         _fake_release(home / "releases" / name, name)
     releases.promote(home, home / "releases" / "E")
+    uid = os.getuid() if owner == "self" else os.getuid() + 1
     class Unreadable:
-        info = {"cmdline": None, "environ": {}, "cwd": None, "exe": None}
+        info = {"uids": SimpleNamespace(real=uid, effective=uid), "name": executable,
+                "cmdline": None, "environ": {}, "cwd": None, "exe": None}
     monkeypatch.setattr(psutil, "process_iter", lambda attrs: iter([Unreadable()]))
-    assert releases.retain(home, rollback_count=1) == []
-    assert all((home / "releases" / name).exists() for name in ("A", "B", "C", "D", "E"))
+    removed = releases.retain(home, rollback_count=1)
+    assert (removed == []) is pins_all
+    assert (home / "releases" / "A").exists() is pins_all
 
 
 def test_retention_prunes_excess_without_uncertain_processes(tmp_path, monkeypatch):
@@ -732,8 +789,8 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
         removed = releases.retain(home)
         assert release_paths[0].exists() and release_paths[1].exists()
         assert release_paths[8].exists() and release_paths[7].exists()
-        assert len([path for path in release_paths[2:7] if path.exists()]) >= 3
-        assert release_paths[0] not in removed and release_paths[1] not in removed
+        assert {path.name for path in release_paths if path.exists()} == {"0", "1", "4", "5", "6", "7", "8"}
+        assert {path.name for path in removed} == {"2", "3"}
     finally:
         worker.terminate()
         worker.wait(timeout=5)
