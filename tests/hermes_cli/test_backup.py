@@ -2188,9 +2188,9 @@ class TestQuickSnapshot:
         live_db = hermes_home / "state.db"
         before = live_db.read_bytes()
 
-        assert restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+        assert restore_quick_snapshot(snap_id, hermes_home=hermes_home) is False
         assert live_db.read_bytes() == before
-        assert any("Refusing restore of corrupted snapshot member state.db" in record.message
+        assert any("Snapshot content verification failed" in record.message
                    for record in caplog.records)
 
 

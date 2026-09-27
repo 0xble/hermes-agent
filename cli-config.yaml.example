@@ -2285,6 +2285,7 @@ updates:
 #     service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN  # headless auth; unset = desktop session
 #     binary_path: ""                               # "" = resolve op via PATH; else absolute path
 #     cache_ttl_seconds: 300                        # 0 disables BOTH cache layers
+#     cache_max_stale_seconds: 86400                # maximum age during transient outages; 0 disables fallback
 #     override_existing: true                       # resolved values win over existing env
 #
 #   # ---- Command helper (any CLI vault) --------------------------------------

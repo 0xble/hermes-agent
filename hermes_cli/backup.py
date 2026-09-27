@@ -28,6 +28,7 @@ from utils import (
 )
 
 from hermes_cli.sizefmt import format_bytes as _format_size
+from hermes_cli.backup_snapshot_integrity import payload_digest, payload_matches
 
 logger = logging.getLogger(__name__)
 
@@ -1539,6 +1540,8 @@ def _create_quick_snapshot_locked(
             print(f"  ⚠ Snapshot aborted: no files captured (failed DBs: {', '.join(failed_dbs)})")
         return None
     meta = {
+        "version": 2,
+        "sha256": {rel: payload_digest(staging_dir / rel) for rel in manifest},
         "id": snap_id, "timestamp": ts, "label": label, "file_count": len(manifest),
         "total_size": sum(manifest.values()), "files": manifest,
         "failed_dbs": failed_dbs, "oversized_skipped": oversized_skipped,
@@ -1627,6 +1630,15 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
         return False
     with open(manifest_path, encoding="utf-8") as f:
         meta = json.load(f)
+    # Validate every captured member before any destination write. A damaged
+    # versioned snapshot must not partially restore unrelated configuration.
+    if not isinstance(meta, dict) or not isinstance(meta.get("files"), dict):
+        return False
+    if meta.get("version", 1) != 1 or "sha256" in meta:
+        if not all(isinstance(rel, str) and payload_matches(snap_dir, rel, size, meta)
+                   for rel, size in meta["files"].items()):
+            logger.error("Snapshot content verification failed: %s", snapshot_id)
+            return False
     snap_res, home_res = snap_dir.resolve(), home.resolve()
     restored = 0
     for rel in meta.get("files", {}):
@@ -1905,16 +1917,10 @@ def _prune_quick_snapshots(
     if not root.exists():
         return 0
 
-    def usable(directory: Path, rel: str, size: Any) -> bool:
-        relative = Path(rel)
-        if relative.is_absolute() or ".." in relative.parts or type(size) is not int or size < 0:
+    def usable(directory: Path, rel: str, size: Any, meta: dict) -> bool:
+        if not payload_matches(directory, rel, size, meta):
             return False
-        path = directory / relative
-        try:
-            if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
-                return False
-        except OSError:
-            return False
+        path = directory / rel
         return not rel.endswith(".db") or verify_sqlite_integrity(path)["valid"]
 
     candidates = []
@@ -1944,14 +1950,14 @@ def _prune_quick_snapshots(
         if not isinstance(failed, list) or not isinstance(oversized, list):
             continue
         omissions.update(rel for rel in failed + oversized if isinstance(rel, str))
-        valid = {rel for rel, size in files.items() if isinstance(rel, str) and usable(directory, rel, size)}
+        valid = {rel for rel, size in files.items() if isinstance(rel, str) and usable(directory, rel, size, meta)}
         if not found_complete and not failed and not oversized and len(valid) == len(files):
             retained.add(directory)
             found_complete = True
         omissions.update(rel for rel in files if isinstance(rel, str) and rel.endswith(".db") and rel not in valid)
     for rel in omissions:
         for directory, meta in candidates:
-            if rel in meta["files"] and usable(directory, rel, meta["files"][rel]):
+            if rel in meta["files"] and usable(directory, rel, meta["files"][rel], meta):
                 retained.add(directory)
                 break
     deleted = 0

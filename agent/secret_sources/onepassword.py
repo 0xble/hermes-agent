@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess  # noqa: F401 — tests monkeypatch ``op.subprocess.run``
@@ -37,6 +38,7 @@ _OP_RUN_TIMEOUT = 30
 # `op` itself reads OP_SERVICE_ACCOUNT_TOKEN; `service_account_token_env` lets
 # the user source it from another name, and _op_child_env normalizes it back.
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
+_DEFAULT_MAX_STALE_SECONDS = 86400.0
 
 # Minimal allowlisted child env (never the full post-dotenv os.environ, which
 # holds every provider credential). OP_SESSION_* and the token are added
@@ -282,6 +284,7 @@ def fetch_onepassword_secrets(
     *, references: Dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
     binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
     cache_ttl_seconds: float = 300, home_path: Optional[Path] = None,
+    cache_max_stale_seconds: float = _DEFAULT_MAX_STALE_SECONDS,
 ) -> Tuple[Dict[str, str], List[str]]:
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
@@ -387,7 +390,10 @@ def fetch_onepassword_secrets(
         # Every failure was transient, so the last good value for a ref is still the
         # best answer. Served for this process only: the stale entry is never re-stored
         # under a fresh timestamp, so the next start retries the backend.
-        stale = _STORE.disk.read(cache_key, float("inf"), home_path)
+        max_age = coerce_float(cache_max_stale_seconds, _DEFAULT_MAX_STALE_SECONDS)
+        if not math.isfinite(max_age):
+            max_age = _DEFAULT_MAX_STALE_SECONDS
+        stale = _STORE.disk.read(cache_key, max(0.0, max_age), home_path)
         if stale is not None:
             stale_used = [n for n in valid if n not in secrets and n in stale.secrets]
             for name in stale_used:
@@ -493,6 +499,7 @@ class OnePasswordSource(SecretSource):
                                           "default": _DEFAULT_TOKEN_ENV},
             "binary_path": {"description": "Pin the op binary (empty = resolve via PATH)", "default": ""},
             "cache_ttl_seconds": {"description": "Disk+memory cache TTL; 0 disables", "default": 300},
+            "cache_max_stale_seconds": {"description": "Maximum total age of last-good values during transient outages; 0 disables fallback", "default": 86400},
             "override_existing": {"description": "Resolved values overwrite .env/shell values", "default": True},
         }
 
@@ -519,6 +526,7 @@ class OnePasswordSource(SecretSource):
             secrets, fetch_warnings = fetch_onepassword_secrets(
                 references=valid, account=str(cfg.get("account") or ""), token_env=self.token_env(cfg),
                 binary=binary, cache_ttl_seconds=coerce_float(cfg.get("cache_ttl_seconds", 300), 300.0),
+                cache_max_stale_seconds=cfg.get("cache_max_stale_seconds", _DEFAULT_MAX_STALE_SECONDS),
                 home_path=home_path)
         except RuntimeError as exc:
             return result.fail(str(exc), _classify_op_error(str(exc)))

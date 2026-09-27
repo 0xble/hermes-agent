@@ -5,6 +5,15 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
 
 ## Required behavior
 
+- New quick snapshots have version-2 manifests containing SHA-256 digests of captured
+  payloads. Retention verifies digests before counting a recovery copy. Restore verifies
+  every versioned payload before writing any destination. Legacy size-only manifests
+  remain readable with their original, weaker guarantee. Digests detect accidental
+  alteration, not an attacker changing both payload and manifest. This belongs to
+  `slice-13-snapshot-integrity`, comparable to upstream #106101. Retire the local
+  addition when a selected release preserves the same same-size-alteration and restore
+  rejection behavior. Verify `tests/hermes_cli/test_quick_snapshot_digests.py` alongside
+  the existing backup/retention suite. Rollback keeps the additive manifests readable.
 - Incomplete backup archives are reported as failures; complete archives survive
   retention; SQLite snapshot members are verified before a quick snapshot is trusted.
 - `scripts/schema_rehearsal.py` proves a copied legacy database opens, migrates, and keeps

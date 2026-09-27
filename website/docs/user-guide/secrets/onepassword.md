@@ -128,6 +128,7 @@ secrets:
 | `service_account_token_env` | `OP_SERVICE_ACCOUNT_TOKEN` | Env var Hermes reads the service-account token from. Its value is exported to the `op` child as `OP_SERVICE_ACCOUNT_TOKEN` (the name `op` expects). Leave the var unset to use a desktop/interactive session. |
 | `binary_path` | `""` | Absolute path to `op`. When set, it is used verbatim and `PATH` is **not** consulted — pin this to avoid trusting whatever `op` appears first on `PATH`. |
 | `cache_ttl_seconds` | `300` | How long resolved values are reused (in-process and on disk). Set to `0` to disable **both** cache layers — no values are written to disk at all. |
+| `cache_max_stale_seconds` | `86400` | Maximum total age of last-good values served during a network failure, timeout or rate limit. Set to `0` to disable stale fallback. Non-finite or invalid values use the finite default. This does not extend the ordinary cache TTL or refresh a cached timestamp. |
 | `override_existing` | `true` | When true, resolved values overwrite anything already in env (so rotation takes effect). Flip to `false` to let `.env` / shell exports win; those references are then skipped *before* `op` is invoked. |
 
 ## Failure modes
