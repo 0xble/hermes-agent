@@ -1902,7 +1902,8 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _finalize_receipt("partial", "Immutable release activation failed: %s")
                 raise SystemExit(1)
             if not opts.no_gateway_restart:
-                restart = _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode)
+                restart = _restart_gateway_fleet_after_update(
+                    _pre_update_plan, gateway_mode, acknowledged_release_root=release)
                 _resume_windows_gateways_and_merge_outcome(restart, _windows_gateway_resume, gateway_mode)
                 _verify_fleet_after_update(
                     restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
@@ -2098,7 +2099,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             f"from={before} to={result['current']} from_sha={before.name} "
                             f"to_sha={result.get('source_sha') or Path(current_target).name}")
         print(f"✓ Rolled back current release to {result['current']}")
-        restart = _restart_gateway_fleet_after_update(None, gateway_mode)
+        restart = _restart_gateway_fleet_after_update(
+            None, gateway_mode, acknowledged_release_root=Path(current_target))
         if gateway_mode:
             _write_gateway_update_exit_code(not restart.incomplete)
         _verify_fleet_after_update(

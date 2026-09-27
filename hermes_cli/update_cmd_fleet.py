@@ -807,6 +807,20 @@ def _apply_pending_fleet_restart_catchup(*, defer: bool = False) -> None:
         print("  (fleet restart deferred — --no-gateway-restart; marker kept)")
         print("  Restart separately: `hermes gateway restart` or next non-cron update.")
         return
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer
+    from hermes_cli.update_cmd import get_hermes_home
+    home = get_hermes_home()
+    paths = ReleasePaths.for_home(home)
+    current = read_pointer(paths.current)
+    if current is not None and _acknowledged_release_launchd_label(home, current):
+        # Catch-up after a completed release reload still owes other fleet members,
+        # but must verify rather than kill the acknowledged launchd gateway.
+        from hermes_cli.update_cmd import _restart_gateway_fleet_after_update, _verify_fleet_after_update
+        outcome = _restart_gateway_fleet_after_update(None, False, acknowledged_release_root=current)
+        _verify_fleet_after_update(
+            outcome, _pre_update_plan=None, _windows_gateway_resume=None,
+            node_failures=[], update_complete=True, expected_sha=current.name, expected_root=current)
+        return
     print()
     _warn_pending_fleet_restart()
     print("→ Running the pending fleet restart...")
@@ -993,6 +1007,35 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
         print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
+def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
+    """Only the transaction's acknowledged, installed plist can exempt its own label."""
+    import hashlib
+    import plistlib
+    from hermes_cli import gateway
+
+    try:
+        if (home / "release-txn.json").exists():
+            return None
+        record = json.loads((home / "release-last-txn.json").read_text(encoding="utf-8"))
+        ack, plist = record["reload_ack"], record["plist"]
+        if not record["requires_reload"] or Path(ack["release_root"]).resolve() != root.resolve():
+            return None
+        installed = gateway.get_launchd_plist_path()
+        if Path(plist["path"]).resolve() != installed.resolve():
+            return None
+        body = installed.read_bytes()
+        label = gateway.get_launchd_label()
+        definition = plistlib.loads(body)
+        if (hashlib.sha256(body).hexdigest() != plist["intended_sha256"]
+                or ack["plist_sha256"] != plist["intended_sha256"]
+                or definition["Label"] != label
+                or Path(definition["EnvironmentVariables"]["HERMES_HOME"]).resolve() != home.resolve()):
+            return None
+        return label
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _restart_launchd_gateway_after_update(
     *, supervision_verify: bool = True, self_restart_pending: set | None = None,
 ) -> tuple[list, list]:
@@ -1076,7 +1119,7 @@ def _restart_launchd_gateway_after_update(
 
 def _restart_macos_launchd_gateways(
     restarted_services: list, failed_or_stale_units: list, drain_budget: float, *, require_supervision: bool = False,
-    self_restart_pending: set | None = None,
+    self_restart_pending: set | None = None, acknowledged_label: str | None = None,
 ) -> None:
     """Restart every launchd-managed gateway after an update (macOS).
 
@@ -1101,10 +1144,16 @@ def _restart_macos_launchd_gateways(
         if listing.returncode != 0:
             failed_or_stale_units.append("launchd (listing failed)")
             return
-    _restarted, _failed = _restart_launchd_gateway_after_update(
-        supervision_verify=True, self_restart_pending=self_restart_pending)
-    restarted_services.extend(_restarted)
-    failed_or_stale_units.extend(_failed)
+    if acknowledged_label == get_launchd_label():
+        # The release transaction already booted this exact label and the new
+        # gateway acknowledged its loaded root. Fleet verification still checks
+        # its successor; only the second mutating relaunch is omitted.
+        restarted_services.append(acknowledged_label)
+    else:
+        _restarted, _failed = _restart_launchd_gateway_after_update(
+            supervision_verify=True, self_restart_pending=self_restart_pending)
+        restarted_services.extend(_restarted)
+        failed_or_stale_units.extend(_failed)
     current_label = get_launchd_label()
 
     derived_labels = launchd_gateway_labels_for_install()
@@ -1800,13 +1849,14 @@ def _gateway_drain_budget() -> float:
         return 45.0
 
 
-def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
+def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool, *,
+                                        acknowledged_release_root: Path | None = None):
     """Restart every running gateway (systemd, launchd, manual) onto the pulled code.
 
     Never raises: a phase abort runs fresh-child recovery and fails closed unless
     every planned gateway is verifiably covered.
     """
-    from hermes_cli.update_cmd import _m, _write_gateway_update_exit_code
+    from hermes_cli.update_cmd import _m, _write_gateway_update_exit_code, get_hermes_home
     # All bookkeeping is declared before the try so abort recovery and fleet reconciliation
     # can read it even if the phase raises early. ``pre_restart_gateway_pids`` stays empty
     # until we are about to stop/drain, so an early exception has nothing to fail closed on,
@@ -1866,11 +1916,16 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
         )
 
         # macOS: EVERY ai.hermes.gateway* LaunchAgent (systemd parity).
+        # The transaction ACK exempts only its own plist's label. All sibling
+        # services and manual gateways still take their ordinary fleet path.
+        acknowledged_label = (_acknowledged_release_launchd_label(get_hermes_home(), acknowledged_release_root)
+                              if acknowledged_release_root is not None else None)
         if is_macos():
             with suppress(FileNotFoundError, ImportError):
                 _restart_macos_launchd_gateways(
                     out.restarted_services, out.failed_or_stale_units, _drain_budget,
                     self_restart_pending=out.self_restart_pending_pids,
+                    acknowledged_label=acknowledged_label,
                 )
 
         _restart_manual_gateways(out, _drain_budget)
