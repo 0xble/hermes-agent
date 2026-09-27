@@ -93,7 +93,7 @@ def test_deferred_first_migration_stages_but_does_not_activate(tmp_path, monkeyp
 
 @pytest.mark.macos_only
 def test_equal_pointer_with_stale_service_repairs_on_noop(tmp_path, monkeypatch):
-    from hermes_cli import immutable_releases as releases, gateway
+    from hermes_cli import immutable_releases as releases, gateway, gateway_launchd
     home = tmp_path / "profile"
     candidate = home / "releases" / "B"
     candidate.mkdir(parents=True)
@@ -107,9 +107,14 @@ def test_equal_pointer_with_stale_service_repairs_on_noop(tmp_path, monkeypatch)
     plist.write_text("source")
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist.read_text() == "release")
-    monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", lambda: plist.write_text("release") or True)
+    monkeypatch.setattr(gateway, "generate_launchd_plist", lambda release_target=None: "release")
+    reloads = []
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
+                        lambda path: reloads.append(path) or True)
     update_cmd._catch_up_immutable_release(defer=False)
     assert plist.read_text() == "release"
+    assert reloads == [plist]
+    assert not (home / "release-txn.json").exists()
 
 
 def test_equal_pointer_with_stale_runtime_arms_fleet_catchup(tmp_path, monkeypatch):
