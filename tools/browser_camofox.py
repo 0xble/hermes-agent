@@ -804,6 +804,14 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
 # its upload route polls for a mounted input for nearly the whole wait before it consumes the
 # chooser, so a longer wait makes a successful attach come back as a 500.
 _UPLOAD_HTTP_TIMEOUT_S = 45
+# Count top-level file inputs the way Camofox's page.locator('input[type="file"]') sees them:
+# Playwright CSS pierces open shadow roots, so walk them too (same-document only, no frames).
+_COUNT_TOP_FILE_INPUTS_JS = (
+    "(() => { let n = 0; const walk = (root) => {"
+    " n += root.querySelectorAll('input[type=file]').length;"
+    " for (const el of root.querySelectorAll('*')) { if (el.shadowRoot) walk(el.shadowRoot); } };"
+    " walk(document); return n; })()"
+)
 
 
 def _stage_upload_file(path: str, uploads_dir: str) -> str:
@@ -875,7 +883,7 @@ def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[st
             try:
                 count = _post(_tab_path(session, "evaluate"), {
                     "userId": session["user_id"],
-                    "expression": "document.querySelectorAll('input[type=file]').length"}).get("result")
+                    "expression": _COUNT_TOP_FILE_INPUTS_JS}).get("result")
             except requests.HTTPError as exc:
                 if classify_camofox_http_error(exc, endpoint="evaluate") != "capability":
                     raise

@@ -111,6 +111,8 @@ def test_named_trigger_refused_when_top_page_has_file_input(mock_post, monkeypat
     assert result.get("success") is False
     assert "file input" in result["error"]
     assert not mock_post.call_args.args[0].endswith("/upload")
+    # The count must pierce open shadow roots, matching Playwright's locator semantics.
+    assert "shadowRoot" in mock_post.call_args.kwargs["json"]["expression"]
 
 
 @patch("tools.browser_camofox.requests.post")
