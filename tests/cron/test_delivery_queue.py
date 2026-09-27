@@ -252,6 +252,33 @@ def test_terminal_projection_retries_after_execution_ledger_failure(
         reset_hermes_home_override(token)
 
 
+def test_terminal_receipt_reconciles_unknown_commit_gap(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        run = executions.create_execution("gap", source="builtin")
+        executions.mark_execution_running(run["id"])
+        with executions._transaction() as conn:
+            conn.execute("UPDATE executions SET delivery_status='unknown' WHERE id=?", (run["id"],))
+        # Crash after the queue's terminal commit, before it projected to ledger.
+        with queue._transaction() as conn:
+            conn.execute(
+                "INSERT INTO deliveries (execution_id, job_json, content, status, created_at, finished_at) "
+                "VALUES (?, '{}', '', 'delivered', ?, ?)",
+                (run["id"], "2026-09-26T00:00:00+00:00", "2026-09-26T00:00:01+00:00"),
+            )
+        assert queue.drain(lambda *_: pytest.fail("must not resend")) == 0
+        assert executions.get_execution(run["id"])["delivery_status"] == "delivered"
+        assert queue.drain(lambda *_: pytest.fail("must not resend")) == 0
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_terminal_receipt_reconciliation_uses_projection_index_and_skips_projected_rows(
     tmp_path, monkeypatch
 ):

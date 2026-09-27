@@ -467,9 +467,8 @@ def record_delivery_status(execution_id: str, status: str) -> None:
         conn.execute(
             "UPDATE executions SET delivery_status=? WHERE id=? "
             "AND (delivery_status IS NULL OR delivery_status NOT IN "
-            "('delivered','failed','suppressed') AND "
-            "(delivery_status!='unknown' OR ?='pending'))",
-            (status, execution_id, status),
+            "('delivered','failed','suppressed'))",
+            (status, execution_id),
         )
 
 

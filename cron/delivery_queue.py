@@ -239,7 +239,7 @@ def reconcile_terminal_deliveries() -> int:
         ledger_conn.executemany(
             "UPDATE executions SET delivery_status=? WHERE id=? "
             "AND (delivery_status IS NULL OR delivery_status NOT IN "
-            "('delivered','failed','unknown','suppressed'))",
+            "('delivered','failed','suppressed'))",
             [
                 (str(row["status"]), str(row["execution_id"]))
                 for row in rows
