@@ -69,7 +69,7 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
     """Serialise and write one pending value; return True when a payload was written."""
     try:
         serialised = _serialise_value(value)
-        if serialised is None:
+        if serialised is None or not serialised.get("text"):
             return False
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True

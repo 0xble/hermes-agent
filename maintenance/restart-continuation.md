@@ -21,6 +21,8 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   archived fork's original regression.
 - When a real user message arrives while resume is pending, the note addresses
   that message first regardless of policy.
+- A follow-up dequeued as a turn finishes during shutdown is flushed through `gateway/shutdown_flush.py` before its local reference is cleared, so startup recovery can restore its user message. Empty text is not written as an invalid pending payload; errors are logged rather than silently claiming preservation.
+- All remaining adapter slots, runner pending slots, and FIFO overflow tails are spooled under the session key's owning served profile (including a secondary reached via the primary bot). Startup recovery walks the launch home and every served home in that home's runtime scope; a failed profile replay retains its spool without stopping other profiles.
 
 ## Provenance and patches
 
@@ -39,7 +41,8 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
 ## Verification
 
 `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py
-tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_notification.py`.
+tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_notification.py
+tests/gateway/test_multiplex_pending_recovery.py tests/gateway/test_shutdown_flush.py`.
 The policy file must prove: platform override > global > adapter default,
 non-interactive safety, platform-neutral continue guidance, validation at
 construction and YAML startup, round-trip through `to_dict`, and that

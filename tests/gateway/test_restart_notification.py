@@ -341,6 +341,31 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
 
 @pytest.mark.asyncio
+async def test_shutdown_notifications_have_one_aggregate_deadline(monkeypatch):
+    """A stuck transport must not serialize one timeout per active chat."""
+    import asyncio
+    import time
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    runner, _ = make_restart_runner()
+    runner._stop_hosted_room_worker = AsyncMock(return_value=True)
+    runner._stop_systemd_watchdog = AsyncMock()
+    runner._cancel_secondary_profile_reconnect_tasks = AsyncMock()
+    entered = asyncio.Event()
+
+    async def blocked_notice():
+        entered.set()
+        await asyncio.Event().wait()
+
+    runner._notify_active_sessions_of_shutdown = blocked_notice
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0)
+    started = time.monotonic()
+    await runner._stop_begin_teardown(ctx)
+    assert entered.is_set()
+    assert time.monotonic() - started < 5.0
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="active-42", chat_type="group", thread_id="topic-7")

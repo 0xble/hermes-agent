@@ -168,6 +168,7 @@ class GatewayShutdownMixin:
         # API-server runs still live when the adapters were released; the adapter map is empty by the
         # time the SessionDB close gate runs, so the count has to be taken before ``adapters.clear()``.
         api_live: int = 0
+        notice_elapsed: float = 0.0
 
         def elapsed(self) -> float:
             return time.monotonic() - self.started_at
@@ -1867,8 +1868,16 @@ class GatewayShutdownMixin:
         if callable(stop_watchdog):
             await stop_watchdog()
         await self._cancel_secondary_profile_reconnect_tasks()
-        # Notify all chats with active agents BEFORE draining — adapters are still connected here.
-        await self._notify_active_sessions_of_shutdown()
+        # Network sends are best-effort; a slow Telegram request must not consume launchd's stop leash.
+        # Detach-on-deadline rather than wait_for: a transport may swallow cancellation.
+        from gateway.run import GatewayRunner
+        notice_started = time.monotonic()
+        notice_task = asyncio.create_task(self._notify_active_sessions_of_shutdown())
+        if not await GatewayRunner._wait_or_detach(notice_task, 3.0):
+            logger.warning("Shutdown notices exceeded 3s total; continuing teardown")
+        else:
+            await notice_task
+        ctx.notice_elapsed = time.monotonic() - notice_started
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
 
     async def _stop_drain_active_work(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:
@@ -1962,6 +1971,21 @@ class GatewayShutdownMixin:
             await self._notify_interrupted_cron_jobs(_interrupted_cron_jobs)
         logger.info("Shutdown phase: cron interrupt notices done at +%.2fs", ctx.elapsed())
 
+    def _flush_owned_pending(self, session_key, value, *, reason, overflow=False):
+        """Spool a queued slot under its session's home, regardless of transport owner."""
+        from gateway.run import _profile_runtime_scope
+        from gateway.run_pending_recovery import pending_home_for_key
+        from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file
+
+        home = pending_home_for_key(self, session_key)
+        if home is None:
+            logger.error("Cannot preserve pending queue: no served home for %s", session_key)
+            return 0
+        with _profile_runtime_scope(home, prepared_secret_scope={}):
+            if overflow:
+                return flush_overflow_to_file({session_key: value}, reason=reason)
+            return flush_pending_to_file({session_key: value}, reason=reason)
+
     async def _stop_finalize_agents_and_adapters(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
         if self._restart_requested and self._restart_detached:
@@ -1985,16 +2009,35 @@ class GatewayShutdownMixin:
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
-        for platform, adapter in list(self.adapters.items()):
-            await self._bounded_adapter_teardown(adapter, platform)
-        # Disconnect secondary-profile adapters (multiplex mode).
+        # Preserve each adapter's queue BEFORE any cancellable background-task cleanup. The
+        # adapter normally flushes after its drain loop, but a slow unwind can outlast that
+        # loop's timeout and skip the flush. Remove only successfully spooled slots so its
+        # later flush cannot replay duplicates; failed slots remain available for retry.
         _profile_adapters = getattr(self, "_profile_adapters", {})
-        for _prof, _amap in list(_profile_adapters.items()):
-            for platform, adapter in list(_amap.items()):
-                await self._bounded_adapter_teardown(adapter, platform, profile=_prof)
+        adapters = [(platform, adapter, None) for platform, adapter in list(self.adapters.items())]
+        adapters.extend((platform, adapter, profile)
+                        for profile, amap in list(_profile_adapters.items())
+                        for platform, adapter in list(amap.items()))
+        for platform, adapter, profile in adapters:
+            pending = getattr(adapter, "_pending_messages", None)
+            if not isinstance(pending, dict) or not pending:
+                continue
+            for key, value in list(pending.items()):
+                try:
+                    if self._flush_owned_pending(key, value, reason="adapter_shutdown"):
+                        if pending.get(key) is value:
+                            pending.pop(key, None)
+                except Exception:
+                    logger.exception("Failed to preserve %s adapter pending message for %s", platform.value, key)
+        # Only network notices share the 3s budget. Adapter teardown has its own bounded
+        # per-operation timeouts and must run through disconnect (token-lock release).
+        if adapters:
+            await asyncio.gather(*(self._bounded_adapter_teardown(adapter, platform, profile=profile)
+                                   for platform, adapter, profile in adapters))
+        for _amap in _profile_adapters.values():
             _amap.clear()
         _profile_adapters.clear()
-        logger.info("Shutdown phase: all adapters disconnected at +%.2fs", ctx.elapsed())
+        logger.info("Shutdown phase: adapter teardown phase ended at +%.2fs", ctx.elapsed())
 
     async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
@@ -2013,16 +2056,14 @@ class GatewayShutdownMixin:
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
-        with suppress(Exception):
-            from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+        for session_key, value in dict(self._pending_messages).items():
+            with suppress(Exception):
+                self._flush_owned_pending(session_key, value, reason="shutdown")
         # The overflow FIFO tail lives in SessionState.conversation.queued_events — flush it too.
-        with suppress(Exception):
-            from gateway.shutdown_flush import flush_overflow_to_file
-            flush_overflow_to_file(
-                {_k: list(_v) for _k, _v in dict(getattr(self, "_queued_events", None) or {}).items() if _v},
-                reason="shutdown",
-            )
+        for session_key, events in dict(getattr(self, "_queued_events", None) or {}).items():
+            if events:
+                with suppress(Exception):
+                    self._flush_owned_pending(session_key, list(events), reason="shutdown", overflow=True)
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
         self._running_agents.clear()
         self._running_agents_ts.clear()
