@@ -1026,6 +1026,69 @@ def test_update_journals_source_sha_before_checkout_advances(tmp_path, monkeypat
         update_cmd._cmd_update_impl(SimpleNamespace(rollback=False), gateway_mode=False)
 
 
+@pytest.mark.macos_only
+def test_rollback_to_source_then_reactivate_records_source_sha(tmp_path, monkeypatch):
+    from hermes_cli import gateway, update_cmd, update_receipt
+
+    source, home = tmp_path / "hermes-agent", tmp_path / "profile"
+    source.mkdir()
+    (source / "version.txt").write_text("source", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "version.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "source"], check=True)
+    source_sha = releases.release_sha(source)
+    release = home / "releases" / source_sha
+    _fake_release(release, source_sha)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
+    monkeypatch.setattr(releases, "_source_python_valid", lambda *args: True)
+    monkeypatch.setattr(releases, "stage_release", lambda *args, **kwargs: (release, "existing"))
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
+
+    assert update_cmd._activate_immutable_release()
+    assert releases.rollback(home)["source_sha"] == source_sha
+    assert (home / "current").resolve() == source
+    update_receipt.begin_update_receipt()
+    assert update_cmd._activate_immutable_release()
+    update_receipt.finalize_update_receipt("success")
+    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
+    assert receipt["release_transition"]["from_path"] == str(source)
+    assert receipt["release_transition"]["from_sha"] == source_sha
+    assert receipt["release_transition"]["to_sha"] == source_sha
+    assert (home / "current").resolve() == release
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("marker_valid", [True, False])
+def test_promotion_receipt_uses_build_marker_or_explains_unknown_identity(tmp_path, monkeypatch, marker_valid):
+    from hermes_cli import gateway, update_cmd, update_receipt
+
+    home = tmp_path / "profile"
+    known_sha = "a" * 40
+    old = home / "releases" / (known_sha if marker_valid else "old")
+    candidate = home / "releases" / "candidate"
+    _fake_release(old, old.name)
+    _fake_release(candidate, "candidate")
+    releases.promote(home, old)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(releases, "release_sha", lambda _: "b" * 40)
+    monkeypatch.setattr(releases, "stage_release", lambda *args, **kwargs: (candidate, "existing"))
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
+
+    update_receipt.begin_update_receipt()
+    assert update_cmd._activate_immutable_release()
+    update_receipt.finalize_update_receipt("success")
+    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
+    assert receipt["release_transition"]["from_sha"] == (known_sha if marker_valid else None)
+    if not marker_valid:
+        assert any("from_sha unknown" in step["detail"] for step in receipt["steps"])
+
+
 def test_atomic_publish_refuses_existing_empty_target(tmp_path):
     staging, target = tmp_path / "staging", tmp_path / "B"
     staging.mkdir()

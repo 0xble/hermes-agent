@@ -6,6 +6,8 @@ main -> update_cmd -> update_cmd_*; ``_m()`` resolves ``hermes_cli.main`` at cal
 """
 
 import logging
+import json
+import re
 from contextlib import suppress
 import os
 import shlex
@@ -131,6 +133,37 @@ def _require_immutable_launchd() -> None:
         raise RuntimeError("immutable releases require macOS launchd; disable updates.immutable_releases on this platform")
 
 
+def _previous_release_sha(paths, previous: str | None) -> str | None:
+    """Resolve a receipt identity from the actual source/release, never a directory label."""
+    if previous is None:
+        return None
+    path = Path(previous)
+    if path.parent == paths.releases.resolve():
+        try:
+            value = (path / ".hermes_build_sha").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return value if re.fullmatch(r"[0-9a-fA-F]{40}", value) else None
+
+    journal = paths.home / "release-layout.json"
+    try:
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        if Path(record["source"]).resolve() == path.resolve():
+            value = record.get("source_sha")
+            if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value):
+                return value
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    # Older/interrupted journals may omit source_sha; HEAD still identifies the
+    # checkout currently pointed to by `previous` if it remains a Git checkout.
+    try:
+        from hermes_cli.immutable_releases import release_sha
+        value = release_sha(path)
+        return value if re.fullmatch(r"[0-9a-fA-F]{40}", value) else None
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def _activate_immutable_release(*, defer: bool = False) -> bool:
     """Stage an opted-in layout; only promote/reload with restart authorization."""
     from hermes_cli.immutable_releases import (
@@ -193,12 +226,10 @@ def _activate_immutable_release(*, defer: bool = False) -> bool:
             raise
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
-        from_sha = None
-        if first and previous:
-            import json
-            from_sha = json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8"))["source_sha"]
-        elif previous:
-            from_sha = Path(previous).name
+        from_sha = _previous_release_sha(paths, previous)
+        if previous and from_sha is None:
+            _record_update_step("immutable_release_identity", True,
+                                f"from_sha unknown: no valid 40-hex source HEAD/journal SHA or release build marker for {previous}")
         record_release_transition(
             from_sha=from_sha,
             to_sha=sha, from_path=previous, to_path=str(candidate),
