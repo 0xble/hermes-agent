@@ -24,8 +24,9 @@ transcript echo, or queued follow-up drain.
   for the queue path.
 - Upstream: [issue 58780](https://github.com/NousResearch/hermes-agent/issues/58780)
   and [PR 73518](https://github.com/NousResearch/hermes-agent/pull/73518) fixed
-  steer-path STT. Queue mode still transcribes only at drain time upstream. No
-  upstream issue or PR proposes eager queued transcription as of 2026-09-24.
+  steer-path STT. Queue mode still transcribes only at drain time upstream. Own
+  [PR #121063](https://github.com/NousResearch/hermes-agent/pull/121063) contributes
+  eager queued transcription and remains open on 2026-09-26.
 
 ## Verification
 

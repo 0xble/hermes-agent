@@ -16,8 +16,11 @@ without a manual approve step.
 
 ## Provenance
 
-Fork-only. Upstream #105921 made the gate unconditional with no opt-out. No
-upstream issue or PR proposes one as of 2026-09-24.
+Fork-only. Upstream #105921 made the gate unconditional with no opt-out. Existing
+own issues [#106919](https://github.com/NousResearch/hermes-agent/issues/106919)
+and [#106918](https://github.com/NousResearch/hermes-agent/issues/106918) cover
+opt-in policy and effective-policy visibility. Both remain open on 2026-09-26.
+Neither supplies a transactional rollback journal.
 
 ## Verification
 

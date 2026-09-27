@@ -19,6 +19,8 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 ## Parked status hides a live gateway
 
 - Fork patch identity: `parked-status-live-gateway`.
+- Upstream tracking: [issue #124553](https://github.com/NousResearch/hermes-agent/issues/124553),
+  filed with both current-main lifecycle regressions on 2026-09-26.
 - `hermes gateway status` returned "parked" before inspecting processes. A
   gateway started with `--force` bypasses parking and leaves the marker, so it
   was hidden, including from `--deep` and `--full`. Status now reports the
@@ -63,6 +65,8 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 ## Restart leaves a parked profile stopped
 
 - Fork patch identity: `parked-profile-restart`.
+- Upstream tracking: [issue #124553](https://github.com/NousResearch/hermes-agent/issues/124553),
+  filed with both current-main lifecycle regressions on 2026-09-26.
 - `hermes -p <name> gateway stop` parks the profile and the host stops serving
   it. A later `gateway restart` then found no host serving the profile and fell
   through to the standalone restart path, so the profile stayed parked and

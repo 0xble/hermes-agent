@@ -68,7 +68,9 @@ its optional icon, and the durable alias can be observed through one Telegram to
   deterministically when the model field is absent or invalid.
 - **Upstream disposition:** source PRs are open design references, not released
   equivalent behavior. `title-concurrent-endpoint` has no upstream equivalent; open
-  NousResearch PRs #120571 and #120627 only widen the deferral. Retire it when a released
+  NousResearch PRs #120571 and #120627 only widen the deferral. Own proposal
+  [#124563](https://github.com/NousResearch/hermes-agent/issues/124563) now tracks
+  explicit endpoint concurrency for auxiliary title scheduling. Retire it when a released
   tag lets a provider declare concurrent capacity for the title gate.
 - **Fork delivery:** landed on fork `main` as one squash-merged PR whose commit carries the
   `Fork-Patch:` trailer slices above. This unit is the owner of those identities;

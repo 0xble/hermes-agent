@@ -10,7 +10,7 @@ A compression worker that unwinds because the shared route deadline expires is d
 
 Fork patch identity: `compression-route-deadline`.
 
-Ported from archived HERMES-107 (archived commit `4dcb30f6bd62`) after reproducing the worker-first deadline race on `origin/main` and `upstream-live/main`. Upstream PR: [#123807](https://github.com/NousResearch/hermes-agent/pull/123807). Brian's earlier PR #102370 remains open and conflicting; this upstream-ready branch supersedes it with the current adaptation.
+Ported from archived HERMES-107 (archived commit `4dcb30f6bd62`) after reproducing the worker-first deadline race on `origin/main` and `upstream-live/main`. Upstream PRs [#123807](https://github.com/NousResearch/hermes-agent/pull/123807) and [#102370](https://github.com/NousResearch/hermes-agent/pull/102370) are closed as of 2026-09-26. Track the active comparable [#103088](https://github.com/NousResearch/hermes-agent/pull/103088), which addresses race-independent hard-ceiling fallback. An open comparable is not release acceptance, so retain the fork regressions until the selected release satisfies the full contract.
 
 ## Verification
 

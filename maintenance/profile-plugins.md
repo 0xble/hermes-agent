@@ -8,18 +8,20 @@ Fork patch identity: `profile-plugin-source-migration` (the local ownership tran
 
 ## Current ownership
 
-The four authored profile plugins are now maintained in the separate `agents`
-repository under `agents/plugins/`:
+The six authored profile plugins are maintained in the separate `agents`
+repository under `agents/sources/plugins/`:
 
 - `goal-lifecycle`
 - `memory-journal`
+- `output-guard`
 - `request-update`
 - `review-candidate`
+- `source-guard`
 
 They remain Hermes-native projections. Their source, tests, ownership metadata,
-and future target build belong to `agents`, not to this Hermes application
-checkout. The active profile may continue using installed copies under its
-Hermes home during the migration.
+and target build belong to `agents`, not to this Hermes application checkout.
+The 2026-09-26 audit verified all six installed profile projections against their
+canonical sources. Source parity does not establish live hook acceptance.
 
 ## Hermes boundary
 
@@ -37,7 +39,7 @@ source tree cannot be recreated.
 
 When Hermes runtime contracts change, run the affected Hermes tests from this
 repository. When profile plugin behavior or source changes, run the canonical
-plugin tests from `agents/plugins/` with the Hermes runtime on the test path.
+plugin tests from `agents/sources/plugins/` with the Hermes runtime on the test path.
 Verify the installed profile projection separately. A source test or successful
 projection build does not establish live gateway acceptance.
 
@@ -48,13 +50,14 @@ Rollback of this ownership transfer means restoring the previous source commit
 and installer only through an explicitly reviewed change. Do not restore a
 second source authority as an operational shortcut.
 
-## Pending migration: canonical-skill-guard
+## Remaining Retirement: Canonical-Skill-Guard
 
 The patch identity `canonical-skill-guard` owns `plugins/canonical-skill-guard/`.
-It keeps externally owned canonical skills read-only. It overlaps the
-profile-owned `skill-source-guard` (dotfiles `agents/guards/`), and both are
-planned to merge into one profile-owned guard. Until then, keep changes here
-narrow: bug fixes and manifest correctness only. Verify with
+It keeps externally owned canonical skills read-only. The replacement
+profile-owned `source-guard` now lives in `agents/sources/plugins/source-guard/`.
+The 2026-09-26 profile has the replacement enabled and the bundled guard
+disabled. That configuration is not retirement or proof of live acceptance.
+Keep changes here narrow until the replacement is qualified. Verify with
 `tests/plugins/test_canonical_skill_guard.py` and
 `hermes plugins validate plugins/canonical-skill-guard`. Retire this identity by
 deleting the plugin once the merged profile guard is installed, enabled, and

@@ -16,7 +16,7 @@ When the opening message contains a link, the background title upgrade reads the
 
 - **Identity and status:** active `title-link-context` fork patch.
 - **Source surfaces:** `agent/title_link_context.py`, `agent/title_generator.py` (`first_link_text`, `_title_link_context`, `build_title_input`, prompt link rule), `tools/url_safety.py` (optional per-call `allow_private` on `is_safe_url` and `create_ssrf_safe_client`, threaded to the connect-time backend), `hermes_cli/config_defaults.py`, and `website/docs/user-guide/configuration.md`.
-- **Upstream:** Searched `NousResearch/hermes-agent` issues and PRs on 2026-09-26 for link- or URL-informed session titles. No matching issue or PR was found. The `allow_private` override on `url_safety` is a small general primitive that an upstream contribution could reuse.
+- **Upstream:** Searched `NousResearch/hermes-agent` issues and PRs on 2026-09-26 for link- or URL-informed session titles. The audit subsequently created proposal [#124560](https://github.com/NousResearch/hermes-agent/issues/124560) for URL-informed titles under equivalent refusal rules. This is a proposal, not an accepted implementation. The `allow_private` override on `url_safety` is a small general primitive the contribution could reuse.
 - **Coupling:** shares `agent/title_generator.py` with [Telegram topic titles and icons](telegram-topics.md). Load both when changing title input or prompt assembly.
 
 ## Verification and retirement

@@ -12,7 +12,7 @@ A detached background command uses the same recovered DM topic as a normal turn.
 - **Source / fork refs:** archived `session-context.md` HERMES-066; fork base `origin/main` `c8e3342595ea5021c920ba707e70926d20f1f9f2`.
 - **Surfaces:** `gateway/slash_commands.py`, `tests/gateway/test_background_command.py`.
 - **Upstream disposition:** current upstream `d0288be5b3330d2442e3907185b8e9d0958297bb` still starts the task from raw `event.source`. Issue [#97498](https://github.com/NousResearch/hermes-agent/issues/97498); third-party [#97537](https://github.com/NousResearch/hermes-agent/pull/97537) normalizes the source but retains the old reply anchor, so it does not satisfy the complete delivery contract. Own contribution [#123797](https://github.com/NousResearch/hermes-agent/pull/123797), head `3188be5583d6d1eb7e412dd3132936a207903c92`.
-- **Fork delivery:** pending review on this branch; no runtime activation claimed.
+- **Fork delivery:** included in the maintained fork source as verified on 2026-09-26. Source inclusion does not establish runtime activation.
 
 ## Update and retirement
 
