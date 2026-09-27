@@ -15,7 +15,9 @@ verification email or SMS from the expected sender in the intended mailbox or ph
 - Codes: `browser_vault_enter_code` first only when `browser_vault_list` reports
   `two_factor` exactly `automatic` for the handle. Otherwise the agent fetches the code itself first,
   because `browser_vault_enter_code` prompts the user synchronously when it cannot mint one.
-  It calls `browser_vault_enter_code` only when no self-fetch source exists.
+  It calls `browser_vault_enter_code` only when no self-fetch source exists. The code
+  condition is independent of the password route: a vault-filled password without a stored
+  authenticator key still allows a self-fetched code.
 
 Unchanged boundaries:
 
