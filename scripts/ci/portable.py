@@ -145,6 +145,14 @@ def external_temporary_directory(prefix: str, parent: Path | None = None) -> Ite
         yield Path(temporary)
 
 
+def windows_appdata_environment(home: Path) -> dict[str, str]:
+    local = home / 'AppData' / 'Local'
+    roaming = home / 'AppData' / 'Roaming'
+    local.mkdir(parents=True, exist_ok=True)
+    roaming.mkdir(parents=True, exist_ok=True)
+    return {'LOCALAPPDATA': str(local), 'APPDATA': str(roaming)}
+
+
 def environment(home: Path) -> dict[str, str]:
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
@@ -166,6 +174,11 @@ def environment(home: Path) -> dict[str, str]:
     })
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
+    if os.name == 'nt':
+        # Windows PowerShell writes Microsoft/Windows/PowerShell/ModuleAnalysisCache
+        # relative to the checkout when LOCALAPPDATA is absent. Keep its cache
+        # and per-user application state inside the disposable isolated HOME.
+        env.update(windows_appdata_environment(home))
     # Hosted native jobs install rustup into checkout-owned state before the
     # isolated HOME is created. Retain that exact toolchain, not runner config.
     if (STATE / 'rustup').is_dir():

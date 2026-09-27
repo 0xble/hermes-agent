@@ -158,6 +158,17 @@ class PortableGateTests(unittest.TestCase):
             ).splitlines()
             self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
 
+    def test_windows_appdata_stays_inside_isolated_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / 'isolated'
+            result = ci.windows_appdata_environment(home)
+            self.assertEqual(result, {
+                'LOCALAPPDATA': str(home / 'AppData' / 'Local'),
+                'APPDATA': str(home / 'AppData' / 'Roaming'),
+            })
+            self.assertTrue(Path(result['LOCALAPPDATA']).is_dir())
+            self.assertTrue(Path(result['APPDATA']).is_dir())
+
     def test_msvc_linker_environment_rejects_git_link_and_retains_sdk_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
             tools = Path(directory) / 'VC/Tools/MSVC/14.51'
