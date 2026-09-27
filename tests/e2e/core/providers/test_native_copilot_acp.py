@@ -67,10 +67,10 @@ FINAL_ONE = f"The file says {CANARY} (FINAL-ONE)"
 FINAL_TWO = "Summary: the canary was read (FINAL-TWO)"
 LATE_TEXT = "LATE-ANSWER-65788"
 # ACP reports no usage, so Hermes estimates pressure from messages and tool schemas. The
-# bridge/prompt makes the request reach this cap after three ~540-token read_file results;
-# only conversation rows (not that fixed prefix) are summarizable. Protect the active tail,
-# but not the first tool pair, and use the ratio-based tail budget so a middle exists.
-COMPACT_THRESHOLD = 15_000
+# bridge/prompt makes the request reach ~17,866 tokens after the FIRST read_file result;
+# at 19,000 the fourth ~540-token result crosses the cap, leaving an old tool pair
+# summarizable outside the protected active tail. The fixed prefix is not summarizable.
+COMPACT_THRESHOLD = 19_000
 COMPACT_FILES = 8
 COMPACT_ASK = "Read f1.txt through f8.txt one by one, then say done (COMPACT-ASK)."
 SUMMARY = "SUMMARY-ACP-7f3: files f1..fN were read; each is lorem ipsum filler."
