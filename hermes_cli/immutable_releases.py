@@ -182,7 +182,7 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
         published = True
         prepare_venv(target, previous=read_pointer(paths.current), uv=uv)
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
-        (target / ".release-ready").write_text(sha + "\n")
+        (target / ".release-ready").write_text(sha + "\n", encoding="utf-8")
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         if published:
@@ -207,7 +207,7 @@ def _receipt_pins(home: Path) -> set[Path]:
     pins: set[Path] = set()
     for path in (home / "logs" / "update_receipts").glob("*.json"):
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         raw = data.get("release") or data.get("release_path")
