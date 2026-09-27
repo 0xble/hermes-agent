@@ -79,3 +79,34 @@ def test_single_profile_pending_queues_round_trip_at_launch_home(tmp_path, monke
     assert sorted(call.kwargs["content"] for call in db.append_message.call_args_list) == [
         "adapter", "overflow", "runner"]
     assert not list((launch / "pending_messages").glob("*.json"))
+
+
+@pytest.mark.parametrize("primary_name", ["default", "other"])
+def test_multiplex_pending_owner_matrix(tmp_path, monkeypatch, primary_name):
+    launch = tmp_path / primary_name
+    launch.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    peer_name = "other" if primary_name == "default" else "default"
+    peer = tmp_path / peer_name
+    peer.mkdir()
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._primary_profile_name = primary_name
+    runner._served_profile_homes = {primary_name: launch, peer_name: peer}
+    dbs = {launch: MagicMock(), peer: MagicMock()}
+    keys = {}
+    store = SessionStore(sessions_dir=launch / "sessions", config=runner.config)
+    for name, home in ((primary_name, launch), (peer_name, peer)):
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm", profile=name)
+        key = store._generate_session_key(source)
+        keys[home] = key
+        assert runner._flush_owned_pending(key, name, reason="adapter_shutdown",
+                                           adapter_profile=primary_name) == 1
+    def resolve(key, *, not_after=None):
+        home = Path(get_hermes_home())
+        return ("session-" + home.name, dbs[home]) if key == keys[home] else None
+    runner.session_store = SimpleNamespace(resolve_session_id_for_key=resolve)
+    assert recover_pending_shutdown_flush(runner) == 2
+    for home, db in dbs.items():
+        assert db.append_message.call_args.kwargs["content"] == home.name
+

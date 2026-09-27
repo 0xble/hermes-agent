@@ -1974,20 +1974,14 @@ class GatewayShutdownMixin:
     def _flush_owned_pending(self, session_key, value, *, reason, overflow=False, adapter_profile=None):
         """Spool a queued slot under its session's home, regardless of transport owner."""
         from gateway.run import _profile_runtime_scope
-        from gateway.session_recovery import SessionRecoveryMixin
+        from gateway.run_pending_recovery import pending_home_for_key
         from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file
-        from hermes_constants import get_routing_process_hermes_home
 
-        owner = SessionRecoveryMixin._profile_from_session_key(session_key) or adapter_profile
-        primary = getattr(self, "_primary_profile_name", None) or "default"
-        if owner and owner != primary:
-            home = (getattr(self, "_served_profile_homes", None) or {}).get(owner)
-            if home is None:
-                logger.error("Cannot preserve pending queue: missing home for profile %s", owner)
-                return 0
-        else:
-            home = get_routing_process_hermes_home()
-        with _profile_runtime_scope(Path(home), prepared_secret_scope={}):
+        home = pending_home_for_key(self, session_key)
+        if home is None:
+            logger.error("Cannot preserve pending queue: no served home for %s", session_key)
+            return 0
+        with _profile_runtime_scope(home, prepared_secret_scope={}):
             if overflow:
                 return flush_overflow_to_file({session_key: value}, reason=reason)
             return flush_pending_to_file({session_key: value}, reason=reason)
