@@ -197,9 +197,10 @@ async def test_explicit_title_renames_without_icon_when_pick_overruns_deadline(t
     monkeypatch.setattr(run_topics, "_EXPLICIT_TITLE_ICON_TIMEOUT_S", 0.2)
     monkeypatch.setattr("agent.title_generator.pick_topic_icon",
                         lambda *a, **k: (release.wait(5), "📈")[1])  # ignores any per-request timeout
+    # A keyword-matching title: an overrun must not fall through to the keyword chooser either.
     try:
-        assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Quarterly Revenue") is True
+        assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Fix Login Bug") is True
     finally:
         release.set()
     kwargs = adapter.rename_dm_topic.await_args.kwargs
-    assert kwargs["name"] == "Quarterly Revenue" and "icon_custom_emoji_id" not in kwargs
+    assert kwargs["name"] == "Fix Login Bug" and "icon_custom_emoji_id" not in kwargs

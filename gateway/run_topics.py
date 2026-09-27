@@ -531,9 +531,11 @@ class GatewayTopicThreadsMixin:
             try:
                 return options, await asyncio.wait_for(asyncio.to_thread(_pick), _EXPLICIT_TITLE_ICON_TIMEOUT_S)
             except asyncio.TimeoutError:
+                # No options, not options without a model icon: the latter would still run the
+                # keyword fallback and change the icon on the path that promised to leave it alone.
                 logger.info("Icon pick for explicit /title exceeded %ss; renaming without it",
                             _EXPLICIT_TITLE_ICON_TIMEOUT_S)
-                return options, None
+                return None, None
         except Exception:
             logger.debug("Failed to propose an icon for explicit /title", exc_info=True)
             return None, None
