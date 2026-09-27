@@ -1626,7 +1626,8 @@ def _finish_pulled_update(
     from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha
     release_paths = ReleasePaths.for_home(get_hermes_home())
     current_release = read_pointer(release_paths.current)
-    release_layout = current_release is not None and current_release.parent == release_paths.releases.resolve()
+    release_layout = ((current_release is not None and current_release.parent == release_paths.releases.resolve())
+                      or (current_release is None and _updates_config().get("immutable_releases", False)))
     if release_layout and (not web_build_ok or node_failures):
         _record_update_step("immutable_release", False,
                             f"prerequisite build failed: web={web_build_ok}, node={node_failures}")

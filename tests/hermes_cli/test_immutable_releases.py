@@ -89,6 +89,9 @@ def test_release_update_reentry_uses_validated_source_interpreter(tmp_path, monk
     (source / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     interpreter = (tmp_path / "outside" if layout == "external" else source / layout) / "bin" / "python"
     venv.EnvBuilder(with_pip=False).create(interpreter.parent.parent)
+    if layout == "external":
+        for sibling in ("venv", ".venv"):
+            venv.EnvBuilder(with_pip=False).create(source / sibling)
     home = tmp_path / "profile"
     release = home / "releases" / "A"
     _fake_release(release, "A")
@@ -111,6 +114,27 @@ def test_release_update_reentry_uses_validated_source_interpreter(tmp_path, monk
         main.cmd_update(object())
     assert called[0][0] == str(interpreter)
     assert called[0][1][3] == str(source)
+
+
+def test_migration_records_source_interpreter_and_preserves_it_on_retry(tmp_path, monkeypatch):
+    import venv
+    source = tmp_path / "source"
+    (source / "hermes_cli").mkdir(parents=True)
+    (source / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "hermes_cli"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"], check=True)
+    interpreter = tmp_path / "external" / "bin" / "python"
+    venv.EnvBuilder(with_pip=False).create(interpreter.parent.parent)
+    home = tmp_path / "profile"
+    monkeypatch.setattr(releases.sys, "executable", str(interpreter))
+    assert releases.begin_migration(home, source)
+    record = json.loads((home / "release-layout.json").read_text())
+    assert record["source_python"] == str(interpreter)
+    assert releases.begin_migration(home, source)
+    assert json.loads((home / "release-layout.json").read_text())["source_python"] == str(interpreter)
+    assert releases.source_checkout_python(home, source) == interpreter
 
 
 def test_source_interpreter_missing_fails_loudly(tmp_path, monkeypatch):
