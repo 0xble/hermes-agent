@@ -554,6 +554,20 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_upload",
+        "description": "Attach local files to the page's upload control, including one inside a cross-origin iframe, without an OS file dialog. Give the trigger that opens the chooser (the upload button itself, not menu text) as a ref from the snapshot, or as a Playwright selector; for an iframe use 'iframe[src*=\"<host>\"] >> internal:control=enter-frame >> <button selector>'. With neither, the first input[type=file] on the page is used. Afterwards take a fresh snapshot, save, and read back the persisted file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                          "description": "Absolute local file paths to attach"},
+                "ref": {"type": "string", "description": "Element ref of the upload trigger (e.g. '@e12')"},
+                "selector": {"type": "string", "description": "Playwright selector for the upload trigger, used when no ref is given"},
+            },
+            "required": ["paths"],
+        },
+    },
+    {
         "name": "browser_press",
         "description": "Press a keyboard key. Useful for submitting forms (Enter), navigating (Tab), or keyboard shortcuts. Requires browser_navigate to be called first.",
         "parameters": {
@@ -751,6 +765,14 @@ def browser_handoff(account: str, task_id: Optional[str] = None, release: bool =
     if not _is_camofox_mode():
         return _dumps(_err("Visible account handoff requires the Camofox browser backend"))
     return _camofox("camofox_handoff", account, task_id, release)
+
+
+def browser_upload(paths: list, ref: Optional[str] = None, selector: Optional[str] = None,
+                   task_id: Optional[str] = None) -> str:
+    """Attach local files to the page's upload control (Camofox file-chooser interception)."""
+    if not _is_camofox_mode():
+        return _dumps(_err("browser_upload requires the Camofox browser backend"))
+    return _camofox("camofox_upload", paths, ref, selector, task_id)
 
 
 def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
@@ -1422,6 +1444,12 @@ registry.register(name="browser_handoff", toolset="browser", schema=_BROWSER_SCH
                                                                release=args.get("release") is True),
                   check_fn=_is_camofox_mode, dynamic_schema_overrides=_camofox_handoff_schema_override,
                   emoji="🌐")
+
+registry.register(name="browser_upload", toolset="browser", schema=_BROWSER_SCHEMA_MAP["browser_upload"],
+                  handler=lambda args, **kw: browser_upload(
+                      [str(p) for p in (args.get("paths") or []) if p], ref=args.get("ref") or None,
+                      selector=args.get("selector") or None, task_id=kw.get("task_id")),
+                  check_fn=_is_camofox_mode, emoji="📎")
 
 for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
     if _check_fn is None:  # also binds the legacy check_browser_<x>_requirements globals (tests + callers)

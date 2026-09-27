@@ -458,6 +458,9 @@ DEFAULT_CONFIG = {
             "user_id": "",
             "session_key": "",
             "adopt_existing_tab": False,  # rehydrate tab_id from Camofox before creating a tab
+            # Camofox's CAMOFOX_UPLOADS_DIR as seen from this host; browser_upload stages files here.
+            # Empty = Camofox's default ~/.camofox/uploads.
+            "uploads_dir": "",
             # Docker Camofox opens page URLs from inside the container: rewrite loopback page URLs
             # (localhost/127.0.0.1/::1) to the host alias; CAMOFOX_URL itself is unchanged.
             "rewrite_loopback_urls": False,

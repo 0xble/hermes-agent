@@ -16,7 +16,7 @@ _HERMES_CORE_TOOLS = [
     "vision_analyze", "image_generate",
     "skills_list", "skill_view", "skill_manage",
     "browser_handoff", "browser_navigate", "browser_snapshot", "browser_click",
-    "browser_type", "browser_scroll", "browser_back",
+    "browser_type", "browser_scroll", "browser_back", "browser_upload",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     "browser_vault_list", "browser_vault_unlock", "browser_vault_fill", "browser_vault_save_login", "browser_vault_enter_code",  # ride with the browser

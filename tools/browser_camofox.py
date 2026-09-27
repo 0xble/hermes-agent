@@ -800,6 +800,69 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
                        lambda data: {"success": True, "scrolled": direction})
 
 
+# Leave Camofox's own chooser wait (12s) in place: the server aborts every tab action at 30s, and
+# its upload route polls for a mounted input for nearly the whole wait before it consumes the
+# chooser, so a longer wait makes a successful attach come back as a 500.
+_UPLOAD_HTTP_TIMEOUT_S = 45
+
+
+def _stage_upload_file(path: str, uploads_dir: str) -> str:
+    """Return a path Camofox will accept: ``path`` itself when already inside ``uploads_dir``,
+    else a content-addressed copy under ``<uploads_dir>/hermes/``. The copy is kept, because the
+    page may read the file lazily after the attach returns."""
+    import hashlib
+    import shutil
+    from pathlib import Path
+    source = Path(path).expanduser().resolve()
+    root = Path(uploads_dir).expanduser().resolve()
+    if source.is_relative_to(root):
+        return str(source)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
+    target = root / "hermes" / f"{digest}-{source.name}"
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    return str(target)
+
+
+def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[str] = None,
+                   task_id: Optional[str] = None) -> str:
+    """Attach local files to the page's upload control via Camofox's file-chooser interception."""
+    from pathlib import Path
+    from agent.file_safety import get_read_block_error
+    if not paths:
+        return tool_error("paths must name at least one local file", success=False)
+    resolved = []
+    for raw in paths:
+        candidate = str(Path(str(raw)).expanduser().resolve())
+        blocked = get_read_block_error(candidate)
+        if blocked:
+            return tool_error(blocked, success=False)
+        if not Path(candidate).is_file():
+            return tool_error(f"Not a file: {raw}", success=False)
+        resolved.append(candidate)
+    # Camofox only accepts files under its uploads root; its own default is ~/.camofox/uploads.
+    uploads_dir = (_env_or_cfg("CAMOFOX_UPLOADS_DIR", _get_camofox_config(), "uploads_dir")
+                   or os.path.join(os.path.expanduser("~"), ".camofox", "uploads"))
+    try:
+        server_paths = [_stage_upload_file(p, uploads_dir) for p in resolved]
+    except OSError as exc:
+        return tool_error(f"Could not stage the file in the Camofox uploads directory: {exc}", success=False)
+    body: Dict[str, Any] = {"path": server_paths}
+    if ref:
+        body["ref"] = ref.lstrip("@")
+    elif selector:
+        body["selector"] = selector
+
+    def run(session):
+        data = _post(_tab_path(session, "upload"), {"userId": session["user_id"], **body},
+                     timeout=max(_get_command_timeout(), _UPLOAD_HTTP_TIMEOUT_S))
+        return json.dumps({"success": bool(data.get("ok", True)), "attached": [Path(p).name for p in resolved],
+                           "via": data.get("via", ""),
+                           "note": "Refs changed; take a fresh snapshot, then save and read back the result."})
+    return _with_tab(task_id, "upload a file", run)
+
+
 def camofox_back(task_id: Optional[str] = None) -> str:
     """Navigate back via Camofox."""
     return _tab_action(task_id, None, "back", {}, lambda data: {"success": True, "url": data.get("url", "")})
