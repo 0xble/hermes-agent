@@ -165,6 +165,7 @@ class PortableGateTests(unittest.TestCase):
             self.assertEqual(result, {
                 'LOCALAPPDATA': str(home / 'AppData' / 'Local'),
                 'APPDATA': str(home / 'AppData' / 'Roaming'),
+                'PSModuleAnalysisCachePath': str(home / 'AppData' / 'Local' / 'Microsoft' / 'Windows' / 'PowerShell' / 'ModuleAnalysisCache'),
             })
             self.assertTrue(Path(result['LOCALAPPDATA']).is_dir())
             self.assertTrue(Path(result['APPDATA']).is_dir())
