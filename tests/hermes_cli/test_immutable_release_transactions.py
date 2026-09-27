@@ -530,6 +530,60 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
 
 
 @pytest.mark.macos_only
+@pytest.mark.parametrize("scenario", ["promote", "rollback", "migration_rollback"])
+def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeypatch, scenario):
+    from hermes_cli import gateway, gateway_launchd, update_cmd
+    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, scenario)
+    calls = []
+    callback = lambda: calls.append(1) or "deferred"
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_: False)
+    if scenario == "promote":
+        assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                         reload_callback=callback)["reload_pending"]
+    else:
+        assert releases.rollback(home, plist_path=plist,
+                                 plist_body=original if scenario == "rollback" else None,
+                                 reload_callback=callback)["reload_pending"]
+    assert calls == [1]
+    record = releases._read_txn(releases.ReleasePaths.for_home(home))
+    assert record is not None and record["reload_issued"]["plist_sha256"] == record["plist"]["intended_sha256"]
+    assert record["reload_issued"]["attempt"] == 1
+    pending = releases.recover_pending_transaction(home, reload_callback=callback)
+    assert pending is not None and pending["reload_pending"]
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _: callback())
+    with pytest.raises(RuntimeError, match="observation-only"):
+        update_cmd._finish_pending_release_transaction(home)
+    # Rollback CLI retry replays its existing WAL rather than creating an
+    # inverse operation or issuing a second callback.
+    if scenario != "promote":
+        assert releases.rollback(home, plist_path=plist, reload_callback=callback)["reload_pending"]
+    assert calls == [1]
+
+
+@pytest.mark.macos_only
+def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
+    from hermes_cli import gateway, gateway_launchd, update_cmd
+    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote")
+    calls = []
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_: False)
+    assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                     reload_callback=lambda: calls.append(1) or "deferred")["reload_pending"]
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
+    monkeypatch.setattr(releases, "release_sha", lambda _: "B")
+    monkeypatch.setattr(update_cmd.sys, "platform", "darwin")
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda **kw: True)
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _: calls.append(1) or "deferred")
+    with pytest.raises(RuntimeError, match="observation-only"):
+        update_cmd._catch_up_immutable_release(defer=False, sha="B", source=source)
+    assert calls == [1]
+
+
+@pytest.mark.macos_only
 @pytest.mark.parametrize("wrong", ["release", "pid"])
 def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong):
     import psutil
