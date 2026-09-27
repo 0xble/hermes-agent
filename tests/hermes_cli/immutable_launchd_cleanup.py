@@ -41,9 +41,44 @@ def register_disposable_label(request, label: str, plist: Path) -> None:
     request.addfinalizer(lambda: _sweep(registry))
 
 
+def _sweep_missing_plists(base: Path) -> None:
+    """Recover disposable jobs after pytest has removed their registry and plist."""
+    domain = f"gui/{os.getuid()}"
+    listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=15)
+    if listing.returncode:
+        return
+    for row in listing.stdout.splitlines():
+        columns = row.split("\t")
+        if len(columns) != 3 or not columns[2].startswith(_PREFIXES):
+            continue
+        label = columns[2]
+        detail = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
+                                capture_output=True, text=True, timeout=15)
+        if detail.returncode:
+            continue
+        paths = [line.strip().removeprefix("path = ") for line in detail.stdout.splitlines()
+                 if line.strip().startswith("path = ")]
+        if len(paths) != 1:
+            continue
+        plist = Path(paths[0])
+        if plist.name != f"{label}.plist" or plist.exists():
+            continue
+        try:
+            relative = plist.relative_to(base)
+        except ValueError:
+            continue
+        if (len(relative.parts) < 4 or not relative.parts[0].startswith("r-")
+                or not relative.parts[1].startswith("pytest-of-")
+                or not relative.parts[2].startswith("pytest-")):
+            continue
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"],
+                       capture_output=True, timeout=15)
+
+
 def sweep_prior_sessions(request) -> None:
-    """Only reap registrations whose exact worker identity has exited."""
+    """Reap dead registered workers and jobs with vanished pytest temp trees."""
     base = Path(request.config._tmp_path_factory.getbasetemp()).parent.parent.parent
+    _sweep_missing_plists(base)
     try:
         registries = list(base.glob(f"r-*/pytest-of-*/pytest-*/{_REGISTRY}"))
     except OSError:
