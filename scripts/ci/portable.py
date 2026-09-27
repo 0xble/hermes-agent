@@ -166,8 +166,20 @@ def environment(home: Path) -> dict[str, str]:
     # isolated HOME is created. Retain that exact toolchain, not runner config.
     if (STATE / 'rustup').is_dir():
         env['RUSTUP_HOME'] = str(STATE / 'rustup')
+    if os.name == 'nt' and os.environ.get('VCToolsInstallDir'):
+        env.update(msvc_linker_environment(Path(os.environ['VCToolsInstallDir']), os.environ))
     env.update(git_environment(root=ROOT, base=env, config_path=home / 'gitconfig'))
     return env
+
+
+def msvc_linker_environment(tools: Path, source: Mapping[str, str]) -> dict[str, str]:
+    """Select MSVC rather than Git-for-Windows' unrelated link.exe."""
+    linker = tools / 'bin/Hostx64/x64/link.exe'
+    if not linker.is_file():
+        raise RuntimeError(f'MSVC linker missing: {linker}')
+    result = {'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER': str(linker)}
+    result.update({key: source[key] for key in ('LIB', 'INCLUDE', 'LIBPATH') if key in source})
+    return result
 
 
 def require_tools(names: tuple[str, ...], env: dict[str, str]) -> None:

@@ -158,6 +158,18 @@ class PortableGateTests(unittest.TestCase):
             ).splitlines()
             self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
 
+    def test_msvc_linker_environment_rejects_git_link_and_retains_sdk_libraries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory) / 'VC/Tools/MSVC/14.51'
+            linker = tools / 'bin/Hostx64/x64/link.exe'
+            with self.assertRaisesRegex(RuntimeError, 'MSVC linker missing'):
+                ci.msvc_linker_environment(tools, {'PATH': '/git/usr/bin', 'LIB': 'sdk'})
+            linker.parent.mkdir(parents=True)
+            linker.touch()
+            env = ci.msvc_linker_environment(tools, {'PATH': '/git/usr/bin', 'LIB': 'sdk', 'INCLUDE': 'headers'})
+            self.assertEqual(env, {'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER': str(linker),
+                                   'LIB': 'sdk', 'INCLUDE': 'headers'})
+
     def test_python_file_runner_preserves_only_isolated_git_config(self):
         # The shell runner clears its environment before spawning pytest. The
         # per-file process still needs the isolated checkout's safe.directory
