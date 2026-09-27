@@ -67,9 +67,13 @@ FINAL_ONE = f"The file says {CANARY} (FINAL-ONE)"
 FINAL_TWO = "Summary: the canary was read (FINAL-TWO)"
 LATE_TEXT = "LATE-ANSWER-65788"
 # ACP reports no usage, so Hermes estimates pressure from messages and tool schemas. The
-# eight ~540-estimated-token read_file results cross this cap mid-turn (the full ACP prompt
-# also includes a text tool bridge, which is not counted as OpenAI tool-schema tokens).
-COMPACT_THRESHOLD = 15_000
+# bridge/prompt makes the request reach ~17,866 tokens after the FIRST read_file result;
+# at 19,000 the fourth ~540-token result crosses the cap, leaving file 2's tool
+# pair eligible for summary. The fixed prefix is not summarizable; the default
+# protect_first_n=3 keeps the first user/assistant/tool rows verbatim, and the
+# default lean tail keeps the latest result (see ContextCompressor._protect_head_size
+# and _find_tail_cut_by_tokens in agent/context_compressor.py).
+COMPACT_THRESHOLD = 19_000
 COMPACT_FILES = 8
 COMPACT_ASK = "Read f1.txt through f8.txt one by one, then say done (COMPACT-ASK)."
 SUMMARY = "SUMMARY-ACP-7f3: files f1..fN were read; each is lorem ipsum filler."
@@ -298,6 +302,9 @@ def test_compaction_in_an_acp_session_keeps_the_next_prompt_valid_and_grounded(o
     final = _transcript(after[-1])
     assert SUMMARY in final and COMPACT_ASK in final, "post-compaction prompt lost the summary or the user's ask"
     assert f"file {COMPACT_FILES} lorem" in final, "post-compaction prompt lost the latest tool result"
+    # File 1 is protected by the default head on the first compaction but can
+    # enter a later summary: _effective_protect_first_n decays after compression.
+    # File 2 is eligible in the first pass and must not be resent verbatim.
     assert "file 2 lorem" not in final, "summarized tool output is still resent after compaction"
     rows = messages(sc.nh, latest_session(sc.nh))
     assert_no_duplicate_assistant_text(rows, FINAL_COMPACT)

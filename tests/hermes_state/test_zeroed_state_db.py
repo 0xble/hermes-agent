@@ -189,6 +189,54 @@ def test_concurrent_quarantine_no_clobber(tmp_path):
     conn.close()
 
 
+def test_quarantine_during_writability_preflight_is_not_readonly(tmp_path, monkeypatch):
+    """A sibling may rename a damaged file after is_file() but before os.access()."""
+    import os
+    import threading
+
+    import hermes_state as hs
+    import hermes_state_repair as repair
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = tmp_path / "state.db"
+    db.write_bytes(bytes(4096))
+    checking = threading.Event()
+    quarantined = threading.Event()
+    original_access = os.access
+    errors = []
+
+    def access_after_rename(path, mode, *args, **kwargs):
+        if Path(path) == db and not quarantined.is_set():
+            checking.set()
+            assert quarantined.wait(timeout=5), "quarantine did not finish"
+        return original_access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(repair.os, "access", access_after_rename)
+
+    def opener():
+        try:
+            sdb = hs.SessionDB(db_path=db)
+            try:
+                sdb.create_session(session_id="after-race", source="test")
+            finally:
+                sdb.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=opener)
+    thread.start()
+    try:
+        assert checking.wait(timeout=5), "preflight did not inspect the damaged file"
+        backup = hs.quarantine_invalid_state_db(db)
+        assert backup is not None and backup.read_bytes() == bytes(4096)
+    finally:
+        quarantined.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert not errors, errors
+    assert db.read_bytes().startswith(b"SQLite format 3\x00")
+
+
 def test_quarantine_fails_closed_when_lock_held(tmp_path):
     """#68805 review: when the cross-process lock cannot be acquired within
     the timeout, quarantine must FAIL CLOSED — return None without moving

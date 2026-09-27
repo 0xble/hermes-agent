@@ -7,6 +7,7 @@ heartbeats stop at exit, and the normal completion notice still fires.
 """
 import json
 import queue
+import threading
 import time
 
 import pytest
@@ -38,14 +39,25 @@ def test_heartbeat_carries_only_new_output_and_stops_at_exit(tmp_path, monkeypat
     monkeypatch.setattr(pr, "HEARTBEAT_MIN_SECONDS", 1)
     monkeypatch.setattr(pr, "HEARTBEAT_TICK_SECONDS", 0.1)
     registry = ProcessRegistry()
-    session = registry.spawn_local("echo first; sleep 2.5; echo second; sleep 2.5", cwd=str(tmp_path))
+    session = registry.spawn_local(
+        "echo first; while [ ! -e second-ready ]; do sleep 0.05; done; "
+        "echo second; while [ ! -e finish-ready ]; do sleep 0.05; done",
+        cwd=str(tmp_path),
+    )
     session.notify_on_complete = True
+    # Arm after the reader has captured output, as happens when a fast child
+    # prints before terminal dispatch has returned to configure its heartbeat.
+    assert _wait_until(lambda: "first" in session.output_buffer, timeout=20)
     assert registry.arm_heartbeat(session, 1) == 1
-
-    assert _wait_until(lambda: registry.poll(session.id)["status"] != "running", timeout=20)
-    # Give the completion event a moment to be enqueued after the reader observes EOF.
-    assert _wait_until(lambda: any(e.get("type") == "completion" for e in list(registry.completion_queue.queue)),
-                       timeout=5)
+    assert _wait_until(
+        lambda: any(e.get("type") == "heartbeat" and "first" in e["output"]
+                    for e in list(registry.completion_queue.queue)), timeout=10)
+    (tmp_path / "second-ready").touch()
+    assert _wait_until(
+        lambda: any(e.get("type") == "heartbeat" and "second" in e["output"]
+                    for e in list(registry.completion_queue.queue)), timeout=10)
+    (tmp_path / "finish-ready").touch()
+    assert session._completion_event.wait(timeout=20)
     events = _drain(registry.completion_queue)
     beats = [e for e in events if e["type"] == "heartbeat"]
     completion = [e for e in events if e["type"] == "completion"]
@@ -59,8 +71,39 @@ def test_heartbeat_carries_only_new_output_and_stops_at_exit(tmp_path, monkeypat
     assert len(completion) == 1
     # Heartbeats never outlive the process: nothing after the completion notice.
     assert events.index(completion[0]) > events.index(beats[-1])
-    assert not _wait_until(lambda: any(e.get("type") == "heartbeat" for e in list(registry.completion_queue.queue)),
-                           timeout=2.5)
+
+
+@pytest.mark.linux_only
+def test_heartbeat_due_at_exit_cannot_arrive_after_completion(tmp_path, monkeypatch):
+    monkeypatch.setattr(pr, "HEARTBEAT_MIN_SECONDS", 1)
+    monkeypatch.setattr(pr, "HEARTBEAT_TICK_SECONDS", 0.1)
+    registry = ProcessRegistry()
+    session = registry.spawn_local(
+        "while [ ! -e finish-ready ]; do sleep 0.05; done", cwd=str(tmp_path))
+    session.notify_on_complete = True
+    due = threading.Event()
+    resume = threading.Event()
+    returned = threading.Event()
+    emit = registry._emit_heartbeat
+
+    def delay_due_heartbeat(target, now):
+        due.set()
+        try:
+            assert resume.wait(timeout=20)
+            emit(target, now)
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(registry, "_emit_heartbeat", delay_due_heartbeat)
+    try:
+        registry.arm_heartbeat(session, 1)
+        assert due.wait(timeout=10)
+        (tmp_path / "finish-ready").touch()
+        assert session._completion_event.wait(timeout=20)
+    finally:
+        resume.set()
+    assert returned.wait(timeout=10)
+    assert [event["type"] for event in _drain(registry.completion_queue)] == ["completion"]
 
 
 def test_terminal_dispatch_heartbeat_implies_notify_and_refuses_foreground(monkeypatch):
