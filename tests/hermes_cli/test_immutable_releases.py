@@ -218,12 +218,15 @@ def test_source_unchanged_head_dirty_blocks_migration_rollback(tmp_path):
 def test_worker_env_pins_physical_venv_and_subprocess_path(tmp_path):
     home = tmp_path / "home"
     physical = home / "releases" / "A"
-    env = releases.detached_worker_env(home, physical, {
+    _fake_release(physical, "A")
+    executable, cwd, env = releases.worker_launch_spec(physical, {
         "VIRTUAL_ENV": str(home / "current" / ".venv"),
         "PATH": str(home / "current" / ".venv" / "bin") + os.pathsep + "/usr/bin",
     })
+    assert executable == str(physical / ".venv" / "bin" / "python")
+    assert cwd == physical
     assert env["VIRTUAL_ENV"] == str(physical / ".venv")
-    assert env["PATH"].split(os.pathsep)[0] == str(physical / ".venv" / "bin")
+    assert env["PATH"].split(os.pathsep) == [str(physical / ".venv" / "bin"), "/usr/bin"]
     assert env["HERMES_RELEASE"] == str(physical)
 
 
@@ -639,7 +642,9 @@ def test_worker_environment_is_resolved_release_not_current(tmp_path):
     home = tmp_path / ".hermes"
     release = home / "releases" / "a"
     _fake_release(release, "a")
-    env = releases.detached_worker_env(home, release, {"PYTHONPATH": "old"})
+    executable, cwd, env = releases.worker_launch_spec(release, {"PYTHONPATH": "old"})
+    assert executable == str(release / ".venv" / "bin" / "python")
+    assert cwd == release
     assert env["HERMES_RELEASE"] == str(release.resolve())
     assert env["PYTHONPATH"].split(os.pathsep)[:2] == [str(release.resolve()), "old"]
 

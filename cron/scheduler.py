@@ -3508,8 +3508,12 @@ def _launch_external_cron_worker(job: dict) -> bool:
     ack_path = handoff_dir / f"{execution_id}.ready"
     # Captured so a worker that dies before its acknowledgement can name the cause (#112729).
     stderr_path = handoff_dir / f"{execution_id}.stderr"
+    from hermes_cli.immutable_releases import LOADED_RELEASE_ROOT, worker_launch_spec
+    # The only launch-spec owner resolves the loaded installation, not the
+    # profile whose job happens to be running in this gateway.
+    executable, _, _ = worker_launch_spec(LOADED_RELEASE_ROOT, {})
     command = [
-        sys.executable,
+        executable,
         "-m",
         "cron.scheduler",
         "--external-worker-file",
@@ -3517,15 +3521,6 @@ def _launch_external_cron_worker(job: dict) -> bool:
         "--ack-file",
         str(ack_path),
     ]
-    # The dispatcher owns the code it has already loaded, even when `current`
-    # moves before this job fires. Resolve this module's physical tree once and
-    # use its interpreter only for an immutable release (not a source checkout).
-    repo_root = _LOADED_CODE_ROOT
-    if repo_root.parent == (_get_hermes_home() / "releases").resolve():
-        pinned_python = repo_root / (".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python")
-        if not pinned_python.is_file():
-            raise RuntimeError(f"cron release interpreter unavailable: {pinned_python}")
-        command[0] = str(pinned_python)
 
     from agent.secret_scope import (
         build_profile_secret_scope,
@@ -3605,16 +3600,15 @@ def _launch_external_cron_worker(job: dict) -> bool:
         "HERMES_EXEC_ASK",
     ):
         worker_env.pop(_presence_var, None)
-    # `-m cron.scheduler` has no hermes_cli.main bootstrap; pin this checkout explicitly
-    # (PYTHONSAFEPATH / stale editable mapping, #112729). See cron/scheduler_worker_env.py.
-    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    worker_env = pin_hermes_tree_on_pythonpath(worker_env, repo_root)
+    # The sanitizer removes inherited runtime variables. Restore all worker
+    # process identity fields together, after sanitization and before spawning.
+    _, worker_cwd, worker_env = worker_launch_spec(LOADED_RELEASE_ROOT, worker_env)
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             process = subprocess.Popen(
                 dispatch.argv,
-                cwd=str(repo_root),
+                cwd=str(worker_cwd),
                 env=worker_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,

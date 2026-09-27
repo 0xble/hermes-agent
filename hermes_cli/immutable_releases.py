@@ -21,6 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+# Freeze the package's physical code tree before `current` can change. This is
+# the installation owning the process, not any individual cron profile home.
+_LOADED_CODE_ROOT = Path(__file__).resolve().parent.parent
+LOADED_RELEASE_ROOT: Path | None = (
+    _LOADED_CODE_ROOT if _LOADED_CODE_ROOT.parent.name == "releases"
+    and (_LOADED_CODE_ROOT / ".hermes_build_sha").is_file() else None
+)
+
 
 @dataclass(frozen=True)
 class ReleasePaths:
@@ -767,14 +775,33 @@ def update_source_checkout(home: Path, running_root: Path) -> Path | None:
         return None
 
 
-def detached_worker_env(home: Path, release: Path, base: dict[str, str] | None = None) -> dict[str, str]:
-    """Pin worker executable/cwd/import path to a resolved release, not ``current``."""
-    env = dict(base or os.environ)
-    root = release.resolve()
+def worker_launch_spec(release_root: Path | None, base_env: dict[str, str]
+                       ) -> tuple[str, Path, dict[str, str]]:
+    """Select the owning physical interpreter, cwd and environment as one unit.
+
+    A source checkout retains the existing interpreter and import-path behavior.
+    A release never inherits a `current` entry even for another profile; no
+    consumer may reassemble only a subset of this specification.
+    """
+    env = dict(base_env)
+    if release_root is None:
+        from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+        return sys.executable, _LOADED_CODE_ROOT, pin_hermes_tree_on_pythonpath(env, _LOADED_CODE_ROOT)
+
+    root = Path(release_root).resolve()
     venv = root / ".venv"
-    binary = str(venv / ("Scripts" if os.name == "nt" else "bin"))
-    previous = env.get("PATH", "").split(os.pathsep)
+    executable = _release_python(root)
+    if not executable.is_file():
+        raise RuntimeError(f"cron release interpreter unavailable: {executable}")
+    binary = str(executable.parent)
+
+    def physical_entries(value: str) -> list[str]:
+        # An inherited `current` path changes meaning during the worker's life.
+        return [entry for entry in value.split(os.pathsep)
+                if entry and "current" not in Path(entry).parts and entry != str(root)
+                and entry != binary and entry != str(venv)]
+
     env.update({"HERMES_RELEASE": str(root), "VIRTUAL_ENV": str(venv),
-                "PATH": os.pathsep.join([binary] + [p for p in previous if p and p != binary]),
-                "PYTHONPATH": str(root) + os.pathsep + env.get("PYTHONPATH", "")})
-    return env
+                "PATH": os.pathsep.join([binary, *physical_entries(env.get("PATH", ""))]),
+                "PYTHONPATH": os.pathsep.join([str(root), *physical_entries(env.get("PYTHONPATH", ""))])})
+    return str(executable), root, env
