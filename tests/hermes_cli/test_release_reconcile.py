@@ -6,42 +6,45 @@ import pytest
 from hermes_cli import update_cmd
 
 
-def test_reconcile_matrix():
-    for enabled, current, candidate, journal, service, running, defer in product(
+@pytest.mark.parametrize(
+    "enabled,current,candidate,journal,service,running,defer",
+    tuple(product(
         (False, True), ("absent", "equal", "different"),
         ("none", "staged", "failed-partial"),
         ("none", "in-progress", "done", "rolled-back"),
         ("none", "source", "current", "stale-release"),
         ("none", "source", "current", "other"), (False, True),
-    ):
-        state = update_cmd._ReleaseReconcileState(enabled, current, candidate, journal, service, running, defer)
-        # Physical constraints: an absent current cannot have a current service
-        # or process; a completed migration has a release pointer.
-        unreachable = ((current == "absent" and (service == "current" or running == "current"))
-                       or (current != "absent" and journal in {"in-progress", "rolled-back"})
-                       or (current == "absent" and journal == "done")
-                       or (current == "different" and journal == "none"))
-        if unreachable:
-            with pytest.raises(ValueError, match="unreachable"):
-                update_cmd._reconcile_immutable_release(state)
-            continue
-        if current == "absent" and not enabled and journal in {"none", "rolled-back"}:
-            expected = "no-op"
-        elif current == "absent" and enabled and journal == "rolled-back":
-            expected = "fail-with-message"
-        elif current == "equal" and candidate != "staged":
-            expected = "fail-with-message"
-        elif current == "equal":
-            expected = ("defer-record" if defer and (service not in {"none", "current"} or running not in {"none", "current"})
-                        else "repair-service" if service not in {"none", "current"} or running not in {"none", "current"}
-                        else "no-op")
-        elif defer:
-            expected = "defer-record"
-        elif candidate == "staged":
-            expected = "activate-staged"
-        else:
-            expected = "build+activate"
-        assert update_cmd._reconcile_immutable_release(state) == expected, state
+    )),
+)
+def test_reconcile_matrix(enabled, current, candidate, journal, service, running, defer):
+    state = update_cmd._ReleaseReconcileState(enabled, current, candidate, journal, service, running, defer)
+    # Physical constraints: an absent current cannot have a current service
+    # or process; a completed migration has a release pointer.
+    unreachable = ((current == "absent" and (service == "current" or running == "current"))
+                   or (current != "absent" and journal in {"in-progress", "rolled-back"})
+                   or (current == "absent" and journal == "done")
+                   or (current == "different" and journal == "none"))
+    if unreachable:
+        with pytest.raises(ValueError, match="unreachable"):
+            update_cmd._reconcile_immutable_release(state)
+        return
+    if current == "absent" and not enabled and journal in {"none", "rolled-back"}:
+        expected = "no-op"
+    elif current == "absent" and enabled and journal == "rolled-back":
+        expected = "fail-with-message"
+    elif current == "equal" and candidate != "staged":
+        expected = "fail-with-message"
+    elif current == "equal":
+        expected = ("defer-record" if defer and (service not in {"none", "current"} or running not in {"none", "current"})
+                    else "repair-service" if service not in {"none", "current"} or running not in {"none", "current"}
+                    else "no-op")
+    elif defer:
+        expected = "defer-record"
+    elif candidate == "staged":
+        expected = "activate-staged"
+    else:
+        expected = "build+activate"
+    assert update_cmd._reconcile_immutable_release(state) == expected, state
 
 
 def test_first_migration_failure_retries_without_ready_candidate(tmp_path, monkeypatch):
