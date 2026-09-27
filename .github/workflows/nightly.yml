@@ -59,13 +59,50 @@ jobs:
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}'
+  native:
+    name: Native OS (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      OPENROUTER_API_KEY: ''
+      OPENAI_API_KEY: ''
+      NOUS_API_KEY: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Assert scheduled or dispatched SHA
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11.16'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '26.8.2'
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: '0.12.13'
+      - name: Install pinned Rust for ripgrep provisioning
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup default 1.96.1
+      - name: Qualify native OS at exact SHA
+        shell: bash
+        run: ./bin/ci nightly-native '${{ github.sha }}'
   desktop-core:
     # The deterministic Desktop core E2E suite (transcript integrity, backend
     # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.
     uses: ./.github/workflows/e2e-desktop-core.yml
   qualification:
     if: always()
-    needs: [linux, desktop-core]
+    needs: [linux, desktop-core, native]
     runs-on: ubuntu-latest
     steps:
       - name: Require every nightly job

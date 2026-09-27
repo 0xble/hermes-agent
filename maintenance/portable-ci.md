@@ -96,7 +96,7 @@ required fork statuses. Linux success does not qualify macOS or Windows.
 | --- | --- |
 | `ci.yaml` | `bin/ci` aggregates seven blocking source lanes. Trusted publisher owns status and cancellation semantics. |
 | `tests.yml` | `python`: canonical `scripts/run_tests.sh tests`. `e2e`: canonical `scripts/run_tests.sh` over `tests/e2e`, with `tests/e2e/core/upgrade` in its own run under a 900 s per-file bound (upstream runs it as a separate `e2e-upgrade` job; real N-1 -> HEAD updates exceed the 300 s default). Profile-plugin source is maintained outside this checkout. Integration and Docker directories stay excluded from the ordinary Python lane. |
-| `tests-os.yml` | Native maintainer qualification using the existing marker selector and canonical test runner. Require the actual OS and nonzero selection. See native commands below. |
+| `tests-os.yml` | Hosted nightly `native` matrix on macOS and Windows, using `bin/ci nightly-native <sha>` and the existing marker selector/canonical runner. Require the actual OS and nonzero selection. |
 | `lint.yml` | `static`: blocking ruff, Windows-footgun, compatibility-pointer, temporary-path and OS-marker checks. Advisory ruff/ty comparison stays a separate advisory review lane. |
 | `js-tests.yml` | `node`: nine nonrelease workspace units plus behavioral runner tests. Signed desktop packaging remains a release lane. |
 | `installer-tests.yml` | Native Windows maintainer qualification under PowerShell 5.1 and 7, using the three existing installer scripts below. |
@@ -134,17 +134,17 @@ required fork statuses. Linux success does not qualify macOS or Windows.
 
 ## Native and release qualification
 
-After `bin/ci setup`, run `bin/ci check --lane native-os` on the actual macOS or
-Windows host. This partial lane selects files with `macos_only` or `windows_only`
-through `scripts/ci/list_os_marked_tests.py`, then runs the canonical Python
-harness with that marker and `not integration`. Empty selection is a failure.
-Windows also runs the existing long-path, Node-compatibility and uv-shim installer
-scripts under both `powershell` 5.1 and `pwsh` 7. Linux cannot substitute for these
-checks. On macOS arm64, the marked lane passed 94 tests across 36 selected files
-with pinned Python 3.11.14 and an isolated HOME. One optional voice test skipped
-because the source-gate environment does not install numpy. This is marked-test
-evidence, not a full macOS source gate or installer qualification. Native Windows
-execution remains unqualified.
+`nightly.yml` runs `bin/ci nightly-native <sha>` at the exact scheduled or
+dispatched SHA on hosted `macos-latest` and `windows-latest`; both matrix jobs
+must pass for nightly `qualification`. The PR gate remains Linux-only. The
+native profile performs setup and selects files with `macos_only` or
+`windows_only` through `scripts/ci/list_os_marked_tests.py`, then runs the
+canonical Python harness with that marker and `not integration`. Empty selection
+is a failure. Windows also runs the existing long-path, Node-compatibility and
+uv-shim installer scripts under both `powershell` 5.1 and `pwsh` 7. Linux cannot
+substitute for these checks. Earlier local macOS arm64 evidence covered 94 tests
+across 36 files with Python 3.11.14; it does not establish a result for the
+current nightly candidate or for hosted Windows.
 
 For Windows process-lifecycle changes, the former on-demand `wine2e/**` selection
 remains available through the canonical harness on an isolated Windows machine:
