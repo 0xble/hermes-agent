@@ -83,9 +83,8 @@ thread.join(timeout=4)
 if mode == 'timeout':
     time.sleep(4)  # watchdog must terminate us before this point
     sys.exit(9)
-time.sleep(1.6)  # let watchdog clean stray descendants after completion
-fence.set()
-sys.exit(0)
+time.sleep(4)  # completed ledger must retain its result, but process is bounded
+sys.exit(9)
 '''
     marker = tmp_path / "slow-ready"
     env = {**os.environ, "HERMES_HOME": str(home)}

@@ -100,33 +100,34 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
             return
         home_token = set_hermes_home_override(Path(profile_home))
         try:
-            if _owner_identity(pid, fingerprint) != "live":
-                return  # unreadable or reused identity: no destructive change
-            # Claim timeout BEFORE the potentially slow descendant teardown. The
-            # completion path claims the same lock before any result side effect.
-            with fence.lock:
-                if fence.completion_claimed:
-                    timeout_won = False
-                else:
-                    timeout_won = finish_execution(
-                        execution_id, success=False,
-                        error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
-                        require_running=True,
-                    ) is not None
-                    if timeout_won:
-                        fence.timed_out = True
-            # Even a completed run must not leave owned stray children behind.
-            if not _terminate_owned_descendants(pid, fingerprint):
-                return  # cannot prove descendant teardown; never kill an unproven owner
-            if timeout_won:
-                os._exit(124)  # stop the active model/tool thread
-            # An earlier inactivity failure may have abandoned a non-daemon thread;
-            # terminate it without inventing a second timeout record. Completion,
-            # on the other hand, must retain its natural exit code.
-            if not fence.completion_claimed:
-                record = get_execution(execution_id)
-                if record and record["status"] == "failed":
-                    os._exit(124)
+            timeout_won = False
+            try:
+                # Claim timeout BEFORE descendant teardown. A completion claim
+                # fences the result, never disarms the process lifetime cap.
+                with fence.lock:
+                    if not fence.completion_claimed and _owner_identity(pid, fingerprint) == "live":
+                        timeout_won = finish_execution(
+                            execution_id, success=False,
+                            error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+                            require_running=True,
+                        ) is not None
+                        if timeout_won:
+                            fence.timed_out = True
+            finally:
+                # Cleanup is best effort, including when ledger I/O fails; never
+                # let an inaccessible child keep the abandoned worker alive.
+                try:
+                    _terminate_owned_descendants(pid, fingerprint)
+                finally:
+                    exit_code = 124 if timeout_won else 1
+                    if not timeout_won:
+                        try:
+                            record = get_execution(execution_id)
+                            if record and record["status"] == "completed":
+                                exit_code = 0
+                        except Exception:
+                            pass  # no durable terminal result can be proven
+                    os._exit(exit_code)
         finally:
             reset_hermes_home_override(home_token)
 

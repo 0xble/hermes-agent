@@ -169,6 +169,44 @@ def test_terminal_recovery_and_timeout_project_execution_status(tmp_path, monkey
         reset_hermes_home_override(token)
 
 
+def test_terminal_queue_commit_reconciles_execution_projection_without_resend(
+    tmp_path, monkeypatch
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(queue, "MAX_TERMINAL_DELIVERIES", 0, raising=False)
+        run = executions.create_execution("job-reconcile", source="builtin")
+        queue.enqueue(run["id"], {"id": "job-reconcile"}, "result")
+        send = Mock(return_value=None)
+        original_reflect = queue._reflect_execution_delivery
+        monkeypatch.setattr(
+            queue,
+            "_reflect_execution_delivery",
+            Mock(side_effect=OSError("ledger unavailable")),
+        )
+
+        with pytest.raises(OSError, match="ledger unavailable"):
+            queue.drain(send)
+
+        assert send.call_count == 1
+        assert executions.get_execution(run["id"])["delivery_status"] == "pending"
+        assert queue.get_status(run["id"])["status"] == "delivered"
+
+        monkeypatch.setattr(queue, "_reflect_execution_delivery", original_reflect)
+        assert queue.drain(send) == 0
+        send.assert_called_once_with({"id": "job-reconcile"}, "result", False)
+        assert executions.get_execution(run["id"])["delivery_status"] == "delivered"
+        assert queue.get_status(run["id"])["status"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_delivery_failure_is_terminal_not_retried_and_redacted(
     tmp_path, monkeypatch
 ):

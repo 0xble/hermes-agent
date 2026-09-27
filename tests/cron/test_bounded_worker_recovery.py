@@ -157,20 +157,37 @@ def test_external_worker_hard_wall_survives_abandoned_inactivity_future(tmp_path
                                    "profile_home": str(home)}), encoding="utf-8")
     code = """import concurrent.futures,sys,time
 from pathlib import Path
-from cron import executions,scheduler
+from types import SimpleNamespace
+from cron import scheduler
 import cron.scheduler_detached_worker as detached
+import run_agent
 
-def timed_out_job(job, **kwargs):
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(time.sleep, 60)
-    # This is the inactivity-timeout teardown: it abandons the still-running future.
-    pool.shutdown(wait=False)
-    assert not future.done()
-    executions.finish_execution(job['execution_id'], success=False, error='inactivity timeout')
-    return False
+# Keep the real run_one_job -> run_job -> executor/inactivity-watchdog path;
+# replace only unrelated agent construction, policy and delivery dependencies.
+class AbandonedAgent:
+    def run_conversation(self, *args, **kwargs):
+        time.sleep(60)
+    def get_activity_summary(self):
+        return {'seconds_since_activity': 10}
+    def interrupt(self, *args):
+        pass
 
-scheduler.run_one_job = timed_out_job
-detached.hard_wall_timeout_seconds = lambda: 0.5
+run_agent.AIAgent = AbandonedAgent
+scheduler._prepare_job_prompt = lambda *args: (None, 'test prompt')
+scheduler._load_cron_job_config = lambda *args: SimpleNamespace(cfg={}, model='test')
+scheduler._resolve_cron_agent_setup = lambda *args: scheduler._CronAgentSetup(model='test')
+scheduler._open_cron_session_db = lambda *args: None
+scheduler._construct_cron_agent = lambda *args, **kwargs: AbandonedAgent()
+scheduler._FireAudit = lambda *args: SimpleNamespace(write=lambda *args: None)
+scheduler._cron_inactivity_seconds = lambda: .1
+original_idle_loop = scheduler._inactivity_watchdog_loop
+scheduler._inactivity_watchdog_loop = lambda **kw: original_idle_loop(**{**kw, 'poll_s': .02})
+original_wait = concurrent.futures.wait
+concurrent.futures.wait = lambda fs, timeout=None, **kw: original_wait(fs, timeout=.02, **kw)
+scheduler._save_compose_deliver = lambda *args, **kwargs: None
+scheduler._finish_completed_run = lambda d, owner, execution_id: bool(
+    scheduler.finish_execution(execution_id, success=d.success, error=d.error))
+detached.hard_wall_timeout_seconds = lambda: 1.2
 sys.exit(0 if scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys.argv[2])) else 1)
 """
     env = {**os.environ, "HERMES_HOME": str(home)}
@@ -180,10 +197,14 @@ sys.exit(0 if scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys
                                stderr=subprocess.PIPE, text=True)
     try:
         stdout, stderr = process.communicate(timeout=4)
-        assert process.returncode == 124, (stdout, stderr)
+        assert process.returncode == 1, (stdout, stderr)
         token = _home(home)
         try:
-            assert executions.get_execution(run["id"])["status"] == "failed"
+            row = executions.get_execution(run["id"])
+            assert row is not None
+            assert row["status"] == "failed"
+            assert "idle for" in row["error"]
+            assert "hard wall-clock" not in row["error"]
         finally:
             reset_hermes_home_override(token)
     finally:

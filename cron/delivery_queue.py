@@ -174,6 +174,31 @@ def _reflect_terminal_deliveries(execution_ids: list[str], status: str) -> None:
         _reflect_execution_delivery(execution_id, status)
 
 
+def reconcile_terminal_deliveries() -> int:
+    """Repair execution projections for every committed terminal queue receipt.
+
+    The queue and execution ledger are separate SQLite stores.  A process crash
+    between their commits can leave the queue terminal while the ledger still
+    says ``pending``.  Reading both live rows and tombstones makes the repair
+    idempotent and does not re-open a delivery for sending.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT execution_id, status FROM deliveries "
+            "WHERE status IN ('delivered','failed','unknown','suppressed')"
+        ).fetchall()
+        tombstones = conn.execute(
+            "SELECT execution_id, terminal_status AS status FROM delivery_tombstones"
+        ).fetchall()
+    terminal_statuses = {str(row["execution_id"]): str(row["status"]) for row in rows}
+    terminal_statuses.update(
+        {str(row["execution_id"]): str(row["status"]) for row in tombstones}
+    )
+    for execution_id, status in terminal_statuses.items():
+        _reflect_execution_delivery(execution_id, status)
+    return len(terminal_statuses)
+
+
 def enqueue(
     execution_id: str,
     job: dict,
@@ -339,6 +364,7 @@ def drain(
     send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20
 ) -> int:
     """Deliver pending rows through *send*, terminalizing every claimed row."""
+    reconcile_terminal_deliveries()
     recover_abandoned()
     processed = 0
     for _ in range(max(0, limit)):
