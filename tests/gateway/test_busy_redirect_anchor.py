@@ -28,11 +28,11 @@ class Receiver:
 
 def _running_turn(runner, key, receiver):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
-    opening = MessageEvent(text="What is the weather in Shanghai?", source=source, message_id="A")
-    ctx = TurnContext(session_key=key, event_message_id="A", inbound_message_id="A")
+    opening = MessageEvent(text="What is the weather in Shanghai?", source=source, message_id="461")
+    ctx = TurnContext(session_key=key, event_message_id="461", inbound_message_id="461")
     turn = runner._session_state(key).turn
     turn.agent, turn.event, turn.ctx = receiver, opening, ctx
-    redirecting = MessageEvent(text="What day is tomorrow?", source=source, message_id="B")
+    redirecting = MessageEvent(text="What day is tomorrow?", source=source, message_id="462")
     return opening, ctx, redirecting, source
 
 
@@ -50,12 +50,12 @@ async def test_successful_redirect_moves_the_turn_reply_anchor_to_the_redirectin
         assert outcome.redirected is True
 
     # The final send is bracketed against the OPENING event: it now quotes B and is ledgered as B.
-    assert _reply_anchor_for_event(opening) == "B"
-    assert opening.ledger_message_id == "B"
+    assert _reply_anchor_for_event(opening) == "462"
+    assert opening.ledger_message_id == "462"
     # The queued-first-response lane reads the TurnContext anchor: it follows too.
-    assert (ctx.event_message_id, ctx.inbound_message_id) == ("B", "B")
+    assert (ctx.event_message_id, ctx.inbound_message_id) == ("462", "462")
     # A's own identity is untouched (the ledger keys on ledger_message_id, not on this).
-    assert opening.message_id == "A"
+    assert opening.message_id == "461"
 
 
 @pytest.mark.asyncio
@@ -65,12 +65,12 @@ async def test_refused_or_foreign_redirect_leaves_the_anchor_on_the_opening_mess
     opening, ctx, redirecting, _ = _running_turn(runner, "key", refusing)
     outcome = await runner._resolve_busy_steer_or_redirect(redirecting, "key", "interrupt", refusing)
     assert outcome.redirected is False
-    assert _reply_anchor_for_event(opening) == "A" and opening.ledger_message_id is None
-    assert ctx.event_message_id == "A"
+    assert _reply_anchor_for_event(opening) == "461" and opening.ledger_message_id is None
+    assert ctx.event_message_id == "461"
 
     # A redirect that lands on an agent which no longer owns the slot (a newer turn claimed it)
     # must not re-anchor the newer turn.
     displaced = Receiver()
     opening2, ctx2, redirecting2, _ = _running_turn(runner, "key2", Receiver())
     assert await runner._resolve_busy_steer_or_redirect(redirecting2, "key2", "interrupt", displaced)
-    assert _reply_anchor_for_event(opening2) == "A" and ctx2.event_message_id == "A"
+    assert _reply_anchor_for_event(opening2) == "461" and ctx2.event_message_id == "461"
