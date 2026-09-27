@@ -207,14 +207,20 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
     return target, "staged"
 
 
-def promote(home: Path, candidate: Path) -> dict[str, str | None]:
+def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
     candidate = candidate.resolve()
-    if not candidate.is_dir() or candidate.parent != paths.releases.resolve():
-        raise ValueError(f"candidate is not a release under {paths.releases}: {candidate}")
+    if (not candidate.is_dir() or candidate.parent != paths.releases.resolve()
+            or not (candidate / ".release-ready").is_file()
+            or (candidate / ".release-ready").read_text(encoding="utf-8").strip() != candidate.name):
+        raise ValueError(f"candidate is not a complete release under {paths.releases}: {candidate}")
     old = read_pointer(paths.current)
+    if old == candidate:
+        return {"current": str(candidate), "previous": str(read_pointer(paths.previous)) if read_pointer(paths.previous) else None}
     if old:
         _atomic_symlink(paths.previous, old)
+    if before_flip is not None:
+        before_flip()
     _atomic_symlink(paths.current, candidate)
     return {"current": str(candidate), "previous": str(old) if old else None}
 

@@ -34,6 +34,7 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
         package = release / "hermes_cli"
         package.mkdir()
         (package / "__init__.py").write_text(f"RELEASE = '{name}'\n")
+        (release / ".release-ready").write_text(name + "\n", encoding="utf-8")
         (release / "probe.py").write_text(
             "import hermes_cli, json, os, pathlib, sys, time\n"
             "p=pathlib.Path(os.environ['S2_PROBE_OUTPUT'])\n"

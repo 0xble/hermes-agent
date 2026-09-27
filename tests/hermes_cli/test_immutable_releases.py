@@ -23,6 +23,7 @@ def _fake_release(path: Path, marker: str, *, lock: str = "same") -> None:
     python = venv / "python"
     python.write_text("#!/bin/sh\nexit 0\n")
     python.chmod(python.stat().st_mode | stat.S_IEXEC)
+    (path / ".release-ready").write_text(path.name + "\n", encoding="utf-8")
 
 
 def test_promote_is_atomic_and_rollback_round_trip(tmp_path):
@@ -75,6 +76,59 @@ def test_retention_keeps_live_and_rollback_pins(tmp_path):
     assert (home / "releases" / "5").exists()
     assert len(list((home / "releases").iterdir())) >= 5
 
+
+def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
+    """Real child process dies at both commit boundaries; a second update converges."""
+    home = tmp_path / "profile"
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "version.txt").write_text("B", encoding="utf-8")
+    a = home / "releases" / "A"
+    _fake_release(a, "A")
+    releases.promote(home, a)
+    script = """
+import os, pathlib, signal, sys, time
+from hermes_cli import immutable_releases as r
+source, home, checkpoint, boundary = map(pathlib.Path, sys.argv[1:])
+r._build_venv = lambda *args, **kwargs: None
+r.smoke_plugins = lambda *args, **kwargs: None
+candidate, _ = r.stage_release(source, home, sha='B')
+def pause():
+    checkpoint.write_text(str(os.getpid()), encoding='utf-8')
+    while True: time.sleep(.1)
+if boundary.name == 'stage': pause()
+r.promote(home, candidate, before_flip=pause)
+"""
+    for boundary in ("stage", "flip"):
+        checkpoint = tmp_path / f"{boundary}.ready"
+        child = subprocess.Popen([sys.executable, "-c", script, str(source), str(home),
+                                  str(checkpoint), boundary], cwd=Path(__file__).resolve().parents[2])
+        try:
+            import time
+            deadline = time.monotonic() + 20
+            while not checkpoint.exists() and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(.05)
+            assert checkpoint.exists(), f"updater exited {child.poll()} before {boundary}"
+            child.kill()  # SIGKILL, no Python finally or cleanup handlers
+            assert child.wait(timeout=5) < 0
+            assert (home / "current").resolve() == a
+            assert (home / "current" / ".release-ready").read_text().strip() == "A"
+            if boundary == "flip":
+                assert (home / "previous").resolve() == a
+            # Simulate rerun in the surviving process. A ready candidate is reused;
+            # an incomplete one is rebuilt at its final venv path.
+            from unittest.mock import patch
+            with patch.object(releases, "_build_venv"), patch.object(releases, "smoke_plugins"):
+                candidate, _ = releases.stage_release(source, home, sha="B")
+            releases.promote(home, candidate)
+            assert (home / "current").resolve() == candidate
+            assert (home / "current" / ".release-ready").read_text().strip() == "B"
+            releases.rollback(home)
+            assert (home / "current").resolve() == a
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
 
 def test_worker_environment_is_resolved_release_not_current(tmp_path):
     home = tmp_path / ".hermes"
