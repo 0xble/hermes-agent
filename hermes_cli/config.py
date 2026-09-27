@@ -1208,6 +1208,26 @@ def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue
                    "or remove the quotes in config.yaml")
 
 
+def _validate_updates(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
+    import math
+
+    updates = config.get("updates")
+    if updates is None:
+        return
+    if not isinstance(updates, dict):
+        _issue(issues, "error", "updates must be a mapping", "Use updates: followed by indented settings")
+        return
+    enabled = updates.get("immutable_releases", False)
+    if type(enabled) is not bool:
+        _issue(issues, "error", "updates.immutable_releases must be a boolean",
+               "Use true or false without quotes")
+    timeout = updates.get("release_acknowledgement_timeout_seconds", 180.0)
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        _issue(issues, "error", "updates.release_acknowledgement_timeout_seconds must be a finite positive number",
+               "Use an unquoted positive number of seconds")
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return detected issues (accepts a pre-loaded dict).
     Catches common YAML mistakes that otherwise surface as confusing runtime errors."""
@@ -1221,6 +1241,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     issues: List[ConfigIssue] = []
     _validate_voice(config, issues)
     _validate_timezone(config, issues)
+    _validate_updates(config, issues)
     cp = config.get("custom_providers")
     fb = config.get("fallback_model")
     for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model)):

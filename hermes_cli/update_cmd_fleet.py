@@ -790,7 +790,7 @@ def _defer_fleet_restart_after_update(*, update_complete: bool, resume_incomplet
         sys.exit(1)
 
 
-def _apply_pending_fleet_restart_catchup(*, defer: bool = False) -> None:
+def _apply_pending_fleet_restart_catchup(*, defer: bool = False, checkout_complete: bool = True) -> None:
     """On an already-up-to-date ``hermes update``, finish a skipped restart.
 
     No-op when nothing is pending; exits 1 on incomplete catch-up so automation
@@ -812,14 +812,16 @@ def _apply_pending_fleet_restart_catchup(*, defer: bool = False) -> None:
     home = get_hermes_home()
     paths = ReleasePaths.for_home(home)
     current = read_pointer(paths.current)
-    if current is not None and _acknowledged_release_launchd_label(home, current):
-        # Catch-up after a completed release reload still owes other fleet members,
-        # but must verify rather than kill the acknowledged launchd gateway.
+    if current is not None:
+        # Credit only a healthy, live ACK. A stale gateway needs the normal
+        # relaunch path, but both paths verify against the physical release.
+        credited = _acknowledged_release_launchd_label(home, current)
         from hermes_cli.update_cmd import _restart_gateway_fleet_after_update, _verify_fleet_after_update
-        outcome = _restart_gateway_fleet_after_update(None, False, acknowledged_release_root=current)
+        outcome = _restart_gateway_fleet_after_update(
+            None, False, acknowledged_release_root=current if credited else None)
         _verify_fleet_after_update(
             outcome, _pre_update_plan=None, _windows_gateway_resume=None,
-            node_failures=[], update_complete=True, expected_sha=current.name, expected_root=current)
+            node_failures=[], update_complete=checkout_complete, expected_sha=current.name, expected_root=current)
         return
     print()
     _warn_pending_fleet_restart()
@@ -1043,6 +1045,13 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
         processes = [supervisor, *supervisor.children(recursive=True)]
         if not any(p.pid == gateway_pid and Path(p.cwd()).resolve() == root.resolve()
                    for p in processes):
+            return None
+        # ACK proves the incarnation and plist, not that it still serves the
+        # intended code. A stale or unreadable live identity cannot earn credit.
+        from hermes_cli.update_receipt import collect_fleet_versions
+        rows = collect_fleet_versions(expected_sha_override=root.name, expected_root_override=root)
+        if not any(row.get("pid") == gateway_pid and row.get("state") == "current"
+                   and row.get("code_root") == str(root) for row in rows):
             return None
         return label
     except (OSError, ValueError, KeyError, TypeError, psutil.Error):

@@ -125,3 +125,7 @@ def test_immutable_post_swap_failure_is_partial_and_never_activates(post_swap_ca
     step = next(step for step in receipt["steps"] if step["name"] == "immutable_maintenance")
     assert step["ok"] is False
     assert ("forced candidate maintenance failure" if failure == "raised" else "incomplete") in step["detail"]
+    message = next(step["detail"] for step in receipt["steps"] if step["name"] == "immutable_maintenance")
+    assert candidate.name in message
+    assert str(paths.home / "release-txn.json") in message
+    assert "hermes update" in message

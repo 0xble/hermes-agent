@@ -184,11 +184,7 @@ _IMMUTABLE_RELEASE_ACK_CALL_SITES = frozenset({
 
 
 def _release_acknowledgement_timeout() -> float:
-    value = _updates_config().get("release_acknowledgement_timeout_seconds", 180.0)
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return 180.0
+    return float(_updates_config().get("release_acknowledgement_timeout_seconds", 180.0))
 
 
 def _await_release_acknowledgement(home: Path, *, timeout_seconds: float | None = None) -> bool:
@@ -302,8 +298,13 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
 
 def _updates_config() -> dict:
     """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors."""
-    from hermes_cli.config import load_config
-    section = (load_config() or {}).get("updates", {})
+    from hermes_cli.config import load_config, validate_config_structure
+    config = load_config() or {}
+    issues = [issue for issue in validate_config_structure({"updates": config.get("updates")})
+              if issue.severity == "error"]
+    if issues:
+        raise ValueError("Invalid update configuration: " + "; ".join(issue.message for issue in issues))
+    section = config.get("updates", {})
     return section if isinstance(section, dict) else {}
 
 
@@ -1651,7 +1652,11 @@ def _finish_already_up_to_date(
     # A deferred/failed release promotion is a separate obligation from the
     # pending fleet restart; never restart A when source HEAD already names B.
     _catch_up_immutable_release(defer=no_gateway_restart)
-    _apply_pending_fleet_restart_catchup(defer=no_gateway_restart)
+    if current_checkout_complete:
+        _apply_pending_fleet_restart_catchup(defer=no_gateway_restart)
+    else:
+        _apply_pending_fleet_restart_catchup(
+            defer=no_gateway_restart, checkout_complete=False)
     if not current_checkout_complete:
         if gateway_mode:
             _write_gateway_update_exit_code(False)
@@ -1884,14 +1889,25 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                     node_failures=[], desktop_build_ok=True,
                     pre_update_version=opts.pre_update_version)
             except Exception as exc:
-                _record_update_step("immutable_maintenance", False, str(exc))
+                detail = (f"immutable_maintenance failed for release {release.name} ({release}): {exc}; "
+                          f"evidence: {paths.home / 'release-txn.json'}, "
+                          f"{paths.home / 'logs/update_receipts/latest.json'}; "
+                          "recover with: hermes update (or hermes update --rollback if current is unhealthy)")
+                _record_update_step("immutable_maintenance", False, detail)
+                print(f"✗ {detail}")
                 if gateway_mode:
                     _write_gateway_update_exit_code(False)
                 _finalize_receipt("partial", "Immutable release maintenance failed: %s")
                 raise SystemExit(1) from exc
             _record_update_step("immutable_maintenance", update_complete,
-                                "required shared state synchronized" if update_complete else "post-update maintenance incomplete")
+                                "required shared state synchronized" if update_complete else
+                                f"post-update maintenance incomplete for release {release.name} ({release}); "
+                                f"evidence: {paths.home / 'release-txn.json'}, "
+                                f"{paths.home / 'logs/update_receipts/latest.json'}; recover with: hermes update")
             if not update_complete:
+                print(f"✗ Post-update maintenance incomplete for release {release.name}; "
+                      f"see {paths.home / 'logs/update_receipts/latest.json'} and "
+                      f"{paths.home / 'release-txn.json'}; recover with: hermes update")
                 if gateway_mode:
                     _write_gateway_update_exit_code(False)
                 _finalize_receipt("partial", "Immutable release maintenance incomplete: %s")
@@ -1899,6 +1915,12 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
             if not _activate_immutable_release(defer=opts.no_gateway_restart,
                                                 sha=release.name, source=Path(payload["source"]),
                                                 source_python=Path(payload["source_python"]) if payload.get("source_python") else None):
+                detail = (f"immutable_activation failed for release {release.name} ({release}); "
+                          f"evidence: {paths.home / 'release-txn.json'}, "
+                          f"{paths.home / 'logs/update_receipts/latest.json'}; "
+                          "recover with: hermes update (or hermes update --rollback)")
+                _record_update_step("immutable_activation", False, detail)
+                print(f"✗ {detail}")
                 _finalize_receipt("partial", "Immutable release activation failed: %s")
                 raise SystemExit(1)
             if not opts.no_gateway_restart:
