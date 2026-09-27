@@ -18,6 +18,8 @@ import venv
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from hermes_cli import immutable_releases as releases
 
@@ -449,3 +451,104 @@ def test_deferred_helper_crash_phases_never_acknowledge_transaction(tmp_path, mo
     assert not json.loads(txn.read_text()).get("reload_done", False)
     assert releases.read_pointer(home / "current") == b
     assert plist.read_bytes() == intended
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("reason", ["failed-submit", "unobserved"])
+def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reason):
+    from hermes_cli import gateway_launchd
+
+    home, _, plist, a, b, _, _, intended = _fixture(tmp_path, "promote")
+    calls = []
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_log_path", lambda: tmp_path / "reload.log")
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 1)
+    monkeypatch.setattr(gateway_launchd, "_gw", lambda: SimpleNamespace(
+        _append_launchd_reload_log=lambda *_: None,
+        logger=SimpleNamespace(warning=lambda *_: None)))
+    def submit(args, **kwargs):
+        calls.append(args)
+        if reason == "failed-submit":
+            raise subprocess.CalledProcessError(1, args)
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(gateway_launchd.subprocess, "run", submit)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _: None)
+    def reload():
+        submitted = gateway_launchd._spawn_deferred_launchd_reload(
+            domain=f"gui/{os.getuid()}", label=plist.stem,
+            target=f"gui/{os.getuid()}/{plist.stem}", plist_path=plist,
+            gateway_pid=os.getpid())
+        return "deferred" if submitted else False
+    if reason == "failed-submit":
+        with pytest.raises(RuntimeError, match="refresh"):
+            releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                      reload_callback=reload)
+    else:
+        result = releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                           reload_callback=reload)
+        assert result["reload_pending"]
+    txn = home / "release-txn.json"
+    assert len(calls) == 1 and calls[0][:2] == ["launchctl", "submit"]
+    assert txn.exists() and not json.loads(txn.read_text()).get("reload_done")
+    assert releases.read_pointer(home / "current") == b
+    assert releases.read_pointer(home / "previous") == a
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_: False)
+    if reason == "unobserved":
+        again = releases.recover_pending_transaction(home, reload_callback=lambda: "deferred")
+        assert again["reload_pending"] and txn.exists()
+    def observed_ack(path):
+        paths = releases.ReleasePaths.for_home(path)
+        record = releases._read_txn(paths)
+        releases._verify_transaction(paths, record)
+        record["reload_ack"] = {"gateway_pid": os.getpid(), "release_root": str(b)}
+        record["reload_done"] = True
+        releases._write_txn(paths, record)
+        releases._finish_txn(paths, record)
+        return True
+    monkeypatch.setattr(releases, "acknowledge_running_release", observed_ack)
+    assert releases.recover_pending_transaction(home, reload_callback=lambda: "deferred")["current"] == str(b)
+    assert not txn.exists()
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("wrong", ["release", "pid"])
+def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong):
+    import psutil
+    from hermes_cli import gateway_launchd
+
+    home, _, plist, _, b, _, _, intended = _fixture(tmp_path, "promote")
+    assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                     reload_callback=lambda: "deferred")["reload_pending"]
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _: 31415)
+    gateway = SimpleNamespace(
+        pid=31416 if wrong == "pid" else 31415,
+        cmdline=lambda: ["hermes_cli.main", "gateway", "run"],
+        exe=lambda: str((b if wrong == "pid" else home / "releases/A") / ".venv/bin/python"),
+        cwd=lambda: str(b if wrong == "pid" else home / "releases/A"),
+        environ=lambda: {}, children=lambda **_: [])
+    monkeypatch.setattr(psutil, "Process", lambda _: gateway)
+    assert not releases.acknowledge_running_release(home)
+    record = json.loads((home / "release-txn.json").read_text())
+    assert not record.get("reload_done") and "reload_ack" not in record
+
+
+@pytest.mark.macos_only
+def test_no_gateway_restart_pending_txn_has_no_launchctl_or_pointer_writes(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd
+
+    home, _, plist, _, b, _, _, intended = _fixture(tmp_path, "promote")
+    assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                     reload_callback=lambda: "deferred")["reload_pending"]
+    txn = home / "release-txn.json"
+    before = (txn.read_bytes(), plist.read_bytes(),
+              releases.read_pointer(home / "current"), releases.read_pointer(home / "previous"))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *_: SimpleNamespace(no_gateway_restart=True))
+    with (patch.object(update_cmd, "_finish_pending_release_transaction", side_effect=AssertionError("replayed")),
+          patch.object(update_cmd, "_require_immutable_launchd", side_effect=AssertionError("service touched")),
+          patch.object(update_cmd, "_finalize_receipt"),
+          patch.object(releases, "acknowledge_running_release", side_effect=AssertionError("launchctl queried")),
+          pytest.raises(SystemExit) as exit_info):
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=False, no_gateway_restart=True), False)
+    assert exit_info.value.code == 1
+    assert before == (txn.read_bytes(), plist.read_bytes(),
+                      releases.read_pointer(home / "current"), releases.read_pointer(home / "previous"))

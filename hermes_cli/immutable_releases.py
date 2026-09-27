@@ -682,7 +682,10 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
     body = Path(plist["path"]).read_bytes()
     if hashlib.sha256(body).hexdigest() != plist["intended_sha256"]:
         return False
-    definition = plistlib.loads(body)
+    try:
+        definition = plistlib.loads(body)
+    except (ValueError, TypeError, plistlib.InvalidFileException):
+        return False
     if Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve() != paths.home:
         return False
     label = definition.get("Label")
@@ -695,6 +698,8 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
         return False
     try:
         supervisor = psutil.Process(supervisor_pid)
+        if supervisor.pid != supervisor_pid:
+            return False
         processes = [supervisor, *supervisor.children(recursive=True)]
         if gateway_pid is not None:
             processes = [p for p in processes if p.pid == gateway_pid]

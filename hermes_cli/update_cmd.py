@@ -181,7 +181,10 @@ def _finish_pending_release_transaction(home: Path | None = None) -> dict | None
     from hermes_cli import gateway, gateway_launchd
     plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
     callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist else None
-    return recover_pending_transaction(home, reload_callback=callback)
+    result = recover_pending_transaction(home, reload_callback=callback)
+    if result and result.get("reload_pending"):
+        raise RuntimeError("release reload pending: intended launchd gateway has not acknowledged startup; retry a restart-authorized update or restart the gateway")
+    return result
 
 
 def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
@@ -1477,12 +1480,10 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
     from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha, _release_is_ready
     paths = ReleasePaths.for_home(get_hermes_home())
     if defer and (paths.home / "release-txn.json").exists():
-        from hermes_cli.immutable_releases import acknowledge_running_release
-        if not acknowledge_running_release(paths.home):
-            message = "Pending release reload unacknowledged; restart-prohibited reconciliation cannot replay it"
-            _record_update_step("immutable_release_catchup", False, message)
-            _finalize_receipt("partial", "Release reload remains pending: %s")
-            raise SystemExit(message)
+        message = "Pending release transaction requires a restart-authorized run; restart-prohibited reconciliation cannot replay it"
+        _record_update_step("immutable_release_catchup", False, message)
+        _finalize_receipt("partial", "Release transaction remains pending: %s")
+        raise SystemExit(message)
     if not _immutable_release_enabled(paths):
         return
     current = read_pointer(paths.current)
@@ -1533,11 +1534,12 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
             if current is None or not plist.exists():
                 raise RuntimeError("cannot repair launchd service without current release and plist")
             body = gateway.generate_launchd_plist(release_target=current).encode("utf-8")
-            if not activate_release(paths.home, current, plist_path=plist, plist_body=body,
-                                    reload_callback=lambda: gateway_launchd._reload_installed_launchd_plist(plist),
-                                    force_reload=True):
-                _record_update_step("immutable_release_catchup", False, "stale launchd definition")
-                _finalize_receipt("partial", "Release service repair failed: %s")
+            result = activate_release(paths.home, current, plist_path=plist, plist_body=body,
+                                      reload_callback=lambda: gateway_launchd._reload_installed_launchd_plist(plist),
+                                      force_reload=True)
+            if result.get("reload_pending"):
+                _record_update_step("immutable_release_catchup", False, "service reload awaiting gateway acknowledgement")
+                _finalize_receipt("partial", "Release service repair remains pending: %s")
                 raise SystemExit(1)
         if state.running not in {"none", "current"}:
             _write_fleet_restart_pending_marker(expected_sha=sha)
@@ -1987,10 +1989,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # may have restart disabled even when it did not spell the CLI flag itself.
     opts = None if getattr(args, "rollback", False) else _resolve_update_options(args, gateway_mode)
     if opts is not None and opts.no_gateway_restart:
-        from hermes_cli.immutable_releases import ReleasePaths, acknowledge_running_release
+        from hermes_cli.immutable_releases import ReleasePaths
         paths = ReleasePaths.for_home(get_hermes_home())
-        if (paths.home / "release-txn.json").exists() and not acknowledge_running_release(paths.home):
-            message = ("Pending immutable release reload is unacknowledged; "
+        if (paths.home / "release-txn.json").exists():
+            message = ("Pending immutable release transaction requires a restart-authorized run; "
                        "--no-gateway-restart prohibits recovery. No launchctl action was attempted.")
             print(f"✗ {message}")
             from hermes_cli.update_receipt import begin_update_receipt
