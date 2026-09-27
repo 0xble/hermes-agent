@@ -873,7 +873,8 @@ class GatewaySessionCommandsMixin:
         reply = t("gateway.title.set_to", title=stored_title)
         if topic_lane:
             # An explicit request needs the Bot API result before we claim the visible name changed.
-            renamed = await self._rename_telegram_topic_explicit(source, session_id, sanitized)
+            renamed = await self._rename_telegram_topic_explicit(
+                source, session_id, sanitized, session_key=session_entry.session_key)
             if not renamed:
                 return reply + "\nTelegram topic rename failed; the session title was stored."
             if stored_title != sanitized:

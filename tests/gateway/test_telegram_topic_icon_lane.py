@@ -27,12 +27,13 @@ def _source(thread_id: str = THREAD) -> SessionSource:
                          chat_type="dm", thread_id=thread_id)
 
 
-def _runner(tmp_path, *, extra: dict, session_id: str = "sess-1"):
+def _runner(tmp_path, *, extra: dict, session_id: str = "sess-1", bind: bool = True):
     db = SessionDB(tmp_path / "state.db")
     db.create_session(session_id, source="telegram")
     db.enable_telegram_topic_mode(chat_id=CHAT, user_id=USER)
-    db.bind_telegram_topic(chat_id=CHAT, thread_id=THREAD, user_id=USER, session_key="k",
-                           session_id=session_id)
+    if bind:
+        db.bind_telegram_topic(chat_id=CHAT, thread_id=THREAD, user_id=USER, session_key="k",
+                               session_id=session_id)
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***", extra=extra)})
     adapter = MagicMock()
@@ -204,3 +205,47 @@ async def test_explicit_title_renames_without_icon_when_pick_overruns_deadline(t
         release.set()
     kwargs = adapter.rename_dm_topic.await_args.kwargs
     assert kwargs["name"] == "Fix Login Bug" and "icon_custom_emoji_id" not in kwargs
+
+
+def _unbound_runner(tmp_path):
+    """A topic whose first turn has not started yet: the session exists, no topic binding does."""
+    return _runner(tmp_path, extra={}, bind=False)
+
+
+@pytest.mark.anyio
+async def test_explicit_title_binds_and_renames_a_topic_its_first_turn_has_not_bound(tmp_path):
+    """/title can arrive before the first turn records the binding (a busy gateway queues the turn)."""
+    runner, adapter, db = _unbound_runner(tmp_path)
+    assert await runner._rename_telegram_topic_explicit(
+        _source(), "sess-1", "Loop Engineering", session_key="k") is True
+    assert adapter.rename_dm_topic.await_args.kwargs["name"] == "Loop Engineering"
+    binding = db.get_telegram_topic_binding(chat_id=CHAT, thread_id=THREAD)
+    assert (binding["session_id"], binding["session_key"]) == ("sess-1", "k")
+
+
+@pytest.mark.anyio
+async def test_explicit_title_without_session_key_still_refuses_an_unbound_topic(tmp_path):
+    runner, adapter, db = _unbound_runner(tmp_path)
+    assert await runner._rename_telegram_topic_explicit(_source(), "sess-1", "Loop Engineering") is False
+    adapter.rename_dm_topic.assert_not_awaited()
+    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id=THREAD) is None
+
+
+@pytest.mark.anyio
+async def test_explicit_title_does_not_take_a_topic_bound_to_another_session(tmp_path):
+    runner, adapter, db = _runner(tmp_path, extra={}, session_id="owner")
+    assert await runner._rename_telegram_topic_explicit(
+        _source(), "intruder", "Hijack", session_key="other") is False
+    adapter.rename_dm_topic.assert_not_awaited()
+    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id=THREAD)["session_id"] == "owner"
+
+
+@pytest.mark.anyio
+async def test_explicit_title_does_not_move_a_session_linked_to_another_topic(tmp_path):
+    """The session already owns topic 77; /title from unbound topic 78 must not steal it."""
+    runner, adapter, db = _runner(tmp_path, extra={})
+    assert await runner._rename_telegram_topic_explicit(
+        _source("78"), "sess-1", "Elsewhere", session_key="k") is False
+    adapter.rename_dm_topic.assert_not_awaited()
+    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id="78") is None
+    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id=THREAD)["session_id"] == "sess-1"

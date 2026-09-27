@@ -10,6 +10,7 @@ import re
 import time
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from agent.compaction_display import project_compaction_message_for_display
@@ -455,21 +456,29 @@ class GatewayTopicThreadsMixin:
         if future is not None:
             future.add_done_callback(_log_rename_failure)
 
-    async def _rename_telegram_topic_explicit(self, source: SessionSource, session_id: str, title: str) -> bool:
+    async def _rename_telegram_topic_explicit(
+        self, source: SessionSource, session_id: str, title: str, *, session_key: Optional[str] = None,
+    ) -> bool:
         """Report whether an explicit /title reached the bound Telegram topic.
 
         The icon follows the new name under the same rules as an automatic rename (override, model
         pick, keyword fallback) and rides the same Bot API call. Unlike an automatic rename it also
         replaces a manually chosen icon: /title is the user saying the topic's subject changed.
+
+        ``session_key`` lets /title bind a topic nothing has bound yet: the first turn records the
+        binding only when it starts, so a /title sent while that turn waits, or in a topic that only
+        receives cron deliveries, would otherwise find no binding and skip the rename.
         """
         if not source.chat_id or not source.thread_id:
             return False
+        thread = source.thread_id
         try:
-            if not await self._telegram_topic_bound_to(source, session_id):
+            if not await self._claim_telegram_topic_for_title(source, session_id, session_key):
                 return False
             adapter = self._delivery_adapter_for(source)
             rename = getattr(adapter, "rename_dm_topic", None) if adapter is not None else None
             if rename is None:
+                logger.info("Explicit /title rename skipped for topic %s: no Telegram adapter", thread)
                 return False
             topic_name = self._sanitize_telegram_topic_title(title)
             options, model_icon = await self._explicit_title_icon_proposal(source, adapter, session_id, topic_name)
@@ -481,11 +490,13 @@ class GatewayTopicThreadsMixin:
                         preserve_manual=False)
                 # The icon pick awaits the model; the topic may have been rebound meanwhile.
                 if not await self._telegram_topic_bound_to(source, session_id):
+                    logger.info("Explicit /title rename skipped for topic %s: rebound during icon pick", thread)
                     return False
                 kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": topic_name}
                 if icon_id:
                     kwargs["icon_custom_emoji_id"] = icon_id
                 if await rename(**kwargs) is not True:
+                    logger.info("Explicit /title rename for topic %s was not accepted by Telegram", thread)
                     return False
                 with suppress(Exception):
                     await self._persist_telegram_topic_icon_records(source, state_record, history_record, owner)
@@ -493,6 +504,34 @@ class GatewayTopicThreadsMixin:
         except Exception:
             logger.warning("Explicit Telegram topic rename failed after storing title", exc_info=True)
             return False
+
+    async def _claim_telegram_topic_for_title(
+        self, source: SessionSource, session_id: str, session_key: Optional[str],
+    ) -> bool:
+        """True when the topic is bound to ``session_id``, binding it first when nothing holds it.
+
+        Never takes a topic bound to another session, and never moves a session that is already
+        bound to a different topic (``bind_telegram_topic`` raises ValueError for that)."""
+        thread = source.thread_id
+        binding = await self._session_db.get_telegram_topic_binding(
+            chat_id=str(source.chat_id), thread_id=str(thread),
+            profile_name=self._telegram_topic_profile_name(source),
+        )
+        if binding:
+            if str(binding.get("session_id") or "") == str(session_id):
+                return True
+            logger.info("Explicit /title rename skipped for topic %s: bound to another session", thread)
+            return False
+        if not session_key:
+            logger.info("Explicit /title rename skipped for topic %s: topic not bound yet", thread)
+            return False
+        entry = SimpleNamespace(session_key=session_key, session_id=session_id)
+        try:
+            await asyncio.to_thread(self._record_telegram_topic_binding, source, entry)
+        except ValueError:
+            logger.info("Explicit /title rename skipped for topic %s: session bound to another topic", thread)
+            return False
+        return await self._telegram_topic_bound_to(source, session_id)
 
     async def _telegram_topic_bound_to(self, source: SessionSource, session_id: str) -> bool:
         binding = await self._session_db.get_telegram_topic_binding(
