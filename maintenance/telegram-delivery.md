@@ -6,13 +6,32 @@ are owned by [Telegram rendering](telegram-rendering.md).
 
 ## Required behavior
 
-- One flood window per chat is shared across edits, typing, and uploads. Media rate limits
-  are classified, but attachments are not durable redelivery obligations.
+- One known flood window per chat is shared across text, edits, typing, uploads,
+  rich/plain drafts, control prompts and deletions. Draft/control/delete calls recheck
+  the window under the existing per-chat send lock. A new RetryAfter from those paths
+  arms the same window, including timedelta values. Rich drafts do not fall back to a
+  plain draft after a flood refusal. Draft/control results retain `flood_control` and
+  `retry_after`; deletion returns false and retains cached status ownership for retry.
+  These are reactive guards, not a durable deletion queue. Media rate limits are
+  classified, but attachments are not durable redelivery obligations.
 - Split sends resume after flood refusals; rejected deliveries back off and preserve
   recovery; a partial delivery does not trigger a duplicate fallback.
 - Nested and multiline legacy emphasis is preserved.
 - Synthetic gateway event IDs may identify notifications but never become Telegram reply
   anchors. Numeric Telegram message IDs still anchor ordinary DM-topic replies.
+
+## Rate Boundary
+
+The proactive text/interim-edit slot remains 1 second (up to 60 calls/minute).
+The base typing loop has a separate default 2-second interval (up to 30/minute
+per active loop), and final/overflow edits, drafts, media, control, deletion and
+other direct Bot API paths are not all charged to one proactive slot. The sum is
+therefore not bounded by this implementation, even before concurrent topic turns.
+The 2026-09-27 follow-up adds no requests, retries, or producer frequency. It
+closes known-window bypasses and removes duplicate helper definitions. It does
+not claim a universal Telegram quota or a complete per-chat proactive budget.
+Do not retire the broader scheduling work in #107612 on this evidence, or change
+streaming/typing/icon preferences as a substitute for delivery correctness.
 
 ## Provenance and patches
 

@@ -53,7 +53,12 @@ its optional icon, and the durable alias can be observed through one Telegram to
   #117296 defers the title until the turn settles whenever both share a self-hosted base URL,
   which delays a new topic's name and icon by the whole first turn on a routing proxy. The
   declaration is keyed by endpoint URL, never by route name, and an undeclared or `false`
-  endpoint keeps the deferral. Patch identity: `title-concurrent-endpoint`.
+  endpoint keeps the deferral. Equivalent host case/default-port spelling uses the
+  shared route identity, and local-server aliases apply the auxiliary router's `/v1`
+  completion while bare custom URLs stay verbatim. Capability lookup uses that
+  normalized endpoint. A literal `false` vetoes conflicting `true` declarations;
+  missing values are neutral and lookup failures retain deferral. Patch identity:
+  `title-concurrent-endpoint`.
 
 ## Provenance and patches
 
@@ -72,7 +77,8 @@ its optional icon, and the durable alias can be observed through one Telegram to
   deterministically when the model field is absent or invalid.
 - **Upstream disposition:** source PRs are open design references, not released
   equivalent behavior. `title-concurrent-endpoint` has no upstream equivalent; open
-  NousResearch PRs #120571 and #120627 only widen the deferral. Own proposal
+  NousResearch PR #120571 also normalizes route identity, while #120627 only widens
+  named-provider deferral. Neither supplies the concurrency capability. Own proposal
   [#124563](https://github.com/NousResearch/hermes-agent/issues/124563) now tracks
   explicit endpoint concurrency for auxiliary title scheduling. Retire it when a released
   tag lets a provider declare concurrent capacity for the title gate.
