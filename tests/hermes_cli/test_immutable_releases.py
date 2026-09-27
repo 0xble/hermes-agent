@@ -133,7 +133,8 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
         worker.wait(timeout=5)
 
 
-def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ["standalone", "backend", "platform", "exclusive", "model-provider"])
+def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch, kind):
     """Exercise checkout -> candidate venv -> plugin probe -> updater receipt, not a mocked smoke."""
     from hermes_cli import update_cmd, update_receipt
 
@@ -148,7 +149,8 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
     plugin = home / "plugins" / "candidate-test"
     plugin.mkdir(parents=True)
     (home / "config.yaml").write_text("plugins:\n  enabled: [candidate-test]\n", encoding="utf-8")
-    (plugin / "plugin.yaml").write_text("name: candidate-test\nversion: '1.0'\n", encoding="utf-8")
+    (plugin / "plugin.yaml").write_text(
+        f"name: candidate-test\nversion: '1.0'\nkind: {kind}\n", encoding="utf-8")
     (plugin / "__init__.py").write_text(
         "from hermes_cli.symbol_that_does_not_exist import broken\n", encoding="utf-8")
     a = home / "releases" / "A"
@@ -169,6 +171,19 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
                    "candidate plugin smoke failed" in s["detail"] for s in receipt["steps"])
     finally:
         update_receipt.finalize_update_receipt("partial")
+
+
+def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path):
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "broken-model"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [broken-model]\n", encoding="utf-8")
+    (plugin / "plugin.yaml").write_text(
+        "name: broken-model\nversion: '1.0'\nkind: model-provider\n", encoding="utf-8")
+    (plugin / "__init__.py").write_text(
+        "raise RuntimeError('incompatible model provider')\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="incompatible model provider"):
+        releases.smoke_plugins(Path(__file__).resolve().parents[2], home)
 
 
 def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profile(tmp_path):

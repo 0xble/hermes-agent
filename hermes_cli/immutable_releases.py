@@ -137,15 +137,31 @@ def _smoke_imports() -> None:
     """Import enabled directory plugins without invoking their register() methods."""
     from hermes_cli.config import load_config
     from hermes_cli.plugins import get_plugin_manager
-    from hermes_cli.plugins_discovery import scan_directory, gate_manifest
+    from hermes_cli.plugins_discovery import (
+        discover_entrypoint_manifests, gate_manifest, manifest_key,
+        resolve_manifest_winners, scan_directory,
+    )
     config = load_config() or {}
     plugin_config = config.get("plugins") or {}
     enabled = plugin_config.get("enabled")
     enabled = set(enabled) if enabled is not None else None
     disabled = set(plugin_config.get("disabled") or ())
     manager = get_plugin_manager()
-    for manifest in scan_directory(Path(os.environ["HERMES_HOME"]) / "plugins", "user"):
+    manifests = scan_directory(Path(os.environ["HERMES_HOME"]) / "plugins", "user")
+    directory_keys = {manifest_key(m) for m in manifests}
+    manifests.extend(m for m in discover_entrypoint_manifests()
+                     if manifest_key(m) not in directory_keys)
+    for manifest in resolve_manifest_winners(manifests).values():
         gate = gate_manifest(manifest, disabled, enabled)
+        # Model providers are loaded by providers/__init__.py rather than the
+        # ordinary plugin registration pass.  They still need a candidate-code
+        # import probe: gate_manifest deliberately returns a placeholder for them.
+        if manifest.kind == "model-provider" and manifest.key not in disabled and manifest.name not in disabled:
+            if manifest.source == "entrypoint":
+                manager._load_entrypoint_module(manifest)
+            else:
+                manager._load_directory_module(manifest)
+            continue
         if gate.action == "placeholder" and not gate.enabled:
             if enabled and (manifest.name in enabled or manifest.key in enabled):
                 raise RuntimeError(f"enabled plugin {manifest.name}: {gate.error}")
