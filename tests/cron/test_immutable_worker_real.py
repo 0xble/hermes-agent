@@ -64,7 +64,10 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
             "'identity':cron.s2_release_probe.IDENTITY,'venv':os.getenv('VIRTUAL_ENV'),"
             "'release':os.getenv('HERMES_RELEASE'),'which_python':shutil.which('python'),"
             "'which_hermes':shutil.which('hermes')}\n"
-            "            (h/f'observed-{job}.json').write_text(json.dumps(actual))\n"
+            "            output=h/f'observed-{job}.json'\n"
+            "            pending=output.with_suffix('.json.tmp')\n"
+            "            pending.write_text(json.dumps(actual))\n"
+            "            os.replace(pending,output)\n"
             "            break\n"
             "        time.sleep(.05)\n"
             "threading.Thread(target=probe,daemon=True).start()\n",
@@ -81,6 +84,15 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
                 return path
             time.sleep(.05)
         raise AssertionError(f"missing {path}")
+
+    def await_json(path, timeout=60):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                time.sleep(.05)
+        raise AssertionError(f"missing or incomplete JSON: {path}")
 
     def dispatch(name, release, profile):
         profile_home = home if profile == "default" else home / "profiles" / "p"
@@ -139,7 +151,7 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
                 (profile_home / f"dispatch-{name}").touch()
                 await_file(profile_home / f"started-{name}")
             (profile_home / f"probe-{name}").touch()
-            result = json.loads(await_file(profile_home / f"observed-{name}.json").read_text(encoding="utf-8"))
+            result = await_json(profile_home / f"observed-{name}.json")
             worker_pids.append(result["pid"])
             print(f"{name}: {json.dumps(result, sort_keys=True)}")
             release = a if name.startswith("A-") else b
