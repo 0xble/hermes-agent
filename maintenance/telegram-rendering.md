@@ -79,8 +79,10 @@ upstream or directly cherry-picked here.
 Paragraph spacing: own contribution [upstream PR 100686](https://github.com/NousResearch/hermes-agent/pull/100686)
 for [issue 100664](https://github.com/NousResearch/hermes-agent/issues/100664),
 head `c90504124b06c12b24ba9c9d0dca6a3ca479a764`, open when adopted on 2026-09-19.
-The fork carries the adapter symbols and regression file at exact AST parity
-with that head so retirement is a hash comparison, not a re-review. The archived
+At adoption, the fork carried the adapter symbols and regression file at exact AST
+parity with that head. The 2026-09-26 audit refreshed the open PR to
+`46dd4994520f683a9bdab216e41f1fefd097a602`. Recheck the final candidate and its
+regressions before retirement. The archived
 fork tracked the same behavior as HERMES-095 (archived PRs #32 and #34).
 
 Currency protection: ported from the archived fork's `_protect_rich_currency`
@@ -103,7 +105,8 @@ cannot express without an `always` mode.
 
 Ordered-list separation: fork-authored on 2026-09-26 from a live message whose
 `**Facts and Evidence**` label preceded items 7 to 10. Upstream searches found
-no issue for this case. Open [upstream PR 76368](https://github.com/NousResearch/hermes-agent/pull/76368)
+no issue for this case before the audit created [#124552](https://github.com/NousResearch/hermes-agent/issues/124552).
+Open [upstream PR 76368](https://github.com/NousResearch/hermes-agent/pull/76368)
 touches the same function but only stops hard-break markers next to block lines.
 The paragraph still absorbs a list not starting at 1, so it does not replace
 this patch.

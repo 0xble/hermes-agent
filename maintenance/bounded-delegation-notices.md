@@ -23,8 +23,7 @@ between 2026-09-19 and 2026-09-24.
 
 Fork patch identity: `bounded-delegation-notices`.
 
-Upstream-owned code (`d4cec15b47e`). No upstream issue or PR covered it when
-this patch landed. Contribute the same change upstream.
+Upstream-owned code (`d4cec15b47e`). Own upstream [PR #124543](https://github.com/NousResearch/hermes-agent/pull/124543), open on 2026-09-26, contributes the same context bound and single/batch regressions. Actual task results remain untruncated.
 
 ## Verification
 

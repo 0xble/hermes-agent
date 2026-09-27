@@ -19,6 +19,12 @@ the system prompt from that agent. The resulting prompt lacks the skills index a
 guidance. The surface-switch path then adopted it as a legitimate earlier surface, so later
 turns ran on the stripped prompt until the next full-agent compaction.
 
+Upstream [#124158](https://github.com/NousResearch/hermes-agent/pull/124158) and
+[#124200](https://github.com/NousResearch/hermes-agent/pull/124200) merged by
+2026-09-26. They preserve the seeded prompt during detached compaction and add
+`hermes sessions repair-prompts` for historical damage. Track them as native
+replacements, with release adoption and historical repair verified separately.
+
 ## Verification
 
 - `tests/agent/test_system_prompt_restore.py::TestSurfaceSwitch::test_prompt_left_by_gateway_hygiene_compaction_is_rebuilt`

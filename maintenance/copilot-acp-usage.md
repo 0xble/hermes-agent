@@ -12,7 +12,7 @@ The `[doctor-fix]` seeder in `tests/hermes_cli/test_config_edit_seed.py` asserts
 
 Fork patch identity: `nightly-regression-0926`.
 
-Found by the scheduled fork nightly on 2026-09-26 (run 36234305522 at `c8e334259`). `test_compaction_in_an_acp_session_keeps_the_next_prompt_valid_and_grounded` reproduced in a Linux container with zero auxiliary summarizer prompts. With `usage=None`, the summarizer received three. The E2E threshold was recalibrated from 21,000 to 15,000 estimated tokens to match measured pressure (about 14,058 after the eight reads). The text tool bridge is not counted as OpenAI tool-schema tokens. Upstream carries the same zero-usage construction and the same test (`e6db58be64c4`). An upstream contribution remains to be filed.
+Found by the scheduled fork nightly on 2026-09-26 (run 36234305522 at `c8e334259`). `test_compaction_in_an_acp_session_keeps_the_next_prompt_valid_and_grounded` reproduced in a Linux container with zero auxiliary summarizer prompts. With `usage=None`, the summarizer received three. The E2E threshold was recalibrated from 21,000 to 15,000 estimated tokens to match measured pressure (about 14,058 after the eight reads). The text tool bridge is not counted as OpenAI tool-schema tokens. Upstream carries the same zero-usage construction and the same test (`e6db58be64c4`). Own upstream [PR #124548](https://github.com/NousResearch/hermes-agent/pull/124548) contributes the unknown-usage fix and regressions (open on 2026-09-26).
 
 ## Verification
 

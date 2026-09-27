@@ -23,6 +23,9 @@ Fork-Patch-Backfill: 0701c45707e8d75c530026baef92af51d44e7dfc; security-guidance
   synchronized from the recorded upstream commit in `plugins/security-guidance/NOTICE`.
 - Hermes-side glue, documentation, and tests are maintained under the Hermes
   project license.
+- Own upstream [issue #124562](https://github.com/NousResearch/hermes-agent/issues/124562)
+  tracks restoring source file-type filters for six JS/DOM rules as of 2026-09-26.
+  It does not propose the entire local policy plugin.
 
 ## Verification
 

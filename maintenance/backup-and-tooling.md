@@ -48,7 +48,9 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   comparison. Open upstream [PR #110248](https://github.com/NousResearch/hermes-agent/pull/110248)
   addresses separate same-second destination collisions and retains that comparison.
   Open [PR #106871](https://github.com/NousResearch/hermes-agent/pull/106871) changes
-  Docker rollback selection, not this helper. Neither replaces this fix.
+  Docker rollback selection, not this helper. Neither replaces this fix. Own
+  [PR #124549](https://github.com/NousResearch/hermes-agent/pull/124549), open on
+  2026-09-26, contributes the current-byte comparison.
   Verify with `scripts/run_tests.sh tests/hermes_cli/test_config_backups.py
   tests/hermes_cli/test_config_lkg_backup.py --file-retries 0`.
   Retire when an accepted upstream release passes the controlled-mtime invariant
@@ -135,8 +137,10 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   The archive is still kept and still returned: a partial rollback point beats none. Whether an
   incomplete one should block an update is a separate decision, unchanged here.
   Retire it if the automatic path adopts the interactive path's structured report.
-- Upstream contribution: none recorded for the local patches. The two adopted backup
-  fixes retire when the candidate release retains them.
+- Upstream contributions are recorded per behavior below. Truncated but CRC-valid
+  ZIP members after partial source-read failures, and incomplete-archive retention, are tracked in
+  [issue #124564](https://github.com/NousResearch/hermes-agent/issues/124564).
+  The two adopted backup fixes retire when the candidate release retains them.
 - `backup-zip-timestamps`: both full ZIP writers use the standard library's timestamp
   clamping so pre-1980 and post-2107 files remain recoverable. Source timestamps,
   content, selection, failure handling, and pruning are unchanged. Narrow adaptation
@@ -159,7 +163,9 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   unchanged. Upstream main `c80d12b9b98e36178aa41d496e8dd555399fc286` still has the
   restartable copy. Upstream issue #86630 and merged PR #86680 bound consecutive
   `SQLITE_BUSY`/`SQLITE_LOCKED` statuses but did not cover successful page copies repeatedly
-  restarted by concurrent WAL commits. Retire when a selected upstream release passes the
+  restarted by concurrent WAL commits. Own
+  [issue #124550](https://github.com/NousResearch/hermes-agent/issues/124550)
+  records the current-main reproduction and snapshot contract. Retire when a selected upstream release passes the
   concurrent-writer snapshot contract.
 - `cron-profile-timezone-reanchor`: an unpinned cron job's future `next_run_at`
   can retain the old profile timezone until the old instant becomes due after a
