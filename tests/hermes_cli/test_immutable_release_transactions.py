@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+import venv
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,18 @@ def watched_unlink(self, *a, **kw):
 os.replace = watched_replace
 pathlib.Path.unlink = watched_unlink
 r._source_python_valid = lambda *args: True  # fixture has no installed Hermes package
+if real != 'real':
+    original_ack = r.acknowledge_running_release
+    def observed_ack(path):
+        record = r._read_txn(r.ReleasePaths.for_home(path))
+        if not record or (path / 'loaded').read_bytes() != pathlib.Path(plist).read_bytes():
+            return False
+        r._verify_transaction(r.ReleasePaths.for_home(path), record)
+        record['reload_done'] = True
+        r._write_txn(r.ReleasePaths.for_home(path), record)
+        r._finish_txn(r.ReleasePaths.for_home(path), record)
+        return True
+    r.acknowledge_running_release = observed_ack
 
 def reload():
     if real == 'real':
@@ -96,14 +109,17 @@ sys.exit(0)
 '''
 
 
-def _release(path: Path) -> None:
+def _release(path: Path, *, real: bool = False) -> None:
     path.mkdir(parents=True)
     (path / "pyproject.toml").write_text("[project]\nname='probe'\n")
     (path / "uv.lock").write_text("")
     python = path / ".venv/bin/python"
-    python.parent.mkdir(parents=True)
-    python.write_text("#!/bin/sh\nexit 0\n")
-    python.chmod(python.stat().st_mode | stat.S_IEXEC)
+    if real:
+        venv.EnvBuilder(with_pip=False).create(path / ".venv")
+    else:
+        python.parent.mkdir(parents=True)
+        python.write_text("#!/bin/sh\nexit 0\n")
+        python.chmod(python.stat().st_mode | stat.S_IEXEC)
     (path / ".release-ready").write_text(path.name + "\n")
     (path / ".hermes_build_sha").write_text(path.name + "\n")
 
@@ -120,9 +136,11 @@ def _source(source: Path) -> str:
 
 
 def _definition(plist: Path, home: Path, root: Path, *, real: bool) -> bytes:
+    python = root / ".venv/bin/python" if real else Path(sys.executable)
     data = {"Label": plist.stem, "WorkingDirectory": str(root),
-            "ProgramArguments": [sys.executable, "-c",
-                                 "import os,pathlib,time;pathlib.Path(os.environ['S2_OUTPUT']).write_text(os.getcwd());time.sleep(90)"],
+            "ProgramArguments": [str(python), "-c",
+                                 "import os,pathlib,time;pathlib.Path(os.environ['S2_OUTPUT']).write_text(os.getcwd());time.sleep(90)",
+                                 "hermes_cli.main", "gateway", "run"],
             "EnvironmentVariables": {"HERMES_HOME": str(home), "S2_OUTPUT": str(home / "observed")},
             "RunAtLoad": True, "KeepAlive": False}
     return plistlib.dumps(data)
@@ -154,9 +172,11 @@ def _crash(home: Path, source: Path, plist: Path, scenario: str, checkpoint: str
 def _fixture(tmp_path: Path, scenario: str, *, real: bool = False):
     home, source = tmp_path / "profile", tmp_path / "source"
     a, b = (home / "releases" / name for name in ("A", "B"))
-    _release(a)
-    _release(b)
+    _release(a, real=real)
+    _release(b, real=real)
     source_sha = _source(source)
+    if real:
+        venv.EnvBuilder(with_pip=False).create(source / ".venv")
     label = f"ai.hermes.s2crash.{uuid.uuid4().hex}" if real else "ai.hermes.disposable"
     plist = tmp_path / f"{label}.plist"
     first = scenario.startswith("migration")
@@ -174,7 +194,7 @@ def _fixture(tmp_path: Path, scenario: str, *, real: bool = False):
         from unittest.mock import patch
         with patch.object(releases, "_source_python_valid", return_value=True):
             releases.activate_release(home, b, source=source, plist_path=plist,
-                                      plist_body=intended, reload_callback=lambda: True)
+                                      plist_body=intended)
         (home / "loaded").write_bytes(intended)
     return home, source, plist, a, b, source_sha, original, intended
 
@@ -190,6 +210,18 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
         return True
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(releases, "_source_python_valid", lambda *args: True)
+    if not real:
+        def observed_ack(path):
+            paths = releases.ReleasePaths.for_home(path)
+            record = releases._read_txn(paths)
+            if not record or (home / "loaded").read_bytes() != plist.read_bytes():
+                return False
+            releases._verify_transaction(paths, record)
+            record["reload_done"] = True
+            releases._write_txn(paths, record)
+            releases._finish_txn(paths, record)
+            return True
+        monkeypatch.setattr(releases, "acknowledge_running_release", observed_ack)
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: plist.stem)
     monkeypatch.setattr(gateway, "_launchd_domain", lambda: f"gui/{os.getuid()}")
@@ -291,3 +323,121 @@ def test_disposable_launchd_first_migration_and_rollback(tmp_path, monkeypatch, 
     finally:
         subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
         assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15).returncode != 0
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("failure", ["submit", "bootstrap"])
+def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_starts(
+    tmp_path, monkeypatch, failure
+):
+    """A failed helper/bootout-bootstrap cannot commit a release transaction."""
+    from hermes_cli import gateway, gateway_launchd
+
+    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote", real=True)
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{plist.stem}"
+    observed = home / "observed"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: plist.stem)
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: domain)
+
+    def wait_for(root):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if observed.exists() and observed.read_text() == str(root):
+                return
+            time.sleep(.05)
+        raise AssertionError(f"no intended process at {root} for {target}")
+
+    try:
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
+        wait_for(a)
+        if failure == "submit":
+            # Failed submission leaves the original registered service untouched.
+            def failed_reload():
+                assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0
+                return False
+        else:
+            def failed_reload():
+                subprocess.run(["launchctl", "bootout", target], check=True, timeout=15)
+                missing = plist.with_name("nonexistent.plist")
+                assert subprocess.run(["launchctl", "bootstrap", domain, str(missing)],
+                                      capture_output=True, timeout=15).returncode != 0
+                return False
+
+        with pytest.raises(RuntimeError, match="reload|refresh"):
+            releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                      reload_callback=failed_reload)
+        txn = home / "release-txn.json"
+        assert txn.is_file()
+        assert not json.loads(txn.read_text()).get("reload_done", False)
+        assert releases.read_pointer(home / "current") == b
+        assert releases.read_pointer(home / "previous") == a
+        assert plist.read_bytes() == intended
+        assert not releases.acknowledge_running_release(home)
+        assert txn.is_file()
+        if failure == "submit":
+            subprocess.run(["launchctl", "bootout", target], check=True, timeout=15)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
+        wait_for(b)
+        # The startup acknowledgement is authoritative; the callback return is not.
+        assert releases.acknowledge_running_release(home)
+        assert not txn.exists()
+        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0
+    finally:
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
+        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("phase", ["before-bootout", "after-bootout", "after-bootstrap"])
+def test_deferred_helper_crash_phases_never_acknowledge_transaction(tmp_path, monkeypatch, phase):
+    """Kill the real generated bash helper at each handoff phase; WAL remains."""
+    from hermes_cli import gateway, gateway_launchd
+
+    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    captured = {}
+    real_run = subprocess.run
+
+    def intercept(args, **kwargs):
+        if args[:2] == ["launchctl", "submit"]:
+            captured["script"] = args[-1]
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(gateway_launchd.subprocess, "run", intercept)
+    result = releases.activate_release(
+        home, b, plist_path=plist, plist_body=intended,
+        reload_callback=lambda: "deferred" if gateway_launchd._spawn_deferred_launchd_reload(
+            domain=f"gui/{os.getuid()}", label=plist.stem,
+            target=f"gui/{os.getuid()}/{plist.stem}", plist_path=plist,
+            gateway_pid=99999999) else False,
+    )
+    assert result["reload_pending"]
+    txn = home / "release-txn.json"
+    before = txn.read_bytes()
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    launchctl = shim / "launchctl"
+    launchctl.write_text(
+        "#!/bin/bash\n"
+        "case $1 in\n"
+        "bootout) test \"$CRASH_PHASE\" = after-bootout && kill -KILL $PPID; exit 0;;\n"
+        "bootstrap) test \"$CRASH_PHASE\" = after-bootstrap && kill -KILL $PPID; exit 0;;\n"
+        "list) printf '\"PID\" = 12345;\\n'; exit 0;;\n"
+        "remove) exit 0;;\n"
+        "esac\nexit 1\n", encoding="utf-8")
+    launchctl.chmod(0o755)
+    sleep = shim / "sleep"
+    sleep.write_text("#!/bin/bash\ntest \"$CRASH_PHASE\" = before-bootout && kill -KILL $PPID\nexit 0\n")
+    sleep.chmod(0o755)
+    # A fake launchctl in the child PATH prevents any interaction with the host's jobs.
+    child = real_run(["/bin/bash", "-c", captured["script"]], timeout=15,
+                     env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}", "CRASH_PHASE": phase})
+    assert child.returncode != 0
+    assert txn.read_bytes() == before
+    assert not json.loads(txn.read_text()).get("reload_done", False)
+    assert releases.read_pointer(home / "current") == b
+    assert plist.read_bytes() == intended
