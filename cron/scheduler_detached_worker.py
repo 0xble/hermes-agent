@@ -62,37 +62,75 @@ def _terminate_owned_descendants(pid: int, started_at: int) -> bool:
     return not alive
 
 
-def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> threading.Event:
+class HardWallFence:
+    """Serialize completion's side effects against the watchdog's durable timeout CAS."""
+
+    def __init__(self) -> None:
+        self.stopped = threading.Event()
+        self.lock = threading.Lock()
+        self.timed_out = False
+        self.completion_claimed = False
+
+    def set(self) -> None:
+        self.stopped.set()
+
+    def claim_completion(self) -> bool:
+        """Claim before saving output or enqueuing/sending a result."""
+        with self.lock:
+            if self.timed_out:
+                return False
+            self.completion_claimed = True
+            return True
+
+
+def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> HardWallFence:
     """Watchdog lives inside the detached worker, not the replaceable gateway."""
     from pathlib import Path
-    from cron.executions import _owner_identity, _process_start_time, finish_execution
+    from cron.executions import _owner_identity, _process_start_time, finish_execution, get_execution
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    stopped = threading.Event()
+    fence = HardWallFence()
     pid = os.getpid()
     fingerprint = _process_start_time(pid)
     if fingerprint is None:
         raise RuntimeError("Detached cron worker has no verifiable start-time fingerprint")
 
     def expire() -> None:
-        if stopped.wait(seconds):
+        if fence.stopped.wait(seconds):
             return
         home_token = set_hermes_home_override(Path(profile_home))
         try:
             if _owner_identity(pid, fingerprint) != "live":
                 return  # unreadable or reused identity: no destructive change
+            # Claim timeout BEFORE the potentially slow descendant teardown. The
+            # completion path claims the same lock before any result side effect.
+            with fence.lock:
+                if fence.completion_claimed:
+                    timeout_won = False
+                else:
+                    timeout_won = finish_execution(
+                        execution_id, success=False,
+                        error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+                    ) is not None
+                    if timeout_won:
+                        fence.timed_out = True
+            # Even a completed run must not leave owned stray children behind.
             if not _terminate_owned_descendants(pid, fingerprint):
-                return  # unsafe to declare the process tree terminated
-            finish_execution(
-                execution_id, success=False,
-                error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
-            )
-            os._exit(124)  # stop the active model/tool thread, never let it commit success
+                return  # cannot prove descendant teardown; never kill an unproven owner
+            if timeout_won:
+                os._exit(124)  # stop the active model/tool thread
+            # An earlier inactivity failure may have abandoned a non-daemon thread;
+            # terminate it without inventing a second timeout record. Completion,
+            # on the other hand, must retain its natural exit code.
+            if not fence.completion_claimed:
+                record = get_execution(execution_id)
+                if record and record["status"] == "failed":
+                    os._exit(124)
         finally:
             reset_hermes_home_override(home_token)
 
     threading.Thread(target=expire, name=f"cron-hard-wall-{execution_id}", daemon=True).start()
-    return stopped
+    return fence
 
 
 def defer_teardown_to_running_worker(

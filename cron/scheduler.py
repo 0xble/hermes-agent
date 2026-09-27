@@ -2713,6 +2713,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+    hard_wall_fence=None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
@@ -2774,6 +2775,7 @@ def run_one_job(
                     extra_prompt=extra_prompt,
                     claim_lost=lost_ownership,
                     transport_cancel=cancel_event,
+                    hard_wall_fence=hard_wall_fence,
                     execution_token=execution_token))
     finally:
         with _running_lock:
@@ -3144,7 +3146,7 @@ def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
     transport_cancel: Optional[_CancelEventLike] = None,
-    execution_token: Optional[object] = None,
+    execution_token: Optional[object] = None, hard_wall_fence=None,
 ) -> bool:
     fence = _FireOwnership(job, claim_lost, transport_cancel)
     fire_owner = fence.owner
@@ -3241,6 +3243,13 @@ def _run_one_job_body(
             _teardown_deferred()
             raise
 
+        # The detached worker must win against the watchdog before any result
+        # side effect, including output writes and delivery enqueue. Claiming at
+        # final finish_execution is too late: descendant teardown can take 3s.
+        if hard_wall_fence is not None and not hard_wall_fence.claim_completion():
+            _teardown_deferred()
+            return False
+
         if _fire_claim_ownership_lost():
             _teardown_deferred()
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
@@ -3318,6 +3327,10 @@ def _run_one_job_body(
         # and no error. Owner fencing still applies: a stale worker must not record over a replacement claim
         # owner.
         _err_text = str(e) or type(e).__name__
+        if hard_wall_fence is not None and not hard_wall_fence.claim_completion():
+            # Timeout already owns the terminal result; no failure/success notice
+            # or job-store bookkeeping may be written by this losing thread.
+            return False
         logger.error(
             "Error processing job %s: %s",
             job["id"],
@@ -3749,7 +3762,8 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                return run_one_job(job, adapters=None, loop=None, verbose=False)
+                return run_one_job(job, adapters=None, loop=None, verbose=False,
+                                   hard_wall_fence=watchdog_stop)
             finally:
                 # Inactivity timeout abandons a ThreadPoolExecutor future with
                 # shutdown(wait=False). run_one_job can return while its worker is
