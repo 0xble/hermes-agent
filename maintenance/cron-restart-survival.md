@@ -26,16 +26,28 @@ Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_re
 ## Delivery-status transition audit
 
 `delivery_status_provisional=1` is written only atomically with the detached
-finish `unknown` marker. It distinguishes the pre-enqueue gap from a terminal
-queue projection; old releases read the status as ordinary `unknown` and ignore
-the additive column. The queue projection clears the flag in the same SQL
-UPDATE, and terminal states remain fenced.
+finish `unknown` marker, and only when the delivery status is still NULL.
+It distinguishes the pre-enqueue gap from a terminal queue projection; old
+releases read the status as ordinary `unknown` and ignore the additive column.
+Every accepted queue projection clears the flag in the same conditional SQL
+UPDATE. The same transition table applies to both immediate and reconciliation
+projections (including tombstones); no stale nonterminal projection can replace
+a terminal one.
 
-| Write site | Transitions | Guard / invariant |
+| Target projection | Allowed source states | Rejected source states |
 | --- | --- | --- |
-| `executions.finish_execution` | `NULL → unknown(provisional)` | Detached terminal finish only; never rewrites an existing delivery state. |
-| `executions.record_delivery_status` | `NULL/pending → pending`; `unknown(provisional) → pending`; `NULL/unknown/provisional/pending/delivering → delivered/failed/unknown/suppressed` | Conditional SQL UPDATE; pending cannot replace terminal unknown (`provisional=0`) or any terminal state; terminal write clears provisional. |
-| `delivery_queue.reconcile_terminal_deliveries` | `NULL/unknown(provisional)/pending/delivering → delivered/failed/unknown/suppressed` | Conditional SQL UPDATE; terminal statuses are immutable and projection marker is cleared atomically. |
+| `pending` | NULL, pending, unknown(provisional) | delivering, unknown(terminal), delivered, failed, suppressed |
+| `delivering` | NULL, pending, delivering, unknown(provisional) | unknown(terminal), delivered, failed, suppressed |
+| `unknown` (terminal) | NULL, pending, delivering, unknown(provisional) | unknown(terminal), delivered, failed, suppressed |
+| `delivered`, `failed`, or `suppressed` | NULL, pending, delivering, unknown(provisional), unknown(terminal) | delivered, failed, suppressed |
+
+Known terminal states (`delivered`, `failed`, `suppressed`) are final. The
+terminal-to-terminal exception is that an unknown(terminal) may become a known
+terminal receipt; another unknown cannot rewrite it. `finish_execution` alone
+may mark NULL → unknown(provisional) on detached terminal finish, and never
+rewrites an existing delivery state. Execution recovery updates run status only,
+not delivery status. The 48-pair SQLite matrix and the idempotent-enqueue versus
+wait-timeout interleaving exercise this contract.
 
 The executions schema migration is additive and idempotent. Existing releases use
 named INSERT/UPDATE columns and `SELECT *` into named rows, so the new column is

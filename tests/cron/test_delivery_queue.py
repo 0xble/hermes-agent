@@ -162,6 +162,80 @@ def test_dead_delivery_owner_becomes_unknown_and_is_not_retried(
     assert queue.get_status("exec-1")["status"] == "unknown"
 
 
+_DELIVERY_FROM_STATES = (
+    None, "pending", "delivering", "unknown_provisional", "unknown_terminal",
+    "delivered", "failed", "suppressed",
+)
+_DELIVERY_TARGETS = ("pending", "delivering", "unknown", "delivered", "failed", "suppressed")
+
+
+@pytest.mark.parametrize("from_state", _DELIVERY_FROM_STATES)
+@pytest.mark.parametrize("to_status", _DELIVERY_TARGETS)
+def test_execution_delivery_transition_matrix(tmp_path, monkeypatch, from_state, to_status):
+    """Every source/target pair executes the real conditional SQLite UPDATE."""
+    from cron import executions
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    run = executions.create_execution("matrix", source="builtin")
+    original_status = "unknown" if from_state in ("unknown_provisional", "unknown_terminal") else from_state
+    original_provisional = int(from_state == "unknown_provisional")
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET delivery_status=?, delivery_status_provisional=? WHERE id=?",
+            (original_status, original_provisional, run["id"]),
+        )
+    mutable = {None, "pending", "delivering", "unknown_provisional"}
+    allowed = (
+        from_state in ({None, "pending", "unknown_provisional"} if to_status == "pending" else
+                       {None, "pending", "delivering", "unknown_provisional"} if to_status in ("delivering", "unknown") else
+                       mutable | {"unknown_terminal"})
+    )
+    executions.record_delivery_status(run["id"], to_status)
+    actual = executions.get_execution(run["id"])
+    assert (actual["delivery_status"], actual["delivery_status_provisional"]) == (
+        to_status if allowed else original_status,
+        0 if allowed else original_provisional,
+    )
+
+
+def test_stale_delivering_cannot_replace_projected_unknown(tmp_path, monkeypatch):
+    """Idempotent enqueue reads delivering, then a wait timeout projects unknown first."""
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+        run = executions.create_execution("job-racing-delivering", source="builtin")
+        queue.enqueue(run["id"], {"id": "job-racing-delivering"}, "result")
+        assert queue.claim_next()["execution_id"] == run["id"]
+        original_reflect = queue._reflect_execution_delivery
+
+        def terminalize_after_enqueue_commit(execution_id, status):
+            if status != "delivering":
+                return original_reflect(execution_id, status)
+            # The outer enqueue already read delivering; restore normal terminal projection.
+            monkeypatch.setattr(queue, "_reflect_execution_delivery", original_reflect)
+            assert "unknown" in queue._terminalize_wait_timeout(execution_id)
+            assert queue.get_status(execution_id)["status"] == "unknown"
+            assert executions.get_execution(execution_id)["delivery_status"] == "unknown"
+            with sqlite3.connect(queue.queue_path()) as conn:
+                assert conn.execute(
+                    "SELECT projected FROM deliveries WHERE execution_id=?", (execution_id,)
+                ).fetchone() == (1,)
+            original_reflect(execution_id, status)
+
+        monkeypatch.setattr(queue, "_reflect_execution_delivery", terminalize_after_enqueue_commit)
+        queue.enqueue(run["id"], {"id": "job-racing-delivering"}, "result")
+        assert queue.reconcile_terminal_deliveries() == 0
+        assert executions.get_execution(run["id"])["delivery_status"] == "unknown"
+    finally:
+        reset_hermes_home_override(token)
+
+
 @pytest.mark.parametrize("terminal", ("unknown", "delivered", "failed", "suppressed"))
 def test_stale_enqueue_pending_cannot_replace_projected_terminal_receipt(
     tmp_path, monkeypatch, terminal

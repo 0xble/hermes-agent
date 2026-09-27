@@ -236,14 +236,9 @@ def reconcile_terminal_deliveries() -> int:
     # repair.  Marking projected before this commit would lose it permanently.
     ledger = executions._connect()
     with transaction(ledger) as ledger_conn:
-        ledger_conn.executemany(
-            "UPDATE executions SET delivery_status=?, delivery_status_provisional=0 WHERE id=? "
-            "AND (delivery_status IS NULL OR delivery_status NOT IN "
-            "('delivered','failed','suppressed'))",
-            [
-                (str(row["status"]), str(row["execution_id"]))
-                for row in rows
-            ],
+        executions._project_delivery_statuses(
+            ledger_conn,
+            ((str(row["status"]), str(row["execution_id"])) for row in rows),
         )
 
     with _transaction() as conn:

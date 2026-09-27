@@ -17,7 +17,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -469,21 +469,45 @@ def list_executions(
     return [dict(row) for row in rows]
 
 
+# SQL transition table: each target group lists its allowed source states.
+# unknown(provisional=0) can only advance to a known terminal receipt;
+# delivered/failed/suppressed are final. The predicate observes current SQLite
+# state atomically with the write, not an earlier queue read.
+_DELIVERY_STATUS_UPDATE = """UPDATE executions
+   SET delivery_status=?, delivery_status_provisional=0
+   WHERE id=? AND CASE ?
+     WHEN 'pending' THEN delivery_status IS NULL OR delivery_status='pending'
+          OR (delivery_status='unknown' AND delivery_status_provisional=1)
+     WHEN 'delivering' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering')
+          OR (delivery_status='unknown' AND delivery_status_provisional=1)
+     WHEN 'unknown' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering')
+          OR (delivery_status='unknown' AND delivery_status_provisional=1)
+     WHEN 'delivered' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering','unknown')
+     WHEN 'failed' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering','unknown')
+     WHEN 'suppressed' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering','unknown')
+     ELSE 0 END"""
+_DELIVERY_STATUSES = frozenset(("pending", "delivering", "unknown", "delivered", "failed", "suppressed"))
+
+
+def _project_delivery_statuses(conn: sqlite3.Connection, rows: Iterable[tuple[str, str]]) -> None:
+    """Project (status, execution_id) pairs through the same atomic transition table."""
+    parameters = []
+    for status, execution_id in rows:
+        if status not in _DELIVERY_STATUSES:
+            raise ValueError("invalid cron delivery status")
+        parameters.append((status, execution_id, status))
+    conn.executemany(_DELIVERY_STATUS_UPDATE, parameters)
+
+
 def record_delivery_status(execution_id: str, status: str) -> None:
     """Delivery can finish after the worker's immutable terminal run result."""
-    if status not in {"pending", "delivering", "delivered", "failed", "unknown", "suppressed"}:
-        raise ValueError("invalid cron delivery status")
     with _transaction() as conn:
-        # Enqueue commits before projecting pending. A terminal queue projection may
-        # win in between; its receipt must not be rolled back by stale pending.
-        conn.execute(
-            "UPDATE executions SET delivery_status=?, delivery_status_provisional=0 WHERE id=? "
-            "AND ((?='pending' AND (delivery_status IS NULL OR delivery_status='pending' "
-            "OR (delivery_status='unknown' AND delivery_status_provisional=1))) "
-            "OR (?!='pending' AND (delivery_status IS NULL OR delivery_status NOT IN "
-            "('delivered','failed','suppressed'))))",
-            (status, execution_id, status, status),
-        )
+        _project_delivery_statuses(conn, [(status, execution_id)])
 
 
 def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
