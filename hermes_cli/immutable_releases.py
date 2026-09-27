@@ -465,6 +465,25 @@ def _release_is_ready(path: Path, sha: str) -> bool:
             for name in (".release-ready", ".hermes_build_sha")))
 
 
+def _build_candidate_web(staging: Path) -> None:
+    """Build generated assets from the archived revision, never the source tree."""
+    web = staging / "web"
+    if not (web / "package.json").is_file():
+        return
+    import shutil as _shutil
+    npm = _shutil.which("npm")
+    if not npm:
+        raise RuntimeError("npm is required to build an immutable release's web assets")
+    workspaces = ["--workspace", "web", "--include-workspace-root"]
+    if (staging / "ui-tui" / "package.json").is_file():
+        workspaces[:0] = ["--workspace", "ui-tui"]
+    subprocess.run([npm, "ci", "--no-audit", "--no-fund", *workspaces],
+                   cwd=staging, check=True)
+    subprocess.run([npm, "run", "build", "--workspace", "web"], cwd=staging, check=True)
+    if not (staging / "hermes_cli" / "web_dist" / "index.html").is_file():
+        raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
+
+
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
                   uv: str = "uv", plugin_dir: Path | None = None,
                   source_python: Path | None = None) -> tuple[Path, str]:
@@ -484,15 +503,12 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
         source = source.resolve(strict=True)
         if (source / ".git").exists():
             _stage_git_tree(source, staging, sha)
-            bundle = source / "hermes_cli" / "web_dist"
-            if bundle.is_dir():
-                shutil.copytree(bundle, staging / "hermes_cli" / "web_dist", dirs_exist_ok=True)
-                if not (staging / "hermes_cli" / "web_dist" / "index.html").is_file():
-                    raise RuntimeError("candidate web_dist lacks index.html")
         else:
             _copy_tree(source, staging, home=paths.home)
         if not (staging / "hermes_cli" / "immutable_releases.py").is_file():
             raise RuntimeError(f"revision {sha} predates immutable releases and cannot be staged")
+        if (source / ".git").exists():
+            _build_candidate_web(staging)
         prepare_venv(staging, previous=read_pointer(paths.current), uv=uv,
                      source=source if (source / ".git").exists() else None,
                      source_python=source_python or (_source_install_python(source, paths.home)
@@ -665,9 +681,10 @@ def begin_migration(home: Path, source: Path, plist_path: Path | None = None) ->
         data = json.loads(journal.read_text(encoding="utf-8"))
         if Path(data["source"]).resolve() != source:
             raise RuntimeError("release migration journal refers to a different checkout")
-        # An interrupted migration may have written an older journal without the
-        # interpreter; preserve its original plist while completing that record.
+        # An interrupted or reversed migration retains the original plist and
+        # source identity. A fresh opt-in can safely use them again.
         data.setdefault("source_python", sys.executable)
+        data["state"] = "in-progress"
     else:
         data = {"source": str(source), "source_python": sys.executable,
                 "source_sha": release_sha(source), "plist": None}
@@ -692,6 +709,19 @@ def begin_migration(home: Path, source: Path, plist_path: Path | None = None) ->
     return True
 
 
+def set_migration_state(home: Path, state: str) -> None:
+    """Persist the migration phase without losing the original plist bytes."""
+    journal = ReleasePaths.for_home(home).home / "release-layout.json"
+    data = json.loads(journal.read_text(encoding="utf-8"))
+    data["state"] = state
+    tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, journal)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def restore_source_layout(home: Path) -> dict[str, str | None]:
     """Reverse the first migration, preserving the candidate as previous."""
     paths = ReleasePaths.for_home(home)
@@ -700,26 +730,23 @@ def restore_source_layout(home: Path) -> dict[str, str | None]:
     source = Path(data["source"]).resolve(strict=True)
     if read_pointer(paths.previous) != source:
         raise RuntimeError("previous is not the recorded source checkout")
-    # Never point launchd at a checkout that has advanced past the saved
-    # migration revision. Refuse dirty trees before changing any pointer/plist.
-    expected_sha = data["source_sha"]
-    actual_sha = release_sha(source)
-    status = subprocess.run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=normal"],
-                            capture_output=True, text=True, check=True)
-    if status.stdout.strip():
-        raise RuntimeError(f"source checkout is dirty; cannot restore migration revision {expected_sha}")
-    if actual_sha != expected_sha:
-        restored = subprocess.run(["git", "-C", str(source), "reset", "--hard", expected_sha],
-                                  capture_output=True, text=True)
-        if restored.returncode or release_sha(source) != expected_sha:
-            raise RuntimeError(f"could not restore source checkout revision {expected_sha}: {restored.stderr}")
+    if release_sha(source) != data["source_sha"]:
+        raise RuntimeError("source checkout changed since migration; refusing unsafe rollback")
     current = read_pointer(paths.current)
-    if current is None:
+    if current is None or current.parent != paths.releases.resolve():
         raise RuntimeError("there is no current release to reverse")
-    # Keep current complete at every crash boundary, even during reversal. Once
-    # the source plist has been reloaded the pointer can be removed by a later run.
-    _atomic_symlink(paths.current, source)
-    _atomic_symlink(paths.previous, current)
+    # The original source and its interpreter were never changed. Remove the
+    # release pointers: a source symlink masquerading as current would allow a
+    # disabled update to promote again. Keep the artifact itself for diagnostics.
+    paths.current.unlink(missing_ok=True)
+    paths.previous.unlink(missing_ok=True)
+    data["state"] = "rolled-back"
+    tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, journal)
+    finally:
+        tmp.unlink(missing_ok=True)
     return {"current": str(source), "previous": str(current), "source_sha": data["source_sha"]}
 
 

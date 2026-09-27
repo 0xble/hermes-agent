@@ -196,9 +196,13 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
     (source / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
     (source / "probe.py").write_text(
         "import json, os, pathlib, sys, time\n"
+        "if pathlib.Path.cwd().name == 'source':\n"
+        " from demo_dep import old_api as api\n"
+        "else:\n"
+        " from demo_dep import new_api as api\n"
         "pathlib.Path(os.environ['S2_PROBE_OUTPUT']).write_text(json.dumps("
         "{'pid': os.getpid(), 'cwd': os.getcwd(), 'exe': sys.executable, "
-        "'release': pathlib.Path(__file__).resolve().parent.name}))\n"
+        "'api': api(), 'release': pathlib.Path(__file__).resolve().parent.name}))\n"
         "time.sleep(120)\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(source)], check=True)
     subprocess.run(["git", "-C", str(source), "add", "probe.py", "hermes_cli/__init__.py"], check=True)
@@ -210,11 +214,29 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
     subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
                     "-c", "commit.gpgsign=false", "commit", "-qm", "B"], check=True)
     sha_b = releases.release_sha(source)
+    remote = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(source), "push", "-q", "origin", "HEAD:main"], check=True)
     subprocess.run(["git", "-C", str(source), "reset", "--hard", sha_a], check=True, capture_output=True)
+    def install_demo(python, api):
+        site = Path(subprocess.check_output([str(python), "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"], text=True).strip())
+        (site / "demo_dep.py").write_text(f"def {api}(): return '{api}'\n", encoding="utf-8")
+        metadata = site / ("demo_dep-1.0.dist-info" if api == "old_api" else "demo_dep-2.0.dist-info")
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(f"Metadata-Version: 2.1\nName: demo-dep\nVersion: {'1.0' if api == 'old_api' else '2.0'}\n", encoding="utf-8")
+    source_python = source / ".venv/bin/python"
+    venv.EnvBuilder(with_pip=False).create(source / ".venv")
+    install_demo(source_python, "old_api")
+    distributions = lambda python: json.loads(subprocess.check_output([
+        str(python), "-c", "import importlib.metadata as m,json;print(json.dumps(sorted((d.metadata['Name'],d.version) for d in m.distributions())))"], text=True))
+    source_distributions = distributions(source_python)
+    source_tree = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True).strip()
     b = home / "releases" / sha_b
     b.mkdir(parents=True)
     venv.EnvBuilder(with_pip=False).create(b / ".venv")
-    (b / "probe.py").write_text((source / "probe.py").read_text(encoding="utf-8"), encoding="utf-8")
+    install_demo(b / ".venv/bin/python", "new_api")
+    (b / "probe.py").write_bytes(subprocess.check_output(["git", "-C", str(source), "show", f"{sha_b}:probe.py"]))
     (b / ".release-ready").write_text(sha_b + "\n", encoding="utf-8")
     (b / ".hermes_build_sha").write_text(sha_b + "\n", encoding="utf-8")
     output = home / "observed.json"
@@ -228,7 +250,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
             "EnvironmentVariables": {"HERMES_HOME": str(home), "S2_PROBE_OUTPUT": str(output)},
         })
 
-    original = definition(source, sys.executable)
+    original = definition(source, source_python)
     replacement = definition(home / "current", home / "current" / ".venv/bin/python")
     plist_path.write_bytes(original)
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -262,6 +284,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=15)
         a = observed("source")
+        assert a["api"] == "old_api"
         # Inject failure after the candidate plist is written, before launchd
         # adopts it. Both durable bytes and pointers must return to old state.
         real_refresh = gateway.refresh_launchd_plist_if_needed
@@ -280,10 +303,10 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         assert Path(recovered["cwd"]).resolve() == source
         journal = json.loads((home / "release-layout.json").read_text(encoding="utf-8"))
         assert journal["source_sha"] == sha_a
-        subprocess.run(["git", "-C", str(source), "reset", "--hard", sha_b], check=True, capture_output=True)
+        assert releases.release_sha(source) == sha_a
         monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", real_refresh)
         update_receipt.begin_update_receipt()
-        assert update_cmd._activate_immutable_release()
+        assert update_cmd._activate_immutable_release(sha=sha_b)
         updated_receipt = update_receipt.finalize_update_receipt("success")
         assert updated_receipt is not None
         recorded = json.loads(updated_receipt.read_text(encoding="utf-8"))
@@ -297,6 +320,10 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         assert (home / "previous").resolve() == source
         assert plist_path.read_bytes() == replacement
         promoted = observed(sha_b, a["pid"])
+        assert promoted["api"] == "new_api"
+        assert releases.release_sha(source) == sha_a
+        assert subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True).strip() == source_tree
+        assert distributions(source_python) == source_distributions
         assert Path(promoted["cwd"]).resolve() == b
         assert Path(promoted["exe"]).resolve().is_relative_to(b)
         from types import SimpleNamespace
@@ -313,17 +340,21 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
             }])
         monkeypatch.setattr(update_cmd, "_verify_fleet_after_update", verify_throwaway)
         update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
-        assert (home / "current").resolve() == source
+        assert not (home / "current").exists()
+        assert not (home / "previous").exists()
+        assert json.loads((home / "release-layout.json").read_text(encoding="utf-8"))["state"] == "rolled-back"
         original_plist = releases.migration_plist(home)
         assert original_plist is not None
         saved_path, saved_body = original_plist
         assert saved_path == plist_path and saved_body == original
         restored = observed("source", promoted["pid"])
+        assert restored["api"] == "old_api"
+        assert distributions(source_python) == source_distributions
+        assert subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True).strip() == source_tree
         assert restored["pid"] != a["pid"]
         assert Path(restored["cwd"]).resolve() == source
         assert releases.release_sha(source) == sha_a
         assert plist_path.read_bytes() == original
-        assert (home / "previous").resolve() == b
         assert b.is_dir()
         rollback_receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
         assert rollback_receipt["outcome"] == "success"

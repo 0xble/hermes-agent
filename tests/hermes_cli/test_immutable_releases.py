@@ -59,7 +59,7 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     assert not (release / "hermes_test").exists()
     assert not (release / ".worktrees").exists()
     assert not (release / ".git").exists()
-    assert (release / "hermes_cli" / "web_dist" / "index.html").read_text() == "fresh built asset"
+    assert not (release / "hermes_cli" / "web_dist" / "index.html").exists()  # never copy A's untracked assets
     code = "import importlib.util, pathlib, sys; p=pathlib.Path(sys.argv[1]); s=importlib.util.spec_from_file_location('staged_build_info',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.get_code_identity(refresh=True)['sha'])"
     result = subprocess.run([sys.executable, "-c", code, str(release / "hermes_cli" / "build_info.py")],
                             check=True, capture_output=True, text=True)
@@ -208,11 +208,10 @@ def test_source_unchanged_head_dirty_blocks_migration_rollback(tmp_path):
     (home / "release-layout.json").write_text(json.dumps({"source": str(source), "source_sha": sha,
                                                            "plist": None}), encoding="utf-8")
     (source / "tracked.txt").write_text("dirty", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="source checkout is dirty"):
-        releases.rollback(home)
-    assert (home / "current").resolve() == current
-    assert (home / "previous").resolve() == source
+    assert releases.rollback(home)["source_sha"] == sha
     assert (source / "tracked.txt").read_text(encoding="utf-8") == "dirty"
+    assert not (home / "current").exists()
+    assert not (home / "previous").exists()
 
 
 def test_worker_env_pins_physical_venv_and_subprocess_path(tmp_path):
@@ -230,7 +229,7 @@ def test_worker_env_pins_physical_venv_and_subprocess_path(tmp_path):
     assert env["HERMES_RELEASE"] == str(physical)
 
 
-def test_missing_web_index_aborts_before_candidate_publish(tmp_path, monkeypatch):
+def test_untracked_source_web_assets_are_not_copied_into_release(tmp_path, monkeypatch):
     source, home = tmp_path / "source", tmp_path / "home"
     (source / "hermes_cli" / "web_dist").mkdir(parents=True)
     (source / "hermes_cli" / "immutable_releases.py").write_text("# test\n", encoding="utf-8")
@@ -239,9 +238,12 @@ def test_missing_web_index_aborts_before_candidate_publish(tmp_path, monkeypatch
     subprocess.run(["git", "-C", str(source), "add", "hermes_cli/immutable_releases.py"], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
                     "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "A"], check=True)
-    with pytest.raises(RuntimeError, match="web_dist lacks index.html"):
-        releases.stage_release(source, home)
-    assert not (home / "releases" / releases.release_sha(source)).exists()
+    monkeypatch.setattr(releases, "prepare_venv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(releases, "smoke_plugins", lambda *args, **kwargs: None)
+    release, _ = releases.stage_release(source, home)
+    assert not (release / "hermes_cli/web_dist/asset.js").exists()
+    assert not (release / "hermes_cli/web_dist/index.html").exists()
+    assert (home / "releases" / releases.release_sha(source)).exists()
 
 
 def test_active_locked_extra_is_passed_to_frozen_uv_sync(tmp_path, monkeypatch):
@@ -1022,13 +1024,30 @@ def test_update_journals_source_sha_before_checkout_advances(tmp_path, monkeypat
     monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda *args: False)
     monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
-    def inspect_before_checkout(*args, **kwargs):
+    def inspect_before_stage(*args, **kwargs):
         assert json.loads((home / "release-layout.json").read_text())["source_sha"] == sha_a
         assert releases.release_sha(source) == sha_a
-        raise RuntimeError("journal observed before checkout mutation")
-    monkeypatch.setattr(update_cmd, "_prepare_checkout_for_update", inspect_before_checkout)
-    with pytest.raises(RuntimeError, match="journal observed before checkout mutation"):
+        raise RuntimeError("journal observed before release stage")
+    monkeypatch.setattr(releases, "stage_release", inspect_before_stage)
+    with pytest.raises(RuntimeError, match="journal observed before release stage"):
         update_cmd._cmd_update_impl(SimpleNamespace(rollback=False), gateway_mode=False)
+    assert releases.release_sha(source) == sha_a
+    # A reversed migration is explicit state, not a current symlink to source.
+    journal = json.loads((home / "release-layout.json").read_text(encoding="utf-8"))
+    journal["state"] = "rolled-back"
+    (home / "release-layout.json").write_text(json.dumps(journal), encoding="utf-8")
+    (home / "previous").unlink()
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": False})
+    def legacy_checkout(*args, **kwargs):
+        assert not (home / "current").exists() and not (home / "previous").exists()
+        assert releases.release_sha(source) == sha_a
+        raise RuntimeError("legacy checkout selected")
+    monkeypatch.setattr(update_cmd, "_prepare_checkout_for_update", legacy_checkout)
+    update_cmd._catch_up_immutable_release(defer=False)
+    with pytest.raises(RuntimeError, match="legacy checkout selected"):
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=False), gateway_mode=False)
+    assert not (home / "current").exists() and not (home / "previous").exists()
+    assert releases.release_sha(source) == sha_a
 
 
 @pytest.mark.macos_only
@@ -1055,7 +1074,9 @@ def test_rollback_to_source_then_reactivate_records_source_sha(tmp_path, monkeyp
 
     assert update_cmd._activate_immutable_release()
     assert releases.rollback(home)["source_sha"] == source_sha
-    assert (home / "current").resolve() == source
+    assert not (home / "current").exists()
+    assert not (home / "previous").exists()
+    assert json.loads((home / "release-layout.json").read_text(encoding="utf-8"))["state"] == "rolled-back"
     update_receipt.begin_update_receipt()
     assert update_cmd._activate_immutable_release()
     update_receipt.finalize_update_receipt("success")

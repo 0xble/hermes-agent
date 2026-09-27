@@ -173,19 +173,7 @@ it guards. `plan → snapshot → apply → restart-per-kind → verify → repo
   the pre-swap process and finished by the post-swap child (below): `detach_update_receipt` /
   `resume_update_receipt` carry it across, so one run still yields exactly one receipt. A write
   failure prints `⚠ Update receipt not written` and logs at WARNING, never debug.
-- **Nothing runs pulled code in the pre-pull interpreter** (`update_handoff.py`). The process that
-  started `hermes update` imported the PRE-pull tree; once git (or the ZIP swap) has replaced the
-  checkout it stops, writes the hand-off payload (open receipt, pre-update plan, pre-update
-  version/active features, Windows pause token) and re-executes
-  `hermes update <same flags> --post-swap <file>` under the venv interpreter, which imports only the
-  pulled tree and owns the tail (deps, Node/web/Desktop, maintenance, config migration, fleet
-  restart, verification, receipt); the parent relays the exit code. Every "purge `sys.modules`" /
-  "reload this list of modules" / "isolate this one step" fix was a symptom of the old shape and is
-  gone — do not reintroduce one: a phase that needs new code runs in the child, full stop. Mocked
-  updater tests run the tail in-process via the `_inline_post_swap_handoff` autouse fixture
-  (`@pytest.mark.real_post_swap_handoff` opts out). Live A/B:
-  `evals/update_pipeline/post_swap_handoff_ab.sh`. Post-update steps still isolate their own
-  failures (a crashed notice must not abort the fleet matrix and receipt finalize that follow).
+- **Nothing runs fetched code in the pre-fetch interpreter** (`update_handoff.py`). Legacy Git/ZIP updates replace the checkout and re-execute the post-swap tail under the updated venv, as before. In immutable mode (including first migration), fetch changes **only Git objects**, never source HEAD, working files or source venv; archive and build the exact fetched SHA beside the source, then re-execute `--post-swap` under the staged release's Python with cwd/import path pinned to that release. That child owns pointer promotion, fleet restart, verification and receipt. A release-origin `/update` may first re-enter the journal-bound source interpreter to fetch, but must not execute B code there. The old module-purge/reload workaround must not return. Mocked updater tests run the tail in-process via `_inline_post_swap_handoff` (`@pytest.mark.real_post_swap_handoff` opts out); `evals/update_pipeline/post_swap_handoff_ab.sh` covers legacy A/B.
 
 Process-scan coordination between updater, serve/dashboard, and gateway is being replaced by a
 gateway-owned control socket (#92091); scans are the fallback layer for old/crashed processes — read

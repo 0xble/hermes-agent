@@ -164,7 +164,15 @@ def _previous_release_sha(paths, previous: str | None) -> str | None:
         return None
 
 
-def _activate_immutable_release(*, defer: bool = False) -> bool:
+def _immutable_release_enabled(paths=None) -> bool:
+    """One opt-in gate for fetched updates and no-pull reconciliation alike."""
+    from hermes_cli.immutable_releases import ReleasePaths, resolved_release
+    paths = paths or ReleasePaths.for_home(get_hermes_home())
+    return bool(_updates_config().get("immutable_releases", False) or resolved_release(paths.home))
+
+
+def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
+                                source: Path | None = None) -> bool:
     """Stage an opted-in layout; only promote/reload with restart authorization."""
     from hermes_cli.immutable_releases import (
         ReleasePaths, begin_migration, promote, read_pointer, release_sha, stage_release,
@@ -174,15 +182,16 @@ def _activate_immutable_release(*, defer: bool = False) -> bool:
     paths = ReleasePaths.for_home(home)
     # The first migration changes launchd's executable and must be deliberate.
     # Normal updates on an existing checkout must not create releases/ or a plist.
-    if read_pointer(paths.current) is None and not _updates_config().get("immutable_releases", False):
+    if not _immutable_release_enabled(paths):
         _record_update_step("immutable_release", True, "skipped: release layout not opted in")
         return True
+    source = source or _m().PROJECT_ROOT
     try:
-        sha = release_sha(_m().PROJECT_ROOT)
+        sha = sha or release_sha(source)
         if not sha:
             _record_update_step("immutable_release", True, "skipped: no git revision in mocked/non-git checkout")
             return True
-        candidate, action = stage_release(_m().PROJECT_ROOT, home, sha=sha)
+        candidate, action = stage_release(source, home, sha=sha)
         if defer:
             _record_update_step("immutable_release", True, f"staged: {candidate}; activation deferred")
             return True
@@ -195,8 +204,8 @@ def _activate_immutable_release(*, defer: bool = False) -> bool:
             plist = gateway.get_launchd_plist_path()
             if plist.exists():
                 original_plist = plist.read_bytes()
-        if first:
-            begin_migration(home, _m().PROJECT_ROOT, plist)
+        if first and read_pointer(paths.previous) is None:
+            begin_migration(home, source, plist)
         # The generated definition resolves the current pointer, so it must be
         # flipped before launchd can load it. A failed reload must undo BOTH
         # durable changes before returning a partial update.
@@ -224,6 +233,9 @@ def _activate_immutable_release(*, defer: bool = False) -> bool:
                 if not gateway_launchd.restore_launchd_plist(original_plist) or plist.read_bytes() != original_plist:
                     raise RuntimeError("launchd reload failed and original service definition could not be restored")
             raise
+        from hermes_cli.immutable_releases import set_migration_state
+        if first:
+            set_migration_state(home, "done")
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
         from_sha = _previous_release_sha(paths, previous)
@@ -1394,12 +1406,9 @@ class _ReleaseReconcileState:
 # Ordered state-table rows. * matches any value; the first matching row owns the
 # entire transition. The axes are normalized observations, not guesses from HEAD.
 _RELEASE_RECONCILE_TABLE = (
-    # disabled legacy checkout / reversed migration: no implicit re-migration
+    # Disabled legacy/reversed layouts never implicitly migrate or repair.
     ((False, "absent", "*", "none", "*", "*", "*"), "no-op"),
     ((False, "absent", "*", "rolled-back", "*", "*", "*"), "no-op"),
-    # A source reversal cannot re-enter begin_migration while current points to
-    # source. Require an explicit recovery instead of silently claiming success.
-    ((True, "absent", "*", "rolled-back", "*", "*", "*"), "fail-with-message"),
     (("*", "equal", "none", "*", "*", "*", "*"), "fail-with-message"),
     (("*", "equal", "failed-partial", "*", "*", "*", "*"), "fail-with-message"),
     (("*", "equal", "*", "*", "none", "none", "*"), "no-op"),
@@ -1459,25 +1468,29 @@ def _release_running_state(paths, source, current, sha) -> str:
     return "other"
 
 
-def _catch_up_immutable_release(*, defer: bool) -> None:
+def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
+                                source: Path | None = None) -> None:
     """Reconcile source, artifact, journal, service and gateway before fleet catch-up."""
     from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha, _release_is_ready
     paths = ReleasePaths.for_home(get_hermes_home())
+    if not _immutable_release_enabled(paths):
+        return
     current = read_pointer(paths.current)
-    sha = release_sha(_m().PROJECT_ROOT)
+    source = source or _m().PROJECT_ROOT
+    sha = sha or release_sha(source)
     candidate = paths.release(sha)
     candidate_state = ("staged" if _release_is_ready(candidate, sha)
                        else "failed-partial" if candidate.exists() else "none")
     journal_path = paths.home / "release-layout.json"
-    journal = ("rolled-back" if current is not None and current.parent != paths.releases.resolve()
-               else "done" if current is not None
-               else "in-progress" if journal_path.exists()
-               else "none")
+    record = json.loads(journal_path.read_text(encoding="utf-8")) if journal_path.exists() else {}
+    journal = record.get("state", "done" if current is not None else "in-progress" if record else "none")
+    if journal not in {"none", "in-progress", "done", "rolled-back"}:
+        raise RuntimeError(f"invalid release migration state: {journal}")
     state = _ReleaseReconcileState(
-        bool(_updates_config().get("immutable_releases", False)),
+        _immutable_release_enabled(paths),
         "absent" if current is None or journal == "rolled-back" else "equal" if current == candidate else "different",
         candidate_state, journal, _release_service_state(paths, current),
-        _release_running_state(paths, _m().PROJECT_ROOT, current, sha), defer,
+        _release_running_state(paths, source, current, sha), defer,
     )
     action = _reconcile_immutable_release(state)
     if action == "fail-with-message":
@@ -1490,11 +1503,8 @@ def _catch_up_immutable_release(*, defer: bool) -> None:
         return
     if action == "defer-record":
         if state.current != "equal" and state.candidate != "staged":
-            node_failures = _update_node_dependencies()
-            web_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-            if node_failures or not web_ok or not _activate_immutable_release(defer=True):
-                _record_update_step("immutable_release_catchup", False,
-                                    f"deferred stage failed: node={node_failures}, web={web_ok}")
+            if not _activate_immutable_release(defer=True, sha=sha, source=source):
+                _record_update_step("immutable_release_catchup", False, "deferred stage failed")
                 _finalize_receipt("partial", "Release deferred stage failed: %s")
                 raise SystemExit(1)
         _record_update_step("immutable_release_catchup", True, f"deferred: {state}")
@@ -1511,13 +1521,10 @@ def _catch_up_immutable_release(*, defer: bool) -> None:
             _write_fleet_restart_pending_marker(expected_sha=sha)
         _record_update_step("immutable_release_catchup", True, f"repaired service/runtime: {state}")
         return
-    # An interrupted stage has no ready marker; never treat a partial artifact
-    # as a no-op. Build prerequisites on the source before staging or promotion.
-    node_failures = _update_node_dependencies()
-    web_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-    if node_failures or not web_ok or not _activate_immutable_release():
-        _record_update_step("immutable_release_catchup", False,
-                            f"candidate={sha}, node_failures={node_failures}, web_build_ok={web_ok}")
+    # A partial build is not ready. Stage from the exact commit without ever
+    # building in or syncing the source checkout.
+    if not _activate_immutable_release(sha=sha, source=source):
+        _record_update_step("immutable_release_catchup", False, f"candidate={sha}")
         _finalize_receipt("partial", "Release catch-up failed: %s")
         raise SystemExit(1)
     _write_fleet_restart_pending_marker(expected_sha=sha)
@@ -1589,6 +1596,51 @@ def _finish_already_up_to_date(
     # The pending fleet restart above remains the sole catch-up authority.
 
 
+def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode,
+                                    had_desktop_app_before_update, pre_update_snapshot_id,
+                                    _pre_update_plan, _windows_gateway_resume):
+    """Fetch-only release path. Source HEAD, files and venv are never updated."""
+    from hermes_cli.immutable_releases import (
+        ReleasePaths, begin_migration, read_pointer, release_sha, stage_release, _release_is_ready,
+    )
+    source = _m().PROJECT_ROOT.resolve()
+    home = get_hermes_home()
+    paths = ReleasePaths.for_home(home)
+    fetched = _git_run(git_cmd, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"], check=True).stdout.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", fetched):
+        raise RuntimeError("fetch did not resolve to a complete commit SHA")
+    current = read_pointer(paths.current)
+    if current is not None and current.parent != paths.releases.resolve():
+        raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
+    if current is not None and not _release_is_ready(current, current.name):
+        raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
+    if current is None:
+        from hermes_cli import gateway
+        begin_migration(home, source, gateway.get_launchd_plist_path() if sys.platform == "darwin" else None)
+    # A deferred candidate must be promoted on the next normal update, even
+    # when the remote has not advanced beyond that exact staged commit.
+    if current is not None and current.name == fetched:
+        _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
+        _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
+        return
+    # stage_release archives FETCH_HEAD itself, builds web and its own locked
+    # environment in a build-aside directory, then atomically publishes it.
+    candidate, _ = stage_release(source, home, sha=fetched)
+    if candidate != paths.release(fetched) or not _release_is_ready(candidate, fetched):
+        raise RuntimeError("staged release does not match fetched commit")
+    _write_fleet_restart_pending_marker(
+        expected_sha=fetched,
+        runtimes=_pre_update_plan.to_dict().get("runtimes") if _pre_update_plan is not None else None,
+    )
+    _hand_off_post_swap(
+        args, swap="immutable", branch=branch, pre_pull_sha=release_sha(source),
+        is_fork=False, opts=opts, gateway_mode=gateway_mode,
+        had_desktop_app_before_update=had_desktop_app_before_update,
+        pre_update_snapshot_id=pre_update_snapshot_id, _pre_update_plan=_pre_update_plan,
+        _windows_gateway_resume=_windows_gateway_resume, release=candidate, source=source,
+    )
+
+
 def _apply_pulled_update(
     git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
     had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
@@ -1638,7 +1690,7 @@ def _post_swap_argv_tail(args) -> list[str]:
 def _post_swap_payload(
     *, swap: str, branch: str, opts, gateway_mode: bool, had_desktop_app_before_update: bool,
     pre_pull_sha=None, is_fork: bool = False, pre_update_snapshot_id=None, _pre_update_plan=None,
-    _windows_gateway_resume=None) -> dict:
+    _windows_gateway_resume=None, release=None, source=None) -> dict:
     """Everything the post-swap tail needs that only the pre-swap process could observe: the
     open receipt (detached here — the child resumes it), the pre-update fleet plan, the
     pre-update version and active features, the Windows pause token. Flags cross as argv."""
@@ -1646,6 +1698,8 @@ def _post_swap_payload(
 
     return {
         "swap": swap, "branch": branch, "pre_pull_sha": pre_pull_sha, "is_fork": bool(is_fork),
+        "release": str(release) if release else None, "candidate_sha": Path(release).name if release else None,
+        "source": str(source) if source else None,
         "gateway_mode": bool(gateway_mode),
         "had_desktop_app_before_update": bool(had_desktop_app_before_update),
         "pre_update_snapshot_id": pre_update_snapshot_id,
@@ -1743,6 +1797,29 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _windows_gateway_resume=_windows_gateway_resume)
             if gateway_mode:
                 _write_gateway_update_exit_code(desktop_build_ok)
+            return
+        if payload.get("swap") == "immutable":
+            from hermes_cli.immutable_releases import ReleasePaths
+            release = Path(payload["release"]).resolve(strict=True)
+            paths = ReleasePaths.for_home(get_hermes_home())
+            if release.parent != paths.releases.resolve() or release.name != payload["candidate_sha"]:
+                raise RuntimeError("immutable handoff release identity mismatch")
+            if _m().PROJECT_ROOT.resolve() != release:
+                raise RuntimeError("immutable post-swap child did not import the staged release")
+            if not _activate_immutable_release(defer=opts.no_gateway_restart,
+                                                sha=release.name, source=Path(payload["source"])):
+                _finalize_receipt("partial", "Immutable release activation failed: %s")
+                raise SystemExit(1)
+            if not opts.no_gateway_restart:
+                restart = _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode)
+                _resume_windows_gateways_and_merge_outcome(restart, _windows_gateway_resume, gateway_mode)
+                _verify_fleet_after_update(
+                    restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
+                    node_failures=[], update_complete=True, expected_sha=release.name,
+                    expected_root=release)
+            else:
+                _record_update_step("immutable_release", True, "activation deferred; fleet restart not requested")
+                _finalize_receipt("success", "Immutable release staged: %s")
             return
         # The parent already ran the checkout preflight (fork banner, lockfile churn, EOL); the
         # child only needs a working git.
@@ -1877,10 +1954,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         from hermes_cli import gateway
         plist_path = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
         plist_before = plist_path.read_bytes() if plist_path is not None and plist_path.exists() else None
-        source_head_before = None
-        if before_previous is not None and before_previous.parent != paths.releases.resolve():
-            from hermes_cli.immutable_releases import release_sha
-            source_head_before = release_sha(before_previous)
+        journal_path = home / "release-layout.json"
+        journal_before = journal_path.read_bytes() if journal_path.exists() else None
         try:
             result = rollback(home)
             current_target = result["current"]
@@ -1899,13 +1974,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         raise RuntimeError("source plist bytes differ after rollback reload")
                     _record_update_step("source_plist_restore", True, str(plist_path))
         except Exception:
-            from hermes_cli.immutable_releases import _atomic_symlink, release_sha
-            if source_head_before and before_previous is not None:
-                source = before_previous
-                if release_sha(source) != source_head_before:
-                    status = _git_run(["git"], ["status", "--porcelain"], cwd=source, check=True)
-                    if status.stdout.strip() or _git_run(["git"], ["reset", "--hard", source_head_before], cwd=source).returncode:
-                        raise RuntimeError("rollback failed and source checkout could not be restored to its prior revision")
+            from hermes_cli.immutable_releases import _atomic_symlink
+            if journal_before is not None:
+                journal_path.write_bytes(journal_before)
             _atomic_symlink(paths.current, before)
             if before_previous is None:
                 paths.previous.unlink(missing_ok=True)
@@ -2028,15 +2099,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
+        if _immutable_release_enabled():
+            _apply_fetched_immutable_update(
+                git_cmd, branch, opts, args, gateway_mode=gateway_mode,
+                had_desktop_app_before_update=had_desktop_app_before_update,
+                pre_update_snapshot_id=pre_update_snapshot_id, _pre_update_plan=_pre_update_plan,
+                _windows_gateway_resume=_windows_gateway_resume)
+            return
+
         current_branch = _current_branch_name(git_cmd, check=True)
-        # Journal the running checkout before branch switching, stashing, merging,
-        # or pulling. A migration rollback must recover this exact source A.
-        if _updates_config().get("immutable_releases", False):
-            from hermes_cli.immutable_releases import ReleasePaths, begin_migration, read_pointer
-            if read_pointer(ReleasePaths.for_home(get_hermes_home()).current) is None:
-                from hermes_cli import gateway
-                begin_migration(get_hermes_home(), _m().PROJECT_ROOT,
-                                gateway.get_launchd_plist_path())
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,

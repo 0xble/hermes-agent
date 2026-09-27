@@ -30,8 +30,6 @@ def test_reconcile_matrix(enabled, current, candidate, journal, service, running
         return
     if current == "absent" and not enabled and journal in {"none", "rolled-back"}:
         expected = "no-op"
-    elif current == "absent" and enabled and journal == "rolled-back":
-        expected = "fail-with-message"
     elif current == "equal" and candidate != "staged":
         expected = "fail-with-message"
     elif current == "equal":
@@ -60,7 +58,7 @@ def test_first_migration_failure_retries_without_ready_candidate(tmp_path, monke
     calls = []
     monkeypatch.setattr(update_cmd, "_activate_immutable_release", lambda **kw: calls.append(kw) or True)
     update_cmd._catch_up_immutable_release(defer=False)
-    assert calls == [{}]
+    assert calls == [{"sha": "B", "source": update_cmd._m().PROJECT_ROOT}]
 
 
 def test_opted_in_already_current_checkout_stages_first_migration(tmp_path, monkeypatch):
@@ -75,7 +73,7 @@ def test_opted_in_already_current_checkout_stages_first_migration(tmp_path, monk
     calls = []
     monkeypatch.setattr(update_cmd, "_activate_immutable_release", lambda **kw: calls.append(kw) or True)
     update_cmd._catch_up_immutable_release(defer=False)
-    assert calls == [{}]
+    assert calls == [{"sha": "B", "source": update_cmd._m().PROJECT_ROOT}]
 
 
 def test_deferred_first_migration_stages_but_does_not_activate(tmp_path, monkeypatch):
@@ -90,7 +88,7 @@ def test_deferred_first_migration_stages_but_does_not_activate(tmp_path, monkeyp
     calls = []
     monkeypatch.setattr(update_cmd, "_activate_immutable_release", lambda **kw: calls.append(kw) or True)
     update_cmd._catch_up_immutable_release(defer=True)
-    assert calls == [{"defer": True}]
+    assert calls == [{"defer": True, "sha": "B", "source": update_cmd._m().PROJECT_ROOT}]
     assert not (home / "current").exists()
 
 

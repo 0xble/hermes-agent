@@ -2416,7 +2416,7 @@ def _update_preflight_handled(args) -> bool:
 
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
-    if not (PROJECT_ROOT / ".git").exists():
+    if not (getattr(args, "post_swap", None) or getattr(args, "rollback", False)) and not (PROJECT_ROOT / ".git").exists():
         from hermes_cli.immutable_releases import resolved_release, source_checkout_python, update_source_checkout
         home = get_hermes_home()
         source = update_source_checkout(home, PROJECT_ROOT)
