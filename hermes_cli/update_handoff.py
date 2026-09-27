@@ -213,6 +213,16 @@ def continue_update_in_fresh_interpreter(payload: dict[str, Any], *, argv_tail: 
     cmd = post_swap_command(handoff_path, argv_tail)
     env = post_swap_child_env()
     cwd = _post_swap_cwd()
+    if payload.get("swap") == "immutable":
+        from hermes_cli.immutable_releases import _release_python
+        release = Path(payload["release"]).resolve(strict=True)
+        cmd[0] = str(_release_python(release))
+        if not Path(cmd[0]).is_file():
+            raise RuntimeError(f"staged release interpreter missing: {cmd[0]}")
+        cwd = str(release)
+        env.pop("PYTHONHOME", None)
+        env["PYTHONPATH"] = str(release)
+        env["VIRTUAL_ENV"] = str(release / ".venv")
     logger.debug("Post-swap hand-off → %s", subprocess.list2cmdline(cmd))
     sys.stdout.flush()
     sys.stderr.flush()

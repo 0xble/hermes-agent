@@ -12,6 +12,9 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         "update", help="Update Hermes Agent to the latest version",
         description="Pull the latest changes from git and reinstall dependencies")
     update_parser.add_argument(
+        "--rollback", action="store_true", default=False,
+        help="Atomically point current at the previous immutable release and exit")
+    update_parser.add_argument(
         "--gateway", action="store_true", default=False,
         help="Gateway mode: use file-based IPC for prompts instead of stdin (used internally by /update)",
     )

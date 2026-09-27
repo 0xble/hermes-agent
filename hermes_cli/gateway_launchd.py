@@ -209,9 +209,9 @@ def _launchd_unsupported_marker_exists() -> bool:
     return _launchd_unsupported_marker_path().exists()
 
 
-def _gateway_run_command() -> list[str]:
-    """Build ``python -m hermes_cli.main [--profile X] gateway run --replace``, honoring the active profile."""
-    return [_gw().get_python_path(), "-m", "hermes_cli.main", *_gw()._profile_arg().split(), "gateway", "run", "--replace"]
+def _gateway_run_command(*, interpreter: str | None = None) -> list[str]:
+    """Build ``python -m hermes_cli.main [--profile X] gateway run --replace``."""
+    return [interpreter or _gw().get_python_path(), "-m", "hermes_cli.main", *_gw()._profile_arg().split(), "gateway", "run", "--replace"]
 
 
 def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: Path) -> list[str]:
@@ -237,7 +237,8 @@ def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: 
     return ["/usr/bin/osascript", "-e", f'do shell script "{applescript}"']
 
 
-def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor: bool = False) -> list[str]:
+def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor: bool = False,
+                                        interpreter: str | None = None) -> list[str]:
     """Wrap gateway run so raw stderr lines are timestamped before file write. ``external_supervisor``
     (launchd ProgramArguments only) adds ``--external-supervisor`` so ``hermes update`` hands back to
     launchd, and drops ``--replace``: KeepAlive respawns would re-arm takeover, so two profiles sharing
@@ -254,12 +255,13 @@ def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor:
     bootout+bootstrap in install/refresh), which run before supervision resumes. Mirrors
     ``generate_systemd_unit``, whose ExecStart also runs ``gateway run`` without ``--replace``.
     """
-    inner = _gw()._gateway_run_command()
+    inner = (_gw()._gateway_run_command() if interpreter is None else
+             _gateway_run_command(interpreter=interpreter))
     if external_supervisor:
         inner = [part for part in inner if part != "--replace"]
         if "--external-supervisor" not in inner:
             inner.append("--external-supervisor")
-    return [_gw().get_python_path(), "-m", "hermes_cli.stderr_timestamp", "--error-log", str(error_log), "--", *inner]
+    return [interpreter or _gw().get_python_path(), "-m", "hermes_cli.stderr_timestamp", "--error-log", str(error_log), "--", *inner]
 
 
 def _spawn_detached_gateway() -> bool:
@@ -328,24 +330,39 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
-def generate_launchd_plist() -> str:
+def generate_launchd_plist(release_target: Path | None = None) -> str:
+    """Render a candidate definition without moving ``current`` first.
+
+    The release updater must persist these exact bytes in its write-ahead record
+    before changing pointers. Normal callers retain the existing service output.
+    """
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
-    working_dir = _gw()._stable_service_working_dir()
+    working_dir = str(_gw().get_hermes_home() / "current") if release_target else _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
     log_dir = _gw().get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = _gw().get_launchd_label()
-    venv_dir = _gw()._service_venv_dir()
+    venv_dir = (str(_gw().get_hermes_home() / "current" / ".venv")
+                if release_target else _gw()._service_venv_dir())
     # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
     # systemd unit) so node stays resolvable even if the shell PATH changes, then the shell PATH.
     priority_dirs = _gw()._build_service_path_dirs()
+    if release_target:
+        root = Path(release_target)
+        if not (root / ".venv" / "bin" / "python").is_file():
+            raise RuntimeError(f"candidate launchd interpreter unavailable: {root}")
+        priority_dirs = [str(_gw().get_hermes_home() / "current" / ".venv" / "bin"),
+                         *[entry for entry in priority_dirs if entry != str(root / ".venv" / "bin")]]
     _gw()._append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
-    command = _timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
+    interpreter = (str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python")
+                   if release_target else None)
+    command = _timestamped_stderr_gateway_command(
+        stderr_log, external_supervisor=True, interpreter=interpreter)
     prog_args_xml = "\n        ".join(
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
     )
@@ -437,14 +454,19 @@ def generate_launchd_plist() -> str:
 """
 
 
-def launchd_plist_is_current() -> bool:
-    """Check if the installed launchd plist matches the currently generated one."""
+def launchd_plist_is_current(release_target: Path | None = None) -> bool:
+    """Check installed definition against the active rendering."""
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists():
         return False
+    if release_target is None:
+        from hermes_cli.immutable_releases import resolved_release
+        release_target = resolved_release(_gw().get_hermes_home())
     installed = plist_path.read_text(encoding="utf-8")
     norm = _gw()._normalize_launchd_plist_for_comparison
-    return norm(installed) == norm(_gw().generate_launchd_plist())
+    expected = (_gw().generate_launchd_plist(release_target=release_target) if release_target
+                else _gw().generate_launchd_plist())
+    return norm(installed) == norm(expected)
 
 
 def _spawn_deferred_launchd_reload(
@@ -497,13 +519,12 @@ def _spawn_deferred_launchd_reload(
         # including a setsid-detached child (#69098). `launchctl submit` creates a wholly independent
         # transient launchd job that launchd manages separately from the gateway, so bootout of the gateway
         # job cannot reach the helper.
-        subprocess.Popen(
+        subprocess.run(
             [
                 "launchctl", "submit", "-l", submit_label, "-o", str(reload_log_path), "-e", str(reload_log_path),
                 "--", "/bin/bash", "-c", reload_script,
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            check=True, timeout=15, capture_output=True,
         )
     except Exception as e:
         # Fall through to in-process bootout/bootstrap: risky in the coalition, but better than a never-reloaded plist.
@@ -515,7 +536,7 @@ def _spawn_deferred_launchd_reload(
     return True
 
 
-def refresh_launchd_plist_if_needed() -> bool:
+def refresh_launchd_plist_if_needed() -> bool | str:
     """Rewrite the installed plist when the generated one differs, then bootout/bootstrap so launchd
     re-reads it immediately."""
     plist_path = _gw().get_launchd_plist_path()
@@ -527,6 +548,11 @@ def refresh_launchd_plist_if_needed() -> bool:
         return False
 
     plist_path.write_text(new_plist, encoding="utf-8")
+    return _reload_installed_launchd_plist(plist_path)
+
+
+def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
+    """Re-register the installed bytes (including a saved source-checkout plist)."""
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
@@ -551,7 +577,7 @@ def refresh_launchd_plist_if_needed() -> bool:
             "↻ Updated gateway launchd service definition; reload deferred to "
             "a transient launchd job (survives the bootout of this process)"
         )
-        return True
+        return "deferred"
 
     # Bootout/bootstrap so launchd reads the new definition; bootstrap can fail silently under load
     # during a drain, and KeepAlive can't revive an unregistered job.

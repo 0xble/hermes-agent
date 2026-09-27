@@ -19,6 +19,20 @@ from hermes_state import AsyncSessionDB
 from hermes_cli.gateway import _cmd_update
 
 
+def test_agent_update_resolver_error_is_user_facing_without_marker(tmp_path):
+    from gateway.update_launcher import make_agent_update_handler
+
+    def unreadable():
+        raise RuntimeError("repair release-layout.json and retry")
+
+    handler = make_agent_update_handler(
+        runner=SimpleNamespace(), home=tmp_path, main_loop=Mock(),
+        resolve_hermes_bin=unreadable, spawn=Mock(), is_managed=lambda: False)
+    result = handler({"reason": "Apply fix", "session_id": "s"})
+    assert result == {"accepted": False, "error": "repair release-layout.json and retry"}
+    assert not (tmp_path / ".update_pending.json").exists()
+
+
 def test_cli_invalid_reason_returns_nonzero_without_ipc(monkeypatch, capsys):
     ipc = Mock()
     monkeypatch.setattr("gateway.control_socket.query_gateway_control", ipc)

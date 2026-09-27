@@ -1,6 +1,9 @@
 """Regression coverage for separate-checkout gateways (#117449)."""
 
+import json
 from pathlib import Path
+
+import pytest
 from types import SimpleNamespace
 
 from hermes_cli import update_cmd_fleet, update_receipt
@@ -95,6 +98,46 @@ def test_external_gateway_does_not_fail_matrix(capsys):
     assert failed is False
     assert "separate checkout" in output
     assert "/srv/hermes-pinned" in output
+
+
+@pytest.mark.parametrize(
+    ("expected_side", "gateway_side", "gateway_sha", "expected_sha", "state", "fails"),
+    [
+        ("release", "source", "old", "new", "stale", True),
+        ("source", "release", "new", "old", "stale", True),
+        ("release", "source", "same", "same", "current", False),
+        ("source", "release", "same", "same", "current", False),
+        ("release", "other", "old", "new", "external", False),
+        ("source", "other", "old", "new", "external", False),
+    ],
+)
+def test_migration_fleet_verifies_only_journal_bound_source(
+    tmp_path, monkeypatch, expected_side, gateway_side, gateway_sha, expected_sha, state, fails,
+):
+    """Exercise the production collector and matrix on either side of migration."""
+    source = _checkout(tmp_path, "source")
+    other = _checkout(tmp_path, "other")
+    home = tmp_path / "home"
+    release = _checkout(home / "releases", "new")
+    home.mkdir(exist_ok=True)
+    (home / "release-layout.json").write_text(json.dumps({"source": str(source)}), encoding="utf-8")
+    roots = {"source": source, "release": release, "other": other}
+    (home / "gateway_state.json").write_text(json.dumps({
+        "gateway_state": "running", "kind": "hermes-gateway", "pid": 4242,
+        "argv": [str(roots[gateway_side] / "hermes_cli" / "main.py")],
+        "code_sha": gateway_sha, "code_version": "1.0",
+    }), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: tmp_path / "no_profiles")
+    monkeypatch.setattr(update_receipt, "_socket_identity", lambda _home: None)
+    monkeypatch.setattr("gateway.status.live_gateway_pid_for_home", lambda _home: 4242)
+
+    fleet = update_receipt.collect_fleet_versions(
+        expected_sha_override=expected_sha, expected_root_override=roots[expected_side],
+    )
+    assert [row["state"] for row in fleet] == [state]
+    assert update_receipt.print_fleet_version_matrix(fleet) is fails
 
 
 def test_collect_fleet_versions_classifies_separate_checkout_gateway(tmp_path, monkeypatch):

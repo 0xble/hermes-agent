@@ -31,9 +31,13 @@ except ImportError:
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 
+# Freeze the physical code root at module import. Resolving `__file__` during a
+# later dispatch would follow a moved `current` symlink into the next release.
+_LOADED_CODE_ROOT = Path(__file__).resolve().parent.parent
+
 # Must precede repo-level imports: standalone invocations (e.g. module reload after
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(_LOADED_CODE_ROOT))
 
 from hermes_constants import get_hermes_home, hermes_home_key
 from cron.env_settings import cron_env_setting
@@ -3504,8 +3508,12 @@ def _launch_external_cron_worker(job: dict) -> bool:
     ack_path = handoff_dir / f"{execution_id}.ready"
     # Captured so a worker that dies before its acknowledgement can name the cause (#112729).
     stderr_path = handoff_dir / f"{execution_id}.stderr"
+    from hermes_cli.immutable_releases import LOADED_RELEASE_ROOT, worker_launch_spec
+    # The only launch-spec owner resolves the loaded installation, not the
+    # profile whose job happens to be running in this gateway.
+    executable, _, _ = worker_launch_spec(LOADED_RELEASE_ROOT, {})
     command = [
-        sys.executable,
+        executable,
         "-m",
         "cron.scheduler",
         "--external-worker-file",
@@ -3592,17 +3600,15 @@ def _launch_external_cron_worker(job: dict) -> bool:
         "HERMES_EXEC_ASK",
     ):
         worker_env.pop(_presence_var, None)
-    # `-m cron.scheduler` has no hermes_cli.main bootstrap; pin this checkout explicitly
-    # (PYTHONSAFEPATH / stale editable mapping, #112729). See cron/scheduler_worker_env.py.
-    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    repo_root = Path(__file__).resolve().parent.parent
-    worker_env = pin_hermes_tree_on_pythonpath(worker_env, repo_root)
+    # The sanitizer removes inherited runtime variables. Restore all worker
+    # process identity fields together, after sanitization and before spawning.
+    _, worker_cwd, worker_env = worker_launch_spec(LOADED_RELEASE_ROOT, worker_env)
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             process = subprocess.Popen(
                 dispatch.argv,
-                cwd=str(repo_root),
+                cwd=str(worker_cwd),
                 env=worker_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,

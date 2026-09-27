@@ -170,6 +170,19 @@ def record_step(name: str, ok: bool, detail: str = "") -> None:
     _record("step", f"update step {name}", name, ok, detail)
 
 
+def record_release_transition(*, from_sha: str | None, to_sha: str, from_path: str | None,
+                              to_path: str, kind: str) -> None:
+    """Persist exact immutable-release identity separately from prose step details."""
+    try:
+        if _current is not None:
+            _current.data["release_transition"] = {
+                "from_sha": from_sha, "to_sha": to_sha,
+                "from_path": from_path, "to_path": to_path, "kind": kind,
+            }
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record release transition: %s", exc)
+
+
 def record_skip(name: str, reason: str) -> None:
     """Record a skipped step WITH the reason it was skipped."""
     _record("skip", f"update skip {name}", name, reason)
@@ -395,14 +408,36 @@ def row_is_external(row: Any) -> bool:
     return isinstance(row, dict) and row.get("state") == EXTERNAL_STATE
 
 
+def _migration_source_root(home: Path) -> Optional[Path]:
+    """Only the source bound by this installation's migration journal is managed."""
+    with suppress(Exception):
+        record = json.loads((home / "release-layout.json").read_text(encoding="utf-8"))
+        source = record.get("source")
+        if isinstance(source, str) and Path(source).is_absolute():
+            return Path(source).resolve()
+    return None
+
+
 def _fleet_row(
     profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any,
     state: str = "unknown", code_root: Optional[Path] = None,
     expected_root: Optional[Path] = None, served_profiles: Any = None,
     self_restart_pending: Optional[set] = None,
+    managed_source_root: Optional[Path] = None, managed_releases_root: Optional[Path] = None,
 ) -> dict[str, Any]:
     if state == "unknown" and code_root and expected_root and code_root != expected_root:
-        state = EXTERNAL_STATE
+        # Two immutable releases in one home, or that home's journal-bound source
+        # and one of its releases, belong to the SAME managed fleet. Never treat
+        # another checkout (including another profile's source) as owned.
+        actual, intended = Path(code_root).resolve(), Path(expected_root).resolve()
+        same_release_fleet = (actual.parent == intended.parent and actual.parent.name == "releases")
+        migration_fleet = bool(
+            managed_source_root and managed_releases_root and
+            ((actual == managed_source_root and intended.parent == managed_releases_root)
+             or (intended == managed_source_root and actual.parent == managed_releases_root))
+        )
+        if not (same_release_fleet or migration_fleet):
+            state = EXTERNAL_STATE
     if state == "unknown" and code_sha and expected_sha:
         state = "current" if str(code_sha) == str(expected_sha) else "stale"
     if state == "stale" and self_restart_pending and pid in self_restart_pending:
@@ -429,6 +464,7 @@ _NOT_EXPECTED_STATES = {"stopped", "startup_failed"}
 
 def collect_fleet_versions(
     *, pre_restart_pids: Optional[list[int]] = None, self_restart_pending: Optional[set] = None,
+    expected_sha_override: str | None = None, expected_root_override: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Snapshot every profile's gateway code identity vs. the current tree.
 
@@ -456,8 +492,25 @@ def collect_fleet_versions(
     _pre_restart = {int(p) for p in (pre_restart_pids or []) if isinstance(p, int)}
     _pending = {int(p) for p in (self_restart_pending or ()) if isinstance(p, int)}
     results: list[dict[str, Any]] = []
-    expected_sha = _code_identity(refresh=True).get("sha")
-    expected_root = _updater_code_root()
+    expected_sha = expected_sha_override or _code_identity(refresh=True).get("sha")
+    expected_root = expected_root_override or _updater_code_root()
+    managed_source_root = None
+    managed_releases_root = None
+    with suppress(Exception):
+        from hermes_constants import get_hermes_home
+        from hermes_cli.immutable_releases import ReleasePaths
+        paths = ReleasePaths.for_home(get_hermes_home())
+        managed_source_root = _migration_source_root(paths.home)
+        managed_releases_root = paths.releases.resolve()
+    if expected_root_override is None:
+        with suppress(Exception):
+            from hermes_constants import get_hermes_home
+            from hermes_cli.immutable_releases import resolved_release
+            release = resolved_release(get_hermes_home())
+            if release is not None:
+                expected_root = release
+                if expected_sha_override is None:
+                    expected_sha = release.name
     try:
         from gateway.status import (
             live_gateway_pid_for_home,
@@ -474,6 +527,7 @@ def collect_fleet_versions(
                     served_profiles=identity.get("served_profiles"),
                     code_root=_gateway_code_root(pid, home), expected_root=expected_root,
                     self_restart_pending=_pending,
+                    managed_source_root=managed_source_root, managed_releases_root=managed_releases_root,
                 )
                 results.append({**row, "source": "socket"})
                 continue
@@ -494,6 +548,7 @@ def collect_fleet_versions(
                         served_profiles=record.get("served_profiles"),
                         code_root=_gateway_code_root(pid, home), expected_root=expected_root,
                         self_restart_pending=_pending,
+                        managed_source_root=managed_source_root, managed_releases_root=managed_releases_root,
                     )
                 )
                 continue

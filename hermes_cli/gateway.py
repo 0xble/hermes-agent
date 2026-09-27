@@ -2950,6 +2950,17 @@ def _detect_venv_dir() -> Path | None:
 
 
 def get_python_path() -> str:
+    try:
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(get_hermes_home())
+        if release:
+            # Service definitions must keep the lexical pointer: launchd resolves it
+            # afresh at each spawn, while the worker launcher pins the resolved path.
+            candidate = get_hermes_home() / "current" / (".venv/Scripts/python.exe" if is_windows() else ".venv/bin/python")
+            if candidate.exists():
+                return str(candidate)
+    except Exception:
+        pass
     venv = _detect_venv_dir()
     if venv is not None:
         try:
@@ -4158,6 +4169,24 @@ def _respawn_storm_backoff() -> None:
         logger.debug("respawn-storm breaker check failed (non-fatal): %s", _be)
 
 
+async def _acknowledge_release_when_running(*, poll_seconds: float = 1.0) -> None:
+    """Observe running state for the gateway's lifetime without blocking its loop."""
+    if sys.platform != "darwin" or not os.environ.get("HERMES_SUPERVISED_CHILD"):
+        return
+    from gateway.status import read_runtime_status
+    from hermes_cli.immutable_releases import acknowledge_running_release
+    while True:
+        await asyncio.sleep(poll_seconds)
+        state = read_runtime_status() or {}
+        if state.get("pid") == os.getpid() and state.get("gateway_state") == "running":
+            try:
+                if await asyncio.to_thread(acknowledge_running_release, get_hermes_home(),
+                                           gateway_pid=os.getpid()):
+                    return
+            except (OSError, RuntimeError, ValueError):
+                logger.warning("Pending release reload could not be acknowledged", exc_info=True)
+
+
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
@@ -4220,9 +4249,16 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         from gateway.run import _exit_after_graceful_shutdown
         _exit_after_graceful_shutdown(code)
 
+    async def _run_with_release_ack() -> bool:
+        watcher = asyncio.create_task(_acknowledge_release_when_running())
+        try:
+            return await start_gateway(replace=replace, force=force, verbosity=verbosity)
+        finally:
+            watcher.cancel()
+
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity))
+        success = asyncio.run(_run_with_release_ack())
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.

@@ -85,11 +85,21 @@ class TestHandleUpdateCommand:
             (fake_root / "gateway").mkdir(parents=True)
             (fake_root / "gateway" / "slash_commands.py").touch()
 
-            with patch("gateway.slash_commands.__file__", fake_file):
+            with patch("gateway.run.__file__", str(fake_root / "gateway" / "run.py")):
                 result = await runner._handle_update_command(event)
 
         assert "Not a git repository" in result
 
+
+    @pytest.mark.asyncio
+    async def test_unreadable_release_layout_returns_guidance(self):
+        runner = _make_runner()
+        event = _make_event()
+        with patch("hermes_cli.config.is_managed", return_value=False), \
+             patch("gateway.run._resolve_update_hermes_bin",
+                   side_effect=RuntimeError("repair release-layout.json and retry")):
+            result = await runner._handle_update_command(event)
+        assert "repair release-layout.json and retry" in result
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_module_argv(self):

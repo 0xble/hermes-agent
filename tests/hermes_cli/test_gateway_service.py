@@ -569,14 +569,15 @@ class TestLaunchdServiceRecovery:
 
         result = gateway_cli.refresh_launchd_plist_if_needed()
 
-        assert result is True
+        assert result == "deferred"
         # The new plist was written.
         assert "--replace" in plist_path.read_text(encoding="utf-8")
         # No DIRECT bootout/bootstrap ran (those would kill us mid-sequence).
         assert not [c for c in run_calls if "bootout" in c or "bootstrap" in c]
-        # Exactly one Popen call was made for the transient launchd job.
-        assert len(popen_calls) == 1
-        cmd, kwargs = popen_calls[0]
+        submit_calls = [c for c in run_calls if c[:2] == ["launchctl", "submit"]]
+        assert len(submit_calls) == 1
+        cmd = submit_calls[0]
+        kwargs = {}
         # Must use `launchctl submit` (not `start_new_session=True`) so the
         # helper runs as a transient launchd job outside the gateway's process
         # coalition, surviving bootout (#69098).
@@ -642,10 +643,10 @@ class TestLaunchdServiceRecovery:
 
         result = gateway_cli.refresh_launchd_plist_if_needed()
 
-        assert result is True
+        assert result == "deferred"
         # Reload was delegated, NOT run in-process where bootout could kill it.
-        assert len(popen_calls) == 1
-        assert popen_calls[0][:2] == ["launchctl", "submit"]
+        submit_calls = [c for c in run_calls if c[:2] == ["launchctl", "submit"]]
+        assert len(submit_calls) == 1
         assert not [c for c in run_calls if "bootout" in c or "bootstrap" in c]
 
     def test_deferred_reload_waits_for_old_gateway_pid_before_bootstrap(
@@ -672,10 +673,11 @@ class TestLaunchdServiceRecovery:
             ),
         )
         monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 4242)
+        run_calls = []
         monkeypatch.setattr(
             gateway_cli.subprocess,
             "run",
-            lambda cmd, check=False, **kw: SimpleNamespace(
+            lambda cmd, check=False, **kw: run_calls.append(cmd) or SimpleNamespace(
                 returncode=0, stdout="", stderr=""
             ),
         )
@@ -687,9 +689,9 @@ class TestLaunchdServiceRecovery:
             lambda cmd, **kw: popen_calls.append(cmd) or SimpleNamespace(pid=1),
         )
 
-        assert gateway_cli.refresh_launchd_plist_if_needed() is True
+        assert gateway_cli.refresh_launchd_plist_if_needed() == "deferred"
 
-        cmd = popen_calls[0]
+        cmd = next(c for c in run_calls if c[:2] == ["launchctl", "submit"])
         script = cmd[cmd.index("--") + 3]
         # Waits on the OLD pid, and does so AFTER bootout but BEFORE bootstrap.
         assert "kill -0 4242" in script
@@ -741,6 +743,8 @@ class TestLaunchdServiceRecovery:
 
         def fake_run(cmd, check=False, **kwargs):
             run_calls.append(cmd)
+            if cmd[:2] == ["launchctl", "submit"]:
+                raise subprocess.CalledProcessError(1, cmd)
             if cmd[:2] == ["launchctl", "list"]:
                 # Post-bootstrap launchd reports a supervised PID; without one
                 # the success check correctly refuses to stop retrying.

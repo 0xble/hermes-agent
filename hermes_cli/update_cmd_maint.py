@@ -1024,6 +1024,50 @@ def _migrate_relay_exporter_env() -> None:
     run_relay_migration_after_update()
 
 
+def strict_immutable_maintenance(project_root: Path) -> bool:
+    """Complete required shared-state work before promoting an immutable release.
+
+    Call from the candidate interpreter, with its staged release directory as
+    ``project_root``. Unlike legacy best-effort maintenance, any failed seed,
+    skill sync, config check or migration raises (and must block activation).
+    Returns True only after every configured profile reaches this code's schema.
+    Credentials requiring a prompt remain the user's responsibility.
+    """
+    from hermes_cli.config import check_config_version, migrate_config
+    from hermes_cli.model_catalog import seed_cache_from_checkout
+    from hermes_cli.profiles import list_profiles, seed_profile_skills
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    if not seed_cache_from_checkout(Path(project_root)):
+        raise RuntimeError("immutable maintenance: model catalog seed failed")
+
+    profile_list = list_profiles(lazy_skill_count=True)
+    if not profile_list:
+        raise RuntimeError("immutable maintenance: no profiles enumerated")
+    for profile in profile_list:
+        # The sync module caches its home at import time. The profile helper
+        # subprocesses with an explicit HERMES_HOME, including for the default.
+        result = seed_profile_skills(profile.path, quiet=True)
+        if (not isinstance(result, dict) or "copied" not in result or
+                not (result.get("total_bundled", 0) or result.get("skipped_opt_out"))):
+            raise RuntimeError(f"immutable maintenance: bundled skills sync failed for {profile.name}")
+        token = set_hermes_home_override(profile.path)
+        try:
+            current, latest = check_config_version(raise_on_parse_error=True)
+            if current > latest:
+                raise RuntimeError(f"config for {profile.name} is newer than this release ({current} > {latest})")
+            if current < latest:
+                migrate_config(interactive=False, quiet=True)
+                after, latest = check_config_version(raise_on_parse_error=True)
+                if after != latest:
+                    raise RuntimeError(
+                        f"config migration incomplete for {profile.name} ({after} != {latest})"
+                    )
+        finally:
+            reset_hermes_home_override(token)
+    return True
+
+
 def _run_post_update_maintenance(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, had_desktop_app_before_update, node_failures, desktop_build_ok,
     pre_update_version,
