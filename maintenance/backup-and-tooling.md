@@ -5,6 +5,15 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
 
 ## Required behavior
 
+- New quick snapshots have version-2 manifests containing SHA-256 digests of captured
+  payloads. Retention verifies digests before counting a recovery copy. Restore verifies
+  every versioned payload before writing any destination. Legacy size-only manifests
+  remain readable with their original, weaker guarantee. Digests detect accidental
+  alteration, not an attacker changing both payload and manifest. This belongs to
+  `slice-13-snapshot-integrity`, comparable to upstream #106101. Retire the local
+  addition when a selected release preserves the same same-size-alteration and restore
+  rejection behavior. Verify `tests/hermes_cli/test_quick_snapshot_digests.py` alongside
+  the existing backup/retention suite. Rollback keeps the additive manifests readable.
 - Incomplete backup archives are reported as failures; complete archives survive
   retention; SQLite snapshot members are verified before a quick snapshot is trusted.
 - `scripts/schema_rehearsal.py` proves a copied legacy database opens, migrates, and keeps
@@ -34,6 +43,7 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `cron-profile-timezone-reanchor`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
   `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
+  `sqlite-close-guard-upstream`,
   `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
   their review fallback), `slice-14-request-update` (the parent-only native update request).
   `maintenance-contract` is owned by the root contract.
@@ -60,6 +70,27 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
   setting) has its own message on the snapshot path. Retire it if the two stop sharing
   one cross-process slot, which is the fix the message exists to compensate for.
+- `sqlite-close-guard-upstream`: exact upstream commits `87bb0d3827a0` and
+  `c451cd1bba80`, from merged
+  [PR #121433](https://github.com/NousResearch/hermes-agent/pull/121433), preserve
+  a closing writer's WAL generation until SQLite closes its connection and scope
+  torture-chamber deleted-sidecar observations to the episode that produced them.
+  Original upstream authorship is retained. Linux A/B reproduction proves that
+  a sibling close unlinks the old generation before the first change and leaves
+  it intact afterward. This does not establish the cause of the SHM-only hit in
+  nightly run `36321016936`: ordinary SQLite close can briefly expose its own
+  deleted SHM descriptor between unlink and close. Keep that diagnostic ambiguity
+  visible instead of suppressing observations or attributing them to data loss.
+  Upstream [issue #125591](https://github.com/NousResearch/hermes-agent/issues/125591)
+  records the standalone ordinary-close reproduction and comparison with #121433.
+  Verify the WAL lock guard, lifecycle, fcntl tolerance, deleted generation,
+  unlink-race suites and SQLite torture chamber with the canonical runner on Linux.
+  On 2026-09-27, the exact adopted code passed 28 focused regressions (7 platform
+  skips) and all 20 torture episodes on Linux, Python 3.11.16, SQLite 3.53.1,
+  default seed `20260923`, with file retries disabled.
+  Retire this backport when the selected upstream release contains both commits.
+  Roll back the two logical upstream patches together, preserving adjacent state
+  and backup fixes. This source adoption does not promote the installed runtime.
 - `vanished-entry-test-contract`: test-only, on top of the diagnostics rewrite in #54.
   Adds the one assertion #38 never made: `entry_vanished=` is recorded in the profile log.
   #38 is NOT uncovered -- `fc45821e1f` shipped four tests pinning the return value, the

@@ -264,7 +264,7 @@ def setup(env: dict[str, str]) -> None:
     run(['uv', 'sync', '--locked', '--python', PINS['python'], *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=ROOT / 'website', env=env)
-    run(['uv', 'venv', '--python', PINS['python'], str(STATE / 'docs-venv')], env=env)
+    run(['uv', 'venv', '--allow-existing', '--python', PINS['python'], str(STATE / 'docs-venv')], env=env)
     run(['uv', 'pip', 'install', '--python', str(docs_python()), 'ascii-guard==2.3.0', 'pyyaml==6.0.3'], env=env)
 
 

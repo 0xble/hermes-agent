@@ -11,6 +11,7 @@ Load this unit when changing `browser_upload`, Camofox tab actions, or the `brow
 - **Trigger bypass:** Camofox attaches to the first top-level `input[type=file]` before it consults `ref` or `selector`. When a trigger is named, the tool counts top-level file inputs through `/evaluate` first. The count walks open shadow roots, because Playwright's CSS locator pierces them. If there are any, it refuses rather than risk the wrong field. If the optional evaluate route is missing, it proceeds.
 - **Chooser wait:** the request leaves Camofox's own chooser wait (12 s) alone. Camofox aborts every tab action at 30 s, and its upload route polls for a mounted input for nearly the whole wait before consuming the chooser. A longer wait turns a successful attach into a 500.
 - **Result:** the result names the attached files and the route (`direct_input`, `panel_input`, `filechooser`), and tells the agent to snapshot, save and read back.
+- **Root mismatch:** when Camofox answers 400 with `file_not_found`, `upload_path_outside_root` or `uploads_dir_not_found`, Hermes staged into a directory the server does not serve from. The error names the staging directory and the `browser.camofox.uploads_dir` setting instead of a bare "400 Bad Request". A launcher that sets its own `CAMOFOX_UPLOADS_DIR` needs the same path in Hermes config.
 
 ## Provenance and patches
 

@@ -19,6 +19,7 @@ from hermes_cli import setup_platforms
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -1994,15 +1995,17 @@ class TelegramAdapter(BasePlatformAdapter):
             and self._rich_content_ok(content))
 
     async def _try_send_rich_draft(self, chat_id: str, draft_id: int, content: str, metadata: Optional[Dict[str, Any]]) -> bool:
-        """Emit one ``sendRichMessageDraft`` frame; True on success. Frames are ephemeral, so any failure
-        returns False and the caller renders the legacy draft; capability failures latch off."""
+        """Emit one rich draft. Non-flood failures permit legacy fallback; capability failures latch off."""
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id), "rich_message": self._rich_message_payload(content)}
         payload.update(self._thread_kwargs_for_draft(chat_id, metadata))
         try:
-            return bool(await _await_with_thread_deadline(
+            return bool(await call_with_flood_guard(self, chat_id, lambda: _await_with_thread_deadline(
                 self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
+                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)))
+        except FloodRefusal:
+            # A penalty is not a capability failure. Do not spend a legacy fallback call.
+            raise
         except Exception as exc:
             if self._is_rich_capability_error(exc):
                 self._rich_draft_disabled = True
@@ -4566,7 +4569,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return False
         try:
-            await self._bot.delete_message(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id))
+            await call_with_flood_guard(self, chat_id, lambda: self._bot.delete_message(
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id)))
             self._forget_status_message(chat_id, message_id)
             return True
         except Exception as e:
@@ -4586,9 +4590,12 @@ class TelegramAdapter(BasePlatformAdapter):
         content = _normalize_dollar_entities(content)
         if not self._bot:
             return SendResult(success=False, error="not_connected")
-        # Rich draft fast-path; any failure degrades to the plain draft below. Drafts have no message_id.
-        if self._should_attempt_rich_draft(content) and await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
-            return SendResult(success=True, message_id=None)
+        # Rich draft capability/format failures may use a plain draft. Flood refusals must not retry.
+        try:
+            if self._should_attempt_rich_draft(content) and await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
+                return SendResult(success=True, message_id=None)
+        except FloodRefusal as exc:
+            return _flood_cap_result(exc.retry_after)
         if not hasattr(self._bot, "send_message_draft"):
             return SendResult(success=False, error="api_unavailable")
         # Drafts share the regular-send UTF-16 length contract.
@@ -4608,10 +4615,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)
             try:
-                if await _await_with_thread_deadline(
-                    self._bot.send_message_draft(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False):
+                if await call_with_flood_guard(self, chat_id, lambda: _await_with_thread_deadline(
+                    self._bot.send_message_draft(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)):
                     return SendResult(success=True, message_id=None)
                 return SendResult(success=False, error="draft_rejected")
+            except FloodRefusal as exc:
+                return _flood_cap_result(exc.retry_after)
             except Exception as e:
                 # MarkdownV2 parse failure → retry once as plain text; anything else returns to the caller,
                 # which falls back to edit-based streaming for this response.
@@ -4636,8 +4645,8 @@ class TelegramAdapter(BasePlatformAdapter):
             raise RuntimeError("Not connected")
         message_thread_id = kwargs.get("message_thread_id")
         try:
-            return await _await_with_thread_deadline(
-                self._bot.send_message(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            return await call_with_flood_guard(self, kwargs.get("chat_id"), lambda: _await_with_thread_deadline(
+                self._bot.send_message(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
         except Exception as send_err:
             if (message_thread_id is not None and self._is_bad_request_error(send_err) and self._is_thread_not_found_error(send_err)):
                 logger.warning(
@@ -4646,8 +4655,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._prune_stale_dm_topic_binding(kwargs.get("chat_id"), message_thread_id)
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
-                return await _await_with_thread_deadline(
-                    self._bot.send_message(**retry_kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                return await call_with_flood_guard(self, kwargs.get("chat_id"), lambda: _await_with_thread_deadline(
+                    self._bot.send_message(**retry_kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
             raise
 
     async def _send_control_message(
@@ -4681,6 +4690,8 @@ class TelegramAdapter(BasePlatformAdapter):
             if on_sent is not None:
                 on_sent(msg)
             return SendResult(success=True, message_id=str(msg.message_id))
+        except FloodRefusal as exc:
+            return _flood_cap_result(exc.retry_after)
         except Exception as e:
             logger.warning("[%s] %s failed: %s", self.name, what, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
@@ -6142,60 +6153,6 @@ class TelegramAdapter(BasePlatformAdapter):
         budget = getattr(self, "_telegram_chat_outbound_slot_secs", _TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS)
         slot_until[str(normalize_telegram_chat_id(chat_id))] = (
             asyncio.get_running_loop().time() + max(0.0, budget))
-
-    # --- per-chat send ordering + flood cooldown (#114396) ---------------------------------------------
-    # Both keyed by the Bot-API-normalized chat id: the text path passes the raw chat_id while the media
-    # funnel's send_kwargs carry the normalized value. ``__dict__.setdefault``: tests build adapters via
-    # ``object.__new__()`` (no __init__).
-
-    @contextlib.asynccontextmanager
-    async def _chat_send_lock(self, chat_id: Any):
-        """FIFO per-chat gate around outgoing API calls, reentrant within one asyncio task (media paths
-        nest: send_voice → send_document, and ``super().send_*`` fallbacks reach ``send()``; a plain
-        ``asyncio.Lock`` re-acquired by its holder would wedge that chat's sends for good)."""
-        key = str(normalize_telegram_chat_id(chat_id))
-        locks: Dict[str, asyncio.Lock] = self.__dict__.setdefault("_telegram_chat_send_locks", {})
-        owners: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_chat_send_lock_owners", {})
-        task = asyncio.current_task()
-        if owners.get(key) is task:
-            yield
-            return
-        lock = locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            owners[key] = task
-            try:
-                yield
-            finally:
-                owners.pop(key, None)
-                if not getattr(lock, "_waiters", None):  # nobody queued: drop the entry (bounded dict)
-                    locks.pop(key, None)
-
-    def _record_send_flood_cooldown(self, chat_id: Any, wait: float) -> SendResult:
-        """A send refused with ``retry_after=wait`` arms a per-chat window during which ``send()`` fails
-        closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
-        unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
-        until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        key = str(normalize_telegram_chat_id(chat_id))
-        now = asyncio.get_running_loop().time()
-        until[key] = now + max(1.0, min(float(wait), 300.0))
-        # The window above is capped; keep the platform's own deadline so an aggregate result (an
-        # album whose images were refused on any route) can report the full penalty.
-        platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
-        platform[key] = max(platform.get(key, 0.0), now + float(wait))
-        return _flood_cap_result(wait)
-
-    def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
-        """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
-        until: Dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
-        key = str(normalize_telegram_chat_id(chat_id))
-        deadline = until.get(key)
-        if deadline is None:
-            return None
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining > 0:
-            return remaining
-        until.pop(key, None)
-        return None
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""

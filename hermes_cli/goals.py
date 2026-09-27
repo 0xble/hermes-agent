@@ -16,6 +16,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -478,6 +479,8 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
+    # Every durable mutation gets a new token, including pause/resume with equal values.
+    mutation_id: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -492,6 +495,7 @@ class GoalState:
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
+            mutation_id=str(data.get("mutation_id") or ""),
             status=data.get("status", "active"),
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
@@ -692,6 +696,7 @@ def save_goal(session_id: str, state: GoalState) -> None:
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
     try:
+        state.mutation_id = uuid.uuid4().hex
         db.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
@@ -716,6 +721,7 @@ def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[boo
         if state.status != "active" or not has_wait or state.waiting_since != waiting_since:
             return False, state
         state.clear_wait()
+        state.mutation_id = uuid.uuid4().hex
         conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
         return True, state
 
@@ -1419,6 +1425,12 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
+        snapshot = getattr(self, "_evaluation_snapshot", None)
+        if snapshot is not None:
+            from hermes_cli.goals_evaluation import assert_goal_snapshot
+            db, expected = snapshot
+            assert_goal_snapshot(self.session_id, expected, db)
+            return self._state
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1806,20 +1818,21 @@ class GoalManager:
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
-    def _state_changed_during_judge(self, before: Optional[GoalState]) -> Optional[Dict[str, Any]]:
-        """Cancel a stale post-judge write when another command changed the durable goal."""
-        if before is None:
-            return None
-        current = load_goal(self.session_id)
-        if current is None or current.to_json() == before.to_json():
-            return None
-        self._state = current
-        return _decision(
-            current.status, False, None, "interrupted", "goal changed while judge was running",
-            "Goal state changed while the completion judge was running; the current goal state was preserved.",
+    def evaluate_after_turn(
+        self, last_response: str, *, user_initiated: bool = True,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
+        active_delegations: int = 0,
+        evidence_session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate an isolated snapshot and atomically commit against its durable state."""
+        from hermes_cli.goals_evaluation import evaluate_goal_snapshot
+        return evaluate_goal_snapshot(
+            self, last_response, user_initiated=user_initiated,
+            background_processes=background_processes, active_delegations=active_delegations,
+            evidence_session_id=evidence_session_id,
         )
 
-    def evaluate_after_turn(
+    def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
@@ -1850,7 +1863,6 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
-        persisted_before_judge = load_goal(self.session_id)
         evidence = collect_goal_evidence(evidence_session_id or self.session_id, since=state.created_at)
         # Gates that just passed are deterministic evidence too; before this they only vetoed DONE.
         now = time.time()
@@ -1864,9 +1876,6 @@ class GoalManager:
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
             evidence=evidence or None,
         )
-        concurrent_decision = self._state_changed_during_judge(persisted_before_judge)
-        if concurrent_decision is not None:
-            return concurrent_decision
         state.last_verdict = verdict
         state.last_reason = reason
         # Parse failures reset on any usable reply INCLUDING transport errors, so a flaky network

@@ -177,6 +177,7 @@ class SessionLifecycleMixin:
                 else:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
+                    entry.resume_marker_token = uuid.uuid4().hex
                     entry.last_resume_marked_at = now  # freshness starts at discovery
                     promoted += 1
             entry.active_turn_token = None
@@ -204,16 +205,30 @@ class SessionLifecycleMixin:
                 return False
             entry.resume_pending = True
             entry.resume_reason = reason
+            entry.resume_marker_token = uuid.uuid4().hex
             entry.last_resume_marked_at = _now()
         return self._update_entry(session_key, _apply)
 
-    def clear_resume_pending(self, session_key: str) -> bool:
+    def get_resume_pending_marker(self, session_key: str) -> Optional[tuple]:
+        """Snapshot the current marker before an interrupt can yield to a successor."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or not entry.resume_pending:
+                return None
+            return (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+
+    def clear_resume_pending(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
         """Clear the resume-pending flag after a successful resumed turn; True if cleared."""
         def _apply(entry: SessionEntry):
             if not entry.resume_pending:
                 return False
+            if expected_marker is not None and expected_marker != (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            ):
+                return False
             entry.resume_pending = False
             entry.resume_reason = None
+            entry.resume_marker_token = None
             entry.last_resume_marked_at = None
         return self._update_entry(session_key, _apply)
 

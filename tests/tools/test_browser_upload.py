@@ -116,6 +116,29 @@ def test_named_trigger_refused_when_top_page_has_file_input(mock_post, monkeypat
 
 
 @patch("tools.browser_camofox.requests.post")
+def test_server_root_mismatch_names_staging_dir_and_setting(mock_post, monkeypatch, tmp_path):
+    import requests
+
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    root = tmp_path / "hermes-side-uploads"
+    monkeypatch.setenv("CAMOFOX_UPLOADS_DIR", str(root))
+    src = tmp_path / "logo.png"
+    src.write_bytes(b"x")
+    _open_tab(mock_post, "up6")
+
+    rejected = MagicMock()
+    rejected.status_code = 400
+    rejected.json.return_value = {"error": "file not found in upload directory", "code": "file_not_found"}
+    rejected.raise_for_status.side_effect = requests.HTTPError("400 Client Error: Bad Request", response=rejected)
+    mock_post.return_value = rejected
+    result = json.loads(camofox_upload([str(src)], task_id="up6"))
+
+    assert result.get("success") is False
+    assert str(root) in result["error"]
+    assert "browser.camofox.uploads_dir" in result["error"]
+
+
+@patch("tools.browser_camofox.requests.post")
 def test_nt_namespace_path_rejected_before_resolve(mock_post, monkeypatch, tmp_path):
     from pathlib import Path
     monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")

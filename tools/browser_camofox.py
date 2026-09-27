@@ -893,13 +893,38 @@ def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[st
                     f"The top-level page has {count} file input(s); Camofox would attach to the first "
                     "one instead of the named trigger. Omit ref/selector if that input is the target; "
                     "otherwise use another upload route.", success=False)
-        data = _post(_tab_path(session, "upload"), {"userId": session["user_id"], **body},
-                     timeout=max(_get_command_timeout(), _UPLOAD_HTTP_TIMEOUT_S))
+        try:
+            data = _post(_tab_path(session, "upload"), {"userId": session["user_id"], **body},
+                         timeout=max(_get_command_timeout(), _UPLOAD_HTTP_TIMEOUT_S))
+        except requests.HTTPError as exc:
+            if _upload_root_mismatch(exc):
+                # Hermes staged into a directory the server does not serve from; a bare 400 hides that.
+                return tool_error(
+                    f"Camofox rejected the staged file: it is not under the server's uploads directory. "
+                    f"Hermes staged into {uploads_dir}. Set browser.camofox.uploads_dir (or "
+                    f"CAMOFOX_UPLOADS_DIR) to the directory the Camofox server uses as its "
+                    f"CAMOFOX_UPLOADS_DIR.", success=False)
+            raise
         return json.dumps({"success": bool(data.get("ok", True)),
                            "attached": [Path(p).name for p in server_paths],
                            "via": data.get("via", ""),
                            "note": "Refs changed; take a fresh snapshot, then save and read back the result."})
     return _with_tab(task_id, "upload a file", run)
+
+
+_UPLOAD_ROOT_MISMATCH_CODES = frozenset({"file_not_found", "upload_path_outside_root", "uploads_dir_not_found"})
+
+
+def _upload_root_mismatch(exc: requests.HTTPError) -> bool:
+    """True when Camofox's 400 says the staged path is not in (or there is no) server uploads root."""
+    response = getattr(exc, "response", None)
+    if response is None or response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("code") in _UPLOAD_ROOT_MISMATCH_CODES
 
 
 def camofox_back(task_id: Optional[str] = None) -> str:

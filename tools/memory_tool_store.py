@@ -265,13 +265,46 @@ class MemoryStore:
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
                 return result
-            self._set_entries(target, result[0])
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
-            self._write_file(path, result[0])
+            from tools.memory_transactions import MemoryTransaction, observe_memory_transaction
+
+            after = ENTRY_DELIMITER.join(result[0])
+            if raw != after:
+                with observe_memory_transaction(MemoryTransaction(target, path, raw, after)):
+                    self._write_file(path, result[0])
+            self._set_entries(target, result[0])
             extra_fields = result[2] if len(result) > 2 else {}
             return self._success_response(target, result[1], **extra_fields)
+
+    def compare_and_restore(self, target: str, *, expected: str, replacement: str,
+                            metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Restore an exact trusted snapshot under the same lock as ordinary writes.
+
+        Native/plugin callers own snapshot authorization. This is not a model tool.
+        Observers may reject stale transaction metadata before any write. Prompt
+        snapshots remain frozen, as with ordinary memory mutations.
+        """
+        if target not in {"memory", "user"}:
+            return _error("Invalid memory target")
+        from tools.memory_transactions import MemoryTransaction, observe_memory_transaction
+
+        path = self._path_for(target)
+        with self._file_lock(path):
+            raw, readable = self._read_raw_checked(path)
+            if not readable:
+                return _read_failed_error(path)
+            if raw != expected:
+                return _error("Memory changed after the snapshot", error_code="stale_undo")
+            transaction = MemoryTransaction(target, path, raw, replacement, dict(metadata or {}))
+            with observe_memory_transaction(transaction):
+                try:
+                    atomic_write_text(path, replacement, tmp_prefix=".mem_", fsync_dir=True)
+                except OSError as exc:
+                    raise RuntimeError(f"Failed to write memory file {path}: {exc}") from exc
+            self._set_entries(target, self._parse_entries(replacement))
+            return self._success_response(target, "Snapshot restored.")
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
@@ -523,7 +556,7 @@ class MemoryStore:
         hold ``_file_lock`` (via ``_mutate``): a bare write from an earlier snapshot
         drops concurrent entries (#119668)."""
         try:
-            atomic_write_text(path, ENTRY_DELIMITER.join(entries), tmp_prefix=".mem_")
+            atomic_write_text(path, ENTRY_DELIMITER.join(entries), tmp_prefix=".mem_", fsync_dir=True)
         except OSError as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 

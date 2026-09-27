@@ -604,8 +604,10 @@ class GatewaySessionCommandsMixin:
                             session_id=session_id,
                             session_db=getattr(self._session_db, "_db", self._session_db))
         _seed_hygiene_system_prompt(tmp_agent, session_row)
-        # Real platform during construction (context engines bind correctly); afterwards a prompt
-        # rebuilt by compression is stamped as the provider-less fallback, stale for the next turn.
+        # Real platform during construction (context engines bind correctly); the stamp afterwards
+        # only marks this agent as no real surface. Since #104414 Platform is not a restore-identity
+        # field, so it no longer forces the next live turn to rebuild; the seed's retain flag is what
+        # keeps the reduced-toolset build out of the session row (#122822).
         tmp_agent.platform = _GATEWAY_HYGIENE_PLATFORM
         tmp_agent._print_fn = lambda *a, **kw: None
         # close() must not end the rotated session the gateway entry now points at.
@@ -873,7 +875,8 @@ class GatewaySessionCommandsMixin:
         reply = t("gateway.title.set_to", title=stored_title)
         if topic_lane:
             # An explicit request needs the Bot API result before we claim the visible name changed.
-            renamed = await self._rename_telegram_topic_explicit(source, session_id, sanitized)
+            renamed = await self._rename_telegram_topic_explicit(
+                source, session_id, sanitized, session_key=session_entry.session_key)
             if not renamed:
                 return reply + "\nTelegram topic rename failed; the session title was stored."
             if stored_title != sanitized:

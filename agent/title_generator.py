@@ -308,31 +308,43 @@ def title_upgrade_must_wait_for_turn(main_runtime: Optional[dict]) -> bool:
     try:
         cfg = _title_config()
         pinned_provider = str(cfg.get("provider") or "").strip().lower()
-        main_base_url = str((main_runtime or {}).get("base_url") or "").strip().rstrip("/")
-        if pinned_provider not in ("", "auto") and not _title_pin_may_share_endpoint(
+        main_base_url = _title_endpoint_identity((main_runtime or {}).get("base_url"), provider)
+        pinned_base_url = _title_endpoint_identity(
+            cfg.get("base_url"), provider if pinned_provider in ("", "auto", "main") else pinned_provider)
+        if pinned_provider not in ("", "auto", "main") and not _title_pin_may_share_endpoint(
                 pinned_provider, provider, main_base_url):
             return False
-        if _endpoint_declares_concurrent_requests(main_base_url):
+        if pinned_base_url and main_base_url and pinned_base_url != main_base_url:
             return False
+        return not _endpoint_declares_concurrent_requests(main_base_url)
     except Exception:
+        # Delaying a title is safer than racing an unresolved single-slot route.
         return True
-    pinned_base_url = str(cfg.get("base_url") or "").strip().rstrip("/")
-    return not pinned_base_url or pinned_base_url == main_base_url
+
+
+def _title_endpoint_identity(base_url: Any, provider: str = "") -> str:
+    """Use the auxiliary router's wire URL, then canonicalize equivalent spelling."""
+    from urllib.parse import urlparse
+    from agent.auxiliary_client import _LOCAL_SERVER_ALIASES, _to_openai_base_url
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    base = _to_openai_base_url(str(base_url or "").strip())
+    if base and provider in _LOCAL_SERVER_ALIASES and not urlparse(base).path.strip("/"):
+        base = base.rstrip("/") + "/v1"
+    return normalize_route_base_url(base)
 
 
 def _endpoint_declares_concurrent_requests(base_url: str) -> bool:
-    """A configured provider serving ``base_url`` declares ``capabilities.concurrent_requests: true``.
-
-    Keyed by endpoint, not route name: the slot count belongs to the server, and every route to it
-    (``custom``, ``custom:<name>``, a display-name pin) shares that one answer.
-    """
+    """A matching endpoint needs a literal true and no contradictory false."""
     if not base_url:
         return False
     from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
-    return any(
-        entry.get("base_url", "").strip().rstrip("/") == base_url
-        and (entry.get("capabilities") or {}).get("concurrent_requests") is True
-        for entry in get_compatible_custom_providers(load_config_readonly()))
+    declarations = [
+        (entry.get("capabilities") or {}).get("concurrent_requests")
+        for entry in get_compatible_custom_providers(load_config_readonly())
+        if _title_endpoint_identity(entry.get("base_url")) == base_url
+    ]
+    return any(value is True for value in declarations) and not any(value is False for value in declarations)
 
 
 def _is_self_hosted_provider(provider: str) -> bool:
@@ -362,7 +374,7 @@ def _title_pin_may_share_endpoint(pinned_provider: str, main_provider: str, main
     if custom_provider_aliases(pinned_provider) & custom_provider_aliases(main_provider):
         return True
     pdef = resolve_custom_provider(pinned_provider, get_compatible_custom_providers(load_config_readonly()))
-    return bool(pdef and main_base_url and pdef.base_url.strip().rstrip("/") == main_base_url)
+    return bool(pdef and main_base_url and _title_endpoint_identity(pdef.base_url) == main_base_url)
 
 
 def start_title_upgrade(upgrade: Optional[threading.Thread]) -> None:
