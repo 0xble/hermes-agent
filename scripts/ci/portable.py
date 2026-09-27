@@ -162,6 +162,10 @@ def environment(home: Path) -> dict[str, str]:
     })
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
+    # Hosted native jobs install rustup into checkout-owned state before the
+    # isolated HOME is created. Retain that exact toolchain, not runner config.
+    if (STATE / 'rustup').is_dir():
+        env['RUSTUP_HOME'] = str(STATE / 'rustup')
     env.update(git_environment(root=ROOT, base=env, config_path=home / 'gitconfig'))
     return env
 

@@ -138,6 +138,10 @@ class PortableGateTests(unittest.TestCase):
             }
             with patch.dict(os.environ, poisoned, clear=True), patch.object(ci, 'STATE', state):
                 env = ci.environment(state / 'isolated')
+                self.assertNotIn('RUSTUP_HOME', env)
+                (state / 'rustup').mkdir()
+                env_with_rustup = ci.environment(state / 'isolated-rust')
+                self.assertEqual(env_with_rustup['RUSTUP_HOME'], str(state / 'rustup'))
             for key in ('OPENAI_API_KEY', 'PYTEST_PLUGINS', 'HERMES_TEST_PATHS', 'HERMES_TEST_SLICE', 'NODE_OPTIONS'):
                 self.assertNotIn(key, env)
             self.assertEqual(env['HOME'], str(state / 'isolated'))
