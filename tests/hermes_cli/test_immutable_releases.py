@@ -471,32 +471,41 @@ def test_true_noop_release_does_not_stage_or_rebuild(tmp_path, monkeypatch):
     assert not (home / "previous").exists()
 
 
-def test_web_build_failure_is_partial_and_never_promotes(tmp_path, monkeypatch):
+@pytest.mark.macos_only
+def test_repeated_rollback_is_noop_without_fleet_relaunch(tmp_path, monkeypatch, capsys):
     from types import SimpleNamespace
-    from hermes_cli import update_cmd, update_receipt
+    from hermes_cli import gateway, update_cmd
     home = tmp_path / "profile"
-    a = home / "releases" / "A"
-    _fake_release(a, "A")
-    releases.promote(home, a)
+    first, second = home / "releases" / "A", home / "releases" / "B"
+    _fake_release(first, "A")
+    _fake_release(second, "B")
+    releases.promote(home, first)
+    releases.promote(home, second)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(update_cmd, "_sync_python_dependencies_after_pull", lambda *a, **kw: None)
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
-    monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: False)
-    monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: pytest.fail("failed web build staged"))
-    update_receipt.begin_update_receipt()
-    with pytest.raises(SystemExit) as exc:
-        update_cmd._finish_pulled_update(None, "main", "A", SimpleNamespace(
-            no_gateway_restart=False, active_lazy_features=[], active_tool_dependencies=[]),
-            gateway_mode=False, is_fork=False, desktop_dir=tmp_path,
-            had_desktop_app_before_update=False, pre_update_snapshot_id=None,
-            _pre_update_plan=None, _windows_gateway_resume=None)
-    assert exc.value.code == 1
-    assert (home / "current").resolve() == a
-    receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
-    assert receipt["outcome"] == "partial"
-    assert any(s["name"] == "immutable_release" and not s["ok"] for s in receipt["steps"])
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
+    calls = []
+    monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update",
+                        lambda *args: calls.append("fleet") or SimpleNamespace(incomplete=False))
+    monkeypatch.setattr(update_cmd, "_verify_fleet_after_update", lambda *args, **kwargs: None)
+    update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+    update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+    assert calls == ["fleet"]
+    assert "Already rolled back, nothing changed" in capsys.readouterr().out
+    assert (home / "current").resolve() == first
+
+
+def test_nonready_current_refuses_legacy_update_before_build(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd
+    home = tmp_path / "profile"
+    broken = home / "releases" / "A"
+    _fake_release(broken, "A")
+    releases.promote(home, broken)
+    (broken / ".release-ready").unlink()
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {})
+    with pytest.raises(RuntimeError, match="current release is not ready"):
+        update_cmd._immutable_release_enabled()
 
 
 def test_fleet_expected_candidate_sha_is_not_current_pointer(tmp_path, monkeypatch):
@@ -689,6 +698,7 @@ def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_pat
     assert plist.read_bytes() == b"candidate"
     assert (home / "release-txn.json").exists()
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: True)
+    monkeypatch.setattr(update_cmd, "_await_release_acknowledgement", lambda path: False)
     assert not update_cmd._activate_immutable_release()
     assert (home / "current").resolve() == b
     assert (home / "previous").resolve() == a

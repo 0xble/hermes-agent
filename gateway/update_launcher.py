@@ -117,7 +117,10 @@ def make_agent_update_handler(
             return {"accepted": False, "error": "no session route"}
         if is_managed():
             return {"accepted": False, "error": "managed installs cannot update here"}
-        hermes_cmd = resolve_hermes_bin()
+        try:
+            hermes_cmd = resolve_hermes_bin()
+        except (RuntimeError, OSError, ValueError) as exc:
+            return {"accepted": False, "error": str(exc)}
         if not hermes_cmd:
             return {"accepted": False, "error": "update requires a git checkout"}
         try:

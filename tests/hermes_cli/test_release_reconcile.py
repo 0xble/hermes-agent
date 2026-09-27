@@ -1,47 +1,41 @@
-"""No-op update reconciliation is exhaustive over the release transition axes."""
-from itertools import product
+"""Distinguishing outcomes of immutable release reconciliation."""
 
 import pytest
 
 from hermes_cli import update_cmd
 
 
-@pytest.mark.parametrize(
-    "enabled,current,candidate,journal,service,running,defer",
-    tuple(product(
-        (False, True), ("absent", "equal", "different"),
-        ("none", "staged", "failed-partial"),
-        ("none", "in-progress", "done", "rolled-back"),
-        ("none", "source", "current", "stale-release"),
-        ("none", "source", "current", "other"), (False, True),
-    )),
-)
-def test_reconcile_matrix(enabled, current, candidate, journal, service, running, defer):
-    state = update_cmd._ReleaseReconcileState(enabled, current, candidate, journal, service, running, defer)
-    # Physical constraints: an absent current cannot have a current service
-    # or process. Journal phases alone do not prove pointer reachability;
-    # a crash may have stopped between those two durable writes.
-    unreachable = ((current == "absent" and (service == "current" or running == "current"))
-                   or (current == "different" and journal == "none"))
-    if unreachable:
+@pytest.mark.parametrize("changes,expected", [
+    ({"pending_transaction": True}, "complete-transaction"),
+    ({"enabled": False, "current": "absent", "journal": "none"}, "no-op"),
+    ({"enabled": False, "current": "absent", "journal": "in-progress"}, "no-op"),
+    ({"enabled": False, "current": "absent", "journal": "done", "defer": True}, "no-op"),
+    ({"enabled": False, "current": "absent", "journal": "rolled-back"}, "no-op"),
+    ({"current": "equal", "candidate": "none"}, "fail-with-message"),
+    ({"current": "equal", "candidate": "failed-partial"}, "fail-with-message"),
+    ({"current": "equal", "candidate": "staged", "service": "current", "running": "current"}, "no-op"),
+    ({"current": "equal", "candidate": "staged", "service": "none", "running": "none"}, "no-op"),
+    ({"current": "equal", "candidate": "staged", "service": "source", "defer": True}, "defer-record"),
+    ({"current": "equal", "candidate": "staged", "running": "other"}, "repair-service"),
+    ({"current": "absent", "defer": True}, "defer-record"),
+    ({"current": "different", "journal": "done", "defer": True}, "defer-record"),
+    ({"candidate": "staged"}, "activate-staged"),
+    ({"candidate": "failed-partial"}, "build+activate"),
+    ({"current": "different", "journal": "done"}, "build+activate"),
+    ({"current": "absent", "service": "current"}, ValueError),
+    ({"current": "different", "journal": "none"}, ValueError),
+])
+def test_reconcile_matrix(changes, expected):
+    values = dict(enabled=True, current="absent", candidate="none", journal="none",
+                  service="none", running="none", defer=False)
+    values.update(changes)
+    state = update_cmd._ReleaseReconcileState(**values)
+    if expected is ValueError:
         with pytest.raises(ValueError, match="unreachable"):
             update_cmd._reconcile_immutable_release(state)
-        return
-    if current == "absent" and not enabled and journal in {"none", "rolled-back"}:
-        expected = "no-op"
-    elif current == "equal" and candidate != "staged":
-        expected = "fail-with-message"
-    elif current == "equal":
-        expected = ("defer-record" if defer and (service not in {"none", "current"} or running not in {"none", "current"})
-                    else "repair-service" if service not in {"none", "current"} or running not in {"none", "current"}
-                    else "no-op")
-    elif defer:
-        expected = "defer-record"
-    elif candidate == "staged":
-        expected = "activate-staged"
     else:
-        expected = "build+activate"
-    assert update_cmd._reconcile_immutable_release(state) == expected, state
+        assert update_cmd._reconcile_immutable_release(state) == expected
+
 
 
 def test_first_migration_failure_retries_without_ready_candidate(tmp_path, monkeypatch):

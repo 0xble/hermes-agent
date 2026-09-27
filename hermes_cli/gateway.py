@@ -4169,6 +4169,24 @@ def _respawn_storm_backoff() -> None:
         logger.debug("respawn-storm breaker check failed (non-fatal): %s", _be)
 
 
+async def _acknowledge_release_when_running(*, poll_seconds: float = 1.0) -> None:
+    """Observe running state for the gateway's lifetime without blocking its loop."""
+    if sys.platform != "darwin" or not os.environ.get("HERMES_SUPERVISED_CHILD"):
+        return
+    from gateway.status import read_runtime_status
+    from hermes_cli.immutable_releases import acknowledge_running_release
+    while True:
+        await asyncio.sleep(poll_seconds)
+        state = read_runtime_status() or {}
+        if state.get("pid") == os.getpid() and state.get("gateway_state") == "running":
+            try:
+                if await asyncio.to_thread(acknowledge_running_release, get_hermes_home(),
+                                           gateway_pid=os.getpid()):
+                    return
+            except (OSError, RuntimeError, ValueError):
+                logger.warning("Pending release reload could not be acknowledged", exc_info=True)
+
+
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
@@ -4230,24 +4248,6 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         # threads (in-flight cron jobs) can't delay a /restart by minutes.
         from gateway.run import _exit_after_graceful_shutdown
         _exit_after_graceful_shutdown(code)
-
-    async def _acknowledge_release_when_running() -> None:
-        # An osascript launchd job supervises an inner Python process. Only
-        # the live gateway (not its updater or deferred submit helper) may
-        # acknowledge after runtime startup has reached the running state.
-        if sys.platform != "darwin" or not os.environ.get("HERMES_SUPERVISED_CHILD"):
-            return
-        from gateway.status import read_runtime_status
-        from hermes_cli.immutable_releases import acknowledge_running_release
-        for _ in range(120):
-            await asyncio.sleep(1)
-            state = read_runtime_status() or {}
-            if state.get("pid") == os.getpid() and state.get("gateway_state") == "running":
-                try:
-                    acknowledge_running_release(get_hermes_home(), gateway_pid=os.getpid())
-                except (OSError, RuntimeError, ValueError):
-                    logger.warning("Pending release reload could not be acknowledged", exc_info=True)
-                return
 
     async def _run_with_release_ack() -> bool:
         watcher = asyncio.create_task(_acknowledge_release_when_running())

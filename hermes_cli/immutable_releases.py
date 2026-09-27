@@ -17,6 +17,7 @@ import subprocess
 import sys
 import uuid
 import re
+import shlex
 import tomllib
 import plistlib
 from dataclasses import dataclass
@@ -718,7 +719,12 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
             return False
         for process in processes:
             argv = process.cmdline()
-            if not ("gateway" in argv and "run" in argv and "hermes_cli.main" in argv):
+            # The wrapper embeds the command in its argv. Require the inner
+            # interpreter's entrypoint before applying the canonical parser,
+            # which also accepts a profile selector before `gateway run`.
+            from gateway.status import looks_like_gateway_command_line
+            if (argv[1:3] != ["-m", "hermes_cli.main"] or
+                    not looks_like_gateway_command_line(shlex.join(argv))):
                 continue
             executable = Path(process.exe()).resolve()
             expected_python = (intended_root / ".venv" / "bin" / "python" if

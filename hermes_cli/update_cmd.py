@@ -166,9 +166,31 @@ def _previous_release_sha(paths, previous: str | None) -> str | None:
 
 def _immutable_release_enabled(paths=None) -> bool:
     """One opt-in gate for fetched updates and no-pull reconciliation alike."""
-    from hermes_cli.immutable_releases import ReleasePaths, resolved_release
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer, resolved_release
     paths = paths or ReleasePaths.for_home(get_hermes_home())
+    current = read_pointer(paths.current)
+    if current is not None and current.parent == paths.releases.resolve() and not resolved_release(paths.home):
+        raise RuntimeError(f"current release is not ready: {current}; repair the pointer or artifact before updating")
     return bool(_updates_config().get("immutable_releases", False) or resolved_release(paths.home))
+
+
+def _await_release_acknowledgement(home: Path, *, timeout_seconds: float = 180.0) -> bool:
+    """Observe a single issued reload until the supervised gateway acknowledges it.
+
+    The caller is the detached updater, not the gateway's event loop. This never
+    submits a second reload. Tests can use a shorter bound via the argument.
+    """
+    from hermes_cli.immutable_releases import acknowledge_running_release
+    pending = home / "release-txn.json"
+    deadline = _time.monotonic() + timeout_seconds
+    while pending.exists():
+        if acknowledge_running_release(home) or not pending.exists():
+            return True
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return False
+        _time.sleep(min(0.5, remaining))
+    return True
 
 
 def _finish_pending_release_transaction(home: Path | None = None) -> dict | None:
@@ -238,9 +260,14 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                                       plist_path=plist, plist_body=plist_body,
                                       reload_callback=reload_callback)
         if result.get("reload_pending"):
-            _record_update_step("immutable_release", False,
-                                f"reload submitted but not acknowledged by launchd gateway: {candidate}")
-            return False
+            if _await_release_acknowledgement(home):
+                result = _finish_pending_release_transaction(home) or result
+            else:
+                _record_update_step("immutable_release", False,
+                                    f"reload issued, awaiting gateway acknowledgement: {candidate}; "
+                                    "inspect the launchd label and recorded plist; if no process starts, "
+                                    "repair the service explicitly under operator control")
+                return False
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
         from_sha = _previous_release_sha(paths, previous)
@@ -1409,24 +1436,22 @@ class _ReleaseReconcileState:
     pending_transaction: bool = False
 
 
-# Ordered state-table rows. * matches any value; the first matching row owns the
-# entire transition. The axes are normalized observations, not guesses from HEAD.
+# Ordered partial states. Each row names only the observations it constrains;
+# the first matching row owns the transition.
 _RELEASE_RECONCILE_TABLE = (
-    (("*", "*", "*", "*", "*", "*", "*", True), "complete-transaction"),
-    # Disabled legacy/reversed layouts never implicitly migrate or repair.
-    ((False, "absent", "*", "none", "*", "*", "*", False), "no-op"),
-    ((False, "absent", "*", "rolled-back", "*", "*", "*", False), "no-op"),
-    (("*", "equal", "none", "*", "*", "*", "*", False), "fail-with-message"),
-    (("*", "equal", "failed-partial", "*", "*", "*", "*", False), "fail-with-message"),
-    (("*", "equal", "*", "*", "none", "none", "*", False), "no-op"),
-    (("*", "equal", "*", "*", "current", "none", "*", False), "no-op"),
-    (("*", "equal", "*", "*", "none", "current", "*", False), "no-op"),
-    (("*", "equal", "*", "*", "current", "current", "*", False), "no-op"),
-    (("*", "equal", "*", "*", "*", "*", True, False), "defer-record"),
-    (("*", "equal", "*", "*", "*", "*", False, False), "repair-service"),
-    (("*", "*", "*", "*", "*", "*", True, False), "defer-record"),
-    (("*", "*", "staged", "*", "*", "*", False, False), "activate-staged"),
-    (("*", "*", "*", "*", "*", "*", False, False), "build+activate"),
+    ({"pending_transaction": True}, "complete-transaction"),
+    ({"enabled": False, "current": "absent"}, "no-op"),
+    ({"current": "equal", "candidate": "none"}, "fail-with-message"),
+    ({"current": "equal", "candidate": "failed-partial"}, "fail-with-message"),
+    ({"current": "equal", "service": "none", "running": "none"}, "no-op"),
+    ({"current": "equal", "service": "current", "running": "none"}, "no-op"),
+    ({"current": "equal", "service": "none", "running": "current"}, "no-op"),
+    ({"current": "equal", "service": "current", "running": "current"}, "no-op"),
+    ({"current": "equal", "defer": True}, "defer-record"),
+    ({"current": "equal", "defer": False}, "repair-service"),
+    ({"defer": True}, "defer-record"),
+    ({"candidate": "staged", "defer": False}, "activate-staged"),
+    ({"defer": False}, "build+activate"),
 )
 
 
@@ -1436,10 +1461,8 @@ def _reconcile_immutable_release(state: _ReleaseReconcileState) -> str:
             ((state.current == "absent" and (state.service == "current" or state.running == "current"))
              or (state.current == "different" and state.journal == "none"))):
         raise ValueError(f"unreachable immutable release state: {state}")
-    fields = tuple(_ReleaseReconcileState.__dataclass_fields__)
-    for pattern, action in _RELEASE_RECONCILE_TABLE:
-        constraints = dict(zip(fields, pattern, strict=True))
-        if all(want == "*" or want == getattr(state, name) for name, want in constraints.items()):
+    for constraints, action in _RELEASE_RECONCILE_TABLE:
+        if all(getattr(state, name) == want for name, want in constraints.items()):
             return action
     raise ValueError(f"unreachable immutable release state: {state}")
 
@@ -1907,27 +1930,10 @@ def _finish_pulled_update(
         _windows_gateway_resume=_windows_gateway_resume)
     node_failures = _update_node_dependencies()
     web_build_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-    # In a release layout these builds are prerequisites, not advisory UI work:
-    # restarting while current=A when HEAD=B would falsely report success on A.
-    from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha
-    release_paths = ReleasePaths.for_home(get_hermes_home())
-    current_release = read_pointer(release_paths.current)
-    release_layout = ((current_release is not None and current_release.parent == release_paths.releases.resolve())
-                      or (current_release is None and _updates_config().get("immutable_releases", False)))
-    if release_layout and (not web_build_ok or node_failures):
-        _record_update_step("immutable_release", False,
-                            f"prerequisite build failed: web={web_build_ok}, node={node_failures}")
-        if gateway_mode:
-            _write_gateway_update_exit_code(False)
-        _finalize_receipt("partial", "Immutable release prerequisite build failed: %s")
-        sys.exit(1)
-    # Freeze generated assets only after the build. A failed build cannot mark a
-    # potentially stale candidate ready for promotion.
-    if web_build_ok and not node_failures and not _activate_immutable_release(defer=opts.no_gateway_restart):
-        if gateway_mode:
-            _write_gateway_update_exit_code(False)
-        _finalize_receipt("partial", "Immutable release staging failed: %s")
-        sys.exit(1)
+    # Legacy post-swap work never activates a release. Immutable layouts are
+    # selected before the code swap; a non-ready current pointer is refused by
+    # _immutable_release_enabled rather than falling through to this path.
+
     desktop_build_ok = _rebuild_desktop_after_update(
         desktop_dir, had_desktop_app_before_update=had_desktop_app_before_update)
 
@@ -1974,8 +1980,7 @@ def _finish_pulled_update(
     _verify_fleet_after_update(
         _restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
         node_failures=node_failures, update_complete=update_complete,
-        expected_sha=release_paths.release(release_sha(_m().PROJECT_ROOT)).name if release_layout else None,
-        expected_root=release_paths.release(release_sha(_m().PROJECT_ROOT)) if release_layout else None)
+        expected_sha=None, expected_root=None)
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
@@ -2056,7 +2061,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if completed.exists():
                 last = json.loads(completed.read_text(encoding="utf-8"))
                 if last.get("operation") in {"rollback", "first-migration-rollback"}:
-                    before = Path(last["current_original"])
+                    message = "Already rolled back, nothing changed"
+                    print(message)
+                    _record_update_step("immutable_rollback", True, message)
+                    _finalize_receipt("success", "Release rollback already complete: %s")
+                    return
         source_layout = Path(current_target).parent != paths.releases.resolve()
         from hermes_cli.update_receipt import record_release_transition
         record_release_transition(

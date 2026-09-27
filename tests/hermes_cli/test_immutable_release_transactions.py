@@ -128,6 +128,13 @@ def _release(path: Path, *, real: bool = False) -> None:
     python = path / ".venv/bin/python"
     if real:
         venv.EnvBuilder(with_pip=False).create(path / ".venv")
+        package = path / "hermes_cli"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "main.py").write_text(
+            "import os,pathlib,time\n"
+            "pathlib.Path(os.environ['S2_OUTPUT']).write_text(os.getcwd())\n"
+            "time.sleep(90)\n")
     else:
         python.parent.mkdir(parents=True)
         python.write_text("#!/bin/sh\nexit 0\n")
@@ -136,11 +143,19 @@ def _release(path: Path, *, real: bool = False) -> None:
     (path / ".hermes_build_sha").write_text(path.name + "\n")
 
 
-def _source(source: Path) -> str:
+def _source(source: Path, *, real: bool = False) -> str:
     source.mkdir()
     (source / "version.txt").write_text("source\n")
+    if real:
+        package = source / "hermes_cli"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "main.py").write_text(
+            "import os,pathlib,time\n"
+            "pathlib.Path(os.environ['S2_OUTPUT']).write_text(os.getcwd())\n"
+            "time.sleep(90)\n")
     subprocess.run(["git", "init", "-q", str(source)], check=True)
-    subprocess.run(["git", "-C", str(source), "add", "version.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "version.txt", *(["hermes_cli"] if real else [])], check=True)
     subprocess.run(["git", "-C", str(source), "-c", "user.name=Probe",
                     "-c", "user.email=probe@example.test", "-c", "commit.gpgsign=false",
                     "commit", "-qm", "fixture"], check=True)
@@ -150,9 +165,10 @@ def _source(source: Path) -> str:
 def _definition(plist: Path, home: Path, root: Path, *, real: bool) -> bytes:
     python = root / ".venv/bin/python" if real else Path(sys.executable)
     data = {"Label": plist.stem, "WorkingDirectory": str(root),
-            "ProgramArguments": [str(python), "-c",
-                                 "import os,pathlib,time;pathlib.Path(os.environ['S2_OUTPUT']).write_text(os.getcwd());time.sleep(90)",
-                                 "hermes_cli.main", "gateway", "run"],
+            "ProgramArguments": ([str(python), "-m", "hermes_cli.main", "gateway", "run"] if real else
+                                 [str(python), "-c",
+                                  "import os,pathlib,time;pathlib.Path(os.environ['S2_OUTPUT']).write_text(os.getcwd());time.sleep(90)",
+                                  "hermes_cli.main", "gateway", "run"]),
             "EnvironmentVariables": {"HERMES_HOME": str(home), "S2_OUTPUT": str(home / "observed")},
             "RunAtLoad": True, "KeepAlive": False}
     return plistlib.dumps(data)
@@ -186,7 +202,7 @@ def _fixture(tmp_path: Path, scenario: str, *, real: bool = False):
     a, b = (home / "releases" / name for name in ("A", "B"))
     _release(a, real=real)
     _release(b, real=real)
-    source_sha = _source(source)
+    source_sha = _source(source, real=real)
     if real:
         venv.EnvBuilder(with_pip=False).create(source / ".venv")
     label = f"ai.hermes.s2crash.{uuid.uuid4().hex}" if real else "ai.hermes.disposable"
@@ -584,7 +600,67 @@ def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
 
 
 @pytest.mark.macos_only
-@pytest.mark.parametrize("wrong", ["release", "pid"])
+@pytest.mark.spawns_gateway_lookalike
+def test_updater_waits_for_deferred_gateway_ack_without_second_reload(tmp_path, monkeypatch):
+    import threading
+    from hermes_cli import gateway_launchd, update_cmd
+
+    from hermes_cli import gateway as gateway_cli, update_receipt
+    home, source, plist, _, candidate, _, _, intended = _fixture(tmp_path, "promote", real=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
+    monkeypatch.setattr(releases, "release_sha", lambda _: "B")
+    monkeypatch.setattr(releases, "stage_release", lambda *args, **kwargs: (candidate, "existing"))
+    monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway_cli, "generate_launchd_plist", lambda **kwargs: intended.decode())
+    calls = []
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
+                        lambda path: calls.append(path) or "deferred")
+    processes = []
+    def launch_gateway():
+        env = dict(os.environ, S2_OUTPUT=str(home / "observed"))
+        env.pop("PYTHONPATH", None)
+        processes.append(subprocess.Popen(
+            [str(candidate / ".venv/bin/python"), "-m", "hermes_cli.main", "gateway", "run"],
+            cwd=candidate, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid",
+                        lambda _: processes[0].pid if processes else None)
+    wait = update_cmd._await_release_acknowledgement
+    monkeypatch.setattr(update_cmd, "_await_release_acknowledgement",
+                        lambda path: wait(path, timeout_seconds=4))
+    timer = threading.Timer(0.1, launch_gateway)
+    timer.start()
+    try:
+        update_receipt.begin_update_receipt()
+        assert update_cmd._activate_immutable_release(sha="B", source=source)
+        receipt = update_receipt.finalize_update_receipt("success")
+        assert json.loads(receipt.read_text())["outcome"] == "success"
+        assert not (home / "release-txn.json").exists()
+        assert calls == [plist]
+    finally:
+        timer.join()
+        for process in processes:
+            process.terminate()
+            process.wait(timeout=5)
+
+
+@pytest.mark.macos_only
+def test_updater_ack_timeout_preserves_pending_without_new_reload(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd
+    home, _, plist, _, candidate, _, _, intended = _fixture(tmp_path, "promote")
+    calls = []
+    pending = releases.activate_release(home, candidate, plist_path=plist, plist_body=intended,
+                                        reload_callback=lambda: calls.append(1) or "deferred")
+    assert pending["reload_pending"]
+    assert not update_cmd._await_release_acknowledgement(home, timeout_seconds=0)
+    assert (home / "release-txn.json").exists()
+    assert calls == [1]
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("wrong", ["release", "pid", "wrapper"])
 def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong):
     import psutil
     from hermes_cli import gateway_launchd
@@ -595,9 +671,11 @@ def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong)
     monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _: 31415)
     gateway = SimpleNamespace(
         pid=31416 if wrong == "pid" else 31415,
-        cmdline=lambda: ["hermes_cli.main", "gateway", "run"],
-        exe=lambda: str((b if wrong == "pid" else home / "releases/A") / ".venv/bin/python"),
-        cwd=lambda: str(b if wrong == "pid" else home / "releases/A"),
+        cmdline=lambda: (["python", "-m", "hermes_cli.stderr_timestamp", "--", "python",
+                          "-m", "hermes_cli.main", "gateway", "run"] if wrong == "wrapper" else
+                         ["python", "-m", "hermes_cli.main", "gateway", "run"]),
+        exe=lambda: str((home / "releases/A" if wrong == "release" else b) / ".venv/bin/python"),
+        cwd=lambda: str(home / "releases/A" if wrong == "release" else b),
         environ=lambda: {}, children=lambda **_: [])
     monkeypatch.setattr(psutil, "Process", lambda _: gateway)
     assert not releases.acknowledge_running_release(home)

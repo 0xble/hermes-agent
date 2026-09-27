@@ -1315,7 +1315,10 @@ class GatewaySlashCommandsMixin(
                 return t("gateway.update.platform_not_messaging")
         if is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
-        hermes_cmd = _resolve_update_hermes_bin(_hermes_home)
+        try:
+            hermes_cmd = _resolve_update_hermes_bin(_hermes_home)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return f"✗ {exc}"
         if not hermes_cmd:
             return t("gateway.update.not_git_repo")
         pending = {

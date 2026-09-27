@@ -92,6 +92,16 @@ class TestHandleUpdateCommand:
 
 
     @pytest.mark.asyncio
+    async def test_unreadable_release_layout_returns_guidance(self):
+        runner = _make_runner()
+        event = _make_event()
+        with patch("hermes_cli.config.is_managed", return_value=False), \
+             patch("gateway.run._resolve_update_hermes_bin",
+                   side_effect=RuntimeError("repair release-layout.json and retry")):
+            result = await runner._handle_update_command(event)
+        assert "repair release-layout.json and retry" in result
+
+    @pytest.mark.asyncio
     async def test_resolve_hermes_bin_module_argv(self):
         """_resolve_hermes_bin uses the running interpreter's module argv when hermes_cli is
         importable, even when PATH also offers a ``hermes`` binary (#111569: a PATH-first
