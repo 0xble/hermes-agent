@@ -58,16 +58,29 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
 
 
 def fast_mode_unprovisioned(api_error: Any, api_kwargs: Any) -> bool:
-    """True for a 429 on a ``speed: "fast"`` request whose fast-mode limit header is 0. The
-    organization has no fast capacity for the model, so waiting or rotating keys cannot help."""
+    """True for a 429 on a ``speed: "fast"`` request that can never succeed at fast speed: the
+    fast-mode limit header is 0 (no fast capacity for the model), or the body is Anthropic's
+    usage-credit refusal (the account has no credits for fast mode). Proxies may drop the limit
+    headers but relay the body, so both are checked. Waiting or rotating keys cannot help."""
     if getattr(api_error, "status_code", None) != 429 or not isinstance(api_kwargs, dict):
         return False
     if (api_kwargs.get("extra_body") or {}).get("speed") != "fast":
         return False
+    if _fast_mode_credit_refusal(api_error):
+        return True
     headers = getattr(getattr(api_error, "response", None), "headers", None)
     if headers is None:
         return False
     return any(str(headers.get(name, "")).strip() == "0" for name in _FAST_LIMIT_HEADERS)
+
+
+def _fast_mode_credit_refusal(api_error: Any) -> bool:
+    """Anthropic's "Usage credits are required for fast mode." A genuine rate limit never
+    mentions fast mode, so this cannot swallow one."""
+    body = getattr(api_error, "body", None)
+    message = ((body.get("error") or {}).get("message") if isinstance(body, dict) else None) or str(api_error)
+    message = str(message).lower()
+    return "fast mode" in message and ("usage credits" in message or "credits are required" in message)
 
 
 def mark_fast_mode_unavailable(agent: Any) -> bool:
