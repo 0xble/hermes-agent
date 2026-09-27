@@ -543,12 +543,21 @@ def test_no_gateway_restart_pending_txn_has_no_launchctl_or_pointer_writes(tmp_p
               releases.read_pointer(home / "current"), releases.read_pointer(home / "previous"))
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *_: SimpleNamespace(no_gateway_restart=True))
+    real_run = subprocess.run
+    launchctl_calls = []
+    def refuse_launchctl(args, *positional, **keywords):
+        if isinstance(args, (list, tuple)) and args and args[0] == "launchctl":
+            launchctl_calls.append(args)
+            raise AssertionError("launchctl called by restart-prohibited update")
+        return real_run(args, *positional, **keywords)
     with (patch.object(update_cmd, "_finish_pending_release_transaction", side_effect=AssertionError("replayed")),
           patch.object(update_cmd, "_require_immutable_launchd", side_effect=AssertionError("service touched")),
           patch.object(update_cmd, "_finalize_receipt"),
+          patch.object(subprocess, "run", side_effect=refuse_launchctl),
           patch.object(releases, "acknowledge_running_release", side_effect=AssertionError("launchctl queried")),
           pytest.raises(SystemExit) as exit_info):
         update_cmd._cmd_update_impl(SimpleNamespace(rollback=False, no_gateway_restart=True), False)
     assert exit_info.value.code == 1
+    assert not launchctl_calls
     assert before == (txn.read_bytes(), plist.read_bytes(),
                       releases.read_pointer(home / "current"), releases.read_pointer(home / "previous"))
