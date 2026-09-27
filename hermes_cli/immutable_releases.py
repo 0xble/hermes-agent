@@ -289,7 +289,8 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     keep.update(p.resolve() for p in extra_pins)
     keep.update(_live_process_pins(paths.home))
     keep.update(_receipt_pins(paths.home))
-    keep.update(p.resolve() for p in releases[:rollback_count])
+    current_previous = {p.resolve() for p in (read_pointer(paths.current), read_pointer(paths.previous)) if p}
+    keep.update(p.resolve() for p in [p for p in releases if p.resolve() not in current_previous][:rollback_count])
     removed = []
     for release in releases:
         if release.resolve() in keep:

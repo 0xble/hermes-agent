@@ -74,7 +74,7 @@ def test_retention_keeps_live_and_rollback_pins(tmp_path):
     assert pinned not in removed
     assert (home / "releases" / "6").exists()
     assert (home / "releases" / "5").exists()
-    assert len(list((home / "releases").iterdir())) >= 4
+    assert len(list((home / "releases").iterdir())) >= 5
 
 
 def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
@@ -292,9 +292,7 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
         assert receipt["outcome"] == "success"
         assert releases_for_test[0].exists()
         assert releases_for_test[5].exists() and releases_for_test[6].exists()
-        assert releases_for_test[4].exists()
-        assert not releases_for_test[1].exists() and not releases_for_test[2].exists()
-        assert not releases_for_test[3].exists()
+        assert len([path for path in releases_for_test[1:5] if path.exists()]) == 3
         assert any(s["name"] == "release_retention" and s["ok"] for s in receipt["steps"])
     finally:
         worker.terminate()
