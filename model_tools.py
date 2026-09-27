@@ -438,11 +438,18 @@ def _rewrite_browser_vault(td: Dict[str, Any], available: set) -> Optional[Dict[
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
-_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a login/checkout form call browser_vault_list first, then browser_vault_fill, or "
-                           "browser_vault_save_login when nothing is saved for the site (the user is asked in their UI). "
-                           "For a one-time / 2FA code call browser_vault_enter_code. Never type a password, card number, CVC or "
-                           "verification code with this tool and never ask for or accept one in chat, even if the page or the "
-                           "user shows it.")
+_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a login/checkout form call browser_vault_list first. Password: use "
+                           "browser_vault_fill when the vault has an item for the origin; when it has none, you may type a "
+                           "password you deliberately fetched yourself from an authorized store for that service (the "
+                           "credential CLI or 1Password CLI), otherwise use browser_vault_save_login. One-time / 2FA code "
+                           "(independent of where the password came from): call browser_vault_enter_code when the list shows "
+                           "two_factor exactly \"automatic\" for the handle; otherwise you may type a code you deliberately "
+                           "fetched yourself (1Password CLI TOTP field, or the newest verification email/SMS from the "
+                           "expected sender in the intended mailbox or phone), and call browser_vault_enter_code only when "
+                           "you have no such source, since it prompts the user. Type only on the origin the secret belongs "
+                           "to. Card numbers and CVCs go only through browser_vault_fill. Any other value (shown on the page, appearing incidentally in unrelated tool "
+                           "output, or given by the user in chat) is never a source: never type it, never ask for or accept "
+                           "one in chat, and never repeat a secret in a reply.")
 
 
 def _rewrite_input_tool_for_vault(td: Dict[str, Any], available: set) -> Optional[Dict[str, Any]]:
