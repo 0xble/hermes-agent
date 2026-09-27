@@ -521,6 +521,7 @@ class SessionEntry:
     # by a parallel counter on this entry.
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
+    resume_marker_token: Optional[str] = None
     last_resume_marked_at: Optional[datetime] = None
     # Durable marker of the executing turn; CAS-cleared on normal unwind, left behind by
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
@@ -539,7 +540,7 @@ class SessionEntry:
     _PLAIN_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
-        "expiry_finalized", "suspended", "resume_pending", "resume_reason",
+        "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",

@@ -62,3 +62,23 @@ Keep changes here narrow until the replacement is qualified. Verify with
 `hermes plugins validate plugins/canonical-skill-guard`. Retire this identity by
 deleting the plugin once the merged profile guard is installed, enabled, and
 verified live.
+
+## Native Memory Transactions
+
+Fork patch identity: `memory-transaction-observers`. The native MemoryStore emits
+profile-scoped before/after transaction snapshots while holding its target file
+lock. Optional observers can prepare durable receipts before the write and
+complete them after it. Preparation failures prevent mutation. Native
+compare-and-restore checks exact expected bytes under that same lock. Neither
+operation changes the frozen prompt snapshot or exposes snapshots to model tools.
+
+The optional journal remains in agents. Version 0.2 requires this API, so install
+it only after the managed runtime includes the core change. Legacy snapshots and
+ambiguous commit receipts cannot authorize undo. Upstream contract discussion:
+[#105397](https://github.com/NousResearch/hermes-agent/issues/105397).
+Retire the local primitive when an accepted upstream version supplies equivalent
+locked transaction observation and compare-and-restore semantics.
+
+Verification: `scripts/run_tests.sh tests/tools/test_memory_transactions.py
+tests/tools/test_memory_tool.py`. Roll back core and its dependent journal version
+together. Preserve journal history and memory files across code rollback.

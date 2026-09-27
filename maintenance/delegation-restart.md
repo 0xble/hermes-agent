@@ -103,6 +103,10 @@ or how an interrupted child reports why it stopped.
 
 ## Verification
 
+Boot enumeration streams durable rows until the eligible-result limit is reached.
+Older batch, partial, claimed, empty-goal, or unroutable rows cannot starve later
+eligible work. Enumeration remains read-only, with the existing claim at admission.
+
 `scripts/run_tests.sh tests/gateway/test_restart_after_turn.py
 tests/gateway/test_restart_drain.py tests/gateway/test_cron_active_work_drain.py
 tests/gateway/test_drain_active_work_report.py

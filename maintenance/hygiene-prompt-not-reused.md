@@ -25,13 +25,26 @@ Upstream [#124158](https://github.com/NousResearch/hermes-agent/pull/124158) and
 `hermes sessions repair-prompts` for historical damage. Track them as native
 replacements, with release adoption and historical repair verified separately.
 
+The fork adopts both merged implementations: detached hygiene and manual compression
+retain the exact seeded prompt and tool pin, while normal compaction still refreshes.
+The repair command defaults to reporting. Automatic application needs positive
+`skill_manage` pin evidence and skips missing, malformed, or memory-only pins.
+Explicit session selection retains upstream's documented override. The fork additionally
+compares the scanned prompt and pin atomically before clearing, preserving live replacements.
+This conditional repair is proposed upstream in
+[PR #125569](https://github.com/NousResearch/hermes-agent/pull/125569).
+Source adoption does not assert that any production historical row has been repaired.
+
 ## Verification
 
 - `tests/agent/test_system_prompt_restore.py::TestSurfaceSwitch::test_prompt_left_by_gateway_hygiene_compaction_is_rebuilt`
+- `tests/gateway/test_hygiene_compaction_keeps_seeded_prompt.py`
+- `tests/hermes_cli/test_sessions_repair_prompts.py`
+- `tests/hermes_cli/test_sessions_repair_prompt_race.py`
 - Live: after a hygiene compaction, the next turn logs `stale runtime identity` rather than
   `switched surface gateway_hygiene -> <platform>`.
 
 ## Retirement
 
-Drop this patch when upstream stops persisting a hygiene-agent prompt at the compaction
-boundary or treats it as stale on restore.
+Drop the restore guard only after upstream prevention and historical repair have both
+been verified on the selected release. A prevention fix alone does not repair old rows.

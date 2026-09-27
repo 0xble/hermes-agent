@@ -36,6 +36,19 @@ def test_resolve_restart_exit_wait_budget_covers_both_phases():
     assert resolve_restart_exit_wait_budget("bad", "bad", cron_drain_timeout=0, headroom="x") == resolve_systemd_timeout_stop_sec(0, 0)
 
 
+def test_infinite_restart_budgets_remain_observable():
+    import math
+    from hermes_cli.update_cmd_drain_report import format_drain_report
+
+    for kwargs in ({"drain_timeout": math.inf}, {"cron_drain_timeout": math.inf},
+                   {"after_turn_timeout": math.inf}, {"delegation_timeout": math.inf}):
+        options = dict(drain_timeout=0, after_turn_timeout=0, cron_drain_timeout=0)
+        options.update(kwargs)
+        budget = resolve_restart_exit_wait_budget(**options)
+        assert math.isinf(budget)
+        assert "infs left" in format_drain_report([], remaining_s=budget)
+
+
 def test_load_restart_after_turn_timeout_preserves_zero(tmp_path, monkeypatch):
     """Config/env ``0`` must disable after-turn wait, not fall back to default."""
     import gateway.run as gateway_run

@@ -136,7 +136,7 @@ def test_passing_gate_is_shown_to_judge_as_evidence(hermes_home, monkeypatch):
     sid = "evidence-gate"
     mgr = GoalManager(session_id=sid)
     mgr.set("ship it")
-    mgr.state.gates.append(goals.GoalGate(command="true"))
+    mgr.add_gate("true")
     prompts = _capture_prompts(monkeypatch, ['{"verdict":"done","reason":"gate passed"}'])
 
     with patch.object(goals, "run_gate", return_value=(True, 0, "all 4 checks green")):

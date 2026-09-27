@@ -486,6 +486,15 @@ class GatewayAgentCacheMixin:
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
             return
+        from gateway.run import _INTERRUPT_REASON_STOP
+        stop_marker = None
+        if interrupt_reason == _INTERRUPT_REASON_STOP:
+            try:
+                # Capture before the first await. The immutable marker includes the
+                # session identity, so a delayed stop cannot clear a newer recovery.
+                stop_marker = self.session_store.get_resume_pending_marker(session_key)
+            except Exception:
+                logger.warning("Could not read restart marker before /stop for %s", session_key, exc_info=True)
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
@@ -554,6 +563,12 @@ class GatewayAgentCacheMixin:
             # Guarded release: a message that arrived during the awaits above may already run as
             # the successor generation — the displaced /stop tail must not wipe its slot.
             self._drop_turn_slot(session_key, run_generation=_generation_at_interrupt)
+
+        if stop_marker is not None:
+            try:
+                await self.async_session_store.clear_resume_pending(session_key, expected_marker=stop_marker)
+            except Exception:
+                logger.warning("Could not persist restart marker clear after /stop for %s", session_key, exc_info=True)
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard
