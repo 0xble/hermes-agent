@@ -144,6 +144,13 @@ def _activate_immutable_release() -> bool:
             from hermes_cli import gateway
             if not gateway.refresh_launchd_plist_if_needed() or not gateway.launchd_plist_is_current():
                 raise RuntimeError("release pointer switched but launchd definition did not reload")
+        from hermes_cli.update_receipt import record_release_transition
+        previous = result["previous"]
+        record_release_transition(
+            from_sha=(release_sha(Path(previous)) if first and previous else Path(previous).name if previous else None),
+            to_sha=sha, from_path=previous, to_path=str(candidate),
+            kind="migration" if first else "promotion",
+        )
         _record_update_step("immutable_release", True,
                             f"{action}: from={result['previous']} to={result['current']} sha={sha} migration={first}")
         return True
@@ -1618,6 +1625,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if current_target is None:
             raise RuntimeError("rollback produced no current target")
         source_layout = Path(current_target).parent != ReleasePaths.for_home(home).releases.resolve()
+        from hermes_cli.update_receipt import record_release_transition
+        record_release_transition(
+            from_sha=before.name, to_sha=str(result.get("source_sha") or Path(current_target).name),
+            from_path=str(before), to_path=current_target,
+            kind="migration_reversal" if source_layout else "rollback",
+        )
         _record_update_step("immutable_rollback", True,
                             f"from={before} to={result['current']} from_sha={before.name} "
                             f"to_sha={result.get('source_sha') or Path(current_target).name}")

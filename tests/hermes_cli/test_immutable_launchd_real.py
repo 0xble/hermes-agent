@@ -27,14 +27,26 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: label)
     monkeypatch.setattr(gateway_launchd, "get_launchd_label", lambda: label)
 
+    source = tmp_path / "source-revisions"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    revisions = {}
     for name in ("A", "B"):
-        release = home / "releases" / name
+        (source / "version.txt").write_text(name, encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "version.txt"], check=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.name=S2", "-c", "user.email=s2@example.test",
+                        "commit", "-qm", name], check=True)
+        revisions[name] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    sha_a, sha_b = revisions["A"], revisions["B"]
+    for name, sha in revisions.items():
+        release = home / "releases" / sha
         release.mkdir(parents=True)
         venv.EnvBuilder(with_pip=False).create(release / ".venv")
         package = release / "hermes_cli"
         package.mkdir()
         (package / "__init__.py").write_text(f"RELEASE = '{name}'\n")
-        (release / ".release-ready").write_text(name + "\n", encoding="utf-8")
+        (package / "main.py").write_text("# release identity root for fleet probe\n")
+        (release / ".release-ready").write_text(sha + "\n", encoding="utf-8")
         (release / "probe.py").write_text(
             "import hermes_cli, json, os, pathlib, sys, time\n"
             "p=pathlib.Path(os.environ['S2_PROBE_OUTPUT'])\n"
@@ -43,7 +55,7 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
             "'release':hermes_cli.RELEASE}))\n"
             "time.sleep(120)\n"
         )
-    promote(home, home / "releases" / "A")
+    promote(home, home / "releases" / sha_a)
     plist = plistlib.loads(gateway.generate_launchd_plist().encode())
     assert plist["Label"] == label
     assert plist["WorkingDirectory"] == str(home / "current")
@@ -73,7 +85,7 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
                     pass
                 else:
                     if result["release"] == name and result["pid"] != old_pid:
-                        root = home / "releases" / name
+                        root = home / "releases" / (sha_a if name == "A" else sha_b)
                         for key in ("exe", "cwd", "module"):
                             assert Path(result[key]).resolve().is_relative_to(root)
                         return result
@@ -84,11 +96,61 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True, timeout=15)
         a = observed("A")
-        promote(home, home / "releases" / "B")
+        promote(home, home / "releases" / sha_b)
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         b = observed("B", a["pid"])
         assert b["pid"] != a["pid"]
-        assert (home / "current").resolve() == home / "releases" / "B"
+        assert (home / "current").resolve() == home / "releases" / sha_b
+        # Exercise the updater's real fleet restart + verification + receipt path.
+        # Discover ONLY this throwaway label; the account's ai.hermes.gateway job
+        # is neither enumerated nor eligible for any restart/kill helper.
+        from types import SimpleNamespace
+        from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+        monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: path)
+        monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [label])
+        monkeypatch.setattr(gateway, "legacy_launchd_labels_for_install", lambda **kw: [])
+        monkeypatch.setattr(gateway, "_launchd_domain", lambda: domain)
+        monkeypatch.setattr(gateway, "find_gateway_pids", lambda **kw: [])
+        monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda **kw: [])
+        monkeypatch.setattr(gateway, "_wait_for_api_server_port_free", lambda: None)
+        monkeypatch.setattr(update_cmd_fleet, "_restart_systemd_gateway_units", lambda *args: None)
+        monkeypatch.setattr(update_cmd_fleet, "_restart_manual_gateways", lambda *args: None)
+        monkeypatch.setattr(update_cmd_fleet, "_force_kill_stuck_gateways", lambda *args: None)
+        monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+        monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *args, **kw: None)
+        monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *args: [])
+        monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *args: True)
+        monkeypatch.setattr(update_receipt, "_profile_homes", lambda: [("default", home)])
+        def real_process_socket_identity(_home):
+            import psutil
+            try:
+                row = json.loads(output.read_text(encoding="utf-8"))
+                process = psutil.Process(row["pid"])
+                root = Path(row["cwd"]).resolve()
+                if not process.is_running() or Path(process.cwd()).resolve() != root:
+                    return None
+                return row["pid"], {"code_sha": root.name}
+            except (ValueError, OSError, psutil.Error):
+                return None
+        monkeypatch.setattr(update_receipt, "_socket_identity", real_process_socket_identity)
+        monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+        rolled_back = observed("A", b["pid"])
+        assert rolled_back["pid"] != b["pid"]
+        assert (home / "current").resolve() == home / "releases" / sha_a
+        assert (home / "previous").resolve() == home / "releases" / sha_b
+        receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
+        assert receipt["outcome"] == "success"
+        assert receipt["gateway_restart"]["restarted_services"] == [label]
+        assert len(receipt["fleet"]) == 1 and receipt["fleet"][0]["state"] == "current"
+        assert receipt["fleet"][0]["code_sha"] == sha_a
+        assert receipt["release_transition"] == {
+            "from_sha": sha_b, "to_sha": sha_a,
+            "from_path": str(home / "releases" / sha_b),
+            "to_path": str(home / "releases" / sha_a), "kind": "rollback",
+        }
+        assert any(s["name"] == "immutable_rollback" and f"from_sha={sha_b}" in s["detail"]
+                   and f"to_sha={sha_a}" in s["detail"] for s in receipt["steps"])
     finally:
         subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
         assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
@@ -173,6 +235,10 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
         recorded = json.loads(updated_receipt.read_text(encoding="utf-8"))
         assert any(s["name"] == "immutable_release" and "migration=True" in s["detail"]
                    and sha in s["detail"] for s in recorded["steps"])
+        assert recorded["release_transition"] == {
+            "from_sha": sha, "to_sha": sha, "from_path": str(source),
+            "to_path": str(b), "kind": "migration",
+        }
         assert (home / "current").resolve() == b
         assert (home / "previous").resolve() == source
         assert plist_path.read_bytes() == replacement
@@ -204,6 +270,10 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
         assert plist_path.read_bytes() == original
         rollback_receipt = json.loads((home / "logs/update_receipts/latest.json").read_text(encoding="utf-8"))
         assert rollback_receipt["outcome"] == "success"
+        assert rollback_receipt["release_transition"] == {
+            "from_sha": sha, "to_sha": sha, "from_path": str(b),
+            "to_path": str(source), "kind": "migration_reversal",
+        }
         assert any(s["name"] == "immutable_rollback" and s["ok"] for s in rollback_receipt["steps"])
     finally:
         subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)

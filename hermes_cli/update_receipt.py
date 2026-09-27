@@ -170,6 +170,19 @@ def record_step(name: str, ok: bool, detail: str = "") -> None:
     _record("step", f"update step {name}", name, ok, detail)
 
 
+def record_release_transition(*, from_sha: str | None, to_sha: str, from_path: str | None,
+                              to_path: str, kind: str) -> None:
+    """Persist exact immutable-release identity separately from prose step details."""
+    try:
+        if _current is not None:
+            _current.data["release_transition"] = {
+                "from_sha": from_sha, "to_sha": to_sha,
+                "from_path": from_path, "to_path": to_path, "kind": kind,
+            }
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record release transition: %s", exc)
+
+
 def record_skip(name: str, reason: str) -> None:
     """Record a skipped step WITH the reason it was skipped."""
     _record("skip", f"update skip {name}", name, reason)

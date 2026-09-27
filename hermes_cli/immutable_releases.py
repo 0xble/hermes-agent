@@ -222,7 +222,8 @@ def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str |
     if before_flip is not None:
         before_flip()
     _atomic_symlink(paths.current, candidate)
-    return {"current": str(candidate), "previous": str(old) if old else None}
+    previous = old or read_pointer(paths.previous)
+    return {"current": str(candidate), "previous": str(previous) if previous else None}
 
 
 def _receipt_pins(home: Path) -> set[Path]:
@@ -232,6 +233,12 @@ def _receipt_pins(home: Path) -> set[Path]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        transition = data.get("release_transition") or {}
+        if isinstance(transition, dict):
+            for field in ("from_path", "to_path"):
+                raw_path = transition.get(field)
+                if isinstance(raw_path, str) and raw_path:
+                    pins.add(Path(raw_path).resolve())
         raw = data.get("release") or data.get("release_path")
         if raw:
             pins.add(Path(raw).resolve())
