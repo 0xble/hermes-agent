@@ -4231,9 +4231,34 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         from gateway.run import _exit_after_graceful_shutdown
         _exit_after_graceful_shutdown(code)
 
+    async def _acknowledge_release_when_running() -> None:
+        # An osascript launchd job supervises an inner Python process. Only
+        # the live gateway (not its updater or deferred submit helper) may
+        # acknowledge after runtime startup has reached the running state.
+        if sys.platform != "darwin" or not os.environ.get("HERMES_SUPERVISED_CHILD"):
+            return
+        from gateway.status import read_runtime_status
+        from hermes_cli.immutable_releases import acknowledge_running_release
+        for _ in range(120):
+            await asyncio.sleep(1)
+            state = read_runtime_status() or {}
+            if state.get("pid") == os.getpid() and state.get("gateway_state") == "running":
+                try:
+                    acknowledge_running_release(get_hermes_home(), gateway_pid=os.getpid())
+                except (OSError, RuntimeError, ValueError):
+                    logger.warning("Pending release reload could not be acknowledged", exc_info=True)
+                return
+
+    async def _run_with_release_ack() -> bool:
+        watcher = asyncio.create_task(_acknowledge_release_when_running())
+        try:
+            return await start_gateway(replace=replace, force=force, verbosity=verbosity)
+        finally:
+            watcher.cancel()
+
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity))
+        success = asyncio.run(_run_with_release_ack())
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.

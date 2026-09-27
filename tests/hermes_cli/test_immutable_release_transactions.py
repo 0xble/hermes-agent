@@ -74,6 +74,10 @@ if real != 'real':
         if not record or (path / 'loaded').read_bytes() != pathlib.Path(plist).read_bytes():
             return False
         r._verify_transaction(r.ReleasePaths.for_home(path), record)
+        record['reload_ack'] = {'plist_sha256': record['plist']['intended_sha256'],
+                                'launchd_pid': os.getpid(), 'gateway_pid': os.getpid(),
+                                'release_root': record.get('candidate') or record.get('source'),
+                                'code_sha': record.get('source_sha') or pathlib.Path(record['candidate']).name}
         record['reload_done'] = True
         r._write_txn(r.ReleasePaths.for_home(path), record)
         r._finish_txn(r.ReleasePaths.for_home(path), record)
@@ -217,6 +221,10 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
             if not record or (home / "loaded").read_bytes() != plist.read_bytes():
                 return False
             releases._verify_transaction(paths, record)
+            record["reload_ack"] = {"plist_sha256": record["plist"]["intended_sha256"],
+                                    "launchd_pid": os.getpid(), "gateway_pid": os.getpid(),
+                                    "release_root": record.get("candidate") or record.get("source"),
+                                    "code_sha": record.get("source_sha") or Path(record["candidate"]).name}
             record["reload_done"] = True
             releases._write_txn(paths, record)
             releases._finish_txn(paths, record)

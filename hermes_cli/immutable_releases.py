@@ -18,6 +18,7 @@ import sys
 import uuid
 import re
 import tomllib
+import plistlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, Any
@@ -667,6 +668,74 @@ def _verify_transaction(paths: ReleasePaths, record: dict[str, Any]) -> None:
             raise RuntimeError("launchd plist differs from transaction intent")
 
 
+def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -> bool:
+    """Finish a pending reload only after observing its supervised gateway."""
+    paths = ReleasePaths.for_home(home)
+    record = _read_txn(paths)
+    if not record or not record.get("requires_reload") or (
+            record.get("candidate") is None and record["operation"] != "first-migration-rollback"):
+        return False
+    _verify_transaction(paths, record)
+    plist = record.get("plist")
+    if not plist or "intended_sha256" not in plist:
+        return False
+    body = Path(plist["path"]).read_bytes()
+    if hashlib.sha256(body).hexdigest() != plist["intended_sha256"]:
+        return False
+    definition = plistlib.loads(body)
+    if Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve() != paths.home:
+        return False
+    label = definition.get("Label")
+    if not isinstance(label, str) or Path(plist["path"]).stem != label:
+        return False
+    import psutil
+    from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+    supervisor_pid = _launchctl_supervised_pid(label)
+    if not supervisor_pid:
+        return False
+    try:
+        supervisor = psutil.Process(supervisor_pid)
+        processes = [supervisor, *supervisor.children(recursive=True)]
+        if gateway_pid is not None:
+            processes = [p for p in processes if p.pid == gateway_pid]
+        intended_root = (Path(record["source"]).resolve() if record["operation"] == "first-migration-rollback"
+                         else Path(record["candidate"]).resolve())
+        expected_sha = (record["source_sha"] if record["operation"] == "first-migration-rollback"
+                        else intended_root.name)
+        if intended_root.parent == paths.releases.resolve():
+            if not _release_is_ready(intended_root, expected_sha):
+                return False
+        elif release_sha(intended_root) != expected_sha:
+            return False
+        if gateway_pid is not None and (gateway_pid != os.getpid() or _LOADED_CODE_ROOT != intended_root):
+            return False
+        for process in processes:
+            argv = process.cmdline()
+            if not ("gateway" in argv and "run" in argv and "hermes_cli.main" in argv):
+                continue
+            executable = Path(process.exe()).resolve()
+            expected_python = (intended_root / ".venv" / "bin" / "python" if
+                               intended_root.parent == paths.releases.resolve() else
+                               Path(record["journal_original"]["source_python"]))
+            if (executable == expected_python.resolve() and
+                    (gateway_pid is None or _LOADED_CODE_ROOT == intended_root) and
+                    Path(process.cwd()).resolve() == intended_root and
+                    not process.environ().get("PYTHONPATH")):
+                _verify_transaction(paths, record)
+                record["reload_ack"] = {"plist_sha256": plist["intended_sha256"],
+                                        "launchd_pid": supervisor_pid,
+                                        "gateway_pid": process.pid,
+                                        "release_root": str(intended_root),
+                                        "code_sha": expected_sha}
+                record["reload_done"] = True
+                _write_txn(paths, record)
+                _finish_txn(paths, record)
+                return True
+    except (OSError, ValueError, KeyError, psutil.Error, subprocess.CalledProcessError):
+        return False
+    return False
+
+
 def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
                      reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
     operation = record["operation"]
@@ -682,10 +751,10 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         if hashlib.sha256(intended).hexdigest() != plist["intended_sha256"]:
             raise RuntimeError("recorded launchd plist intent failed hash verification")
     if record.get("reload_done"):
-        # A completed external reload is not repeatable merely because its
-        # on-disk input was subsequently tampered with. Fail closed instead of
-        # rewriting the plist and silently skipping the launchctl operation.
+        # A durable observed ack, not a callback result, authorizes cleanup.
         _verify_transaction(paths, record)
+        if not record.get("reload_ack"):
+            raise RuntimeError("release reload pending: missing observed gateway acknowledgement")
         _finish_txn(paths, record)
         if operation == "first-migration-rollback":
             return {"current": record["source"], "previous": record["current_original"],
@@ -735,13 +804,17 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
     if record.get("requires_reload") and not record.get("reload_done"):
         if reload_callback is None:
             raise RuntimeError("pending release transaction requires its launchd refresh callback")
-        if reload_callback() is False:
+        reload_status = reload_callback()
+        if reload_status not in (True, "deferred"):
             raise RuntimeError("launchd refresh callback failed")
         _verify_transaction(paths, record)
-        record["reload_done"] = True
-        _write_txn(paths, record)
+        if not acknowledge_running_release(paths.home):
+            # A submitted helper (or a synchronous bootstrap) is not proof of
+            # intended code running. Startup will consume the retained WAL.
+            return dict(result, reload_pending=True)
     _verify_transaction(paths, record)
-    _finish_txn(paths, record)
+    if not record.get("requires_reload"):
+        _finish_txn(paths, record)
     return result
 
 
@@ -752,7 +825,30 @@ def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] |
     record = _read_txn(paths)
     if record is None:
         return None
+    if record.get("requires_reload") and (record.get("candidate") is not None or
+                                           record["operation"] == "first-migration-rollback"):
+        # WAL can describe a crash at any point before pointers/plist were
+        # applied. Replay the file intent idempotently before checking service.
+        if record.get("reload_done"):
+            if not record.get("reload_ack"):
+                raise RuntimeError("release reload pending: missing observed gateway acknowledgement")
+            _verify_transaction(paths, record)
+            _finish_txn(paths, record)
+            return _transaction_result(record)
+        if reload_callback is None:
+            raise RuntimeError("release reload pending: restart-authorized update required")
+        return _run_transaction(paths, record, reload_callback)
     return _run_transaction(paths, record, reload_callback)
+
+
+def _transaction_result(record: dict[str, Any]) -> dict[str, str | None]:
+    if record["operation"] == "first-migration-rollback":
+        return {"current": record["source"], "previous": record["current_original"],
+                "source_sha": record["source_sha"]}
+    result = {"current": record["candidate"], "previous": record["previous_intended"]}
+    if record["operation"] == "first-migration":
+        result["source_sha"] = record["source_sha"]
+    return result
 
 
 def activate_release(home: Path, candidate: Path, *, source: Path | None = None,

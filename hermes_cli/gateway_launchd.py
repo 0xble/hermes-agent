@@ -516,13 +516,12 @@ def _spawn_deferred_launchd_reload(
         # including a setsid-detached child (#69098). `launchctl submit` creates a wholly independent
         # transient launchd job that launchd manages separately from the gateway, so bootout of the gateway
         # job cannot reach the helper.
-        subprocess.Popen(
+        subprocess.run(
             [
                 "launchctl", "submit", "-l", submit_label, "-o", str(reload_log_path), "-e", str(reload_log_path),
                 "--", "/bin/bash", "-c", reload_script,
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            check=True, timeout=15, capture_output=True,
         )
     except Exception as e:
         # Fall through to in-process bootout/bootstrap: risky in the coalition, but better than a never-reloaded plist.
@@ -534,7 +533,7 @@ def _spawn_deferred_launchd_reload(
     return True
 
 
-def refresh_launchd_plist_if_needed() -> bool:
+def refresh_launchd_plist_if_needed() -> bool | str:
     """Rewrite the installed plist when the generated one differs, then bootout/bootstrap so launchd
     re-reads it immediately."""
     plist_path = _gw().get_launchd_plist_path()
@@ -549,7 +548,7 @@ def refresh_launchd_plist_if_needed() -> bool:
     return _reload_installed_launchd_plist(plist_path)
 
 
-def restore_launchd_plist(body: bytes) -> bool:
+def restore_launchd_plist(body: bytes) -> bool | str:
     """Restore the original source-checkout definition and re-register its exact bytes."""
     import plistlib
     path = _gw().get_launchd_plist_path()
@@ -567,7 +566,7 @@ def restore_launchd_plist(body: bytes) -> bool:
     return _reload_installed_launchd_plist(path)
 
 
-def _reload_installed_launchd_plist(plist_path: Path) -> bool:
+def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     """Re-register the installed bytes (including a saved source-checkout plist)."""
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
@@ -593,7 +592,7 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool:
             "↻ Updated gateway launchd service definition; reload deferred to "
             "a transient launchd job (survives the bootout of this process)"
         )
-        return True
+        return "deferred"
 
     # Bootout/bootstrap so launchd reads the new definition; bootstrap can fail silently under load
     # during a drain, and KeepAlive can't revive an unregistered job.

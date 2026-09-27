@@ -234,6 +234,10 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                                       source_python=source_python if first else None,
                                       plist_path=plist, plist_body=plist_body,
                                       reload_callback=reload_callback)
+        if result.get("reload_pending"):
+            _record_update_step("immutable_release", False,
+                                f"reload submitted but not acknowledged by launchd gateway: {candidate}")
+            return False
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
         from_sha = _previous_release_sha(paths, previous)
@@ -1472,6 +1476,13 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
     """Reconcile source, artifact, journal, service and gateway before fleet catch-up."""
     from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha, _release_is_ready
     paths = ReleasePaths.for_home(get_hermes_home())
+    if defer and (paths.home / "release-txn.json").exists():
+        from hermes_cli.immutable_releases import acknowledge_running_release
+        if not acknowledge_running_release(paths.home):
+            message = "Pending release reload unacknowledged; restart-prohibited reconciliation cannot replay it"
+            _record_update_step("immutable_release_catchup", False, message)
+            _finalize_receipt("partial", "Release reload remains pending: %s")
+            raise SystemExit(message)
     if not _immutable_release_enabled(paths):
         return
     current = read_pointer(paths.current)
@@ -1972,8 +1983,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     if getattr(args, "rollback", False) and getattr(args, "no_gateway_restart", False):
         raise ValueError("--rollback cannot be combined with --no-gateway-restart: rollback requires a fleet restart")
+    # Resolve policy before any recovery action: a cron or gateway invocation
+    # may have restart disabled even when it did not spell the CLI flag itself.
+    opts = None if getattr(args, "rollback", False) else _resolve_update_options(args, gateway_mode)
+    if opts is not None and opts.no_gateway_restart:
+        from hermes_cli.immutable_releases import ReleasePaths, acknowledge_running_release
+        paths = ReleasePaths.for_home(get_hermes_home())
+        if (paths.home / "release-txn.json").exists() and not acknowledge_running_release(paths.home):
+            message = ("Pending immutable release reload is unacknowledged; "
+                       "--no-gateway-restart prohibits recovery. No launchctl action was attempted.")
+            print(f"✗ {message}")
+            from hermes_cli.update_receipt import begin_update_receipt
+            begin_update_receipt()
+            _record_update_step("immutable_release_recovery", False, message)
+            _finalize_receipt("partial", "Release reload remains pending: %s")
+            raise SystemExit(1)
     if not getattr(args, "rollback", False):
-        _finish_pending_release_transaction()
+        try:
+            _finish_pending_release_transaction()
+        except RuntimeError as exc:
+            from hermes_cli.update_receipt import begin_update_receipt
+            begin_update_receipt()
+            _record_update_step("immutable_release_recovery", False, str(exc))
+            _finalize_receipt("partial", "Release reload remains pending: %s")
+            print(f"✗ {exc}")
+            raise SystemExit(1) from exc
     _require_immutable_launchd()
 
     if getattr(args, "rollback", False):
@@ -2005,6 +2039,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist and plist.exists() else None
             result = rollback(home, plist_path=plist if plist and plist.exists() else None,
                               plist_body=plist_body, reload_callback=callback)
+        if result.get("reload_pending"):
+            message = "Rollback reload pending: intended launchd gateway has not acknowledged the release"
+            _record_update_step("immutable_rollback", False, message)
+            _finalize_receipt("partial", "Release rollback remains pending: %s")
+            raise SystemExit(1)
         current_target = result["current"]
         if current_target is None:
             raise RuntimeError("rollback produced no current target")
@@ -2036,7 +2075,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         return
 
-    opts = _resolve_update_options(args, gateway_mode)
+    assert opts is not None
     gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
     # A child spawned off hermes.exe already outwaited its parent in ``cmd_update``.
     if getattr(args, "post_swap", None):
