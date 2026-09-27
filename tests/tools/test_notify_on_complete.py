@@ -197,12 +197,12 @@ class TestTerminalSchema:
 
     def test_cut_completion_says_so_and_points_at_the_log(self):
         """The rendered notice names the cut and the process log; a whole output renders as before."""
-        from tools.process_registry_notifications import format_process_notification
+        from tools.process_registry_notifications import PROCESS_NOTIFICATION_END, format_process_notification
         base = {"type": "completion", "session_id": "proc_abc", "command": "hermes peer dm mini",
                 "exit_code": 0, "output": "Reply from mini:\ntail"}
         cut = format_process_notification({**base, "output_cut": 3000})
         assert "3000" in cut and "proc_abc" in cut
-        assert cut.endswith("Reply from mini:\ntail]")
+        assert cut.endswith(f"Reply from mini:\ntail]\n{PROCESS_NOTIFICATION_END}")
         assert "cut" not in format_process_notification(base)
 
 

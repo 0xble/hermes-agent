@@ -145,6 +145,15 @@ host fixture defects addressed here. Focused reruns establish repaired fixtures;
 the original full run is not reported as green. Candidate extension files are
 additionally included in both bounded and full fork validation.
 
+## Nightly Linux notification regression
+
+The `fork-ci-reliability` identity covers the cut-completion notice assertion in
+`tests/tools/test_notify_on_complete.py`. The formatter intentionally ends every
+completion with `PROCESS_NOTIFICATION_END`; the older test still required the
+payload's closing bracket to be the final character. Assert the exact bounded
+output and framing terminator together. The nightly Linux failure was a stale
+test expectation, not a truncated-notice product defect.
+
 ## Git fixture isolation
 
 The `fork-ci-reliability` identity also covers the real-Git fixtures in
