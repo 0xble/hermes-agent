@@ -67,8 +67,9 @@ FINAL_ONE = f"The file says {CANARY} (FINAL-ONE)"
 FINAL_TWO = "Summary: the canary was read (FINAL-TWO)"
 LATE_TEXT = "LATE-ANSWER-65788"
 # ACP reports no usage, so Hermes estimates pressure from messages and tool schemas. The
-# eight ~540-estimated-token read_file results cross this cap mid-turn (the full ACP prompt
-# also includes a text tool bridge, which is not counted as OpenAI tool-schema tokens).
+# bridge/prompt makes the request reach this cap after three ~540-token read_file results;
+# only conversation rows (not that fixed prefix) are summarizable. Protect the active tail,
+# but not the first tool pair, and use the ratio-based tail budget so a middle exists.
 COMPACT_THRESHOLD = 15_000
 COMPACT_FILES = 8
 COMPACT_ASK = "Read f1.txt through f8.txt one by one, then say done (COMPACT-ASK)."
@@ -154,7 +155,8 @@ def _compaction(root: Path) -> Scenario:
         f"call_f{i}", "read_file", {"path": str(project / f"f{i}.txt")}))] for i in range(1, COMPACT_FILES + 1)]
     fake = acp.AcpFake(root / "acp", [*turns, [acp.message(FINAL_COMPACT)]], models=MODELS, aux_text=SUMMARY)
     nh = make_home(root, {"provider": "copilot-acp", "default": CONFIGURED_MODEL}, env_file=fake.env(),
-                   extra_config={"compression": {"threshold_tokens": COMPACT_THRESHOLD, "protect_last_n": 4}})
+                   extra_config={"compression": {"threshold_tokens": COMPACT_THRESHOLD, "protect_first_n": 0,
+                                                 "protect_last_n": 4, "tail_mode": "legacy"}})
     for i in range(1, COMPACT_FILES + 1):
         (nh.project / f"f{i}.txt").write_text(f"file {i} " + "lorem ipsum dolor " * 250 + "\n", encoding="utf-8")
     sc = Scenario(nh, fake)
@@ -292,7 +294,7 @@ def test_compaction_in_an_acp_session_keeps_the_next_prompt_valid_and_grounded(o
     assert sc.fake.invalid() == [], f"requests rejected by the ACP schema: {sc.fake.invalid()}"
     aux = sc.fake.aux_prompts()
     assert aux, "compaction never called the summarizer through the ACP provider"
-    assert "file 2 lorem" in acp.prompt_text(aux[0]), "the summarizer did not receive the history to compact"
+    assert "file 1 lorem" in acp.prompt_text(aux[0]), "the summarizer did not receive the history to compact"
     after = [r for r in sc.fake.main_prompts() if r["t"] > aux[0]["t"]]
     assert after, "no main-turn call followed the compaction"
     final = _transcript(after[-1])

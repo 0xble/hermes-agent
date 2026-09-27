@@ -667,7 +667,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         seconds = max(int(seconds), HEARTBEAT_MIN_SECONDS)
         session.heartbeat_seconds = seconds
         session._heartbeat_last = time.time()
-        session._heartbeat_total_at_last = session.total_output_chars
+        # The reader may already have ingested output before dispatch arms the
+        # heartbeat. Keep the cursor at zero (or at the last beat on re-arm).
         self._ensure_heartbeat_thread()
         return seconds
 
@@ -693,26 +694,36 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 self._emit_heartbeat(session, now)
 
     def _emit_heartbeat(self, session: ProcessSession, now: float) -> None:
-        with session._lock:
-            delta = session.total_output_chars - session._heartbeat_total_at_last
-            output = session.output_buffer[-delta:] if delta > 0 else ""
-            session._heartbeat_total_at_last = session.total_output_chars
-        if len(output) > HEARTBEAT_OUTPUT_CHARS:
-            cut = len(output) - HEARTBEAT_OUTPUT_CHARS
-            output = f"...({cut} earlier characters omitted)\n" + output[-HEARTBEAT_OUTPUT_CHARS:]
-        session._heartbeat_last = now
-        session._heartbeat_seq += 1
-        notification = {
-            **self._watch_event_base(session),
-            "type": "heartbeat",
-            "seq": session._heartbeat_seq,
-            "interval": session.heartbeat_seconds,
-            "elapsed": int(now - session.started_at) if session.started_at else 0,
-            "output": output,
-            "started_at": session.started_at,
-        }
+        # A timer may select a due session just before the reader finishes it.
+        # Serialize the liveness check and enqueue with _move_to_finished so a
+        # stale heartbeat cannot arrive after its completion notification.
+        with self._lock:
+            if session.exited or session.id not in self._running:
+                return
+            with session._lock:
+                delta = session.total_output_chars - session._heartbeat_total_at_last
+                output = session.output_buffer[-delta:] if delta > 0 else ""
+                session._heartbeat_total_at_last = session.total_output_chars
+            if len(output) > HEARTBEAT_OUTPUT_CHARS:
+                cut = len(output) - HEARTBEAT_OUTPUT_CHARS
+                output = f"...({cut} earlier characters omitted)\n" + output[-HEARTBEAT_OUTPUT_CHARS:]
+            session._heartbeat_last = now
+            session._heartbeat_seq += 1
+            notification = {
+                **self._watch_event_base(session),
+                "type": "heartbeat",
+                "seq": session._heartbeat_seq,
+                "interval": session.heartbeat_seconds,
+                "elapsed": int(now - session.started_at) if session.started_at else 0,
+                "output": output,
+                "started_at": session.started_at,
+            }
+        # Output transforms are extensible hooks; never run them while holding
+        # the registry lock. Recheck after transformation because exit can win.
         _redact_process_result(notification)
-        self.completion_queue.put(notification)
+        with self._lock:
+            if not session.exited and session.id in self._running:
+                self.completion_queue.put(notification)
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
