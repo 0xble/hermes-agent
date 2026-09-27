@@ -1343,6 +1343,12 @@ exit 3
     ) "pipedrain"
     $sw.Stop()
     $elapsed = [Math]::Round($sw.Elapsed.TotalSeconds, 2)
+    # The post-exit drain starts after the child has launched its descendant.
+    # Exclude variable PowerShell startup on a busy host from this bound.
+    $leakAfterSpawnElapsed = $null
+    if (Test-Path -LiteralPath $pidFile) {
+        $leakAfterSpawnElapsed = [Math]::Round(((Get-Date) - (Get-Item -LiteralPath $pidFile).LastWriteTime).TotalSeconds, 2)
+    }
 
     $leakPid = 0
     if (Test-Path -LiteralPath $pidFile) {
@@ -1369,7 +1375,8 @@ exit 3
     # to start, before there is any output to drain. Do not let that startup
     # race masquerade as a failure of the post-exit leak bound.
     $savedIdleTimeoutSeconds = $script:StepIdleTimeoutSeconds
-    $script:StepIdleTimeoutSeconds = 3
+    $selfTestIdleTimeoutSeconds = 3
+    $script:StepIdleTimeoutSeconds = $selfTestIdleTimeoutSeconds
     $stallSw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $stall = Invoke-HermesStep $powershell @(
@@ -1422,13 +1429,14 @@ exit 3
     $floodBudget = 25
     $problems = @()
     if (-not $leakAlive) { $problems += "handle-holding grandchild was not alive on return (fixture did not reproduce the leak)" }
-    if ($elapsed -ge $budget) { $problems += "leak arm returned in ${elapsed}s, over the ${budget}s budget" }
+    if ($null -eq $leakAfterSpawnElapsed) { $problems += "leak arm never recorded grandchild startup" }
+    if ($null -ne $leakAfterSpawnElapsed -and $leakAfterSpawnElapsed -ge $budget) { $problems += "leak arm took ${leakAfterSpawnElapsed}s after grandchild startup, over the ${budget}s budget" }
     if ($res.Code -ne 7) { $problems += "leak arm exit code $($res.Code), expected 7" }
     if ($res.Output -notmatch "pipe-drain step output") { $problems += "leak arm step output was lost" }
     if ($floodElapsed -ge $floodBudget) { $problems += "flood arm returned in ${floodElapsed}s, over the ${floodBudget}s budget -- the drain is metering itself, which backpressures the step" }
     if ($flood.Code -ne 5) { $problems += "flood arm exit code $($flood.Code), expected 5" }
     if ($floodBytes -lt ($floodKb * 1024)) { $problems += "flood arm captured $floodBytes bytes of $($floodKb * 1024)" }
-    $stallBudget = $script:StepIdleTimeoutSeconds + 30
+    $stallBudget = $selfTestIdleTimeoutSeconds + 30
     if ($stallElapsed -ge $stallBudget) { $problems += "stall arm returned in ${stallElapsed}s, over the ${stallBudget}s budget" }
     if ($stall.Code -ne 124) { $problems += "stall arm exit code $($stall.Code), expected 124" }
     if ($stall.Output -notmatch "step entered silent finalization") { $problems += "stall arm step output was lost" }

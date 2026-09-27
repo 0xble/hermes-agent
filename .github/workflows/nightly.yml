@@ -111,7 +111,12 @@ jobs:
           rustup default 1.96.1
       - name: Qualify native OS at exact SHA
         shell: bash
-        run: ./bin/ci nightly-native '${{ github.sha }}'
+        run: |
+          # Windows PowerShell fixture startup competes with other test-file
+          # processes for the hosted runner's two cores. Run Windows files
+          # serially so a stalled launcher is not mistaken for a pipe leak or
+          # a UI timeout; preserve the existing macOS file concurrency.
+          ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-latest' && '1' || '4' }}
   desktop-core:
     # The deterministic Desktop core E2E suite (transcript integrity, backend
     # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.
