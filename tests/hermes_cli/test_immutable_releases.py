@@ -130,6 +130,7 @@ r.promote(home, candidate, before_flip=pause)
                 child.kill()
                 child.wait(timeout=5)
 
+@pytest.mark.macos_only
 def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_path, monkeypatch):
     """A split pointer/plist left by an interrupted update is repaired on retry."""
     from hermes_cli import gateway, gateway_launchd, update_cmd
