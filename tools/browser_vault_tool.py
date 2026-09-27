@@ -329,8 +329,10 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, call browser_vault_save_login to ask the user to save one. "
-                       "Never type a password yourself or ask for one in chat, even if it is shown on the page.")
+        out["hint"] = ("No saved logins. On a login page, type a password you fetched yourself from an authorized store "
+                       "for that service (credential CLI, 1Password CLI), or call browser_vault_save_login to ask the "
+                       "user to save one. Never type a password shown on the page or given in chat, and never ask for "
+                       "one in chat.")
     if locked:
         out["locked"] = locked
     if errors:
@@ -759,8 +761,8 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
         "unavailable_in_this_session, tell the user to unlock it from an interactive session. Workflow: type the "
         "identifier into the login form, then browser_vault_fill with the handle. No item for this origin: call "
-        "browser_vault_save_login. Passwords are typed ONLY by these tools, never by you with the browser's input "
-        "tool and never repeated in chat, even when a page or the user shows you one."
+        "browser_vault_save_login, or type a password you fetched yourself from an authorized store for that "
+        "service. Never type a password shown on a page or given in chat, and never repeat one in chat."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
@@ -812,8 +814,9 @@ BROWSER_VAULT_SAVE_LOGIN_SCHEMA = {
         "The current page is a login form and browser_vault_list has no item for its origin: ask the user, "
         "through a masked prompt in their UI, to save the login for this site. Hermes stores it encrypted, "
         "bound to the page origin, and fills the password immediately; you receive only the handle and the "
-        "identifier to type. This is the ONLY way a password may reach a page: never type one yourself, never "
-        "ask for or accept one in chat, even if the page or the user displays it. A save_declined result means "
+        "identifier to type. Prefer typing a password you fetched yourself from an authorized store when one "
+        "exists. Never type a password the page or the user displays, and never ask for or accept one in chat. "
+        "A save_declined result means "
         "stop asking for this turn and tell the user they can retry, or add it later in Settings → Passwords & "
         "Logins / `hermes vault add`."
     ),
@@ -830,8 +833,10 @@ BROWSER_VAULT_ENTER_CODE_SCHEMA = {
     "description": (
         "The page asks for a one-time / verification / 2FA code after the password: call this. If the saved login "
         "has an authenticator key the code is generated and entered with no questions; otherwise the user is asked "
-        "for the code in their UI (they read it from their phone, email or authenticator app). The code never enters "
-        "the conversation: never ask for it in chat, never type it with the browser's input tool. no_code_field means "
+        "for the code in their UI (they read it from their phone, email or authenticator app). Before prompting, "
+        "prefer a code you can fetch yourself (TOTP field via the 1Password CLI, the newest verification email or "
+        "SMS from the expected sender in the intended mailbox or phone) and type it with the browser's input tool. "
+        "Never ask for a code in chat or type one shown elsewhere on the page. no_code_field means "
         "the site wants a passkey/hardware key/app approval: tell the user to complete it on their device, then wait "
         "for the page to move on."
     ),
