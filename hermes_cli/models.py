@@ -1163,11 +1163,18 @@ def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
 
 def _fast_mode_route_supported(
     model_id: Optional[str], provider: Optional[str], base_url: Optional[str]) -> bool:
-    """Only the first-party endpoint that bills for fast mode may receive its params."""
+    """Only the first-party endpoint that bills for fast mode may receive its params, plus a
+    custom endpoint that opted in with ``capabilities.fast_mode`` (``models_fast_route``)."""
     from urllib.parse import urlparse
 
     from agent.model_metadata import is_grok_46_family
 
+    requested = normalize_provider(provider) if provider else ""
+    if requested == "custom" or requested.startswith("custom:"):
+        from hermes_cli.models_fast_route import custom_route_fast_mode_opted_in
+
+        return custom_route_fast_mode_opted_in(
+            requested, base_url, anthropic_model=_is_anthropic_fast_model(model_id))
     if _is_anthropic_fast_model(model_id):
         allowed = {"anthropic": "api.anthropic.com"}
     elif is_grok_46_family(str(model_id or "")):
