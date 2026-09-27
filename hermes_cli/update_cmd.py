@@ -1332,31 +1332,140 @@ def _finalize_receipt(status: str, debug_message: str) -> None:
         finalize_update_receipt(status)
 
 
+@dataclass(frozen=True)
+class _ReleaseReconcileState:
+    enabled: bool
+    current: str  # absent, equal, different
+    candidate: str  # none, staged, failed-partial
+    journal: str  # none, in-progress, done, rolled-back
+    service: str  # none, source, current, stale-release
+    running: str  # none, source, current, other (root AND SHA)
+    defer: bool
+
+
+# Ordered state-table rows. * matches any value; the first matching row owns the
+# entire transition. The axes are normalized observations, not guesses from HEAD.
+_RELEASE_RECONCILE_TABLE = (
+    # disabled legacy checkout / reversed migration: no implicit re-migration
+    ((False, "absent", "*", "none", "*", "*", "*"), "no-op"),
+    ((False, "absent", "*", "rolled-back", "*", "*", "*"), "no-op"),
+    # A source reversal cannot re-enter begin_migration while current points to
+    # source. Require an explicit recovery instead of silently claiming success.
+    ((True, "absent", "*", "rolled-back", "*", "*", "*"), "fail-with-message"),
+    (("*", "equal", "none", "*", "*", "*", "*"), "fail-with-message"),
+    (("*", "equal", "failed-partial", "*", "*", "*", "*"), "fail-with-message"),
+    (("*", "equal", "*", "*", "none", "none", "*"), "no-op"),
+    (("*", "equal", "*", "*", "current", "none", "*"), "no-op"),
+    (("*", "equal", "*", "*", "none", "current", "*"), "no-op"),
+    (("*", "equal", "*", "*", "current", "current", "*"), "no-op"),
+    (("*", "equal", "*", "*", "*", "*", True), "defer-record"),
+    (("*", "equal", "*", "*", "*", "*", False), "repair-service"),
+    (("*", "*", "*", "*", "*", "*", True), "defer-record"),
+    (("*", "*", "staged", "*", "*", "*", False), "activate-staged"),
+    (("*", "*", "*", "*", "*", "*", False), "build+activate"),
+)
+
+
+def _reconcile_immutable_release(state: _ReleaseReconcileState) -> str:
+    """Resolve one no-pull transition; reject impossible combinations explicitly."""
+    if ((state.current == "absent" and (state.service == "current" or state.running == "current"
+                                        or state.journal == "done"))
+            or (state.current != "absent" and state.journal in {"in-progress", "rolled-back"})
+            or (state.current == "different" and state.journal == "none")):
+        raise ValueError(f"unreachable immutable release state: {state}")
+    axes = tuple(vars(state).values())
+    for pattern, action in _RELEASE_RECONCILE_TABLE:
+        if all(want == "*" or want == actual for want, actual in zip(pattern, axes)):
+            return action
+    raise ValueError(f"unreachable immutable release state: {state}")
+
+
+def _release_service_state(paths, current) -> str:
+    if sys.platform != "darwin":
+        return "none"
+    from hermes_cli import gateway
+    plist = gateway.get_launchd_plist_path()
+    if not plist.exists():
+        return "none"
+    if current is not None and gateway.launchd_plist_is_current():
+        return "current" if current.parent == paths.releases.resolve() else "source"
+    from hermes_cli.immutable_releases import migration_plist
+    journal = paths.home / "release-layout.json"
+    if journal.exists():
+        original = migration_plist(paths.home)
+        if original and original[0] == plist and original[1] == plist.read_bytes():
+            return "source"
+    return "stale-release"
+
+
+def _release_running_state(paths, source, current, sha) -> str:
+    from hermes_cli.update_receipt import collect_fleet_versions
+    rows = collect_fleet_versions(expected_sha_override=sha, expected_root_override=paths.release(sha))
+    if not rows:
+        return "none"
+    roots = {(row.get("code_root"), row.get("code_sha")) for row in rows}
+    if roots == {(str(source.resolve()), sha)}:
+        return "source"
+    if current is not None and roots == {(str(current), sha)}:
+        return "current"
+    return "other"
+
+
 def _catch_up_immutable_release(*, defer: bool) -> None:
-    """Complete a previously pulled release before any fleet catch-up restart."""
+    """Reconcile source, artifact, journal, service and gateway before fleet catch-up."""
     from hermes_cli.immutable_releases import ReleasePaths, read_pointer, release_sha
     paths = ReleasePaths.for_home(get_hermes_home())
     current = read_pointer(paths.current)
-    if current is None and not _updates_config().get("immutable_releases", False):
-        return
-    if current is not None and current.parent != paths.releases.resolve():
-        return
     sha = release_sha(_m().PROJECT_ROOT)
     candidate = paths.release(sha)
-    if current is None:
-        # First migration may also have been deferred: only a complete staged
-        # artifact plus explicit opt-in can resume that transition on a no-op pull.
-        if not ((candidate / ".release-ready").is_file()
-                and (candidate / ".release-ready").read_text(encoding="utf-8").strip() == sha):
-            return
-    if current == candidate:
+    ready = candidate / ".release-ready"
+    candidate_state = ("staged" if ready.is_file() and ready.read_text(encoding="utf-8").strip() == sha
+                       else "failed-partial" if candidate.exists() else "none")
+    journal_path = paths.home / "release-layout.json"
+    journal = ("rolled-back" if current is not None and current.parent != paths.releases.resolve()
+               else "done" if current is not None
+               else "in-progress" if journal_path.exists()
+               else "none")
+    state = _ReleaseReconcileState(
+        bool(_updates_config().get("immutable_releases", False)),
+        "absent" if current is None or journal == "rolled-back" else "equal" if current == candidate else "different",
+        candidate_state, journal, _release_service_state(paths, current),
+        _release_running_state(paths, _m().PROJECT_ROOT, current, sha), defer,
+    )
+    action = _reconcile_immutable_release(state)
+    if action == "fail-with-message":
+        print(f"✗ Immutable release needs manual recovery: current={current}, candidate={candidate_state}, journal={journal}. "
+              "Do not restart the gateway until the release pointer and migration record are repaired.")
+        _record_update_step("immutable_release_catchup", False, f"manual recovery required: {state}")
+        _finalize_receipt("partial", "Release reconciliation requires recovery: %s")
+        raise SystemExit(1)
+    if action == "no-op":
         return
-    if defer:
-        print(f"  Release {sha} still awaits activation; --no-gateway-restart keeps "
-              f"{current.name if current else 'the source layout'} active.")
+    if action == "defer-record":
+        if state.current != "equal" and state.candidate != "staged":
+            node_failures = _update_node_dependencies()
+            web_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+            if node_failures or not web_ok or not _activate_immutable_release(defer=True):
+                _record_update_step("immutable_release_catchup", False,
+                                    f"deferred stage failed: node={node_failures}, web={web_ok}")
+                _finalize_receipt("partial", "Release deferred stage failed: %s")
+                raise SystemExit(1)
+        _record_update_step("immutable_release_catchup", True, f"deferred: {state}")
+        print(f"  Release {sha} still awaits reconciliation; --no-gateway-restart keeps the running gateway active.")
         return
-    # An interrupted/failed stage may have no candidate, and the source web
-    # bundle may be stale. Rebuild prerequisites before reusing or staging it.
+    if action == "repair-service":
+        from hermes_cli import gateway
+        if state.service not in {"none", "current"}:
+            if not gateway.refresh_launchd_plist_if_needed() or not gateway.launchd_plist_is_current():
+                _record_update_step("immutable_release_catchup", False, "stale launchd definition")
+                _finalize_receipt("partial", "Release service repair failed: %s")
+                raise SystemExit(1)
+        if state.running not in {"none", "current"}:
+            _write_fleet_restart_pending_marker(expected_sha=sha)
+        _record_update_step("immutable_release_catchup", True, f"repaired service/runtime: {state}")
+        return
+    # An interrupted stage has no ready marker; never treat a partial artifact
+    # as a no-op. Build prerequisites on the source before staging or promotion.
     node_failures = _update_node_dependencies()
     web_ok = _m()._build_web_ui(_m().PROJECT_ROOT / "web")
     if node_failures or not web_ok or not _activate_immutable_release():
@@ -1364,7 +1473,8 @@ def _catch_up_immutable_release(*, defer: bool) -> None:
                             f"candidate={sha}, node_failures={node_failures}, web_build_ok={web_ok}")
         _finalize_receipt("partial", "Release catch-up failed: %s")
         raise SystemExit(1)
-    _record_update_step("immutable_release_catchup", True, f"activated {sha} before fleet restart")
+    _write_fleet_restart_pending_marker(expected_sha=sha)
+    _record_update_step("immutable_release_catchup", True, f"{action}: {sha} before fleet restart")
 
 
 def _finish_already_up_to_date(

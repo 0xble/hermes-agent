@@ -46,6 +46,24 @@ Measured before activation: the checkout including all worktrees and generated a
 4. If post-flip health fails, the **rollback point** is `previous`: under the same authorization run `hermes update --rollback` and check receipt exit/status, `current` target, fleet PID/code SHA, launchd definition and inbound response. Do not merely flip a symlink by hand while a gateway is running. If this is first migration from an in-place checkout, `hermes update --rollback` restores the saved source-checkout plist and restarts the source interpreter/cwd; verify the plist bytes and process. If its receipt, fleet verification, or runtime identity differs from the source SHA, stop and repair before further updates.
 5. Keep release A and the saved plist until live process pins, receipts, health and rollback are independently verified. Never remove a pinned release manually; no automatic rerun of interrupted cron/chat work.
 
+## No-pull reconciliation state table
+
+`hermes_cli.update_cmd._reconcile_immutable_release` owns the no-pull decision. It observes seven axes before any catch-up restart: opt-in (`enabled`), `current` pointer (`absent/equal/different` from HEAD's release), candidate (`none/staged/failed-partial`; staged requires the exact `.release-ready` SHA), journal (`none/in-progress/done/rolled-back`), installed launchd definition (`none/source/current/stale-release`), running fleet root **and** SHA (`none/source/current/other`), and `--no-gateway-restart` (`defer`). Ordered rows below use `*` as any state; the first match wins. `test_reconcile_matrix` checks the complete Cartesian product and explicitly rejects physically unreachable combinations rather than silently treating them as success.
+
+| Enabled | Current | Candidate | Journal | Service | Running | Defer | Action |
+|---|---|---|---|---|---|---|---|
+| false | absent | * | none or rolled-back | * | * | * | no-op (legacy/reversed source; never opt in implicitly) |
+| true | absent | * | rolled-back | * | * | * | fail-with-message (source pointer reversal needs explicit recovery) |
+| * | equal | none or failed-partial | * | * | * | * | fail-with-message (active release is incomplete) |
+| * | equal | staged | * | none or current | none or current | * | no-op |
+| * | equal | staged | * | source or stale-release, or running source/other | * | true | defer-record |
+| * | equal | staged | * | source or stale-release, or running source/other | * | false | repair-service (refresh launchd, arm fleet restart if runtime stale) |
+| * | absent or different | * | * | * | * | true | defer-record (stage incomplete/missing artifact first; never flip/reload) |
+| * | absent or different | staged | * | * | * | false | activate-staged (validate build prerequisites; promote) |
+| * | absent or different | none or failed-partial | * | * | * | false | build+activate (retry failed first migration too) |
+
+Unreachable rows: absent pointer with a `current` service/process or a done journal; non-absent release pointer with an in-progress/rolled-back journal; different pointer with no journal. A rolled-back source pointer is represented by `absent` for decision purposes. Any unrecognized state fails closed. Service repair failure is partial, never a successful no-op. The existing fleet catch-up consumes a newly armed restart marker after release reconciliation; `--no-gateway-restart` does not restart the caller's gateway.
+
 ## Qualification before this runbook may be used
 
 Use a **throwaway launchd label and temp HERMES_HOME**, never `ai.hermes.gateway` or a prefix enumerated by the updater's real fleet. Prove bootout/re-bootstrap and cleanup of the exact throwaway label, A-worker loaded paths across A→B, B gateway loaded SHA, candidate-failure pointer preservation, kill-at-both-atomic-boundaries, A→B→A with receipt and fleet verification, first-migration reversal, and retention of real PID/cwd/exe and receipt pins. Run `scripts/run_tests.sh` focused files, `mise x uv@0.12.13 node@26.8.2 -- ./bin/ci preflight`, and the hosted Linux/qualification checks at the **same head SHA**. An ordinary process-group SIGTERM test does not substitute for actual `launchctl bootout` coalition behavior.
