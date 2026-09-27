@@ -77,6 +77,10 @@ def preflight() -> None:
     run([sys.executable, '-m', 'unittest',
          'scripts.ci.tests.test_portable.PortableGateTests.test_exact_checkout_rejects_malformed_wrong_and_mutated_sha'])
     run([sys.executable, '-m', 'py_compile', 'scripts/ci/portable.py'])
+    # The gate's static lane rejects any Fork-Patch identity without a maintenance owner.
+    # It reads only git history and maintenance/, needs no install, and takes seconds, so
+    # running it here catches the most common gate failure before the push.
+    run([sys.executable, 'scripts/check_fork_patches.py', '--repo', '.', '--source-only'])
 
 
 
