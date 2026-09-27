@@ -58,7 +58,8 @@ def _content_digest(release: Path) -> str:
 
 def _python_version(python: Path) -> str:
     result = subprocess.run([str(python), "-c", "import platform; print(platform.python_version())"],
-                            check=True, capture_output=True, text=True)
+                            check=True, capture_output=True, text=True,
+                            env=_release_subprocess_env())
     return result.stdout.strip()
 
 
@@ -124,8 +125,23 @@ def read_pointer(path: Path) -> Path | None:
         return None
 
 
+def _release_subprocess_env(release: Path | None = None) -> dict[str, str]:
+    """Keep inherited credentials/network settings, not interpreter or uv target overrides."""
+    env = os.environ.copy()
+    for key in ("CONDA_DEFAULT_ENV", "CONDA_PREFIX", "VIRTUAL_ENV", "PYTHONHOME",
+                "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONINSPECT",
+                "__PYVENV_LAUNCHER__", "UV_PROJECT_ENVIRONMENT", "UV_PYTHON",
+                "UV_ACTIVE", "UV_CONFIG_FILE"):
+        env.pop(key, None)
+    if release is not None:
+        env["UV_PROJECT_ENVIRONMENT"] = str(release.resolve() / ".venv")
+    env["UV_NO_CONFIG"] = "1"
+    return env
+
+
 def _build_venv(release: Path, *, uv: str = "uv") -> None:
-    subprocess.run([uv, "sync", "--frozen", "--python", sys.executable], cwd=release, check=True)
+    subprocess.run([uv, "sync", "--frozen", "--python", sys.executable],
+                   cwd=release, env=_release_subprocess_env(release), check=True)
 
 
 def _active_distributions(python: Path) -> dict[str, str]:
@@ -133,7 +149,7 @@ def _active_distributions(python: Path) -> dict[str, str]:
               "print(json.dumps({d.metadata['Name'].lower().replace('_','-'): d.version "
               "for d in m.distributions() if d.metadata.get('Name')}))")
     result = subprocess.run([str(python), "-c", script], check=True,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=_release_subprocess_env())
     return json.loads(result.stdout)
 
 
@@ -143,7 +159,7 @@ def _active_plugin_entrypoints(python: Path) -> set[tuple[str, str, str]]:
               "print(json.dumps(sorted((e.group,e.name,e.value) for d in m.distributions() "
               "for e in d.entry_points if e.group in groups)))")
     result = subprocess.run([str(python), "-c", script], check=True,
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, env=_release_subprocess_env())
     return {tuple(row) for row in json.loads(result.stdout)}
 
 
@@ -166,7 +182,8 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
     missing = [f"{name}=={version}" for name, version in sorted(installed.items())
                if name not in {"hermes-agent", "hermes-agent-cli"} and target.get(name) != version]
     if missing:
-        subprocess.run([uv, "pip", "install", "--python", str(candidate_python), *missing], check=True)
+        subprocess.run([uv, "pip", "install", "--python", str(candidate_python), *missing],
+                       env=_release_subprocess_env(candidate), check=True)
     target = _active_distributions(candidate_python)
     unmatched = [name for name, version in installed.items()
                  if name not in {"hermes-agent", "hermes-agent-cli"} and target.get(name) != version]
@@ -202,7 +219,7 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
             if any(path.is_symlink() for path in plugin_dir.rglob("*")):
                 raise RuntimeError("plugin smoke refuses symlinks in shared plugin tree")
             shutil.copytree(plugin_dir, isolated / "plugins")
-        env = os.environ.copy()
+        env = _release_subprocess_env(release)
         env.update({"HERMES_HOME": str(isolated), "PYTHONDONTWRITEBYTECODE": "1"})
         env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
         result = subprocess.run(
@@ -419,7 +436,8 @@ def _source_python_valid(python: Path, source: Path) -> bool:
              "pathlib.Path(sys.argv[1]).resolve() / 'hermes_cli'")
     try:
         return subprocess.run([str(python), "-c", probe, str(source)],
-                              capture_output=True, timeout=15).returncode == 0
+                              capture_output=True, timeout=15,
+                              env=_release_subprocess_env()).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 

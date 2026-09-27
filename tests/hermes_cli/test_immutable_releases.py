@@ -534,6 +534,37 @@ def test_worker_environment_is_resolved_release_not_current(tmp_path):
     assert env["PYTHONPATH"].split(os.pathsep)[:2] == [str(release.resolve()), "old"]
 
 
+def test_build_venv_ignores_inherited_source_uv_target_and_preserves_other_envs(tmp_path, monkeypatch):
+    """A real uv sync must build candidate, never an inherited source or live env."""
+    import venv
+
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "pyproject.toml").write_text(
+        "[project]\nname = 'candidate-env-probe'\nversion = '0.1.0'\n"
+        "requires-python = '>=3.11'\n[tool.uv]\npackage = false\n", encoding="utf-8")
+    source_env = tmp_path / "source-venv"
+    running_env = tmp_path / "running-release" / ".venv"
+    for environment in (source_env, running_env):
+        venv.EnvBuilder(with_pip=False).create(environment)
+        (environment / "protected.dist-info").mkdir()
+        (environment / "protected.dist-info" / "METADATA").write_text("keep", encoding="utf-8")
+    subprocess.run(["uv", "lock", "--offline"], cwd=candidate, check=True,
+                   capture_output=True, text=True)
+    before = {path: (path.stat().st_mtime_ns, sorted(p.name for p in path.iterdir()))
+              for path in (source_env, running_env)}
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(source_env))
+    monkeypatch.setenv("VIRTUAL_ENV", str(running_env))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "stale-checkout"))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "stale-python"))
+    releases._build_venv(candidate)
+    assert releases._release_python(candidate).is_file()
+    assert all((path.stat().st_mtime_ns, sorted(p.name for p in path.iterdir())) == snapshot
+               for path, snapshot in before.items())
+    assert all((path / "protected.dist-info" / "METADATA").read_text(encoding="utf-8") == "keep"
+               for path in (source_env, running_env))
+
+
 def test_prepare_venv_changed_lock_builds_fresh(tmp_path, monkeypatch):
     old, new = tmp_path / "old", tmp_path / "new"
     _fake_release(old, "old", lock="old")
@@ -723,6 +754,22 @@ def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path):
     (plugin / "__init__.py").write_text(
         "raise RuntimeError('incompatible model provider')\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="incompatible model provider"):
+        releases.smoke_plugins(Path(__file__).resolve().parents[2], home)
+
+
+def test_candidate_smoke_cannot_pass_via_inherited_stale_pythonpath(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "broken"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [broken]\n", encoding="utf-8")
+    (plugin / "plugin.yaml").write_text("name: broken\nversion: '1.0'\n", encoding="utf-8")
+    (plugin / "__init__.py").write_text("raise RuntimeError('candidate plugin broken')\n", encoding="utf-8")
+    stale = tmp_path / "stale" / "hermes_cli"
+    stale.mkdir(parents=True)
+    (stale / "__init__.py").write_text("", encoding="utf-8")
+    (stale / "immutable_releases.py").write_text("# stale copy bypasses candidate smoke\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(stale.parent))
+    with pytest.raises(RuntimeError, match="candidate plugin broken"):
         releases.smoke_plugins(Path(__file__).resolve().parents[2], home)
 
 
