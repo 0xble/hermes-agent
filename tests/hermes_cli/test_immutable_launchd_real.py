@@ -319,13 +319,13 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         updated_receipt = update_receipt.finalize_update_receipt("success")
         assert updated_receipt is not None
         recorded = json.loads(updated_receipt.read_text(encoding="utf-8"))
-        # Recovery completes the pending migration before the updater records
-        # its step; that receipt classifies the already-moved pointer as promotion.
-        assert any(s["name"] == "immutable_release" and "migration=False" in s["detail"]
+        # Recovery preserves the operation identity for the receipt: an
+        # interrupted migration remains a migration after its reload succeeds.
+        assert any(s["name"] == "immutable_release" and "migration=True" in s["detail"]
                    and sha_b in s["detail"] for s in recorded["steps"])
         assert recorded["release_transition"] == {
             "from_sha": sha_a, "to_sha": sha_b, "from_path": str(source),
-            "to_path": str(b), "kind": "promotion",
+            "to_path": str(b), "kind": "migration",
         }
         assert (home / "current").resolve() == b
         assert (home / "previous").resolve() == source

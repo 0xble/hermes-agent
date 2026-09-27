@@ -689,7 +689,10 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         if operation == "first-migration-rollback":
             return {"current": record["source"], "previous": record["current_original"],
                     "source_sha": record["source_sha"]}
-        return {"current": record["candidate"], "previous": record["previous_intended"]}
+        result = {"current": record["candidate"], "previous": record["previous_intended"]}
+        if operation == "first-migration":
+            result["source_sha"] = record["source_sha"]
+        return result
     for name, expected in (("current", record["current_original"]),
                            ("previous", record["previous_original"])):
         actual = _pointer_value(getattr(paths, name))
@@ -726,6 +729,8 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         if plist and "intended_body" in plist:
             _ensure_plist_intent(plist)
         result = {"current": str(candidate), "previous": record["previous_intended"]}
+        if operation == "first-migration":
+            result["source_sha"] = record["source_sha"]
     if record.get("requires_reload") and not record.get("reload_done"):
         if reload_callback is None:
             raise RuntimeError("pending release transaction requires its launchd refresh callback")
