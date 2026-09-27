@@ -94,6 +94,7 @@ def test_deferred_first_migration_stages_but_does_not_activate(tmp_path, monkeyp
     assert not (home / "current").exists()
 
 
+@pytest.mark.macos_only
 def test_equal_pointer_with_stale_service_repairs_on_noop(tmp_path, monkeypatch):
     from hermes_cli import immutable_releases as releases, gateway
     home = tmp_path / "profile"
