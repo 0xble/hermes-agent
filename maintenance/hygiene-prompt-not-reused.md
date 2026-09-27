@@ -31,6 +31,8 @@ The repair command defaults to reporting. Automatic application needs positive
 `skill_manage` pin evidence and skips missing, malformed, or memory-only pins.
 Explicit session selection retains upstream's documented override. The fork additionally
 compares the scanned prompt and pin atomically before clearing, preserving live replacements.
+This conditional repair is proposed upstream in
+[PR #125569](https://github.com/NousResearch/hermes-agent/pull/125569).
 Source adoption does not assert that any production historical row has been repaired.
 
 ## Verification

@@ -46,8 +46,8 @@ Failed or interrupted model turns do not run completion judging.
   mutation carries a fresh token, including pause/resume cycles returning to equal values.
   Stale evaluations and failed persistence never authorize continuation. Commands remain
   authoritative before evaluation, during gates/judging, and at the final write boundary.
-  This completes the narrower read-before-write guard in our upstream
-  [PR #124017](https://github.com/NousResearch/hermes-agent/pull/124017).
+  Our upstream [PR #124017](https://github.com/NousResearch/hermes-agent/pull/124017)
+  now carries this complete atomic settlement and mutation-token contract.
   Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_evaluation_atomic.py
   tests/hermes_cli/test_goals.py tests/hermes_cli/test_goal_gates.py`.
 
