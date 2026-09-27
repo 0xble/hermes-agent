@@ -68,8 +68,11 @@ FINAL_TWO = "Summary: the canary was read (FINAL-TWO)"
 LATE_TEXT = "LATE-ANSWER-65788"
 # ACP reports no usage, so Hermes estimates pressure from messages and tool schemas. The
 # bridge/prompt makes the request reach ~17,866 tokens after the FIRST read_file result;
-# at 19,000 the fourth ~540-token result crosses the cap, leaving an old tool pair
-# summarizable outside the protected active tail. The fixed prefix is not summarizable.
+# at 19,000 the fourth ~540-token result crosses the cap, leaving file 2's tool
+# pair eligible for summary. The fixed prefix is not summarizable; the default
+# protect_first_n=3 keeps the first user/assistant/tool rows verbatim, and the
+# default lean tail keeps the latest result (see ContextCompressor._protect_head_size
+# and _find_tail_cut_by_tokens in agent/context_compressor.py).
 COMPACT_THRESHOLD = 19_000
 COMPACT_FILES = 8
 COMPACT_ASK = "Read f1.txt through f8.txt one by one, then say done (COMPACT-ASK)."
@@ -155,8 +158,7 @@ def _compaction(root: Path) -> Scenario:
         f"call_f{i}", "read_file", {"path": str(project / f"f{i}.txt")}))] for i in range(1, COMPACT_FILES + 1)]
     fake = acp.AcpFake(root / "acp", [*turns, [acp.message(FINAL_COMPACT)]], models=MODELS, aux_text=SUMMARY)
     nh = make_home(root, {"provider": "copilot-acp", "default": CONFIGURED_MODEL}, env_file=fake.env(),
-                   extra_config={"compression": {"threshold_tokens": COMPACT_THRESHOLD, "protect_first_n": 0,
-                                                 "protect_last_n": 4, "tail_mode": "legacy"}})
+                   extra_config={"compression": {"threshold_tokens": COMPACT_THRESHOLD, "protect_last_n": 4}})
     for i in range(1, COMPACT_FILES + 1):
         (nh.project / f"f{i}.txt").write_text(f"file {i} " + "lorem ipsum dolor " * 250 + "\n", encoding="utf-8")
     sc = Scenario(nh, fake)
@@ -294,12 +296,15 @@ def test_compaction_in_an_acp_session_keeps_the_next_prompt_valid_and_grounded(o
     assert sc.fake.invalid() == [], f"requests rejected by the ACP schema: {sc.fake.invalid()}"
     aux = sc.fake.aux_prompts()
     assert aux, "compaction never called the summarizer through the ACP provider"
-    assert "file 1 lorem" in acp.prompt_text(aux[0]), "the summarizer did not receive the history to compact"
+    assert "file 2 lorem" in acp.prompt_text(aux[0]), "the summarizer did not receive the history to compact"
     after = [r for r in sc.fake.main_prompts() if r["t"] > aux[0]["t"]]
     assert after, "no main-turn call followed the compaction"
     final = _transcript(after[-1])
     assert SUMMARY in final and COMPACT_ASK in final, "post-compaction prompt lost the summary or the user's ask"
     assert f"file {COMPACT_FILES} lorem" in final, "post-compaction prompt lost the latest tool result"
+    # File 1 is protected by the default head on the first compaction but can
+    # enter a later summary: _effective_protect_first_n decays after compression.
+    # File 2 is eligible in the first pass and must not be resent verbatim.
     assert "file 2 lorem" not in final, "summarized tool output is still resent after compaction"
     rows = messages(sc.nh, latest_session(sc.nh))
     assert_no_duplicate_assistant_text(rows, FINAL_COMPACT)
