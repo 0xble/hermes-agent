@@ -42,13 +42,13 @@ def _claude_agent(provider: str = "custom:claude-proxy", base_url: str = PROXY):
 
 
 def _claude_kwargs(agent=None) -> dict:
-    from agent.chat_completion_helpers import _anthropic_fast_route_opted_in
+    from agent.chat_completion_helpers import _anthropic_fast_route_supported
 
     agent = agent or _claude_agent()
     return build_anthropic_kwargs(
         model=CLAUDE_MODEL, messages=[{"role": "user", "content": "hi"}], tools=None,
         max_tokens=64, reasoning_config=None, base_url=agent._anthropic_base_url, fast_mode=True,
-        fast_route_opted_in=_anthropic_fast_route_opted_in(agent))
+        fast_route_supported=_anthropic_fast_route_supported(agent))
 
 
 def test_opted_in_codex_proxy_receives_priority_and_the_warning_stops():
@@ -169,3 +169,39 @@ def test_opt_in_is_read_from_the_active_profile_home(tmp_path):
     assert priority_in("a") == {"service_tier": "priority"}
     assert priority_in("b") is None
     assert priority_in("a") == {"service_tier": "priority"}
+
+
+def test_custom_route_at_anthropics_hostname_still_needs_the_opt_in():
+    """Pointing a custom provider at api.anthropic.com does not bypass capabilities.fast_mode."""
+    from hermes_constants import get_hermes_home
+
+    native = "https://api.anthropic.com"
+    config = {"providers": {"anthropic-direct": {"base_url": native, "api_mode": "anthropic_messages"}}}
+    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    agent = _claude_agent("custom:anthropic-direct", base_url=native)
+    assert "speed" not in (_claude_kwargs(agent).get("extra_body") or {})
+
+
+def test_native_anthropic_route_keeps_fast():
+    from types import SimpleNamespace
+
+    native = "https://api.anthropic.com"
+    agent = SimpleNamespace(model=CLAUDE_MODEL, provider="anthropic", requested_provider="anthropic",
+                            base_url=native, _anthropic_base_url=native)
+    assert _claude_kwargs(agent)["extra_body"]["speed"] == "fast"
+
+
+def test_fallback_onto_a_closed_sibling_drops_a_carried_speed_override():
+    """Fallback rewrites the route identity with the URL; a speed override pinned for the opted-in
+    primary must not reach the closed sibling it falls back to."""
+    from hermes_constants import get_hermes_home
+
+    config = {"providers": {
+        "claude-fast": {"base_url": PROXY, "api_mode": "anthropic_messages", "capabilities": {"fast_mode": True}},
+        "claude-std": {"base_url": PROXY, "api_mode": "anthropic_messages"},
+    }}
+    (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    agent = _claude_agent("custom:claude-fast")
+    assert _claude_kwargs(agent)["extra_body"]["speed"] == "fast"
+    agent.provider = agent.requested_provider = "custom:claude-std"   # as fallback activation assigns
+    assert "speed" not in (_claude_kwargs(agent).get("extra_body") or {})
