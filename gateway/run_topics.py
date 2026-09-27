@@ -10,7 +10,6 @@ import re
 import time
 from contextlib import suppress
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from agent.compaction_display import project_compaction_message_for_display
@@ -525,13 +524,19 @@ class GatewayTopicThreadsMixin:
         if not session_key:
             logger.info("Explicit /title rename skipped for topic %s: topic not bound yet", thread)
             return False
-        entry = SimpleNamespace(session_key=session_key, session_id=session_id)
         try:
-            await asyncio.to_thread(self._record_telegram_topic_binding, source, entry)
+            await self._session_db.bind_telegram_topic(
+                chat_id=str(source.chat_id), thread_id=str(thread), user_id=str(source.user_id or ""),
+                session_key=session_key, session_id=session_id,
+                profile_name=self._telegram_topic_profile_name(source), only_if_unbound=True,
+            )
         except ValueError:
             logger.info("Explicit /title rename skipped for topic %s: session bound to another topic", thread)
             return False
-        return await self._telegram_topic_bound_to(source, session_id)
+        if not await self._telegram_topic_bound_to(source, session_id):
+            logger.info("Explicit /title rename skipped for topic %s: another session bound it first", thread)
+            return False
+        return True
 
     async def _telegram_topic_bound_to(self, source: SessionSource, session_id: str) -> bool:
         binding = await self._session_db.get_telegram_topic_binding(

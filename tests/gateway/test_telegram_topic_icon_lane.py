@@ -249,3 +249,23 @@ async def test_explicit_title_does_not_move_a_session_linked_to_another_topic(tm
     adapter.rename_dm_topic.assert_not_awaited()
     assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id="78") is None
     assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id=THREAD)["session_id"] == "sess-1"
+
+
+@pytest.mark.anyio
+async def test_explicit_title_claim_loses_to_a_binder_that_wins_the_race(tmp_path):
+    """Another path binds the topic between /title's unbound check and its claim.
+
+    The claim must not overwrite that owner, and the rename must be skipped."""
+    runner, adapter, db = _unbound_runner(tmp_path)
+    db.create_session("new-owner", source="telegram")
+    real_bind = db.bind_telegram_topic
+
+    def bind_after_competitor(**kwargs):
+        real_bind(chat_id=CHAT, thread_id=THREAD, user_id=USER, session_key="k2", session_id="new-owner")
+        return real_bind(**kwargs)
+
+    db.bind_telegram_topic = bind_after_competitor
+    assert await runner._rename_telegram_topic_explicit(
+        _source(), "sess-1", "Loop Engineering", session_key="k") is False
+    adapter.rename_dm_topic.assert_not_awaited()
+    assert db.get_telegram_topic_binding(chat_id=CHAT, thread_id=THREAD)["session_id"] == "new-owner"
