@@ -2097,6 +2097,23 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
                 if _ur._current is not None:
                     _ur._current.data["runtime_outcomes"] = _runtime_outcomes
 
+    # Destructive retention is the last update step: never prune on partial
+    # health, a deferred restart, or an unverified candidate. A failed prune
+    # records a warning without turning a healthy promotion into failure.
+    if not restart.incomplete and update_complete:
+        try:
+            from hermes_cli.immutable_releases import retain, resolved_release
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+            if resolved_release(home) is not None:
+                removed = retain(home)
+                from hermes_cli.update_receipt import record_step
+                record_step("release_retention", True, f"removed={len(removed)}: {', '.join(map(str, removed))}")
+        except Exception as exc:
+            logger.warning("Immutable release retention failed after verification: %s", exc, exc_info=True)
+            from hermes_cli.update_receipt import record_step
+            record_step("release_retention", False, str(exc))
+
     with _best_effort('Update receipt finalize failed: %s'):
         from hermes_cli.update_receipt import finalize_update_receipt
         _receipt_path = finalize_update_receipt(

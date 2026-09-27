@@ -134,7 +134,28 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
                 return None
         monkeypatch.setattr(update_receipt, "_socket_identity", real_process_socket_identity)
         monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-        update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+        # Real update/rollback verification must invoke retention, not only
+        # unit-call retain(). Protect a live worker cwd and an explicit receipt.
+        extra = []
+        for i in range(7):
+            old = home / "releases" / f"old-{i}"
+            old.mkdir()
+            (old / ".release-ready").write_text(old.name + "\n")
+            os.utime(old, (i + 1, i + 1))
+            extra.append(old)
+        pins_dir = home / "logs" / "update_receipts"
+        pins_dir.mkdir(parents=True, exist_ok=True)
+        (pins_dir / "worker-pin.json").write_text(json.dumps({"release_path": str(extra[1])}))
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=extra[0])
+        import psutil
+        try:
+            assert Path(psutil.Process(worker.pid).cwd()).resolve() == extra[0]
+            update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+            assert extra[0].exists() and extra[1].exists()
+            assert not extra[2].exists()  # oldest unpinned, pruned by update
+        finally:
+            worker.terminate()
+            worker.wait(timeout=5)
         rolled_back = observed("A", b["pid"])
         assert rolled_back["pid"] != b["pid"]
         assert (home / "current").resolve() == home / "releases" / sha_a
@@ -228,6 +249,23 @@ def test_first_migration_and_source_plist_reversal_real_process(tmp_path, monkey
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=15)
         a = observed("source")
+        # Inject failure after the candidate plist is written, before launchd
+        # adopts it. Both durable bytes and pointers must return to old state.
+        real_refresh = gateway.refresh_launchd_plist_if_needed
+        def failed_refresh():
+            plist_path.write_bytes(replacement)
+            return False
+        monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", failed_refresh)
+        update_receipt.begin_update_receipt()
+        assert update_cmd._activate_immutable_release() is False
+        failed_receipt = update_receipt.finalize_update_receipt("partial")
+        assert failed_receipt is not None
+        assert plist_path.read_bytes() == original
+        assert not (home / "current").exists()
+        assert not (home / "previous").exists()
+        recovered = observed("source", a["pid"])
+        assert Path(recovered["cwd"]).resolve() == source
+        monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", real_refresh)
         update_receipt.begin_update_receipt()
         assert update_cmd._activate_immutable_release()
         updated_receipt = update_receipt.finalize_update_receipt("success")

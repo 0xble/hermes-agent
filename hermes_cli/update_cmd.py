@@ -133,17 +133,45 @@ def _activate_immutable_release() -> bool:
             _record_update_step("immutable_release", True, "skipped: no git revision in mocked/non-git checkout")
             return True
         candidate, action = stage_release(_m().PROJECT_ROOT, home, sha=sha)
-        first = read_pointer(ReleasePaths.for_home(home).current) is None
+        paths = ReleasePaths.for_home(home)
+        old_current, old_previous = read_pointer(paths.current), read_pointer(paths.previous)
+        first = old_current is None
         plist = None
+        original_plist = None
+        if sys.platform == "darwin":
+            from hermes_cli import gateway
+            plist = gateway.get_launchd_plist_path()
+            if plist.exists():
+                original_plist = plist.read_bytes()
         if first:
-            from hermes_cli import gateway
-            plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
             begin_migration(home, _m().PROJECT_ROOT, plist)
-        result = promote(home, candidate)
-        if first and sys.platform == "darwin" and plist is not None and plist.exists():
-            from hermes_cli import gateway
-            if not gateway.refresh_launchd_plist_if_needed() or not gateway.launchd_plist_is_current():
-                raise RuntimeError("release pointer switched but launchd definition did not reload")
+        # The generated definition resolves the current pointer, so it must be
+        # flipped before launchd can load it. A failed reload must undo BOTH
+        # durable changes before returning a partial update.
+        try:
+            result = promote(home, candidate)
+            if original_plist is not None:
+                from hermes_cli import gateway
+                if not gateway.launchd_plist_is_current():
+                    if not gateway.refresh_launchd_plist_if_needed() or not gateway.launchd_plist_is_current():
+                        raise RuntimeError("launchd definition did not reload for the promoted release")
+        except Exception:
+            from hermes_cli.immutable_releases import _atomic_symlink
+            # Restore the pointer before loading the original definition: even a
+            # deferred reload must never spawn the failed candidate via `current`.
+            if old_current is None:
+                paths.current.unlink(missing_ok=True)
+            else:
+                _atomic_symlink(paths.current, old_current)
+            if old_previous is None:
+                paths.previous.unlink(missing_ok=True)
+            else:
+                _atomic_symlink(paths.previous, old_previous)
+            if original_plist is not None and plist.read_bytes() != original_plist:
+                from hermes_cli import gateway_launchd
+                if not gateway_launchd.restore_launchd_plist(original_plist) or plist.read_bytes() != original_plist:
+                    raise RuntimeError("launchd reload failed and original service definition could not be restored")
+            raise
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
         record_release_transition(

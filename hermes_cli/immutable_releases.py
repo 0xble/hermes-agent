@@ -233,8 +233,12 @@ def _receipt_pins(home: Path) -> set[Path]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        # Successful historical transitions are audit records, not permanent
+        # rollback leases: pinning every from/to path across the receipt archive
+        # would prevent pruning on every normal update. Keep unresolved/failed
+        # transitions, plus explicit release pins in any receipt below.
         transition = data.get("release_transition") or {}
-        if isinstance(transition, dict):
+        if data.get("outcome") != "success" and isinstance(transition, dict):
             for field in ("from_path", "to_path"):
                 raw_path = transition.get(field)
                 if isinstance(raw_path, str) and raw_path:

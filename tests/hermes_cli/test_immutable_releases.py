@@ -130,6 +130,39 @@ r.promote(home, candidate, before_flip=pause)
                 child.kill()
                 child.wait(timeout=5)
 
+def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_path, monkeypatch):
+    """A split pointer/plist left by an interrupted update is repaired on retry."""
+    from hermes_cli import gateway, gateway_launchd, update_cmd
+    home = tmp_path / "profile"
+    a, b = home / "releases" / "a", home / "releases" / "b"
+    _fake_release(a, "a")
+    _fake_release(b, "b")
+    releases.promote(home, a)
+    plist = tmp_path / "test.plist"
+    plist.write_bytes(b"source")
+    monkeypatch.setattr(update_cmd.sys, "platform", "darwin")
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(releases, "release_sha", lambda path: "b")
+    monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: (b, "existing"))
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist.read_bytes() == b"candidate")
+    monkeypatch.setattr(gateway_launchd, "restore_launchd_plist", lambda body: plist.write_bytes(body) or True)
+    def fail():
+        plist.write_bytes(b"candidate")
+        return False
+    monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", fail)
+    assert not update_cmd._activate_immutable_release()
+    assert (home / "current").resolve() == a
+    assert not (home / "previous").exists()
+    assert plist.read_bytes() == b"source"
+    monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", lambda: plist.write_bytes(b"candidate") or True)
+    assert update_cmd._activate_immutable_release()
+    assert (home / "current").resolve() == b
+    assert (home / "previous").resolve() == a
+    assert plist.read_bytes() == b"candidate"
+
+
 def test_worker_environment_is_resolved_release_not_current(tmp_path):
     home = tmp_path / ".hermes"
     release = home / "releases" / "a"
