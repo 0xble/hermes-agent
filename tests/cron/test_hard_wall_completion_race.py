@@ -63,7 +63,7 @@ thread.join(timeout=4)
 if mode == 'timeout':
     time.sleep(4)  # watchdog must terminate us before this point
     sys.exit(9)
-time.sleep(4)  # completed ledger must retain its result, but process is bounded
+time.sleep(12)  # completed ledger retains its result, watchdog must bound process
 sys.exit(9)
 '''
     marker = tmp_path / "slow-ready"

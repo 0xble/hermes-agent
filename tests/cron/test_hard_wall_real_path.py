@@ -61,6 +61,9 @@ if mode == 'completion-in-flight':
         return original(*args, **kwargs)
     scheduler.save_job_output = slow_save
 result = scheduler.run_one_job(job, hard_wall_fence=fence)
+if not result and 'hard wall-clock timeout' in str((executions.get_execution(job['execution_id']) or {}).get('error')):
+    # The watchdog owns the exit code and descendant teardown; don't race it.
+    time.sleep(5)
 fence.set()
 Path(marker).write_text('returned ' + str(result))
 sys.exit(0 if result else 2)

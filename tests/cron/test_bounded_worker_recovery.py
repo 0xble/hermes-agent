@@ -194,7 +194,7 @@ sys.exit(0 if scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys
                                start_new_session=True, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True)
     try:
-        stdout, stderr = process.communicate(timeout=4)
+        stdout, stderr = process.communicate(timeout=12)
         assert process.returncode == 1, (stdout, stderr)
         token = _home(home)
         try:

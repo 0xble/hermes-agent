@@ -3784,9 +3784,10 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 # still non-daemon and preventing interpreter exit; disarming here
                 # would leave the detached process unbounded. Once that work ends,
                 # normal interpreter shutdown exits without needing the watchdog.
-                if watchdog_stop.timed_out:
-                    # A losing run_job thread must not return exit 1 while the
-                    # watchdog is still reaping descendants for exit 124.
+                terminal = get_execution(execution_id)
+                if terminal and terminal["status"] == "failed" and terminal.get("error") and "hard wall-clock timeout" in terminal["error"]:
+                    # Timeout CAS won; let its watchdog reap descendants and
+                    # terminate with 124, not this returning thread's code 1.
                     threading.Event().wait(4)
                     os._exit(124)
                 if not any(
