@@ -19,10 +19,9 @@ from hermes_cli import update_cmd
 def test_reconcile_matrix(enabled, current, candidate, journal, service, running, defer):
     state = update_cmd._ReleaseReconcileState(enabled, current, candidate, journal, service, running, defer)
     # Physical constraints: an absent current cannot have a current service
-    # or process; a completed migration has a release pointer.
+    # or process. Journal phases alone do not prove pointer reachability;
+    # a crash may have stopped between those two durable writes.
     unreachable = ((current == "absent" and (service == "current" or running == "current"))
-                   or (current != "absent" and journal in {"in-progress", "rolled-back"})
-                   or (current == "absent" and journal == "done")
                    or (current == "different" and journal == "none"))
     if unreachable:
         with pytest.raises(ValueError, match="unreachable"):

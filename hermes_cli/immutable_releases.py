@@ -7,6 +7,7 @@ side-effect explicit so the transactional updater can use it as one stage.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence, Any
 
 # Freeze the package's physical code tree before `current` can change. This is
 # the installation owning the process, not any individual cron profile home.
@@ -526,21 +527,291 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
     return target, "staged"
 
 
-def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str | None]:
+def _sync_dir(path: Path) -> None:
+    """Persist a rename/unlink, not only the bytes in the renamed file."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_bytes(path: Path, body: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        _sync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _atomic_json(path: Path, data: dict[str, Any]) -> None:
+    _atomic_bytes(path, (json.dumps(data, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _txn_path(paths: ReleasePaths) -> Path:
+    return paths.home / "release-txn.json"
+
+
+def _read_txn(paths: ReleasePaths) -> dict[str, Any] | None:
+    path = _txn_path(paths)
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record["version"] != 1 or record["operation"] not in {
+            "promote", "rollback", "first-migration", "first-migration-rollback"
+        }:
+            raise ValueError("unsupported release transaction")
+        return record
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"unreadable release transaction {path}; manual repair required") from exc
+
+
+def _write_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
+    _atomic_json(_txn_path(paths), record)
+
+
+def _finish_txn(paths: ReleasePaths, record: dict[str, Any]) -> None:
+    # Keep a durable completion identity: after the pending record's final unlink,
+    # an immediate CLI --rollback retry must not interpret the newly exchanged
+    # previous pointer as a fresh request to roll back the rollback.
+    _atomic_json(paths.home / "release-last-txn.json", record)
+    # The record is the recovery authority until the final unlink. A crash
+    # between cleanup operations may leave an unreferenced backup, never a
+    # pending record with its required backup missing.
+    _txn_path(paths).unlink(missing_ok=True)
+    _sync_dir(paths.home)
+    plist = record.get("plist")
+    if plist:
+        Path(plist["backup"]).unlink(missing_ok=True)
+        _sync_dir(paths.home)
+
+
+def _pointer_value(path: Path) -> str | None:
+    if path.is_symlink():
+        return str(path.resolve())
+    if path.exists():
+        raise RuntimeError(f"release pointer is not a symlink: {path}")
+    return None
+
+
+def _set_pointer(path: Path, target: str | None) -> None:
+    if _pointer_value(path) == target:
+        return
+    if target is None:
+        path.unlink(missing_ok=True)
+    else:
+        _atomic_symlink(path, Path(target))
+    _sync_dir(path.parent)
+
+
+def _plist_backup(plist_path: Path | None, paths: ReleasePaths) -> dict[str, Any] | None:
+    if plist_path is None or not plist_path.is_file():
+        return None
+    path = plist_path.resolve()
+    body = path.read_bytes()
+    backup = paths.home / f"release-plist-{uuid.uuid4().hex}.backup"
+    _atomic_bytes(backup, body)
+    return {"path": str(path), "backup": str(backup),
+            "sha256": hashlib.sha256(body).hexdigest()}
+
+
+def _plist_intent(plist_path: Path | None, plist_body: bytes | None,
+                  paths: ReleasePaths) -> dict[str, Any] | None:
+    if plist_body is not None and not isinstance(plist_body, bytes):
+        raise TypeError("plist_body must be exact bytes")
+    if plist_path is None:
+        if plist_body is not None:
+            raise ValueError("plist_body requires plist_path")
+        return None
+    if plist_body is None:
+        raise ValueError("plist_path requires precomputed plist_body before transaction")
+    if not plist_path.is_file():
+        raise RuntimeError(f"installed launchd plist missing: {plist_path}")
+    plist = _plist_backup(plist_path, paths)
+    assert plist is not None
+    plist["intended_body"] = base64.b64encode(plist_body).decode("ascii")
+    plist["intended_sha256"] = hashlib.sha256(plist_body).hexdigest()
+    return plist
+
+
+def _ensure_plist_intent(plist: dict[str, Any]) -> None:
+    intended = base64.b64decode(plist["intended_body"], validate=True)
+    if hashlib.sha256(intended).hexdigest() != plist["intended_sha256"]:
+        raise RuntimeError("recorded launchd plist intent failed hash verification")
+    target = Path(plist["path"])
+    if not target.is_file() or target.read_bytes() != intended:
+        _atomic_bytes(target, intended)
+
+
+def _verify_transaction(paths: ReleasePaths, record: dict[str, Any]) -> None:
+    operation = record["operation"]
+    expected_current = None if operation == "first-migration-rollback" else record["candidate"]
+    expected_previous = None if operation == "first-migration-rollback" else record["previous_intended"]
+    if (_pointer_value(paths.current), _pointer_value(paths.previous)) != (expected_current, expected_previous):
+        raise RuntimeError("release pointers differ from transaction intent")
+    journal = record.get("journal_intended")
+    if journal is not None and json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8")) != journal:
+        raise RuntimeError("release layout differs from transaction intent")
+    plist = record.get("plist")
+    if plist and "intended_body" in plist:
+        actual = Path(plist["path"]).read_bytes()
+        if actual != base64.b64decode(plist["intended_body"], validate=True) or hashlib.sha256(actual).hexdigest() != plist["intended_sha256"]:
+            raise RuntimeError("launchd plist differs from transaction intent")
+
+
+def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
+                     reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+    operation = record["operation"]
+    if (record.get("requires_reload") and reload_callback is None
+            and not record.get("reload_done")
+            and not (operation == "first-migration" and record.get("candidate") is None)):
+        raise RuntimeError("pending release transaction requires its launchd refresh callback")
+    plist = record.get("plist")
+    if plist and hashlib.sha256(Path(plist["backup"]).read_bytes()).hexdigest() != plist["sha256"]:
+        raise RuntimeError("launchd plist backup failed hash verification")
+    if plist and "intended_body" in plist:
+        intended = base64.b64decode(plist["intended_body"], validate=True)
+        if hashlib.sha256(intended).hexdigest() != plist["intended_sha256"]:
+            raise RuntimeError("recorded launchd plist intent failed hash verification")
+    if record.get("reload_done"):
+        # A completed external reload is not repeatable merely because its
+        # on-disk input was subsequently tampered with. Fail closed instead of
+        # rewriting the plist and silently skipping the launchctl operation.
+        _verify_transaction(paths, record)
+        _finish_txn(paths, record)
+        if operation == "first-migration-rollback":
+            return {"current": record["source"], "previous": record["current_original"],
+                    "source_sha": record["source_sha"]}
+        return {"current": record["candidate"], "previous": record["previous_intended"]}
+    for name, expected in (("current", record["current_original"]),
+                           ("previous", record["previous_original"])):
+        actual = _pointer_value(getattr(paths, name))
+        intended = (None if operation == "first-migration-rollback" else
+                    (record.get("candidate") if name == "current" else record["previous_intended"]))
+        if actual not in (expected, intended):
+            raise RuntimeError(f"release {name} pointer diverged during transaction: {actual}")
+    if operation == "first-migration" and record.get("candidate") is None:
+        journal = record["journal_intended"]
+        _atomic_json(paths.home / "release-layout.json", journal)
+        _set_pointer(paths.previous, record["previous_intended"])
+        return {"current": None, "previous": record["previous_intended"]}
+
+    if operation == "first-migration-rollback":
+        source = Path(record["source"])
+        if not source.is_dir() or release_sha(source) != record["source_sha"]:
+            raise RuntimeError("source checkout changed since migration; refusing unsafe rollback")
+        _set_pointer(paths.current, None)
+        _set_pointer(paths.previous, None)
+        if record.get("journal_intended") is not None:
+            _atomic_json(paths.home / "release-layout.json", record["journal_intended"])
+        if plist:
+            _ensure_plist_intent(plist)
+        result = {"current": record["source"], "previous": record["current_original"],
+                  "source_sha": record["source_sha"]}
+    else:
+        candidate = Path(record["candidate"])
+        if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
+            raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
+        if record.get("journal_intended") is not None:
+            _atomic_json(paths.home / "release-layout.json", record["journal_intended"])
+        _set_pointer(paths.previous, record["previous_intended"])
+        _set_pointer(paths.current, str(candidate))
+        if plist and "intended_body" in plist:
+            _ensure_plist_intent(plist)
+        result = {"current": str(candidate), "previous": record["previous_intended"]}
+    if record.get("requires_reload") and not record.get("reload_done"):
+        if reload_callback is None:
+            raise RuntimeError("pending release transaction requires its launchd refresh callback")
+        if reload_callback() is False:
+            raise RuntimeError("launchd refresh callback failed")
+        _verify_transaction(paths, record)
+        record["reload_done"] = True
+        _write_txn(paths, record)
+    _verify_transaction(paths, record)
+    _finish_txn(paths, record)
+    return result
+
+
+def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] | None = None
+                                ) -> dict[str, str | None] | None:
+    """Converge the recorded intent, never infer an inverse from partial pointers."""
     paths = ReleasePaths.for_home(home)
-    candidate = candidate.resolve()
+    record = _read_txn(paths)
+    if record is None:
+        return None
+    return _run_transaction(paths, record, reload_callback)
+
+
+def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
+                     source_python: Path | None = None,
+                     plist_path: Path | None = None, plist_body: bytes | None = None,
+                     reload_callback: Callable[[], Any] | None = None,
+                     before_flip: Callable[[], Any] | None = None,
+                     operation: str = "promote", force_reload: bool = False) -> dict[str, str | None]:
+    """Persist the exact pointers, layout and plist bytes before any live mutation.
+
+    plist_body is the fully rendered *target* definition. The core writes those
+    bytes atomically; reload_callback only reloads launchd and returns False on
+    failure. It must tolerate retry after a crash before reload_done is durable.
+    """
+    paths = ReleasePaths.for_home(home)
+    candidate = Path(candidate).resolve()
     if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
         raise ValueError(f"candidate is not a complete release under {paths.releases}: {candidate}")
-    old = read_pointer(paths.current)
-    if old == candidate:
-        return {"current": str(candidate), "previous": str(read_pointer(paths.previous)) if read_pointer(paths.previous) else None}
-    if old:
-        _atomic_symlink(paths.previous, old)
+    if operation not in {"promote", "rollback"}:
+        raise ValueError(f"unsupported activation operation: {operation}")
+    pending = _read_txn(paths)
+    if pending is not None:
+        if pending["operation"] == "first-migration" and pending.get("candidate") is None:
+            if source is not None and str(Path(source).resolve()) != pending["source"]:
+                raise RuntimeError("pending migration belongs to another source")
+            if pending.get("plist") and plist_body is None and (source is not None or reload_callback is not None):
+                raise ValueError("pending migration requires precomputed plist_body")
+            pending["candidate"] = str(candidate)
+            pending["journal_intended"] = dict(pending["journal_intended"], state="done")
+            pending["requires_reload"] = reload_callback is not None
+            if pending.get("plist") and plist_body is not None:
+                pending["plist"]["intended_body"] = base64.b64encode(plist_body).decode("ascii")
+                pending["plist"]["intended_sha256"] = hashlib.sha256(plist_body).hexdigest()
+            _write_txn(paths, pending)
+        else:
+            result = recover_pending_transaction(paths.home, reload_callback)
+            if result and result.get("current") == str(candidate):
+                return result
+            pending = None
+    old = _pointer_value(paths.current)
+    if old == str(candidate) and not force_reload:
+        return {"current": old, "previous": _pointer_value(paths.previous)}
+    if pending is None:
+        if source is not None and old is None:
+            pending = _migration_record(paths, source, plist_path, candidate=candidate,
+                                        plist_body=plist_body, source_python=source_python)
+            pending["requires_reload"] = reload_callback is not None
+        else:
+            plist = _plist_intent(plist_path, plist_body, paths)
+            previous = _pointer_value(paths.previous)
+            pending = {"version": 1, "operation": operation,
+                       "current_original": old, "previous_original": previous,
+                       "candidate": str(candidate), "previous_intended": previous if old == str(candidate) else old or previous,
+                       "journal_original": None, "journal_intended": None,
+                       "requires_reload": reload_callback is not None, "plist": plist}
+        _write_txn(paths, pending)
     if before_flip is not None:
+        # Compatibility hook: call after previous is recorded but before current.
+        _set_pointer(paths.previous, pending["previous_intended"])
         before_flip()
-    _atomic_symlink(paths.current, candidate)
-    previous = old or read_pointer(paths.previous)
-    return {"current": str(candidate), "previous": str(previous) if previous else None}
+    return _run_transaction(paths, pending, reload_callback)
+
+
+def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str | None]:
+    return activate_release(home, candidate, before_flip=before_flip)
 
 
 def _receipt_pins(home: Path) -> set[Path]:
@@ -664,32 +935,25 @@ def source_checkout_python(home: Path, source: Path) -> Path:
         "with hermes_cli installed, then retry the update.")
 
 
-def begin_migration(home: Path, source: Path, plist_path: Path | None = None) -> bool:
-    """Save the original checkout service definition before the first release flip.
-
-    The migration journal and previous pointer survive a process crash; a rerun
-    never replaces the original plist with an already-migrated one.
-    """
-    paths = ReleasePaths.for_home(home)
-    if read_pointer(paths.current) is not None:
-        return False
+def _migration_record(paths: ReleasePaths, source: Path, plist_path: Path | None,
+                      *, candidate: Path | None = None,
+                      plist_body: bytes | None = None,
+                      source_python: Path | None = None) -> dict[str, Any]:
     source = source.resolve(strict=True)
+    source_python = Path(source_python) if source_python is not None else _source_install_python(source, paths.home)
     journal = paths.home / "release-layout.json"
-    if not _source_python_valid(Path(sys.executable), source):
-        raise RuntimeError(f"migration requires an interpreter importing hermes_cli from {source}: {sys.executable}")
-    if journal.exists():
-        data = json.loads(journal.read_text(encoding="utf-8"))
-        if Path(data["source"]).resolve() != source:
+    if not _source_python_valid(source_python, source):
+        raise RuntimeError(f"migration requires a source interpreter importing hermes_cli from {source}: {source_python}")
+    original = json.loads(journal.read_text(encoding="utf-8")) if journal.exists() else None
+    if original is not None:
+        if Path(original["source"]).resolve() != source:
             raise RuntimeError("release migration journal refers to a different checkout")
-        # An interrupted or reversed migration retains the original plist and
-        # source identity. A fresh opt-in can safely use them again.
-        data.setdefault("source_python", sys.executable)
-        data["state"] = "in-progress"
+        data = dict(original)
+        data.setdefault("source_python", str(source_python))
     else:
-        data = {"source": str(source), "source_python": sys.executable,
+        data = {"source": str(source), "source_python": str(source_python),
                 "source_sha": release_sha(source), "plist": None}
         if plist_path is not None and plist_path.exists():
-            import base64
             import plistlib
             raw = plist_path.read_bytes()
             definition = plistlib.loads(raw)
@@ -698,14 +962,39 @@ def begin_migration(home: Path, source: Path, plist_path: Path | None = None) ->
             if definition["Label"] != plist_path.stem:
                 raise RuntimeError("installed plist label does not match its path")
             data["plist"] = {"path": str(plist_path), "body": base64.b64encode(raw).decode("ascii")}
-    journal.parent.mkdir(parents=True, exist_ok=True)
-    tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
-    try:
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        os.replace(tmp, journal)
-    finally:
-        tmp.unlink(missing_ok=True)
-    _atomic_symlink(paths.previous, source)
+    data["state"] = "done" if candidate is not None else "in-progress"
+    plist = (_plist_intent(plist_path, plist_body, paths) if candidate is not None
+             else _plist_backup(plist_path, paths))
+    return {"version": 1, "operation": "first-migration", "source": str(source),
+            "source_sha": data["source_sha"], "candidate": str(candidate) if candidate else None,
+            "current_original": None, "previous_original": _pointer_value(paths.previous),
+            "previous_intended": str(source), "journal_original": original,
+            "journal_intended": data, "plist": plist,
+            "requires_reload": False}
+
+
+def begin_migration(home: Path, source: Path, plist_path: Path | None = None) -> bool:
+    """Save the original checkout service definition before the first release flip.
+
+    The migration journal and previous pointer survive a process crash; a rerun
+    never replaces the original plist with an already-migrated one.
+    """
+    paths = ReleasePaths.for_home(home)
+    pending = _read_txn(paths)
+    if pending is not None:
+        if pending["operation"] != "first-migration" or pending["source"] != str(source.resolve()):
+            recover_pending_transaction(paths.home)
+            return begin_migration(paths.home, source, plist_path)
+        if pending.get("candidate") is None:
+            _run_transaction(paths, pending)
+        else:
+            recover_pending_transaction(paths.home)
+        return True
+    if read_pointer(paths.current) is not None:
+        return False
+    record = _migration_record(paths, source, plist_path)
+    _write_txn(paths, record)
+    _run_transaction(paths, record)
     return True
 
 
@@ -714,17 +1003,22 @@ def set_migration_state(home: Path, state: str) -> None:
     journal = ReleasePaths.for_home(home).home / "release-layout.json"
     data = json.loads(journal.read_text(encoding="utf-8"))
     data["state"] = state
-    tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
-    try:
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        os.replace(tmp, journal)
-    finally:
-        tmp.unlink(missing_ok=True)
+    pending = _read_txn(ReleasePaths.for_home(home))
+    if pending is not None and pending["operation"] == "first-migration":
+        pending["journal_intended"] = data
+        _write_txn(ReleasePaths.for_home(home), pending)
+    _atomic_json(journal, data)
 
 
-def restore_source_layout(home: Path) -> dict[str, str | None]:
-    """Reverse the first migration, preserving the candidate as previous."""
+def restore_source_layout(home: Path, *, plist_path: Path | None = None,
+                          reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+    """Finish a first-migration rollback, including after interrupted unlinks."""
     paths = ReleasePaths.for_home(home)
+    pending = _read_txn(paths)
+    if pending is not None:
+        if pending["operation"] == "first-migration-rollback":
+            return _run_transaction(paths, pending, reload_callback)
+        recover_pending_transaction(paths.home, reload_callback)
     journal = paths.home / "release-layout.json"
     data = json.loads(journal.read_text(encoding="utf-8"))
     source = Path(data["source"]).resolve(strict=True)
@@ -735,19 +1029,25 @@ def restore_source_layout(home: Path) -> dict[str, str | None]:
     current = read_pointer(paths.current)
     if current is None or current.parent != paths.releases.resolve():
         raise RuntimeError("there is no current release to reverse")
-    # The original source and its interpreter were never changed. Remove the
-    # release pointers: a source symlink masquerading as current would allow a
-    # disabled update to promote again. Keep the artifact itself for diagnostics.
-    paths.current.unlink(missing_ok=True)
-    paths.previous.unlink(missing_ok=True)
-    data["state"] = "rolled-back"
-    tmp = journal.with_name(f".{journal.name}.tmp-{os.getpid()}")
-    try:
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        os.replace(tmp, journal)
-    finally:
-        tmp.unlink(missing_ok=True)
-    return {"current": str(source), "previous": str(current), "source_sha": data["source_sha"]}
+    intended = dict(data, state="rolled-back")
+    plist = None
+    if data.get("plist"):
+        import base64
+        original = base64.b64decode(data["plist"]["body"], validate=True)
+        backup = paths.home / f"release-plist-{uuid.uuid4().hex}.backup"
+        _atomic_bytes(backup, original)
+        plist = {"path": data["plist"]["path"], "backup": str(backup),
+                 "sha256": hashlib.sha256(original).hexdigest(),
+                 "intended_body": base64.b64encode(original).decode("ascii"),
+                 "intended_sha256": hashlib.sha256(original).hexdigest()}
+    record = {"version": 1, "operation": "first-migration-rollback",
+              "source": str(source), "source_sha": data["source_sha"],
+              "current_original": str(current), "previous_original": str(source),
+              "candidate": None, "previous_intended": None,
+              "journal_original": data, "journal_intended": intended, "plist": plist,
+              "requires_reload": reload_callback is not None}
+    _write_txn(paths, record)
+    return _run_transaction(paths, record, reload_callback)
 
 
 def migration_plist(home: Path) -> tuple[Path, bytes] | None:
@@ -759,14 +1059,39 @@ def migration_plist(home: Path) -> tuple[Path, bytes] | None:
     return Path(data["plist"]["path"]), base64.b64decode(data["plist"]["body"], validate=True)
 
 
-def rollback(home: Path) -> dict[str, str | None]:
+def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | None = None,
+             reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
+    pending = _read_txn(paths)
+    if pending is not None:
+        operation = pending["operation"]
+        result = recover_pending_transaction(paths.home, reload_callback)
+        if operation in {"rollback", "first-migration-rollback"}:
+            assert result is not None
+            return result
+    # An os._exit immediately after the pending record's deletion is also an
+    # interrupted CLI invocation. Repeating it cannot reverse the completed
+    # rollback merely because previous now identifies the old current.
+    last_path = paths.home / "release-last-txn.json"
+    if last_path.is_file():
+        last = json.loads(last_path.read_text(encoding="utf-8"))
+        if last.get("operation") in {"rollback", "first-migration-rollback"}:
+            try:
+                _verify_transaction(paths, last)
+            except (OSError, RuntimeError, ValueError):
+                pass  # The observed state changed; this is a distinct transition.
+            else:
+                if last["operation"] == "first-migration-rollback":
+                    return {"current": last["source"], "previous": last["current_original"],
+                            "source_sha": last["source_sha"]}
+                return {"current": last["candidate"], "previous": last["previous_intended"]}
     previous = read_pointer(paths.previous)
     if previous is None:
         raise RuntimeError("no previous release is available")
     if previous.parent != paths.releases.resolve():
-        return restore_source_layout(home)
-    return promote(paths.home, previous)
+        return restore_source_layout(home, plist_path=plist_path, reload_callback=reload_callback)
+    return activate_release(paths.home, previous, plist_path=plist_path, plist_body=plist_body,
+                            reload_callback=reload_callback, operation="rollback")
 
 
 def resolved_release(home: Path) -> Path | None:

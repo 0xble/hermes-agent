@@ -328,24 +328,43 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
-def generate_launchd_plist() -> str:
+def generate_launchd_plist(release_target: Path | None = None) -> str:
+    """Render a candidate definition without moving ``current`` first.
+
+    The release updater must persist these exact bytes in its write-ahead record
+    before changing pointers. Normal callers retain the existing service output.
+    """
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
-    working_dir = _gw()._stable_service_working_dir()
+    working_dir = str(_gw().get_hermes_home() / "current") if release_target else _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
     log_dir = _gw().get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = _gw().get_launchd_label()
-    venv_dir = _gw()._service_venv_dir()
+    venv_dir = (str(_gw().get_hermes_home() / "current" / ".venv")
+                if release_target else _gw()._service_venv_dir())
     # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
     # systemd unit) so node stays resolvable even if the shell PATH changes, then the shell PATH.
     priority_dirs = _gw()._build_service_path_dirs()
+    if release_target:
+        root = Path(release_target)
+        if not (root / ".venv" / "bin" / "python").is_file():
+            raise RuntimeError(f"candidate launchd interpreter unavailable: {root}")
+        priority_dirs = [str(_gw().get_hermes_home() / "current" / ".venv" / "bin"),
+                         *[entry for entry in priority_dirs if entry != str(root / ".venv" / "bin")]]
     _gw()._append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
-    command = _timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
+    command = (_timestamped_stderr_gateway_command(stderr_log, external_supervisor=True)
+               if release_target is None else [
+                   str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python"),
+                   "-m", "hermes_cli.stderr_timestamp", "--error-log", str(stderr_log), "--",
+                   str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python"),
+                   "-m", "hermes_cli.main", *_gw()._profile_arg().split(),
+                   "gateway", "run", "--external-supervisor",
+               ])
     prog_args_xml = "\n        ".join(
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
     )

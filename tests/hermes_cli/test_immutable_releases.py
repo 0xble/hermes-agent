@@ -608,7 +608,7 @@ r.promote(home, candidate, before_flip=pause)
 
 @pytest.mark.macos_only
 def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_path, monkeypatch):
-    """A split pointer/plist left by an interrupted update is repaired on retry."""
+    """A failed reload leaves a durable roll-forward transaction for retry."""
     from hermes_cli import gateway, gateway_launchd, update_cmd
     home = tmp_path / "profile"
     a, b = home / "releases" / "a", home / "releases" / "b"
@@ -623,21 +623,20 @@ def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_pat
     monkeypatch.setattr(releases, "release_sha", lambda path: "b")
     monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: (b, "existing"))
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway, "generate_launchd_plist", lambda **kwargs: "candidate")
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda: plist.read_bytes() == b"candidate")
-    monkeypatch.setattr(gateway_launchd, "restore_launchd_plist", lambda body: plist.write_bytes(body) or True)
-    def fail():
-        plist.write_bytes(b"candidate")
-        return False
-    monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", fail)
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: False)
     assert not update_cmd._activate_immutable_release()
-    assert (home / "current").resolve() == a
-    assert not (home / "previous").exists()
-    assert plist.read_bytes() == b"source"
-    monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", lambda: plist.write_bytes(b"candidate") or True)
+    assert (home / "current").resolve() == b
+    assert (home / "previous").resolve() == a
+    assert plist.read_bytes() == b"candidate"
+    assert (home / "release-txn.json").exists()
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda path: True)
     assert update_cmd._activate_immutable_release()
     assert (home / "current").resolve() == b
     assert (home / "previous").resolve() == a
     assert plist.read_bytes() == b"candidate"
+    assert not (home / "release-txn.json").exists()
 
 
 def test_worker_environment_is_resolved_release_not_current(tmp_path):
@@ -992,7 +991,7 @@ def test_promote_and_rollback_refuse_mismatched_build_stamp(tmp_path):
 
 
 
-def test_update_journals_source_sha_before_checkout_advances(tmp_path, monkeypatch):
+def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway, update_cmd
     source, home, remote = tmp_path / "source", tmp_path / "profile", tmp_path / "origin.git"
@@ -1025,18 +1024,20 @@ def test_update_journals_source_sha_before_checkout_advances(tmp_path, monkeypat
     monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
     def inspect_before_stage(*args, **kwargs):
-        assert json.loads((home / "release-layout.json").read_text())["source_sha"] == sha_a
+        assert not (home / "release-layout.json").exists()
+        assert not (home / "release-txn.json").exists()
         assert releases.release_sha(source) == sha_a
-        raise RuntimeError("journal observed before release stage")
+        raise RuntimeError("staged before release transaction")
     monkeypatch.setattr(releases, "stage_release", inspect_before_stage)
-    with pytest.raises(RuntimeError, match="journal observed before release stage"):
+    with pytest.raises(RuntimeError, match="staged before release transaction"):
         update_cmd._cmd_update_impl(SimpleNamespace(rollback=False), gateway_mode=False)
     assert releases.release_sha(source) == sha_a
-    # A reversed migration is explicit state, not a current symlink to source.
-    journal = json.loads((home / "release-layout.json").read_text(encoding="utf-8"))
-    journal["state"] = "rolled-back"
+    # Model an already completed and reversed legacy migration explicitly;
+    # begin_migration deliberately leaves a pending transaction until promotion.
+    journal = {"source": str(source), "source_python": sys.executable,
+               "source_sha": sha_a, "plist": None, "state": "rolled-back"}
+    home.mkdir(parents=True, exist_ok=True)
     (home / "release-layout.json").write_text(json.dumps(journal), encoding="utf-8")
-    (home / "previous").unlink()
     monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": False})
     def legacy_checkout(*args, **kwargs):
         assert not (home / "current").exists() and not (home / "previous").exists()

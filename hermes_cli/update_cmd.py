@@ -171,11 +171,26 @@ def _immutable_release_enabled(paths=None) -> bool:
     return bool(_updates_config().get("immutable_releases", False) or resolved_release(paths.home))
 
 
+def _finish_pending_release_transaction(home: Path | None = None) -> dict | None:
+    """Replay the durable intent before any updater or reconciliation decision."""
+    from hermes_cli.immutable_releases import ReleasePaths, recover_pending_transaction
+    home = home or get_hermes_home()
+    paths = ReleasePaths.for_home(home)
+    if not (paths.home / "release-txn.json").exists():
+        return None
+    from hermes_cli import gateway, gateway_launchd
+    plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
+    callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist else None
+    return recover_pending_transaction(home, reload_callback=callback)
+
+
 def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
-                                source: Path | None = None) -> bool:
+                                source: Path | None = None,
+                                source_python: Path | None = None) -> bool:
     """Stage an opted-in layout; only promote/reload with restart authorization."""
     from hermes_cli.immutable_releases import (
-        ReleasePaths, begin_migration, promote, read_pointer, release_sha, stage_release,
+        ReleasePaths, activate_release, read_pointer, release_sha, stage_release,
+        recover_pending_transaction,
     )
     _require_immutable_launchd()
     home = get_hermes_home()
@@ -195,47 +210,30 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
         if defer:
             _record_update_step("immutable_release", True, f"staged: {candidate}; activation deferred")
             return True
-        old_current, old_previous = read_pointer(paths.current), read_pointer(paths.previous)
-        first = old_current is None
-        plist = None
-        original_plist = None
-        if sys.platform == "darwin":
-            from hermes_cli import gateway
-            plist = gateway.get_launchd_plist_path()
-            if plist.exists():
-                original_plist = plist.read_bytes()
-        if first and read_pointer(paths.previous) is None:
-            begin_migration(home, source, plist)
-        # The generated definition resolves the current pointer, so it must be
-        # flipped before launchd can load it. A failed reload must undo BOTH
-        # durable changes before returning a partial update.
-        try:
-            result = promote(home, candidate)
-            if original_plist is not None:
-                from hermes_cli import gateway
-                if not gateway.launchd_plist_is_current():
-                    if not gateway.refresh_launchd_plist_if_needed() or not gateway.launchd_plist_is_current():
-                        raise RuntimeError("launchd definition did not reload for the promoted release")
-        except Exception:
-            from hermes_cli.immutable_releases import _atomic_symlink
-            # Restore the pointer before loading the original definition: even a
-            # deferred reload must never spawn the failed candidate via `current`.
-            if old_current is None:
-                paths.current.unlink(missing_ok=True)
-            else:
-                _atomic_symlink(paths.current, old_current)
-            if old_previous is None:
-                paths.previous.unlink(missing_ok=True)
-            else:
-                _atomic_symlink(paths.previous, old_previous)
-            if original_plist is not None and plist.read_bytes() != original_plist:
-                from hermes_cli import gateway_launchd
-                if not gateway_launchd.restore_launchd_plist(original_plist) or plist.read_bytes() != original_plist:
-                    raise RuntimeError("launchd reload failed and original service definition could not be restored")
-            raise
-        from hermes_cli.immutable_releases import set_migration_state
-        if first:
-            set_migration_state(home, "done")
+        # A pending record owns its target, even if its pointers already moved.
+        # Complete it before evaluating a new candidate. The release manager
+        # persists the exact intended plist before touching any mutable state.
+        recovered = _finish_pending_release_transaction(home)
+        if recovered is not None and recovered.get("current") == str(candidate):
+            result = recovered
+            first = recovered.get("source_sha") is not None
+        else:
+            first = read_pointer(paths.current) is None
+            plist = None
+            plist_body = None
+            reload_callback = None
+            if sys.platform == "darwin":
+                from hermes_cli import gateway, gateway_launchd
+                plist = gateway.get_launchd_plist_path()
+                if plist.exists():
+                    plist_body = gateway.generate_launchd_plist(release_target=candidate).encode("utf-8")
+                    reload_callback = lambda: gateway_launchd._reload_installed_launchd_plist(plist)
+                else:
+                    plist = None
+            result = activate_release(home, candidate, source=source if first else None,
+                                      source_python=source_python if first else None,
+                                      plist_path=plist, plist_body=plist_body,
+                                      reload_callback=reload_callback)
         from hermes_cli.update_receipt import record_release_transition
         previous = result["previous"]
         from_sha = _previous_release_sha(paths, previous)
@@ -1401,11 +1399,13 @@ class _ReleaseReconcileState:
     service: str  # none, source, current, stale-release
     running: str  # none, source, current, other (root AND SHA)
     defer: bool
+    pending_transaction: bool = False
 
 
 # Ordered state-table rows. * matches any value; the first matching row owns the
 # entire transition. The axes are normalized observations, not guesses from HEAD.
 _RELEASE_RECONCILE_TABLE = (
+    (("*", "*", "*", "*", "*", "*", "*", True), "complete-transaction"),
     # Disabled legacy/reversed layouts never implicitly migrate or repair.
     ((False, "absent", "*", "none", "*", "*", "*"), "no-op"),
     ((False, "absent", "*", "rolled-back", "*", "*", "*"), "no-op"),
@@ -1425,10 +1425,9 @@ _RELEASE_RECONCILE_TABLE = (
 
 def _reconcile_immutable_release(state: _ReleaseReconcileState) -> str:
     """Resolve one no-pull transition; reject impossible combinations explicitly."""
-    if ((state.current == "absent" and (state.service == "current" or state.running == "current"
-                                        or state.journal == "done"))
-            or (state.current != "absent" and state.journal in {"in-progress", "rolled-back"})
-            or (state.current == "different" and state.journal == "none")):
+    if (not state.pending_transaction and
+            ((state.current == "absent" and (state.service == "current" or state.running == "current"))
+             or (state.current == "different" and state.journal == "none"))):
         raise ValueError(f"unreachable immutable release state: {state}")
     axes = tuple(vars(state).values())
     for pattern, action in _RELEASE_RECONCILE_TABLE:
@@ -1491,8 +1490,12 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
         "absent" if current is None or journal == "rolled-back" else "equal" if current == candidate else "different",
         candidate_state, journal, _release_service_state(paths, current),
         _release_running_state(paths, source, current, sha), defer,
+        (paths.home / "release-txn.json").exists(),
     )
     action = _reconcile_immutable_release(state)
+    if action == "complete-transaction":
+        _finish_pending_release_transaction(paths.home)
+        return
     if action == "fail-with-message":
         print(f"✗ Immutable release needs manual recovery: current={current}, candidate={candidate_state}, journal={journal}. "
               "Do not restart the gateway until the release pointer and migration record are repaired.")
@@ -1513,7 +1516,15 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
     if action == "repair-service":
         from hermes_cli import gateway
         if state.service not in {"none", "current"}:
-            if not gateway.refresh_launchd_plist_if_needed() or not gateway.launchd_plist_is_current():
+            from hermes_cli import gateway_launchd
+            from hermes_cli.immutable_releases import activate_release
+            plist = gateway.get_launchd_plist_path()
+            if current is None or not plist.exists():
+                raise RuntimeError("cannot repair launchd service without current release and plist")
+            body = gateway.generate_launchd_plist(release_target=current).encode("utf-8")
+            if not activate_release(paths.home, current, plist_path=plist, plist_body=body,
+                                    reload_callback=lambda: gateway_launchd._reload_installed_launchd_plist(plist),
+                                    force_reload=True):
                 _record_update_step("immutable_release_catchup", False, "stale launchd definition")
                 _finalize_receipt("partial", "Release service repair failed: %s")
                 raise SystemExit(1)
@@ -1601,7 +1612,7 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
                                     _pre_update_plan, _windows_gateway_resume):
     """Fetch-only release path. Source HEAD, files and venv are never updated."""
     from hermes_cli.immutable_releases import (
-        ReleasePaths, begin_migration, read_pointer, release_sha, stage_release, _release_is_ready,
+        ReleasePaths, read_pointer, release_sha, stage_release, _release_is_ready,
     )
     source = _m().PROJECT_ROOT.resolve()
     home = get_hermes_home()
@@ -1614,9 +1625,8 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
         raise RuntimeError("current is not a release; remove the obsolete source pointer before updating")
     if current is not None and not _release_is_ready(current, current.name):
         raise RuntimeError("current release is not ready; refusing to activate from an invalid pointer")
-    if current is None:
-        from hermes_cli import gateway
-        begin_migration(home, source, gateway.get_launchd_plist_path() if sys.platform == "darwin" else None)
+    # Migration metadata and the source plist are captured with the candidate
+    # inside one transaction at activation, not before staging/handoff.
     # A deferred candidate must be promoted on the next normal update, even
     # when the remote has not advanced beyond that exact staged commit.
     if current is not None and current.name == fetched:
@@ -1700,6 +1710,7 @@ def _post_swap_payload(
         "swap": swap, "branch": branch, "pre_pull_sha": pre_pull_sha, "is_fork": bool(is_fork),
         "release": str(release) if release else None, "candidate_sha": Path(release).name if release else None,
         "source": str(source) if source else None,
+        "source_python": sys.executable if swap == "immutable" else None,
         "gateway_mode": bool(gateway_mode),
         "had_desktop_app_before_update": bool(had_desktop_app_before_update),
         "pre_update_snapshot_id": pre_update_snapshot_id,
@@ -1806,8 +1817,34 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 raise RuntimeError("immutable handoff release identity mismatch")
             if _m().PROJECT_ROOT.resolve() != release:
                 raise RuntimeError("immutable post-swap child did not import the staged release")
+            # This child imports from the staged release. Shared-state changes
+            # must run using its schema and bundled assets before that code is
+            # selected by current; a failure never promotes a partial candidate.
+            from hermes_cli.update_cmd_maint import strict_immutable_maintenance
+            try:
+                strict_immutable_maintenance(release)
+                update_complete = _run_post_update_maintenance(
+                    assume_yes=opts.assume_yes, gateway_mode=gateway_mode,
+                    pre_update_snapshot_id=payload.get("pre_update_snapshot_id"),
+                    had_desktop_app_before_update=had_desktop_app_before_update,
+                    node_failures=[], desktop_build_ok=True,
+                    pre_update_version=opts.pre_update_version)
+            except Exception as exc:
+                _record_update_step("immutable_maintenance", False, str(exc))
+                if gateway_mode:
+                    _write_gateway_update_exit_code(False)
+                _finalize_receipt("partial", "Immutable release maintenance failed: %s")
+                raise SystemExit(1) from exc
+            _record_update_step("immutable_maintenance", update_complete,
+                                "required shared state synchronized" if update_complete else "post-update maintenance incomplete")
+            if not update_complete:
+                if gateway_mode:
+                    _write_gateway_update_exit_code(False)
+                _finalize_receipt("partial", "Immutable release maintenance incomplete: %s")
+                raise SystemExit(1)
             if not _activate_immutable_release(defer=opts.no_gateway_restart,
-                                                sha=release.name, source=Path(payload["source"])):
+                                                sha=release.name, source=Path(payload["source"]),
+                                                source_python=Path(payload["source_python"]) if payload.get("source_python") else None):
                 _finalize_receipt("partial", "Immutable release activation failed: %s")
                 raise SystemExit(1)
             if not opts.no_gateway_restart:
@@ -1815,7 +1852,7 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _resume_windows_gateways_and_merge_outcome(restart, _windows_gateway_resume, gateway_mode)
                 _verify_fleet_after_update(
                     restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
-                    node_failures=[], update_complete=True, expected_sha=release.name,
+                    node_failures=[], update_complete=update_complete, expected_sha=release.name,
                     expected_root=release)
             else:
                 _record_update_step("immutable_release", True, "activation deferred; fleet restart not requested")
@@ -1935,57 +1972,49 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     if getattr(args, "rollback", False) and getattr(args, "no_gateway_restart", False):
         raise ValueError("--rollback cannot be combined with --no-gateway-restart: rollback requires a fleet restart")
+    if not getattr(args, "rollback", False):
+        _finish_pending_release_transaction()
     _require_immutable_launchd()
 
     if getattr(args, "rollback", False):
-        from hermes_cli.immutable_releases import ReleasePaths, migration_plist, read_pointer, rollback
+        from hermes_cli.immutable_releases import ReleasePaths, read_pointer, rollback
         from hermes_cli.update_receipt import begin_update_receipt
-        from hermes_cli import gateway_launchd
         begin_update_receipt()
         home = get_hermes_home()
         paths = ReleasePaths.for_home(home)
+        # Finish an interrupted rollback without deriving A from pointers already
+        # swapped toward A. Otherwise a second --rollback would undo itself.
+        pending_path = paths.home / "release-txn.json"
+        pending_operation = (json.loads(pending_path.read_text(encoding="utf-8"))["operation"]
+                             if pending_path.exists() else None)
         before = read_pointer(paths.current)
-        before_previous = read_pointer(paths.previous)
-        if before is None:
-            raise RuntimeError("cannot roll back without a current release")
-        # A first-migration reversal needs a new launchd definition BEFORE the
-        # fleet restart. Save both sides so a failed reload cannot strand a
-        # source pointer under the release's service definition.
-        from hermes_cli import gateway
-        plist_path = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
-        plist_before = plist_path.read_bytes() if plist_path is not None and plist_path.exists() else None
-        journal_path = home / "release-layout.json"
-        journal_before = journal_path.read_bytes() if journal_path.exists() else None
-        try:
-            result = rollback(home)
-            current_target = result["current"]
-            if current_target is None:
-                raise RuntimeError("rollback produced no current target")
-            source_layout = Path(current_target).parent != paths.releases.resolve()
-            if source_layout and plist_before is not None:
-                original = migration_plist(home)
-                if original is not None:
-                    if original[0] != plist_path:
-                        raise RuntimeError("saved source plist belongs to a different launchd path")
-                    if (plist_path.read_bytes() != original[1]
-                            and not gateway_launchd.restore_launchd_plist(original[1])):
-                        raise RuntimeError("source plist reload failed during rollback")
-                    if plist_path.read_bytes() != original[1]:
-                        raise RuntimeError("source plist bytes differ after rollback reload")
-                    _record_update_step("source_plist_restore", True, str(plist_path))
-        except Exception:
-            from hermes_cli.immutable_releases import _atomic_symlink
-            if journal_before is not None:
-                journal_path.write_bytes(journal_before)
-            _atomic_symlink(paths.current, before)
-            if before_previous is None:
-                paths.previous.unlink(missing_ok=True)
-            else:
-                _atomic_symlink(paths.previous, before_previous)
-            if plist_before is not None and plist_path.read_bytes() != plist_before:
-                if not gateway_launchd.restore_launchd_plist(plist_before):
-                    raise RuntimeError("rollback failed and original launchd definition could not be restored")
-            raise
+        recovered = _finish_pending_release_transaction(home)
+        if pending_operation in {"rollback", "first-migration-rollback"} and recovered is not None:
+            result = recovered
+            before = Path(recovered["previous"]) if recovered.get("previous") else before
+        else:
+            if before is None:
+                raise RuntimeError("cannot roll back without a current release")
+            from hermes_cli import gateway, gateway_launchd
+            plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
+            previous = read_pointer(paths.previous)
+            source_layout = previous is not None and previous.parent != paths.releases.resolve()
+            plist_body = None
+            if plist and plist.exists() and not source_layout and previous is not None:
+                plist_body = gateway.generate_launchd_plist(release_target=previous).encode("utf-8")
+            callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist and plist.exists() else None
+            result = rollback(home, plist_path=plist if plist and plist.exists() else None,
+                              plist_body=plist_body, reload_callback=callback)
+        current_target = result["current"]
+        if current_target is None:
+            raise RuntimeError("rollback produced no current target")
+        if before is not None and str(before) == current_target:
+            completed = paths.home / "release-last-txn.json"
+            if completed.exists():
+                last = json.loads(completed.read_text(encoding="utf-8"))
+                if last.get("operation") in {"rollback", "first-migration-rollback"}:
+                    before = Path(last["current_original"])
+        source_layout = Path(current_target).parent != paths.releases.resolve()
         from hermes_cli.update_receipt import record_release_transition
         record_release_transition(
             from_sha=before.name, to_sha=str(result.get("source_sha") or Path(current_target).name),
