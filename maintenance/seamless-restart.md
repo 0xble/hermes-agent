@@ -1,6 +1,6 @@
 # Seamless Restart Phase 1 Implementation Plan
 
-> **Execution boundary:** This plan does not authorize implementation. Execution must follow repository policy, applicable specialist instructions, verification, review, and delivery requirements.
+> **Status (2026-09-27):** S1–S3 shipped on fork `main` and run live on this Mac; S4 is not started. See [Shipped Status](#shipped-status). Later changes still follow repository policy, specialist instructions, verification, review, and delivery requirements.
 
 **Goal:** Promote a new Hermes gateway release without interrupting active cron executions or in-flight conversations, while making failure and rollback observable.
 
@@ -12,7 +12,7 @@
 
 ## Baseline and contract
 
-This is a proposed **fork plan**, not shipped behavior. The maintained fork `0xble/hermes-agent` `main` is the implementation base; the runtime installation and source checkout are distinct ([runtime ownership](runtime-ownership.md)). Current `cron/scheduler.py::_launch_external_cron_worker` uses `restart_safe_gateway_child_argv`; on non-Linux that resolver returns `in_process` (`tools/process_registry.py`), so a macOS launchd gateway does not get an external restart-safe cron worker. Linux's systemd transient-scope model cannot be copied to macOS: `launchctl bootout` terminates the job process group, but a `start_new_session` child and double-forked `setsid` grandchild can survive outside that group. Design the macOS worker boundary and explicit kill semantics around that topology, without claiming bootout alone reaps all descendants.
+This was written as a **fork plan** before implementation; [Shipped Status](#shipped-status) records what landed. The maintained fork `0xble/hermes-agent` `main` is the implementation base; the runtime installation and source checkout are distinct ([runtime ownership](runtime-ownership.md)). Before S1, `cron/scheduler.py::_launch_external_cron_worker` used `restart_safe_gateway_child_argv`; on non-Linux that resolver returns `in_process` (`tools/process_registry.py`), so a macOS launchd gateway does not get an external restart-safe cron worker. Linux's systemd transient-scope model cannot be copied to macOS: `launchctl bootout` terminates the job process group, but a `start_new_session` child and double-forked `setsid` grandchild can survive outside that group. Design the macOS worker boundary and explicit kill semantics around that topology, without claiming bootout alone reaps all descendants.
 
 The profile-local `cron/executions.py` ledger records attempt owner PID/start fingerprint and immutable terminal states; it is **not a retry queue**. The current cron inactivity watchdog is idle-based, not a hard wall-clock cap. Scheduler tick locking, `pending_slot`/`scheduled_instant` deduplication, profile scope, and delivery ownership remain authoritative ([cron contract](../cron/AGENTS.md)). Current restart/delegation policy can wait or offer explicit parent-driven recovery, but does not provide uninterrupted overlapping execution ([delegation restart](delegation-restart.md)). The gateway's control socket presently supports identity/status/pause-for-update; it is a candidate coordination seam, not yet a handoff protocol. Upstream's open [structured safe restart PR #71876](https://github.com/NousResearch/hermes-agent/pull/71876) addresses agent-request coordination, not evidence that release pinning or two-generation handoff already exists. Recheck upstream and fork source before each implementation slice.
 
@@ -57,3 +57,31 @@ Before S1 code, decide and test the macOS descendant-termination authority when 
 - **Promotion order is transactional.** Stage the fetched source, private venv, and plugin smoke; write `previous` to the old target; atomically replace `current`; then retain `current`, `previous`, three rollback-capable releases, and every release pinned by a live process or receipt. A failed stage leaves the old pointer untouched.
 - **Runtime pinning.** launchd definitions resolve program, cwd, venv, and import path through `current`; a detached cron worker resolves `current` once at launch and pins the resulting release path for its executable, cwd, and `PYTHONPATH`. `~/.hermes/hermes-agent` remains the git source checkout and is not replaced by a release.
 - **Migration and rollback.** The first promotion creates the current-HEAD release and updates the existing launchd plist through `hermes_cli/gateway_launchd.py`; `hermes update --rollback` atomically points `current` at `previous` and uses the existing restart/report/receipt path. A migration rollback points the plist back to the source checkout. Do not activate this migration on the live install without the parent owner's separate authorization.
+
+## Shipped Status
+
+Every row merged with an independent `review_candidate` approval on its exact head and a green exact-SHA `qualification` check, using normal merges.
+
+| Slice | PR | Merge |
+|---|---|---|
+| Phase 0: Telegram status per topic/turn | [#186](https://github.com/0xble/hermes-agent/pull/186) | `ec3bac417f` |
+| Phase 0: restart follow-ups, bounded notices | [#188](https://github.com/0xble/hermes-agent/pull/188) | `396382f4ac` |
+| S1: macOS cron survives gateway restart | [#187](https://github.com/0xble/hermes-agent/pull/187) | `8649c8e7ef` |
+| S3: bounded workers, durable delivery | [#194](https://github.com/0xble/hermes-agent/pull/194) | `a79fbaa6d8` |
+| Synthetic reply anchors (restart replay) | [#202](https://github.com/0xble/hermes-agent/pull/202) | `ceabe38a5a` |
+| S2: immutable releases and rollback | [#192](https://github.com/0xble/hermes-agent/pull/192) | `d64abc4778` |
+| S2: one reload per release switch | [#211](https://github.com/0xble/hermes-agent/pull/211) | `784396c5ec` |
+
+S3 landed before S2 (its code-SHA ledger column works without releases). S2 is **opt-in** with `updates.immutable_releases: true` and macOS launchd only; its runbook, state table and qualification contract live in [seamless-restart-s2.md](seamless-restart-s2.md). One shared observe-only wait (`wait_for_release_acknowledgement`, `updates.release_acknowledgement_timeout_seconds`, default 180) completes every switch, rollback, pending-switch finish and service repair only after the new gateway acknowledges from the intended release. Each switch reloads launchd exactly once: the fleet step credits the acknowledged gateway instead of relaunching it. Disposable rehearsals with real launchd jobs and every `launchctl` call captured proved first migration, release→release, rollback, first-migration rollback, timeout recovery, repeated rollback and repair.
+
+**Live on this Mac (2026-09-27).** Config: `platforms.telegram.extra.drop_pending_on_cold_boot: false`, `platforms.telegram.gateway_restart_notification: false`, `updates.immutable_releases: true`. Promotion took two updates: the pre-S2 updater pulled `784396c5ec` into the source checkout, then the S2 updater's no-pull reconciliation performed the first migration (receipt `update_20260927_151424_22786.json`): `current` → `releases/784396c5…`, `previous` → the source checkout, launchd `ProgramArguments`/`WorkingDirectory` through `current`, one reload, gateway acknowledgement recorded in `release-last-txn.json`. A controlled restart afterwards showed: a 240 s cron probe started before the restart kept running under its pinned release interpreter and completed once with `code_sha` and one delivery; a Telegram message sent while the old gateway was down was answered after boot; a follow-up queued behind an active turn was preserved and replayed; per-chat and home-channel notices were suppressed; teardown took 2.3 s against `ExitTimeOut` 60 with the pending-message flush recovered on boot.
+
+**Remaining risks.**
+
+- An in-flight chat turn is still interrupted by a restart (`restart_drain_timeout: 0`); it auto-resumes with a restart note, but its tool call is not retried. Background delegations of that gateway are interrupted too. Removing this is S4.
+- An unloaded or corrupted launchd service after a failed switch needs an operator repair from a shell outside the gateway. A corrupt `current` pointer makes `get_python_path()` fall back to the source venv silently. The S2 config keys have no type/range validation.
+- In a rare no-pull catch-up where checkout repair is incomplete, the receipt can read `success` while the command exits 1 (review finding on #211). `release-last-txn.json` persists, so a repeatedly failing fleet verification on the credited label never falls back to a relaunch; `hermes gateway restart` remains the remedy.
+- Manually stopped cron runs still record a misleading "scheduler restarted" `unknown`, and manual runs are not kill-protected. A double-forked descendant that escapes the worker session is not swept, and a kill between ledger commit and delivery enqueue leaves `unknown` with no resend.
+- The full unscoped update path can only be proven live; disposable rehearsals cover it with throwaway launchd labels.
+
+**Next.** Decide S4 after measuring post-promotion interruptions: the remaining user-visible cost of a restart is the interrupted in-flight turn or delegation.
