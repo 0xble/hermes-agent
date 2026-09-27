@@ -18,8 +18,11 @@ are owned by [Telegram rendering](telegram-rendering.md).
   `slice-10-telegram-delivery-followup`, `slice-10-delivery-ledger`,
   `slice-11-telegram-emphasis`.
 - Adopted upstream commits: split-send recovery `595f3a289c7`, partial-delivery suppression
-  `969898d4ff4`, redelivery backoff `c961e5bb691` and `807435ac1ec`. Flood coherence is a
-  local patch with no upstream submission.
+  `969898d4ff4`, redelivery backoff `c961e5bb691` and `807435ac1ec`. All four are
+  ancestors of upstream release v2026.9.24 (`f97608f178d1ffeca59860195ab7da295f7c8e5f`),
+  verified on 2026-09-26. They are released native behavior, not pending borrowed
+  changes. Separate local flood-coherence and ledger deltas remain. Flood coherence
+  is tracked in [issue #107612](https://github.com/NousResearch/hermes-agent/issues/107612).
 - Emphasis is an own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906),
   open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19.
 
@@ -32,7 +35,9 @@ and `tests/gateway/test_telegram_emphasis.py`.
 
 ## Retirement and rollback
 
-Retire each adopted commit when the candidate upstream release contains it. Retire flood
+The four adopted commits are already contained in v2026.9.24. Retire only their
+redundant adaptation after checking the selected release against the regressions,
+while preserving the independently required local deltas. Retire flood
 coherence when upstream classifies media floods and shares one per-chat window. Retire
 emphasis when PR 106906 merges and the candidate tag includes it. Roll back by reverting
 the logical patch; no persistent data changes.
