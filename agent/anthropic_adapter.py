@@ -193,6 +193,13 @@ def _forbids_sampling_params(model: str) -> bool:
     )
 
 
+def _custom_endpoint_opted_into_fast(base_url: str | None) -> bool:
+    """Every Anthropic-transport custom provider at ``base_url`` declares ``capabilities.fast_mode``."""
+    from hermes_cli.models_fast_route import custom_route_fast_mode_opted_in
+
+    return custom_route_fast_mode_opted_in("custom", base_url, anthropic_model=True)
+
+
 def _supports_fast_mode(model: str) -> bool:
     """True for models accepting ``speed: "fast"`` (Opus 4.8 / Opus 5 / Opus 5.5, Claude API only).
     The list lives in ``agent.model_metadata`` so the wire gate and the ``/fast`` toggle agree."""
@@ -659,10 +666,12 @@ def build_anthropic_kwargs(
     if _forbids_sampling_params(model):
         for key in ("temperature", "top_p", "top_k"):
             kwargs.pop(key, None)
-    # Fast mode: native Anthropic only — third-party providers reject the unknown beta/param and
-    # Anthropic scopes it to the Claude API (not Bedrock/Vertex/Foundry). Per-request extra_headers
-    # OVERRIDE the client-level anthropic-beta header, so rebuild the full beta list.
-    if fast_mode and not _is_third_party_anthropic_endpoint(base_url) and _supports_fast_mode(model):
+    # Fast mode: native Anthropic, or a custom endpoint that opted in (``capabilities.fast_mode``,
+    # a proxy forwarding to the Claude API). Other third-party providers reject the unknown
+    # beta/param and Anthropic scopes it to the Claude API (not Bedrock/Vertex/Foundry). Per-request
+    # extra_headers OVERRIDE the client-level anthropic-beta header, so rebuild the full beta list.
+    if fast_mode and _supports_fast_mode(model) and (
+            not _is_third_party_anthropic_endpoint(base_url) or _custom_endpoint_opted_into_fast(base_url)):
         kwargs.setdefault("extra_body", {})["speed"] = "fast"
         betas = _common_betas_for_base_url(base_url, drop_context_1m_beta=drop_context_1m_beta)
         kwargs["extra_headers"] = _beta_header(betas + (_OAUTH_ONLY_BETAS if is_oauth else []) + [_FAST_MODE_BETA])

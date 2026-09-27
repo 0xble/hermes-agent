@@ -20,7 +20,8 @@ runtime and request-override resolution in `tools/delegate_tool_config.py`.
 - The parent's wire fields are never copied. A static `priority` mode is
   re-derived for the child's own provider, model and base URL
   (`resolve_fast_mode_overrides`). A route with no fast mode, such as a local
-  proxy, gets no fast field.
+  proxy that has not opted in with `capabilities.fast_mode`, gets no fast
+  field.
 - Bounded modes stay bounded. `auto`/`cold` open the child's own
   `agent.fast_auto_seconds` window at its first turn and are never pinned into
   static request fields.
@@ -29,6 +30,20 @@ runtime and request-override resolution in `tools/delegate_tool_config.py`.
   the child then inherits no mode.
 - A child routed to a different provider or base URL does not inherit the
   parent's route-bound overrides.
+
+### Custom-provider Fast opt-in
+
+- Fast fields reach a custom provider only when its `providers:` entry sets
+  `capabilities.fast_mode: true` (`hermes_cli/models_fast_route.py`). The
+  opt-in is a billing decision and fails closed.
+- It is transport-scoped. Anthropic `speed` needs an `anthropic_messages`
+  entry, and OpenAI/xAI `service_tier` needs any other transport. When
+  entries share one proxy URL, a bare `custom` route is opted in only if every
+  same-transport entry at that URL opts in.
+- The Anthropic adapter honors the same opt-in for its native third-party
+  guard, so the request carries `speed` and the fast-mode beta.
+- Brian's profile opts in `codex-proxy` only (2026-09-26). Claude Fast bills
+  usage credits from the first token, so `claude-proxy` stays closed.
 
 ### Reasoning level
 
@@ -52,7 +67,8 @@ runtime and request-override resolution in `tools/delegate_tool_config.py`.
 
 ## Provenance
 
-Fork patch identities: `delegation-service-tier`, `delegation-explicit-inheritance`.
+Fork patch identities: `delegation-service-tier`, `delegation-explicit-inheritance`,
+`fast-mode-custom-provider-opt-in`.
 
 Fork-Patch-Backfill: 893c9262c9beacb9296f7c03f365790b2be2929e; delegation-service-tier
 
@@ -76,7 +92,8 @@ Run:
 ```
 scripts/run_tests.sh tests/tools/test_delegate_service_tier_inheritance.py \
   tests/tools/test_delegate_explicit_inheritance.py \
-  tests/gateway/test_running_agent_session_toggles.py
+  tests/gateway/test_running_agent_session_toggles.py \
+  tests/hermes_cli/test_fast_mode_custom_provider_opt_in.py
 ```
 
 These cover:
@@ -88,7 +105,8 @@ These cover:
 - explicit-override precedence,
 - the reasoning precedence table, including stale markers and an explicit
   `none`,
-- surface marking and reset.
+- surface marking and reset,
+- the custom-provider opt-in, its transport scope, and shared-URL closure.
 
 ## Retirement and rollback
 
