@@ -160,6 +160,14 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         yield conn
 
 
+def _reflect_execution_delivery(execution_id: str, status: str) -> None:
+    """Project the independent queue receipt onto an existing execution, never create a run."""
+    from cron import executions
+    path = executions.EXECUTIONS_FILE or get_hermes_home().resolve() / "cron" / "executions.db"
+    if Path(path).exists():
+        executions.record_delivery_status(str(execution_id), status)
+
+
 def enqueue(
     execution_id: str,
     job: dict,
@@ -198,6 +206,7 @@ def enqueue(
         row = conn.execute(
             "SELECT * FROM deliveries WHERE execution_id=?", (str(execution_id),)
         ).fetchone()
+    _reflect_execution_delivery(str(execution_id), row["status"])
     return dict(row)
 
 
@@ -273,6 +282,8 @@ def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False
             ),
         )
         _prune_terminal_unlocked(conn)
+    if cur.rowcount == 1:
+        _reflect_execution_delivery(execution_id, status)
     return cur.rowcount == 1
 
 

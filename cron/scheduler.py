@@ -3718,6 +3718,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                     execution_id,
                 )
                 return False
+            from cron.scheduler_detached_worker import arm_hard_wall_timeout, hard_wall_timeout_seconds
+            watchdog_stop = arm_hard_wall_timeout(
+                execution_id, profile_home, hard_wall_timeout_seconds())
             try:
                 ack_path.parent.mkdir(parents=True, exist_ok=True)
                 # Publish via write-to-temp + atomic rename. Writing ack_path in place
@@ -3748,6 +3751,7 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             try:
                 return run_one_job(job, adapters=None, loop=None, verbose=False)
             finally:
+                watchdog_stop.set()
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)
                 else:

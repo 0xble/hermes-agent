@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import subprocess
 import sqlite3
 import threading
 import time
@@ -87,6 +88,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    # Additive only: an older release can still SELECT/INSERT/UPDATE this table during rollback.
+    add_column_if_missing(conn, "executions", "code_sha", "code_sha TEXT")
+    add_column_if_missing(conn, "executions", "execution_identity", "execution_identity TEXT")
+    add_column_if_missing(conn, "executions", "owner_kind", "owner_kind TEXT")
+    add_column_if_missing(conn, "executions", "delivery_status", "delivery_status TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -126,22 +132,48 @@ def _process_start_time(pid: int) -> Optional[int]:
         return None
 
 
-def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+def running_code_sha() -> Optional[str]:
+    """Resolve the imported release, not the gateway's moving ``current`` pointer.
+
+    Release builders may stamp either marker; a checkout uses its own Git HEAD.
+    Never label an unidentifiable run with the unrelated live install's revision.
+    """
+    root = Path(__file__).resolve().parent.parent
+    for marker in (".release_sha", "RELEASE"):
+        path = root / marker
+        if path.is_file():
+            value = path.read_text(encoding="utf-8").strip().splitlines()[0]
+            if len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower()):
+                return value.lower()
     try:
-        from gateway.status import _pid_exists
+        value = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        return value if len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower()) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _owner_identity(pid: int, started_at: Optional[int]) -> str:
+    """Return live/dead/ambiguous; a recycled PID is NOT proof of the original owner's death."""
+    try:
+        from gateway.status import _pid_exists, start_time_fingerprints_match
         if not _pid_exists(pid):
-            return False
+            return "dead"
+        if started_at is None:
+            return "live" if pid == os.getpid() else "ambiguous"
+        current = _process_start_time(pid)
+        if current is None:
+            return "ambiguous"
+        return "live" if start_time_fingerprints_match(started_at, current) else "ambiguous"
     except Exception:
-        return True  # fail safe: inability to prove death must not rewrite state
-    if started_at is None:
-        return pid == os.getpid()
-    current = _process_start_time(pid)
-    if current is None:
-        return True  # cannot compare -> cannot prove death; a misread must not rewrite state
-    # Drifted same-host readings (#117505) are not proof of death; a live misread is still
-    # bounded by the stale-claim sweep below.
-    from gateway.status import start_time_fingerprints_match
-    return start_time_fingerprints_match(started_at, current)
+        return "ambiguous"
+
+
+def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+    # Other recovery clients must also fail closed on unreadable/recycled fingerprints.
+    return _owner_identity(pid, started_at) != "dead"
 
 
 def _live_owner_stale_after_seconds() -> Optional[float]:
@@ -194,10 +226,12 @@ def create_execution(
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, scheduled_instant, code_sha, execution_identity,
+                owner_kind)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, 'gateway')""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now, canonical_instant(scheduled_instant),
+             running_code_sha(), execution_id),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
@@ -250,7 +284,7 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
             """UPDATE executions
                SET process_id=?, pid=?, process_started_at=?,
                    status='running', started_at=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, owner_kind='detached'
                WHERE id=? AND status='claimed' AND handoff_pending=1""",
             (_PROCESS_ID, pid, process_started_at, now, execution_id),
         )
@@ -317,9 +351,8 @@ _OWNER_WEDGED_REASON = (
 
 
 def recover_interrupted_executions() -> int:
-    """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
-    dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
+    """Mark abandoned attempts unknown only for proved-dead owners. Legacy gateway-owned
+    live stale claims retain their existing bounded recovery; detached live workers never do."""
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
@@ -330,7 +363,7 @@ def recover_interrupted_executions() -> int:
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at, claimed_at
+                      handoff_pending, handoff_started_at, claimed_at, owner_kind
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
@@ -338,7 +371,12 @@ def recover_interrupted_executions() -> int:
             if row["process_id"] == _PROCESS_ID:
                 continue
             reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            identity = _owner_identity(int(row["pid"]), row["process_started_at"])
+            if identity == "ambiguous":
+                continue  # PID reuse / unreadable fingerprint is not proof of death.
+            if row["owner_kind"] == "detached" and identity == "live":
+                continue  # Gateway replacement never terminalizes its live worker.
+            if identity == "live":
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
                 # this check, so a claim older than the derived bound is treated as wedged
@@ -404,6 +442,19 @@ def list_executions(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def record_delivery_status(execution_id: str, status: str) -> None:
+    """Delivery can finish after the worker's immutable terminal run result."""
+    if status not in {"pending", "delivering", "delivered", "failed", "unknown", "suppressed"}:
+        raise ValueError("invalid cron delivery status")
+    with _transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET delivery_status=? WHERE id=? "
+            "AND (delivery_status IS NULL OR delivery_status NOT IN "
+            "('delivered','failed','unknown','suppressed'))",
+            (status, execution_id),
+        )
 
 
 def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:

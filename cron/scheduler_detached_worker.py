@@ -9,9 +9,90 @@ overlap behind #102827. The worker's Future owns the teardown instead.
 from __future__ import annotations
 
 import concurrent.futures
+import math
+import os
 import subprocess
 import threading
 from typing import Optional
+
+
+def hard_wall_timeout_seconds() -> float:
+    """Finite config.yaml bound, separate from inactivity and script timeouts."""
+    from cron.scheduler import load_config_readonly
+    try:
+        value = float((load_config_readonly().get("cron") or {}).get("hard_wall_timeout_seconds", 7200))
+        return value if math.isfinite(value) and value > 0 else 7200.0
+    except (TypeError, ValueError, OSError):
+        return 7200.0
+
+
+def _terminate_owned_descendants(pid: int, started_at: int) -> bool:
+    """Snapshot descendants before signaling the owner, across their own setsid groups.
+
+    psutil handles include start-time identity; never signal a reused PID or an
+    unrelated process after its parent exits. An orphan already reparented before
+    the snapshot cannot be proven owned and must not be swept by name/argv.
+    """
+    import psutil
+    from cron.executions import _owner_identity
+
+    if _owner_identity(pid, started_at) != "live":
+        return False
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+    for child in reversed(children):
+        try:
+            child.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            return False
+    _, alive = psutil.wait_procs(children, timeout=1)
+    for child in alive:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            return False
+    _, alive = psutil.wait_procs(alive, timeout=2)
+    return not alive
+
+
+def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> threading.Event:
+    """Watchdog lives inside the detached worker, not the replaceable gateway."""
+    from pathlib import Path
+    from cron.executions import _owner_identity, _process_start_time, finish_execution
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    stopped = threading.Event()
+    pid = os.getpid()
+    fingerprint = _process_start_time(pid)
+    if fingerprint is None:
+        raise RuntimeError("Detached cron worker has no verifiable start-time fingerprint")
+
+    def expire() -> None:
+        if stopped.wait(seconds):
+            return
+        home_token = set_hermes_home_override(Path(profile_home))
+        try:
+            if _owner_identity(pid, fingerprint) != "live":
+                return  # unreadable or reused identity: no destructive change
+            if not _terminate_owned_descendants(pid, fingerprint):
+                return  # unsafe to declare the process tree terminated
+            finish_execution(
+                execution_id, success=False,
+                error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+            )
+            os._exit(124)  # stop the active model/tool thread, never let it commit success
+        finally:
+            reset_hermes_home_override(home_token)
+
+    threading.Thread(target=expire, name=f"cron-hard-wall-{execution_id}", daemon=True).start()
+    return stopped
 
 
 def defer_teardown_to_running_worker(
