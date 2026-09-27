@@ -84,8 +84,7 @@ def test_launchd_resolves_current_on_each_spawn(tmp_path, monkeypatch):
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True, timeout=15)
         a = observed("A")
         promote(home, home / "releases" / "B")
-        subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
-        subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         b = observed("B", a["pid"])
         assert b["pid"] != a["pid"]
         assert (home / "current").resolve() == home / "releases" / "B"
