@@ -9,9 +9,125 @@ overlap behind #102827. The worker's Future owns the teardown instead.
 from __future__ import annotations
 
 import concurrent.futures
+import math
+import os
 import subprocess
 import threading
 from typing import Optional
+
+
+def hard_wall_timeout_seconds() -> float:
+    """Finite config.yaml bound, separate from inactivity and script timeouts."""
+    from cron.scheduler import load_config_readonly
+    try:
+        value = float((load_config_readonly().get("cron") or {}).get("hard_wall_timeout_seconds", 7200))
+        return value if math.isfinite(value) and value > 0 else 7200.0
+    except (TypeError, ValueError, OSError):
+        return 7200.0
+
+
+def _terminate_owned_descendants(pid: int, started_at: int) -> bool:
+    """Snapshot descendants before signaling the owner, across their own setsid groups.
+
+    psutil handles include start-time identity; never signal a reused PID or an
+    unrelated process after its parent exits. An orphan already reparented before
+    the snapshot cannot be proven owned and must not be swept by name/argv.
+    """
+    import psutil
+    from cron.executions import _owner_identity
+
+    if _owner_identity(pid, started_at) != "live":
+        return False
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+    for child in reversed(children):
+        try:
+            child.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            return False
+    _, alive = psutil.wait_procs(children, timeout=1)
+    for child in alive:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            return False
+    _, alive = psutil.wait_procs(alive, timeout=2)
+    return not alive
+
+
+class HardWallFence:
+    """Lifetime timer only; the SQLite execution row is the sole result fence."""
+
+    def __init__(self) -> None:
+        self.stopped = threading.Event()
+
+    def set(self) -> None:
+        self.stopped.set()
+
+
+def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> HardWallFence:
+    """Watchdog lives inside the detached worker, not the replaceable gateway."""
+    from pathlib import Path
+    from cron.executions import _owner_identity, _process_start_time, finish_execution, get_execution
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    fence = HardWallFence()
+    pid = os.getpid()
+    fingerprint = _process_start_time(pid)
+    if fingerprint is None:
+        raise RuntimeError("Detached cron worker has no verifiable start-time fingerprint")
+
+    def expire() -> None:
+        if fence.stopped.wait(seconds):
+            return
+        home_token = set_hermes_home_override(Path(profile_home))
+        try:
+            timeout_won = False
+            try:
+                if _owner_identity(pid, fingerprint) == "live":
+                    timeout_won = finish_execution(
+                        execution_id, success=False,
+                        error=f"Detached cron run exceeded hard wall-clock timeout ({seconds:g}s).",
+                        require_running=True,
+                    ) is not None
+                # Reserve the final 3s for bounded descendant cleanup. The
+                # post-commit allowance is derived from the configured wall cap,
+                # with enough headroom to include cleanup inside cap+grace.
+                if not timeout_won:
+                    grace = min(60.0, max(4.0, seconds))
+                    fence.stopped.wait(grace - 3.0)
+            finally:
+                try:
+                    _terminate_owned_descendants(pid, fingerprint)
+                finally:
+                    exit_code = 124 if timeout_won else 1
+                    if not timeout_won:
+                        try:
+                            record = get_execution(execution_id)
+                            if record and record["status"] == "completed":
+                                exit_code = 0
+                            elif record and record["status"] == "running":
+                                # Database errors on the first claim must not strand
+                                # the row while the worker is being killed.
+                                finish_execution(
+                                    execution_id, success=False,
+                                    error="Detached cron worker could not complete before termination.",
+                                    require_running=True)
+                        except Exception:
+                            pass
+                    os._exit(exit_code)
+        finally:
+            reset_hermes_home_override(home_token)
+
+    threading.Thread(target=expire, name=f"cron-hard-wall-{execution_id}", daemon=True).start()
+    return fence
 
 
 def defer_teardown_to_running_worker(

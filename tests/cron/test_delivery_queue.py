@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -50,6 +51,23 @@ def test_terminal_delivery_retention_is_bounded(tmp_path, monkeypatch):
     send = Mock(return_value=None)
     assert queue.drain(send) == 0
     send.assert_not_called()
+
+
+def test_pruning_preserves_projected_tombstone(tmp_path, monkeypatch):
+    import cron.delivery_queue as queue
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    monkeypatch.setattr(queue, "MAX_TERMINAL_DELIVERIES", 0, raising=False)
+    queue.enqueue("exec-projected", {"id": "job"}, "brief")
+    assert queue.claim_next()["execution_id"] == "exec-projected"
+    assert queue._finish("exec-projected", error=None)
+
+    with sqlite3.connect(queue.queue_path()) as conn:
+        projected = conn.execute(
+            "SELECT projected FROM delivery_tombstones WHERE execution_id=?",
+            ("exec-projected",),
+        ).fetchone()
+    assert projected == (1,)
 
 
 def test_failure_delivery_lane_survives_durable_handoff(tmp_path, monkeypatch):
@@ -142,6 +160,348 @@ def test_dead_delivery_owner_becomes_unknown_and_is_not_retried(
     assert queue.drain(send) == 0
     send.assert_not_called()
     assert queue.get_status("exec-1")["status"] == "unknown"
+
+
+_DELIVERY_FROM_STATES = (
+    None, "pending", "delivering", "unknown_provisional", "unknown_terminal",
+    "delivered", "failed", "suppressed",
+)
+_DELIVERY_TARGETS = ("pending", "delivering", "unknown", "delivered", "failed", "suppressed")
+
+
+@pytest.mark.parametrize("from_state", _DELIVERY_FROM_STATES)
+@pytest.mark.parametrize("to_status", _DELIVERY_TARGETS)
+def test_execution_delivery_transition_matrix(tmp_path, monkeypatch, from_state, to_status):
+    """Every source/target pair executes the real conditional SQLite UPDATE."""
+    from cron import executions
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    run = executions.create_execution("matrix", source="builtin")
+    original_status = "unknown" if from_state in ("unknown_provisional", "unknown_terminal") else from_state
+    original_provisional = int(from_state == "unknown_provisional")
+    with executions._transaction() as conn:
+        conn.execute(
+            "UPDATE executions SET delivery_status=?, delivery_status_provisional=? WHERE id=?",
+            (original_status, original_provisional, run["id"]),
+        )
+    mutable = {None, "pending", "delivering", "unknown_provisional"}
+    allowed = (
+        from_state in ({None, "pending", "unknown_provisional"} if to_status == "pending" else
+                       {None, "pending", "delivering", "unknown_provisional"} if to_status in ("delivering", "unknown") else
+                       mutable | {"unknown_terminal"})
+    )
+    executions.record_delivery_status(run["id"], to_status)
+    actual = executions.get_execution(run["id"])
+    assert (actual["delivery_status"], actual["delivery_status_provisional"]) == (
+        to_status if allowed else original_status,
+        0 if allowed else original_provisional,
+    )
+
+
+def test_stale_delivering_cannot_replace_projected_unknown(tmp_path, monkeypatch):
+    """Idempotent enqueue reads delivering, then a wait timeout projects unknown first."""
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+        run = executions.create_execution("job-racing-delivering", source="builtin")
+        queue.enqueue(run["id"], {"id": "job-racing-delivering"}, "result")
+        assert queue.claim_next()["execution_id"] == run["id"]
+        original_reflect = queue._reflect_execution_delivery
+
+        def terminalize_after_enqueue_commit(execution_id, status):
+            if status != "delivering":
+                return original_reflect(execution_id, status)
+            # The outer enqueue already read delivering; restore normal terminal projection.
+            monkeypatch.setattr(queue, "_reflect_execution_delivery", original_reflect)
+            assert "unknown" in queue._terminalize_wait_timeout(execution_id)
+            assert queue.get_status(execution_id)["status"] == "unknown"
+            assert executions.get_execution(execution_id)["delivery_status"] == "unknown"
+            with sqlite3.connect(queue.queue_path()) as conn:
+                assert conn.execute(
+                    "SELECT projected FROM deliveries WHERE execution_id=?", (execution_id,)
+                ).fetchone() == (1,)
+            original_reflect(execution_id, status)
+
+        monkeypatch.setattr(queue, "_reflect_execution_delivery", terminalize_after_enqueue_commit)
+        queue.enqueue(run["id"], {"id": "job-racing-delivering"}, "result")
+        assert queue.reconcile_terminal_deliveries() == 0
+        assert executions.get_execution(run["id"])["delivery_status"] == "unknown"
+    finally:
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("terminal", ("unknown", "delivered", "failed", "suppressed"))
+def test_stale_enqueue_pending_cannot_replace_projected_terminal_receipt(
+    tmp_path, monkeypatch, terminal
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", home / "cron" / "executions.db")
+        run = executions.create_execution("job-racing-projection", source="builtin")
+        original_reflect = queue._reflect_execution_delivery
+
+        def terminalize_after_enqueue_commit(execution_id, status):
+            assert execution_id == run["id"]
+            if status != "pending":
+                return original_reflect(execution_id, status)
+            # enqueue() has committed the queue row but has not projected pending.
+            # A second connection claims and terminalizes it, projecting the receipt.
+            assert queue.claim_next()["execution_id"] == execution_id
+            if terminal == "unknown":
+                assert "unknown" in queue._terminalize_wait_timeout(execution_id)
+            else:
+                assert queue._finish(
+                    execution_id,
+                    error="send failed" if terminal == "failed" else None,
+                    suppressed=terminal == "suppressed",
+                )
+            assert queue.get_status(execution_id)["status"] == terminal
+            assert executions.get_execution(execution_id)["delivery_status"] == terminal
+            with sqlite3.connect(queue.queue_path()) as conn:
+                assert conn.execute(
+                    "SELECT projected FROM deliveries WHERE execution_id=?", (execution_id,)
+                ).fetchone()[0] == 1
+            original_reflect(execution_id, status)  # stale pending projection resumes
+
+        monkeypatch.setattr(queue, "_reflect_execution_delivery", terminalize_after_enqueue_commit)
+        queue.enqueue(run["id"], {"id": "job-racing-projection"}, "result")
+        assert queue.reconcile_terminal_deliveries() == 0
+        assert executions.get_execution(run["id"])["delivery_status"] == terminal
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_terminal_recovery_and_timeout_project_execution_status(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        for transition in ("restart", "timeout"):
+            run = executions.create_execution(f"job-{transition}", source="builtin")
+            queue.enqueue(run["id"], {"id": f"job-{transition}"}, "result")
+            assert queue.claim_next()["execution_id"] == run["id"]
+            assert executions.get_execution(run["id"])["delivery_status"] == "pending"
+            if transition == "restart":
+                monkeypatch.setattr(queue, "_PROCESS_ID", "replacement-gateway")
+                monkeypatch.setattr(queue, "_owner_is_live", lambda _pid, _started: False)
+                assert queue.recover_abandoned() == 1
+            else:
+                assert "unknown" in queue._terminalize_wait_timeout(run["id"])
+            assert queue.get_status(run["id"])["status"] == "unknown"
+            assert executions.get_execution(run["id"])["delivery_status"] == "unknown"
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_terminal_queue_commit_reconciles_execution_projection_without_resend(
+    tmp_path, monkeypatch
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        monkeypatch.setattr(queue, "MAX_TERMINAL_DELIVERIES", 0, raising=False)
+        run = executions.create_execution("job-reconcile", source="builtin")
+        queue.enqueue(run["id"], {"id": "job-reconcile"}, "result")
+        send = Mock(return_value=None)
+        original_reflect = queue._reflect_execution_delivery
+        monkeypatch.setattr(
+            queue,
+            "_reflect_execution_delivery",
+            Mock(side_effect=OSError("ledger unavailable")),
+        )
+
+        with pytest.raises(OSError, match="ledger unavailable"):
+            queue.drain(send)
+
+        assert send.call_count == 1
+        assert executions.get_execution(run["id"])["delivery_status"] == "pending"
+        assert queue.get_status(run["id"])["status"] == "delivered"
+
+        monkeypatch.setattr(queue, "_reflect_execution_delivery", original_reflect)
+        assert queue.drain(send) == 0
+        send.assert_called_once_with({"id": "job-reconcile"}, "result", False)
+        assert executions.get_execution(run["id"])["delivery_status"] == "delivered"
+        assert queue.get_status(run["id"])["status"] == "delivered"
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_terminal_projection_retries_after_execution_ledger_failure(
+    tmp_path, monkeypatch
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        run = executions.create_execution("job-retry-projection", source="builtin")
+        queue.enqueue(run["id"], {"id": "job-retry-projection"}, "result")
+        assert queue.claim_next() is not None
+        original_reflect = queue._reflect_terminal_deliveries
+        monkeypatch.setattr(
+            queue,
+            "_reflect_terminal_deliveries",
+            Mock(side_effect=OSError("ledger unavailable")),
+        )
+        with pytest.raises(OSError, match="ledger unavailable"):
+            queue._finish(run["id"], error=None)
+
+        original_connect = executions._connect
+        monkeypatch.setattr(queue, "_reflect_terminal_deliveries", original_reflect)
+        monkeypatch.setattr(executions, "_connect", Mock(side_effect=OSError("ledger unavailable")))
+        with pytest.raises(OSError, match="ledger unavailable"):
+            queue.reconcile_terminal_deliveries()
+
+        with sqlite3.connect(queue.queue_path()) as conn:
+            projection = conn.execute(
+                "SELECT projected FROM deliveries WHERE execution_id=?", (run["id"],)
+            ).fetchone()
+            assert projection is not None
+            assert projection[0] == 0
+
+        monkeypatch.setattr(executions, "_connect", original_connect)
+        assert queue.reconcile_terminal_deliveries() == 1
+        assert executions.get_execution(run["id"])["delivery_status"] == "delivered"
+        assert queue.reconcile_terminal_deliveries() == 0
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_terminal_receipt_reconciles_unknown_commit_gap(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.setattr(queue, "DELIVERY_DB", home / "cron" / "deliveries.db")
+        run = executions.create_execution("gap", source="builtin")
+        executions.mark_execution_running(run["id"])
+        with executions._transaction() as conn:
+            conn.execute("UPDATE executions SET delivery_status='unknown' WHERE id=?", (run["id"],))
+        # Crash after the queue's terminal commit, before it projected to ledger.
+        with queue._transaction() as conn:
+            conn.execute(
+                "INSERT INTO deliveries (execution_id, job_json, content, status, created_at, finished_at) "
+                "VALUES (?, '{}', '', 'delivered', ?, ?)",
+                (run["id"], "2026-09-26T00:00:00+00:00", "2026-09-26T00:00:01+00:00"),
+            )
+        assert queue.drain(lambda *_: pytest.fail("must not resend")) == 0
+        assert executions.get_execution(run["id"])["delivery_status"] == "delivered"
+        assert queue.drain(lambda *_: pytest.fail("must not resend")) == 0
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_terminal_receipt_reconciliation_uses_projection_index_and_skips_projected_rows(
+    tmp_path, monkeypatch
+):
+    from cron import delivery_queue as queue, executions
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        delivery_db = home / "cron" / "deliveries.db"
+        execution_db = home / "cron" / "executions.db"
+        monkeypatch.setattr(queue, "DELIVERY_DB", delivery_db)
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", execution_db)
+        run = executions.create_execution("job-indexed", source="builtin")
+
+        with queue._transaction() as conn:
+            conn.execute(
+                "INSERT INTO deliveries "
+                "(execution_id, job_json, content, status, created_at, finished_at) "
+                "VALUES (?, '{}', '', 'delivered', ?, ?)",
+                (run["id"], "2026-09-26T00:00:00+00:00", "2026-09-26T00:00:01+00:00"),
+            )
+
+        assert queue.reconcile_terminal_deliveries() == 1
+        assert queue.reconcile_terminal_deliveries() == 0
+        with sqlite3.connect(delivery_db) as conn:
+            assert conn.execute(
+                "SELECT projected FROM deliveries WHERE execution_id=?", (run["id"],)
+            ).fetchone()[0] == 1
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_reconcile_10k_tombstones_under_one_second(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from hermes_cli.sqlite_util import transaction
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        delivery_db = home / "cron" / "deliveries.db"
+        execution_db = home / "cron" / "executions.db"
+        monkeypatch.setattr(queue, "DELIVERY_DB", delivery_db)
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", execution_db)
+        count = 10_000
+        ids = [f"exec-tombstone-{index}" for index in range(count)]
+        ledger = executions._connect()
+        with transaction(ledger) as conn:
+            conn.executemany(
+                "INSERT INTO executions "
+                "(id, job_id, source, process_id, pid, status, claimed_at) "
+                "VALUES (?, ?, 'builtin', 'test', 1, 'completed', ?)",
+                [(execution_id, execution_id, "2026-09-26T00:00:00+00:00") for execution_id in ids],
+            )
+        with queue._transaction() as conn:
+            conn.executemany(
+                "INSERT INTO delivery_tombstones "
+                "(execution_id, terminal_status, finished_at) VALUES (?, 'delivered', ?)",
+                [(execution_id, "2026-09-26T00:00:01+00:00") for execution_id in ids],
+            )
+
+        original_connect = executions._connect
+        ledger_connects = []
+
+        def counted_connect():
+            ledger_connects.append(True)
+            return original_connect()
+
+        monkeypatch.setattr(executions, "_connect", counted_connect)
+        started = time.perf_counter()
+        assert queue.reconcile_terminal_deliveries() == count
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 1.0
+        assert queue.reconcile_terminal_deliveries() == 0
+        assert len(ledger_connects) == 1
+        with sqlite3.connect(delivery_db) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM delivery_tombstones WHERE projected=1"
+            ).fetchone()[0] == count
+    finally:
+        reset_hermes_home_override(token)
 
 
 def test_delivery_failure_is_terminal_not_retried_and_redacted(

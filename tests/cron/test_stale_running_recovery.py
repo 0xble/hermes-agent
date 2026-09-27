@@ -23,7 +23,7 @@ from cron.executions import _hermes_now, _transaction, recover_interrupted_execu
 def _ledger(monkeypatch, tmp_path):
     monkeypatch.setattr(executions_mod, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     # The owner is alive for every row in this module; the bound alone decides.
-    monkeypatch.setattr(executions_mod, "_owner_is_live", lambda pid, started_at: True)
+    monkeypatch.setattr(executions_mod, "_owner_identity", lambda pid, started_at: "live")
 
 
 def _seed_running(job_id: str, *, age_seconds: float, pid: int = 99999) -> str:

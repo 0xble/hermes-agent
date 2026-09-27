@@ -546,7 +546,7 @@ from cron.jobs import (
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions)
+    record_delivery_outcome, recover_interrupted_executions)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -2713,6 +2713,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, cancel_event: Optional[_CancelEventLike] = None,
+    hard_wall_fence=None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
@@ -2774,6 +2775,7 @@ def run_one_job(
                     extra_prompt=extra_prompt,
                     claim_lost=lost_ownership,
                     transport_cancel=cancel_event,
+                    hard_wall_fence=hard_wall_fence,
                     execution_token=execution_token))
     finally:
         with _running_lock:
@@ -3051,7 +3053,21 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
         error="Interrupted by gateway shutdown before terminal completion.")
 
 
-def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
+def _record_committed_delivery_outcome(execution_id: str, outcome: str) -> None:
+    # No queue receipt will resolve these outcomes. 'not_configured' means no
+    # target existed, so its delivery status is suppressed, not transport-failed.
+    terminal_status = {
+        "delivered": "delivered", "failed": "failed",
+        "suppressed": "suppressed", "suppressed_acked": "suppressed",
+        "not_configured": "suppressed",
+    }.get(outcome)
+    record_delivery_outcome(
+        execution_id, outcome, resolve_provisional_status=terminal_status)
+
+
+def _finish_completed_run(
+    d: _RunDelivery, fire_owner: Optional[str], execution_id: str, *, result_committed: bool = False,
+) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
     if not d.should_deliver and job.get("last_delivery_queued"):
@@ -3096,8 +3112,11 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
-    finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    if result_committed:
+        _record_committed_delivery_outcome(execution_id, delivery_outcome)
+    else:
+        finish_execution(
+            execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
     return True
 
 
@@ -3144,7 +3163,7 @@ def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
     transport_cancel: Optional[_CancelEventLike] = None,
-    execution_token: Optional[object] = None,
+    execution_token: Optional[object] = None, hard_wall_fence=None,
 ) -> bool:
     fence = _FireOwnership(job, claim_lost, transport_cancel)
     fire_owner = fence.owner
@@ -3157,6 +3176,7 @@ def _run_one_job_body(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
     delivery_attempted = False
     delivery_error = None
+    committed = False
     from agent.secret_scope import (
         build_profile_secret_scope, reset_secret_scope, set_secret_scope)
 
@@ -3255,6 +3275,22 @@ def _run_one_job_body(
             if marker_error is not None:
                 success, error, agent_declared = False, marker_error, True
 
+        if hard_wall_fence is not None:
+            # The execution ledger is the sole completion/timeout arbiter. Commit
+            # the final run result before output, notification, or agent teardown.
+            if success and _is_interrupted(job["id"], execution_token):
+                success = False
+                error = "Interrupted by gateway shutdown before the run finished."
+            if success and not final_response.strip():
+                success = False
+                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            if finish_execution(execution_id, success=success, error=error,
+                                output=output, require_running=True) is None:
+                # The watchdog already committed failed(timeout); even teardown
+                # can hang, so leave it to the watchdog's bounded cleanup.
+                return False
+            committed = True
+
         # Agent is still live through delivery; wrap ALL of save/compose/deliver in try/finally so a
         # raise anywhere still tears the deferred agent down.
         d = _RunDelivery(job=job, success=success, error=error, agent_declared=agent_declared)
@@ -3303,7 +3339,7 @@ def _run_one_job_body(
             _finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
-        return _finish_completed_run(d, fire_owner, execution_id)
+        return _finish_completed_run(d, fire_owner, execution_id, result_committed=committed)
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
@@ -3318,6 +3354,14 @@ def _run_one_job_body(
         # and no error. Owner fencing still applies: a stale worker must not record over a replacement claim
         # owner.
         _err_text = str(e) or type(e).__name__
+        if committed:
+            logger.error("Cron post-commit side effect failed for job %s: %s", job["id"], _err_text)
+            return False
+        if hard_wall_fence is not None:
+            if finish_execution(execution_id, success=False, error=_err_text,
+                                require_running=True) is None:
+                return False
+            committed = True
         logger.error(
             "Error processing job %s: %s",
             job["id"],
@@ -3349,8 +3393,11 @@ def _run_one_job_body(
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
         try:
-            finish_execution(
-                execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
+            if committed:
+                _record_committed_delivery_outcome(execution_id, delivery_outcome)
+            else:
+                finish_execution(
+                    execution_id, success=False, error=_err_text, delivery_outcome=delivery_outcome)
         except Exception as record_err:
             logger.error("Failed to finish execution record for job %s: %s", job["id"], record_err)
         if not isinstance(e, Exception):
@@ -3718,6 +3765,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                     execution_id,
                 )
                 return False
+            from cron.scheduler_detached_worker import arm_hard_wall_timeout, hard_wall_timeout_seconds
+            watchdog_stop = arm_hard_wall_timeout(
+                execution_id, profile_home, hard_wall_timeout_seconds())
             try:
                 ack_path.parent.mkdir(parents=True, exist_ok=True)
                 # Publish via write-to-temp + atomic rename. Writing ack_path in place
@@ -3746,8 +3796,26 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                return run_one_job(job, adapters=None, loop=None, verbose=False)
+                return run_one_job(job, adapters=None, loop=None, verbose=False,
+                                   hard_wall_fence=watchdog_stop)
             finally:
+                # Inactivity timeout abandons a ThreadPoolExecutor future with
+                # shutdown(wait=False). run_one_job can return while its worker is
+                # still non-daemon and preventing interpreter exit; disarming here
+                # would leave the detached process unbounded. Once that work ends,
+                # normal interpreter shutdown exits without needing the watchdog.
+                terminal = get_execution(execution_id)
+                if terminal and terminal["status"] == "failed" and terminal.get("error") and "hard wall-clock timeout" in terminal["error"]:
+                    # Timeout CAS won; let its watchdog reap descendants and
+                    # terminate with 124, not this returning thread's code 1.
+                    threading.Event().wait(4)
+                    os._exit(124)
+                if not any(
+                    thread.is_alive() and not thread.daemon
+                    and thread is not threading.current_thread()
+                    for thread in threading.enumerate()
+                ):
+                    watchdog_stop.set()
                 if old_external_execution is None:
                     os.environ.pop("_HERMES_CRON_EXTERNAL_WORKER", None)
                 else:

@@ -888,6 +888,17 @@ cron:
 
 A timed-out send is recorded in `last_delivery_error` as `standalone send to <target> timed out after Ns`; the message may still land if the adapter had already accepted it.
 
+## Detached worker hard wall-clock timeout
+
+A cron run handed to a restart-safe detached worker has a finite **two-hour** wall-clock limit, separate from the 600-second inactivity watchdog and the script timeout. Set `cron.hard_wall_timeout_seconds` in the owning profile's `config.yaml` to another positive finite number of seconds:
+
+```yaml
+cron:
+  hard_wall_timeout_seconds: 3600
+```
+
+Invalid, zero, and non-finite values fall back to 7200 seconds rather than disabling the cap. When the limit expires, the worker stops its identifiable descendant tree (including children in another process session), records one failed execution, and exits. If the process fingerprint cannot be verified or a descendant cannot be terminated, it leaves the result inspectable rather than declaring a successful kill.
+
 ## No-agent mode (script-only jobs)
 
 For recurring jobs that don't need LLM reasoning — classic watchdogs, disk/memory alerts, heartbeats, CI pings — pass `no_agent=True` at creation time. The scheduler runs your script on schedule and delivers its stdout directly, skipping the agent entirely:

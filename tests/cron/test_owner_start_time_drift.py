@@ -58,8 +58,8 @@ def test_drift_within_tolerance_keeps_execution_running(monkeypatch, drift, expe
         assert recovered == 0
         assert _status(execution_id) == "running"
     else:
-        assert recovered == 1
-        assert _status(execution_id) == "unknown"
+        assert recovered == 0
+        assert _status(execution_id) == "running"  # PID reuse is ambiguous, not proof of death
 
 
 def test_unreadable_start_time_fail_safe(monkeypatch):

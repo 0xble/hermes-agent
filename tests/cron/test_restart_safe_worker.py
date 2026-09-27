@@ -924,7 +924,9 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
                     {Platform.TELEGRAM: adapter}, replacement_loop
                 )
             current = executions.latest_execution(job["id"])
-            if current and current["status"] == "completed":
+            if current and current["status"] == "completed" and (
+                (delivery_queue.get_status(execution["id"]) or {}).get("status") == "delivered"
+            ):
                 break
             time.sleep(0.05)
         assert executions.latest_execution(job["id"])["status"] == "completed"

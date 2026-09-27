@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import subprocess
 import sqlite3
 import threading
 import time
@@ -16,7 +17,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -87,6 +88,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    # Additive only: an older release can still SELECT/INSERT/UPDATE this table during rollback.
+    add_column_if_missing(conn, "executions", "code_sha", "code_sha TEXT")
+    add_column_if_missing(conn, "executions", "execution_identity", "execution_identity TEXT")
+    add_column_if_missing(conn, "executions", "owner_kind", "owner_kind TEXT")
+    add_column_if_missing(conn, "executions", "delivery_status", "delivery_status TEXT")
+    # 0 means an unknown status is a terminal queue projection; 1 is the
+    # detached finish-before-enqueue provisional marker.  Additive so older
+    # releases can continue using this shared DB with named-column statements.
+    add_column_if_missing(
+        conn, "executions", "delivery_status_provisional",
+        "delivery_status_provisional INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(conn, "executions", "output", "output TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -126,22 +140,55 @@ def _process_start_time(pid: int) -> Optional[int]:
         return None
 
 
-def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+def running_code_sha() -> Optional[str]:
+    """Resolve the imported release, not the gateway's moving ``current`` pointer.
+
+    Release builders may stamp either marker; a checkout uses its own Git HEAD.
+    Never label an unidentifiable run with the unrelated live install's revision.
+    """
+    root = Path(__file__).resolve().parent.parent
+    # S2 release directories are named by their immutable SHA and carry the
+    # `.release-ready` marker. Resolve that identity before consulting Git so a
+    # worker launched from `releases/<sha>` never reports the moving checkout.
+    release_name = root.name
+    if root.parent.name == "releases" and len(release_name) == 40 and all(
+        c in "0123456789abcdef" for c in release_name.lower()
+    ) and (root / ".release-ready").is_file():
+        return release_name.lower()
+    marker = root / ".release-ready"
+    if marker.is_file():
+        value = marker.read_text(encoding="utf-8").strip().splitlines()[0]
+        if len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower()):
+            return value.lower()
     try:
-        from gateway.status import _pid_exists
+        value = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        return value if len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower()) else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _owner_identity(pid: int, started_at: Optional[int]) -> str:
+    """Return live/dead/ambiguous; a recycled PID is NOT proof of the original owner's death."""
+    try:
+        from gateway.status import _pid_exists, start_time_fingerprints_match
         if not _pid_exists(pid):
-            return False
+            return "dead"
+        if started_at is None:
+            return "live" if pid == os.getpid() else "ambiguous"
+        current = _process_start_time(pid)
+        if current is None:
+            return "ambiguous"
+        return "live" if start_time_fingerprints_match(started_at, current) else "ambiguous"
     except Exception:
-        return True  # fail safe: inability to prove death must not rewrite state
-    if started_at is None:
-        return pid == os.getpid()
-    current = _process_start_time(pid)
-    if current is None:
-        return True  # cannot compare -> cannot prove death; a misread must not rewrite state
-    # Drifted same-host readings (#117505) are not proof of death; a live misread is still
-    # bounded by the stale-claim sweep below.
-    from gateway.status import start_time_fingerprints_match
-    return start_time_fingerprints_match(started_at, current)
+        return "ambiguous"
+
+
+def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+    # Other recovery clients must also fail closed on unreadable/recycled fingerprints.
+    return _owner_identity(pid, started_at) != "dead"
 
 
 def _live_owner_stale_after_seconds() -> Optional[float]:
@@ -194,10 +241,12 @@ def create_execution(
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, scheduled_instant, code_sha, execution_identity,
+                owner_kind)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, 'gateway')""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now, canonical_instant(scheduled_instant),
+             running_code_sha(), execution_id),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
@@ -244,13 +293,15 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
     """
     pid = os.getpid()
     process_started_at = _process_start_time(pid)
+    if process_started_at is None:
+        return None  # never acknowledge a worker whose identity cannot be verified
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
                SET process_id=?, pid=?, process_started_at=?,
                    status='running', started_at=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, owner_kind='detached'
                WHERE id=? AND status='claimed' AND handoff_pending=1""",
             (_PROCESS_ID, pid, process_started_at, now, execution_id),
         )
@@ -282,7 +333,8 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
-    delivery_outcome: Optional[str] = None,
+    delivery_outcome: Optional[str] = None, require_running: bool = False,
+    output: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
@@ -292,10 +344,17 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?, output=?,
+                   delivery_status=CASE WHEN owner_kind='detached' AND delivery_status IS NULL
+                                        THEN 'unknown' ELSE delivery_status END,
+                   delivery_status_provisional=CASE
+                       WHEN owner_kind='detached' AND delivery_status IS NULL THEN 1
+                       ELSE delivery_status_provisional END
                WHERE id=? AND status IN ('claimed','running')
+                 AND (?=0 OR status='running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, output, execution_id,
+             int(require_running), _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -317,9 +376,8 @@ _OWNER_WEDGED_REASON = (
 
 
 def recover_interrupted_executions() -> int:
-    """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
-    dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
+    """Mark abandoned attempts unknown only for proved-dead owners. Legacy gateway-owned
+    live stale claims retain their existing bounded recovery; detached live workers never do."""
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
@@ -330,7 +388,7 @@ def recover_interrupted_executions() -> int:
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at, claimed_at
+                      handoff_pending, handoff_started_at, claimed_at, owner_kind
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
@@ -338,7 +396,12 @@ def recover_interrupted_executions() -> int:
             if row["process_id"] == _PROCESS_ID:
                 continue
             reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            identity = _owner_identity(int(row["pid"]), row["process_started_at"])
+            if identity == "ambiguous":
+                continue  # PID reuse / unreadable fingerprint is not proof of death.
+            if row["owner_kind"] == "detached" and identity == "live":
+                continue  # Gateway replacement never terminalizes its live worker.
+            if identity == "live":
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
                 # this check, so a claim older than the derived bound is treated as wedged
@@ -404,6 +467,90 @@ def list_executions(
             params,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+# SQL transition table: each target group lists its allowed source states.
+# unknown(provisional=0) can only advance to a known terminal receipt;
+# delivered/failed/suppressed are final. The predicate observes current SQLite
+# state atomically with the write, not an earlier queue read.
+_DELIVERY_STATUS_TRANSITION = """CASE ?
+     WHEN 'pending' THEN delivery_status IS NULL OR delivery_status='pending'
+          OR (delivery_status='unknown' AND delivery_status_provisional=1)
+     WHEN 'delivering' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering')
+          OR (delivery_status='unknown' AND delivery_status_provisional=1)
+     WHEN 'unknown' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering')
+          OR (delivery_status='unknown' AND delivery_status_provisional=1)
+     WHEN 'delivered' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering','unknown')
+     WHEN 'failed' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering','unknown')
+     WHEN 'suppressed' THEN delivery_status IS NULL
+          OR delivery_status IN ('pending','delivering','unknown')
+     ELSE 0 END"""
+_DELIVERY_STATUS_UPDATE = """UPDATE executions
+   SET delivery_status=?, delivery_status_provisional=0
+   WHERE id=? AND """ + _DELIVERY_STATUS_TRANSITION
+_DELIVERY_STATUSES = frozenset(("pending", "delivering", "unknown", "delivered", "failed", "suppressed"))
+
+
+def _project_delivery_statuses(conn: sqlite3.Connection, rows: Iterable[tuple[str, str]]) -> None:
+    """Project (status, execution_id) pairs through the same atomic transition table."""
+    parameters = []
+    for status, execution_id in rows:
+        if status not in _DELIVERY_STATUSES:
+            raise ValueError("invalid cron delivery status")
+        parameters.append((status, execution_id, status))
+    conn.executemany(_DELIVERY_STATUS_UPDATE, parameters)
+
+
+def record_delivery_outcome(
+    execution_id: str, outcome: str, *, resolve_provisional_status: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Classify an already committed detached result once, without reopening its result fence.
+
+    The same process/PID that committed the result owns this write; a replacement
+    gateway or watchdog cannot classify someone else's execution. A queue receipt
+    may have projected in the meantime, so only provisional unknown is resolved.
+    """
+    if not outcome:
+        raise ValueError("cron delivery outcome must be nonempty")
+    if resolve_provisional_status is not None and resolve_provisional_status not in (
+        "delivered", "failed", "suppressed"
+    ):
+        raise ValueError("provisional delivery resolution must be terminal")
+    eligible = (
+        "delivery_status='unknown' AND delivery_status_provisional=1 AND ("
+        + _DELIVERY_STATUS_TRANSITION + ")"
+    )
+    with _transaction() as conn:
+        # The outcome and optional status resolution are one conditional SQLite
+        # write. Reuse the receipt transition predicate, never overwrite a queue
+        # projection, and do not emit twice on an idempotent retry.
+        cur = conn.execute(
+            "UPDATE executions SET delivery_outcome=?, "
+            "delivery_status=CASE WHEN ? IS NOT NULL AND " + eligible +
+            " THEN ? ELSE delivery_status END, "
+            "delivery_status_provisional=CASE WHEN ? IS NOT NULL AND " + eligible +
+            " THEN 0 ELSE delivery_status_provisional END "
+            "WHERE id=? AND owner_kind='detached' AND status IN ('completed','failed') "
+            "AND process_id=? AND pid=? AND delivery_outcome IS NULL",
+            (outcome, resolve_provisional_status, resolve_provisional_status,
+             resolve_provisional_status, resolve_provisional_status,
+             resolve_provisional_status, execution_id, _PROCESS_ID, os.getpid()),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record, delivery_outcome=outcome)
+    return record
+
+
+def record_delivery_status(execution_id: str, status: str) -> None:
+    """Delivery can finish after the worker's immutable terminal run result."""
+    with _transaction() as conn:
+        _project_delivery_statuses(conn, [(status, execution_id)])
 
 
 def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
