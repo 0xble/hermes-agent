@@ -37,13 +37,65 @@ OPTIONAL_LANES = {
 
 # Keep the existing full/check interface for maintainers. Hosted CI selects these
 # explicit profiles rather than treating partial --lane runs as qualification.
-GATE_PYTHON_FILES = (
-    'tests/agent/test_agent_guardrails.py',
-    'tests/agent/test_oneshot.py',
-    'tests/gateway/test_own_policy_startup_gate.py',
-    'tests/hermes_cli/test_cli_retry.py',
-)
-GATE_LANES = ('static', 'python-gate', 'node-gate')
+GATE_LANES = ('static', 'node-gate')
+# Upgrade requires upstream release tags and a 900s per-file bound. The SQLite
+# torture chamber remains nightly-only while its kill9/FTS failures are resolved.
+NIGHTLY_ONLY_E2E = ('tests/e2e/core/upgrade', 'tests/e2e/core/sqlite/test_torture_chamber.py')
+
+
+def shard_files(root: Path, count: int) -> list[list[str]]:
+    """Partition Python and PR-safe e2e by measured wall time, deterministically.
+
+    Files taking >=5s in the first hosted run are pinned in the timing table.
+    Short and newly added files use a size-based estimate, calibrated against
+    the measured short files. Path breaks equal-weight ties; no runner-local
+    duration cache can shift ownership between jobs.
+    """
+    if count < 1:
+        raise ValueError('Shard count must be positive')
+    files = [path for path in (root / 'tests').rglob('test_*.py')
+             if not {'integration', 'docker'} & set(path.relative_to(root).parts)
+             and not (path.relative_to(root).parts[1] == 'e2e'
+                      and (path.is_relative_to(root / NIGHTLY_ONLY_E2E[0])
+                           or path == root / NIGHTLY_ONLY_E2E[1]))]
+    # Most files live in tests/; candidate-extensions is an additional ordinary root.
+    files.extend((root / 'candidate-extensions').rglob('test_*.py') if (root / 'candidate-extensions').is_dir() else ())
+    timings = json.loads((ROOT / 'scripts/ci/python_shard_timings.json').read_text(encoding='utf-8'))
+    def weight(path: Path) -> float:
+        relative = path.relative_to(root).as_posix()
+        # The 3 KB/s estimate matches the aggregate of measured sub-5s files;
+        # cap it below the recorded-file threshold so new giant files cannot
+        # overwhelm a shard before their first hosted timing is available.
+        return timings.get(relative, min(4.9, max(0.7, path.stat().st_size / 3000)))
+
+    buckets: list[list[str]] = [[] for _ in range(count)]
+    totals = [0.0] * count
+    for path in sorted(files, key=lambda p: (-weight(p), p.relative_to(root).as_posix())):
+        index = min(range(count), key=lambda i: (totals[i], i))
+        buckets[index].append(path.relative_to(root).as_posix())
+        totals[index] += weight(path)
+    return buckets
+
+
+def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> None:
+    buckets = shard_files(ROOT, count)
+    files = buckets[index - 1]
+    if not files:
+        raise RuntimeError(f'Empty Python shard {index}/{count}')
+    print(f'Python shard {index}/{count}: {len(files)} files', flush=True)
+    python_tests(env, files, workers)
+
+
+def nightly_only_e2e(env: dict[str, str], workers: int) -> None:
+    failures = []
+    for path, timeout in ((NIGHTLY_ONLY_E2E[1], None),
+                          (NIGHTLY_ONLY_E2E[0], E2E_UPGRADE_FILE_TIMEOUT)):
+        try:
+            python_tests(env, [path], workers, file_timeout=timeout)
+        except subprocess.CalledProcessError as error:
+            failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 def git_environment(*, root: Path | None = ROOT, base: dict[str, str] | None = None,
@@ -527,14 +579,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
     parser.add_argument('expected_sha', nargs='?', help='Exact committed SHA required by gate/nightly')
-    parser.add_argument('--lane', choices=(*LANES, *OPTIONAL_LANES), action='append', help='Partial check, never full-gate evidence')
+    parser.add_argument('--lane', choices=(*LANES, *OPTIONAL_LANES, 'node-gate', 'nightly-only-e2e'), action='append', help='Select exact-SHA lanes or partial check lanes')
+    parser.add_argument('--shard', help='Run only Python/e2e file shard I/N (1-indexed, gate/nightly only)')
     parser.add_argument('--workers', type=int, default=4, help='Python file workers (default 4)')
     parser.add_argument('--node-workers', type=int, default=2)
     args = parser.parse_args()
     if args.workers < 1 or args.node_workers < 1:
         parser.error('Worker counts must be positive')
-    if args.command != 'check' and args.lane:
-        parser.error('--lane is only valid for check')
+    if args.command not in ('check', 'gate', 'nightly') and args.lane:
+        parser.error('--lane is only valid for check/gate/nightly')
+    shard_index = shard_count = 0
+    if args.shard:
+        if args.command not in ('gate', 'nightly') or args.lane:
+            parser.error('--shard requires gate/nightly without --lane')
+        match = re.fullmatch(r'([1-9][0-9]*)/([1-9][0-9]*)', args.shard)
+        if not match or int(match[1]) > int(match[2]):
+            parser.error('--shard must be I/N with 1 <= I <= N')
+        shard_index, shard_count = map(int, match.groups())
     exact = args.command in ('gate', 'nightly', 'nightly-native')
     if exact != bool(args.expected_sha):
         parser.error('gate/nightly require a positional full SHA; other commands do not accept one')
@@ -561,8 +622,8 @@ def main() -> int:
             assert_exact_checkout(args.expected_sha)
         lanes = {
             'static': lambda: static(env),
-            'python-gate': lambda: python_tests(env, list(GATE_PYTHON_FILES), args.workers),
             'node-gate': lambda: node_gate(env, args.node_workers),
+            'nightly-only-e2e': lambda: nightly_only_e2e(env, args.workers),
             'python': lambda: python_tests(env, ['tests'], args.workers),
             'e2e': lambda: e2e_tests(env, args.workers),
             'node': lambda: node(env, args.node_workers),
@@ -571,8 +632,11 @@ def main() -> int:
             'container-lint': lambda: container_lint(env),
             'native-os': lambda: native_os(env, args.workers),
         }
-        selected = args.lane or (list(GATE_LANES) if args.command == 'gate' else
-                                 ['native-os'] if args.command == 'nightly-native' else list(LANES))
+        selected = (['python-shard'] if args.shard else args.lane or
+                    (list(GATE_LANES) if args.command == 'gate' else
+                     ['native-os'] if args.command == 'nightly-native' else list(LANES)))
+        if args.shard:
+            lanes['python-shard'] = lambda: python_shard(env, args.workers, shard_index, shard_count)
         passed = aggregate([(name, lanes[name]) for name in dict.fromkeys(selected)])
         if exact:
             assert_exact_checkout(args.expected_sha)

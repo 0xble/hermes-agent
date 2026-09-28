@@ -530,6 +530,41 @@ def check_tts_requirements() -> bool:
     return check() if check is not None else _plugin_provider_is_available(provider)
 
 
+def _sdk_available_or_installable(module: str) -> bool:
+    """Check SDK availability without installing it as a side effect of tool discovery."""
+    if _package_installed(module):
+        return True
+    from tools.lazy_deps import _allow_lazy_installs, _lazy_install_target
+    if not _allow_lazy_installs():
+        return False
+    if _lazy_install_target() is None:
+        from hermes_cli.config import get_managed_system
+        if get_managed_system():
+            return False
+    return True
+
+
+_SDK_TOOL_REQUIREMENTS: Dict[str, Callable[[], bool]] = {
+    "edge": lambda: _sdk_available_or_installable("edge_tts") or _check_neutts_available(),
+    "elevenlabs": lambda: _sdk_available_or_installable("elevenlabs") and bool(_resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs")),
+    "mistral": lambda: _sdk_available_or_installable("mistralai") and bool(_resolve_provider_key("MISTRAL_API_KEY", "mistral")),
+}
+
+
+def check_tts_tool_availability() -> bool:
+    """Advertise TTS without blocking an unrelated turn on an SDK install.
+
+    The importer still performs the lazy install when the tool is actually used.
+    Other TTS consumers keep their existing readiness checks.
+    """
+    tts_config = _load_tts_config()
+    provider = _get_provider(tts_config)
+    if _resolve_command_provider_config(provider, tts_config) is not None:
+        return True
+    check = _SDK_TOOL_REQUIREMENTS.get(provider)
+    return check() if check is not None else check_tts_requirements()
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -595,7 +630,7 @@ registry.register(
     handler=lambda args, **kw: text_to_speech_tool(
         text=args.get("text", ""),
         **{k: args.get(k) for k in ("output_path", "speed", "instructions", "provider")}),
-    check_fn=check_tts_requirements,
+    check_fn=check_tts_tool_availability,
     emoji="🔊",
     dynamic_schema_overrides=_tts_schema_overrides)
 
