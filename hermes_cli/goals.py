@@ -1315,7 +1315,20 @@ _RUNTIME_NOTICE_LABELS = (
 )
 
 
-def _runtime_notice_label(content: Any) -> str:
+# display_kind values only the runtime writes on the user-role rows it injects.
+_RUNTIME_NOTICE_KINDS = frozenset({"internal_notification", "async_delegation_complete", "hidden"})
+# display_kind values of user-role rows the person typed: none, or a mid-turn /steer message.
+_USER_TYPED_KINDS = frozenset({"", "steer"})
+
+
+def _runtime_notice_label(row: Dict[str, Any]) -> str:
+    """Label for a runtime-delivered notice row, or "" when its provenance is not runtime-owned.
+
+    The persisted ``display_kind`` authenticates the row; the text prefix only picks the label.
+    A user message that merely starts with the same words is typed input, never evidence."""
+    if str(row.get("display_kind") or "") not in _RUNTIME_NOTICE_KINDS:
+        return ""
+    content = row.get("content")
     text = content.lstrip() if isinstance(content, str) else ""
     return next((label for prefix, label in _RUNTIME_NOTICE_LABELS if text.startswith(prefix)), "")
 
@@ -1366,9 +1379,9 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
             try:
                 for variant in _citation_variants(needle):
                     notices = [r for r in finder(session_id, variant, role="user", since=since, limit=4)
-                               if _runtime_notice_label(r.get("content"))]
+                               if _runtime_notice_label(r)]
                     if notices:
-                        matches = [(dict(r, tool_name=_runtime_notice_label(r.get("content"))), variant, False)
+                        matches = [(dict(r, tool_name=_runtime_notice_label(r)), variant, False)
                                    for r in notices]
                         break
             except Exception as exc:
@@ -1640,11 +1653,32 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
 
 # ── GoalManager — the orchestration surface CLI + gateway talk to ──────
 
-# Runtime-injected user-role messages: never evidence of what the user said.
+# Runtime-injected user-role messages: never evidence of what the user said. Provenance
+# (display_kind, compression flags) is the primary test; this list catches legacy rows written
+# before the runtime typed every injection.
 _SYNTHETIC_USER_PREFIXES = (
-    "[Continuing toward", "[ASYNC DELEGATION", "[IMPORTANT:", "[System note", "[CONTEXT COMPACTION",
-    "[STILL IN PROGRESS", "[Cron delivery", "[Your active task list", "[Relay from", "[Goal set]",
+    "[Continuing toward", "[ASYNC DELEGATION", "[IMPORTANT:", "[System note", "[System:", "[CONTEXT COMPACTION",
+    "[PRIOR CONTEXT", "[STILL IN PROGRESS", "[Cron delivery", "[Your active task list", "[Relay from",
+    "[Goal set]",
 )
+
+
+def _is_user_typed(row: Dict[str, Any]) -> bool:
+    """Whether a user-role row is input the person typed, judged by provenance first."""
+    content = row.get("content")
+    if not isinstance(content, str) or row.get("compressed_summary"):
+        return False
+    if str(row.get("display_kind") or "") not in _USER_TYPED_KINDS:
+        return False
+    if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
+        return False
+    try:
+        from agent.context_compressor import ContextCompressor
+        if ContextCompressor._is_context_summary_content(content):
+            return False
+    except Exception:  # pragma: no cover - compressor is part of the runtime
+        pass
+    return True
 _REPLY_QUOTE_RE = re.compile(r'^\[Replying to: ".*?"\]\n\s*', re.DOTALL)
 
 
@@ -1666,13 +1700,7 @@ def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: in
     except Exception as exc:
         logger.debug("goal revise: user message read failed: %s", exc)
         return []
-    texts = []
-    for row in rows:
-        content = row.get("content")
-        if not isinstance(content, str) or content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
-            continue
-        texts.append(_REPLY_QUOTE_RE.sub("", content, count=1))
-    return texts
+    return [_REPLY_QUOTE_RE.sub("", row["content"], count=1) for row in rows if _is_user_typed(row)]
 
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
