@@ -28,7 +28,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
+          filter: blob:none
+      - name: Fetch main history for attribution and previous-release checks
+        shell: bash
+        run: git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main'
       - name: Assert scheduled or dispatched SHA
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
@@ -61,12 +65,12 @@ jobs:
           runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}' \
             --lane static --lane node --lane docs --lane rust --lane container-lint --lane nightly-only-e2e
   python-shard:
-    name: Python and e2e (${{ matrix.shard }}/8)
+    name: Python and e2e (${{ matrix.shard }}/10)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     container:
       image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
       options: --init
@@ -83,7 +87,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
       - name: Assert scheduled or dispatched SHA
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
@@ -101,7 +105,7 @@ jobs:
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
-          runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}' --shard '${{ matrix.shard }}/8'
+          runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}' --shard '${{ matrix.shard }}/10'
   native:
     name: Native OS (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

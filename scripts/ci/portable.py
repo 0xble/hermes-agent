@@ -44,11 +44,12 @@ NIGHTLY_ONLY_E2E = ('tests/e2e/core/upgrade', 'tests/e2e/core/sqlite/test_tortur
 
 
 def shard_files(root: Path, count: int) -> list[list[str]]:
-    """Partition exactly the ordinary Python and PR-safe e2e files by source size.
+    """Partition Python and PR-safe e2e by measured wall time, deterministically.
 
-    No duration data is checked in (the runner's duration cache is local to each
-    job). Stable largest-file-first greedy assignment avoids independently
-    generated caches shifting ownership across jobs; path breaks equal-size ties.
+    Files taking >=5s in the first hosted run are pinned in the timing table.
+    Short and newly added files use a size-based estimate, calibrated against
+    the measured short files. Path breaks equal-weight ties; no runner-local
+    duration cache can shift ownership between jobs.
     """
     if count < 1:
         raise ValueError('Shard count must be positive')
@@ -59,12 +60,20 @@ def shard_files(root: Path, count: int) -> list[list[str]]:
                            or path == root / NIGHTLY_ONLY_E2E[1]))]
     # Most files live in tests/; candidate-extensions is an additional ordinary root.
     files.extend((root / 'candidate-extensions').rglob('test_*.py') if (root / 'candidate-extensions').is_dir() else ())
+    timings = json.loads((ROOT / 'scripts/ci/python_shard_timings.json').read_text(encoding='utf-8'))
+    def weight(path: Path) -> float:
+        relative = path.relative_to(root).as_posix()
+        # The 3 KB/s estimate matches the aggregate of measured sub-5s files;
+        # cap it below the recorded-file threshold so new giant files cannot
+        # overwhelm a shard before their first hosted timing is available.
+        return timings.get(relative, min(4.9, max(0.7, path.stat().st_size / 3000)))
+
     buckets: list[list[str]] = [[] for _ in range(count)]
-    totals = [0] * count
-    for path in sorted(files, key=lambda p: (-p.stat().st_size, p.relative_to(root).as_posix())):
+    totals = [0.0] * count
+    for path in sorted(files, key=lambda p: (-weight(p), p.relative_to(root).as_posix())):
         index = min(range(count), key=lambda i: (totals[i], i))
         buckets[index].append(path.relative_to(root).as_posix())
-        totals[index] += path.stat().st_size
+        totals[index] += weight(path)
     return buckets
 
 

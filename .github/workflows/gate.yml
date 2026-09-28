@@ -26,7 +26,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
+          filter: blob:none
+      - name: Fetch only main and the PR head history for attribution checks
+        shell: bash
+        run: git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main'
       - name: Assert checked-out PR head
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
@@ -46,12 +50,12 @@ jobs:
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
   python-shard:
-    name: Python and e2e (${{ matrix.shard }}/8)
+    name: Python and e2e (${{ matrix.shard }}/10)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     container:
       image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
       options: --init
@@ -68,7 +72,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
-          fetch-depth: 0
+          fetch-depth: 1
       - name: Assert checked-out PR head
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
@@ -86,7 +90,7 @@ jobs:
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
-          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/8'
+          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
   qualification:
     if: always()
     needs: [linux, python-shard]

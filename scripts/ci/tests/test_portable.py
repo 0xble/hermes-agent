@@ -32,10 +32,10 @@ class PortableGateTests(unittest.TestCase):
                if not p.is_relative_to(ci.ROOT / ci.NIGHTLY_ONLY_E2E[0])
                and p != ci.ROOT / ci.NIGHTLY_ONLY_E2E[1]}
         expected = ordinary | e2e
-        buckets = ci.shard_files(ci.ROOT, 8)
+        buckets = ci.shard_files(ci.ROOT, 10)
         self.assertEqual(set().union(*(set(bucket) for bucket in buckets)), expected)
         self.assertEqual(sum(map(len, buckets)), len(expected))
-        self.assertEqual(buckets, ci.shard_files(ci.ROOT, 8))
+        self.assertEqual(buckets, ci.shard_files(ci.ROOT, 10))
         self.assertTrue(all(buckets))
         with self.assertRaisesRegex(ValueError, 'positive'):
             ci.shard_files(ci.ROOT, 0)
