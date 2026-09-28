@@ -5942,6 +5942,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not _start_gateway_claim_pid_file(force=force):
         return False
 
+    # An opt-in active generation registers only after winning the legacy singleton lock.
+    # The normal unflagged path never constructs or touches the coordinator.
+    _active_generation = None
+    if getattr(runner.config, "overlap_handover_enabled", False):
+        from gateway.run_generation import start_active_generation
+        try:
+            _active_generation = await start_active_generation(runner.config)
+        except Exception:
+            logger.exception("Could not register the active overlap generation")
+            return False
+
+    async def _close_active_generation() -> None:
+        if _active_generation is not None:
+            await _active_generation.close()
+
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
     # Now the attach channel answers: republish the host record with the settled served set.
@@ -5976,13 +5991,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         success = await runner.start()
     except BaseException:
         _shutdown_gateway_health_export(runner)
+        await _close_active_generation()
         raise
     if not success:
         _shutdown_gateway_health_export(runner)
+        await _close_active_generation()
         return False
 
     if runner.should_exit_cleanly:
         _shutdown_gateway_health_export(runner)
+        await _close_active_generation()
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         # Explicit exit codes (GATEWAY_FATAL_CONFIG_EXIT_CODE) must propagate so s6 finish maps 78 → 125.
@@ -6000,18 +6018,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
         finally:
             _shutdown_gateway_health_export(runner)
+            await _close_active_generation()
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
         _start_gateway_start_cron_and_housekeeping(runner))
 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()
+    if _active_generation is not None:
+        _active_generation.mark_ready()
 
-    await runner.wait_for_shutdown()
-
-    return await _start_gateway_shutdown_tail(
-        runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
-        _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
+    try:
+        await runner.wait_for_shutdown()
+        return await _start_gateway_shutdown_tail(
+            runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
+            _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
+    finally:
+        await _close_active_generation()
 
 
 def _guard_corrupt_user_config() -> None:

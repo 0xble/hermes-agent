@@ -132,8 +132,8 @@ class GenerationCoordinator:
     def acquire_lease(self, resource: str, generation_id: str, *, state: str = "active") -> int:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT epoch,generation_id FROM leases WHERE resource=?", (resource,)).fetchone()
-            if row and row["generation_id"] != generation_id:
+            row = conn.execute("SELECT epoch,generation_id,state FROM leases WHERE resource=?", (resource,)).fetchone()
+            if row and row["state"] != "released" and row["generation_id"] != generation_id:
                 raise RuntimeError(f"lease {resource!r} is held by another generation")
             epoch = (int(row["epoch"]) + 1) if row else 1
             conn.execute(
@@ -142,6 +142,17 @@ class GenerationCoordinator:
             )
             conn.commit()
             return epoch
+
+    def release_lease(self, resource: str, generation_id: str, epoch: int) -> bool:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "UPDATE leases SET state='released' WHERE resource=? AND generation_id=? "
+                "AND epoch=? AND state!='released'",
+                (resource, generation_id, epoch),
+            ).rowcount
+            conn.commit()
+            return bool(changed)
 
     def generations(self) -> list[dict[str, Any]]:
         with self.connect() as conn:

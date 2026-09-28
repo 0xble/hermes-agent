@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from gateway.generation import (
     GenerationCoordinator,
     GenerationIdentity,
@@ -45,6 +47,33 @@ def test_generation_files_are_scoped_and_cleanup_is_fenced(tmp_path: Path):
     remove_generation_files(tmp_path, identity)
     assert not paths["state"].exists()
     assert other_paths["state"].exists()
+
+
+def test_lease_cannot_be_stolen_and_release_is_fenced(tmp_path):
+    coordinator = GenerationCoordinator(tmp_path)
+    first = GenerationIdentity.create(release_sha="a", label="ai.hermes.gateway-a")
+    second = GenerationIdentity.create(release_sha="b", label="ai.hermes.gateway-b")
+    coordinator.register(first)
+    coordinator.register(second)
+    epoch = coordinator.acquire_lease("active_generation", first.id)
+    with pytest.raises(RuntimeError, match="held by another"):
+        coordinator.acquire_lease("active_generation", second.id)
+    assert not coordinator.release_lease("active_generation", second.id, epoch)
+    assert not coordinator.release_lease("active_generation", first.id, epoch + 1)
+    assert coordinator.release_lease("active_generation", first.id, epoch)
+    assert coordinator.acquire_lease("active_generation", second.id) > epoch
+
+
+@pytest.mark.asyncio
+async def test_disabled_standby_creates_no_coordinator_or_legacy_files(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway.run_generation import serve_standby_generation
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with pytest.raises(RuntimeError, match="requires gateway.overlap_handover.enabled"):
+        await serve_standby_generation(GatewayConfig())
+    assert not (tmp_path / "gateway-coordinator.db").exists()
+    assert not (tmp_path / "gateway.pid").exists()
+    assert not (tmp_path / "gateway_state.json").exists()
 
 
 def test_overlap_gate_defaults_off_and_reads_nested_config(tmp_path, monkeypatch):

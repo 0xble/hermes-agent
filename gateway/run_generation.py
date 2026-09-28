@@ -19,6 +19,95 @@ from gateway.generation import (
 )
 
 
+async def start_active_generation(config) -> "ActiveGeneration | None":
+    """Register an already singleton-claimed active gateway; never claim from standby."""
+    if not overlap_handover_enabled(config):
+        return None
+    from gateway.status import _get_process_start_time
+    home = Path(get_hermes_home())
+    coordinator = GenerationCoordinator(home)
+    started = _get_process_start_time(os.getpid())
+    identity = GenerationIdentity.create(
+        release_sha=os.environ.get("HERMES_RELEASE_SHA", "unknown"),
+        label=os.environ.get("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway"),
+        start_fingerprint=f"{os.getpid()}:{started}",
+    )
+    coordinator.register(identity, state="serving")
+    try:
+        epoch = coordinator.acquire_lease("active_generation", identity.id)
+    except Exception:
+        coordinator.heartbeat(identity.id, state="failed")
+        raise
+    active = ActiveGeneration(home, coordinator, identity, epoch)
+    try:
+        await active.start()
+    except BaseException:
+        await active.close()
+        coordinator.heartbeat(identity.id, state="failed")
+        raise
+    return active
+
+
+class ActiveGeneration:
+    """Generation-scoped identity and heartbeat alongside the existing active dispatcher."""
+
+    def __init__(self, home: Path, coordinator: GenerationCoordinator,
+                 identity: GenerationIdentity, epoch: int):
+        self.home, self.coordinator, self.identity, self.epoch = home, coordinator, identity, epoch
+        self.paths = generation_paths(home, identity)
+        self.server: asyncio.AbstractServer | None = None
+        self.task: asyncio.Task | None = None
+        self.socket_stat = None
+
+    async def start(self) -> None:
+        import json
+        for name in ("pid", "host"):
+            write_generation_record(self.paths[name], self.identity, state="serving")
+        socket_path = self.paths["socket"]
+        if len(os.fsencode(socket_path)) >= 100:
+            raise RuntimeError("generation control socket path exceeds UNIX socket limit")
+
+        async def identify(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writer.write((json.dumps({"generation_id": self.identity.id, "state": "ready",
+                                     "release_sha": self.identity.release_sha,
+                                     "lease_epoch": self.epoch}) + "\n").encode())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        self.server = await asyncio.start_unix_server(identify, path=str(socket_path))
+        self.socket_stat = socket_path.stat()
+        write_generation_record(self.paths["state"], self.identity, state="serving", socket_path=socket_path)
+        self.task = asyncio.create_task(self._heartbeat())
+
+    def mark_ready(self) -> None:
+        write_generation_record(self.paths["state"], self.identity, state="ready",
+                                socket_path=self.paths["socket"])
+        self.coordinator.heartbeat(self.identity.id, state="ready")
+
+    async def _heartbeat(self) -> None:
+        while True:
+            await asyncio.sleep(1)
+            self.coordinator.heartbeat(self.identity.id)
+
+    async def close(self) -> None:
+        if self.task:
+            self.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.task
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+        if self.socket_stat:
+            with suppress(FileNotFoundError):
+                current = self.paths["socket"].stat()
+                if (current.st_dev, current.st_ino) == (self.socket_stat.st_dev, self.socket_stat.st_ino):
+                    self.paths["socket"].unlink()
+        self.coordinator.release_lease("active_generation", self.identity.id, self.epoch)
+        self.coordinator.heartbeat(self.identity.id, state="exited")
+        remove_generation_files(self.home, self.identity)
+
+
 async def serve_standby_generation(config=None) -> bool:
     """Report readiness without constructing a runner or connecting any adapter.
 
