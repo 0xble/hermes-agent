@@ -3777,12 +3777,13 @@ def _commit_compaction(
                         and source.get("content") == message.get("content")
                         and source.get("tool_calls") == message.get("tool_calls")
                     )
-                tail_count = sum(
-                    1 for m in compressed
-                    if id(m) in _tail_tagged_ids
-                    and isinstance(m, dict)
-                    and _tail_row_is_still_verbatim(m)
-                )
+                # The rewind below is positional (newest `tail_count` durable rows), so a rewritten carrier can
+                # only be left out of the count at the OLDEST end of the tail, where the summary seam folds into
+                # it. Excluding one from the middle would shift the window onto a still-verbatim neighbour.
+                _tail_rows = [m for m in compressed if id(m) in _tail_tagged_ids and isinstance(m, dict)]
+                _leading_rewritten = next(
+                    (i for i, m in enumerate(_tail_rows) if _tail_row_is_still_verbatim(m)), len(_tail_rows))
+                tail_count = len(_tail_rows) - _leading_rewritten
                 # The rewind takes the newest `tail_count` durable rows as the tail's originals, so a tail row
                 # with none (this turn's user row, which the CLI and gateway persist after preflight; unflushed
                 # scaffolding) would flag a summarized row superseded instead: gone from display and search.
