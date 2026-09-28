@@ -706,7 +706,9 @@ class GatewayInboundMixin:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        if self._draining:
+        if self._draining and not self._hm_is_registered_command(event):
+            if await self._route_plaintext_approval_while_busy(event, _quick_key):
+                return None
             self._preserve_drain_event(_quick_key, event)
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
@@ -1095,12 +1097,20 @@ class GatewayInboundMixin:
         except Exception as e:
             return f"Quick command error: {e}"
 
+    @staticmethod
+    def _hm_is_registered_command(event: "MessageEvent") -> bool:
+        command = event.get_command()
+        if not command:
+            return False
+        from hermes_cli.commands import resolve_command
+        return resolve_command(command) is not None
+
     async def _hm_dispatch_quick_and_plugin_commands(
         self, event: "MessageEvent", source: SessionSource, command: Optional[str]
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
-        if self._draining:
+        if self._draining and not self._hm_is_registered_command(event):
             self._preserve_drain_event(self._session_key_for_source(source), event)
             return True, None, command
 
@@ -1375,7 +1385,7 @@ class GatewayInboundMixin:
             # The original response was already acknowledged. Returning it
             # here would send it a second time.
             return None
-        if self._draining:
+        if self._draining and not self._hm_is_registered_command(event):
             self._preserve_drain_event(self._session_key_for_source(source), event)
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle

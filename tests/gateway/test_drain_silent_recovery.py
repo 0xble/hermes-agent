@@ -141,6 +141,33 @@ async def test_queued_interrupt_placeholder_does_not_send_before_followup():
     runner._run_agent.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_queued_model_echo_of_interrupt_diagnostic_never_sends_before_followup():
+    """A completed model turn can echo a prior interrupt diagnostic without its interrupt flag."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    runner._run_agent = AsyncMock(return_value={"final_response": "follow-up answer", "messages": []})
+    runner._is_goal_continuation_event = MagicMock(return_value=False)
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="follow-up")
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    ctx = SimpleNamespace(
+        session_key=key, session_id="sid", source=source, stream_consumer_holder=[None],
+        mute_notification_reply=False, persist_user_display_kind=None,
+        _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
+        run_generation=1, _interrupt_depth=0, history=[], context_prompt=None,
+        result_holder=[None], _post_delivery_adapter=None,
+    )
+    result = {"final_response": "Operation interrupted: retrying API call after error (retry 1/3).",
+              "interrupted": False, "failed": False, "messages": []}
+    followup = MessageEvent(text="follow-up", source=source, user_id="u1")
+    await runner._run_agent_queued_followup(
+        ctx, adapter, "follow-up", followup, result, result, None,
+    )
+    assert adapter.sent == []
+    runner._run_agent.assert_awaited_once()
+
+
 @pytest.mark.parametrize("placeholder", [
     "Operation interrupted.",
     "Operation interrupted: handling API error (timeout).",
@@ -153,8 +180,15 @@ def test_interrupted_turn_placeholders_are_not_chat_replies(placeholder):
     from gateway.run import _sanitize_gateway_final_response
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, placeholder, interrupted=True) == ""
-    if "waiting for model response" not in placeholder:
-        assert _sanitize_gateway_final_response(Platform.TELEGRAM, placeholder, interrupted=False) == placeholder
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, placeholder, interrupted=False) == ""
+
+
+def test_interrupted_diagnostic_mentioned_in_prose_is_retained():
+    from gateway.config import Platform
+    from gateway.run import _sanitize_gateway_final_response
+
+    prose = "Operation interrupted: waiting for model response is a diagnostic, not a reply."
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, prose) == prose
 
 
 @pytest.mark.asyncio
@@ -291,6 +325,168 @@ async def test_adapter_drain_preserves_one_turn_without_reentering_handler(
     assert spool.exists()
     assert adapter.sent == []
     db.append_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/restart", "/stop", "/status", "/approve"])
+@pytest.mark.parametrize("busy", [False, True])
+async def test_control_commands_dispatch_during_drain_without_replay(command, busy, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    runner._draining = True
+    runner._restart_requested = True
+    runner._hm_admit_event = AsyncMock(side_effect=lambda event: (event, source, False))
+    runner._hm_estop_gate = lambda *_args: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_evict_idle_stale_agent = lambda _key: None
+    runner._is_session_running = lambda _key: busy
+    runner._check_slash_access = lambda *_args: None
+    runner._async_profile_scope_for_source = lambda *_args: _null_async_context()
+    calls = []
+    for name in ("restart", "stop", "status", "approve"):
+        async def handler(event, name=name):
+            calls.append(name)
+            return f"{name} handled"
+        setattr(runner, f"_handle_{name}_command", handler)
+    async def busy_dispatch(event, definition, *_args):
+        return await getattr(runner, f"_handle_{definition.name}_command")(event)
+    runner._dispatch_busy_slash_command = AsyncMock(side_effect=busy_dispatch)
+    adapter.set_message_handler(runner._handle_admitted_message)
+    if busy:
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def active(_event):
+            entered.set()
+            await release.wait()
+        adapter.set_message_handler(active)
+        await adapter.handle_message(MessageEvent(text="active", source=source, user_id="u1"))
+        await asyncio.wait_for(entered.wait(), 2)
+        adapter.set_message_handler(runner._handle_admitted_message)
+        # Keep the real adapter guard, but avoid changing the running turn in this fixture.
+        async def dispatch_active(event, *_args):
+            return await runner._handle_admitted_message(event)
+        adapter._dispatch_active_session_command = AsyncMock(side_effect=dispatch_active)
+    await adapter.handle_message(MessageEvent(text=command, source=source, user_id="u1"))
+    if busy:
+        release.set()
+    for _ in range(300):
+        if key not in adapter._session_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert calls == [command[1:]]
+    assert not adapter._pending_messages
+    assert not list((tmp_path / "pending_messages").glob("*.json")) if (tmp_path / "pending_messages").exists() else True
+    assert all("Gateway" not in sent for sent in adapter.sent)
+
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _null_async_context():
+    yield
+
+
+@pytest.mark.asyncio
+async def test_update_during_existing_drain_does_not_schedule_another_update(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    source = make_restart_source()
+    runner._draining = True
+    runner._hm_admit_event = AsyncMock(side_effect=lambda event: (event, source, False))
+    runner._hm_estop_gate = lambda *_args: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_evict_idle_stale_agent = lambda _key: None
+    runner._is_session_running = lambda _key: False
+    runner._check_slash_access = lambda *_args: None
+    runner._async_profile_scope_for_source = lambda *_args: _null_async_context()
+    runner._handle_update_command = type(runner)._handle_update_command.__get__(runner)
+    runner._schedule_update_notification_watch = MagicMock()
+    from gateway import update_launcher
+    launch = MagicMock(side_effect=AssertionError("must not schedule update"))
+    monkeypatch.setattr(update_launcher, "launch_native_update", launch)
+    adapter.set_message_handler(runner._handle_admitted_message)
+    await adapter.handle_message(MessageEvent(text="/update", source=source, user_id="u1"))
+    key = runner._session_key_for_source(source)
+    for _ in range(300):
+        if key not in adapter._session_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert not adapter._pending_messages
+    assert any("progress" in sent.lower() or "already" in sent.lower() for sent in adapter.sent)
+    launch.assert_not_called()
+    runner._schedule_update_notification_watch.assert_not_called()
+
+
+@pytest.mark.parametrize("text,age_hours,authorized", [
+    ("/restart", 0, True), ("/stop", 0, True), ("/restart@HermesBot", 0, True),
+    ("old turn", 25, True), ("unauthorized turn", 0, False),
+])
+def test_drain_recovery_drops_controls_expired_and_denied_events(
+    text, age_hours, authorized, tmp_path, monkeypatch, caplog,
+):
+    import os
+    import time
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    event = MessageEvent(text=text, source=source, user_id="u1")
+    event._drain_deferred = True
+    assert flush_pending_to_file({key: event}) == 1
+    spool = next((tmp_path / "pending_messages").glob("*.json"))
+    if age_hours:
+        then = time.time() - age_hours * 3600
+        os.utime(spool, (then, then))
+    now = datetime.now()
+    runner.session_store._lock = MagicMock()
+    runner.session_store._ensure_loaded_locked = lambda: None
+    runner.session_store._entries[key] = SessionEntry(
+        session_key=key, session_id="sid", created_at=now, updated_at=now, origin=source)
+    runner._is_session_running = lambda _key: False
+    runner._restored_source = lambda entry: entry.origin
+    runner._resume_owner_authorized = lambda *_args: authorized
+    runner._startup_restore_queue = []
+    db = MagicMock()
+    from gateway.run_pending_recovery import _defer_followup
+    assert recover_pending_to_db(
+        db, session_resolver=lambda *_a, **_kw: ("sid", db),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    ) == 0
+    assert not spool.exists()
+    assert not runner._startup_restore_queue
+    db.append_message.assert_not_called()
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_full_drain_fifo_replays_original_arrival_order(tmp_path, monkeypatch):
+    from datetime import timedelta
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    runner._BUSY_QUEUE_MAX_PENDING = 1
+    earlier = MessageEvent(text="earlier", source=source, user_id="u1",
+                           timestamp=datetime.now() - timedelta(seconds=15))
+    later = MessageEvent(text="later", source=source, user_id="u1", timestamp=datetime.now())
+    runner._preserve_drain_event(key, earlier)
+    runner._preserve_drain_event(key, later)
+    assert flush_pending_to_file(dict(adapter._pending_messages)) == 1
+    runner.session_store._lock = MagicMock()
+    runner.session_store._ensure_loaded_locked = lambda: None
+    runner.session_store._entries[key] = SessionEntry(
+        session_key=key, session_id="sid", created_at=datetime.now(), updated_at=datetime.now(), origin=source)
+    runner._is_session_running = lambda _key: False
+    runner._restored_source = lambda entry: entry.origin
+    runner._resume_owner_authorized = lambda *_args: True
+    runner._startup_restore_queue = []
+    db = MagicMock()
+    from gateway.run_pending_recovery import _defer_followup
+    assert recover_pending_to_db(db, session_resolver=lambda *_a, **_kw: ("sid", db),
+                                 deferred_followup=partial(_defer_followup, runner, {}, None)) == 2
+    assert [event.text for event in runner._startup_restore_queue] == ["earlier", "later"]
 
 
 def _defer_for_test(runner, key, sid, data, path):

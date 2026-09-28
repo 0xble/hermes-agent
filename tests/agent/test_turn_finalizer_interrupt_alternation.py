@@ -167,6 +167,19 @@ def test_interrupt_after_tool_closes_sequence_with_placeholder():
 
 
 
+def test_interrupted_tool_tail_does_not_persist_delivery_diagnostic():
+    agent = _StubAgent()
+    messages = _interrupted_tool_tail()
+    result = _finalize(
+        agent, messages, interrupted=True,
+        final_response="Operation interrupted: waiting for model response (1.3s elapsed).",
+    )
+    assert result["interrupted"] is True
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == "Operation interrupted."
+    assert all("waiting for model response" not in str(m) for m in agent.persisted_messages)
+
+
 def test_interrupt_without_tool_tail_adds_nothing():
     # Interrupt while the tail is already an assistant/user message: no
     # synthetic close needed.

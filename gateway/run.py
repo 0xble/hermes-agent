@@ -35,7 +35,6 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE, COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE, IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE)
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
@@ -716,13 +715,18 @@ def _sanitize_gateway_final_response(platform: Any, text: str, *, interrupted: b
     if _eos_start >= 0:
         text = text[:_eos_start].rstrip()
 
-    # Cancellation metadata, not prose; ACP/TUI already suppress this sentinel, chat surfaces should too.
-    # See #7921.
-    # Interrupted turns return diagnostic placeholders for local callers; none is chat text.
-    # The result flag distinguishes these from genuine non-interrupted failure replies.
+    # Interrupted turns return local diagnostics rather than assistant prose. A prior
+    # diagnostic can also be echoed by a later, normally completed model turn, so the
+    # flag alone is insufficient. Match only complete, known diagnostic shapes.
     if interrupted and str(text).strip().startswith("Operation interrupted"):
         return ""
-    if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+    if re.fullmatch(
+        r"Operation interrupted(?:\.|: (?:waiting for model response|handling API error|"
+        r"retrying API call after error|waiting for the provider to recover|"
+        r"retrying empty response from model) \([^\n]{1,100}\)\.|"
+        r" during retry \([^\n]{1,100}\)\.)",
+        str(text).strip(),
+    ):
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))

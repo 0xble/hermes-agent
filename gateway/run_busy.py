@@ -768,7 +768,7 @@ class GatewayBusySessionMixin:
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
-        if self._draining and event.internal:
+        if self._draining and event.internal and not self._hm_is_registered_command(event):
             self._preserve_drain_event(session_key, event)
             return True
         if event.internal and event.allow_gateway_control:
@@ -795,11 +795,22 @@ class GatewayBusySessionMixin:
             return True
         event._bot_loop_admitted = True
 
-        if self._draining:  # gateway stopping
+        if await self._route_plaintext_approval_while_busy(event, session_key):
+            return True
+        if self._draining and not self._hm_is_registered_command(event):
             self._preserve_drain_event(session_key, event)
             return True
         effective_mode = self._effective_busy_input_mode(event.source)
-        if await self._route_plaintext_approval_while_busy(event, session_key):
+        if self._draining:
+            # A command not bypassed by the adapter still uses the ordinary busy
+            # dispatch path, never the busy-input interrupt/queue lane.
+            handled, reply = await self._hm_busy_slash_or_photo(event, event.source, session_key)
+            if handled:
+                if reply:
+                    adapter = self._delivery_adapter_for(event.source)
+                    if adapter:
+                        await self._send_busy_reply(event, adapter, reply)
+                return True
             return True
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:

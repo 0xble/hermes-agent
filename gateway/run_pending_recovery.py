@@ -7,7 +7,7 @@ from datetime import datetime
 
 from hermes_constants import get_routing_process_hermes_home
 from gateway.session_recovery import SessionRecoveryMixin
-from gateway.shutdown_flush import OTHER_PLATFORM_PENDING, recover_pending_to_db
+from gateway.shutdown_flush import DROP_PENDING, OTHER_PLATFORM_PENDING, recover_pending_to_db
 
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
@@ -68,7 +68,10 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, 
     if drain_deferred and platform is not None and source.platform != platform:
         return OTHER_PLATFORM_PENDING
     if not runner._resume_owner_authorized(key, source):
-        return None if drain_deferred else False
+        if drain_deferred:
+            logger.warning("Dropping unauthorized drain-deferred message from %s", path)
+            return DROP_PENDING
+        return False
     ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
              runner._auto_resume_ready(entry, require_adapter=False))
     if ready is None:
