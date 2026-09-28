@@ -24,6 +24,19 @@ from tools.browser_use_cli import _attach_vault_supervisor
 from tools.registry import registry
 
 
+# A payment processor's card form. The parent page cannot read it across the origin boundary, so it
+# reports its own card inputs (count and whether any holds a value) through postMessage on request.
+_PROCESSOR_FRAME = b"""<!doctype html><title>processor</title><body>
+<input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc">
+<script>
+addEventListener('message', (e) => {
+  const inputs = [...document.querySelectorAll('input')];
+  e.source.postMessage({cardInputs: inputs.filter(i => i.autocomplete === 'cc-number').length,
+                        filled: inputs.some(i => i.value !== '')}, '*');
+});
+</script></body>"""
+
+
 @pytest.fixture
 def browser(tmp_path):
     executable = next((shutil.which(n) for n in ("chromium", "chromium-browser", "google-chrome")
@@ -39,7 +52,8 @@ def browser(tmp_path):
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            self.wfile.write(b"<!doctype html><title>vault regression</title><body></body>")
+            self.wfile.write(_PROCESSOR_FRAME if self.path == '/processor'
+                             else b"<!doctype html><title>vault regression</title><body></body>")
 
         def log_message(self, *args):
             pass
@@ -306,12 +320,25 @@ def test_card_fill_asks_only_when_a_real_page_can_take_the_card(browser, monkeyp
 
     # Card inputs live only in a processor iframe on another origin (the page's own
     # cardholder name and ZIP are fillable, but without a card number the fill cannot pay).
-    evaluate(sup, f"""document.body.innerHTML = `<form>
-      <input autocomplete="cc-name"><input autocomplete="postal-code">
-      <iframe src="{origin}/processor"></iframe></form>`""")
+    evaluate(sup, f"""new Promise((resolve) => {{
+      document.body.innerHTML = `<form>
+        <input autocomplete="cc-name"><input autocomplete="postal-code">
+        <iframe src="{origin}/processor"></iframe></form>`;
+      document.querySelector('iframe').onload = resolve;
+    }})""")
+
+    def processor_state():
+        # The frame's state, read across the origin boundary through its postMessage reply.
+        return evaluate(sup, """new Promise((resolve) => {
+          addEventListener('message', (e) => resolve(e.data), {once: true});
+          document.querySelector('iframe').contentWindow.postMessage('state', '*');
+        })""")
+
+    assert processor_state() == {'cardInputs': 1, 'filled': False}
     assert fill()['error_type'] == 'no_payment_fields'
     assert prompts == []
     assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")
+    assert processor_state() == {'cardInputs': 1, 'filled': False}
 
     # A declined prompt writes nothing.
     evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
