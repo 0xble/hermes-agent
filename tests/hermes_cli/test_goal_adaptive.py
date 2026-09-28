@@ -465,3 +465,21 @@ def test_steer_messages_count_as_typed_input(hermes_home):
     mgr.set("Ship X", contract=GoalContract(constraints="Never publish secrets"))
     db.append_message(sid, "user", "Please drop the secrets constraint for this run", display_kind="steer")
     assert "Please drop the secrets constraint for this run" in goals.user_messages_since(sid, since=mgr.state.created_at)
+
+
+def test_a_dropped_constraint_stays_binding_in_the_continuation_prompt(hermes_home):
+    """An agent revision must not remove a prohibition from the working agent's own prompt."""
+    mgr = GoalManager(session_id="rev-continuation")
+    mgr.set("Ship X", contract=GoalContract(outcome="X live", constraints="Never publish secrets"))
+    assert mgr.revise(reason="loosen", contract={"constraints": ""}, user_quote="Please keep going",
+                      user_messages=["Please keep going and never publish secrets"])["ok"]
+    prompt = mgr.next_continuation_prompt()
+    assert "earlier constraints: Never publish secrets" in prompt
+    assert "still binds you unless the user message cited" in prompt
+    assert 'full message: "Please keep going and never publish secrets"' in prompt
+
+
+def test_an_unrevised_goal_has_no_revision_block(hermes_home):
+    mgr = GoalManager(session_id="rev-none")
+    mgr.set("Ship X", contract=GoalContract(outcome="X live"))
+    assert "has been revised" not in mgr.next_continuation_prompt()

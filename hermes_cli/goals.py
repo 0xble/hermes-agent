@@ -118,6 +118,17 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "If you are blocked and need input from the user, say so clearly and stop."
 )
 
+# Appended to every continuation prompt once the goal has been revised. The runtime cannot tell
+# whether a quoted user message really authorizes a change (the judge decides that after the
+# fact), so the working agent keeps seeing each replaced requirement as binding: a prohibition the
+# agent dropped on its own must still stop it before an irreversible action, not only at judging.
+CONTINUATION_REVISIONS_TEMPLATE = (
+    "\n\nThis goal has been revised. Each earlier requirement listed below still "
+    "binds you unless the user message cited for that revision plainly instructs "
+    "that specific change. When in doubt, honor the earlier requirement.\n"
+    "{revision_lines}"
+)
+
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
 # not to break, scope, and when to stop — so it targets the verification surface.
 CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
@@ -2377,6 +2388,13 @@ class GoalManager:
         s = self._state
         if not s or s.status != "active":
             return None
+        prompt = self._current_continuation_prompt(s)
+        if s.revisions:
+            prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=s.render_revisions_block())
+        return prompt
+
+    @staticmethod
+    def _current_continuation_prompt(s: "GoalState") -> str:
         # Contract first (it carries the verification surface); subgoals fold in as extra criteria.
         if s.has_contract():
             contract_block = s.contract.render_block()

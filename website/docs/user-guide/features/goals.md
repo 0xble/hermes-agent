@@ -135,7 +135,7 @@ The continuation prompt asks the agent to end a completion claim with an Evidenc
 
 ### Revising a goal
 
-The agent can revise the active goal through its `goal_set` tool (`action=revise`) with a reason. Each revision is versioned and sent to you as a notice. The judge sees the revision history and the continuation prompt carries the current version, so superseded wording stops binding.
+With the `goal-lifecycle` plugin installed, the agent can revise the active goal through its `goal_set` tool (`action=revise`) with a reason. Each revision is versioned and sent to you as a notice. Both the judge and the agent's continuation prompt show the current version plus every revision and the requirement it replaced. A replaced requirement keeps binding the agent unless the user message cited for that revision plainly asks for the change.
 
 - The agent may reword or restructure the outcome, verification, boundaries and stop condition. The judge still holds it to any earlier requirement such a revision weakened.
 - Changing the objective or the constraints, or dropping a subgoal, needs your authority. The agent must quote your instruction verbatim from a message you sent since the goal was set, or the revision is rejected. The judge sees your full message beside the change, and the earlier requirement still binds unless that message plainly asks for this change.

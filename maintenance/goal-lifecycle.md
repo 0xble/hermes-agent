@@ -86,7 +86,10 @@ Failed or interrupted model turns do not run completion judging.
   - **Revisions.** `GoalManager.revise()` records a versioned revision (actor,
     reason, user quote with its source message, before, after). The judge prompt
     shows every revision and every requirement it replaced, in full. The
-    continuation prompt shows the current version. Changing the objective or
+    continuation prompt shows the current version and the same history, with each
+    replaced requirement still binding unless its cited user message plainly
+    instructs the change, so the working agent cannot act on an unauthorized
+    weakening before the judge sees it. Changing the objective or
     constraints, or dropping a subgoal, needs a verbatim quote of 12+ characters
     from a real user message sent since the goal was set. The runtime proves only
     that the user said it. The judge sees the complete source message, which may
