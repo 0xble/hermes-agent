@@ -53,6 +53,9 @@ the browser vault fill tool, or the 1Password backends.
   profile-scoped guard is bounded to 256 entries and expires by monotonic time; a later
   explicit request can retry after expiry. Other origins/sessions, successful fills, and
   `no_payment_fields` do not arm it. Unanswered prompts are distinct from explicit declines.
+- Vault listing accepts optional kind and exact normalized page origin filters, including
+  manager multi-origin matches and unbound cards. No filters preserve the full listing;
+  locked backend and error reports remain visible.
 - Configured 1Password protected fields expose only an opaque handle and semantic token. They
   remain exact-origin bound, resolve server-side, and fill only a matching supported control
   in a verified task-owned local Chromium session. Birth-date fills refuse all Camofox
@@ -102,6 +105,9 @@ the browser vault fill tool, or the 1Password backends.
   `vault-card-retry-guard` (separate fork-only safety fix: session/origin-scoped
   ten-minute in-memory refusal after a declined/unanswered prompt; retire when released
   upstream enforces equivalent no-reprompt behavior), and
+  `vault-list-filter` (separate fork-only listing filter to avoid large unfiltered
+  model responses; retire when released upstream supports equivalent optional kind/origin
+  filtering while preserving unbound cards), and
   `vault-payment-consent-order` (own fork fix, 2026-09-28: prompt only once card targets are
   found, then re-inspect after consent). Plus `mcp-elicitation-one-shot`, adopted from upstream
   [PR 118429](https://github.com/NousResearch/hermes-agent/pull/118429) at

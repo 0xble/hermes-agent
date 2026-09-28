@@ -231,6 +231,32 @@ def test_local_card_without_origin_is_still_refused(store):
     consent.assert_not_called()
 
 
+def test_listing_filters_kind_and_exact_origin_without_losing_unbound_cards():
+    from tools import browser_vault_tool as vault
+    login = VaultItemMeta(id="mg:login", kind="login", label="Shop", origin="https://shop.test",
+                          created_at="", identifier="user@shop.test",
+                          allowed_origins=("https://shop.test", "https://other.test"))
+    foreign = VaultItemMeta(id="mg:foreign", kind="login", label="Else", origin="https://else.test", created_at="")
+    card = _Manager.meta
+    backend = _Manager()
+    with patch.object(backend, "list_items", return_value=[login, foreign, card]), \
+         patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+        all_items = json.loads(vault._handle_vault_list({}))
+        shop = json.loads(vault._handle_vault_list({"origin": "https://SHOP.test:443/pay"}))
+        logins = json.loads(vault._handle_vault_list({"origin": "https://other.test", "kind": "login"}))
+        cards = json.loads(vault._handle_vault_list({"kind": "payment"}))
+        missing = json.loads(vault._handle_vault_list({"origin": "https://missing.test", "kind": "login"}))
+        invalid = json.loads(vault._handle_vault_list({"origin": "not-an-origin"}))
+    assert missing["items"] == [] and "hint" in missing
+    assert invalid["error_type"] == "invalid_origin"
+    assert [item["handle"] for item in all_items["items"]] == ["mg:login", "mg:foreign", "mg:card"]
+    assert [item["handle"] for item in shop["items"]] == ["mg:login", "mg:card"]
+    assert [item["handle"] for item in logins["items"]] == ["mg:login"]
+    assert [item["handle"] for item in cards["items"]] == ["mg:card"]
+    assert vault.BROWSER_VAULT_LIST_SCHEMA["parameters"]["properties"]["kind"]["enum"] == [
+        "login", "payment", "address", "protected_field"]
+
+
 def test_listing_marks_manager_card_available():
     from tools import browser_vault_tool
     with patch("agent.vault_backends.enabled_backends", return_value=[_Manager()]):

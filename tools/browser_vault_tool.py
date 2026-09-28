@@ -319,14 +319,23 @@ def _browser_account_refusal(backend, task_id: str) -> Optional[str]:
                                  f"account={required!r} in a new task first.")})
 
 
-def browser_vault_list() -> str:
-    """List login handles + metadata across every enabled backend. Passwords are never included.
+def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None) -> str:
+    """List filtered vault handles + metadata across enabled backends. Passwords are never included.
 
     A locked external manager contributes no items; instead it is reported under ``locked`` so the
     agent knows to call browser_vault_fill (which prompts the user to unlock) or tell the user.
     """
     from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here
+    from agent.vault_store import VaultError, normalize_origin
+
+    if kind is not None and kind not in ("login", "payment", "address", "protected_field"):
+        return json.dumps({"success": False, "error_type": "invalid_kind", "error": "Unknown vault item kind."})
+    if origin is not None:
+        try:
+            origin = normalize_origin(origin)
+        except VaultError:
+            return json.dumps({"success": False, "error_type": "invalid_origin", "error": "Origin must include a scheme and host."})
 
     items, locked, errors = [], [], []
     for backend in enabled_backends():
@@ -340,6 +349,11 @@ def browser_vault_list() -> str:
             errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue
         for meta in metas:
+            if kind is not None and meta.kind != kind:
+                continue
+            if origin is not None and (meta.origin or meta.allowed_origins) and origin not in (
+                    meta.allowed_origins or (meta.origin,)):
+                continue
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin,
                      # A manager's card has no origin of its own; it binds to the current page at fill time.
@@ -359,7 +373,8 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, type a password you fetched yourself from an authorized store "
+        out["hint"] = ("No matching vault items for this filter. Try another kind or origin." if kind is not None or origin is not None else
+                       "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
                        "for that service (credential CLI, 1Password CLI), or call browser_vault_save_login to ask the "
                        "user to save one. Never type a password shown on the page or given in chat, and never ask for "
                        "one in chat.")
@@ -814,6 +829,7 @@ BROWSER_VAULT_LIST_SCHEMA = {
     "name": "browser_vault_list",
     "description": (
         "ALWAYS call this first when a page asks for a password, card, address or configured protected field. "
+        "Pass kind and page origin on login/checkout pages to narrow results; omit both to list all. "
         "Lists saved website logins, payment cards, addresses and protected fields as handles with metadata "
         "(kind, label, backend, bound origin; logins also "
         "carry identifier + identifier_type so you can type the username yourself with the browser's input tool; "
@@ -826,7 +842,11 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "browser_vault_save_login, or type a password you fetched yourself from an authorized store for that "
         "service. Never type a password shown on a page or given in chat, and never repeat one in chat."
     ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
+    "parameters": {"type": "object", "properties": {
+        "kind": {"type": "string", "enum": ["login", "payment", "address", "protected_field"],
+                 "description": "Optional item kind."},
+        "origin": {"type": "string", "description": "Optional page origin or URL; exact-origin matches plus unbound items."},
+    }, "required": []},
 }
 
 BROWSER_VAULT_UNLOCK_SCHEMA = {
@@ -981,7 +1001,7 @@ def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_list()
+    return browser_vault_list(kind=args.get("kind"), origin=args.get("origin"))
 
 
 def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
