@@ -180,20 +180,69 @@ class TestSyncFallbacks:
                 res = _try_dispatch_background_run(_job('job-bg-06'))
         assert res is None
 
-    def test_pool_at_capacity_runs_inline(self):
-        """A rejected dispatch must not strand the already-taken claim."""
+    def test_pool_at_capacity_runs_inline(self, tmp_path, monkeypatch):
+        """A rejected dispatch must not strand the already-taken claim or execution."""
+        from cron import executions
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+        seen = []
+        def run(job, **kw):
+            seen.append(job.get("execution_id"))
+            if seen[-1]:
+                executions.mark_execution_running(seen[-1])
+                executions.finish_execution(seen[-1], success=True)
+            return True
         with _bound_session_key():
             with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
                  patch("tools.async_delegation.dispatch_async_delegation",
                        return_value={"status": "rejected", "error": "capacity"}), \
-                 patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+                 patch("cron.scheduler.run_one_job", side_effect=run) as m_run, \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
                 res = _try_dispatch_background_run(_job('job-bg-07'))
         assert res["dispatched"] is False
         assert res["success"] is True
-        m_run.assert_called_once()   # ran inline on this thread
+        m_run.assert_called_once()
+        rows = executions.list_executions(job_id="job-bg-07")
+        assert len(rows) == 1 and rows[0]["status"] == "completed"
+        assert seen == [rows[0]["id"]]
 
+
+    def test_refused_claim_terminalizes_manual_execution(self, tmp_path, monkeypatch):
+        from cron import executions, scheduler as sched
+        from tools.cronjob_tools import _run_claimed_job
+
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+        job = _job("job-bg-refused")
+        run = executions.create_execution(job["id"], source="manual")
+        job["execution_id"] = run["id"]
+        assert sched.try_register_running_job(job["id"])
+        try:
+            result = _run_claimed_job(job)
+        finally:
+            sched.release_running_job(job["id"])
+        assert result["error"] and "already running" in result["error"]
+        assert executions.get_execution(run["id"])["status"] == "failed"
+        assert "already running" in executions.get_execution(run["id"])["error"]
+
+    def test_manual_completion_recovers_waiter_error_and_saved_output(self, tmp_path, monkeypatch):
+        from cron import executions
+        from tools.cronjob_tools import _manual_run_completion
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+        run = executions.create_execution("job-bg-completion", source="manual")
+        with patch("tools.cronjob_tools.get_job", return_value={}), \
+             patch("tools.cronjob_tools._latest_job_output_excerpt", return_value="saved agent output"):
+            refused = _manual_run_completion(
+                {"success": False, "error": "already running"}, "job-bg-completion",
+                "job", "local", 0, execution_id=run["id"])
+            assert refused["status"] == "error" and refused["error"] == "already running"
+            assert "saved agent output" in refused["summary"]
+            executions.mark_execution_running(run["id"])
+            executions.finish_execution(run["id"], success=True)
+            completed = _manual_run_completion(
+                {"success": True, "error": None}, "job-bg-completion",
+                "job", "local", 0, execution_id=run["id"])
+            assert completed["status"] == "completed"
+            assert "saved agent output" in completed["summary"]
 
 class TestInFlightDedupe:
     """Manual runs must not double-fire a job that is already mid-run

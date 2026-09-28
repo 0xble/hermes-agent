@@ -53,6 +53,52 @@ def test_hard_wall_sweeps_double_forked_orphan(tmp_path):
 
 @pytest.mark.macos_only
 @pytest.mark.live_system_guard_bypass
+def test_script_timeout_spares_unrelated_worker_child(monkeypatch, tmp_path):
+    from cron import scheduler as sched
+    from cron.scheduler_script import _run_job_script
+
+    execution_id = uuid.uuid4().hex
+    monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", execution_id)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(sched, "_SCRIPT_TIMEOUT", 1)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    orphan_pid_file = tmp_path / "orphan.pid"
+    script = scripts / "fork.py"
+    script.write_text(
+        "import os,time,sys\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    if os.fork(): os._exit(0)\n"
+        f"    with open({str(orphan_pid_file)!r}, 'w') as f: f.write(str(os.getpid()))\n"
+        "    time.sleep(60)\n"
+        "else:\n"
+        "    time.sleep(60)\n"
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"])
+    try:
+        ok, output = _run_job_script(str(script))
+        assert not ok and "timed out" in output
+        assert orphan_pid_file.exists()
+        orphan = int(orphan_pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while psutil.pid_exists(orphan) and psutil.Process(orphan).status() != psutil.STATUS_ZOMBIE and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not psutil.pid_exists(orphan) or psutil.Process(orphan).status() == psutil.STATUS_ZOMBIE
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+        if orphan_pid_file.exists():
+            orphan = int(orphan_pid_file.read_text())
+            if psutil.pid_exists(orphan):
+                try:
+                    os.kill(orphan, 9)
+                except ProcessLookupError:
+                    pass
+
+@pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
 def test_script_cancel_sweeps_reparented_child(monkeypatch, tmp_path):
     from cron.scheduler_script import _run_job_script
 

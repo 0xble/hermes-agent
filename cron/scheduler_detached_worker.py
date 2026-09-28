@@ -26,8 +26,14 @@ def hard_wall_timeout_seconds() -> float:
         return 7200.0
 
 
-def _terminate_owned_descendants(pid: int, started_at: int, execution_id: Optional[str] = None) -> bool:
+def _terminate_owned_descendants(
+    pid: int, started_at: int, execution_id: Optional[str] = None, *, orphan_only: bool = False,
+) -> bool:
     """Sweep the owner tree and same-user processes carrying its exact execution marker.
+
+    With orphan_only, only marker-matched processes outside the current tree are
+    selected. Script teardown already handled that tree, and other worker children
+    must survive the script's own timeout.
 
     A double-forked setsid child is reparented before a tree snapshot. The
     inherited execution marker preserves ownership across that boundary;
@@ -40,11 +46,12 @@ def _terminate_owned_descendants(pid: int, started_at: int, execution_id: Option
         return False
     try:
         parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
+        descendants = parent.children(recursive=True)
+        children = [] if orphan_only else descendants
         if execution_id:
             owner_uid = parent.uids().real
             owner_start = parent.create_time()
-            known = {child.pid for child in children}
+            known = {child.pid for child in descendants}
             for candidate in psutil.process_iter():
                 try:
                     if (candidate.pid in known or candidate.pid == pid

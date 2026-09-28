@@ -222,7 +222,7 @@ def _sweep_detached_script_orphans() -> None:
     from cron.scheduler_detached_worker import _terminate_owned_descendants
     fingerprint = _process_start_time(os.getpid())
     if fingerprint is not None:
-        _terminate_owned_descendants(os.getpid(), fingerprint, execution_id)
+        _terminate_owned_descendants(os.getpid(), fingerprint, execution_id, orphan_only=True)
 
 
 def _drain_script_pipes(proc: subprocess.Popen) -> None:

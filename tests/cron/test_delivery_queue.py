@@ -9,6 +9,56 @@ from unittest.mock import Mock
 import pytest
 
 
+def test_gated_missing_execution_expires_without_sending_and_uses_one_ledger_read(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, executions
+    from datetime import timedelta
+    from hermes_time import now
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    running = executions.create_execution("job-live", source="builtin")
+    executions.mark_execution_running(running["id"])
+    for execution_id in ("missing-old", "missing-young", running["id"]):
+        queue.enqueue(execution_id, {"id": "job"}, "message", terminal_gate=True)
+    with queue._transaction() as conn:
+        conn.execute("UPDATE deliveries SET created_at=? WHERE execution_id=?",
+                     ((now() - timedelta(days=2)).isoformat(), "missing-old"))
+    original_connect = executions._connect
+    calls = []
+    def connect():
+        calls.append(True)
+        return original_connect()
+    monkeypatch.setattr(executions, "_connect", connect)
+    assert queue.claim_next() is None
+    assert len(calls) == 1
+    assert queue.get_status("missing-old")["status"] == "suppressed"
+    assert queue.get_status("missing-young")["status"] == "pending"
+    assert queue.get_status(running["id"])["status"] == "pending"
+    monkeypatch.setattr(executions, "_connect", Mock(side_effect=OSError("ledger offline")))
+    assert queue.claim_next() is None
+    assert queue.get_status("missing-young")["status"] == "pending"
+
+
+def test_gated_failure_notice_preserves_pre_timeout_failure_text(tmp_path, monkeypatch):
+    """A genuine failure alert is preferable to suppressing it for a changed reason.
+
+    Its text may describe the pre-timeout failure; the execution ledger retains
+    the watchdog's authoritative error for status/history.
+    """
+    from cron import delivery_queue as queue, executions
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    run = executions.create_execution("job-failure", source="builtin")
+    executions.mark_execution_running(run["id"])
+    queue.enqueue(run["id"], {"id": "job-failure"}, "original failure",
+                  for_failure=True, terminal_gate=True)
+    executions.finish_execution(run["id"], success=False, error="watchdog timeout")
+    sent = Mock(return_value=None)
+    assert queue.drain(sent) == 1
+    sent.assert_called_once_with({"id": "job-failure"}, "original failure", True)
+    assert executions.get_execution(run["id"])["error"] == "watchdog timeout"
+
+
 def test_pending_delivery_is_claimed_and_sent_once(tmp_path, monkeypatch):
     import cron.delivery_queue as queue
 

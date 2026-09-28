@@ -74,6 +74,13 @@ if mode == 'commit-in-flight':
             time.sleep(float(wall) * 2)
         return original_finish(*args, **kwargs)
     scheduler.finish_execution = slow_finish
+if mode == 'commit-lost-before-delivery':
+    original_finish = scheduler.finish_execution
+    def raced_finish(*args, **kwargs):
+        if kwargs.get('require_running'):
+            original_finish(*args, **dict(kwargs, success=False, error='watchdog timeout'))
+        return original_finish(*args, **kwargs)
+    scheduler.finish_execution = raced_finish
 if mode == 'completion-in-flight':
     original = scheduler.save_job_output
     def slow_save(*args, **kwargs):
@@ -185,6 +192,16 @@ def test_terminal_commit_survives_worker_death_before_delivery_call(tmp_path):
         reset_hermes_home_override(token)
     assert recovered == 0
 
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("deliver", ["telegram:123", "origin"])
+def test_watchdog_commit_wins_before_delivery_and_does_not_mark_job_success(tmp_path, deliver):
+    code, row, queued, stored, _, _, out, err, _ = _run(
+        tmp_path, "commit-lost-before-delivery", wall=10, deliver=deliver)
+    assert code == 2, (code, row, stored, out, err)
+    assert row["status"] == "failed" and row["error"] == "watchdog timeout"
+    assert stored["last_status"] not in ("ok", "delivery_queued")
+    assert queued is None or queued["status"] == "pending"
 
 @pytest.mark.macos_only
 def test_output_persistence_hang_before_commit_times_out(tmp_path):

@@ -281,6 +281,10 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
         # outlived by real jobs, so it alone cannot stop a manual run from double-firing a job the ticker
         # (or another manual run) is still executing.
         if not try_register_running_job(job_id):
+            if job.get("execution_id"):
+                from cron.executions import finish_execution
+                finish_execution(str(job["execution_id"]), success=False,
+                                 error=_ALREADY_RUNNING_ERROR)
             return {"claimed": True, "success": False, "error": _ALREADY_RUNNING_ERROR}
         _registered = True
 
@@ -336,6 +340,9 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
                 release_running_job(job_id)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
+        if job.get("execution_id"):
+            from cron.executions import finish_execution
+            finish_execution(str(job["execution_id"]), success=False, error=str(e))
         return {"claimed": True, "success": False, "error": str(e)}
 
 
@@ -431,7 +438,7 @@ def _manual_run_completion(
     if execution_id:
         from cron.executions import get_execution
         execution = get_execution(str(execution_id))
-    if execution is not None:
+    if execution is not None and execution["status"] in {"completed", "failed", "unknown"}:
         state = execution["status"]
         res = {"success": state == "completed", "error": execution.get("error")}
     else:
@@ -447,8 +454,8 @@ def _manual_run_completion(
     ]
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-    excerpt = (str(execution.get("output") or "")[-4000:] if execution is not None
-               else _latest_job_output_excerpt(job_id))
+    excerpt = (str(execution.get("output") or "")[-4000:] if execution is not None else "")
+    excerpt = excerpt or _latest_job_output_excerpt(job_id)
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
@@ -566,7 +573,7 @@ def _try_dispatch_background_run(
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name)
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 

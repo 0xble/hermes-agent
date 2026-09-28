@@ -2880,6 +2880,9 @@ def _compose_run_delivery(
 class _FireClaimLostDuringSideEffect(Exception):
     """Raised inside a side-effect fence when the durable fire claim is no longer ours."""
 
+class _ExecutionCommitLost(Exception):
+    """A competing watchdog already terminalized the execution before delivery."""
+
 
 class _FireOwnership:
     """Fire-claim ownership checks for one run (``owner`` is None when the job carries no claim)."""
@@ -3049,7 +3052,7 @@ def _save_compose_deliver(
                 for_failure=not d.success,
             )
     except Exception as de:
-        if isinstance(de, _FireClaimLostDuringSideEffect):
+        if isinstance(de, (_FireClaimLostDuringSideEffect, _ExecutionCommitLost)):
             raise
         d.delivery_error = str(de)
         logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -3309,7 +3312,7 @@ def _run_one_job_body(
             nonlocal committed
             if finish_execution(execution_id, success=d.success, error=d.error,
                                 output=output, require_running=True) is None:
-                raise RuntimeError("Execution already terminalized before delivery")
+                raise _ExecutionCommitLost("Execution already terminalized before delivery")
             committed = d.result_committed = True
 
         # Compose and enqueue before the detached worker commits its terminal

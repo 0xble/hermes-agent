@@ -16,7 +16,8 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -34,6 +35,7 @@ _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
+MISSING_EXECUTION_GRACE = timedelta(hours=24)
 
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
@@ -344,20 +346,58 @@ def claim_next() -> Optional[dict]:
     started = _process_start_time(pid)
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT execution_id, for_failure, terminal_gate FROM deliveries WHERE status='pending' "
+            "SELECT execution_id, for_failure, terminal_gate, created_at FROM deliveries WHERE status='pending' "
             "ORDER BY created_at, execution_id"
         ).fetchall()
         row = None
+        suppressed_missing = False
+        # Read all gated executions from one ledger connection rather than opening
+        # one for each pending notice under the queue lock. On ledger failure,
+        # defer all gated rows; absence is only meaningful after a successful read.
+        gated_ids = [str(candidate["execution_id"]) for candidate in rows if candidate["terminal_gate"]]
+        executions_by_id = None
+        if gated_ids:
+            from cron import executions
+            ledger_path = executions.EXECUTIONS_FILE or get_hermes_home().resolve() / "cron" / "executions.db"
+            if Path(ledger_path).exists():
+                try:
+                    with closing(executions._connect()) as ledger:
+                        executions_by_id = {}
+                        for start in range(0, len(gated_ids), 500):
+                            batch = gated_ids[start:start + 500]
+                            found = ledger.execute(
+                                "SELECT id, status, error FROM executions WHERE id IN ("
+                                + ",".join("?" for _ in batch) + ")", batch,
+                            ).fetchall()
+                            executions_by_id.update((str(execution["id"]), execution) for execution in found)
+                except (OSError, sqlite3.Error):
+                    logger.warning("Cron delivery ledger unavailable; deferring gated notices", exc_info=True)
+                    executions_by_id = None
         # A queue admission can precede the worker's terminal commit. Never
         # send while the result is unsettled or if a timeout won that race.
-        from cron.executions import get_execution
         for candidate in rows:
             if not candidate["terminal_gate"]:
                 row = candidate
                 break
-            execution = get_execution(str(candidate["execution_id"]))
-            if execution is None or execution["status"] in ("claimed", "running"):
+            if executions_by_id is None:
                 continue
+            execution = executions_by_id.get(str(candidate["execution_id"]))
+            if execution is None:
+                if datetime.fromisoformat(candidate["created_at"]) <= _hermes_now() - MISSING_EXECUTION_GRACE:
+                    conn.execute("""UPDATE deliveries SET status='suppressed', finished_at=?,
+                        error='Execution record missing after retention grace', projected=1
+                        WHERE execution_id=? AND status='pending'""",
+                        (_hermes_now().isoformat(), candidate["execution_id"]),
+                    )
+                    suppressed_missing = True
+                continue
+            if execution["status"] in ("claimed", "running"):
+                continue
+            # A pre-admitted failure notice contains the worker's original failure
+            # summary. If a watchdog later overwrites the terminal reason, it remains
+            # a true failure notice but may cite that earlier reason. Suppressing every
+            # mismatch would silently lose a legitimate failure alert; the ledger is
+            # authoritative for the final error in status/history.
             if (execution["status"] == "unknown" or
                     (execution["status"] == "failed") != bool(candidate["for_failure"])):
                 conn.execute("""UPDATE deliveries SET status='suppressed', finished_at=?,
@@ -368,6 +408,8 @@ def claim_next() -> Optional[dict]:
                 continue
             row = candidate
             break
+        if suppressed_missing:
+            _prune_terminal_unlocked(conn)
         if row is None:
             return None
         cur = conn.execute(
