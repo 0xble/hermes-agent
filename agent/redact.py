@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 _VAULT_REDACTION_MAX_PER_PROFILE = 64
 _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_DATE_PARTS: dict = {}  # (profile home, tab key, origin) → ordered {(component, value)}
+_VAULT_CARD_PARTS: dict = {}  # same scope → separately bounded card metadata components
 _VAULT_REDACTION_LOCK = threading.Lock()
 
 
@@ -77,6 +78,19 @@ def register_vault_date_component(token: str, value: str, *,
             del bucket[next(iter(bucket))]
 
 
+def register_vault_card_component(field: str, value: str, *, tab: str, origin: str) -> None:
+    """Keep low-entropy card metadata on its filled tab and origin, not in the global secret set."""
+    if field not in {"cardholder_name", "exp_month", "exp_year", "billing_postal_code"} or not isinstance(value, str) or not value:
+        return
+    with _VAULT_REDACTION_LOCK:
+        bucket = _VAULT_CARD_PARTS.setdefault(_date_scope(tab, origin), {})
+        key = (field, value)
+        bucket.pop(key, None)
+        bucket[key] = None
+        while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
+            del bucket[next(iter(bucket))]
+
+
 def mark_vault_protected_tab(tab: str, origin: str) -> None:
     """Record a protected fill on a tab/origin even when no short component exists
     (a combined ``input[type=date]``): pixel capture must still be refused there."""
@@ -90,16 +104,24 @@ def vault_read_has_protected_field_context(expression: str) -> bool:
 
 
 def clear_vault_date_components(tab: str, origin: str | None = None) -> None:
-    """Forget one tab's date components on close or cross-origin navigation."""
+    """Forget a tab's birthday and card components on close or cross-origin navigation."""
     with _VAULT_REDACTION_LOCK:
-        for key in list(_VAULT_DATE_PARTS):
-            if key[:2] == (_vault_scope(), str(tab)) and (origin is None or key[2] != str(origin).lower()):
-                del _VAULT_DATE_PARTS[key]
+        for registry in (_VAULT_DATE_PARTS, _VAULT_CARD_PARTS):
+            for key in list(registry):
+                if key[:2] == (_vault_scope(), str(tab)) and (origin is None or key[2] != str(origin).lower()):
+                    del registry[key]
 
 
 def has_vault_date_components(tab: str) -> bool:
     with _VAULT_REDACTION_LOCK:
         return any(key[:2] == (_vault_scope(), str(tab)) for key in _VAULT_DATE_PARTS)
+
+
+def has_vault_scoped_components(tab: str) -> bool:
+    """Whether browser egress should resolve this session's current origin."""
+    with _VAULT_REDACTION_LOCK:
+        return any(key[:2] == (_vault_scope(), str(tab))
+                   for registry in (_VAULT_DATE_PARTS, _VAULT_CARD_PARTS) for key in registry)
 
 
 def has_any_vault_date_components() -> bool:
@@ -109,15 +131,14 @@ def has_any_vault_date_components() -> bool:
 
 
 def _date_parts(tab: str, origin: str = "") -> tuple:
-    """Every component registered for the browser session, whatever page is focused.
-
-    ``origin`` is ignored on purpose: the focused origin cannot prove the filled tab
-    has gone (another tab may be focused), so masking lasts until session teardown.
-    """
+    """Birthday parts persist across focused origins; card parts require the filled origin."""
     with _VAULT_REDACTION_LOCK:
         merged = {}
         for key, bucket in _VAULT_DATE_PARTS.items():
             if key[:2] == (_vault_scope(), str(tab)):
+                merged.update(bucket)
+        for key, bucket in _VAULT_CARD_PARTS.items():
+            if key[:2] == (_vault_scope(), str(tab)) and origin and key[2] == origin.lower():
                 merged.update(bucket)
         return tuple(merged)
 
@@ -134,9 +155,10 @@ def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
     with _VAULT_REDACTION_LOCK:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
-        for key in list(_VAULT_DATE_PARTS):
-            if key[0] == _vault_scope():
-                del _VAULT_DATE_PARTS[key]
+        for registry in (_VAULT_DATE_PARTS, _VAULT_CARD_PARTS):
+            for key in list(registry):
+                if key[0] == _vault_scope():
+                    del registry[key]
 
 
 def redact_registered_vault_values(text: str, *,
