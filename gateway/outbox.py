@@ -213,12 +213,15 @@ def _uncertain(result) -> bool:
         return False
     from gateway.platforms.base import SEND_ERROR_KINDS
     kind = result.error_kind
+    error = (result.error or "").lower()
+    if kind == "connectionrefused" or (
+        kind in {"transient", "unknown", None}
+        and ("connection refused" in error or "connectionrefused" in error)
+    ):
+        return False
     if kind == "transient":
         return True  # A connection may drop after the server accepts the send.
-    if kind == "connectionrefused" or kind in SEND_ERROR_KINDS - {"unknown"}:
-        return False
-    error = (result.error or "").lower()
-    if "connection refused" in error or "connectionrefused" in error:
+    if kind in SEND_ERROR_KINDS - {"unknown"}:
         return False
     return (any(marker in error for marker in
                 ("timeout", "timed out", "network error", "connection reset",
@@ -238,6 +241,11 @@ async def _store_io(operation, *args, **kwargs):
         except Exception:
             logger.exception("Cancelled outbox disk operation failed")
         raise
+
+
+async def open_outbox(home: Path) -> "Outbox":
+    """Construct and migrate the store off the gateway event loop."""
+    return await _store_io(Outbox, home)
 
 
 def _prepare_row(store, home, turn_id, kind, payload):
@@ -350,6 +358,31 @@ async def _schedule_retry(store: "Outbox", adapter) -> None:
         _RETRY_TASKS[key] = task
 
 
+def _retention_days(home: Path) -> int:
+    """Read only this setting using the gateway loader's layer precedence."""
+    from gateway import config_loader
+    from gateway.config import GatewayConfig, validate_outbox_retention_days
+    import yaml
+
+    default = GatewayConfig.durable_outbox_retention_days
+    legacy = config_loader.load_legacy_gateway_json(home)
+    try:
+        yaml_cfg = config_loader.read_yaml_layers(home)
+        gateway = yaml_cfg.get("gateway")
+        found, outbox = config_loader._bridge_lookup(yaml_cfg, gateway, legacy,
+                                                       "durable_outbox", "presence")
+        if not found:
+            outbox = legacy.get("durable_outbox", {})
+        if outbox is None:
+            outbox = {}
+        if not isinstance(outbox, dict):
+            raise ValueError("gateway.durable_outbox must be a mapping")
+        return validate_outbox_retention_days(outbox.get("retention_days", default))
+    except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+        logger.warning("Invalid outbox retention for %s; using %s days: %s", home, default, exc)
+        return default
+
+
 async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[int, int]:
     """Replay proven-unsent rows; only boot replays fresh unclaimed rows."""
     sent = 0
@@ -405,10 +438,7 @@ async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[in
         logger.error("Held ambiguous outbox dispatch: turn=%s sequence=%s key=%s",
                      row.turn_id, row.sequence, row.idempotency_key)
     if startup:
-        from hermes_cli.config_effective import load_user_config_effective
-        from gateway.config import GatewayConfig
-        config = load_user_config_effective(store.path.parent / "config.yaml")
-        retention = GatewayConfig.from_dict(config).durable_outbox_retention_days
+        retention = await _store_io(_retention_days, store.path.parent)
         await _store_io(store.prune, retention_days=retention)
     await _schedule_retry(store, adapter)
     return sent, len(ambiguous)

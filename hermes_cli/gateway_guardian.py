@@ -287,8 +287,13 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 config = load_user_config_effective(home / "config.yaml", fail_closed=True)
             else:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
+            updates = config.get("updates")
+            if updates is not None and not isinstance(updates, dict):
+                raise ValueError("updates must be a mapping")
+            scoped = {"updates": {"release_acknowledgement_timeout_seconds":
+                                   (updates or {}).get("release_acknowledgement_timeout_seconds", 180.0)}}
             issues = []
-            _validate_updates(config, issues)
+            _validate_updates(scoped, issues)
             if issues:
                 raise ValueError("; ".join(issue.message for issue in issues))
             if grace is None:

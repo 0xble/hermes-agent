@@ -70,6 +70,18 @@ def test_explicit_invalid_grace_writes_alert_receipt(tmp_path, monkeypatch, grac
     home, plist, label, *_ = layout(tmp_path)
     monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
     assert guardian.run_once(home, plist, label, grace=grace) == "alert"
+    assert any(json.loads(path.read_text())["outcome"] == "alert"
+               for path in (home / "logs/guardian").glob("*.json"))
+
+
+@pytest.mark.macos_only
+def test_unrelated_invalid_update_key_does_not_block_repair(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("updates:\n  immutable_releases: not-a-boolean\n")
+    calls = fake_launchctl(monkeypatch, label)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    assert guardian.run_once(home, plist, label) == "repaired"
+    assert [row[1] for row in calls].count("bootstrap") == 1
 
 
 @pytest.mark.macos_only

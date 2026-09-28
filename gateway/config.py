@@ -839,9 +839,7 @@ class GatewayConfig:
             raise ValueError("gateway.durable_outbox must be a mapping with an enabled boolean")
         if type(outbox.get("enabled", False)) is not bool:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
-        retention = outbox.get("retention_days", 7)
-        if type(retention) is not int or retention < 1:
-            raise ValueError("gateway.durable_outbox.retention_days must be a positive integer")
+        retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -889,6 +887,12 @@ class GatewayConfig:
         """Effective notice-delivery mode ("public"/"private") for a platform."""
         choice = self._extra_choice(platform, "notice_delivery", {"public", "private"}, "public")
         return "public" if choice is None else choice
+
+
+def validate_outbox_retention_days(value: Any) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("gateway.durable_outbox.retention_days must be a positive integer")
+    return value
 
 
 def load_gateway_config() -> GatewayConfig:

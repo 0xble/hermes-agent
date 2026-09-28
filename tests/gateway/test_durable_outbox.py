@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import errno
 import multiprocessing as mp
 import os
 import sqlite3
@@ -678,6 +679,29 @@ async def _send_bound(adapter, home, turn):
         clear_turn()
 
 
+@pytest.mark.asyncio
+async def test_open_outbox_migration_does_not_block_event_loop(tmp_path, monkeypatch):
+    from gateway.outbox import open_outbox
+    entered, released = threading.Event(), threading.Event()
+    original = Outbox._connect
+    waits = []
+
+    def slow_connect(self):
+        if not entered.is_set():
+            entered.set()
+            waits.append(released.wait(timeout=2))
+        return original(self)
+
+    monkeypatch.setattr(Outbox, "_connect", slow_connect)
+
+    async def pulse():
+        await asyncio.to_thread(entered.wait, 2)
+        released.set()
+
+    store, _ = await asyncio.gather(open_outbox(tmp_path), pulse())
+    assert store.path.is_file() and waits == [True]
+
+
 def test_prune_retains_unresolved_and_recent_rows_and_removes_terminal_media(tmp_path):
     store = Outbox(tmp_path)
     media = tmp_path / "gateway-outbox-media" / "copy.txt"
@@ -805,6 +829,34 @@ async def test_boot_sweep_uses_profile_retention(tmp_path):
     assert store.all_rows() == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["0", "true", "'7'"])
+async def test_boot_sweep_invalid_profile_retention_uses_default(tmp_path, caplog, bad):
+    (tmp_path / "config.yaml").write_text(f"gateway:\n  durable_outbox:\n    retention_days: {bad}\n")
+    store = Outbox(tmp_path)
+    row = store.enqueue("old", "send", {"content": "sent"})
+    store.begin_send(row)
+    store.receipt(row, message_id="one", success=True)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=?", (time.time() - 3 * 86400,))
+    assert await recover(store, _fake_adapter(True, [])) == (0, 0)
+    assert store.all_rows() == [row.__class__(**{**row.__dict__, "state": "delivered", "message_id": "one"})]
+    assert "retention" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_boot_sweep_honors_legacy_retention(tmp_path):
+    (tmp_path / "gateway.json").write_text('{"durable_outbox":{"retention_days":2}}')
+    store = Outbox(tmp_path)
+    row = store.enqueue("old", "send", {"content": "sent"})
+    store.begin_send(row)
+    store.receipt(row, message_id="one", success=True)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=?", (time.time() - 3 * 86400,))
+    assert await recover(store, _fake_adapter(True, [])) == (0, 0)
+    assert store.all_rows() == []
+
+
 def test_retention_config_parses_and_rejects_invalid_age():
     config = GatewayConfig.from_dict({"gateway": {"durable_outbox": {
         "enabled": True, "retention_days": 3}}})
@@ -856,9 +908,18 @@ async def test_cancelled_store_io_preserves_cancellation_when_disk_fails():
     with pytest.raises(asyncio.CancelledError):
         await task
 
-def test_connection_refused_is_definitively_unsent():
-    assert not _uncertain(SendResult(False, error="connection refused", error_kind="connectionrefused", retryable=True))
-    assert not _uncertain(SendResult(False, error="connection refused", error_kind="unknown", retryable=True))
+@pytest.mark.parametrize("error", [ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+                                         OSError(errno.ECONNREFUSED, "Connection refused")])
+def test_connection_refused_is_definitively_unsent(error):
+    from gateway.platforms.base import classify_send_error
+    result = SendResult(False, error=str(error), error_kind=classify_send_error(error), retryable=True)
+    assert not _uncertain(result)
+
+
+def test_connection_reset_is_held_after_classification():
+    from gateway.platforms.base import classify_send_error
+    error = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+    assert _uncertain(SendResult(False, error=str(error), error_kind=classify_send_error(error), retryable=True))
 
 def test_prune_bounds_expired_ambiguous_and_unfinished_admissions(tmp_path):
     store = Outbox(tmp_path)
