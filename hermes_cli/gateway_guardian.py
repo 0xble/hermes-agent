@@ -6,7 +6,6 @@ work, or falls back to the checkout when the release pointer is damaged.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import plistlib
@@ -23,6 +22,12 @@ from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollb
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
 INTERVAL = 30
 MAX_REPAIRS = 3
+
+
+def _domain() -> str:
+    if sys.platform != "darwin":
+        raise RuntimeError("gateway guardian requires macOS launchd")
+    return f"gui/{getattr(os, 'getuid')()}"
 
 
 def intent_path(home: Path) -> Path:
@@ -125,7 +130,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
-    domain = domain or f"gui/{os.getuid()}"
+    domain = domain or _domain()
     def reload_target():
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
         subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
@@ -215,6 +220,7 @@ def _repair_count(home: Path) -> int:
 
 def run_once(home: Path, plist: Path, label: str, *, grace: float = 180,
              domain: str | None = None) -> str:
+    import fcntl
     home = Path(home)
     directory = home / "logs/guardian"
     directory.mkdir(parents=True, exist_ok=True)
@@ -224,7 +230,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float = 180,
         except BlockingIOError:
             return "locked"
         try:
-            return _run(home, Path(plist), label, grace=grace, domain=domain or f"gui/{os.getuid()}")
+            return _run(home, Path(plist), label, grace=grace, domain=domain or _domain())
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"
@@ -247,14 +253,17 @@ def cli(argv: list[str] | None = None) -> int:
     parser.add_argument("action", choices=["install", "uninstall", "status", "run"])
     parser.add_argument("--gateway-plist", type=Path)
     parser.add_argument("--gateway-label")
-    parser.add_argument("--domain", default=f"gui/{os.getuid()}")
+    parser.add_argument("--domain", default=None)
     args = parser.parse_args(argv)
+    if sys.platform != "darwin":
+        parser.error("gateway guardian requires macOS launchd")
+    args.domain = args.domain or _domain()
     from hermes_cli import gateway
     home = get_hermes_home()
     target = args.gateway_plist or gateway.get_launchd_plist_path()
     label = args.gateway_label or gateway.get_launchd_label()
     import pwd
-    path = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
+    path = Path(pwd.getpwuid(getattr(os, 'getuid')()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
         print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()}")
         return 0
