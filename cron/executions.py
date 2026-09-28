@@ -365,8 +365,9 @@ def finish_execution(
 
 
 _OWNER_GONE_REASON = (
-    "Scheduler restarted after this execution's owner exited before a durable "
-    "terminal state; whether side effects ran is unknown."
+    "Execution owner process stopped before recording a durable terminal state; "
+    "the cause is not known (it may have been stopped by an operator). "
+    "Whether side effects ran is unknown."
 )
 _OWNER_WEDGED_REASON = (
     "Owner process is still alive but the claim outlived the derived stale bound; "

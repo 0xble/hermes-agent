@@ -790,9 +790,10 @@ def test_lost_execution_start_cas_prevents_side_effects(monkeypatch):
     pytest.param("linux", marks=pytest.mark.linux_only),
     pytest.param("macos", marks=pytest.mark.macos_only),
 ])
+@pytest.mark.parametrize("manual", [False, True])
 @pytest.mark.live_system_guard_bypass
 def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
-    tmp_path, monkeypatch, host
+    tmp_path, monkeypatch, host, manual
 ):
     import cron.delivery_queue as delivery_queue
     import cron.executions as executions
@@ -881,7 +882,14 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         "from tools import process_registry\n"
         "process_registry._is_supervised_gateway_process = lambda: True\n"
         f"job = json.loads(pathlib.Path({str(payload)!r}).read_text())\n"
-        "if not scheduler.run_one_job(job, adapters=None, loop=None):\n"
+        f"if {manual!r}:\n"
+        "    from cron.jobs import claim_job_for_fire\n"
+        "    from tools.cronjob_tools import _run_claimed_job\n"
+        "    job = claim_job_for_fire(job['id'], manual=True, return_job=True)\n"
+        "    result = _run_claimed_job(job)['success']\n"
+        "else:\n"
+        "    result = scheduler.run_one_job(job, adapters=None, loop=None)\n"
+        "if not result:\n"
         "    raise SystemExit('worker was not isolated')\n"
         f"pathlib.Path({str(launched)!r}).write_text('returned')\n"
     )

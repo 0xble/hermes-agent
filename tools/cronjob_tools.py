@@ -281,6 +281,10 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
         # outlived by real jobs, so it alone cannot stop a manual run from double-firing a job the ticker
         # (or another manual run) is still executing.
         if not try_register_running_job(job_id):
+            if job.get("execution_id"):
+                from cron.executions import finish_execution
+                finish_execution(str(job["execution_id"]), success=False,
+                                 error=_ALREADY_RUNNING_ERROR)
             return {"claimed": True, "success": False, "error": _ALREADY_RUNNING_ERROR}
         _registered = True
 
@@ -336,6 +340,9 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
                 release_running_job(job_id)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
+        if job.get("execution_id"):
+            from cron.executions import finish_execution
+            finish_execution(str(job["execution_id"]), success=False, error=str(e))
         return {"claimed": True, "success": False, "error": str(e)}
 
 
@@ -423,24 +430,38 @@ def _background_session_key(session_id: Optional[str]) -> str:
 
 
 def _manual_run_completion(
-    res: Dict[str, Any], job_id: str, job_name: str, deliver: str, started_at: float) -> Dict[str, Any]:
-    """Async-delegation completion block for a finished background manual run."""
+    res: Dict[str, Any], job_id: str, job_name: str, deliver: str, started_at: float,
+    *, execution_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Report the exact durable execution, not the gateway waiter's result."""
+    execution = None
+    if execution_id:
+        from cron.executions import get_execution
+        execution = get_execution(str(execution_id))
+    if execution is not None and execution["status"] in {"completed", "failed", "unknown"}:
+        state = execution["status"]
+        res = {"success": state == "completed", "error": execution.get("error")}
+    else:
+        state = "completed" if res.get("success") else "failed"
     duration = round(time.time() - started_at, 2)
     refreshed = get_job(job_id) or {}
+    label = "ok" if state == "completed" else "unknown" if state == "unknown" else "FAILED"
     lines = [
         f"Cron job '{job_name}' ({job_id}) finished its manual run.",
-        f"Result: {'ok' if res.get('success') else 'FAILED'}"
+        f"Result: {label}"
         + (f" — {res.get('error')}" if res.get("error") else ""),
         f"Delivery target: {deliver}" + _manual_run_delivery_note(deliver, refreshed),
     ]
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-    excerpt = _latest_job_output_excerpt(job_id)
+    excerpt = (str(execution.get("output") or "")[-4000:] if execution is not None else "")
+    excerpt = excerpt or _latest_job_output_excerpt(job_id)
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
-        "status": "completed" if res.get("success") else "error", "summary": "\n".join(lines),
-        "error": res.get("error"), "api_calls": 0, "duration_seconds": duration,
+        "status": "completed" if state == "completed" else "unknown" if state == "unknown" else "error",
+        "summary": "\n".join(lines), "error": res.get("error"),
+        "api_calls": 0, "duration_seconds": duration,
     }
 
 
@@ -492,6 +513,10 @@ def _try_dispatch_background_run(
         if err["claimed"]:
             err["dispatched"] = False
         return err
+    # Persist the attempt before registering the completion. A replacement
+    # process must know the exact worker to observe, not infer from job history.
+    from cron.executions import create_execution
+    claimed_job["execution_id"] = create_execution(job_id, source="manual")["id"]
 
     origin_ui_session_id = ""
     try:
@@ -523,7 +548,10 @@ def _try_dispatch_background_run(
 
     def _runner() -> Dict[str, Any]:
         res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
-        return _manual_run_completion(res, job_id, job_name, deliver, started_at)
+        return _manual_run_completion(
+            res, job_id, job_name, deliver, started_at,
+            execution_id=str((claimed_job or {}).get("execution_id") or "") or None,
+        )
 
     dispatch = dispatch_async_delegation(
         goal=f"Manual run of cron job '{job_name}' ({job_id})",
@@ -532,7 +560,12 @@ def _try_dispatch_background_run(
         toolsets=None, role="cron_run", model=job.get("model"), session_key=session_key,
         parent_session_id=str(session_id) if session_id else None, runner=_runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
-        max_async_children=max_async)
+        max_async_children=max_async,
+        cron_execution={
+            "cron_execution_id": str((claimed_job or {}).get("execution_id") or ""),
+            "cron_job_id": job_id, "cron_job_name": job_name,
+            "cron_deliver": deliver,
+        })
     if dispatch.get("status") == "dispatched":
         return {"claimed": True, "dispatched": True, "delegation_id": dispatch.get("delegation_id")}
 
@@ -540,7 +573,7 @@ def _try_dispatch_background_run(
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name)
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 

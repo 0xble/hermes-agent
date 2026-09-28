@@ -213,6 +213,18 @@ def _terminate_cron_script_tree(proc: subprocess.Popen) -> None:
     fallback("Cron script tree-kill reported no signal for pid %s", pid)
 
 
+def _sweep_detached_script_orphans() -> None:
+    """Cancel/timeout also reaches script grandchildren already reparented."""
+    execution_id = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
+    if not execution_id:
+        return
+    from cron.executions import _process_start_time
+    from cron.scheduler_detached_worker import _terminate_owned_descendants
+    fingerprint = _process_start_time(os.getpid())
+    if fingerprint is not None:
+        _terminate_owned_descendants(os.getpid(), fingerprint, execution_id, orphan_only=True)
+
+
 def _drain_script_pipes(proc: subprocess.Popen) -> None:
     """Reap a terminated script without blocking forever: a surviving descendant can hold the pipe
     write ends open, so bound the drain and abandon the pipes (output is not needed)."""
@@ -370,6 +382,10 @@ def _run_job_script(
         # process env itself — no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
+        # The worker's exact execution marker is an ownership fence for
+        # double-forked descendants that escape the original process tree.
+        if os.environ.get("_HERMES_CRON_EXTERNAL_WORKER"):
+            env["_HERMES_CRON_EXTERNAL_WORKER"] = os.environ["_HERMES_CRON_EXTERNAL_WORKER"]
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
@@ -383,11 +399,13 @@ def _run_job_script(
             # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_tree(proc)
+                _sweep_detached_script_orphans()
                 _drain_script_pipes(proc)
                 return False, "Script cancelled because cron fire ownership was lost"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_tree(proc)
+                _sweep_detached_script_orphans()
                 _drain_script_pipes(proc)
                 # Phase 4a (#85125): a script timeout must leave ZERO living descendants. killpg only
                 # reaches the script's own process group — a grandchild that called setsid (backgrounded

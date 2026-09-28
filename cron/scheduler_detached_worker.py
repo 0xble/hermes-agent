@@ -26,12 +26,18 @@ def hard_wall_timeout_seconds() -> float:
         return 7200.0
 
 
-def _terminate_owned_descendants(pid: int, started_at: int) -> bool:
-    """Snapshot descendants before signaling the owner, across their own setsid groups.
+def _terminate_owned_descendants(
+    pid: int, started_at: int, execution_id: Optional[str] = None, *, orphan_only: bool = False,
+) -> bool:
+    """Sweep the owner tree and same-user processes carrying its exact execution marker.
 
-    psutil handles include start-time identity; never signal a reused PID or an
-    unrelated process after its parent exits. An orphan already reparented before
-    the snapshot cannot be proven owned and must not be swept by name/argv.
+    With orphan_only, only marker-matched processes outside the current tree are
+    selected. Script teardown already handled that tree, and other worker children
+    must survive the script's own timeout.
+
+    A double-forked setsid child is reparented before a tree snapshot. The
+    inherited execution marker preserves ownership across that boundary;
+    require both matching marker and a process created after this worker.
     """
     import psutil
     from cron.executions import _owner_identity
@@ -40,7 +46,23 @@ def _terminate_owned_descendants(pid: int, started_at: int) -> bool:
         return False
     try:
         parent = psutil.Process(pid)
-        children = parent.children(recursive=True)
+        descendants = parent.children(recursive=True)
+        children = [] if orphan_only else descendants
+        if execution_id:
+            owner_uid = parent.uids().real
+            owner_start = parent.create_time()
+            known = {child.pid for child in descendants}
+            for candidate in psutil.process_iter():
+                try:
+                    if (candidate.pid in known or candidate.pid == pid
+                            or candidate.uids().real != owner_uid
+                            or candidate.create_time() < owner_start
+                            or candidate.environ().get("_HERMES_CRON_EXTERNAL_WORKER") != execution_id):
+                        continue
+                    children.append(candidate)
+                    known.add(candidate.pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
     for child in reversed(children):
@@ -105,7 +127,7 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
                     fence.stopped.wait(grace - 3.0)
             finally:
                 try:
-                    _terminate_owned_descendants(pid, fingerprint)
+                    _terminate_owned_descendants(pid, fingerprint, execution_id)
                 finally:
                     exit_code = 124 if timeout_won else 1
                     if not timeout_won:
