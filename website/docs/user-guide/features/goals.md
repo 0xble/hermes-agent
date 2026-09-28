@@ -131,14 +131,14 @@ A goal names the end state, not the route. Plans change during long work, and a 
 
 The judge sees the start and the end of the agent's reply, the most recent tool results, and **every identifier the reply cites**. Backticked values, quoted strings, commit SHAs, URLs, run or deploy ids and `N passed` lines are looked up verbatim in every tool result recorded since the goal was set, even ones from hundreds of calls earlier or already compacted out of context. The judge gets the matching excerpts. Citations that match no recorded result are listed as unproven, so a made-up SHA or test count cannot pass as evidence.
 
-The continuation prompt asks the agent to end a completion claim with an Evidence section that quotes these identifiers. A dispute names the single criterion that lacks evidence and the check that would prove it. The goal pauses as "judge disputed completion" only after 3 disputes in a row that bring no newly located evidence.
+The continuation prompt asks the agent to end a completion claim with an Evidence section that quotes these identifiers. A dispute names the single criterion that lacks evidence and the check that would prove it. The goal pauses as "judge disputed completion" after 3 disputes in a row, unless a reply cites a recorded result that no earlier dispute in the streak saw.
 
 ### Revising a goal
 
 The agent can revise the active goal through its `goal_set` tool (`action=revise`) with a reason. Each revision is versioned and sent to you as a notice. The judge sees the revision history and the continuation prompt carries the current version, so superseded wording stops binding.
 
 - The agent may reword or restructure the outcome, verification, boundaries and stop condition. The judge still holds it to any earlier requirement such a revision weakened.
-- Changing the objective or the constraints, or dropping a subgoal, needs your authority. The agent must quote your instruction verbatim from a message you sent since the goal was set, or the revision is rejected.
+- Changing the objective or the constraints, or dropping a subgoal, needs your authority. The agent must quote your instruction verbatim from a message you sent since the goal was set, or the revision is rejected. The judge sees your full message beside the change, and the earlier requirement still binds unless that message plainly asks for this change.
 
 ## Adding criteria mid-goal: `/subgoal`
 

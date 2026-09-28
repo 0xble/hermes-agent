@@ -80,14 +80,18 @@ Failed or interrupted model turns do not run completion judging.
   - **Response window.** The judge sees the head and the tail of a long
     response, so a closing Evidence section is not cut off.
   - **Disputes.** A dispute names one missing criterion and the check that would
-    prove it. Only disputes that bring no newly located evidence count toward the
-    stall breaker, and it pauses at 3 instead of 2.
+    prove it. A dispute counts toward the stall breaker, which pauses at 3
+    instead of 2, unless the reply cites a recorded result that no earlier dispute
+    in the streak cited. Rewording or dropping citations is not progress.
   - **Revisions.** `GoalManager.revise()` records a versioned revision (actor,
-    reason, user quote, before, after). The judge prompt shows the history, and
-    the continuation prompt shows the current version. Changing the objective or constraints, or dropping a
-    subgoal, needs a verbatim quote from a real user message sent since the goal
-    was set. The judge holds an agent revision made without user authority to any
-    earlier requirement it weakened.
+    reason, user quote with its source message, before, after). The judge prompt
+    shows every revision and every requirement it replaced, in full. The
+    continuation prompt shows the current version. Changing the objective or
+    constraints, or dropping a subgoal, needs a verbatim quote of 12+ characters
+    from a real user message sent since the goal was set. The runtime proves only
+    that the user said it. The judge decides whether that message plainly
+    instructs the specific change, and otherwise holds the agent to the earlier
+    requirement.
   The judge prompt judges the end state, not the route. A remedied state
   invariant stops blocking `done`, while a breached irreversible prohibition
   returns BLOCKED.

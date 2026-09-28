@@ -198,7 +198,7 @@ DISPUTED = ("continue", "tests missing", False, {"disputed": True}, False)
 def test_disputes_with_new_evidence_do_not_pause(hermes_home):
     mgr = GoalManager(session_id="dispute-progress")
     mgr.set("ship", max_turns=100)
-    fingerprints = iter([{"cited": [], "unresolved": [], "fingerprint": f"fp{i}"} for i in range(5)])
+    fingerprints = iter([{"cited": [], "unresolved": [], "evidence_ids": [str(i)]} for i in range(5)])
     with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
             patch.object(goals, "resolve_cited_evidence", side_effect=lambda *a, **k: next(fingerprints)):
         decisions = [mgr.evaluate_after_turn("done") for _ in range(5)]
@@ -209,7 +209,7 @@ def test_disputes_with_new_evidence_do_not_pause(hermes_home):
 def test_disputes_without_new_evidence_pause_at_the_limit(hermes_home):
     mgr = GoalManager(session_id="dispute-stuck")
     mgr.set("ship", max_turns=100)
-    same = {"cited": [], "unresolved": [], "fingerprint": "same"}
+    same = {"cited": [], "unresolved": [], "evidence_ids": ["41"]}
     with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
             patch.object(goals, "resolve_cited_evidence", return_value=same):
         decisions = [mgr.evaluate_after_turn("done") for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES)]
@@ -236,8 +236,8 @@ def test_agent_may_restructure_verification_without_user_authority(hermes_home, 
     prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
     mgr.evaluate_after_turn("working")
     history = prompts[0].split("Revision history")[1]
-    assert "agent, no user authority" in history and "was verification: 12-item checklist" in history
-    assert "cannot lower the bar" in prompts[0]
+    assert "agent, no user authority" in history and "earlier verification: 12-item checklist" in history
+    assert "only the user can lower the bar" in prompts[0]
 
 
 @pytest.mark.parametrize("change", [
@@ -260,6 +260,7 @@ def test_objective_constraints_and_dropped_criteria_need_a_real_user_quote(herme
     assert missing["error_code"] == "user_authority_required"
     assert invented["error_code"] == "user_quote_not_found"
     assert real["ok"] and load_goal("rev-authority").revisions[-1]["user_quote"] == "drop Willow and ship a smaller X"
+    assert load_goal("rev-authority").revisions[-1]["user_message"].startswith("ok. drop Willow")
 
 
 def test_user_quote_is_checked_against_real_user_messages_only(hermes_home):
@@ -302,3 +303,72 @@ def test_legacy_state_without_revisions_loads():
     legacy = json.dumps({"goal": "g", "status": "active", "turns_used": 3})
     state = goals.GoalState.from_json(legacy)
     assert state.revisions == [] and state.last_dispute_evidence == "" and state.render_revisions_block() == ""
+
+
+# ── review regressions ────────────────────────────────────────────────
+
+
+def test_every_superseded_requirement_stays_visible_in_full(hermes_home):
+    """An unauthorized weakening must not scroll out of the judge's view behind later revisions."""
+    mgr = GoalManager(session_id="rev-window")
+    original = "Run the security audit and every integration test. " + "x" * 600 + " END-OF-REQUIREMENT"
+    mgr.set("Ship X", contract=GoalContract(verification=original))
+    mgr.revise(reason="simplify", contract={"verification": "Say done"}, user_messages=[])
+    for i in range(6):
+        mgr.revise(reason=f"reword {i}", contract={"outcome": f"X live v{i}"}, user_messages=[])
+    block = mgr.state.render_revisions_block()
+    assert original in block and "END-OF-REQUIREMENT" in block
+
+
+def test_a_real_quote_is_shown_with_its_full_message_for_the_judge_to_weigh(hermes_home, monkeypatch):
+    """Substring presence proves the user said it, not that they authorized this change."""
+    mgr = GoalManager(session_id="rev-context")
+    mgr.set("Ship X", contract=GoalContract(constraints="Never publish secrets"))
+    result = mgr.revise(reason="loosen", contract={"constraints": ""}, user_quote="Please keep going",
+                        user_messages=["Please keep going and never publish secrets"])
+    assert result["ok"]
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
+    mgr.evaluate_after_turn("working")
+    history = prompts[0].split("Revision history")[1]
+    assert 'full message: "Please keep going and never publish secrets"' in history
+    assert "earlier constraints: Never publish secrets" in history
+    assert "plainly instructs that specific change" in prompts[0]
+    assert "user-authorized" not in history
+
+
+def test_optional_quote_must_meet_the_minimum_length(hermes_home):
+    mgr = GoalManager(session_id="rev-short")
+    mgr.set("Ship X")
+    result = mgr.revise(reason="r", contract={"verification": "v2"}, user_quote="ok",
+                        user_messages=["ok"])
+    assert result["error_code"] == "user_quote_too_short"
+
+
+def test_citations_far_apart_in_one_result_each_get_an_excerpt(hermes_home):
+    sid = "cite-far"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    body = "proof_start=aaaa1111 " + "filler " * 200 + " proof_end=bbbb2222"
+    _tool(db, sid, "terminal", {"command": "report"}, body, "rep")
+    result = goals.resolve_cited_evidence(sid, "Evidence: `proof_start=aaaa1111` and `proof_end=bbbb2222`.",
+                                          since=mgr.state.created_at)
+    block = goals._render_cited_block(result)
+    # Each located citation's own text reaches the judge, though ~1,400 chars separate them.
+    assert "proof_start=aaaa1111" in block.split("→", 1)[1] and "proof_end=bbbb2222" in block
+    excerpted = [c["excerpt"] for c in result["cited"] if not c["excerpt"].startswith("(inside")]
+    assert any("proof_start=aaaa1111" in e for e in excerpted)
+    assert any("proof_end=bbbb2222" in e for e in excerpted)
+
+
+def test_rewording_or_dropping_citations_is_not_new_evidence(hermes_home):
+    mgr = GoalManager(session_id="dispute-reword")
+    mgr.set("ship", max_turns=100)
+    # Alternate: cite result 7, cite nothing, cite result 7 through other wording.
+    # The fingerprint key carries each turn's differing citation wording.
+    seq = iter([{"cited": [], "unresolved": [], "evidence_ids": ids, "fingerprint": fp}
+                for ids, fp in ((["7"], "7:proof a"), ([], ""), (["7"], "7:proof b"))])
+    with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
+            patch.object(goals, "resolve_cited_evidence", side_effect=lambda *a, **k: next(seq)):
+        decisions = [mgr.evaluate_after_turn("done") for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES)]
+    assert decisions[-1]["verdict"] == "disputed" and not decisions[-1]["should_continue"]

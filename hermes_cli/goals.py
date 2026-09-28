@@ -74,6 +74,12 @@ _CITATION_CONTEXT_CHARS = 280
 _CITATION_MAX_UNRESOLVED_SHOWN = 10
 _CITATION_ROWS_PER_NEEDLE = 2
 _CITATION_MAX_EXCERPTS = 32
+# Result ids remembered across one dispute streak.
+_DISPUTE_SEEN_MAX = 200
+
+
+def _evidence_id_order(value: str) -> Tuple[int, str]:
+    return (int(value), value) if value.isdigit() else (0, value)
 _CITATION_BACKTICK_RE = re.compile(r"`([^`\n]{6,200})`")
 _CITATION_QUOTED_RE = re.compile(r"[\"\u201c]([^\"\u201c\u201d`\n]{8,200})[\"\u201d]")
 _CITATION_URL_RE = re.compile(r"https?://[^\s)\]>`\"']+")
@@ -274,12 +280,12 @@ JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
 
 # Judge prompt block for the goal's revision history (empty without revisions).
 JUDGE_REVISIONS_BLOCK_TEMPLATE = (
-    "Revision history (the goal and criteria above are the CURRENT version; "
-    "superseded wording no longer applies). A revision marked user-authorized "
-    "supersedes the earlier wording. A revision the agent made without user "
-    "authority may clarify or restructure, but it cannot lower the bar: if it "
-    "drops or weakens an earlier requirement, hold the agent to the earlier "
-    "requirement.\n{revision_lines}\n\n"
+    "Revision history (the goal and criteria above are the CURRENT version). "
+    "A revision may clarify or restructure, but only the user can lower the "
+    "bar. For each earlier requirement a revision dropped or weakened: it is "
+    "superseded only when the cited user message plainly instructs that "
+    "specific change; otherwise, including every revision with no user "
+    "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
 )
 
 JUDGE_USER_PROMPT_TEMPLATE = (
@@ -552,8 +558,8 @@ class GoalState:
     # Versioned revisions of the goal/contract/subgoals: {at, actor, reason, user_quote, before, after}.
     # Shown to the judge and continuation so superseded wording stops binding. Old rows load as [].
     revisions: List[Dict[str, Any]] = field(default_factory=list)
-    # Fingerprint of the cited evidence the judge last disputed; a dispute counts toward the stall
-    # breaker only when no new evidence was located since the previous dispute.
+    # Comma-joined ids of recorded results cited during the current dispute streak; a dispute that
+    # cites none beyond these counts toward the stall breaker.
     last_dispute_evidence: str = ""
 
     def to_json(self) -> str:
@@ -597,25 +603,30 @@ class GoalState:
         """Numbered ``- N. text`` block; empty when there are no subgoals."""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
-    def render_revisions_block(self, limit: int = 5) -> str:
-        """Newest revisions as ``- vN (actor, authority): reason — changed: fields``; empty without any."""
+    def render_revisions_block(self) -> str:
+        """Every revision with every requirement it replaced, in full; empty without revisions.
+
+        Nothing is windowed or truncated: a replaced requirement stays binding unless a user message
+        instructs the change, so dropping it from the prompt would silently lower the bar."""
         lines = []
         for i, rev in enumerate(self.revisions, start=1):
-            if i <= len(self.revisions) - limit:
-                continue
             quote = str(rev.get("user_quote") or "").strip()
-            authority = f'user-authorized: "{_truncate(quote, 200)}"' if quote else "agent, no user authority"
+            source = str(rev.get("user_message") or "").strip()
+            if quote:
+                authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
+            else:
+                authority = "agent, no user authority"
             before, after = rev.get("before") or {}, rev.get("after") or {}
             changed = [k for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
             lines.append(f"- v{i + 1} ({rev.get('actor') or 'agent'}, {authority}): "
                          f"{_truncate(str(rev.get('reason') or ''), 300)} — changed: {', '.join(changed) or 'nothing'}")
             for key in changed:
                 if key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
-                    lines.append(f"    was {key}: {_truncate(str(before.get(key) or '(empty)'), 400)}")
+                    lines.append(f"    earlier {key}: {str(before.get(key) or '(empty)')}")
                 elif key == "subgoals":
                     dropped = [s for s in (before.get(key) or []) if s not in (after.get(key) or [])]
                     if dropped:
-                        lines.append("    dropped criteria: " + "; ".join(_truncate(str(s), 200) for s in dropped))
+                        lines.append("    dropped criteria: " + "; ".join(str(s) for s in dropped))
         return "\n".join(lines)
 
     def clear_wait(self) -> None:
@@ -1309,10 +1320,10 @@ def _runtime_notice_label(content: Any) -> str:
 def resolve_cited_evidence(session_id: Optional[str], response: str, since: float = 0.0) -> Dict[str, Any]:
     """Locate each identifier the response cites in tool results recorded since ``since``.
 
-    Returns ``{"cited": [{needle, tool, call, excerpt, timestamp, message_id}], "unresolved": [...],
-    "fingerprint": str}``. Only tool-layer rows count, so the agent cannot cite its own prose into
+    Returns ``{"cited": [{needle, tool, excerpt, timestamp, message_id}], "unresolved": [...],
+    "evidence_ids": [message ids]}``. Only tool-layer rows count, so the agent cannot cite its own prose into
     evidence. Excerpts are secret-redacted and bounded. Fail-safe: any error yields no citations."""
-    empty: Dict[str, Any] = {"cited": [], "unresolved": [], "fingerprint": ""}
+    empty: Dict[str, Any] = {"cited": [], "unresolved": [], "evidence_ids": []}
     needles = extract_citations(response)
     if not session_id or not needles:
         return empty
@@ -1327,7 +1338,9 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
         redact_sensitive_text = None
     cited: List[Dict[str, Any]] = []
     unresolved: List[str] = []
-    shown: set = set()
+    # Excerpted ranges per result row: a citation inside an already-shown range points at it,
+    # while a citation elsewhere in the same long result still gets its own excerpt.
+    shown: Dict[Any, List[Tuple[int, int]]] = {}
     half = _CITATION_CONTEXT_CHARS // 2
     for needle in needles:
         matches: List[Tuple[Dict[str, Any], str, bool]] = []
@@ -1362,30 +1375,36 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
         for row, hit, via_call in matches:
             if kept >= _CITATION_ROWS_PER_NEEDLE or len(cited) >= _CITATION_MAX_EXCERPTS:
                 break
-            if row.get("id") in shown:
-                # Same result already excerpted for another citation: record the match, not a copy.
-                cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"),
-                              "excerpt": f"(same result #{row.get('id')} as above)",
-                              "timestamp": float(row.get("timestamp") or 0.0), "message_id": row.get("id")})
-                kept += 1
-                continue
-            shown.add(row.get("id"))
-            kept += 1
             content = str(row.get("content") or "")
             if via_call:
+                span = (-1, -1)   # the call's own result tail: one excerpt per row
+            else:
+                at = max(0, content.find(hit))
+                span = (at, at + len(hit))
+            ranges = shown.setdefault(row.get("id"), [])
+            covered = next((r for r in ranges if (span == (-1, -1) and r == span)
+                            or (span != (-1, -1) and r[0] <= span[0] and span[1] <= r[1])), None)
+            kept += 1
+            if covered is not None:
+                cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"),
+                              "excerpt": f"(inside the excerpt of result #{row.get('id')} above)",
+                              "timestamp": float(row.get("timestamp") or 0.0), "message_id": row.get("id")})
+                continue
+            if via_call:
+                ranges.append(span)
                 excerpt = "ran " + _one_line(row.get("arguments"), _EVIDENCE_CALL_CHARS) + " → " + \
                     _tail(content.strip(), _CITATION_CONTEXT_CHARS).replace("\n", " ⏎ ")
             else:
-                at = content.find(hit)
-                start, end = max(0, at - half), min(len(content), at + len(hit) + half)
+                start, end = max(0, span[0] - half), min(len(content), span[1] + half)
+                ranges.append((start, end))
                 excerpt = ("…" if start else "") + content[start:end].replace("\n", " ⏎ ") + \
                     ("…" if end < len(content) else "")
             if redact_sensitive_text is not None:
                 excerpt = redact_sensitive_text(excerpt, force=True)
             cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"), "excerpt": excerpt,
                           "timestamp": float(row.get("timestamp") or 0.0), "message_id": row.get("id")})
-    fingerprint = ",".join(sorted(str(c["message_id"]) + ":" + c["needle"] for c in cited))
-    return {"cited": cited, "unresolved": unresolved, "fingerprint": fingerprint}
+    evidence_ids = sorted({str(c["message_id"]) for c in cited if c.get("message_id") is not None})
+    return {"cited": cited, "unresolved": unresolved, "evidence_ids": evidence_ids}
 
 
 def _render_cited_block(citations: Optional[Dict[str, Any]], now: Optional[float] = None) -> str:
@@ -1624,6 +1643,21 @@ _SYNTHETIC_USER_PREFIXES = (
 _REPLY_QUOTE_RE = re.compile(r'^\[Replying to: ".*?"\]\n\s*', re.DOTALL)
 
 
+_REVISION_QUOTE_MIN_CHARS = 12
+# Context kept around a quoted user instruction: long enough to judge what it asks for.
+_REVISION_SOURCE_CHARS = 1200
+
+
+def _quote_context(message: str, quote: str) -> str:
+    """The user message, or a window of it centred on the quote when the message is long."""
+    if len(message) <= _REVISION_SOURCE_CHARS:
+        return message
+    at = message.find(quote)
+    pad = max(0, (_REVISION_SOURCE_CHARS - len(quote)) // 2)
+    start, end = max(0, at - pad), min(len(message), at + len(quote) + pad)
+    return ("…" if start else "") + message[start:end] + ("…" if end < len(message) else "")
+
+
 def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> List[str]:
     """Text the user actually wrote since ``since``: synthetic runtime prompts are dropped and a
     reply's quoted header (which repeats the assistant's words) is stripped. Fail-safe: ``[]``."""
@@ -1847,21 +1881,25 @@ class GoalManager:
         dropped = [s for s in before["subgoals"] if s not in after["subgoals"]]
         needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
         quote = " ".join((user_quote or "").split())
-        if needs_authority:
-            if len(quote) < 12:
-                return {"ok": False, "error_code": "user_authority_required",
-                        "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
-                                 "(12+ chars) of the user's instruction in this session"}
+        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS:
+            return {"ok": False, "error_code": "user_authority_required",
+                    "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
+                             f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session"}
+        source = ""
+        if quote:
+            # Deterministic part: the quote must come from a real user message. Whether that message
+            # authorizes this specific change is judged against the full message, shown with the revision.
+            if len(quote) < _REVISION_QUOTE_MIN_CHARS:
+                return {"ok": False, "error_code": "user_quote_too_short",
+                        "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
             pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-            if not any(quote in " ".join(m.split()) for m in pool):
+            source = next((" ".join(m.split()) for m in pool if quote in " ".join(m.split())), "")
+            if not source:
                 return {"ok": False, "error_code": "user_quote_not_found",
                         "error": "user_quote does not match any user message sent since the goal was set"}
-        elif quote:
-            pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-            if not any(quote in " ".join(m.split()) for m in pool):
-                return {"ok": False, "error_code": "user_quote_not_found",
-                        "error": "user_quote does not match any user message sent since the goal was set"}
+            source = _quote_context(source, quote)
         revision = {"at": time.time(), "actor": actor, "reason": reason, "user_quote": quote,
+                    "user_message": source,
                     "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}}
         state.goal = after["goal"]
         state.contract = GoalContract.from_dict({k: after[k] for k in _CONTRACT_FIELDS})
@@ -2237,16 +2275,17 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
         disputed = verdict == "continue" and bool((wait_directive or {}).get("disputed"))
-        # A dispute only counts toward the stall breaker when the agent brought no new located
-        # evidence since the previous one: new proof means the loop is converging, not stalling.
-        fingerprint = citations.get("fingerprint") or ""
+        # A dispute counts toward the stall breaker unless the reply cites a recorded result no
+        # earlier dispute in this streak cited: new proof means converging, rewording is not.
+        current = set(citations.get("evidence_ids") or [])
+        seen = {i for i in state.last_dispute_evidence.split(",") if i}
         if not disputed:
             state.consecutive_disputes = 0
-        elif state.consecutive_disputes and fingerprint != state.last_dispute_evidence:
-            state.consecutive_disputes = 1
+            state.last_dispute_evidence = ""
         else:
-            state.consecutive_disputes += 1
-        state.last_dispute_evidence = fingerprint if disputed else ""
+            fresh = current - seen
+            state.consecutive_disputes = 1 if (state.consecutive_disputes and fresh) else state.consecutive_disputes + 1
+            state.last_dispute_evidence = ",".join(sorted(seen | current, key=_evidence_id_order)[-_DISPUTE_SEEN_MAX:])
 
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
