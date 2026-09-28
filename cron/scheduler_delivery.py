@@ -1903,6 +1903,15 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
+def _uses_external_delivery_queue(job: dict, adapters, targets: list, external_execution: str) -> bool:
+    """Keep pre-commit admission and the actual send lane on the same routing decision."""
+    return bool(
+        external_execution and adapters is None
+        and external_execution == str(job.get("execution_id") or "")
+        and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)
+    )
+
+
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
@@ -1923,9 +1932,7 @@ def _deliver_result(
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
     # and that nested delivery must not be keyed under the outer execution id.
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
-    if (external_execution and adapters is None
-            and external_execution == str(job.get("execution_id") or "")
-            and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
+    if _uses_external_delivery_queue(job, adapters, targets, external_execution):
         from cron.delivery_queue import enqueue_and_wait
 
         _record_delivery_verification(job, [])

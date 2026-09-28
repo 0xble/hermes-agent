@@ -5,6 +5,21 @@ from cron import executions, incidents, jobs, scheduler
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 
 
+@pytest.mark.parametrize("worker, job_id, adapters, platforms, expected", [
+    ("run-1", "run-1", None, ["telegram"], True),
+    ("run-1", "run-2", None, ["telegram"], False),
+    ("run-1", "run-1", {}, ["telegram"], False),
+    ("run-1", "run-1", None, ["bot-chat"], False),
+    ("run-1", "run-1", None, ["bot-chat", "telegram"], True),
+    ("", "run-1", None, ["telegram"], False),
+])
+def test_precommit_gate_matches_external_delivery_lane(worker, job_id, adapters, platforms, expected):
+    from cron.scheduler_delivery import BOT_CHAT_PLATFORM, _uses_external_delivery_queue
+
+    targets = [{"platform": BOT_CHAT_PLATFORM if p == "bot-chat" else p} for p in platforms]
+    assert _uses_external_delivery_queue({"execution_id": job_id}, adapters, targets, worker) is expected
+
+
 @pytest.mark.parametrize("mode", ["failure", "crash", "success"])
 @pytest.mark.parametrize("suppress", [False, True])
 @pytest.mark.parametrize("external_worker", [False, True])
