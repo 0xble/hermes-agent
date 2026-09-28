@@ -87,7 +87,11 @@ def build_gateway_parser(
     _flag(gateway_restart, "--force", help=_FORCE_SERVED_PROFILE_HELP)
     _add_compat_platform_flag(gateway_restart)
 
-    guardian = gateway_subparsers.add_parser("guardian", help="Manage the independent macOS gateway guardian")
+    guardian = gateway_subparsers.add_parser(
+        "guardian", help="Manage the opt-in macOS guardian (install, uninstall, status)",
+        description="Manage the independent launchd guardian. Set gateway.guardian.enabled: true "
+                    "for install; status reports enabled, installed and stopped intent. "
+                    "Inspect logs/guardian for bounded repair receipts and alerts.")
     guardian.add_argument("guardian_command", choices=("install", "uninstall", "status"))
 
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
