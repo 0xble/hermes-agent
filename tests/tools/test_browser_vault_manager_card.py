@@ -126,6 +126,56 @@ def test_manager_card_uses_the_focused_checkout_tab_over_the_default_page():
         redact.clear_vault_redaction_values()
 
 
+@pytest.mark.parametrize("decision, expected", [("decline", "payment_declined"), ("cancel", "payment_prompt_unanswered")])
+def test_card_prompt_refusal_blocks_retries_on_same_origin_but_not_other_origin(decision, expected):
+    from tools import browser_vault_tool as vault
+    page = {"url": "https://shop.test/pay"}
+    prompts = []
+    writes = []
+
+    def evaluate(task, expression):
+        if "location.href" in expression:
+            return {"success": True, "result": page["url"]}
+        return {"success": True, "result": json.dumps(_CONTROLS)}
+
+    def consent(*args, **kwargs):
+        prompts.append(args[0])
+        return decision
+
+    def write(task, expression):
+        writes.append(expression)
+        return {"success": True, "result": json.dumps({"filled": 1})}
+
+    with patch("agent.vault_backends.backend_for_handle", return_value=_Manager()), \
+         patch.object(vault, "_eval_js", side_effect=evaluate), \
+         patch.object(vault, "_eval_js_secret", side_effect=write), \
+         patch.object(vault, "_focus_bound_origin", return_value=None), \
+         patch("tools.approval_context.get_current_session_key", return_value="retry-session"), \
+         patch("tools.approval_prompt.request_elicitation_consent", side_effect=consent):
+        first = json.loads(vault.browser_vault_fill("mg:card", task_id="task-a"))
+        second = json.loads(vault.browser_vault_fill("mg:card", task_id="task-a"))
+        page["url"] = "https://else.test/pay"
+        third = json.loads(vault.browser_vault_fill("mg:card", task_id="task-a"))
+    assert first["error_type"] == expected
+    assert second["error_type"] == "payment_retry_refused"
+    assert "user" in second["error"].lower()
+    assert third["error_type"] == expected
+    assert len(prompts) == 2 and not writes
+
+
+def test_card_retry_guard_expires_and_is_session_scoped():
+    from tools import browser_vault_tool as vault
+    with patch("tools.approval_context.get_current_session_key", return_value="session-one"), \
+         patch.object(vault.time, "monotonic", return_value=1000):
+        key = vault._payment_retry_key("task", "https://shop.test")
+        vault._payment_retry_blocked(key, refuse=True)
+        assert vault._payment_retry_blocked(key)
+    with patch("tools.approval_context.get_current_session_key", return_value="session-two"):
+        assert not vault._payment_retry_blocked(vault._payment_retry_key("task", "https://shop.test"))
+    with patch.object(vault.time, "monotonic", return_value=1601):
+        assert not vault._payment_retry_blocked(key)
+
+
 def test_manager_card_declined_writes_nothing():
     raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout", decision="decline")
     assert json.loads(raw)["error_type"] == "payment_declined"

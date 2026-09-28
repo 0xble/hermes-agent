@@ -48,6 +48,11 @@ the browser vault fill tool, or the 1Password backends.
   ask. After consent the page is inspected again with a fresh nonce, and only those stamps are
   written. Card consent is one-shot: the prompt offers Allow Once and Deny, and a session or
   permanent answer never approves or consumes it (adopted from upstream PR 118429).
+- A declined or unanswered card prompt blocks further card-fill prompts on that exact origin
+  in the same approval session for 10 minutes, regardless of card handle. The in-memory,
+  profile-scoped guard is bounded to 256 entries and expires by monotonic time; a later
+  explicit request can retry after expiry. Other origins/sessions, successful fills, and
+  `no_payment_fields` do not arm it. Unanswered prompts are distinct from explicit declines.
 - Configured 1Password protected fields expose only an opaque handle and semantic token. They
   remain exact-origin bound, resolve server-side, and fill only a matching supported control
   in a verified task-owned local Chromium session. Birth-date fills refuse all Camofox
@@ -94,6 +99,9 @@ the browser vault fill tool, or the 1Password backends.
   `op-quota-resilience` (own fork fix: last-good 1Password secrets on rate limit or
   outage, a display-only listing cache, https for bare-host websites, and a stop at the
   first 429 with a 15-minute per-identity cooldown shared across processes).
+  `vault-card-retry-guard` (separate fork-only safety fix: session/origin-scoped
+  ten-minute in-memory refusal after a declined/unanswered prompt; retire when released
+  upstream enforces equivalent no-reprompt behavior), and
   `vault-payment-consent-order` (own fork fix, 2026-09-28: prompt only once card targets are
   found, then re-inspect after consent). Plus `mcp-elicitation-one-shot`, adopted from upstream
   [PR 118429](https://github.com/NousResearch/hermes-agent/pull/118429) at
