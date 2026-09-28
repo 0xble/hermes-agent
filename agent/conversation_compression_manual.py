@@ -141,6 +141,12 @@ def compress_now(
     # ``here N`` already chose what stays verbatim, so the head is summarized at the tightest level: only the
     # head's own latest exchange rides along, which the compressor keeps so a real user turn follows the summary.
     level = MAX_COMPRESS_LEVEL if tail else request.level
+    if level > 1 and getattr(agent, "_compression_feasibility_checked", True) is False:
+        # The first attempt's lazy aux-feasibility probe may recalibrate the retention budgets, which would
+        # silently discard the per-run override, so the probe runs before the override is applied.
+        from agent.conversation_compression import check_compression_model_feasibility
+        check_compression_model_feasibility(agent)
+        agent._compression_feasibility_checked = True
     with compression_level(compressor, level):
         return _compress_head(agent, before, head, tail, before_tokens, request, system_message=system_message,
                               task_id=task_id, skip_without_window=skip_without_window)

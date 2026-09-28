@@ -343,3 +343,32 @@ def test_here_n_keeps_only_the_requested_exchanges(session_db, keep):
     assert _live(result.after_messages[-2 * keep:]) == _live(loaded[-2 * keep:])
     summary_at = next(i for i, m in enumerate(result.after_messages) if "Numbered fruit questions" in m["content"])
     assert len(result.after_messages) - summary_at - 1 <= 2 * keep + 3
+
+
+@pytest.mark.parametrize("raw", ["--level 3", "here 1"])
+def test_level_survives_the_first_attempt_feasibility_recalibration(tmp_path, raw):
+    """The first manual compression runs the lazy aux-feasibility probe, which may clamp the threshold to a
+    smaller summariser window and re-derive the tail budget. That must not undo the per-run level: the run keeps
+    exactly what it keeps when the probe already ran."""
+    from agent import conversation_compression
+    from agent.conversation_compression import _lower_threshold_to_aux_context
+    probes = []
+
+    def _clamping_probe(agent):
+        probes.append(agent.context_compressor.tail_token_budget)
+        _lower_threshold_to_aux_context(agent, aux_model="small-aux", aux_context=agent.context_compressor.threshold_tokens,
+                                        aux_provider="test", aux_base_url="")
+
+    from hermes_state import SessionDB
+    kept = []
+    for probe_pending in (False, True):
+        db = SessionDB(db_path=tmp_path / f"probe_pending_{probe_pending}.db")
+        agent, loaded = _stored_agent(db, _long_exchanges(120))
+        agent._compression_feasibility_checked = not probe_pending
+        with patch.object(conversation_compression, "check_compression_model_feasibility", _clamping_probe):
+            result = _compress(agent, loaded, raw)
+        assert result.status == "compressed"
+        kept.append(len(result.after_messages))
+        db.close()
+    assert probes, "the pending probe must run"
+    assert kept[0] == kept[1], kept
