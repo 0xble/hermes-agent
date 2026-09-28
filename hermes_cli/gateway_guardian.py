@@ -33,7 +33,7 @@ def _domain(label: str) -> str:
 
 def _gateway_domain(label: str, preferred: str | None) -> str:
     """Observe both domains before trusting a saved domain or starting an unloaded job."""
-    domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")
+    domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")  # windows-footgun: ok (macOS launchd only)
     if preferred is not None and preferred not in domains:
         raise RuntimeError("guardian domain is not a gateway launchd domain for this user")
     states = {}
