@@ -3298,6 +3298,14 @@ def _run_one_job_body(
                 success, error, agent_declared = False, marker_error, True
 
         if hard_wall_fence is not None:
+            # The watchdog may terminalize the execution and kill a script while
+            # run_job is still unwinding. A killed no-agent script can return a
+            # plausible silent success; do not publish its output or delivery
+            # after the timeout has already won the durable result CAS.
+            if (get_execution(execution_id) or {}).get("status") != "running":
+                logger.info("Cron job %s: discarding result after hard-wall terminalization", job["id"])
+                _teardown_deferred()
+                return False
             if success and _is_interrupted(job["id"], execution_token):
                 success = False
                 error = "Interrupted by gateway shutdown before the run finished."
