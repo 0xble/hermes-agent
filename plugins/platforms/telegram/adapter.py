@@ -19,6 +19,7 @@ from hermes_cli import setup_platforms
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
@@ -4107,6 +4108,7 @@ class TelegramAdapter(BasePlatformAdapter):
             tracked.add(task)
             task.add_done_callback(tracked.discard)
 
+    @durable_egress("send")
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
@@ -4316,6 +4318,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._edit_text(chat_id, message_id, plain)
         return False
 
+    @durable_egress("edit_message")
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
        ) -> SendResult:
@@ -4659,6 +4662,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._bot.send_message(**retry_kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
             raise
 
+    @durable_control
     async def _send_control_message(
         self, chat_id: str, text: str, *, parse_mode: Any, thread_id: Optional[str], metadata: Optional[Dict[str, Any]],
         reply_markup: Any = None, reply_to_mode: Optional[str] = None):
@@ -5706,6 +5710,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise
         raise _last_parse_error or RuntimeError("Telegram send_voice failed for all caption variants")
 
+    @durable_egress("send_voice")
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -5755,6 +5760,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 with contextlib.suppress(OSError):
                     os.unlink(_transcoded_voice_path)
 
+    @durable_egress("send_multiple_images")
     async def send_multiple_images(
         self, chat_id: str, images: List[tuple], metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
@@ -5869,6 +5875,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return _flood_cap_result(max(waits))
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
+    @durable_egress("send_image_file")
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -5934,6 +5941,7 @@ class TelegramAdapter(BasePlatformAdapter):
         logger.warning("[%s] Failed to send %s: %s", self.name, media_key, _redact_telegram_error_text(e))
         return await fallback
 
+    @durable_egress("send_document")
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -5946,6 +5954,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     TelegramAdapter, self,
                 ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
 
+    @durable_egress("send_video")
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -5980,6 +5989,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 with contextlib.suppress(OSError):
                     os.remove(thumb_path)
 
+    @durable_egress("send_image")
     async def send_image(
         self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -6018,6 +6028,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.error("[%s] File upload send_photo also failed: %s", self.name, e2, exc_info=True)
                 return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
+    @durable_egress("send_animation")
     async def send_animation(
         self, chat_id: str, animation_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:

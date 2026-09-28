@@ -2823,7 +2823,9 @@ class GatewayTurnMixin:
             None if scheduled_heartbeat
             else self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         )
-        stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
+        from gateway.outbox import active_turn, run_turn_child
+        stream_task = (asyncio.create_task(run_turn_child(_stream_consumer.run(), active_turn()))
+                       if _stream_consumer else None)
 
         _adapter = self._delivery_adapter_for(source)
         if _adapter and not scheduled_heartbeat:

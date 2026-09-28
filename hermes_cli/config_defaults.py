@@ -2103,6 +2103,9 @@ DEFAULT_CONFIG = {
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
+        # Opt-in, per-profile admission and ordered outbound receipt ledger. Existing delivery
+        # behavior remains unchanged until explicitly enabled.
+        "durable_outbox": {"enabled": False},
         # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
         # connect timed out" loops (many slash commands to sync). 0/negative = wait forever. Bridged
         # to HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
