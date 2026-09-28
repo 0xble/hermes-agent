@@ -50,6 +50,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
     agent_plist = tmp_path / f"{guardian_label}.plist"
     repo = Path(__file__).resolve().parents[2]
     agent_plist.write_bytes(plistlib.dumps({"Label": guardian_label, "RunAtLoad": True,
+        "StartInterval": 2,
         "ProgramArguments": [sys.executable, "-m", "hermes_cli.gateway_guardian", "run",
             "--gateway-plist", str(gw_plist), "--gateway-label", label, "--domain", domain],
         "WorkingDirectory": str(repo),
@@ -77,14 +78,12 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
         subprocess.run(["launchctl", "bootout", gw_target], check=True, timeout=15)
         assert not loaded()
         start = time.monotonic()
-        subprocess.run(["launchctl", "kickstart", agent_target], check=True, timeout=25)
         assert wait_for(loaded)
         assert time.monotonic() - start < 60
         assert wait_for(lambda: any(json.loads(p.read_text(encoding="utf-8")).get("outcome") == "repaired"
                    for p in (home / "logs/guardian").glob("*.json")))
         guardian.set_intent(home, stopped=True)
         subprocess.run(["launchctl", "bootout", gw_target], check=True, timeout=15)
-        subprocess.run(["launchctl", "kickstart", agent_target], check=True, timeout=25)
         assert wait_for(lambda: "stopped" in (tmp_path / "guardian-out.log").read_text(encoding="utf-8"))
         assert not loaded()
         # Reproduce a completed forward switch whose new process never acknowledges.
@@ -108,7 +107,6 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
         subprocess.run(["launchctl", "bootstrap", domain, str(gw_plist)], check=True, timeout=15)
         assert wait_for(lambda: json.loads((home / "gateway_state.json").read_text()).get("code_sha") == new.name)
         subprocess.run(["launchctl", "bootout", gw_target], check=True, timeout=15)
-        subprocess.run(["launchctl", "kickstart", agent_target], check=True, timeout=25)
         assert wait_for(lambda: (home / "current").resolve() == release)
         assert any(home.glob("release-abandoned-*.json"))
         assert wait_for(loaded)
