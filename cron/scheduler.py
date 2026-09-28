@@ -3030,13 +3030,10 @@ def _save_compose_deliver(
             # Queue before committing terminal: a worker killed between those
             # writes cannot lose the notice. The gateway claims only after the
             # ledger is terminal (delivery_queue.claim_next).
-            external_id = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
-            from cron.scheduler_delivery import BOT_CHAT_PLATFORM
-            if (commit_result is not None and external_id == str(job.get("execution_id"))
-                    and adapters is None and any(
-                        target["platform"] != BOT_CHAT_PLATFORM
-                        for target in _resolve_delivery_targets(job, for_failure=not d.success)
-                    )):
+            external_id = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
+            from cron.scheduler_delivery import _uses_external_delivery_queue
+            if (commit_result is not None and _uses_external_delivery_queue(
+                    job, adapters, _resolve_delivery_targets(job, for_failure=not d.success), external_id)):
                 from cron.delivery_queue import enqueue
                 enqueue(str(external_id), job, deliver_content, for_failure=not d.success,
                         terminal_gate=True)
