@@ -70,13 +70,16 @@ Failed or interrupted model turns do not run completion judging.
 - Fork patch identity: `goal-adaptive`. Extends `goal-judge-evidence`. Own fork
   patch, no upstream PR yet. Four parts:
   - **Cited evidence.** Identifiers the response cites (backtick spans, quoted
-    strings, SHAs, URLs, long ids, `N passed`) are located verbatim with
-    `instr` in every tool result recorded since the goal was set, including
-    compaction-archived rows. A cited command resolves to its own result. A
-    runtime delegation or background-process notice counts, labeled as such.
-    Agent prose, ordinary user text and bookkeeping tools never count. The
-    judge sees the redacted excerpts plus a list of citations that were not
-    found, which it treats as unproven.
+    strings, SHAs, URLs, long ids, `N passed`) are located with `instr` in every
+    tool result recorded since the goal was set, including compaction-archived
+    rows. A trailing `…` or `...` resolves by prefix only when at least 8
+    characters remain; a commit URL ending `/commit/<7–40 hex>` can resolve by
+    its hash in a tool result, explicitly labeled as hash-matched rather than
+    URL-verified. The judge sees the real matched excerpt. A cited command
+    resolves to its own result. A runtime delegation or background-process
+    notice counts, labeled as such. Agent prose, ordinary user text and
+    bookkeeping tools never count. Missing prefixes and hashes remain unresolved;
+    the judge treats those citations as unproven.
   - **Response window.** The judge sees the head and the tail of a long
     response, so a closing Evidence section is not cut off.
   - **Disputes.** A dispute names one missing criterion and the check that would
