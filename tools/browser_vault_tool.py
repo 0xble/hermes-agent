@@ -710,16 +710,27 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}
         )
 
-    # Register the secret bytes with the model-egress redaction boundary
-    # BEFORE they touch the page: any later browser_* result (including
-    # browser_cdp Runtime.evaluate reads) that echoes them is scrubbed.
-    # Address values are not secrets but the card fields are: register every payment value.
+    # Register before injection. PAN/CVC remain profile-global exact secrets; short,
+    # human-readable card metadata uses the existing tab/origin component registry.
     from agent.redact import (
-        mark_vault_protected_tab, register_vault_date_component, register_vault_redaction_value,
+        mark_vault_protected_tab, register_vault_card_component,
+        register_vault_date_component, register_vault_redaction_value,
     )
-    for value in (secret.values() if meta.kind in ("payment", "protected_field") else [secret.get("password", "")]):
-        register_vault_redaction_value(value)
-    protected_tab = effective_task_id
+    protected_tab = browser_key if meta.kind in ("payment", "protected_field") else effective_task_id
+    if meta.kind == "payment":
+        for field in ("card_number", "cvc"):
+            register_vault_redaction_value(secret.get(field, ""))
+        for field in ("cardholder_name", "exp_month", "exp_year", "billing_postal_code"):
+            value = secret.get(field, "")
+            register_vault_card_component(field, value, tab=protected_tab, origin=page_origin)
+            if field == "exp_month" and value.isdigit():
+                for variant in (str(int(value)), f"{int(value):02d}"):
+                    register_vault_card_component(field, variant, tab=protected_tab, origin=page_origin)
+            if field == "exp_year" and value.isdigit() and len(value) == 4:
+                register_vault_card_component(field, value[-2:], tab=protected_tab, origin=page_origin)
+    else:
+        for value in (secret.values() if meta.kind == "protected_field" else [secret.get("password", "")]):
+            register_vault_redaction_value(value)
     if meta.kind == "protected_field":
         # Key protected state by the pinned browser session key, the one every reader resolves
         # (_last_session_key): a remapped task (e.g. a hybrid sidecar) must hit the same registry

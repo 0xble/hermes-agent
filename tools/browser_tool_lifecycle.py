@@ -655,7 +655,7 @@ def _force_reap_browser_session(task_id: str) -> None:
 
     Janitor last resort after repeated cleanup failures (#100738).
     """
-    from agent.redact import has_vault_date_components
+    from agent.redact import clear_vault_date_components, has_vault_date_components
     if has_vault_date_components(task_id):
         _bt.logger.warning("Cannot force-reap protected browser %s without confirmed close", task_id)
         return
@@ -666,6 +666,7 @@ def _force_reap_browser_session(task_id: str) -> None:
         _bt._recording_sessions.discard(task_id)
     if session_info:
         _release_session_resources(task_id, session_info)
+    clear_vault_date_components(task_id)
     _drop_last_active_binding(task_id)
 
 
@@ -724,8 +725,10 @@ def _cleanup_single_browser_session(task_id: str) -> None:
             if protected:
                 return
 
-    if protected:
-        clear_vault_date_components(task_id)
+    # Failed close retains birthday quarantine; card-only sessions follow normal teardown.
+    # PAN/CVC remain globally masked, but low-entropy card metadata cannot outlive
+    # the session key once its tracking/resources are released.
+    clear_vault_date_components(task_id)
     _release_session_resources(task_id, session_info)
     _bt.logger.debug("Removed task %s from active sessions", task_id)
 
