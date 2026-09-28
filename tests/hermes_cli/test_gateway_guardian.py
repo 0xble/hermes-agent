@@ -93,6 +93,7 @@ def test_overlap_generation_guardian_is_observe_only(tmp_path, monkeypatch):
     assert guardian.run_once(home, plist, label, grace=1) == "waiting"
 
 
+@pytest.mark.macos_only
 def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
