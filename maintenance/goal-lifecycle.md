@@ -67,6 +67,43 @@ Failed or interrupted model turns do not run completion judging.
   red without the patch. Rollback reverts the source change; old goal rows load
   with a zero dispute counter and no schema change.
 
+- Fork patch identity: `goal-adaptive`. Extends `goal-judge-evidence`. Own fork
+  patch, no upstream PR yet. Four parts:
+  - **Cited evidence.** Identifiers the response cites (backtick spans, quoted
+    strings, SHAs, URLs, long ids, `N passed`) are located verbatim with
+    `instr` in every tool result recorded since the goal was set, including
+    compaction-archived rows. A cited command resolves to its own result. A
+    runtime delegation or background-process notice counts, labeled as such.
+    Agent prose, ordinary user text and bookkeeping tools never count. The
+    judge sees the redacted excerpts plus a list of citations that were not
+    found, which it treats as unproven.
+  - **Response window.** The judge sees the head and the tail of a long
+    response, so a closing Evidence section is not cut off.
+  - **Disputes.** A dispute names one missing criterion and the check that would
+    prove it. A dispute counts toward the stall breaker, which pauses at 3
+    instead of 2, unless the reply cites a recorded result that no earlier dispute
+    in the streak cited. Rewording or dropping citations is not progress.
+  - **Revisions.** `GoalManager.revise()` records a versioned revision (actor,
+    reason, user quote with its source message, before, after). The judge prompt
+    shows every revision and every requirement it replaced, in full. The
+    continuation prompt shows the current version and the same history, with each
+    replaced requirement still binding unless its cited user message plainly
+    instructs the change, so the working agent cannot act on an unauthorized
+    weakening before the judge sees it. Changing the objective or
+    constraints, or dropping a subgoal, needs a verbatim quote of 12+ characters
+    from a real user message sent since the goal was set. The runtime proves only
+    that the user said it. The judge sees the complete source message, which may
+    be at most 4,000 characters (longer ones are refused, never excerpted), and
+    decides whether it plainly instructs the specific change. Otherwise it holds
+    the agent to the earlier requirement.
+  The judge prompt judges the end state, not the route. A remedied state
+  invariant stops blocking `done`, while a breached irreversible prohibition
+  returns BLOCKED.
+  Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_adaptive.py`.
+  Live replay of two historical false-negative disputes against the real judge
+  is recorded in the PR. Rollback reverts the source change. `revisions` and
+  `last_dispute_evidence` default empty on old rows, and there is no migration.
+
 The initial reproduction established missing criteria and paused state after a
 repair turn. Upstream comparison confirmed both and supplied a matching recovery
 implementation. Configuration or plugin changes cannot repair these native judge
