@@ -805,17 +805,21 @@ class GatewayAdapterLifecycleMixin:
         """Claim owed follow-ups before resume and drain them as separate turns."""
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
         from gateway.run import _startup_restore_drain_timeout_secs
-        candidates = self._resume_pending_candidates()
+        candidates = self._resume_pending_candidates(record_boot=False)
         queued_before = len(getattr(self, "_startup_restore_queue", []))
         tasks = []
         keys = set()
         try:
             recover_pending_shutdown_flush(self, candidates=candidates, platform=platform)
+        except Exception:
+            logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
+                           exc_info=True)
+        try:
             # Recovery scans all served homes, but only the newly available platform resumes.
             self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
                                                    restore_tasks=tasks, restore_keys=keys)
         except Exception:
-            logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
+            logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
                            exc_info=True)
         keys.update(self._session_key_for_source(event.source)
                     for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
@@ -833,13 +837,17 @@ class GatewayAdapterLifecycleMixin:
                     "Reconnect restore released after %.0fs with %d resume turn(s) still running",
                     "background reconnect auto-resume task failed", level=logging.DEBUG,
                 )
+            if not self._startup_restore_in_progress:
+                # Drain under our own gate. A concurrent inbound on these keys must queue behind
+                # the older follow-up, while an overlapping reconnect still owns its separate claim.
+                await self._drain_startup_restore_queue(keys, owned_keys=keys)
         finally:
+            # The timeout deliberately fails open after a bounded wait; unfinished resume turns
+            # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
             for key in keys:
                 counts[key] -= 1
                 if not counts[key]:
                     del counts[key]
-            if not self._startup_restore_in_progress:
-                await self._drain_startup_restore_queue(keys)
 
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:

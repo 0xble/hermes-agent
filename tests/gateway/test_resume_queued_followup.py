@@ -283,6 +283,111 @@ async def test_overlapping_reconnects_hold_only_owned_sessions(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_reconnect_live_inbound_waits_until_older_followup_finishes(tmp_path, monkeypatch):
+    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
+    runner._await_startup_warmup = AsyncMock()
+    assert flush_pending_to_file({key: MessageEvent(text="older", source=source, user_id="u1")}) == 1
+    older_started = asyncio.Event()
+    release_older = asyncio.Event()
+    seen = []
+
+    async def handle(event):
+        if event.text == "older":
+            older_started.set()
+            await release_older.wait()
+        seen.append(event.text)
+
+    adapter.handle_message = handle
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._admit_bot_message_for_source = MagicMock(return_value=True)
+    recovery = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(older_started.wait(), 5)
+    live = MessageEvent(text="live", source=source, user_id="u1")
+    assert await runner._hm_admit_event(live) is None
+    assert seen == []
+    release_older.set()
+    await asyncio.wait_for(recovery, 5)
+    assert seen == ["older", "live"]
+    assert not runner._reconnect_restore_keys
+
+
+def test_boot_snapshot_records_once_across_recovery_and_schedule(tmp_path, monkeypatch):
+    runner, _, _, _, _ = _spooled_runner(tmp_path, monkeypatch)
+    recorded = MagicMock(return_value=False)
+    monkeypatch.setattr("gateway.restart_loop_guard.check_and_record", recorded)
+    candidates = runner._resume_pending_candidates()
+    assert candidates is not None and len(candidates) == 1
+    assert recover_pending_shutdown_flush(runner, candidates=candidates) == 0
+    runner._auto_resume_ready = MagicMock(return_value=None)
+    assert runner._schedule_resume_pending_sessions(candidates=candidates) == 0
+    recorded.assert_called_once()
+
+
+def test_failed_boot_snapshot_is_not_reenumerated_by_recovery_or_scheduler(tmp_path, monkeypatch):
+    runner, _, _, _, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._resume_pending_candidates = MagicMock(return_value=None)
+    assert recover_pending_shutdown_flush(runner, candidates=None) == 0
+    assert runner._schedule_resume_pending_sessions(candidates=None) == 0
+    runner._resume_pending_candidates.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconnects_do_not_spend_boot_breaker_budget(tmp_path, monkeypatch):
+    runner, _, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner.adapters.clear()  # an offline stale session persists across multiple other reconnects
+    runner.session_store._entries[key].origin = replace(source, platform=Platform.DISCORD)
+    recorded = MagicMock(return_value=False)
+    monkeypatch.setattr("gateway.restart_loop_guard.check_and_record", recorded)
+    for _ in range(3):
+        await runner._recover_spool_after_reconnect(Platform.TELEGRAM)
+    recorded.assert_not_called()
+    assert runner.session_store._entries[key].resume_pending
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_still_schedules_reconnect_resume(tmp_path, monkeypatch):
+    runner, _, source, _, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
+    monkeypatch.setattr("gateway.run_pending_recovery.recover_pending_shutdown_flush",
+                        MagicMock(side_effect=OSError("spool unavailable")))
+    await runner._recover_spool_after_reconnect(source.platform)
+    runner._schedule_resume_pending_sessions.assert_called_once()
+
+
+def test_unrelated_reconnect_retention_does_not_warn(tmp_path, monkeypatch, caplog):
+    runner, _, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    other = replace(source, platform=Platform.DISCORD)
+    runner.session_store._entries[key].origin = other
+    assert flush_pending_to_file({key: MessageEvent(text="later", source=other, user_id="u1")}) == 1
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        assert recover_pending_shutdown_flush(runner, platform=Platform.TELEGRAM) == 0
+    assert list((tmp_path / "pending_messages").glob("*.json"))
+    assert "delivery adapter offline or" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_inbound_without_restore_gate_does_not_derive_restore_key(tmp_path, monkeypatch):
+    runner, _, source, _, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner._reconnect_restore_keys = {}
+    runner._session_key_for_source = MagicMock(side_effect=AssertionError("no restore gate"))
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._admit_bot_message_for_source = MagicMock(return_value=True)
+    event = MessageEvent(text="live", source=source, user_id="u1")
+    admitted = await runner._hm_admit_event(event)
+    assert admitted is not None and admitted[0] is event
+    runner._session_key_for_source.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_keeps_other_platforms_followup_until_its_resume(tmp_path, monkeypatch):
     runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch, pending=False)
     runner._startup_restore_in_progress = False

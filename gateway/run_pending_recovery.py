@@ -5,9 +5,10 @@ from pathlib import Path
 
 from hermes_constants import get_routing_process_hermes_home
 from gateway.session_recovery import SessionRecoveryMixin
-from gateway.shutdown_flush import recover_pending_to_db
+from gateway.shutdown_flush import OTHER_PLATFORM_PENDING, recover_pending_to_db
 
 logger = logging.getLogger("gateway.run")
+_NOT_SUPPLIED = object()
 
 
 def pending_home_for_key(runner, session_key: str) -> Path | None:
@@ -29,13 +30,13 @@ def pending_home_for_key(runner, session_key: str) -> Path | None:
     return Path(served[owner]) if owner in served else None
 
 
-def recover_pending_shutdown_flush(runner, *, candidates=None, platform=None) -> int:
+def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform=None) -> int:
     """Visit the launch home and every served home; leave failed spools for a later boot."""
     from gateway.run import _profile_runtime_scope
 
     # Snapshot once per recovery pass: the loop breaker must not be counted per payload.
-    if candidates is None and hasattr(runner, "_resume_pending_candidates"):
-        candidates = runner._resume_pending_candidates()
+    if candidates is _NOT_SUPPLIED:
+        candidates = runner._resume_pending_candidates() if hasattr(runner, "_resume_pending_candidates") else []
     eligible = {entry.session_key: entry for entry in (candidates or [])}
     launch_home = Path(get_routing_process_hermes_home())
     homes = [launch_home, *((getattr(runner, "_served_profile_homes", None) or {}).values())]
@@ -44,7 +45,7 @@ def recover_pending_shutdown_flush(runner, *, candidates=None, platform=None) ->
         # A queued message is a *future* turn. Appending it to the interrupted
         # transcript before auto-resume makes the recovery note answer that message.
         if platform is not None and key in eligible and eligible[key].origin.platform != platform:
-            return None
+            return OTHER_PLATFORM_PENDING
         if key not in eligible:
             return False
         store = runner.session_store

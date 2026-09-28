@@ -262,6 +262,9 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
     return recovered
 
 
+OTHER_PLATFORM_PENDING = object()  # retained for a different adapter's reconnect, not a failure
+
+
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                          session_resolver=None, deferred_followup=None) -> bool:
     """Append one flush payload to ``session_db``; False (file kept) when structurally invalid."""
@@ -306,6 +309,9 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return False
     if deferred_followup is not None:
         claim = deferred_followup(session_key, session_id, data)
+        if claim is OTHER_PLATFORM_PENDING:
+            logger.debug("Pending message for %s retained until its platform reconnects", session_key)
+            return False
         if claim is None:  # resume deferred until its delivery path is ready
             logger.warning("Pending message for %s retained in %s: delivery adapter offline or "
                            "resume awaiting platform reconnect", session_key, path)

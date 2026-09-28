@@ -209,9 +209,10 @@ class GatewayInboundMixin:
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
             return None
 
+        reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
         if (
             (getattr(self, "_startup_restore_in_progress", False)
-             or getattr(self, "_reconnect_restore_keys", {}).get(self._session_key_for_source(source), 0))
+             or (reconnect_keys and reconnect_keys.get(self._session_key_for_source(source), 0)))
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):

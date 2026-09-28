@@ -40,6 +40,7 @@ from typing import Any, Dict, Optional, Tuple
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+_NOT_SUPPLIED = object()
 
 
 class GatewayStartupMixin:
@@ -94,15 +95,16 @@ class GatewayStartupMixin:
                 source.chat_id if source else "unknown",
             )
 
-    async def _drain_startup_restore_queue(self, keys=None) -> int:
+    async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
         """Replay ready inbound, leaving sessions owned by another restore in order."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
         while True:
             index = next((i for i, event in enumerate(queue)
                           if (keys is None or self._session_key_for_source(event.source) in keys)
-                          and not getattr(self, "_reconnect_restore_keys", {}).get(
-                              self._session_key_for_source(event.source))), None)
+                          and getattr(self, "_reconnect_restore_keys", {}).get(
+                              self._session_key_for_source(event.source), 0)
+                          <= (1 if owned_keys and self._session_key_for_source(event.source) in owned_keys else 0)), None)
             if index is None:
                 break
             event = queue.pop(index)
@@ -542,9 +544,8 @@ class GatewayStartupMixin:
                 )
         return await self._redeliver_claimed_obligations(sendable)
 
-    def _resume_pending_candidates(self, platform=None) -> Optional[list]:
-        """Snapshot resume-pending entries (optionally scoped to ``platform``); None when
-        enumeration failed or the restart-loop breaker tripped for this boot."""
+    def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
+        """Snapshot resume-pending entries; only the boot path spends breaker budget."""
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -561,7 +562,7 @@ class GatewayStartupMixin:
             return None
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
         # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
-        if candidates:
+        if candidates and record_boot:
             try:
                 from gateway import restart_loop_guard as _rlg
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
@@ -600,13 +601,14 @@ class GatewayStartupMixin:
             return None
         return adapter, source
 
-    def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None, candidates=None) -> int:
+    def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
+                                          candidates=_NOT_SUPPLIED) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        candidates = self._resume_pending_candidates(platform) if candidates is None else candidates
+        candidates = self._resume_pending_candidates(platform) if candidates is _NOT_SUPPLIED else candidates
         if candidates is None:
             return 0
         scheduled = 0
