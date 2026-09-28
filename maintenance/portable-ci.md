@@ -43,6 +43,8 @@ The snapshot also runs links, diagram lint and the English build. Generated
 skills dashboard data is built there, matching the old workflow's parity scope.
 No generator or build writes into the contributor's website source.
 
+The public fork uses hosted eight-way Linux Python/E2E shards on both PR and nightly rather than the former serial Python lane. All ordinary files under `tests` (excluding integration/docker), plus PR-safe `tests/e2e`, are partitioned once by descending source byte size, with deterministic path and shard-index tie breaks; untracked `test_durations.json` must not affect assignment across independently provisioned jobs. `scripts/run_tests.sh` still gives each file its own process and `--file-retries 0` in CI. Upgrade E2E retains the nightly-only upstream-tag fetch and 900-second per-file timeout; the SQLite torture chamber also stays nightly-only until its known FTS corruption and kill9 failures are fixed. Static and bounded Node remain a separate gate job. The PR `qualification` depends on both it and the entire eight-shard matrix; nightly's qualification additionally depends on broad Linux, native macOS/Windows and desktop-core. Each Linux job uses the same pinned container with `--init`, installs its pinned tools as root, then runs the exact-SHA profile as the non-root `ci` user. This matrix executes full ordinary Linux Python and PR-safe E2E on every same-repository PR, not just the previous four focused Python files. Native, desktop-core, full Node, docs, Rust, container lint, upgrade and torture remain nightly-only.
+
 ## Tools and Linux image
 
 Exact CLI versions are declared in `scripts/ci/toolchain.json`. Python uses the
