@@ -160,6 +160,36 @@ def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch
 
 
 @pytest.mark.macos_only
+def test_configured_release_ack_grace_delays_guardian_rollback(tmp_path, monkeypatch):
+    home, plist, label, a, b = layout(tmp_path)
+    (home / "config.yaml").write_text(
+        "updates:\n  release_acknowledgement_timeout_seconds: 300\n", encoding="utf-8")
+    (home / "release-last-txn.json").write_text(json.dumps({
+        "version": 1, "operation": "promote", "candidate": str(b),
+        "previous_intended": str(a),
+        "reload_issued": {"at": datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - 240, timezone.utc).isoformat()},
+    }), encoding="utf-8")
+    calls = fake_launchctl(monkeypatch, label)
+    assert guardian.run_once(home, plist, label) == "waiting"
+    assert calls == []
+
+
+@pytest.mark.macos_only
+def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
+    from hermes_cli import gateway_launchd
+    import psutil
+    home, plist, label, a, b = layout(tmp_path)
+    (home / "gateway_state.json").write_text(json.dumps({
+        "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
+        "updated_at": "2020-01-01T00:00:00+00:00",
+    }), encoding="utf-8")
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: os.getpid())
+    monkeypatch.setattr(psutil.Process, "cwd", lambda self: str(b))
+    assert not guardian.healthy(home, label, b)
+
+
+@pytest.mark.macos_only
 @pytest.mark.parametrize("operation", ["promote", "first-migration"])
 def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch, operation):
     home, plist, label, a, b = layout(tmp_path)

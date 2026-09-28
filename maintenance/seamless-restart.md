@@ -106,6 +106,14 @@ Before S1 code, decide and test the macOS descendant-termination authority when 
 - **Runtime pinning.** launchd definitions resolve program, cwd, venv, and import path through `current`; a detached cron worker resolves `current` once at launch and pins the resulting release path for its executable, cwd, and `PYTHONPATH`. `~/.hermes/hermes-agent` remains the git source checkout and is not replaced by a release.
 - **Migration and rollback.** The first promotion creates the current-HEAD release and updates the existing launchd plist through `hermes_cli/gateway_launchd.py`; `hermes update --rollback` atomically points `current` at `previous` and uses the existing restart/report/receipt path. A migration rollback points the plist back to the source checkout. Do not activate this migration on the live install without the parent owner's separate authorization.
 
+### G1 Guardian (Opt-In, macOS launchd)
+
+`gateway.guardian.enabled: true` enables the independent one-shot launchd guardian; it is off by default and is not installed or loaded merely by setting the key. On an immutable release with an installed gateway plist, `hermes gateway guardian install` installs its separate launchd job; `hermes gateway guardian status` reports the enable flag, installation and stopped intent; `hermes gateway guardian uninstall` removes the guardian job. Run these only for the intended profile, not as a consequence of landing source code.
+
+A deliberate gateway stop writes `<HERMES_HOME>/gateway-guardian-stopped`; a start clears it before dispatch so failed start attempts do not leave false stopped intent. While the marker exists the guardian does not repair an unloaded gateway. It waits through `updates.release_acknowledgement_timeout_seconds` (default 180 seconds) before judging an unacknowledged release switch, and rejects stale runtime status. With an intact `current` release and matching launchd plist, it can bootstrap an unloaded gateway or roll back a failed switch to a verified `previous` release. It never repairs a corrupt pointer from the source checkout. A nonblocking lock and a cap of three bootstrap/rollback attempts per hour prevent a repair loop; loaded but unhealthy services are left to launchd or operator inspection rather than force-repaired.
+
+Inspect `<HERMES_HOME>/logs/guardian/` for JSON attempt, result, capped and alert receipts, plus `stdout.log` and `stderr.log`. Identical recent alerts are deduplicated and receipts older than an hour are pruned. The guardian does not manage router/executor handoff or retry interrupted work.
+
 ## Shipped Status
 
 Every row merged with an independent `review_candidate` approval on its exact head and a green exact-SHA `qualification` check, using normal merges.
@@ -127,7 +135,7 @@ S3 landed before S2 (its code-SHA ledger column works without releases). S2 is *
 **Remaining risks.**
 
 - An in-flight chat turn is still interrupted by a restart (`restart_drain_timeout: 0`); it auto-resumes with a restart note, but its tool call is not retried. Background delegations of that gateway are interrupted too. Removing this is S4.
-- An unloaded or corrupted launchd service after a failed switch needs an operator repair from a shell outside the gateway. A corrupt `current` pointer makes `get_python_path()` fall back to the source venv silently. The S2 config keys have no type/range validation.
+- An unloaded or corrupted launchd service after a failed switch needs operator inspection when the opt-in G1 guardian is disabled, capped, or unable to prove the current and previous release identities. A corrupt `current` pointer can make `get_python_path()` fall back to the source venv; G1 explicitly refuses that fallback.
 - In a rare no-pull catch-up where checkout repair is incomplete, the receipt can read `success` while the command exits 1 (review finding on #211). `release-last-txn.json` persists, so a repeatedly failing fleet verification on the credited label never falls back to a relaunch; `hermes gateway restart` remains the remedy.
 - Manually stopped cron runs still record a misleading "scheduler restarted" `unknown`, and manual runs are not kill-protected. A double-forked descendant that escapes the worker session is not swept, and a kill between ledger commit and delivery enqueue leaves `unknown` with no resend.
 - The full unscoped update path can only be proven live; disposable rehearsals cover it with throwaway launchd labels.
