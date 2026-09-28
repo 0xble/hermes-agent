@@ -211,6 +211,9 @@ class TelegramApplication(Application):
             return
         del self.adapter._inflight_update_ids[claim.key]
         if claim.accepted or (claim.completed and not claim.failed):
+            journal = getattr(self.adapter, "_controlled_journal", None)
+            if journal is not None:
+                journal.accept(int(claim.key.rsplit(":", 1)[1]))
             _record_receipt(self.adapter, claim.key)
 
     async def process_error(self, update, error, job=None, coroutine=None):
@@ -232,6 +235,9 @@ class TelegramApplication(Application):
         seen = self.adapter._seen_update_ids
         pending = self.adapter._inflight_update_ids
         if key in seen or key in pending:
+            return
+        journal = getattr(self.adapter, "_controlled_journal", None)
+        if journal is not None and not journal.claim(update.update_id):
             return
         claim = _Claim(key, asyncio.current_task())
         # Atomic on PTB's event loop: no await between lookup and claim. Dispatch and its
