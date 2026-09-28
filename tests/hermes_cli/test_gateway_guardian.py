@@ -176,6 +176,25 @@ def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch
 
 
 @pytest.mark.macos_only
+def test_gateway_restart_command_clears_stopped_intent(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import gateway
+    from hermes_cli import gateway_profile_lifecycle
+    home, *_ = layout(tmp_path)
+    guardian.set_intent(home, stopped=True)
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "_refuse_from_inside_gateway", lambda *args: None)
+    monkeypatch.setattr(gateway_profile_lifecycle, "profile_lifecycle", lambda *args: False)
+    monkeypatch.setattr(gateway, "_guard_named_profile_under_multiplexer", lambda **kwargs: None)
+    dispatched = []
+    monkeypatch.setattr(gateway, "_dispatch_via_service_manager_if_s6",
+                        lambda action: dispatched.append(action) or True)
+    gateway._cmd_restart(SimpleNamespace(system=False, all=False, force=False))
+    assert dispatched == ["restart"]
+    assert not guardian.intent_path(home).exists()
+
+
+@pytest.mark.macos_only
 def test_launchd_restart_clears_stopped_intent(tmp_path, monkeypatch):
     from hermes_cli import gateway, gateway_launchd
     from gateway import status
