@@ -2475,6 +2475,18 @@ def cmd_update(args):
             _update_exit.code if isinstance(_update_exit.code, int) else 0
         )
         raise
+    except ValueError as _update_exc:
+        if not str(_update_exc).startswith("Invalid update configuration: "):
+            _finalize_update_receipt(1, f"ValueError: {_update_exc}")
+            raise
+        from hermes_cli import update_receipt
+        if update_receipt._current is None:
+            update_receipt.begin_update_receipt()
+        update_receipt.record_step("update_config", False, str(_update_exc))
+        _finalize_update_receipt(1, str(_update_exc))
+        print(f"✗ {_update_exc}. Run hermes doctor and correct the setting with hermes config set.")
+        _update_handoff_exit_code = 1
+        raise SystemExit(1) from None
     except BaseException as _update_exc:
         _finalize_update_receipt(1, f"{type(_update_exc).__name__}: {_update_exc}")
         raise

@@ -90,7 +90,10 @@ def test_immutable_post_swap_maintains_before_activation_and_receipts_success(po
     assert not handoff.exists()
     receipt = _latest(home)
     assert receipt["outcome"] == "success"
-    assert {step["name"]: step["ok"] for step in receipt["steps"]}["immutable_maintenance"] is True
+    steps = {step["name"]: step for step in receipt["steps"]}
+    assert steps["immutable_maintenance"]["ok"] is True
+    assert steps["immutable_activation"]["ok"] is True
+    assert "deferred" in steps["immutable_activation"]["detail"]
 
 
 @pytest.mark.parametrize("failure", ["raised", "incomplete"])

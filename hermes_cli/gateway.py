@@ -2955,7 +2955,16 @@ def get_python_path() -> str:
     home = get_hermes_home()
     paths = ReleasePaths.for_home(home)
     current = paths.current
-    if current.exists() or current.is_symlink():
+    # Only launchd can use immutable releases. A broken pointer on another
+    # platform is not its service executable, so fall back to that platform's
+    # ordinary interpreter unless a real current target exists.
+    if is_macos():
+        raw = read_raw_config() or {}
+        updates = raw.get("updates", {}) if isinstance(raw, dict) else {}
+        enabled = isinstance(updates, dict) and updates.get("immutable_releases") is True
+    else:
+        enabled = False
+    if current.exists() or (is_macos() and (enabled or current.is_symlink())):
         try:
             release = read_pointer(current)
             if release is None:

@@ -516,6 +516,17 @@ def test_gateway_interpreter_refuses_broken_immutable_current(tmp_path, monkeypa
         gateway.get_python_path()
 
 
+@pytest.mark.linux_only
+def test_gateway_interpreter_ignores_unsupported_dangling_pointer(tmp_path, monkeypatch):
+    from hermes_cli import gateway
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "current").symlink_to(home / "missing")
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "_detect_venv_dir", lambda: None)
+    assert gateway.get_python_path() == gateway.sys.executable
+
+
 def test_incomplete_checkout_never_receipts_success_during_acknowledged_catchup(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
