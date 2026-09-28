@@ -3,6 +3,7 @@ import asyncio
 import json
 
 import pytest
+pytest.importorskip("telegram")
 from telegram import Update
 
 from gateway.generation import GenerationCoordinator
