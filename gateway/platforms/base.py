@@ -3702,6 +3702,15 @@ class BasePlatformAdapter(ABC):
             return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
+        if (self.platform == Platform.TELEGRAM and result.retry_after is not None and
+                not (isinstance(metadata, dict) and metadata.get("_interim_send")) and
+                getattr(getattr(getattr(self, "gateway_runner", None), "config", None),
+                        "durable_outbox_enabled", False)):
+            from gateway.outbox import active_turn
+            if active_turn() is not None:
+                # The outbox already persisted one timed retry. The inline loop
+                # must not race that timer and produce two final messages.
+                return result
         if result.success or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
@@ -4157,12 +4166,13 @@ class BasePlatformAdapter(ABC):
         # otherwise turn a transport redelivery into another user turn.
         if (self.platform == Platform.TELEGRAM and not event.internal
                 and getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)):
-            from gateway.outbox import Outbox, event_kind, transport_id
+            from gateway.outbox import store_for, event_kind, transport_id
             event_id = transport_id(event)
             if event_id:
                 home = getattr(self.gateway_runner, "_resolve_profile_home_for_source")(event.source)
-                original = Outbox(home).lookup(str(event.source.profile or "default"),
-                                                "telegram", event_id, event_kind(event))
+                original = await asyncio.to_thread(
+                    store_for(home).lookup, str(event.source.profile or "default"),
+                    "telegram", event_id, event_kind(event))
                 if original:
                     setattr(event, "_outbox_original_result", original[1])
                     event._gateway_accepted = True

@@ -7,12 +7,13 @@ import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
-from gateway.outbox import Outbox, bind_turn, clear_turn, recover
+from gateway.outbox import Outbox, active_turn, bind_turn, clear_turn, recover
 from gateway.platforms.base import SendResult
-from gateway.config import GatewayConfig, load_gateway_config
+from gateway.config import GatewayConfig, Platform, load_gateway_config
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -135,12 +136,10 @@ def test_fifo_receipts_and_edit_order(tmp_path):
     second = store.enqueue("turn", "edit_message", {"content": "final", "message_id": "msg-1"})
     third = store.enqueue("turn", "attachment", {"file": "a"})
     assert [r.sequence for r in (first, second, third)] == [1, 2, 3]
-    assert not store.begin_send(second)
-    assert store.begin_send(first)
-    assert store.pending() == []
-    store.receipt(first, message_id="msg-1", success=True)
-    assert store.pending() == [second]
     assert store.begin_send(second)
+    assert store.begin_send(first)
+    assert store.pending() == [third]
+    store.receipt(first, message_id="msg-1", success=True)
     store.receipt(second, message_id="msg-1", success=True)
     assert store.pending() == [third]
     assert store.begin_send(third)
@@ -166,6 +165,7 @@ def test_admission_scoped_by_profile_and_original_result(tmp_path):
 
 def _fake_adapter(enabled, sends):
     adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
     adapter.gateway_runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=enabled))
     adapter._bot = object()
     adapter._chat_send_lock = lambda chat: contextlib.nullcontext()
@@ -225,6 +225,211 @@ async def test_ambiguous_telegram_send_held_without_duplicate(tmp_path):
         assert sends == [("chat", "final")]
     finally:
         clear_turn()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    SendResult(False, error="Bad Request: chat not found"),
+    SendResult(False, error="message_too_long", error_kind="too_long"),
+    SendResult(False, error="flood_control:120", retry_after=120),
+    SendResult(False, error="Not connected"),
+    SendResult(False, error="draft_rejected"),
+    SendResult(False, error="network timeout", retryable=True),
+])
+async def test_failed_send_does_not_hold_different_payload(tmp_path, failure):
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    async def first_fails(chat_id, content, reply_to, metadata):
+        sends.append(content)
+        return failure if len(sends) == 1 else SendResult(True, message_id="fallback")
+    adapter._send_text_locked = first_fails
+    bind_turn(tmp_path, "fallback-turn")
+    try:
+        assert not (await adapter.send("chat", "formatted")).success
+        assert (await adapter.send("chat", "plain fallback")).success
+        assert sends == ["formatted", "plain fallback"]
+        states = [row.state for row in Outbox(tmp_path).all_rows()]
+        expected = ("ambiguous" if failure.error == "network timeout" else
+                    "pending" if failure.retry_after is not None else "failed_unsent")
+        assert states[0] == expected
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_not_connected_edit_does_not_hold_final_send(tmp_path):
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    adapter._bot = None
+    bind_turn(tmp_path, "edit-fallback")
+    try:
+        assert not (await adapter.edit_message("chat", "old", "updated", finalize=True)).success
+        adapter._bot = object()
+        assert (await adapter.send("chat", "updated")).success
+        assert sends == [("chat", "updated")]
+        assert [r.state for r in Outbox(tmp_path).all_rows()] == ["failed_unsent", "delivered"]
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_background_task_does_not_inherit_turn_egress(tmp_path):
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    bind_turn(tmp_path, "outer")
+    try:
+        row = Outbox(tmp_path).enqueue("outer", "send", {"chat_id": "chat", "content": "held"})
+        assert Outbox(tmp_path).begin_send(row)
+        async def background():
+            assert active_turn() is None
+            return await adapter.send("chat", "background")
+        assert (await asyncio.create_task(background())).success
+        assert sends == [("chat", "background")]
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_reentrant_inbound_preserves_outer_turn(tmp_path):
+    from gateway.run_inbound import GatewayInboundMixin
+    class Runner(GatewayInboundMixin):
+        async def _handle_admitted_message(self, event):
+            assert active_turn() is None
+            return None
+    bind_turn(tmp_path, "outer")
+    try:
+        assert await Runner()._handle_message(cast(Any, SimpleNamespace())) is None
+        assert active_turn() == (tmp_path, "outer")
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_turn_owned_stream_child_binds_explicitly(tmp_path):
+    from gateway.outbox import run_turn_child
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    bind_turn(tmp_path, "stream")
+    try:
+        async def stream_send():
+            assert active_turn() == (tmp_path, "stream")
+            return await adapter.send("chat", "stream-final")
+        result = await asyncio.create_task(run_turn_child(stream_send(), active_turn()))
+        assert result.success
+        assert Outbox(tmp_path).all_rows()[0].state == "delivered"
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_flood_wait_retries_once_without_a_second_final(tmp_path):
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    async def limited(chat_id, content, reply_to, metadata):
+        sends.append(content)
+        if len(sends) == 1:
+            return SendResult(False, error="flood_control:0.01", retry_after=0.01)
+        return SendResult(True, message_id="one-final")
+    adapter._send_text_locked = limited
+    bind_turn(tmp_path, "flood-turn")
+    try:
+        assert not (await adapter.send("chat", "final")).success
+        await asyncio.sleep(0.1)
+        assert sends == ["final", "final"]
+        assert [r.state for r in Outbox(tmp_path).all_rows()] == ["delivered"]
+        assert await recover(Outbox(tmp_path), adapter) == (0, 0)
+        assert len(sends) == 2
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_final_retry_does_not_compete_with_inline_retry(tmp_path):
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    async def limited(chat_id, content, reply_to, metadata):
+        sends.append(content)
+        if len(sends) == 1:
+            return SendResult(False, error="flood_control:0.01", retry_after=0.01)
+        return SendResult(True, message_id="one-final")
+    adapter._send_text_locked = limited
+    bind_turn(tmp_path, "single-final")
+    try:
+        result = await adapter._send_with_retry("chat", "answer", max_retries=2, base_delay=0)
+        assert not result.success
+        await asyncio.sleep(0.1)
+        assert sends == ["answer", "answer"]
+        assert [r.state for r in Outbox(tmp_path).all_rows()] == ["delivered"]
+        event = SimpleNamespace(text="hello", _outbox_turn_id="single-final")
+        assert await adapter._record_delivery_obligation(cast(Any, event), "key", "answer", adapter, False) is None
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_non_json_metadata_is_defensively_stored(tmp_path):
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    bind_turn(tmp_path, "metadata")
+    try:
+        assert (await adapter.send("chat", "reply", metadata={"opaque": object()})).success
+        assert sends == [("chat", "reply")]
+        assert Outbox(tmp_path).all_rows()[0].state == "delivered"
+    finally:
+        clear_turn()
+
+
+def test_ambiguous_expires_without_replay_and_is_visible(tmp_path):
+    store = Outbox(tmp_path)
+    row = store.enqueue("turn", "send", {"content": "uncertain"})
+    assert store.begin_send(row)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=created_at-90000")
+    assert store.ambiguous() == []
+    assert store.status()[0]["state"] == "expired_ambiguous"
+    assert store.held_payload("turn", "send", {"content": "uncertain"})
+    assert store.pending() == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_restores_image_pairs_and_control_parse_mode(tmp_path):
+    store = Outbox(tmp_path)
+    store.enqueue("images", "send_multiple_images", {
+        "chat_id": "chat", "images": [("https://example.com/a.png", "alt")],
+    })
+    store.enqueue("control", "control_prompt", {
+        "chat_id": "chat", "text": "Confirm", "parse_mode": "HTML",
+        "thread_id": None, "metadata": None, "reply_markup": None, "reply_to_mode": None,
+    })
+    seen = []
+    class Adapter:
+        async def send_multiple_images(self, **kwargs):
+            seen.append(kwargs["images"])
+            return SendResult(True, message_id="image")
+        async def _send_control_message(self, **kwargs):
+            seen.append(kwargs["parse_mode"])
+            return SimpleNamespace(message_id="control")
+    assert await recover(store, Adapter()) == (2, 0)
+    assert seen == [[("https://example.com/a.png", "alt")], "HTML"]
+
+
+def test_schema_upgrades_old_outbox_without_losing_receipts(tmp_path):
+    path = tmp_path / "gateway-outbox.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE outbox (turn_id TEXT NOT NULL, sequence INTEGER NOT NULL, "
+                   "type TEXT NOT NULL, payload TEXT NOT NULL, idempotency_key TEXT UNIQUE NOT NULL, "
+                   "owner_epoch INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending' "
+                   "CHECK (state IN ('pending','sending','ambiguous','delivered')), "
+                   "message_id TEXT, send_status TEXT, edit_status TEXT, "
+                   "PRIMARY KEY (turn_id, sequence))")
+        db.execute("INSERT INTO outbox VALUES ('t', 1, 'send', '{}', 'old', 0, "
+                   "'delivered', 'm1', 'success', NULL)")
+    store = Outbox(tmp_path)
+    assert store.all_rows()[0].message_id == "m1"
+    second = store.enqueue("t", "send", {"content": "no"})
+    assert store.begin_send(second)
+    store.receipt(second, message_id=None, success=False, uncertain=False)
+    assert store.all_rows()[-1].state == "failed_unsent"
 
 
 def test_additive_schema_does_not_disturb_existing_store(tmp_path):

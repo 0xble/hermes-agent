@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import time
 import uuid
 import weakref
 from contextlib import contextmanager
@@ -24,19 +25,50 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Bound at authorized ingress; propagated into the turn runner's spawned tasks.
-_CURRENT_TURN: contextvars.ContextVar[tuple[Path, str] | None] = contextvars.ContextVar(
+# Context is copied into child tasks; only the task explicitly bound to ingress
+# may use the turn's outbox. A separate background notification is not its egress.
+_CURRENT_TURN: contextvars.ContextVar[tuple[Path, str, asyncio.Task | None] | None] = contextvars.ContextVar(
     "gateway_outbox_turn", default=None)
 _BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("gateway_outbox_transport", default=False)
 _TURN_LOCKS: weakref.WeakValueDictionary[tuple[Path, str], asyncio.Lock] = weakref.WeakValueDictionary()
+_STORES: dict[Path, "Outbox"] = {}
+_RETRY_TASKS: dict[tuple[Path, str], asyncio.Task] = {}
+
+
+def store_for(home: Path) -> "Outbox":
+    key = Path(home).resolve()
+    if key not in _STORES:
+        _STORES[key] = Outbox(key)
+    return _STORES[key]
 
 
 def bind_turn(home: Path, turn_id: str) -> None:
-    _CURRENT_TURN.set((Path(home), turn_id))
+    _CURRENT_TURN.set((Path(home), turn_id, asyncio.current_task()))
 
 
 def clear_turn() -> None:
     _CURRENT_TURN.set(None)
+
+
+def scoped_turn_entry():
+    """Hide an inherited turn while processing another ingress; restore on return."""
+    return _CURRENT_TURN.set(None)
+
+
+def restore_turn(token: contextvars.Token) -> None:
+    _CURRENT_TURN.reset(token)
+
+
+async def run_turn_child(coro, turn: tuple[Path, str] | None):
+    """Bind a turn-owned streaming worker, unlike unrelated background tasks."""
+    if turn is None:
+        return await coro
+    token = scoped_turn_entry()
+    try:
+        bind_turn(*turn)
+        return await coro
+    finally:
+        restore_turn(token)
 
 
 @contextmanager
@@ -49,7 +81,10 @@ def transport_bypass():
 
 
 def active_turn():
-    return None if _BYPASS.get() else _CURRENT_TURN.get()
+    turn = _CURRENT_TURN.get()
+    if _BYPASS.get() or turn is None or turn[2] is not asyncio.current_task():
+        return None
+    return turn[:2]
 
 
 def transport_id(event) -> str | None:
@@ -78,7 +113,7 @@ def durable_control(method):
                                 reply_markup=reply_markup, reply_to_mode=reply_to_mode)
         from gateway.platforms.base import SendResult
         payload = {
-            "chat_id": chat_id, "text": text, "parse_mode": str(parse_mode),
+            "chat_id": chat_id, "text": text, "parse_mode": getattr(parse_mode, "value", parse_mode),
             "thread_id": thread_id, "metadata": metadata,
             "reply_markup": reply_markup.to_dict() if reply_markup is not None else None,
             "reply_to_mode": reply_to_mode,
@@ -158,6 +193,18 @@ def _discard_delivered_media(home: Path, payload: dict[str, Any]) -> None:
                 logger.warning("Unable to remove delivered outbox media %s", candidate, exc_info=True)
 
 
+def _uncertain(result) -> bool:
+    """Only a transport outcome without a definitive refusal can have been sent."""
+    if result.success or result.retry_after is not None or result.raw_response is not None:
+        return False
+    error = (result.error or "").lower()
+    return (any(marker in error for marker in
+                ("timeout", "timed out", "network error", "connection reset",
+                 "connection aborted", "server disconnected")) or
+            (result.retryable and not any(marker in error for marker in
+             ("not connected", "bad request", "too_long", "draft_rejected", "flood_control"))))
+
+
 async def deliver(adapter, kind: str, payload: dict[str, Any], send):
     """Commit an ordered row before crossing the transport boundary.
 
@@ -170,9 +217,13 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
     if turn is None:
         return await send(payload)
     home, turn_id = turn
-    store = Outbox(home)
+    store = store_for(home)
     lock = _TURN_LOCKS.setdefault(turn, asyncio.Lock())
     async with lock:
+        # A repeated ambiguous payload cannot be safely retried, but unrelated
+        # output in the same turn must not be starved by that uncertainty.
+        if store.held_payload(turn_id, kind, payload):
+            return SendResult(success=False, error="outbox payload has an uncertain prior dispatch")
         # Preserve the original request for certain non-delivery retries: a
         # scratch file's copied path differs from its original path.
         previous = store.pending_retry(turn_id, kind, payload)
@@ -196,7 +247,11 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
                 durable["images"] = images
             if original_media:
                 durable["_outbox_original"] = payload
-            row = store.enqueue(turn_id, kind, durable)
+            try:
+                row = store.enqueue(turn_id, kind, durable)
+            except (TypeError, ValueError) as exc:
+                logger.warning("Outbox could not serialize %s; using ordinary transport: %s", kind, exc)
+                return await send(payload)
         if not store.begin_send(row):
             return SendResult(success=False, error="earlier outbox row is unresolved")
         try:
@@ -205,13 +260,33 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
         except BaseException:
             store.receipt(row, message_id=None, success=False)
             raise
-        store.receipt(row, message_id=str(result.message_id) if result.message_id else None,
-                      success=bool(result.success),
-                      definitely_unsent=(not result.success and result.retryable and
-                                         not getattr(result, "raw_response", None)))
+        retry_after = (result.retry_after if kind == "send" and
+                       not (isinstance(payload.get("metadata"), dict) and
+                            payload["metadata"].get("_interim_send")) else None)
+        scheduled = store.receipt(row, message_id=str(result.message_id) if result.message_id else None,
+                                  success=bool(result.success), uncertain=_uncertain(result),
+                                  retry_after=retry_after)
+        if scheduled:
+            _schedule_retry(store, adapter)
         if result.success:
             _discard_delivered_media(home, row.payload)
         return result
+
+
+def _schedule_retry(store: "Outbox", adapter) -> None:
+    """One durable server-directed retry per row, without blocking ingress."""
+    for row, deadline in store.scheduled():
+        key = (store.path, row.idempotency_key)
+        if key in _RETRY_TASKS:
+            continue
+        async def redeliver(key=key, deadline=deadline):
+            try:
+                await asyncio.sleep(max(0, deadline - time.time()))
+                await recover(store, adapter)
+            finally:
+                _RETRY_TASKS.pop(key, None)
+        task = asyncio.create_task(redeliver())
+        _RETRY_TASKS[key] = task
 
 
 async def recover(store: "Outbox", adapter) -> tuple[int, int]:
@@ -242,15 +317,22 @@ async def recover(store: "Outbox", adapter) -> tuple[int, int]:
                         message = await adapter._send_control_message(**payload)
                         result = SendResult(success=True, message_id=str(message.message_id))
                     else:
-                        result = await getattr(adapter, row.type)(**wire_payload(row.payload))
+                        payload = wire_payload(row.payload)
+                        if row.type == "send_multiple_images" and "images" in payload:
+                            payload["images"] = [tuple(image) for image in payload["images"]]
+                        result = await getattr(adapter, row.type)(**payload)
             except BaseException:
                 store.receipt(row, message_id=None, success=False)
                 logger.exception("Ambiguous outbox dispatch %s", row.idempotency_key)
                 continue
-            store.receipt(row, message_id=str(result.message_id) if result.message_id else None,
-                          success=bool(result.success),
-                          definitely_unsent=(not result.success and result.retryable and
-                                             not getattr(result, "raw_response", None)))
+            retry_after = (result.retry_after if row.type == "send" and
+                           not (isinstance(row.payload.get("metadata"), dict) and
+                                row.payload["metadata"].get("_interim_send")) else None)
+            scheduled = store.receipt(row, message_id=str(result.message_id) if result.message_id else None,
+                                      success=bool(result.success), uncertain=_uncertain(result),
+                                      retry_after=retry_after)
+            if scheduled:
+                _schedule_retry(store, adapter)
             if result.success:
                 _discard_delivered_media(store.path.parent, row.payload)
                 sent += 1
@@ -261,6 +343,7 @@ async def recover(store: "Outbox", adapter) -> tuple[int, int]:
     for row in ambiguous:
         logger.error("Held ambiguous outbox dispatch: turn=%s sequence=%s key=%s",
                      row.turn_id, row.sequence, row.idempotency_key)
+    _schedule_retry(store, adapter)
     return sent, len(ambiguous)
 
 
@@ -299,14 +382,40 @@ class Outbox:
                     idempotency_key TEXT NOT NULL UNIQUE,
                     owner_epoch INTEGER NOT NULL,
                     state TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (state IN ('pending', 'sending', 'ambiguous', 'delivered')),
+                        CHECK (state IN ('pending', 'sending', 'ambiguous', 'delivered', 'failed_unsent', 'expired_ambiguous')),
                     message_id TEXT,
                     send_status TEXT,
                     edit_status TEXT,
+                    created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+                    retry_at REAL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (turn_id, sequence)
                 );
                 CREATE INDEX IF NOT EXISTS outbox_state ON outbox(state, turn_id, sequence);
             """)
+            schema = db.execute("SELECT sql FROM sqlite_master WHERE name='outbox'").fetchone()[0]
+            if "failed_unsent" not in schema:
+                db.executescript("""
+                    DROP INDEX IF EXISTS outbox_state;
+                    ALTER TABLE outbox RENAME TO outbox_old;
+                    CREATE TABLE outbox (
+                        turn_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                        type TEXT NOT NULL, payload TEXT NOT NULL,
+                        idempotency_key TEXT NOT NULL UNIQUE, owner_epoch INTEGER NOT NULL,
+                        state TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (state IN ('pending','sending','ambiguous','delivered','failed_unsent','expired_ambiguous')),
+                        message_id TEXT, send_status TEXT, edit_status TEXT,
+                        created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+                        retry_at REAL, attempts INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (turn_id, sequence)
+                    );
+                    INSERT INTO outbox (turn_id, sequence, type, payload, idempotency_key,
+                                        owner_epoch, state, message_id, send_status, edit_status)
+                        SELECT turn_id, sequence, type, payload, idempotency_key,
+                               owner_epoch, state, message_id, send_status, edit_status FROM outbox_old;
+                    DROP TABLE outbox_old;
+                    CREATE INDEX outbox_state ON outbox(state, turn_id, sequence);
+                """)
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -368,11 +477,21 @@ class Outbox:
         with self._connect() as db:
             row = db.execute("SELECT * FROM outbox WHERE turn_id=? ORDER BY sequence DESC LIMIT 1",
                              (turn_id,)).fetchone()
-            if row and row["state"] == "pending" and row["type"] == kind:
+            if row and row["state"] == "pending" and row["retry_at"] is None and row["type"] == kind:
                 stored = json.loads(row["payload"])
                 if stored.get("_outbox_original", stored) == payload:
                     return self._row(row)
             return None
+
+    def held_payload(self, turn_id: str, kind: str, payload: dict[str, Any]) -> bool:
+        with self._connect() as db:
+            for row in db.execute("SELECT payload FROM outbox WHERE turn_id=? AND type=? "
+                                  "AND (state IN ('sending','ambiguous','expired_ambiguous') "
+                                  "OR (state='pending' AND retry_at IS NOT NULL))", (turn_id, kind)):
+                stored = json.loads(row[0])
+                if stored.get("_outbox_original", stored) == payload:
+                    return True
+        return False
 
     def enqueue(self, turn_id: str, kind: str, payload: dict[str, Any], owner_epoch: int = 0,
                 idempotency_key: str | None = None) -> OutboxRow:
@@ -388,7 +507,7 @@ class Outbox:
                                  (turn_id,)).fetchone()[0]
                 db.execute("INSERT INTO outbox (turn_id, sequence, type, payload, idempotency_key, owner_epoch) "
                            "VALUES (?, ?, ?, ?, ?, ?)",
-                           (turn_id, seq, kind, json.dumps(payload), key, owner_epoch))
+                           (turn_id, seq, kind, json.dumps(payload, default=str), key, owner_epoch))
                 db.commit()
                 return OutboxRow(turn_id, seq, kind, payload, key, owner_epoch, "pending", None)
             except BaseException:
@@ -403,24 +522,47 @@ class Outbox:
     def pending(self) -> list[OutboxRow]:
         with self._connect() as db:
             return [self._row(r) for r in db.execute(
-                "SELECT * FROM outbox WHERE state='pending' AND NOT EXISTS "
-                "(SELECT 1 FROM outbox prior WHERE prior.turn_id=outbox.turn_id "
-                "AND prior.sequence<outbox.sequence AND prior.state!='delivered') "
-                "ORDER BY rowid")]
+                "SELECT * FROM outbox WHERE state='pending' AND (retry_at IS NULL OR retry_at<=?) "
+                "ORDER BY rowid", (time.time(),))]
+
+    def scheduled(self) -> list[tuple[OutboxRow, float]]:
+        with self._connect() as db:
+            return [(self._row(r), r["retry_at"]) for r in db.execute(
+                "SELECT * FROM outbox WHERE state='pending' AND retry_at>? ORDER BY retry_at",
+                (time.time(),))]
+
+    def all_rows(self) -> list[OutboxRow]:
+        with self._connect() as db:
+            return [self._row(r) for r in db.execute("SELECT * FROM outbox ORDER BY rowid")]
 
     def ambiguous(self) -> list[OutboxRow]:
         with self._connect() as db:
+            expired = db.execute("UPDATE outbox SET state='expired_ambiguous' "
+                                 "WHERE state IN ('sending','ambiguous') AND created_at<?",
+                                 (time.time() - 86400,)).rowcount
+            if expired:
+                logger.error("Expired %s uncertain outbox sends without replay; inspect %s",
+                             expired, self.path)
             return [self._row(r) for r in db.execute(
                 "SELECT * FROM outbox WHERE state IN ('sending','ambiguous') ORDER BY rowid")]
+
+    def status(self) -> list[dict[str, Any]]:
+        self.ambiguous()  # expire old holds and log them
+        with self._connect() as db:
+            return [dict(r) for r in db.execute(
+                "SELECT turn_id, sequence, type, idempotency_key, state, created_at, "
+                "retry_at, attempts, send_status, edit_status FROM outbox "
+                "WHERE state IN ('sending','ambiguous','expired_ambiguous','pending','failed_unsent') "
+                "ORDER BY created_at DESC")]
 
     def begin_send(self, row: OutboxRow) -> bool:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
-                changed = db.execute("UPDATE outbox SET state='sending' WHERE turn_id=? AND sequence=? "
-                                     "AND state='pending' AND NOT EXISTS (SELECT 1 FROM outbox prior "
-                                     "WHERE prior.turn_id=outbox.turn_id AND prior.sequence<outbox.sequence "
-                                     "AND prior.state!='delivered')", (row.turn_id, row.sequence)).rowcount
+                changed = db.execute("UPDATE outbox SET state='sending', retry_at=NULL, attempts=attempts+1 "
+                                     "WHERE turn_id=? AND sequence=? AND state='pending' "
+                                     "AND (retry_at IS NULL OR retry_at<=?)",
+                                     (row.turn_id, row.sequence, time.time())).rowcount
                 db.commit()
                 return bool(changed)
             except BaseException:
@@ -428,16 +570,34 @@ class Outbox:
                 raise
 
     def receipt(self, row: OutboxRow, *, message_id: str | None, success: bool,
-                definitely_unsent: bool = False) -> None:
-        state = "delivered" if success else ("pending" if definitely_unsent else "ambiguous")
+                uncertain: bool = True, retry_after: float | None = None) -> bool:
+        """Return whether one server-directed, proven-unsent retry was queued."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
+                attempts = db.execute("SELECT attempts FROM outbox WHERE turn_id=? AND sequence=?",
+                                      (row.turn_id, row.sequence)).fetchone()[0]
+                scheduled = bool(not success and retry_after is not None and attempts == 1)
+                state = ("delivered" if success else "pending" if scheduled else
+                         "ambiguous" if uncertain else "failed_unsent")
                 column = "edit_status" if row.type == "edit_message" else "send_status"
-                db.execute(f"UPDATE outbox SET state=?, message_id=?, {column}=? "
+                db.execute(f"UPDATE outbox SET state=?, message_id=?, {column}=?, retry_at=? "
                            "WHERE turn_id=? AND sequence=? AND state='sending'",
-                           (state, message_id, "success" if success else state, row.turn_id, row.sequence))
+                           (state, message_id, "success" if success else state,
+                            time.time() + min(max(0, retry_after or 0), 86400) if scheduled else None,
+                            row.turn_id, row.sequence))
                 db.commit()
+                return scheduled
             except BaseException:
                 db.rollback()
                 raise
+
+
+if __name__ == "__main__":
+    import argparse
+    from hermes_constants import get_hermes_home
+
+    parser = argparse.ArgumentParser(description="Inspect durable outbox unresolved deliveries")
+    parser.add_argument("--home", type=Path, default=get_hermes_home())
+    args = parser.parse_args()
+    print(json.dumps(Outbox(args.home).status(), indent=2))

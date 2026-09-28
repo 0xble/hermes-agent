@@ -164,10 +164,6 @@ class GatewayInboundMixin:
         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
         from gateway.run import _is_slack_ignored_channel
-        # Every admission starts with an empty egress context, including rejected input.
-        # A reused polling task must never inherit the prior message's outbox turn.
-        from gateway.outbox import clear_turn
-        clear_turn()
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
         _config = getattr(self, "config", None)
@@ -257,7 +253,7 @@ class GatewayInboundMixin:
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
         if getattr(_config, "durable_outbox_enabled", False) and source.platform == Platform.TELEGRAM:
-            from gateway.outbox import Outbox, bind_turn, event_kind, transport_id
+            from gateway.outbox import store_for, bind_turn, event_kind, transport_id
             import uuid
 
             home = getattr(self, "_resolve_profile_home_for_source")(source)
@@ -267,7 +263,7 @@ class GatewayInboundMixin:
             if not event_id:
                 event_id = uuid.uuid4().hex
                 setattr(event, "_outbox_transport_id", event_id)
-            store = Outbox(home)
+            store = store_for(home)
             turn_id, fresh = store.admit(str(profile), "telegram", event_id, kind)
             setattr(event, "_outbox_turn_id", turn_id)
             setattr(event, "_outbox_home", home)
@@ -1349,6 +1345,8 @@ class GatewayInboundMixin:
             return event, source, is_internal
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from gateway.outbox import scoped_turn_entry, restore_turn, store_for
+        token = scoped_turn_entry()
         result = None
         try:
             handler = getattr(type(self), "_handle_admitted_message", None)
@@ -1360,10 +1358,12 @@ class GatewayInboundMixin:
             return result
         finally:
             turn_id = getattr(event, "_outbox_turn_id", None)
-            if turn_id and not getattr(event, "_outbox_duplicate", False):
-                from gateway.outbox import Outbox
-                Outbox(getattr(event, "_outbox_home")).finish_admission(
-                    turn_id, result if isinstance(result, str) else None)
+            try:
+                if turn_id and not getattr(event, "_outbox_duplicate", False):
+                    store_for(getattr(event, "_outbox_home")).finish_admission(
+                        turn_id, result if isinstance(result, str) else None)
+            finally:
+                restore_turn(token)
 
     async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
