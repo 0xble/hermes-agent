@@ -5975,13 +5975,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _shutdown_gateway_health_export(runner)
         return False
 
-    def _recover_pending() -> None:
-        from gateway.run_pending_recovery import recover_pending_shutdown_flush
-        recovered = recover_pending_shutdown_flush(runner)
-        if recovered:
-            logger.info("Recovered %d pending message(s) across served profiles", recovered)
-
-    _best_effort(_recover_pending)
     if runner.should_exit_cleanly:
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:

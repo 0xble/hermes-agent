@@ -4,8 +4,9 @@ When FTS5 corruption blocks ``INSERT INTO messages``, ``_pending_messages`` and 
 ``agent._session_messages`` are the only surviving copies; shutdown ``.clear()`` would drop them.
 All hooks write atomic JSON payloads under ``<hermes_home>/pending_messages/``:
 ``flush_pending_to_file`` / ``flush_overflow_to_file`` (queue head / FIFO tail, before clear),
-``recover_pending_to_db`` (after ``runner.start()``; replays via ``SessionDB.append_message``,
-deletes each file on success), ``flush_agent_history_to_file`` (DB flush raised),
+``recover_pending_to_db`` (after ``runner.start()``; replays via ``SessionDB.append_message``;
+claimed follow-ups remain spooled until their adapter accepts replay; other files delete
+on success), ``flush_agent_history_to_file`` (DB flush raised),
 ``spool_dropped_transcript_message`` / ``drain_transcript_spool``.
 """
 
@@ -193,11 +194,21 @@ def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
-        for attr in ("session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
+        for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
+        for attr in ("user_id", "user_name", "media_urls", "media_types", "reply_to_message_id"):
+            val = getattr(value, attr, None)
+            if val is not None and _json_safe(val):
+                result[attr] = val
+        source = getattr(value, "source", None)
+        if source is not None:
+            for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
+                val = getattr(source, attr, None)
+                if val is not None and _json_safe(val):
+                    result[f"source_{attr}"] = val
         return result
     if isinstance(value, str):  # runner-level _pending_messages
         return {"text": value}
@@ -206,7 +217,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
-def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
+def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_followup=None) -> int:
     """Replay flush-dir ``*.json`` files via ``SessionDB.append_message``, deleting each on success.
 
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
@@ -214,7 +225,8 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     ``SessionStore.resolve_session_id_for_key``) is required for real flush files: adapter
     ``MessageEvent`` objects carry no ``session_id``, so without it every recovery lands in the skip
     branch. A returned ``db`` routes the append to the profile store owning the key (multiplexed
-    gateways); ``None`` falls back to ``session_db``. Returns the number of messages recovered.
+    gateways); ``None`` falls back to ``session_db``. ``deferred_followup`` may claim a resolved
+    payload as a separate turn before it is appended to history. Returns the number recovered.
     """
     flush_files = sorted(_get_flush_dir().glob("*.json"))
     if not flush_files:
@@ -234,10 +246,13 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                     continue
-                if _recover_one_payload(session_db, path, payload,
-                                        session_resolver=session_resolver):
+                result = _recover_one_payload(session_db, path, payload,
+                                              session_resolver=session_resolver,
+                                              deferred_followup=deferred_followup)
+                if result:
                     recovered += 1
-                    path.unlink(missing_ok=True)
+                    if result is not CLAIMED_FOLLOWUP:
+                        path.unlink(missing_ok=True)
             except Exception as exc:
                 logger.warning("Failed to recover pending message from %s: %s", path, exc)
     finally:
@@ -250,9 +265,13 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
     return recovered
 
 
+OTHER_PLATFORM_PENDING = object()  # retained for a different adapter's reconnect, not a failure
+CLAIMED_FOLLOWUP = object()  # queued in memory, disk copy retained until adapter accepts replay
+
+
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
-                         session_resolver=None) -> bool:
-    """Append one flush payload to ``session_db``; False (file kept) when structurally invalid."""
+                         session_resolver=None, deferred_followup=None) -> bool | object:
+    """Append a flush payload or retain a claimed follow-up until adapter admission."""
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.
     if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
@@ -292,6 +311,17 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
+    if deferred_followup is not None:
+        claim = deferred_followup(session_key, session_id, data, path)
+        if claim is OTHER_PLATFORM_PENDING:
+            logger.debug("Pending message for %s retained until its platform reconnects", session_key)
+            return False
+        if claim is None:  # resume deferred until its delivery path is ready
+            logger.warning("Pending message for %s retained in %s: delivery adapter offline or "
+                           "resume awaiting platform reconnect", session_key, path)
+            return False
+        if claim:
+            return CLAIMED_FOLLOWUP
     target_db.append_message(session_id=session_id, role="user", content=text,
                              timestamp=payload.get("ts", int(time.time())))
     return True

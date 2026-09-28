@@ -774,8 +774,12 @@ class GatewayAdapterLifecycleMixin:
                 # promptly, so 2 fds/retry leak at 300s backoff cap = ~12 fds/hour (#37011).
                 await _dispose_unused_adapter(adapter)
         except Exception as e:
+            if adapter is not None and self.adapters.get(platform) is adapter:
+                # Installation already transferred ownership to the gateway. A tail failure
+                # cannot dispose the live receive path or recreate a stale retry entry.
+                logger.warning("Reconnect %s post-install recovery error: %s", platform.value, e)
+                return
             if adapter is not None:
-                # An exception escaping connect leaves the adapter in the same unowned state.
                 await _dispose_unused_adapter(adapter)
             # A reconnect exception is transient; keep retrying at the cap rather than auto-pausing.
             backoff = self._bump_reconnect_backoff(platform, info, attempt, None, str(e))
@@ -800,6 +804,54 @@ class GatewayAdapterLifecycleMixin:
                 self._replay_pending_planned_restart_notification(),
             ))
             task.add_done_callback(self._late_failure_callback("planned-restart notification replay failed"))
+
+    async def _recover_spool_after_reconnect(self, platform) -> None:
+        """Claim owed follow-ups before resume and drain them as separate turns."""
+        from gateway.run_pending_recovery import recover_pending_shutdown_flush
+        from gateway.run import _startup_restore_drain_timeout_secs
+        candidates = self._resume_pending_candidates(record_boot=False)
+        queued_before = len(getattr(self, "_startup_restore_queue", []))
+        tasks = []
+        keys = set()
+        try:
+            recover_pending_shutdown_flush(self, candidates=candidates, platform=platform)
+        except Exception:
+            logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
+                           exc_info=True)
+        try:
+            # Recovery scans all served homes, but only the newly available platform resumes.
+            self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
+                                                   restore_tasks=tasks, restore_keys=keys)
+        except Exception:
+            logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                           exc_info=True)
+        keys.update(self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+                    for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
+        if not keys and not tasks:
+            return
+        counts = getattr(self, "_reconnect_restore_keys", None)
+        if counts is None:
+            counts = self._reconnect_restore_keys = {}
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1
+        try:
+            if tasks:
+                await self._wait_bounded_or_release(
+                    set(tasks), _startup_restore_drain_timeout_secs(),
+                    "Reconnect restore released after %.0fs with %d resume turn(s) still running",
+                    "background reconnect auto-resume task failed", level=logging.DEBUG,
+                )
+            # Drain under our own gate even while boot restore is active. Boot skips
+            # keys held here, so skipping here too strands them after both gates open.
+            await self._drain_startup_restore_queue(keys, owned_keys=keys)
+        finally:
+            # The timeout deliberately fails open after a bounded wait; unfinished resume turns
+            # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
+            for key in keys:
+                counts[key] -= 1
+                if not counts[key]:
+                    del counts[key]
+
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""
@@ -830,11 +882,25 @@ class GatewayAdapterLifecycleMixin:
         with suppress(Exception):
             from gateway.channel_directory import build_channel_directory
             await build_channel_directory(self.adapters)
-        # A platform offline at startup skipped its restart-interrupted sessions; resume them now.
-        try:
-            self._schedule_resume_pending_sessions(platform=platform)
-        except Exception:
-            logger.debug("resume-pending reschedule after %s reconnect failed", platform.value, exc_info=True)
+        # A spool held while this adapter was offline must be reclaimed before its
+        # interrupted session resumes, then replayed after the resumed answer.
+        self._start_reconnect_spool_recovery(platform)
+
+    def _start_reconnect_spool_recovery(self, platform) -> None:
+        """One retained recovery worker per platform, independent of the reconnect watcher."""
+        pending = getattr(self, "_reconnect_spool_tasks", None)
+        if pending is None:
+            pending = self._reconnect_spool_tasks = {}
+        if platform in pending and not pending[platform].done():
+            return
+        async def recover():
+            try:
+                await self._recover_spool_after_reconnect(platform)
+            except Exception:
+                logger.warning("Pending recovery after %s reconnect failed", platform.value, exc_info=True)
+            finally:
+                pending.pop(platform, None)
+        pending[platform] = self._retain_background_task(asyncio.create_task(recover()))
 
     async def _cancel_secondary_profile_reconnect_tasks(self) -> None:
         """Cancel profile-scoped reconnects before tearing down their registry, so a reconnect
@@ -1288,11 +1354,7 @@ class GatewayAdapterLifecycleMixin:
                             # What a primary reconnect replays too: the owed notice spans served profiles' home
                             # channels, and sessions boot skipped for this offline adapter wait for this call.
                             self._schedule_planned_restart_replay()
-                            try:
-                                self._schedule_resume_pending_sessions(platform=platform)
-                            except Exception:
-                                logger.debug("resume-pending reschedule after %s reconnect failed (profile: %s)",
-                                             platform.value, profile_name, exc_info=True)
+                            await self._recover_spool_after_reconnect(platform)
                             return
                     # Not installed (newer reconnect won the slot, shutdown began, or connect failed):
                     # release partial resources; stop only for a non-retryable fatal.

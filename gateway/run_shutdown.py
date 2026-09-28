@@ -2064,6 +2064,17 @@ class GatewayShutdownMixin:
             if events:
                 with suppress(Exception):
                     self._flush_owned_pending(session_key, list(events), reason="shutdown", overflow=True)
+        # Claimed follow-ups still have their original spool until replay accepts them.
+        # Fresh inbound held by the restore gate has no spool yet and must be persisted now.
+        for event in list(getattr(self, "_startup_restore_queue", None) or []):
+            spool = getattr(event, "_hermes_recovery_spool", None)
+            if spool is not None and spool.exists():
+                continue
+            try:
+                key = self._session_key_for_source(event.source)
+                self._flush_owned_pending(key, event, reason="restore_shutdown")
+            except Exception:
+                logger.exception("Failed to preserve startup-restore queued event during shutdown")
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
         self._running_agents.clear()
         self._running_agents_ts.clear()
