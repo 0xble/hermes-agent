@@ -833,7 +833,9 @@ class GatewayConfig:
         outbox = pick("durable_outbox")
         if outbox is None:
             outbox = {}
-        if not isinstance(outbox, dict) or type(outbox.get("enabled", False)) is not bool:
+        if not isinstance(outbox, dict):
+            raise ValueError("gateway.durable_outbox must be a mapping with an enabled boolean")
+        if type(outbox.get("enabled", False)) is not bool:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
 
         return cls(

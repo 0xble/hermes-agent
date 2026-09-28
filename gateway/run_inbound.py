@@ -95,7 +95,7 @@ class GatewayInboundMixin:
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    event = dataclasses.replace(event, text=_new_text)
+                    event.text = _new_text
                 break
             if _action == "allow":
                 break
@@ -264,12 +264,12 @@ class GatewayInboundMixin:
                 event_id = uuid.uuid4().hex
                 setattr(event, "_outbox_transport_id", event_id)
             store = store_for(home)
-            turn_id, fresh = store.admit(str(profile), "telegram", event_id, kind)
+            turn_id, fresh = await asyncio.to_thread(
+                store.admit, str(profile), "telegram", event_id, kind)
             setattr(event, "_outbox_turn_id", turn_id)
             setattr(event, "_outbox_home", home)
             if not fresh:
                 setattr(event, "_outbox_duplicate", True)
-                setattr(event, "_outbox_original_result", store.original_result(turn_id))
                 logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
             else:
                 bind_turn(home, turn_id)
@@ -1360,8 +1360,9 @@ class GatewayInboundMixin:
             turn_id = getattr(event, "_outbox_turn_id", None)
             try:
                 if turn_id and not getattr(event, "_outbox_duplicate", False):
-                    store_for(getattr(event, "_outbox_home")).finish_admission(
-                        turn_id, result if isinstance(result, str) else None)
+                    await asyncio.to_thread(
+                        store_for(getattr(event, "_outbox_home")).finish_admission,
+                        turn_id, "completed" if result is not None else "empty")
             finally:
                 restore_turn(token)
 

@@ -12,8 +12,12 @@ from typing import Any, cast
 import pytest
 
 from gateway.outbox import Outbox, active_turn, bind_turn, clear_turn, recover
-from gateway.platforms.base import SendResult
-from gateway.config import GatewayConfig, Platform, load_gateway_config
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource
+from gateway.run_inbound import GatewayInboundMixin
+from gateway.config import GatewayConfig, Platform, PlatformConfig, load_gateway_config
+from unittest.mock import AsyncMock
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -245,7 +249,9 @@ async def test_failed_send_does_not_hold_different_payload(tmp_path, failure):
     adapter._send_text_locked = first_fails
     bind_turn(tmp_path, "fallback-turn")
     try:
-        assert not (await adapter.send("chat", "formatted")).success
+        first = await adapter.send("chat", "formatted")
+        assert first.success is (failure.retry_after is not None)
+        assert first.deferred is (failure.retry_after is not None)
         assert (await adapter.send("chat", "plain fallback")).success
         assert sends == ["formatted", "plain fallback"]
         states = [row.state for row in Outbox(tmp_path).all_rows()]
@@ -333,7 +339,8 @@ async def test_flood_wait_retries_once_without_a_second_final(tmp_path):
     adapter._send_text_locked = limited
     bind_turn(tmp_path, "flood-turn")
     try:
-        assert not (await adapter.send("chat", "final")).success
+        result = await adapter.send("chat", "final")
+        assert result.success and result.deferred
         await asyncio.sleep(0.1)
         assert sends == ["final", "final"]
         assert [r.state for r in Outbox(tmp_path).all_rows()] == ["delivered"]
@@ -356,12 +363,13 @@ async def test_final_retry_does_not_compete_with_inline_retry(tmp_path):
     bind_turn(tmp_path, "single-final")
     try:
         result = await adapter._send_with_retry("chat", "answer", max_retries=2, base_delay=0)
-        assert not result.success
+        assert result.success and result.deferred
+        assert [r.state for r in Outbox(tmp_path).all_rows()] == ["pending"]
         await asyncio.sleep(0.1)
         assert sends == ["answer", "answer"]
-        assert [r.state for r in Outbox(tmp_path).all_rows()] == ["delivered"]
-        event = SimpleNamespace(text="hello", _outbox_turn_id="single-final")
-        assert await adapter._record_delivery_obligation(cast(Any, event), "key", "answer", adapter, False) is None
+        rows = Outbox(tmp_path).all_rows()
+        assert len(rows) == 1 and rows[0].state == "delivered"
+        assert rows[0].turn_id == "single-final"
     finally:
         clear_turn()
 
@@ -440,3 +448,180 @@ def test_additive_schema_does_not_disturb_existing_store(tmp_path):
     Outbox(tmp_path)
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT value FROM older_release").fetchone()[0] == "intact"
+
+
+class _FinalAdapter(TelegramAdapter):
+    def __init__(self, runner, sends):
+        BasePlatformAdapter.__init__(self, PlatformConfig(enabled=True), Platform.TELEGRAM)
+        self.gateway_runner = runner
+        self.sends = sends
+        self._bot = object()
+        self._chat_send_lock = lambda chat: contextlib.nullcontext()
+        self._start_typing_refresh = lambda *a, **kw: None
+        self._stop_typing_refresh = AsyncMock()
+        self._run_processing_hook = AsyncMock()
+        self._fire_post_delivery_callback = AsyncMock()
+        self._flush_text_debounce_now = AsyncMock()
+        self._finish_session_task = lambda *a: None
+
+    async def _send_text_locked(self, chat_id, content, reply_to, metadata):
+        self.sends.append(content)
+        return SendResult(True, message_id=str(len(self.sends)))
+
+
+def _final_fixture(home, sends):
+    class Runner(GatewayInboundMixin):
+        async def _handle_admitted_message(self, event):
+            admitted = await self._hm_admit_event(event)
+            if event.text == "explode":
+                raise RuntimeError("agent failed")
+            return "answer" if admitted and not getattr(event, "_outbox_duplicate", False) else None
+
+        async def _hm_pre_gateway_dispatch_hook(self, event, source):
+            return event
+
+        def _scale_to_zero_note_real_inbound(self):
+            pass
+
+        def _is_user_authorized_for_source(self, source):
+            return True
+
+        def _admit_bot_message_for_source(self, source):
+            return True
+
+        def _resolve_profile_home_for_source(self, source):
+            return home
+
+    runner = Runner()
+    runner.config = SimpleNamespace(durable_outbox_enabled=True, multiplex_profiles=False)
+    adapter = _FinalAdapter(runner, sends)
+    adapter.set_message_handler(runner._handle_message)
+    return adapter
+
+
+def _final_event():
+    return MessageEvent(text="hello", message_type=MessageType.TEXT, message_id="original",
+                        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat", user_id="user"))
+
+
+@pytest.mark.asyncio
+async def test_runner_to_adapter_final_has_exactly_one_outbox_receipt(tmp_path):
+    sends = []
+    adapter = _final_fixture(tmp_path, sends)
+    event = _final_event()
+    await adapter._process_message_background(event, "session")
+    rows = Outbox(tmp_path).all_rows()
+    assert sends == ["answer"]
+    assert len(rows) == 1 and rows[0].turn_id == event._outbox_turn_id
+    assert rows[0].state == "delivered"
+    assert active_turn() is None
+    assert await recover(Outbox(tmp_path), adapter) == (0, 0)
+    assert sends == ["answer"]
+
+
+def _crash_final_before_ack(home):
+    import gateway.outbox as outbox
+    adapter = _final_fixture(home, [])
+    def exit_after_enqueue(store, row):
+        os._exit(0)
+    outbox.Outbox.begin_send = exit_after_enqueue
+    asyncio.run(adapter._process_message_background(_final_event(), "session"))
+
+
+def test_completed_agent_final_recovers_after_crash_before_ack(tmp_path):
+    child = mp.Process(target=_crash_final_before_ack, args=(tmp_path,))
+    child.start()
+    child.join(timeout=10)
+    assert child.exitcode == 0
+    sends = []
+    adapter = _final_fixture(tmp_path, sends)
+    assert asyncio.run(recover(Outbox(tmp_path), adapter)) == (1, 0)
+    assert sends == ["answer"]
+    assert asyncio.run(recover(Outbox(tmp_path), adapter)) == (0, 0)
+    assert sends == ["answer"]
+
+
+@pytest.mark.asyncio
+async def test_live_retry_cannot_claim_fresh_pending_row(tmp_path, monkeypatch):
+    store = Outbox(tmp_path)
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    original = store.begin_send
+    def race(row):
+        # A live retry wakes on another event loop after enqueue but before
+        # this send claims its row; it must not dispatch the fresh payload.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            attempt = pool.submit(lambda: asyncio.run(recover(store, adapter, startup=False)))
+            assert attempt.result(timeout=5) == (0, 0)
+        return original(row)
+    monkeypatch.setattr(store, "begin_send", race)
+    monkeypatch.setattr("gateway.outbox.store_for", lambda home: store)
+    bind_turn(tmp_path, "race")
+    try:
+        assert (await adapter.send("chat", "answer")).success
+        assert sends == [("chat", "answer")]
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_stream_final_deferral_has_one_durable_retry_no_fallback(tmp_path):
+    from gateway.outbox import run_turn_child
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    async def limited(chat_id, content, reply_to, metadata):
+        sends.append(content)
+        if len(sends) == 1:
+            return SendResult(False, error="flood_control:0.01", retry_after=0.01)
+        return SendResult(True, message_id="final")
+    adapter._send_text_locked = limited
+    bind_turn(tmp_path, "stream-deferred")
+    try:
+        consumer = GatewayStreamConsumer(
+            adapter, "chat", StreamConsumerConfig(buffer_only=True, cursor="", transport="edit"))
+        task = asyncio.create_task(run_turn_child(consumer.run(), active_turn()))
+        consumer.on_delta("answer")
+        consumer.finish("answer")
+        await task
+        assert consumer.delivered_final_matches("answer")
+        await asyncio.sleep(0.1)
+        assert sends == ["answer", "answer"]
+        assert [row.state for row in Outbox(tmp_path).all_rows()] == ["delivered"]
+    finally:
+        clear_turn()
+
+
+def test_scalar_outbox_setting_reports_required_mapping():
+    with pytest.raises(ValueError, match="durable_outbox.*mapping"):
+        GatewayConfig.from_dict({"gateway": {"durable_outbox": True}})
+
+
+@pytest.mark.asyncio
+async def test_error_notice_after_handler_is_outbox_receipted(tmp_path):
+    sends = []
+    adapter = _final_fixture(tmp_path, sends)
+    event = _final_event()
+    event.text = "explode"
+    await adapter._process_message_background(event, "session")
+    rows = Outbox(tmp_path).all_rows()
+    assert len(rows) == 1 and rows[0].turn_id == event._outbox_turn_id
+    assert rows[0].state == "delivered"
+    assert len(sends) == 1 and "encountered an error" in sends[0]
+
+
+@pytest.mark.asyncio
+async def test_ledger_covers_outbox_event_without_active_send_binding(tmp_path, monkeypatch):
+    import gateway.delivery_ledger as ledger
+    recorded = []
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
+    monkeypatch.setattr(ledger, "record_obligation", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(ledger, "mark_attempting", lambda obligation_id: None)
+    adapter = _final_fixture(tmp_path, [])
+    event = _final_event()
+    event._outbox_turn_id = "admitted"
+    event._outbox_home = tmp_path
+    obligation = await adapter._record_delivery_obligation(event, "session", "answer", adapter, False)
+    assert obligation is not None
+    assert len(recorded) == 1 and recorded[0]["content"] == "answer"

@@ -46,6 +46,16 @@ def bind_turn(home: Path, turn_id: str) -> None:
     _CURRENT_TURN.set((Path(home), turn_id, asyncio.current_task()))
 
 
+def bind_event_turn(event) -> contextvars.Token:
+    """Re-enter the admitted turn for adapter delivery after the runner returns."""
+    token = scoped_turn_entry()
+    turn_id = getattr(event, "_outbox_turn_id", None)
+    home = getattr(event, "_outbox_home", None)
+    if turn_id and home is not None and not getattr(event, "_outbox_duplicate", False):
+        bind_turn(home, turn_id)
+    return token
+
+
 def clear_turn() -> None:
     _CURRENT_TURN.set(None)
 
@@ -151,6 +161,7 @@ def durable_egress(kind: str):
             payload.update(bound.arguments.get("kwargs", {}))
             return await deliver(self, kind, payload, lambda p: method(self, **p))
 
+        setattr(wrapped, "_durable_outbox", True)
         return wrapped
     return decorate
 
@@ -250,8 +261,8 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
             try:
                 row = store.enqueue(turn_id, kind, durable)
             except (TypeError, ValueError) as exc:
-                logger.warning("Outbox could not serialize %s; using ordinary transport: %s", kind, exc)
-                return await send(payload)
+                logger.error("Outbox could not serialize %s; refusing unreceipted transport: %s", kind, exc)
+                return SendResult(success=False, error="outbox payload could not be serialized")
         if not store.begin_send(row):
             return SendResult(success=False, error="earlier outbox row is unresolved")
         try:
@@ -268,6 +279,9 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
                                   retry_after=retry_after)
         if scheduled:
             _schedule_retry(store, adapter)
+            # The send is accepted for durable redelivery. Consumers must not
+            # launch an independent fallback while this row is waiting.
+            return SendResult(success=True, deferred=True, retry_after=retry_after)
         if result.success:
             _discard_delivered_media(home, row.payload)
         return result
@@ -282,18 +296,18 @@ def _schedule_retry(store: "Outbox", adapter) -> None:
         async def redeliver(key=key, deadline=deadline):
             try:
                 await asyncio.sleep(max(0, deadline - time.time()))
-                await recover(store, adapter)
+                await recover(store, adapter, startup=False)
             finally:
                 _RETRY_TASKS.pop(key, None)
         task = asyncio.create_task(redeliver())
         _RETRY_TASKS[key] = task
 
 
-async def recover(store: "Outbox", adapter) -> tuple[int, int]:
-    """Replay only proven-unsent rows. 'sending' is always held for inspection."""
+async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[int, int]:
+    """Replay proven-unsent rows; only boot replays fresh unclaimed rows."""
     sent = 0
     while True:
-        pending = store.pending()
+        pending = store.pending(startup=startup)
         if not pending:
             break
         advanced = False
@@ -519,11 +533,15 @@ class Outbox:
         return OutboxRow(row["turn_id"], row["sequence"], row["type"], json.loads(row["payload"]),
                          row["idempotency_key"], row["owner_epoch"], row["state"], row["message_id"])
 
-    def pending(self) -> list[OutboxRow]:
+    def pending(self, *, startup: bool = True) -> list[OutboxRow]:
         with self._connect() as db:
+            if startup:
+                return [self._row(r) for r in db.execute(
+                    "SELECT * FROM outbox WHERE state='pending' AND (retry_at IS NULL OR retry_at<=?) "
+                    "ORDER BY rowid", (time.time(),))]
             return [self._row(r) for r in db.execute(
-                "SELECT * FROM outbox WHERE state='pending' AND (retry_at IS NULL OR retry_at<=?) "
-                "ORDER BY rowid", (time.time(),))]
+                "SELECT * FROM outbox WHERE state='pending' AND retry_at<=? ORDER BY rowid",
+                (time.time(),))]
 
     def scheduled(self) -> list[tuple[OutboxRow, float]]:
         with self._connect() as db:

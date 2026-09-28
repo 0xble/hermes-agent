@@ -1669,6 +1669,7 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    deferred: bool = False  # accepted by a durable outbox, not yet acknowledged by transport
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -3645,17 +3646,22 @@ class BasePlatformAdapter(ABC):
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
-        text, eph_ttl = self._unwrap_ephemeral(response)
-        if not text:
-            return
-        if log_cmd is not None:
-            logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
-                        len(text), event.source.chat_id)
-        result = await self._send_with_retry(
-            chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
-        if eph_ttl > 0 and result.success and result.message_id:
-            self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+        from gateway.outbox import bind_event_turn, restore_turn
+        token = bind_event_turn(event)
+        try:
+            text, eph_ttl = self._unwrap_ephemeral(response)
+            if not text:
+                return
+            if log_cmd is not None:
+                logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
+                            len(text), event.source.chat_id)
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_meta))
+            if eph_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+        finally:
+            restore_turn(token)
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
@@ -3702,15 +3708,6 @@ class BasePlatformAdapter(ABC):
             return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
-        if (self.platform == Platform.TELEGRAM and result.retry_after is not None and
-                not (isinstance(metadata, dict) and metadata.get("_interim_send")) and
-                getattr(getattr(getattr(self, "gateway_runner", None), "config", None),
-                        "durable_outbox_enabled", False)):
-            from gateway.outbox import active_turn
-            if active_turn() is not None:
-                # The outbox already persisted one timed retry. The inline loop
-                # must not race that timer and produce two final messages.
-                return result
         if result.success or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
@@ -4346,9 +4343,15 @@ class BasePlatformAdapter(ABC):
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
-        if (is_ephemeral_response or
-                (getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)
-                 and getattr(event, "_outbox_turn_id", None)) or
+        from gateway.outbox import active_turn
+        outbox_turn = (getattr(event, "_outbox_home", None), getattr(event, "_outbox_turn_id", None))
+        outbox_covers_send = (
+            getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)
+            and delivery_adapter.platform == Platform.TELEGRAM
+            and getattr(type(delivery_adapter).send, "_durable_outbox", False)
+            and active_turn() == outbox_turn
+        )
+        if (is_ephemeral_response or outbox_covers_send or
                 str(event.text or "").lstrip().startswith(
                     ("/", self.typed_command_prefix or "!"))):
             return None
@@ -4704,11 +4707,14 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
+        turn_token = scoped_turn_entry()
         delivery_generation = None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            bind_event_turn(event)
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
@@ -4800,6 +4806,7 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            bind_event_turn(event)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4807,6 +4814,7 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            restore_turn(turn_token)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
