@@ -726,6 +726,9 @@ class GatewayNotificationsMixin:
                             self._defer_update_notice(*current, result)
                         return consumed
                 except Exception:
+                    current = self._current_update(self._update_paths(), original)
+                    if current and current[1].get("notification_version") == 2:
+                        self._defer_update_notice(*current)
                     logger.debug("Update stream send failed", exc_info=True)
                     return consumed
             consumed += len(chunk.encode("utf-8", errors="surrogateescape"))
@@ -1030,6 +1033,10 @@ class GatewayNotificationsMixin:
             # cleanup contract while native reason-bearing markers remain durable.
             if legacy_marker and paths is not None and pending is not None:
                 self._clear_update_markers(paths, None, original)
+            elif paths is not None and original is not None:
+                current = self._current_update(paths, original)
+                if current and current[1].get("notification_version") == 2:
+                    self._defer_update_notice(*current)
             return False
         finally:
             self._update_final_send_active = False

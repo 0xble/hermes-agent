@@ -505,12 +505,16 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   Phases, output checkpoints, and final sends retain the starting identity across awaited
   adapter sends, so an in-flight old notice cannot adopt, announce, or alter the new request.
   Housekeeping retries post-deadline notices with persisted exponential backoff honoring
-  the platform's `retry_after`; a never-connected adapter retains its existing expiry.
-  No profile state or updater process is restarted by these retries.
+  the platform's `retry_after`; raised delivery errors in phase acknowledgements,
+  output chunks and final notices use the same backoff as failed send results.
+  A never-connected adapter retains its existing expiry. No profile state or
+  updater process is restarted by these retries.
 - Guards: `tests/gateway/test_agent_update_launcher.py` (finished, unfinished, claimed,
   concurrent and failed-spawn admission) and
   `tests/gateway/test_update_lifecycle_notifications.py` (post-deadline retry, flood
-  delay, stream/final retry, adapter expiry, and
+  delay, stream/final retry, adapter expiry,
+  `test_post_deadline_delivery_exception_persists_retry_backoff` for output,
+  final notice and phase acknowledgement, and
   `test_inflight_old_notice_cannot_mutate_superseding_request` for final notice,
   final output, phase acknowledgement and watcher checkpoint).
 - Related upstream [#42191](https://github.com/NousResearch/hermes-agent/pull/42191) preserves state after a soft send failure but does not admit a subsequent request or schedule post-deadline retries; [#111307](https://github.com/NousResearch/hermes-agent/pull/111307) addresses a distinct `fleet_restart_pending` warning. Both were open at qualification, neither is an equivalent released replacement.

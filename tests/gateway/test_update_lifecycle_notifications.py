@@ -418,6 +418,54 @@ async def test_notice_retry_honors_flood_delay_and_prior_result(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("send_path", ["final_notice", "final_output", "phase_ack"])
+@pytest.mark.parametrize("error", [TimeoutError("transport timed out"), Exception("transport unavailable")])
+async def test_post_deadline_delivery_exception_persists_retry_backoff(tmp_path, send_path, error):
+    pending(tmp_path)
+    marker, record = read_pending(tmp_path)
+    if send_path != "phase_ack":
+        record["updating_notified"] = True
+    marker.write_text(json.dumps(record), encoding="utf-8")
+    if send_path == "final_output":
+        (tmp_path / ".update_output.txt").write_text("native output\n", encoding="utf-8")
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(side_effect=error))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    # A completed watcher cannot retry; only the housekeeping tick remains.
+    runner._update_notification_task = asyncio.get_running_loop().create_future()
+    runner._update_notification_task.set_result(None)
+
+    class Clock(datetime):
+        instant = datetime.now(timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.instant.astimezone(tz) if tz else cls.instant.replace(tzinfo=None)
+
+    with patch("gateway.run._hermes_home", tmp_path), patch("gateway.run_notifications.datetime", Clock):
+        runner._retry_update_notice_if_due()
+        await runner._update_notice_retry_task
+        first = read_pending(tmp_path)[1]
+        assert adapter.send.call_count == 1
+        assert first["notice_attempts"] == 1
+        assert first["notice_retry_at"] > Clock.now(timezone.utc).timestamp()
+        assert first.get("output_offset", 0) == 0
+        for _ in range(3):
+            runner._retry_update_notice_if_due()
+            await asyncio.sleep(0)
+        assert adapter.send.call_count == 1
+        Clock.instant = datetime.fromtimestamp(first["notice_retry_at"] + 1, timezone.utc)
+        runner._retry_update_notice_if_due()
+        await runner._update_notice_retry_task
+        second = read_pending(tmp_path)[1]
+        assert adapter.send.call_count == 2
+        assert second["notice_attempts"] == 2
+        assert second["notice_retry_at"] - Clock.now(timezone.utc).timestamp() >= 120
+        assert second.get("output_offset", 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_missing_adapter_retries_then_expires_without_success_claim(tmp_path, caplog):
     runner = _make_runner()
     runner.adapters = {}
