@@ -487,3 +487,48 @@ async def test_whitespace_only_trailing_output_does_not_hold_the_final_notice(tm
     assert messages[-1].startswith("✅ Update Complete")
     assert not any("timed out" in m.lower() or "still running" in m.lower() for m in messages)
     assert read_pending(tmp_path) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_path", ["final_notice", "final_output", "phase", "watcher_output"])
+async def test_inflight_old_notice_cannot_mutate_superseding_request(tmp_path, send_path):
+    old = pending(tmp_path)
+    if send_path != "phase":
+        marker, record = read_pending(tmp_path)
+        record["updating_notified"] = True
+        marker.write_text(json.dumps(record), encoding="utf-8")
+    if send_path in {"final_output", "watcher_output"}:
+        (tmp_path / ".update_output.txt").write_text("A" * 3500 + "B")
+    finalize_update(tmp_path)
+    messages = []
+
+    async def send(_chat, text, **_kwargs):
+        messages.append(text)
+        if len(messages) == 1:
+            result = launch_native_update(
+                home=tmp_path, hermes_cmd=["hermes"],
+                pending={**old, "reason": "second request",
+                         "timestamp": datetime.now(timezone.utc).isoformat()}, spawn=Mock(),
+            )
+            assert result["started"] is True
+        return SimpleNamespace(success=True)
+
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=send)}
+    with patch("gateway.run._hermes_home", tmp_path):
+        if send_path in {"final_notice", "final_output"}:
+            assert await runner._send_update_notification() is False
+        elif send_path == "phase":
+            assert await runner._send_update_phase("updating") is False
+        else:
+            await asyncio.wait_for(runner._watch_update_progress(
+                poll_interval=.01, stream_interval=0, timeout=.1), 2)
+    current = read_pending(tmp_path)
+    assert current is not None
+    assert current[1]["reason"] == "second request"
+    assert current[1]["request_id"] != old["request_id"]
+    assert current[1]["previous_outcome"]["reason"] == old["reason"]
+    assert not current[1].get("updating_notified")
+    assert not current[1].get("output_offset")
+    assert not current[1].get("notice_retry_at")
+    assert len(messages) == 1
