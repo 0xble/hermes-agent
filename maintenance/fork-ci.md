@@ -174,6 +174,24 @@ A poison global config with `commit.gpgsign=true` fails setup before the patch,
 and all 95 affected tests pass after it. Retire the fork adaptation when a
 released upstream revision provides the same hermetic tests.
 
+## Audio playback isolation
+
+The `fork-ci-reliability` identity also covers test audio isolation. The autouse
+`_audio_playback_guard` stubbed only `hermes_cli.voice`, but the streaming TTS
+pipeline late-imports `tools.voice_mode.play_audio_file`. On macOS,
+`TestStreamTtsToSpeaker::test_none_sentinel_flushes_buffer` synthesized "Hello
+world." through keyless Edge TTS and played it with `afplay` on every run. The
+guard now also stubs `tools.voice_mode.play_audio_file` and
+`_play_int16_via_tempfile`. The sentinel test fakes synthesis and asserts one
+playback. Tests that exercise playback with mocked backends opt out through
+`@pytest.mark.real_audio_playback`. This adopts upstream
+[PR #111089](https://github.com/NousResearch/hermes-agent/pull/111089) by
+yanglei070-ux for [issue #88898](https://github.com/NousResearch/hermes-agent/issues/88898).
+The adaptation keeps the fork's portable `TestPlayBeep` and Linux-only WSL2
+class, and omits upstream opt-out tests the fork already removed. A logging
+`afplay` shim on `PATH` recorded one call on the base and none with the patch.
+Retire when a released upstream revision carries equivalent guard coverage.
+
 ## Verification and retirement
 
 The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`

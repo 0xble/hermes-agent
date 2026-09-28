@@ -107,3 +107,9 @@ def test_voice_env_does_not_leak_into_the_next_test():
     assert server._voice_mode_enabled() is False
 
 
+def test_voice_mode_playback_sink_is_stubbed():
+    """Late-import playback paths are covered by the same guard."""
+    import tools.voice_mode as voice_mode
+
+    assert voice_mode.play_audio_file.__name__ == "_blocked_play_audio_file"
+    assert voice_mode._play_int16_via_tempfile(None, 24000) is None
