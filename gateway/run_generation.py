@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import signal
+import time
 from contextlib import suppress
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from gateway.generation import (
     remove_generation_files,
     write_generation_record,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def start_active_generation(config) -> "ActiveGeneration | None":
@@ -93,6 +97,8 @@ class ActiveGeneration:
         self.server: GatewayControlServer | None = None
         self.task: asyncio.Task | None = None
         self.socket_stat = None
+        self._last_runtime: dict | None = None
+        self._last_status_write = 0.0
 
     async def start(self) -> None:
         for name in ("pid", "host"):
@@ -118,14 +124,26 @@ class ActiveGeneration:
         # project the compatibility status to the generation-scoped record.
         if runtime.get("pid") != self.identity.pid:
             runtime = {}
+        now = time.monotonic()
+        if runtime == self._last_runtime and now - self._last_status_write < 30:
+            return
         write_generation_record(self.paths["state"], self.identity, state="ready",
                                 socket_path=self.paths["socket"], runtime=runtime)
+        self._last_runtime = runtime.copy()
+        self._last_status_write = now
 
     async def _heartbeat(self) -> None:
+        last_warning = 0.0
         while True:
             await asyncio.sleep(1)
-            await asyncio.to_thread(self._sync_runtime_status)
-            await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id)
+            try:
+                await asyncio.to_thread(self._sync_runtime_status)
+                await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id)
+            except Exception:
+                now = time.monotonic()
+                if now - last_warning >= 30:
+                    logger.warning("active generation heartbeat failed; retrying", exc_info=True)
+                    last_warning = now
 
     async def close(self) -> None:
         if self.task:
@@ -182,7 +200,12 @@ async def serve_standby_generation(config=None) -> bool:
     socket_path = paths["socket"]
     if len(os.fsencode(socket_path)) >= 100:
         raise RuntimeError("generation control socket path exceeds UNIX socket limit")
-    server = await asyncio.start_unix_server(report_ready, path=str(socket_path))
+    old_umask = os.umask(0o177)
+    try:
+        server = await asyncio.start_unix_server(report_ready, path=str(socket_path))
+    finally:
+        os.umask(old_umask)
+    os.chmod(socket_path, 0o600)
     socket_stat = paths["socket"].stat()
     write_generation_record(paths["state"], identity, state="ready", socket_path=socket_path)
     coordinator.heartbeat(identity.id, state="ready")
@@ -196,11 +219,18 @@ async def serve_standby_generation(config=None) -> bool:
             continue
         installed.append(sig)
     try:
+        last_warning = 0.0
         while not stop.is_set():
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
-                await asyncio.to_thread(coordinator.heartbeat, identity.id)
+                try:
+                    await asyncio.to_thread(coordinator.heartbeat, identity.id)
+                except Exception:
+                    now = time.monotonic()
+                    if now - last_warning >= 30:
+                        logger.warning("standby generation heartbeat failed; retrying", exc_info=True)
+                        last_warning = now
     finally:
         server.close()
         await server.wait_closed()

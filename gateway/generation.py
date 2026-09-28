@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS generations (
   id TEXT PRIMARY KEY, release_sha TEXT NOT NULL, label TEXT NOT NULL,
   pid INTEGER NOT NULL, started_at REAL NOT NULL, boot_id TEXT NOT NULL,
   start_fingerprint TEXT NOT NULL, state TEXT NOT NULL,
-  heartbeat_at REAL NOT NULL, drain_deadline REAL
+  heartbeat_at REAL NOT NULL, drain_deadline REAL, suspect_from_state TEXT
 );
 CREATE TABLE IF NOT EXISTS leases (
   resource TEXT PRIMARY KEY, epoch INTEGER NOT NULL, generation_id TEXT NOT NULL,
@@ -98,6 +98,9 @@ class GenerationCoordinator:
         with self.connect() as conn:
             conn.executescript(_SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(generations)")}
+            if "suspect_from_state" not in columns:
+                conn.execute("ALTER TABLE generations ADD COLUMN suspect_from_state TEXT")
             version = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
             if version is None:
                 conn.execute("INSERT INTO schema_meta(key,value) VALUES('version', ?)",
@@ -117,15 +120,31 @@ class GenerationCoordinator:
                 (identity.id, identity.release_sha, identity.label, identity.pid,
                  identity.started_at, identity.boot_id, identity.start_fingerprint, state, now),
             )
+            # Bound terminal history at registration without ever deleting a live or
+            # leased generation; remove released lease references before rows.
+            terminal = conn.execute(
+                "SELECT g.id,g.started_at FROM generations g "
+                "WHERE g.state IN ('exited','failed') AND NOT EXISTS "
+                "(SELECT 1 FROM leases l WHERE l.generation_id=g.id AND l.state!='released') "
+                "ORDER BY g.started_at DESC,g.id DESC"
+            ).fetchall()
+            stale = [(row["id"],) for rank, row in enumerate(terminal)
+                     if rank >= 20 or row["started_at"] < now - 7 * 86400]
+            if stale:
+                conn.executemany("DELETE FROM leases WHERE generation_id=? AND state='released'", stale)
+                conn.executemany("DELETE FROM generations WHERE id=?", stale)
             conn.commit()
 
     def heartbeat(self, generation_id: str, *, state: str | None = None) -> None:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if state is None:
-                conn.execute("UPDATE generations SET heartbeat_at=? WHERE id=?", (time.time(), generation_id))
+                conn.execute(
+                    "UPDATE generations SET heartbeat_at=?, "
+                    "state=CASE WHEN state='suspect' THEN COALESCE(suspect_from_state,'ready') ELSE state END, "
+                    "suspect_from_state=NULL WHERE id=?", (time.time(), generation_id))
             else:
-                conn.execute("UPDATE generations SET heartbeat_at=?,state=? WHERE id=?",
+                conn.execute("UPDATE generations SET heartbeat_at=?,state=?,suspect_from_state=NULL WHERE id=?",
                              (time.time(), state, generation_id))
             conn.commit()
 
@@ -151,7 +170,10 @@ class GenerationCoordinator:
                     conn.execute("UPDATE generations SET state='failed' WHERE id=?", (row["generation_id"],))
                 else:
                     if time.time() - holder["heartbeat_at"] > 5:
-                        conn.execute("UPDATE generations SET state='suspect' WHERE id=?", (row["generation_id"],))
+                        conn.execute(
+                            "UPDATE generations SET suspect_from_state=CASE WHEN state='suspect' "
+                            "THEN suspect_from_state ELSE state END,state='suspect' WHERE id=?",
+                            (row["generation_id"],))
                         conn.commit()
                         raise RuntimeError(f"lease {resource!r} is suspect: holder PID {pid} is alive; takeover refused")
                     raise RuntimeError(f"lease {resource!r} is held by another generation")
@@ -234,7 +256,7 @@ def remove_generation_files(home: Path, identity: GenerationIdentity) -> None:
 def overlap_handover_enabled(config: Any) -> bool:
     value = config
     if isinstance(config, dict):
-        value = (config.get("gateway") or {}).get("overlap_handover", {}).get("enabled", False)
+        value = ((config.get("gateway") or {}).get("overlap_handover") or {}).get("enabled", False)
     else:
         value = getattr(config, "overlap_handover_enabled", False)
     return bool(value)

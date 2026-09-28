@@ -3,12 +3,15 @@
 Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
+import argparse
 import asyncio
 import contextlib
+import io
 from hermes_cli.cli_output import line_input  # noqa: F401 — resolved lazily by siblings through the facade
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -17,6 +20,7 @@ import sys
 import textwrap
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from hermes_cli import setup_platforms  # noqa: F401 — resolved lazily by siblings through the facade
 
@@ -629,6 +633,34 @@ def _iter_proc_cmdlines(exclude_pids: set[int]):
         yield pid, cmdline.replace("\x00", " ")
 
 
+@lru_cache(maxsize=1)
+def _gateway_scan_parser() -> argparse.ArgumentParser:
+    """Use the actual gateway parser to classify the run mode, not an argv substring."""
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+    parser = argparse.ArgumentParser(add_help=False)
+    groups = parser.add_subparsers(dest="command")
+    noop = lambda *_: None
+    build_gateway_parser(groups, cmd_gateway=noop, cmd_proxy=noop, cmd_gateway_enroll=noop)
+    return parser
+
+
+def _scan_is_standby(command: str) -> bool:
+    try:
+        tokens = shlex.split(command, posix=False)
+    except ValueError:
+        return False
+    run_index = next((i for i in range(len(tokens) - 1)
+                      if tokens[i:i + 2] == ["gateway", "run"]), None)
+    if run_index is None:
+        return False
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            args, _ = _gateway_scan_parser().parse_known_args(tokens[run_index:])
+        return bool(args.standby)
+    except (SystemExit, ValueError, AttributeError):
+        return False
+
+
 def _scan_gateway_pids(
     exclude_pids: set[int], all_profiles: bool = False, include_restart_managers: bool = False
 ) -> list[int]:
@@ -673,18 +705,10 @@ def _scan_gateway_pids(
                 or command_line_names_hermes_home(command_lc, current_home_lc))
 
     def _consider(pid: int, command: str) -> None:
-        # Passive overlap generations are not gateway dispatchers. Do not count them as
-        # duplicate active gateways in the legacy process-scan fallback.
-        try:
-            import shlex
-            if "--standby" in shlex.split(command):
-                return
-        except ValueError:
-            pass
         matches_runtime = looks_like_gateway_command_line(command) or (
             include_restart_managers and looks_like_gateway_runtime_command_line(command)
         )
-        if matches_runtime and (all_profiles or _matches_current_profile(command)):
+        if matches_runtime and not _scan_is_standby(command) and (all_profiles or _matches_current_profile(command)):
             _append_unique_pid(pids, pid, exclude_pids)
 
     try:

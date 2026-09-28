@@ -1,14 +1,15 @@
-from __future__ import annotations
+"""Pinned launchd definitions for an opt-in overlapping gateway generation.
 
-"""Pinned launchd definitions for an opt-in overlapping gateway generation."""
+Rendering and bootstrap are exposed here but wired into the update flow in a later slice.
+"""
+from __future__ import annotations
 
 from pathlib import Path
 import plistlib
 import subprocess
 
 
-# Overlap helpers are intentionally separate from the legacy renderer above. They are pure and
-# can be used by the updater without changing the installed gateway definition.
+# Pure definitions only; updater wiring and lifecycle orchestration ship later.
 def generation_launchd_label(slot: str) -> str:
     """Return the alternating generation label used by overlap handover."""
     normalized = str(slot).strip().lower()
