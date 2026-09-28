@@ -2959,8 +2959,11 @@ def get_python_path() -> str:
     # platform is not its service executable, so fall back to that platform's
     # ordinary interpreter unless a real current target exists.
     if is_macos():
-        raw = read_raw_config() or {}
-        updates = raw.get("updates", {}) if isinstance(raw, dict) else {}
+        # The launchd executable decision needs effective user settings, including
+        # managed scope, but not DEFAULT_CONFIG or updater validation side effects.
+        from hermes_cli.config_effective import load_user_config_effective
+        config = load_user_config_effective()
+        updates = config.get("updates", {})
         enabled = isinstance(updates, dict) and updates.get("immutable_releases") is True
     else:
         enabled = False

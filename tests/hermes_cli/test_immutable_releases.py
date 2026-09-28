@@ -496,7 +496,10 @@ def test_repeated_rollback_is_noop_without_fleet_relaunch(tmp_path, monkeypatch,
     assert (home / "current").resolve() == first
 
 
-@pytest.mark.parametrize("pointer", ["dangling", "outside", "unready", "missing_python"])
+@pytest.mark.parametrize("pointer", [
+    pytest.param("dangling", marks=pytest.mark.macos_only),
+    "outside", "unready", "missing_python",
+])
 def test_gateway_interpreter_refuses_broken_immutable_current(tmp_path, monkeypatch, pointer):
     from hermes_cli import gateway
     home = tmp_path / "profile"
@@ -514,6 +517,21 @@ def test_gateway_interpreter_refuses_broken_immutable_current(tmp_path, monkeypa
         (root / ".venv/bin/python").unlink()
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
     with pytest.raises(RuntimeError, match="current.*hermes update --rollback"):
+        gateway.get_python_path()
+
+
+@pytest.mark.macos_only
+def test_gateway_interpreter_honors_managed_immutable_opt_in(tmp_path, monkeypatch):
+    from hermes_cli import gateway
+    home = tmp_path / "profile"
+    managed = tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    (managed / "config.yaml").write_text("updates:\n  immutable_releases: true\n")
+    (home / "release-layout.json").write_text("{}")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    with pytest.raises(RuntimeError, match="Invalid immutable release current pointer"):
         gateway.get_python_path()
 
 

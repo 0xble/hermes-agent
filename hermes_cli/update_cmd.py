@@ -296,10 +296,17 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
         return False
 
 
+class UpdateConfigurationLoadError(Exception):
+    """Config could not be read before updater options were resolved."""
+
+
 def _updates_config() -> dict:
     """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors."""
     from hermes_cli.config import load_config, validate_config_structure
-    config = load_config() or {}
+    try:
+        config = load_config() or {}
+    except Exception as exc:
+        raise UpdateConfigurationLoadError(str(exc)) from exc
     issues = [issue for issue in validate_config_structure({"updates": config.get("updates")})
               if issue.severity == "error"]
     if issues:
