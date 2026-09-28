@@ -85,6 +85,14 @@ def test_unrelated_invalid_update_key_does_not_block_repair(tmp_path, monkeypatc
 
 
 @pytest.mark.macos_only
+def test_overlap_generation_guardian_is_observe_only(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
+    monkeypatch.setattr(guardian, "_run", lambda *a, **kw: pytest.fail("legacy repair reached"))
+    assert guardian.run_once(home, plist, label) == "waiting"
+    assert guardian.run_once(home, plist, label, grace=1) == "waiting"
+
+
 def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)

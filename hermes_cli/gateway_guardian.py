@@ -282,10 +282,16 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             return "locked"
         try:
             from hermes_cli.config import _validate_updates
-            if grace is None:
-                from hermes_cli.config_effective import load_user_config_effective
-                config = load_user_config_effective(home / "config.yaml", fail_closed=True)
-            else:
+            from hermes_cli.config_effective import load_user_config_effective
+            config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+            # The legacy guardian only knows one launchd label. Until overlap repair has
+            # its own fenced protocol, it must not bootstrap or roll back either generation.
+            gateway_config = config.get("gateway") or {}
+            if (isinstance(gateway_config, dict) and
+                    isinstance(gateway_config.get("overlap_handover"), dict) and
+                    gateway_config["overlap_handover"].get("enabled") is True):
+                return "waiting"
+            if grace is not None:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
             updates = config.get("updates")
             if updates is not None and not isinstance(updates, dict):
