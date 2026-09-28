@@ -95,14 +95,16 @@ def _quiet_kill(kill: Callable, proc) -> None:
 def kill_live_foreground_processes(*, now: bool = False) -> int:
     """Kill every in-flight foreground command's process tree; returns how many were signalled.
 
-    ``now=True`` is for a caller about to ``os._exit``: the graceful kill TERMs, waits and only then
-    KILLs, so a SIGTERM-ignoring command outlives a hard exit that lands inside that window. It also
-    raises the exit fence and waits for spawns already past it to register, so no command started
-    around the snapshot survives, and it never blocks past ``_HARD_KILL_BUDGET_S``: SDK cancels
+    Both exit paths fence new spawns and wait for children already spawning to register before
+    taking their snapshot. ``now=True`` is for a caller about to ``os._exit``: the graceful kill
+    TERMs, waits and only then KILLs, so a SIGTERM-ignoring command outlives a hard exit that lands
+    inside that window. The hard path never blocks past ``_HARD_KILL_BUDGET_S``: SDK cancels
     (Modal, Daytona, Vercel) run on daemon threads under that one deadline."""
     global _exit_fenced
     if not now:
         with _live_foreground_cond:
+            _exit_fenced = True
+            _live_foreground_cond.wait_for(lambda: _spawns_in_flight == 0)
             live = list(_live_foreground.values())
         for env, proc in live:
             _quiet_kill(env._kill_process, proc)
