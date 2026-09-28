@@ -3761,7 +3761,28 @@ def _commit_compaction(
                 from agent.context_compressor import PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, stamp_db_persisted_markers
                 # Tail rows tagged by compress() are archived as superseded duplicates, not
                 # compacted=1. Count against the FINAL list — salvage may have dropped rows.
-                tail_count = sum(1 for m in compressed if id(m) in _tail_tagged_ids)
+                def _tail_row_is_still_verbatim(message: dict) -> bool:
+                    row_id = message.get("_row_id")
+                    if not isinstance(row_id, int) or isinstance(row_id, bool) or row_id <= 0:
+                        return True
+                    source = next(
+                        (candidate for candidate in messages
+                         if isinstance(candidate, dict) and candidate.get("_row_id") == row_id),
+                        None,
+                    )
+                    if source is None:
+                        return True
+                    return (
+                        source.get("role") == message.get("role")
+                        and source.get("content") == message.get("content")
+                        and source.get("tool_calls") == message.get("tool_calls")
+                    )
+                tail_count = sum(
+                    1 for m in compressed
+                    if id(m) in _tail_tagged_ids
+                    and isinstance(m, dict)
+                    and _tail_row_is_still_verbatim(m)
+                )
                 # The rewind takes the newest `tail_count` durable rows as the tail's originals, so a tail row
                 # with none (this turn's user row, which the CLI and gateway persist after preflight; unflushed
                 # scaffolding) would flag a summarized row superseded instead: gone from display and search.
@@ -4234,13 +4255,10 @@ def compress_context(
         # reply has to be back in its chronological slot before they look.
         from agent.conversation_compression_reply_anchor import _ensure_compressed_keeps_last_assistant_reply
 
-        # `/compress here N` hands only the HEAD in as `messages` and carries the kept tail
-        # separately: the head's last assistant is an OLD reply the user explicitly asked to
-        # fold, not the just-delivered one (which lives in the verbatim tail), so the guard
-        # must not undo the compression it was asked for.
-        reinserted_reply = None if verbatim_tail else _ensure_compressed_keeps_last_assistant_reply(
+        reinserted_reply = _ensure_compressed_keeps_last_assistant_reply(
             messages, compressed, session_id=agent.session_id,
         )
+        carried_reply = reinserted_reply
         if reinserted_reply is not None:
             logger.info(
                 "Compression: engine folded away the just-delivered assistant reply; reinserted it into the "
@@ -4258,7 +4276,7 @@ def compress_context(
             # both); carry exactly that one row so the commit rewinds the durable original instead
             # of archiving it compacted=1 next to a fresh twin (display would show it twice). The
             # todo fold / user-anchor rows added above are NOT carried: they keep their own class.
-            carried_messages=[reinserted_reply] if reinserted_reply is not None else None,
+            carried_messages=[carried_reply] if carried_reply is not None else None,
         )
         if commit.refused_prompt is not None:
             return messages, commit.refused_prompt

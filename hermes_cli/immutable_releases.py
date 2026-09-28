@@ -476,8 +476,8 @@ def _build_candidate_web(staging: Path) -> None:
     web = staging / "web"
     if not (web / "package.json").is_file():
         return
-    import shutil as _shutil
-    npm = _shutil.which("npm")
+    from hermes_constants import find_node_executable
+    npm = find_node_executable("npm")
     if not npm:
         raise RuntimeError("npm is required to build an immutable release's web assets")
     workspaces = ["--workspace", "web", "--include-workspace-root"]
