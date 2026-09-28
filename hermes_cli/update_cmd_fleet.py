@@ -818,7 +818,8 @@ def _apply_pending_fleet_restart_catchup(*, defer: bool = False, checkout_comple
         credited = _acknowledged_release_launchd_label(home, current)
         from hermes_cli.update_cmd import _restart_gateway_fleet_after_update, _verify_fleet_after_update
         outcome = _restart_gateway_fleet_after_update(
-            None, False, acknowledged_release_root=current if credited else None)
+            None, False, acknowledged_release_root=current,
+            acknowledged_release_label=credited, acknowledgement_checked=True)
         _verify_fleet_after_update(
             outcome, _pre_update_plan=None, _windows_gateway_resume=None,
             node_failures=[], update_complete=checkout_complete, expected_sha=current.name, expected_root=current)
@@ -1049,9 +1050,10 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
         # ACK proves the incarnation and plist, not that it still serves the
         # intended code. A stale or unreadable live identity cannot earn credit.
         from hermes_cli.update_receipt import collect_fleet_versions
-        rows = collect_fleet_versions(expected_sha_override=root.name, expected_root_override=root)
+        resolved_root = root.resolve()
+        rows = collect_fleet_versions(expected_sha_override=root.name, expected_root_override=resolved_root)
         if not any(row.get("pid") == gateway_pid and row.get("state") == "current"
-                   and row.get("code_root") == str(root) for row in rows):
+                   and row.get("code_root") == str(resolved_root) for row in rows):
             return None
         return label
     except (OSError, ValueError, KeyError, TypeError, psutil.Error):
@@ -1872,7 +1874,9 @@ def _gateway_drain_budget() -> float:
 
 
 def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool, *,
-                                        acknowledged_release_root: Path | None = None):
+                                        acknowledged_release_root: Path | None = None,
+                                        acknowledged_release_label: str | None = None,
+                                        acknowledgement_checked: bool = False):
     """Restart every running gateway (systemd, launchd, manual) onto the pulled code.
 
     Never raises: a phase abort runs fresh-child recovery and fails closed unless
@@ -1940,7 +1944,8 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool, *,
         # macOS: EVERY ai.hermes.gateway* LaunchAgent (systemd parity).
         # The transaction ACK exempts only its own plist's label. All sibling
         # services and manual gateways still take their ordinary fleet path.
-        acknowledged_label = (_acknowledged_release_launchd_label(get_hermes_home(), acknowledged_release_root)
+        acknowledged_label = (acknowledged_release_label if acknowledgement_checked else
+                              _acknowledged_release_launchd_label(get_hermes_home(), acknowledged_release_root)
                               if acknowledged_release_root is not None else None)
         if is_macos():
             with suppress(FileNotFoundError, ImportError):

@@ -245,6 +245,79 @@ class TestCommandBoundaryFinalization:
         assert len(list(directory.glob("update_*.json"))) == 1
 
 
+@pytest.mark.parametrize("gateway_mode", [False, True])
+def test_invalid_update_config_exits_cleanly_with_failed_receipt(receipt_home, monkeypatch, capsys, gateway_mode):
+    from hermes_cli import main as hermes_main
+    from hermes_cli import update_cmd_fleet
+    import hermes_cli.update_lock as update_lock_mod
+
+    (receipt_home / "config.yaml").write_text('updates:\n  immutable_releases: "false"\n')
+    monkeypatch.setattr(hermes_main, "_update_preflight_handled", lambda args: False)
+    monkeypatch.setattr(hermes_main, "_install_hangup_protection", lambda **kw: None)
+    monkeypatch.setattr(hermes_main, "_finalize_update_output", lambda state: None)
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "test")
+    class FakeLock:
+        holder = None
+        def acquire(self):
+            return True
+        def release(self):
+            pass
+    monkeypatch.setattr(update_lock_mod, "UpdateLock", FakeLock)
+    exit_codes = []
+    monkeypatch.setattr(update_cmd_fleet, "_write_gateway_update_exit_code", lambda ok: exit_codes.append(ok))
+    with pytest.raises(SystemExit) as error:
+        hermes_main.cmd_update(SimpleNamespace(yes=True, gateway=gateway_mode))
+    assert exit_codes == ([False] if gateway_mode else [])
+    assert error.value.code != 0
+    output = capsys.readouterr()
+    assert "updates.immutable_releases" in output.out
+    assert "hermes doctor" in output.out and "hermes config set" in output.out
+    assert "Traceback" not in output.err
+    receipt = ur.read_latest_receipt()
+    assert receipt["outcome"] == "failed"
+    assert "updates.immutable_releases" in receipt["stop_reason"]
+
+
+@pytest.mark.parametrize("gateway_mode", [False, True])
+def test_unreadable_update_config_fails_cleanly(receipt_home, monkeypatch, capsys, gateway_mode):
+    from hermes_cli import main as hermes_main
+    from hermes_cli import config as hermes_config, update_cmd_fleet
+    import hermes_cli.update_lock as update_lock_mod
+
+    monkeypatch.setattr(hermes_main, "_update_preflight_handled", lambda args: False)
+    monkeypatch.setattr(hermes_main, "_install_hangup_protection", lambda **kw: None)
+    monkeypatch.setattr(hermes_main, "_finalize_update_output", lambda state: None)
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "test")
+    monkeypatch.setattr(hermes_config, "load_config", lambda: (_ for _ in ()).throw(OSError("unreadable config")))
+    exit_codes = []
+    monkeypatch.setattr(update_cmd_fleet, "_write_gateway_update_exit_code", lambda ok: exit_codes.append(ok))
+
+    class FakeLock:
+        holder = None
+        def acquire(self):
+            return True
+        def release(self):
+            pass
+    monkeypatch.setattr(update_lock_mod, "UpdateLock", FakeLock)
+
+    with pytest.raises(SystemExit) as error:
+        hermes_main.cmd_update(SimpleNamespace(yes=True, gateway=gateway_mode))
+    assert error.value.code == 1
+    output = capsys.readouterr()
+    assert "✗ Could not load configuration: unreadable config" in output.out
+    assert "hermes doctor" in output.out
+    assert "Traceback" not in output.err
+    assert exit_codes == ([False] if gateway_mode else [])
+    receipt = ur.read_latest_receipt()
+    assert receipt["outcome"] == "failed"
+    assert receipt["exit_code"] == 1
+    assert "unreadable config" in receipt["stop_reason"]
+
+
 class TestFleetClassification:
     def _fleet_with(self, monkeypatch, tmp_path, record, expected_sha="a" * 40):
         """Run collect_fleet_versions against one fake default profile."""

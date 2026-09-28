@@ -2461,7 +2461,7 @@ def cmd_update(args):
     # Exit code for the Windows hand-off child's hard exit (see finally); None
     # = not SystemExit-shaped, so real exceptions keep their traceback.
     _update_handoff_exit_code: int | None = None
-    from hermes_cli.update_cmd import _cmd_update_impl
+    from hermes_cli.update_cmd import _cmd_update_impl, UpdateConfigurationLoadError
 
     try:
         _cmd_update_impl(args, gateway_mode=gateway_mode)
@@ -2475,6 +2475,23 @@ def cmd_update(args):
             _update_exit.code if isinstance(_update_exit.code, int) else 0
         )
         raise
+    except (ValueError, UpdateConfigurationLoadError) as _update_exc:
+        if isinstance(_update_exc, ValueError) and not str(_update_exc).startswith("Invalid update configuration: "):
+            _finalize_update_receipt(1, f"ValueError: {_update_exc}")
+            raise
+        from hermes_cli import update_receipt
+        if update_receipt._current is None:
+            update_receipt.begin_update_receipt()
+        message = (f"Could not load configuration: {_update_exc}"
+                   if isinstance(_update_exc, UpdateConfigurationLoadError) else str(_update_exc))
+        update_receipt.record_step("update_config", False, message)
+        _finalize_update_receipt(1, message)
+        print(f"✗ {message}. Run hermes doctor and correct the setting with hermes config set.")
+        if gateway_mode:
+            from hermes_cli.update_cmd_fleet import _write_gateway_update_exit_code
+            _write_gateway_update_exit_code(False)
+        _update_handoff_exit_code = 1
+        raise SystemExit(1) from None
     except BaseException as _update_exc:
         _finalize_update_receipt(1, f"{type(_update_exc).__name__}: {_update_exc}")
         raise
