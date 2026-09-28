@@ -129,6 +129,36 @@ def test_acknowledged_or_mismatched_switch_is_not_abandoned(tmp_path):
 
 
 @pytest.mark.macos_only
+def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    home, plist, label, a, b = layout(tmp_path)
+    calls = fake_launchctl(monkeypatch, label, loaded=True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: False)
+    txn = {"version": 1, "operation": "promote", "candidate": str(b),
+           "previous_intended": str(a), "reload_issued": {"at": datetime.now(timezone.utc).isoformat()}}
+    last = home / "release-last-txn.json"
+    last.write_text(json.dumps(txn), encoding="utf-8")
+    monkeypatch.setattr(guardian, "rollback_switch", lambda *args, **kwargs: pytest.fail("premature rollback"))
+    assert guardian.run_once(home, plist, label, grace=180) == "waiting"
+    txn["reload_ack"] = {"gateway_pid": 123}
+    last.write_text(json.dumps(txn), encoding="utf-8")
+    assert guardian.run_once(home, plist, label, grace=0) == "waiting"
+    assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
+
+
+@pytest.mark.macos_only
+def test_unknown_launchctl_failure_is_alert_not_bootstrap(tmp_path, monkeypatch):
+    home, plist, label, a, b = layout(tmp_path)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 113, stdout="", stderr="Input/output error")
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    assert guardian.run_once(home, plist, label) == "alert"
+    assert len(calls) == 1 and calls[0][1] == "print"
+
+
+@pytest.mark.macos_only
 def test_failed_switch_rolls_back_only_verified_previous(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     txn = {"version": 1, "operation": "promote", "candidate": str(b), "previous_intended": str(a),

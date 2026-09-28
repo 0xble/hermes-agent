@@ -100,7 +100,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
         definition = plistlib.loads(gw_plist.read_bytes())
         definition["WorkingDirectory"] = str(new)
         gw_plist.write_bytes(plistlib.dumps(definition))
-        (home / "release-last-txn.json").write_text(json.dumps({
+        (home / "release-txn.json").write_text(json.dumps({
             "version": 1, "operation": "promote", "candidate": str(new),
             "previous_intended": str(release), "current_original": str(release),
             "previous_original": str(new), "requires_reload": True,
@@ -110,6 +110,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
         subprocess.run(["launchctl", "bootout", gw_target], check=True, timeout=15)
         subprocess.run(["launchctl", "kickstart", agent_target], check=True, timeout=25)
         assert wait_for(lambda: (home / "current").resolve() == release)
+        assert any(home.glob("release-abandoned-*.json"))
         assert wait_for(loaded)
         assert wait_for(lambda: json.loads((home / "gateway_state.json").read_text()).get("code_sha") == release.name)
         assert wait_for(lambda: any(json.loads(p.read_text(encoding="utf-8")).get("outcome") == "rolled_back"

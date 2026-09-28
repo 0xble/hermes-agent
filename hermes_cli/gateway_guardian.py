@@ -271,6 +271,14 @@ def cli(argv: list[str] | None = None) -> int:
     paths = ReleasePaths.for_home(home)
     if not paths.current.is_symlink() or not _release_is_ready(paths.current.resolve(), paths.current.resolve().name):
         parser.error("a valid immutable current release is required")
+    if not (paths.current / ".venv/bin/python").is_file():
+        parser.error("current release has no runnable Python interpreter")
+    if not target.is_file():
+        parser.error("install the gateway launchd plist before installing its guardian")
+    definition = plistlib.loads(target.read_bytes())
+    if (definition.get("Label") != label or
+            Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve() != home.resolve()):
+        parser.error("gateway launchd plist does not match this label and home")
     body = guardian_plist(home, target, label, domain=args.domain)
     path.parent.mkdir(parents=True, exist_ok=True)
     (home / "logs/guardian").mkdir(parents=True, exist_ok=True)
