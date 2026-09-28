@@ -115,14 +115,14 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
 
 
 def healthy(home: Path, label: str, expected: Path) -> bool:
-    from gateway.status import read_runtime_status
+    from gateway.status import read_runtime_status, runtime_status_is_stale
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
     import psutil
     state = read_runtime_status(home / "gateway_state.json") or {}
     pid = state.get("pid")
     if type(pid) is not int or state.get("gateway_state") not in {"running", "degraded"}:
         return False
-    if state.get("code_sha") != expected.name:
+    if state.get("code_sha") != expected.name or runtime_status_is_stale(state):
         return False
     supervised = _launchctl_supervised_pid(label)
     if supervised is None:
@@ -268,7 +268,7 @@ def _repair_count(home: Path) -> int:
     return count
 
 
-def run_once(home: Path, plist: Path, label: str, *, grace: float = 180,
+def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
              domain: str | None = None) -> str:
     import fcntl
     home = Path(home)
@@ -280,6 +280,11 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float = 180,
         except BlockingIOError:
             return "locked"
         try:
+            if grace is None:
+                from hermes_cli.config_effective import load_user_config_effective
+                config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+                grace = float((config.get("updates") or {}).get(
+                    "release_acknowledgement_timeout_seconds", 180.0))
             return _run(home, Path(plist), label, grace=grace, domain=domain)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
