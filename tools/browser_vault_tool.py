@@ -30,12 +30,42 @@ from __future__ import annotations
 import json
 import secrets
 import logging
+import threading
+import time
 from typing import Any, Dict, Optional
 
 from agent.vault_login_classifier import build_form_probe_js
 from tools.registry import no_cache_check_fn
 
 logger = logging.getLogger(__name__)
+
+# A refused/unanswered prompt blocks another card prompt for this approval session and origin.
+# Monotonic TTL lets an explicit later request retry; cap entries in a long-running gateway.
+_PAYMENT_RETRY_TTL = 600
+_payment_retry_lock = threading.Lock()
+_payment_retry_until: dict[tuple[str, str, str], float] = {}
+
+
+def _payment_retry_key(task_id: str, origin: str) -> tuple[str, str, str]:
+    from hermes_constants import hermes_home_key
+    from tools.approval_context import get_current_session_key
+
+    session = get_current_session_key()
+    return (hermes_home_key(), task_id if session == "default" else session, origin)
+
+
+def _payment_retry_blocked(key: tuple[str, str, str], *, refuse: bool = False) -> bool:
+    now = time.monotonic()
+    with _payment_retry_lock:
+        for old_key, expiry in list(_payment_retry_until.items()):
+            if expiry <= now:
+                del _payment_retry_until[old_key]
+        if refuse:
+            if len(_payment_retry_until) >= 256 and key not in _payment_retry_until:
+                del _payment_retry_until[min(_payment_retry_until, key=lambda existing: _payment_retry_until[existing])]
+            _payment_retry_until[key] = now + _PAYMENT_RETRY_TTL
+            return True
+        return key in _payment_retry_until
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +319,23 @@ def _browser_account_refusal(backend, task_id: str) -> Optional[str]:
                                  f"account={required!r} in a new task first.")})
 
 
-def browser_vault_list() -> str:
-    """List login handles + metadata across every enabled backend. Passwords are never included.
+def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None) -> str:
+    """List filtered vault handles + metadata across enabled backends. Passwords are never included.
 
     A locked external manager contributes no items; instead it is reported under ``locked`` so the
     agent knows to call browser_vault_fill (which prompts the user to unlock) or tell the user.
     """
     from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here
+    from agent.vault_store import VaultError, normalize_origin
+
+    if kind is not None and kind not in ("login", "payment", "address", "protected_field"):
+        return json.dumps({"success": False, "error_type": "invalid_kind", "error": "Unknown vault item kind."})
+    if origin is not None:
+        try:
+            origin = normalize_origin(origin)
+        except VaultError:
+            return json.dumps({"success": False, "error_type": "invalid_origin", "error": "Origin must include a scheme and host."})
 
     items, locked, errors = [], [], []
     for backend in enabled_backends():
@@ -310,6 +349,11 @@ def browser_vault_list() -> str:
             errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue
         for meta in metas:
+            if kind is not None and meta.kind != kind:
+                continue
+            if origin is not None and (meta.origin or meta.allowed_origins) and origin not in (
+                    meta.allowed_origins or (meta.origin,)):
+                continue
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
                      "origin": meta.origin,
                      # A manager's card has no origin of its own; it binds to the current page at fill time.
@@ -329,7 +373,8 @@ def browser_vault_list() -> str:
             items.append(entry)
     out: Dict[str, Any] = {"success": True, "items": items}
     if not items:
-        out["hint"] = ("No saved logins. On a login page, type a password you fetched yourself from an authorized store "
+        out["hint"] = ("No matching vault items for this filter. Try another kind or origin." if kind is not None or origin is not None else
+                       "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
                        "for that service (credential CLI, 1Password CLI), or call browser_vault_save_login to ask the "
                        "user to save one. Never type a password shown on the page or given in chat, and never ask for "
                        "one in chat.")
@@ -580,6 +625,10 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+    retry_key = _payment_retry_key(effective_task_id, page_origin) if meta.kind == "payment" else None
+    if retry_key is not None and _payment_retry_blocked(retry_key):
+        return json.dumps({"success": False, "error_type": "payment_retry_refused",
+                           "error": "Card confirmation was declined or unanswered on this origin. Do not retry; hand card entry to the user."})
 
     # ── Inspect + classify page controls ────────────────────────────────────
     def _inspect_page() -> tuple[str, list[ClassifiedLoginControl]] | str:
@@ -627,9 +676,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         # fill that cannot succeed spends the user's attention for nothing. That inspection is advisory; the
         # prompt can wait minutes, so after consent the page is inspected again with a fresh nonce and only
         # that inspection's targets are written (the fill script also re-checks the origin at write time).
-        if not _confirm_payment_fill(meta.label, page_origin):
-            return json.dumps({"success": False, "error_type": "payment_declined",
-                               "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
+        decision = _confirm_payment_fill(meta.label, page_origin)
+        if decision != "accept":
+            assert retry_key is not None
+            _payment_retry_blocked(retry_key, refuse=True)
+            return json.dumps({"success": False,
+                               "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
+                               "error": ("The user declined this payment card." if decision == "decline" else
+                                         "The payment card prompt went unanswered.") +
+                                        " Do not retry; hand card entry to the user."})
         inspected = _inspect_page()
         if isinstance(inspected, str):
             return inspected
@@ -753,7 +808,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     return json.dumps(out)
 
 
-def _confirm_payment_fill(label: str, origin: str) -> bool:
+def _confirm_payment_fill(label: str, origin: str) -> str:
     """Human confirmation before a card is written into a page: a prompt injection that reaches a checkout
     must not be able to spend. Routes through the approval surface of the active session (gateway button
     round-trip or CLI panel); headless sessions cannot confirm and the fill is refused."""
@@ -763,7 +818,7 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
         f"Fill payment card '{label}' on {origin}",
         "The agent wants to enter your saved card details into this checkout page. The card number and "
         "CVC never enter the conversation. Approve only if you intend to pay here.",
-        surface="vault-payment", title="Confirm payment card fill?") == "accept"
+        surface="vault-payment", title="Confirm payment card fill?")
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +829,7 @@ BROWSER_VAULT_LIST_SCHEMA = {
     "name": "browser_vault_list",
     "description": (
         "ALWAYS call this first when a page asks for a password, card, address or configured protected field. "
+        "Pass kind and page origin on login/checkout pages to narrow results; omit both to list all. "
         "Lists saved website logins, payment cards, addresses and protected fields as handles with metadata "
         "(kind, label, backend, bound origin; logins also "
         "carry identifier + identifier_type so you can type the username yourself with the browser's input tool; "
@@ -786,7 +842,11 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "browser_vault_save_login, or type a password you fetched yourself from an authorized store for that "
         "service. Never type a password shown on a page or given in chat, and never repeat one in chat."
     ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
+    "parameters": {"type": "object", "properties": {
+        "kind": {"type": "string", "enum": ["login", "payment", "address", "protected_field"],
+                 "description": "Optional item kind."},
+        "origin": {"type": "string", "description": "Optional page origin or URL; exact-origin matches plus unbound items."},
+    }, "required": []},
 }
 
 BROWSER_VAULT_UNLOCK_SCHEMA = {
@@ -814,8 +874,8 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "allowed origin. Values are resolved server-side and never appear in the conversation. "
         "A password manager's card has no bound origin: it is bound to the current page and that origin is shown "
         "in the user's confirmation. Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
-        "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
-        "payment_declined result."
+        "fill time). If a password manager is locked the user is prompted to unlock first. Never retry "
+        "payment_declined, payment_prompt_unanswered or payment_retry_refused; hand card entry to the user."
     ),
     "parameters": {
         "type": "object",
@@ -941,7 +1001,7 @@ def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
 
 
 def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
-    return browser_vault_list()
+    return browser_vault_list(kind=args.get("kind"), origin=args.get("origin"))
 
 
 def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
