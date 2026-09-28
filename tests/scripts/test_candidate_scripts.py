@@ -89,6 +89,26 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     assert any("not a native" in p for p in mod.check_receipt(tmp_path))
 
 
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_non_symlink_current_fails_closed(tmp_path, monkeypatch, kind):
+    mod = _load("check_fork_patches")
+    monkeypatch.setattr(mod, "_git", lambda *args: "a" * 40)
+    current = tmp_path / "current"
+    if kind == "directory":
+        current.mkdir()
+    else:
+        current.write_text("not a pointer\n", encoding="utf-8")
+    revision, target, failure = mod._verification_revision(tmp_path)
+    assert (revision, target) == ("", "release")
+    assert failure and "not a release symlink" in failure
+
+
+def test_absent_current_keeps_legacy_checkout(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    monkeypatch.setattr(mod, "_git", lambda *args: "a" * 40)
+    assert mod._verification_revision(tmp_path) == ("a" * 40, "checkout", None)
+
+
 def test_check_receipt_uses_immutable_release_not_source_head(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     source_head, active = "a" * 40, "b" * 40

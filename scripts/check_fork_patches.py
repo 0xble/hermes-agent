@@ -148,6 +148,10 @@ def _verification_revision(home: Path) -> tuple[str, str, str | None]:
         if release is None:
             return "", "release", "current release pointer does not identify a ready release"
         return release.name, "release", None
+    if current.exists():
+        # A directory or file where the pointer belongs is a broken immutable layout,
+        # not a legacy home. Falling back would verify the stale checkout instead.
+        return "", "release", f"{current} exists but is not a release symlink"
     return _git("rev-parse", "HEAD"), "checkout", None
 
 
