@@ -679,6 +679,7 @@ class GatewayConfig:
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
+    durable_outbox_enabled: bool = False  # gateway.durable_outbox.enabled, opt-in
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -759,6 +760,7 @@ class GatewayConfig:
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
+            **({"durable_outbox": {"enabled": True}} if self.durable_outbox_enabled else {}),
             "profile_routes": [
                 {k: v for k, v in asdict(r).items() if k != "user_id" or v is not None}
                 if is_dataclass(r) and not isinstance(r, type) else r
@@ -828,6 +830,11 @@ class GatewayConfig:
             session_store_max_age_days = 90
 
         from gateway.profile_routing import parse_profile_routes
+        outbox = pick("durable_outbox")
+        if outbox is None:
+            outbox = {}
+        if not isinstance(outbox, dict) or type(outbox.get("enabled", False)) is not bool:
+            raise ValueError("gateway.durable_outbox.enabled must be a boolean")
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -852,6 +859,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
+            durable_outbox_enabled=outbox.get("enabled", False),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:

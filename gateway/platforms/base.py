@@ -4152,6 +4152,21 @@ class BasePlatformAdapter(ABC):
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
+        # An already-admitted Telegram update must not enter the busy queue: the
+        # runner would see it only after the original turn completed and could
+        # otherwise turn a transport redelivery into another user turn.
+        if (self.platform == Platform.TELEGRAM and not event.internal
+                and getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)):
+            from gateway.outbox import Outbox, event_kind, transport_id
+            event_id = transport_id(event)
+            if event_id:
+                home = getattr(self.gateway_runner, "_resolve_profile_home_for_source")(event.source)
+                original = Outbox(home).lookup(str(event.source.profile or "default"),
+                                                "telegram", event_id, event_kind(event))
+                if original:
+                    setattr(event, "_outbox_original_result", original[1])
+                    event._gateway_accepted = True
+                    return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.
@@ -4321,8 +4336,11 @@ class BasePlatformAdapter(ABC):
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
-        if is_ephemeral_response or str(event.text or "").lstrip().startswith(
-            ("/", self.typed_command_prefix or "!")):
+        if (is_ephemeral_response or
+                (getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)
+                 and getattr(event, "_outbox_turn_id", None)) or
+                str(event.text or "").lstrip().startswith(
+                    ("/", self.typed_command_prefix or "!"))):
             return None
         try:
             from gateway.delivery_ledger import (

@@ -1242,6 +1242,12 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     _validate_voice(config, issues)
     _validate_timezone(config, issues)
     _validate_updates(config, issues)
+    gateway = config.get("gateway") if isinstance(config, dict) else None
+    if isinstance(gateway, dict) and "durable_outbox" in gateway:
+        block = gateway["durable_outbox"]
+        if not isinstance(block, dict) or type(block.get("enabled", False)) is not bool:
+            _issue(issues, "error", "gateway.durable_outbox.enabled must be a boolean",
+                   "Set gateway.durable_outbox.enabled to true or false")
     cp = config.get("custom_providers")
     fb = config.get("fallback_model")
     for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model)):
