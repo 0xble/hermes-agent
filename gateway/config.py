@@ -680,6 +680,7 @@ class GatewayConfig:
     session_store_max_age_days: int = 90
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
     durable_outbox_enabled: bool = False  # gateway.durable_outbox.enabled, opt-in
+    durable_outbox_retention_days: int = 7
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -760,7 +761,8 @@ class GatewayConfig:
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
-            **({"durable_outbox": {"enabled": True}} if self.durable_outbox_enabled else {}),
+            "durable_outbox": {"enabled": self.durable_outbox_enabled,
+                               "retention_days": self.durable_outbox_retention_days},
             "profile_routes": [
                 {k: v for k, v in asdict(r).items() if k != "user_id" or v is not None}
                 if is_dataclass(r) and not isinstance(r, type) else r
@@ -837,6 +839,9 @@ class GatewayConfig:
             raise ValueError("gateway.durable_outbox must be a mapping with an enabled boolean")
         if type(outbox.get("enabled", False)) is not bool:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
+        retention = outbox.get("retention_days", 7)
+        if type(retention) is not int or retention < 1:
+            raise ValueError("gateway.durable_outbox.retention_days must be a positive integer")
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -862,6 +867,7 @@ class GatewayConfig:
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
             durable_outbox_enabled=outbox.get("enabled", False),
+            durable_outbox_retention_days=retention,
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
