@@ -95,17 +95,27 @@ def _is_git_checkout() -> bool:
     return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True).returncode == 0
 
 
-def _owned_identities() -> set[str] | None:
+def _maintenance_texts(revision: str = "HEAD") -> list[str]:
+    """Root contract and unit texts. ``HEAD`` reads the working tree; any other revision
+    reads that commit, so an immutable release is judged by the contract it shipped."""
+    if revision == "HEAD":
+        root = REPO / MAINTENANCE_ROOT
+        units = sorted((REPO / MAINTENANCE_DIR).glob("*.md")) if (REPO / MAINTENANCE_DIR).is_dir() else []
+        return [p.read_text(encoding="utf-8") for p in [root, *units] if p.is_file()]
+    names = _git("ls-tree", "--name-only", revision, "--", MAINTENANCE_ROOT, f"{MAINTENANCE_DIR}/").split("\n")
+    paths = [n for n in names if n == MAINTENANCE_ROOT or (n.startswith(f"{MAINTENANCE_DIR}/") and n.endswith(".md"))]
+    return [_git("show", f"{revision}:{n}") for n in sorted(paths)]
+
+
+def _owned_identities(revision: str = "HEAD") -> set[str] | None:
     """Backticked tokens on identity lines of the root contract or a maintenance unit; None when neither exists."""
-    root = REPO / MAINTENANCE_ROOT
-    units = sorted((REPO / MAINTENANCE_DIR).glob("*.md")) if (REPO / MAINTENANCE_DIR).is_dir() else []
-    files = [p for p in [root, *units] if p.is_file()]
-    if not files:
+    texts = _maintenance_texts(revision)
+    if not texts:
         return None
     owned: set[str] = set()
-    for path in files:
+    for text in texts:
         in_identity_block = False
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in text.splitlines():
             stripped = line.strip()
             continuation = bool(stripped) and line[:1] in (" ", "\t") and not stripped.startswith(("-", "*", "|", "#"))
             if not continuation:
@@ -116,8 +126,8 @@ def _owned_identities() -> set[str] | None:
     return owned
 
 
-def _recorded_baseline() -> str | None:
-    """The checkout's own accepted baseline, when it ships the shared reader."""
+def _recorded_baseline(revision: str | None = None) -> str | None:
+    """The accepted baseline recorded at ``revision`` (default: the working tree), when the checkout ships the shared reader."""
     reader = REPO / "scripts/ci/release_baseline.py"
     if not reader.is_file():
         return None
@@ -125,7 +135,7 @@ def _recorded_baseline() -> str | None:
     spec = importlib.util.spec_from_file_location("release_baseline", reader)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.accepted_release_baseline(REPO)
+    return module.accepted_release_baseline(REPO, revision)
 
 
 def _verification_revision(home: Path) -> tuple[str, str, str | None]:
@@ -165,9 +175,9 @@ def _resolve_floor(floor: str, baseline: str, subject: str | None, revision: str
 
 
 def check_trailers(baseline: str, floor: str | None = None, floor_subject: str | None = None,
-                   revision: str = "HEAD") -> list[str]:
+                   revision: str = "HEAD", contract: str = "HEAD") -> list[str]:
     """Every commit above ``floor`` (default: ``baseline``) carries only owned ``Fork-Patch`` identities."""
-    owned = _owned_identities()
+    owned = _owned_identities(contract)
     if owned is None:
         return [f"{MAINTENANCE_ROOT} and {MAINTENANCE_DIR}/ are missing; patch identities have no owner"]
     if not _is_ancestor(baseline, revision):
@@ -182,8 +192,8 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
     # Repair already-published metadata without rewriting main or granting a new
     # blanket floor. Stable patch IDs retain exact content coverage after a rebase.
     backfills = {}
-    for unit in sorted((REPO / MAINTENANCE_DIR).glob("*.md")):
-        for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", unit.read_text(encoding="utf-8"), re.M):
+    for text in _maintenance_texts(contract):
+        for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", text, re.M):
             backfills[patch_id] = identity.strip()
     # Classify fork commits after the floor, excluding the verified upstream release
     # ancestry. A release merge introduces upstream commits without fork trailers.
@@ -369,8 +379,6 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.repo:
         REPO = args.repo.resolve()
-    if not args.baseline:
-        args.baseline = _recorded_baseline() or DEFAULT_BASELINE
     if not _is_git_checkout():
         # A package-managed install has no history to check; say so instead of tracebacking.
         print(f"FAIL {REPO} is not a git checkout; the trailer and receipt checks need the source checkout")
@@ -378,9 +386,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     # The subject fallback belongs to the default floor only; a custom --trailer-floor must resolve as given.
     floor_subject = DEFAULT_TRAILER_FLOOR_SUBJECT if args.trailer_floor == DEFAULT_TRAILER_FLOOR else None
-    revision, _, pointer_failure = _verification_revision(args.home) if not args.source_only else ("HEAD", "checkout", None)
+    revision, target, pointer_failure = _verification_revision(args.home) if not args.source_only else ("HEAD", "checkout", None)
+    # An immutable release is judged by the maintenance contract it shipped with. The source
+    # checkout's working tree can lag the release by many commits, so its units would not
+    # own identities added since. Legacy checkouts keep reading the working tree.
+    contract = revision if target == "release" and not pointer_failure else "HEAD"
+    if not args.baseline:
+        args.baseline = _recorded_baseline(None if contract == "HEAD" else contract) or DEFAULT_BASELINE
     failures = [pointer_failure] if pointer_failure else check_trailers(
-        args.baseline, args.trailer_floor, floor_subject, revision=revision)
+        args.baseline, args.trailer_floor, floor_subject, revision=revision, contract=contract)
     if not args.source_only:
         failures += check_extensions(args.home)
         if not args.skip_config:
