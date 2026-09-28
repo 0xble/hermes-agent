@@ -213,11 +213,16 @@ def _uncertain(result) -> bool:
         return False
     from gateway.platforms.base import SEND_ERROR_KINDS
     kind = result.error_kind
+    error = (result.error or "").lower()
+    if kind == "connectionrefused" or (
+        kind in {"transient", "unknown", None}
+        and ("connection refused" in error or "connectionrefused" in error)
+    ):
+        return False
     if kind == "transient":
         return True  # A connection may drop after the server accepts the send.
     if kind in SEND_ERROR_KINDS - {"unknown"}:
         return False
-    error = (result.error or "").lower()
     return (any(marker in error for marker in
                 ("timeout", "timed out", "network error", "connection reset",
                  "connection aborted", "server disconnected")) or
@@ -231,8 +236,16 @@ async def _store_io(operation, *args, **kwargs):
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        await task
+        try:
+            await task
+        except Exception:
+            logger.exception("Cancelled outbox disk operation failed")
         raise
+
+
+async def open_outbox(home: Path) -> "Outbox":
+    """Construct and migrate the store off the gateway event loop."""
+    return await _store_io(Outbox, home)
 
 
 def _prepare_row(store, home, turn_id, kind, payload):
@@ -345,6 +358,31 @@ async def _schedule_retry(store: "Outbox", adapter) -> None:
         _RETRY_TASKS[key] = task
 
 
+def _retention_days(home: Path) -> int:
+    """Read only this setting using the gateway loader's layer precedence."""
+    from gateway import config_loader
+    from gateway.config import GatewayConfig, validate_outbox_retention_days
+    import yaml
+
+    default = GatewayConfig.durable_outbox_retention_days
+    legacy = config_loader.load_legacy_gateway_json(home)
+    try:
+        yaml_cfg = config_loader.read_yaml_layers(home)
+        gateway = yaml_cfg.get("gateway")
+        found, outbox = config_loader._bridge_lookup(yaml_cfg, gateway, legacy,
+                                                       "durable_outbox", "presence")
+        if not found:
+            outbox = legacy.get("durable_outbox", {})
+        if outbox is None:
+            outbox = {}
+        if not isinstance(outbox, dict):
+            raise ValueError("gateway.durable_outbox must be a mapping")
+        return validate_outbox_retention_days(outbox.get("retention_days", default))
+    except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+        logger.warning("Invalid outbox retention for %s; using %s days: %s", home, default, exc)
+        return default
+
+
 async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[int, int]:
     """Replay proven-unsent rows; only boot replays fresh unclaimed rows."""
     sent = 0
@@ -399,9 +437,9 @@ async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[in
     for row in ambiguous:
         logger.error("Held ambiguous outbox dispatch: turn=%s sequence=%s key=%s",
                      row.turn_id, row.sequence, row.idempotency_key)
-    await _store_io(store.prune, retention_days=getattr(
-        getattr(getattr(adapter, "gateway_runner", None), "config", None),
-        "durable_outbox_retention_days", 7))
+    if startup:
+        retention = await _store_io(_retention_days, store.path.parent)
+        await _store_io(store.prune, retention_days=retention)
     await _schedule_retry(store, adapter)
     return sent, len(ambiguous)
 
@@ -453,14 +491,51 @@ class Outbox:
                 );
                 CREATE INDEX IF NOT EXISTS outbox_state ON outbox(state, turn_id, sequence);
             """)
-            if not any(col[1] == "created_at" for col in db.execute("PRAGMA table_info(admissions)")):
-                db.execute("ALTER TABLE admissions ADD COLUMN created_at REAL")
-                db.execute("UPDATE admissions SET created_at=? WHERE created_at IS NULL", (time.time(),))
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if not any(col[1] == "created_at" for col in db.execute("PRAGMA table_info(admissions)")):
+                    db.execute("ALTER TABLE admissions ADD COLUMN created_at REAL")
+                    db.execute("UPDATE admissions SET created_at=? WHERE created_at IS NULL", (time.time(),))
+                schema = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='outbox'").fetchone()[0]
+                cols = {col[1] for col in db.execute("PRAGMA table_info(outbox)")}
+                if (not {"created_at", "retry_at", "attempts"} <= cols
+                        or "expired_ambiguous" not in schema or "failed_unsent" not in schema):
+                    db.execute("""CREATE TABLE outbox_migrated (
+                        turn_id TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL,
+                        payload TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+                        owner_epoch INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (state IN ('pending','sending','ambiguous','delivered','failed_unsent','expired_ambiguous')),
+                        message_id TEXT, send_status TEXT, edit_status TEXT,
+                        created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+                        retry_at REAL, attempts INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (turn_id, sequence))""")
+                    fields = ("turn_id", "sequence", "type", "payload", "idempotency_key", "owner_epoch",
+                              "state", "message_id", "send_status", "edit_status", "created_at", "retry_at", "attempts")
+                    defaults = {"created_at": "strftime('%s','now')", "retry_at": "NULL", "attempts": "0"}
+                    selected = ", ".join(field if field in cols else defaults[field] for field in fields)
+                    db.execute(f"INSERT INTO outbox_migrated SELECT {selected} FROM outbox")
+                    db.execute("DROP TABLE outbox")
+                    db.execute("ALTER TABLE outbox_migrated RENAME TO outbox")
+                    db.execute("CREATE INDEX outbox_state ON outbox(state, turn_id, sequence)")
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         db.execute("PRAGMA busy_timeout=5000")
-        db.execute("PRAGMA journal_mode=WAL")
+        # SQLite's journal-mode switch may report BUSY immediately even with a
+        # busy_timeout when two openers switch the same legacy DB to WAL.
+        for attempt in range(100):
+            try:
+                db.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 99:
+                    db.close()
+                    raise
+                time.sleep(0.05)
         db.row_factory = sqlite3.Row
         return db
 
@@ -590,25 +665,31 @@ class Outbox:
                 "SELECT * FROM outbox WHERE state IN ('sending','ambiguous') ORDER BY rowid")]
 
     def prune(self, *, retention_days: int = 7) -> None:
-        """Keep uncertain work and unfinished admissions while aging out terminal data."""
+        """Keep uncertain work temporarily, bounding even unresolved history at 4x retention."""
         cutoff = time.time() - retention_days * 86400
+        hard_cutoff = time.time() - 4 * retention_days * 86400
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
                 terminal = db.execute(
-                    "SELECT payload FROM outbox WHERE state IN ('delivered','failed_unsent') "
-                    "AND created_at<?", (cutoff,)).fetchall()
-                for row in terminal:
-                    _discard_delivered_media(self.path.parent, json.loads(row[0]))
+                    "SELECT payload FROM outbox WHERE (state IN ('delivered','failed_unsent') "
+                    "AND created_at<?) OR (state='expired_ambiguous' AND created_at<?)",
+                    (cutoff, hard_cutoff)).fetchall()
                 db.execute("DELETE FROM outbox WHERE state IN ('delivered','failed_unsent') "
                            "AND created_at<?", (cutoff,))
+                db.execute("DELETE FROM outbox WHERE state='expired_ambiguous' AND created_at<?", (hard_cutoff,))
                 db.execute("DELETE FROM admissions WHERE created_at<? AND result IS NOT NULL "
                            "AND NOT EXISTS (SELECT 1 FROM outbox WHERE outbox.turn_id=admissions.turn_id "
                            "AND outbox.state NOT IN ('delivered','failed_unsent'))", (cutoff,))
+                db.execute("DELETE FROM admissions WHERE created_at<? AND result IS NULL "
+                           "AND NOT EXISTS (SELECT 1 FROM outbox WHERE outbox.turn_id=admissions.turn_id)",
+                           (hard_cutoff,))
                 db.commit()
             except BaseException:
                 db.rollback()
                 raise
+        for row in terminal:
+            _discard_delivered_media(self.path.parent, json.loads(row[0]))
 
     def status(self) -> list[dict[str, Any]]:
         self.ambiguous()  # expire old holds and log them

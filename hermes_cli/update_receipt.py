@@ -125,6 +125,11 @@ def _receipt_dir() -> Path:
     return get_hermes_home() / "logs" / "update_receipts"
 
 
+def has_active_update_receipt() -> bool:
+    """Whether the current command already owns an open receipt."""
+    return _current is not None
+
+
 def begin_update_receipt() -> None:
     """Start recording a new update receipt. Never raises."""
     global _current

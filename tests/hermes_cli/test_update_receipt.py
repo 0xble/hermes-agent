@@ -318,6 +318,20 @@ def test_unreadable_update_config_fails_cleanly(receipt_home, monkeypatch, capsy
     assert "unreadable config" in receipt["stop_reason"]
 
 
+def test_invalid_updates_raise_typed_configuration_error(receipt_home):
+    (receipt_home / "config.yaml").write_text('updates:\n  immutable_releases: "false"\n')
+    with pytest.raises(update_cmd.UpdateConfigurationError, match="immutable_releases"):
+        update_cmd._updates_config()
+
+
+def test_receipt_active_predicate_tracks_finalization(receipt_home):
+    assert not ur.has_active_update_receipt()
+    ur.begin_update_receipt()
+    assert ur.has_active_update_receipt()
+    ur.finalize_update_receipt("failed")
+    assert not ur.has_active_update_receipt()
+
+
 class TestFleetClassification:
     def _fleet_with(self, monkeypatch, tmp_path, record, expected_sha="a" * 40):
         """Run collect_fleet_versions against one fake default profile."""

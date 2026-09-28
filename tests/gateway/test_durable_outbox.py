@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import errno
 import multiprocessing as mp
 import os
 import sqlite3
@@ -13,7 +14,7 @@ from typing import Any, cast
 
 import pytest
 
-from gateway.outbox import Outbox, active_turn, bind_turn, clear_turn, recover, _uncertain
+from gateway.outbox import Outbox, active_turn, bind_turn, clear_turn, recover, _uncertain, _store_io
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -678,6 +679,29 @@ async def _send_bound(adapter, home, turn):
         clear_turn()
 
 
+@pytest.mark.asyncio
+async def test_open_outbox_migration_does_not_block_event_loop(tmp_path, monkeypatch):
+    from gateway.outbox import open_outbox
+    entered, released = threading.Event(), threading.Event()
+    original = Outbox._connect
+    waits = []
+
+    def slow_connect(self):
+        if not entered.is_set():
+            entered.set()
+            waits.append(released.wait(timeout=2))
+        return original(self)
+
+    monkeypatch.setattr(Outbox, "_connect", slow_connect)
+
+    async def pulse():
+        await asyncio.to_thread(entered.wait, 2)
+        released.set()
+
+    store, _ = await asyncio.gather(open_outbox(tmp_path), pulse())
+    assert store.path.is_file() and waits == [True]
+
+
 def test_prune_retains_unresolved_and_recent_rows_and_removes_terminal_media(tmp_path):
     store = Outbox(tmp_path)
     media = tmp_path / "gateway-outbox-media" / "copy.txt"
@@ -725,6 +749,13 @@ async def test_scheduled_retry_uses_reconnected_adapter(tmp_path):
     original_sends, replacement_sends = [], []
     old = _fake_adapter(True, original_sends)
     current = _fake_adapter(True, replacement_sends)
+    delivered = asyncio.Event()
+    original_send = current._send_text_locked
+    async def notified(*args):
+        result = await original_send(*args)
+        delivered.set()
+        return result
+    current._send_text_locked = notified
     registry = {Platform.TELEGRAM: old}
     old.gateway_runner.adapters = registry
     current.gateway_runner.adapters = registry
@@ -738,7 +769,11 @@ async def test_scheduled_retry_uses_reconnected_adapter(tmp_path):
     try:
         assert (await old.send("chat", "answer")).deferred
         registry[Platform.TELEGRAM] = current
-        await asyncio.sleep(0.35)
+        await asyncio.wait_for(delivered.wait(), timeout=3)
+        for _ in range(100):
+            if [row.state for row in Outbox(tmp_path).all_rows()] == ["delivered"]:
+                break
+            await asyncio.sleep(0.01)
         assert original_sends == [("chat", "answer")]
         assert replacement_sends == [("chat", "answer")]
         assert [row.state for row in Outbox(tmp_path).all_rows()] == ["delivered"]
@@ -781,6 +816,7 @@ async def test_retry_deadline_passed_during_scheduling_is_dispatched(tmp_path, m
 
 @pytest.mark.asyncio
 async def test_boot_sweep_uses_profile_retention(tmp_path):
+    (tmp_path / "config.yaml").write_text("gateway:\n  durable_outbox:\n    retention_days: 2\n")
     store = Outbox(tmp_path)
     row = store.enqueue("old", "send", {"content": "sent"})
     store.begin_send(row)
@@ -788,8 +824,36 @@ async def test_boot_sweep_uses_profile_retention(tmp_path):
     with sqlite3.connect(store.path) as db:
         db.execute("UPDATE outbox SET created_at=?", (time.time() - 3 * 86400,))
     adapter = _fake_adapter(True, [])
-    adapter.gateway_runner.config.durable_outbox_retention_days = 2
+    adapter.gateway_runner.config.durable_outbox_retention_days = 7
     assert await recover(store, adapter) == (0, 0)
+    assert store.all_rows() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["0", "true", "'7'"])
+async def test_boot_sweep_invalid_profile_retention_uses_default(tmp_path, caplog, bad):
+    (tmp_path / "config.yaml").write_text(f"gateway:\n  durable_outbox:\n    retention_days: {bad}\n")
+    store = Outbox(tmp_path)
+    row = store.enqueue("old", "send", {"content": "sent"})
+    store.begin_send(row)
+    store.receipt(row, message_id="one", success=True)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=?", (time.time() - 3 * 86400,))
+    assert await recover(store, _fake_adapter(True, [])) == (0, 0)
+    assert store.all_rows() == [row.__class__(**{**row.__dict__, "state": "delivered", "message_id": "one"})]
+    assert "retention" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_boot_sweep_honors_legacy_retention(tmp_path):
+    (tmp_path / "gateway.json").write_text('{"durable_outbox":{"retention_days":2}}')
+    store = Outbox(tmp_path)
+    row = store.enqueue("old", "send", {"content": "sent"})
+    store.begin_send(row)
+    store.receipt(row, message_id="one", success=True)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=?", (time.time() - 3 * 86400,))
+    assert await recover(store, _fake_adapter(True, [])) == (0, 0)
     assert store.all_rows() == []
 
 
@@ -801,3 +865,116 @@ def test_retention_config_parses_and_rejects_invalid_age():
     for age in (0, -1, True, 1.5, "7"):
         with pytest.raises(ValueError, match="retention_days"):
             GatewayConfig.from_dict({"gateway": {"durable_outbox": {"retention_days": age}}})
+
+def test_old_outbox_schema_migrates_without_losing_receipts(tmp_path):
+    path = tmp_path / "gateway-outbox.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE outbox (turn_id TEXT NOT NULL, sequence INTEGER NOT NULL, "
+                   "type TEXT NOT NULL, payload TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, "
+                   "owner_epoch INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending' "
+                   "CHECK (state IN ('pending','sending','ambiguous','delivered')), message_id TEXT, "
+                   "send_status TEXT, edit_status TEXT, PRIMARY KEY (turn_id, sequence))")
+        db.execute("INSERT INTO outbox VALUES ('old',1,'send','{}','old-key',0,'pending',NULL,NULL,NULL)")
+    store = Outbox(tmp_path)
+    Outbox(tmp_path)
+    assert store.all_rows()[0].idempotency_key == "old-key"
+    assert store.begin_send(store.all_rows()[0])
+    store.receipt(store.all_rows()[0], message_id=None, success=False, uncertain=False)
+    assert store.all_rows()[0].state == "failed_unsent"
+
+def test_concurrent_old_admission_migration_preserves_single_receipt(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    path = tmp_path / "gateway-outbox.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE admissions (profile TEXT, platform TEXT, transport_event_id TEXT, "
+                   "event_kind TEXT, turn_id TEXT, result TEXT, "
+                   "PRIMARY KEY (profile, platform, transport_event_id, event_kind))")
+        db.execute("INSERT INTO admissions VALUES ('default','telegram','event','message','turn','completed')")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: Outbox(tmp_path).lookup("default", "telegram", "event", "message"), range(8)))
+    assert results == [("turn", "completed")] * 8
+
+@pytest.mark.asyncio
+async def test_cancelled_store_io_preserves_cancellation_when_disk_fails():
+    entered, release = threading.Event(), threading.Event()
+    def fails():
+        entered.set()
+        release.wait(timeout=3)
+        raise OSError("disk failed")
+    task = asyncio.create_task(_store_io(fails))
+    await asyncio.to_thread(entered.wait, 3)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+@pytest.mark.parametrize("error", [ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+                                         OSError(errno.ECONNREFUSED, "Connection refused")])
+def test_connection_refused_is_definitively_unsent(error):
+    from gateway.platforms.base import classify_send_error
+    result = SendResult(False, error=str(error), error_kind=classify_send_error(error), retryable=True)
+    assert not _uncertain(result)
+
+
+def test_connection_reset_is_held_after_classification():
+    from gateway.platforms.base import classify_send_error
+    error = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+    assert _uncertain(SendResult(False, error=str(error), error_kind=classify_send_error(error), retryable=True))
+
+def test_prune_bounds_expired_ambiguous_and_unfinished_admissions(tmp_path):
+    store = Outbox(tmp_path)
+    media = tmp_path / "gateway-outbox-media" / "held.txt"
+    media.parent.mkdir()
+    media.write_text("held")
+    row = store.enqueue("held", "send_document", {"file_path": str(media), "_outbox_original": {"file_path": "source"}})
+    store.begin_send(row)
+    unfinished, _ = store.admit("default", "telegram", "unfinished", "message")
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET state='expired_ambiguous', created_at=?", (time.time() - 29 * 86400,))
+        db.execute("UPDATE admissions SET created_at=?", (time.time() - 29 * 86400,))
+    store.prune(retention_days=7)
+    assert store.all_rows() == [] and not media.exists()
+    assert store.original_result(unfinished) is None
+
+def test_prune_unlinks_media_only_after_row_deletion_is_committed(tmp_path, monkeypatch):
+    import gateway.outbox as outbox
+    store = Outbox(tmp_path)
+    media = tmp_path / "gateway-outbox-media" / "copy.txt"
+    media.parent.mkdir()
+    media.write_text("owned")
+    row = store.enqueue("old", "send_document", {"file_path": str(media),
+                        "_outbox_original": {"file_path": "original"}})
+    store.begin_send(row)
+    store.receipt(row, message_id="delivered", success=True)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=?", (time.time() - 9 * 86400,))
+    original = outbox._discard_delivered_media
+    def after_commit(home, payload):
+        with sqlite3.connect(store.path) as db:
+            assert db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0
+        original(home, payload)
+    monkeypatch.setattr(outbox, "_discard_delivered_media", after_commit)
+    store.prune(retention_days=7)
+    assert not media.exists()
+
+@pytest.mark.asyncio
+async def test_scheduled_recovery_does_not_prune(tmp_path, monkeypatch):
+    store = Outbox(tmp_path)
+    monkeypatch.setattr(store, "prune", lambda **kw: pytest.fail("scheduled retry pruned"))
+    assert await recover(store, _fake_adapter(True, []), startup=False) == (0, 0)
+
+@pytest.mark.asyncio
+async def test_boot_sweep_uses_store_profile_not_launch_retention(tmp_path):
+    home = tmp_path / "satellite"
+    home.mkdir()
+    (home / "config.yaml").write_text("gateway:\n  durable_outbox:\n    retention_days: 2\n")
+    store = Outbox(home)
+    row = store.enqueue("old", "send", {"content": "sent"})
+    store.begin_send(row)
+    store.receipt(row, message_id="one", success=True)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=?", (time.time() - 3 * 86400,))
+    adapter = _fake_adapter(True, [])
+    adapter.gateway_runner.config.durable_outbox_retention_days = 7
+    assert await recover(store, adapter) == (0, 0)
+    assert store.all_rows() == []

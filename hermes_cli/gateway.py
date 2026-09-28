@@ -2950,6 +2950,7 @@ def _detect_venv_dir() -> Path | None:
 
 
 def get_python_path() -> str:
+    """Resolve the service interpreter; effective config is needed before a current pointer exists."""
     from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _release_is_ready
 
     home = get_hermes_home()
@@ -2958,7 +2959,7 @@ def get_python_path() -> str:
     # Only launchd can use immutable releases. A broken pointer on another
     # platform is not its service executable, so fall back to that platform's
     # ordinary interpreter unless a real current target exists.
-    if is_macos():
+    if is_macos() and not current.exists() and not current.is_symlink():
         # The launchd executable decision needs effective user settings, including
         # managed scope, but not DEFAULT_CONFIG or updater validation side effects.
         from hermes_cli.config_effective import load_user_config_effective
