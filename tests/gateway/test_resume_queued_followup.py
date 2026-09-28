@@ -46,7 +46,7 @@ async def test_spooled_followup_waits_for_resumed_answer_with_own_reply_anchor(t
     monkeypatch.setattr("gateway.run_pending_recovery.get_routing_process_hermes_home", lambda: tmp_path)
     assert recover_pending_shutdown_flush(runner) == 1
     assert [row["content"] for row in rows] == ["A: interrupted", "Operation interrupted."]
-    assert not list((tmp_path / "pending_messages").glob("*.json"))
+    assert len(list((tmp_path / "pending_messages").glob("*.json"))) == 1
 
     replies = []
     async def handle(event):
@@ -88,6 +88,69 @@ def _spooled_runner(tmp_path, monkeypatch, *, pending=True, session_id="sid"):
     runner._startup_restore_tasks = []
     runner._startup_restore_in_progress = True
     return runner, adapter, source, key, db
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["offline", "raise", "accepted"])
+async def test_claimed_spool_survives_until_replay_acceptance(tmp_path, monkeypatch, outcome):
+    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    assert flush_pending_to_file({key: MessageEvent(text="queued", source=source, user_id="u1")}) == 1
+    path, = (tmp_path / "pending_messages").glob("*.json")
+    assert recover_pending_shutdown_flush(runner) == 1
+    assert path.exists()
+    # A second recovery in this process must not claim the same durable event twice.
+    assert recover_pending_shutdown_flush(runner) == 0
+    assert len(runner._startup_restore_queue) == 1
+    runner._startup_restore_in_progress = False
+    if outcome == "offline":
+        runner.adapters.clear()
+    elif outcome == "raise":
+        adapter.handle_message = AsyncMock(side_effect=RuntimeError("dispatch failed"))
+    else:
+        adapter.handle_message = AsyncMock()
+    assert await runner._drain_startup_restore_queue() == (1 if outcome == "accepted" else 0)
+    assert path.exists() == (outcome != "accepted")
+    if outcome != "accepted":
+        # A new process recovers the original spool rather than losing the message.
+        fresh, _, _, fresh_key, _ = _spooled_runner(tmp_path, monkeypatch)
+        assert recover_pending_shutdown_flush(fresh, candidates=[fresh.session_store._entries[fresh_key]]) == 1
+        assert [event.text for event in fresh._startup_restore_queue] == ["queued"]
+    db.append_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_unclaimed_restore_queue_and_reuses_claimed_spool(tmp_path, monkeypatch):
+    runner, _, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._background_tasks = set()
+    runner._stop_task = runner._restart_task = None
+    runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_approvals = {}
+    runner._shutdown_event = asyncio.Event()
+    runner._active_api_run_count = MagicMock(return_value=0)
+    runner._stop_kill_tool_subprocesses_off_loop = AsyncMock()
+    claimed = MessageEvent(text="claimed", source=source, user_id="u1")
+    fresh = MessageEvent(text="fresh", source=source, user_id="u1")
+    assert flush_pending_to_file({key: claimed}) == 1
+    path, = (tmp_path / "pending_messages").glob("*.json")
+    setattr(claimed, "_hermes_recovery_spool", path)
+    runner._startup_restore_queue = [claimed, fresh]
+    ctx = MagicMock()
+    ctx.elapsed.return_value = 0
+    await runner._stop_release_runtime_state(ctx)
+    payloads = [json.loads(p.read_text(encoding="utf-8"))["data"]["text"]
+                for p in (tmp_path / "pending_messages").glob("*.json")]
+    assert sorted(payloads) == ["claimed", "fresh"]
+
+
+def test_breaker_keeps_pending_followup_spooled(tmp_path, monkeypatch):
+    runner, _, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    assert flush_pending_to_file({key: MessageEvent(text="queued", source=source, user_id="u1")}) == 1
+    assert recover_pending_shutdown_flush(runner, candidates=None) == 0
+    assert list((tmp_path / "pending_messages").glob("*.json"))
+    db.append_message.assert_not_called()
 
 
 def test_shared_followup_replays_under_real_author_and_preserves_context(tmp_path, monkeypatch):
@@ -187,6 +250,7 @@ async def test_offline_followup_retried_on_primary_reconnect(tmp_path, monkeypat
     runner._await_startup_warmup = AsyncMock()
     adapter.handle_message = AsyncMock()
     await runner._install_reconnected_adapter(source.platform, adapter)
+    await runner._reconnect_spool_tasks[source.platform]
     assert not list((tmp_path / "pending_messages").glob("*.json"))
     runner._schedule_resume_pending_sessions.assert_called_once()
     adapter.handle_message.assert_awaited_once()
@@ -204,7 +268,7 @@ def test_direct_session_id_spool_skips_resolver_and_queues(tmp_path, monkeypatch
     runner.session_store.resolve_session_id_for_key.side_effect = AssertionError("resolver must be skipped")
     assert recover_pending_shutdown_flush(runner) == 1
     assert [event.text for event in runner._startup_restore_queue] == ["separate"]
-    assert not path.exists()
+    assert path.exists()
 
 
 def test_non_auto_resume_reason_appends_to_transcript(tmp_path, monkeypatch):
@@ -215,6 +279,21 @@ def test_non_auto_resume_reason_appends_to_transcript(tmp_path, monkeypatch):
     assert not runner._startup_restore_queue
     db.append_message.assert_called_once()
     assert db.append_message.call_args.kwargs["content"] == "ordinary"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_gate_uses_normalized_session_identity(tmp_path, monkeypatch):
+    runner, _, source, _, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    normalized = replace(source, thread_id="topic-recovered")
+    key = runner._session_key_for_source(normalized)
+    assert key != runner._session_key_for_source(source)
+    runner._normalize_source_for_session_key = MagicMock(return_value=normalized)
+    runner._reconnect_restore_keys = {key: 1}
+    event = MessageEvent(text="held", source=source, user_id="u1")
+    assert await runner._hm_admit_event(event) is None
+    assert runner._startup_restore_queue == [event]
+    runner._normalize_source_for_session_key.assert_called_once_with(source)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from functools import partial
 
 from hermes_constants import get_routing_process_hermes_home
 from gateway.session_recovery import SessionRecoveryMixin
@@ -30,6 +31,64 @@ def pending_home_for_key(runner, session_key: str) -> Path | None:
     return Path(served[owner]) if owner in served else None
 
 
+def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, breaker_tripped=False):
+    if breaker_tripped and hasattr(runner.session_store, "_lock"):
+        with runner.session_store._lock:
+            runner.session_store._ensure_loaded_locked()
+            entry = runner.session_store._entries.get(key)
+            if entry and entry.resume_pending and entry.session_id == session_id:
+                return None
+    # A queued message is a future turn; appending it to the interrupted transcript
+    # makes the recovery note answer that message instead.
+    if platform is not None and key in eligible and eligible[key].origin.platform != platform:
+        return OTHER_PLATFORM_PENDING
+    if key not in eligible:
+        return False
+    if any(getattr(event, "_hermes_recovery_spool", None) == path
+           for event in getattr(runner, "_startup_restore_queue", ())):
+        return OTHER_PLATFORM_PENDING  # claimed by this process already
+    store = runner.session_store
+    with store._lock:
+        store._ensure_loaded_locked()
+        entry = store._entries.get(key)
+        if not (entry and entry is eligible.get(key) and entry.resume_pending
+                and entry.session_id == session_id and entry.origin):
+            return False
+    ready = runner._auto_resume_ready(entry, require_adapter=False)
+    if ready is None:
+        return None
+    # Older spools lack authorship; never guess who issued a command in shared chats.
+    author_id = data.get("source_user_id") or data.get("user_id")
+    if not isinstance(author_id, str) or not author_id.strip():
+        return False
+    adapter, source = ready
+    if adapter is None:
+        return None
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.session_identity import replace_source
+    message_id = data.get("message_id")
+    source = replace_source(
+        source, message_id=message_id, user_id=author_id,
+        user_name=data.get("source_user_name") or data.get("user_name"),
+        user_id_alt=data.get("source_user_id_alt"),
+        is_bot=bool(data.get("source_is_bot", False)),
+        role_authorized=bool(data.get("source_role_authorized", False)),
+    )
+    event = MessageEvent(
+        text=data["text"], message_type=MessageType.TEXT, source=source,
+        user_id=data.get("user_id") or author_id,
+        user_name=data.get("user_name") or source.user_name,
+        message_id=message_id,
+        media_urls=data.get("media_urls") or data.get("media") or [],
+        media_types=data.get("media_types") or [],
+        reply_to_message_id=data.get("reply_to_message_id") or data.get("reply_to"),
+    )
+    setattr(event, "_hermes_recovered_followup", True)
+    setattr(event, "_hermes_recovery_spool", path)
+    runner._queue_startup_restore_event(event)
+    return True
+
+
 def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform=None) -> int:
     """Visit the launch home and every served home; leave failed spools for a later boot."""
     from gateway.run import _profile_runtime_scope
@@ -41,55 +100,6 @@ def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform
     launch_home = Path(get_routing_process_hermes_home())
     homes = [launch_home, *((getattr(runner, "_served_profile_homes", None) or {}).values())]
     recovered = 0
-    def defer_followup(key, session_id, data):
-        # A queued message is a *future* turn. Appending it to the interrupted
-        # transcript before auto-resume makes the recovery note answer that message.
-        if platform is not None and key in eligible and eligible[key].origin.platform != platform:
-            return OTHER_PLATFORM_PENDING
-        if key not in eligible:
-            return False
-        store = runner.session_store
-        with store._lock:
-            store._ensure_loaded_locked()
-            entry = store._entries.get(key)
-            if not (entry and entry is eligible.get(key) and entry.resume_pending
-                    and entry.session_id == session_id and entry.origin):
-                return False
-        # Admission is shared with the scheduler, including freshness, running slot,
-        # authorization and the boot's restart-loop decision (eligible snapshot).
-        ready = runner._auto_resume_ready(entry, require_adapter=False)
-        if ready is None:
-            return False
-        # Older spools lack authorship. A guessed author would authorize a queued command as
-        # the session starter in shared chats, so recover those only as transcript text.
-        author_id = data.get("source_user_id") or data.get("user_id")
-        if not isinstance(author_id, str) or not author_id.strip():
-            return False
-        source = ready[1]
-        if ready[0] is None:
-            return None
-        from gateway.platforms.event import MessageEvent, MessageType
-        from gateway.session_identity import replace_source
-        message_id = data.get("message_id")
-        source = replace_source(
-            source, message_id=message_id, user_id=author_id,
-            user_name=data.get("source_user_name") or data.get("user_name"),
-            user_id_alt=data.get("source_user_id_alt"),
-            is_bot=bool(data.get("source_is_bot", False)),
-            role_authorized=bool(data.get("source_role_authorized", False)),
-        )
-        event = MessageEvent(
-            text=data["text"], message_type=MessageType.TEXT, source=source,
-            user_id=data.get("user_id") or author_id,
-            user_name=data.get("user_name") or source.user_name,
-            message_id=message_id,
-            media_urls=data.get("media_urls") or data.get("media") or [],
-            media_types=data.get("media_types") or [],
-            reply_to_message_id=data.get("reply_to_message_id") or data.get("reply_to"),
-        )
-        setattr(event, "_hermes_recovered_followup", True)
-        runner._queue_startup_restore_event(event)
-        return True
 
     for home in dict.fromkeys(Path(home) for home in homes):
         try:
@@ -106,8 +116,10 @@ def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform
                     with _profile_runtime_scope(owner_home, prepared_secret_scope={}):
                         return runner.session_store.resolve_session_id_for_key(key, not_after=not_after)
 
-                recovered += recover_pending_to_db(session_resolver=resolve_here,
-                                                   deferred_followup=defer_followup)
+                recovered += recover_pending_to_db(
+                    session_resolver=resolve_here,
+                    deferred_followup=partial(_defer_followup, runner, eligible, platform,
+                                              breaker_tripped=candidates is None))
         except Exception:
             logger.warning("Pending-message recovery failed for profile home %s; spool retained", home,
                            exc_info=True)

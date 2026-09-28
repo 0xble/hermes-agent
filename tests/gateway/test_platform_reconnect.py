@@ -154,6 +154,51 @@ class TestPlatformReconnectWatcher:
 
 
     @pytest.mark.asyncio
+    async def test_installed_adapter_survives_recovery_error(self):
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._update_platform_runtime_status = MagicMock()
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 1, "next_retry": 0,
+        }
+        adapter = StubAdapter()
+        adapter.disconnect = AsyncMock()
+        runner._schedule_planned_restart_replay = MagicMock(side_effect=RuntimeError("replay failed"))
+        with patch.object(runner, "_create_adapter", return_value=adapter):
+            await runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic())
+        assert runner.adapters[Platform.TELEGRAM] is adapter
+        adapter.disconnect.assert_not_awaited()
+        assert Platform.TELEGRAM not in runner._failed_platforms
+
+    @pytest.mark.asyncio
+    async def test_reconnect_recovery_does_not_block_next_platform(self):
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._update_platform_runtime_status = MagicMock()
+        runner._background_tasks = set()
+        for platform in (Platform.TELEGRAM, Platform.DISCORD):
+            runner._failed_platforms[platform] = {
+                "config": PlatformConfig(enabled=True, token="test"),
+                "attempts": 1, "next_retry": 0,
+            }
+        gate = asyncio.Event()
+        seen = []
+        async def recover(platform):
+            seen.append(platform)
+            if platform is Platform.TELEGRAM:
+                await gate.wait()
+        runner._recover_spool_after_reconnect = recover
+        with patch("gateway.channel_directory.build_channel_directory", new_callable=AsyncMock):
+            with patch.object(runner, "_create_adapter", side_effect=lambda p, c: StubAdapter(platform=p)):
+                await asyncio.wait_for(runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic()), 2)
+                await asyncio.wait_for(runner._reconnect_failed_platform(Platform.DISCORD, time.monotonic()), 2)
+                gate.set()
+                await asyncio.gather(*runner._background_tasks)
+        assert set(seen) == {Platform.TELEGRAM, Platform.DISCORD}
+        assert set(runner.adapters) == set(seen)
+
+    @pytest.mark.asyncio
     async def test_reconnect_passes_is_reconnect_true(self):
         """The watcher must connect with is_reconnect=True so adapters preserve
         their server-side update queue across an outage (#46621). Without this,

@@ -99,12 +99,16 @@ class GatewayStartupMixin:
         """Replay ready inbound, leaving sessions owned by another restore in order."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
+        def ready(event):
+            key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+            if keys is not None and key not in keys:
+                return False
+            # Our own gate permits one claimant; every other owner's gate must be fully open.
+            limit = 1 if owned_keys and key in owned_keys else 0
+            return getattr(self, "_reconnect_restore_keys", {}).get(key, 0) <= limit
+
         while True:
-            index = next((i for i, event in enumerate(queue)
-                          if (keys is None or self._session_key_for_source(event.source) in keys)
-                          and getattr(self, "_reconnect_restore_keys", {}).get(
-                              self._session_key_for_source(event.source), 0)
-                          <= (1 if owned_keys and self._session_key_for_source(event.source) in owned_keys else 0)), None)
+            index = next((i for i, event in enumerate(queue) if ready(event)), None)
             if index is None:
                 break
             event = queue.pop(index)
@@ -123,6 +127,9 @@ class GatewayStartupMixin:
                 with suppress(Exception):
                     setattr(event, "_hermes_startup_restore_replay", True)
                 await adapter.handle_message(event)
+                spool = getattr(event, "_hermes_recovery_spool", None)
+                if spool is not None:
+                    spool.unlink(missing_ok=True)
             except Exception:
                 # One bad replay must not abort the drain: the remaining queued
                 # events still deserve their turn, and a raise here used to skip

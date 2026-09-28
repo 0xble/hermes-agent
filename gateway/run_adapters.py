@@ -774,8 +774,12 @@ class GatewayAdapterLifecycleMixin:
                 # promptly, so 2 fds/retry leak at 300s backoff cap = ~12 fds/hour (#37011).
                 await _dispose_unused_adapter(adapter)
         except Exception as e:
+            if adapter is not None and self.adapters.get(platform) is adapter:
+                # Installation already transferred ownership to the gateway. A tail failure
+                # cannot dispose the live receive path or recreate a stale retry entry.
+                logger.warning("Reconnect %s post-install recovery error: %s", platform.value, e)
+                return
             if adapter is not None:
-                # An exception escaping connect leaves the adapter in the same unowned state.
                 await _dispose_unused_adapter(adapter)
             # A reconnect exception is transient; keep retrying at the cap rather than auto-pausing.
             backoff = self._bump_reconnect_backoff(platform, info, attempt, None, str(e))
@@ -821,7 +825,7 @@ class GatewayAdapterLifecycleMixin:
         except Exception:
             logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
                            exc_info=True)
-        keys.update(self._session_key_for_source(event.source)
+        keys.update(self._session_key_for_source(self._normalize_source_for_session_key(event.source))
                     for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
         if not keys and not tasks:
             return
@@ -881,7 +885,23 @@ class GatewayAdapterLifecycleMixin:
             await build_channel_directory(self.adapters)
         # A spool held while this adapter was offline must be reclaimed before its
         # interrupted session resumes, then replayed after the resumed answer.
-        await self._recover_spool_after_reconnect(platform)
+        self._start_reconnect_spool_recovery(platform)
+
+    def _start_reconnect_spool_recovery(self, platform) -> None:
+        """One retained recovery worker per platform, independent of the reconnect watcher."""
+        pending = getattr(self, "_reconnect_spool_tasks", None)
+        if pending is None:
+            pending = self._reconnect_spool_tasks = {}
+        if platform in pending and not pending[platform].done():
+            return
+        async def recover():
+            try:
+                await self._recover_spool_after_reconnect(platform)
+            except Exception:
+                logger.warning("Pending recovery after %s reconnect failed", platform.value, exc_info=True)
+            finally:
+                pending.pop(platform, None)
+        pending[platform] = self._retain_background_task(asyncio.create_task(recover()))
 
     async def _cancel_secondary_profile_reconnect_tasks(self) -> None:
         """Cancel profile-scoped reconnects before tearing down their registry, so a reconnect

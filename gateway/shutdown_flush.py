@@ -4,8 +4,9 @@ When FTS5 corruption blocks ``INSERT INTO messages``, ``_pending_messages`` and 
 ``agent._session_messages`` are the only surviving copies; shutdown ``.clear()`` would drop them.
 All hooks write atomic JSON payloads under ``<hermes_home>/pending_messages/``:
 ``flush_pending_to_file`` / ``flush_overflow_to_file`` (queue head / FIFO tail, before clear),
-``recover_pending_to_db`` (after ``runner.start()``; replays via ``SessionDB.append_message``,
-deletes each file on success), ``flush_agent_history_to_file`` (DB flush raised),
+``recover_pending_to_db`` (after ``runner.start()``; replays via ``SessionDB.append_message``;
+claimed follow-ups remain spooled until their adapter accepts replay; other files delete
+on success), ``flush_agent_history_to_file`` (DB flush raised),
 ``spool_dropped_transcript_message`` / ``drain_transcript_spool``.
 """
 
@@ -245,11 +246,13 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                     continue
-                if _recover_one_payload(session_db, path, payload,
-                                        session_resolver=session_resolver,
-                                        deferred_followup=deferred_followup):
+                result = _recover_one_payload(session_db, path, payload,
+                                              session_resolver=session_resolver,
+                                              deferred_followup=deferred_followup)
+                if result:
                     recovered += 1
-                    path.unlink(missing_ok=True)
+                    if result is not CLAIMED_FOLLOWUP:
+                        path.unlink(missing_ok=True)
             except Exception as exc:
                 logger.warning("Failed to recover pending message from %s: %s", path, exc)
     finally:
@@ -263,11 +266,12 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
 
 
 OTHER_PLATFORM_PENDING = object()  # retained for a different adapter's reconnect, not a failure
+CLAIMED_FOLLOWUP = object()  # queued in memory, disk copy retained until adapter accepts replay
 
 
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
-                         session_resolver=None, deferred_followup=None) -> bool:
-    """Append one flush payload to ``session_db``; False (file kept) when structurally invalid."""
+                         session_resolver=None, deferred_followup=None) -> bool | object:
+    """Append a flush payload or retain a claimed follow-up until adapter admission."""
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.
     if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
@@ -308,7 +312,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                        "The message text is preserved in %s", session_key, path)
         return False
     if deferred_followup is not None:
-        claim = deferred_followup(session_key, session_id, data)
+        claim = deferred_followup(session_key, session_id, data, path)
         if claim is OTHER_PLATFORM_PENDING:
             logger.debug("Pending message for %s retained until its platform reconnects", session_key)
             return False
@@ -317,7 +321,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                            "resume awaiting platform reconnect", session_key, path)
             return False
         if claim:
-            return True
+            return CLAIMED_FOLLOWUP
     target_db.append_message(session_id=session_id, role="user", content=text,
                              timestamp=payload.get("ts", int(time.time())))
     return True
