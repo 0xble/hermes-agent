@@ -161,6 +161,9 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str) -> s
             not _release_is_ready(current, current.name)):
         receipt(home, "inspect", "alert", reason="corrupt current pointer; no source fallback")
         return "alert"
+    if Path(definition.get("WorkingDirectory", "")).resolve() != current:
+        receipt(home, "inspect", "alert", reason="gateway plist is not rooted in current release")
+        return "alert"
     switch = _switch(home, grace=grace)
     state = _launch_state(domain, label)
     if state == "loaded" and healthy(home, label, current):

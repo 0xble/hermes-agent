@@ -98,6 +98,17 @@ def test_corrupt_current_pointer_reports_without_source_fallback(tmp_path, monke
 
 
 @pytest.mark.macos_only
+def test_source_checkout_plist_is_never_bootstrapped(tmp_path, monkeypatch):
+    home, plist, label, a, b = layout(tmp_path)
+    definition = plistlib.loads(plist.read_bytes())
+    definition["WorkingDirectory"] = str(tmp_path / "source")
+    plist.write_bytes(plistlib.dumps(definition))
+    calls = fake_launchctl(monkeypatch, label)
+    assert guardian.run_once(home, plist, label) == "alert"
+    assert not calls
+
+
+@pytest.mark.macos_only
 def test_pending_failed_switch_archived_before_rollback(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     txn = {"version": 1, "operation": "promote", "candidate": str(b),
