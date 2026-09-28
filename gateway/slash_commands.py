@@ -1313,6 +1313,8 @@ class GatewaySlashCommandsMixin(
                     return t("gateway.update.platform_not_messaging")
             except Exception:
                 return t("gateway.update.platform_not_messaging")
+        if self._draining:
+            return t("gateway.restart.in_progress")
         if is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
         try:

@@ -75,11 +75,6 @@ def _same_chat_key_slots(
 class GatewayBusySessionMixin:
     """Busy-session queueing, slot claims, slash dispatch tables, destructive-slash confirmation."""
 
-    def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
-        # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
-        mode = busy_input_mode or self._busy_input_mode
-        return self._restart_requested and mode in {"queue", "steer"}
-
     def _overflow_queue(self, session_key: str):
         """The session's FIFO overflow list, or None when no session state exists yet."""
         state = self._peek_session_state(session_key)
@@ -486,17 +481,21 @@ class GatewayBusySessionMixin:
             metadata=self._thread_metadata_for_source(event.source, reply_anchor),
         )
 
-    async def _send_busy_drain_notice(self, event: MessageEvent, session_key: str, effective_mode: str) -> None:
-        """Busy path while the gateway is restarting/stopping: queue (if allowed) and tell the user."""
-        adapter = self._delivery_adapter_for(event.source)
-        if not adapter:
+    def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> None:
+        """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing."""
+        setattr(event, "_drain_deferred", True)
+        self._queue_or_replace_pending_event(session_key, event)
+        if getattr(event, "_gateway_accepted", False):
             return
-        if self._queue_during_drain_enabled(effective_mode):
-            self._queue_or_replace_pending_event(session_key, event)
-            message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-        else:
-            message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-        await self._send_busy_reply(event, adapter, message)
+        # No adapter or a full FIFO: use the same durable shutdown spool rather than lose
+        # the turn. Recovery retains the file if its session cannot yet be resolved.
+        try:
+            preserved = self._flush_owned_pending(session_key, event, reason="drain_arrival")
+        except Exception:
+            preserved = 0
+            logger.warning("Failed to preserve drain arrival for %s", session_key, exc_info=True)
+        if not preserved:
+            logger.warning("Drain arrival for %s could not be preserved", session_key)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command.
     _PLAINTEXT_APPROVAL_WORDS: Dict[str, tuple] = {
@@ -769,6 +768,9 @@ class GatewayBusySessionMixin:
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
+        if self._draining and event.internal and not self._hm_is_registered_command(event):
+            self._preserve_drain_event(session_key, event)
+            return True
         if event.internal and event.allow_gateway_control:
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
@@ -793,11 +795,22 @@ class GatewayBusySessionMixin:
             return True
         event._bot_loop_admitted = True
 
-        effective_mode = self._effective_busy_input_mode(event.source)
-        if self._draining:  # gateway restarting/stopping
-            await self._send_busy_drain_notice(event, session_key, effective_mode)
-            return True
         if await self._route_plaintext_approval_while_busy(event, session_key):
+            return True
+        if self._draining and not self._hm_is_registered_command(event):
+            self._preserve_drain_event(session_key, event)
+            return True
+        effective_mode = self._effective_busy_input_mode(event.source)
+        if self._draining:
+            # A command not bypassed by the adapter still uses the ordinary busy
+            # dispatch path, never the busy-input interrupt/queue lane.
+            handled, reply = await self._hm_busy_slash_or_photo(event, event.source, session_key)
+            if handled:
+                if reply:
+                    adapter = self._delivery_adapter_for(event.source)
+                    if adapter:
+                        await self._send_busy_reply(event, adapter, reply)
+                return True
             return True
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
