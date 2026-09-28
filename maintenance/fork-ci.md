@@ -32,6 +32,14 @@ The test still uses a local origin with no network and seeds a v45 user config t
 exercise the MCP disabled → enabled migration even when the release binary is v46.
 A missing upstream tag fetch fails the nightly rather than silently narrowing coverage.
 
+The macOS immutable-release plugin rejection matrix builds one real checkout and
+candidate venv, then tests each plugin kind through the existing-candidate smoke
+path. The previous five parametrized cases each independently rebuilt the entire
+web UI and venv. On hosted macOS this exhausted the 300-second per-file bound
+partway through the fourth case, not in launchd. Reusing a ready, immutable
+candidate preserves each kind's import rejection, unflipped pointer, and partial
+receipt without repeatedly testing unrelated build tooling.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
