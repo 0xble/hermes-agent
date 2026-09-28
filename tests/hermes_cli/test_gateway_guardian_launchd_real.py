@@ -34,9 +34,11 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
     script = tmp_path / "fake_gateway.py"
     script.write_text(
         "import json,os,pathlib,time\n"
+        "from datetime import datetime,timezone\n"
         "h=pathlib.Path(os.environ['HERMES_HOME'])\n"
         "(h/'gateway_state.json').write_text(json.dumps({'pid':os.getpid(),"
-        "'gateway_state':'running','code_sha':pathlib.Path.cwd().name}))\n"
+        "'gateway_state':'running','code_sha':pathlib.Path.cwd().name,"
+        "'updated_at':datetime.now(timezone.utc).isoformat()}))\n"
         "time.sleep(120)\n", encoding="utf-8")
     domain = f"gui/{os.getuid()}"
     suffix = uuid.uuid4().hex
