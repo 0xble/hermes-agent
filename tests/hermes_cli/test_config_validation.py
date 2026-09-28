@@ -8,6 +8,27 @@ from hermes_cli.config import (
 )
 
 
+@pytest.mark.parametrize("updates,key", [
+    ({"immutable_releases": "false"}, "updates.immutable_releases"),
+    ({"release_acknowledgement_timeout_seconds": "30"}, "updates.release_acknowledgement_timeout_seconds"),
+    ({"release_acknowledgement_timeout_seconds": 0}, "updates.release_acknowledgement_timeout_seconds"),
+    ({"release_acknowledgement_timeout_seconds": -1}, "updates.release_acknowledgement_timeout_seconds"),
+    ({"release_acknowledgement_timeout_seconds": float("nan")}, "updates.release_acknowledgement_timeout_seconds"),
+])
+def test_immutable_update_config_rejects_invalid_values(updates, key):
+    issues = validate_config_structure({"updates": updates})
+    assert any(issue.severity == "error" and key in issue.message for issue in issues)
+
+
+def test_update_command_rejects_invalid_immutable_config_on_use(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd
+    from hermes_cli import config as config_module
+    monkeypatch.setattr(config_module, "load_config", lambda: {"updates": {
+        "immutable_releases": "false", "release_acknowledgement_timeout_seconds": -1}})
+    with pytest.raises(ValueError, match="updates.immutable_releases.*updates.release_acknowledgement_timeout_seconds"):
+        update_cmd._updates_config()
+
+
 class TestCustomProvidersValidation:
     """custom_providers must be a YAML list, not a dict."""
 

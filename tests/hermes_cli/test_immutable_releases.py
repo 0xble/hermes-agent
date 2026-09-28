@@ -495,6 +495,55 @@ def test_repeated_rollback_is_noop_without_fleet_relaunch(tmp_path, monkeypatch,
     assert (home / "current").resolve() == first
 
 
+@pytest.mark.parametrize("pointer", ["dangling", "outside", "unready", "missing_python"])
+def test_gateway_interpreter_refuses_broken_immutable_current(tmp_path, monkeypatch, pointer):
+    from hermes_cli import gateway
+    home = tmp_path / "profile"
+    root = home / "releases" / ("a" * 40)
+    _fake_release(root, root.name)
+    home.mkdir(exist_ok=True)
+    current = home / "current"
+    current.symlink_to(tmp_path / "missing" if pointer == "dangling" else
+                       tmp_path / "outside" if pointer == "outside" else root)
+    if pointer == "outside":
+        (tmp_path / "outside").mkdir()
+    if pointer == "unready":
+        (root / ".release-ready").unlink()
+    if pointer == "missing_python":
+        (root / ".venv/bin/python").unlink()
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    with pytest.raises(RuntimeError, match="current.*hermes update --rollback"):
+        gateway.get_python_path()
+
+
+def test_incomplete_checkout_never_receipts_success_during_acknowledged_catchup(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+    home = tmp_path / "profile"
+    root = home / "releases" / ("a" * 40)
+    _fake_release(root, root.name)
+    releases.promote(home, root)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd_fleet, "_pending_fleet_restart_needed", lambda: True)
+    monkeypatch.setattr(update_cmd_fleet, "_acknowledged_release_launchd_label", lambda *a: "test.label")
+    monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **kw: False)
+    monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a: None)
+    monkeypatch.setattr(update_cmd, "_catch_up_immutable_release", lambda **kw: None)
+    monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update", lambda *a, **kw: SimpleNamespace(incomplete=False))
+    monkeypatch.setattr(update_cmd, "_verify_fleet_after_update", lambda _outcome, **kw:
+                        update_receipt.finalize_update_receipt("success" if kw["update_complete"] else "partial"))
+    update_receipt.begin_update_receipt()
+    plan = SimpleNamespace(auto_stash_ref=None, parked_branch_switched=False, upstream_checked=True)
+    with pytest.raises(SystemExit) as exited:
+        update_cmd._finish_already_up_to_date(None, "main", "main", plan,
+            assume_yes=True, gateway_mode=False, gw_input_fn=None,
+            pre_update_snapshot_id=None, had_desktop_app_before_update=False,
+            active_lazy_features=[], active_tool_dependencies=[], _windows_gateway_resume=None)
+    assert exited.value.code == 1
+    assert update_receipt.read_latest_receipt()["outcome"] == "partial"
+
+
 def test_nonready_current_refuses_legacy_update_before_build(tmp_path, monkeypatch):
     from hermes_cli import update_cmd
     home = tmp_path / "profile"
