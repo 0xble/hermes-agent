@@ -4904,6 +4904,9 @@ def _cmd_start(args):
     start_all = getattr(args, "all", False)
     force = getattr(args, "force", False)
     _guard_named_profile_under_multiplexer(force=force)
+    if sys.platform == "darwin" and not start_all:
+        from hermes_cli.gateway_guardian import set_intent
+        set_intent(get_hermes_home(), stopped=False)
     if not start_all and _dispatch_via_service_manager_if_s6("start"):
         return
     if start_all:
@@ -4953,6 +4956,9 @@ def _cmd_stop(args):
         print(f"    hermes {owner_flag}gateway stop      # takes every served profile offline")
         print(f"    hermes {owner_flag}gateway restart")
         sys.exit(GATEWAY_FATAL_CONFIG_EXIT_CODE)
+    if sys.platform == "darwin":
+        from hermes_cli.gateway_guardian import set_intent
+        set_intent(get_hermes_home(), stopped=True)
     # Under s6 a bare pkill is seen as a crash and restarted; go through the supervisor.
     if stop_all and _dispatch_all_via_service_manager_if_s6("stop"):
         return
@@ -5270,10 +5276,15 @@ def _cmd_migrate(args):
     cmd_migrate(args)
 
 
+def _cmd_guardian(args):
+    from hermes_cli.gateway_guardian import cli
+    return cli([args.guardian_command])
+
+
 _GATEWAY_SUBCOMMANDS = {
     None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
     "uninstall": _cmd_uninstall, "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart,
-    "status": _cmd_status, "list": _cmd_list, "update": _cmd_update, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
+    "status": _cmd_status, "list": _cmd_list, "update": _cmd_update, "guardian": _cmd_guardian, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
 }
 
 

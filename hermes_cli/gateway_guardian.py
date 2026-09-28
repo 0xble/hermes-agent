@@ -1,0 +1,291 @@
+"""One-shot macOS launchd guardian for an immutable Hermes gateway release.
+
+The job is independent of the gateway process tree. It never updates source, retries
+work, or falls back to the checkout when the release pointer is damaged.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from hermes_constants import get_hermes_home
+from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
+
+GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
+INTERVAL = 30
+MAX_REPAIRS = 3
+
+
+def intent_path(home: Path) -> Path:
+    return home / "gateway-guardian-stopped"
+
+
+def set_intent(home: Path, *, stopped: bool) -> None:
+    path = intent_path(home)
+    if stopped:
+        path.write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
+
+
+def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
+    directory = home / "logs" / "guardian"
+    directory.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    path = directory / f"{now.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
+    payload = {"at": now.isoformat(), "action": action, "outcome": outcome, **detail}
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def enabled(home: Path) -> bool:
+    from hermes_cli.config_effective import load_user_config_effective
+    config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+    value = (config.get("gateway") or {}).get("guardian", {}).get("enabled", False)
+    if type(value) is not bool:
+        raise ValueError("gateway.guardian.enabled must be a boolean")
+    return value
+
+
+def _switch(home: Path, *, grace: float) -> dict | None:
+    for name in ("release-txn.json", "release-last-txn.json"):
+        path = home / name
+        if not path.exists():
+            continue
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(record, dict) or record.get("version") != 1:
+            raise ValueError(f"invalid release receipt: {path}")
+        if record.get("operation") not in {"promote", "first-migration"} or record.get("reload_ack"):
+            return None
+        issued = record.get("reload_issued")
+        if not isinstance(issued, dict) or not isinstance(issued.get("at"), str):
+            return None
+        age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(issued["at"]).timestamp()
+        if age < grace:
+            return None
+        return record
+    return None
+
+
+def healthy(home: Path, label: str, expected: Path) -> bool:
+    from gateway.status import read_runtime_status
+    from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+    import psutil
+    state = read_runtime_status(home / "gateway_state.json") or {}
+    pid = state.get("pid")
+    if type(pid) is not int or state.get("gateway_state") not in {"running", "degraded"}:
+        return False
+    if state.get("code_sha") != expected.name:
+        return False
+    supervised = _launchctl_supervised_pid(label)
+    if supervised is None:
+        return False
+    try:
+        process = psutil.Process(pid)
+        return (process.is_running() and
+                (supervised == pid or supervised in {p.pid for p in process.parents()}) and
+                process.cwd() == str(expected))
+    except (psutil.Error, OSError):
+        return False
+
+
+def _launch_state(domain: str, label: str) -> str:
+    result = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
+                            capture_output=True, text=True, encoding="utf-8", timeout=5)
+    if result.returncode == 0:
+        return "loaded"
+    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
+        return "unloaded"
+    raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
+
+
+def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None) -> bool:
+    """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
+    from hermes_cli import gateway
+    from hermes_cli.immutable_releases import wait_for_release_acknowledgement
+    paths = ReleasePaths.for_home(home)
+    pending = home / "release-txn.json"
+    if pending.exists():
+        from hermes_cli.immutable_releases import abandon_failed_switch
+        abandon_failed_switch(home, candidate=paths.current.resolve(), previous=old)
+        receipt(home, "abandon_switch", "recorded", candidate=str(paths.current.resolve()), previous=str(old))
+    definition = plistlib.loads(plist.read_bytes())
+    if label == gateway.get_launchd_label() and home.resolve() == get_hermes_home().resolve():
+        body = gateway.generate_launchd_plist(release_target=old).encode("utf-8")
+    else:
+        # A disposable label uses its own plist; never regenerate the real service.
+        definition["WorkingDirectory"] = str(old)
+        body = plistlib.dumps(definition)
+    domain = domain or f"gui/{os.getuid()}"
+    def reload_target():
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
+        return True
+    result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
+    if result.get("reload_pending"):
+        # The S2 acknowledgement may arrive after this one-shot invocation; live
+        # process identity below is the independent health proof for this action.
+        wait_for_release_acknowledgement(home, timeout_seconds=5)
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if healthy(home, label, old):
+            return True
+        time.sleep(.25)
+    return False
+
+
+def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str) -> str:
+    from hermes_cli.immutable_releases import _verify_transaction
+    if intent_path(home).exists():
+        return "stopped"
+    if not plist.is_file():
+        receipt(home, "inspect", "alert", reason="gateway plist missing")
+        return "alert"
+    definition = plistlib.loads(plist.read_bytes())
+    if (definition.get("Label") != label or
+            Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve() != home.resolve()):
+        receipt(home, "inspect", "alert", reason="gateway plist identity mismatch")
+        return "alert"
+    paths = ReleasePaths.for_home(home)
+    current = paths.current.resolve()
+    if (not paths.current.is_symlink() or current.parent != paths.releases.resolve() or
+            not _release_is_ready(current, current.name)):
+        receipt(home, "inspect", "alert", reason="corrupt current pointer; no source fallback")
+        return "alert"
+    switch = _switch(home, grace=grace)
+    state = _launch_state(domain, label)
+    if state == "loaded" and healthy(home, label, current):
+        return "healthy"
+    if switch:
+        old = Path(switch["previous_intended"])
+        if (old != paths.previous.resolve() or old == current or old.parent != paths.releases.resolve() or
+                not _release_is_ready(old, old.name)):
+            receipt(home, "rollback", "alert", reason="previous release is not intact", candidate=str(current))
+            return "alert"
+        if (home / "release-txn.json").exists():
+            _verify_transaction(paths, switch)
+        if _repair_count(home) >= MAX_REPAIRS:
+            receipt(home, "rollback", "capped", candidate=str(current))
+            return "capped"
+        receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
+        ok = rollback_switch(home, plist, label, old, domain=domain)
+        receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
+        return "rolled_back" if ok else "failed"
+    if state == "loaded":
+        return "waiting"  # KeepAlive may be bringing up a registered job.
+    if _repair_count(home) >= MAX_REPAIRS:
+        receipt(home, "bootstrap", "capped", label=label)
+        return "capped"
+    receipt(home, "bootstrap", "attempt", label=label)
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if _launch_state(domain, label) == "loaded" and healthy(home, label, current):
+            receipt(home, "bootstrap", "repaired", label=label, release=str(current))
+            return "repaired"
+        time.sleep(.25)
+    receipt(home, "bootstrap", "failed", label=label, reason="gateway not healthy after bootstrap")
+    return "failed"
+
+
+def _repair_count(home: Path) -> int:
+    cutoff = time.time() - 3600
+    count = 0
+    for path in (home / "logs/guardian").glob("*.json"):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+            if row.get("action") in {"bootstrap", "rollback"} and row.get("outcome") == "attempt" and datetime.fromisoformat(row["at"]).timestamp() > cutoff:
+                count += 1
+        except (OSError, ValueError, KeyError):
+            continue
+    return count
+
+
+def run_once(home: Path, plist: Path, label: str, *, grace: float = 180,
+             domain: str | None = None) -> str:
+    home = Path(home)
+    directory = home / "logs/guardian"
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "guardian.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "locked"
+        try:
+            return _run(home, Path(plist), label, grace=grace, domain=domain or f"gui/{os.getuid()}")
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+            receipt(home, "inspect", "alert", reason=str(exc))
+            return "alert"
+
+
+def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str) -> bytes:
+    python = home / "current/.venv/bin/python"
+    return plistlib.dumps({"Label": GUARDIAN_LABEL, "RunAtLoad": True, "StartInterval": INTERVAL,
+                           "ProgramArguments": [str(python), "-m", "hermes_cli.gateway_guardian", "run",
+                                                "--gateway-plist", str(gateway_plist), "--gateway-label", label,
+                                                "--domain", domain],
+                           "WorkingDirectory": str(home / "current"),
+                           "EnvironmentVariables": {"HERMES_HOME": str(home)},
+                           "StandardOutPath": str(home / "logs/guardian/stdout.log"),
+                           "StandardErrorPath": str(home / "logs/guardian/stderr.log")})
+
+
+def cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Independent gateway guardian")
+    parser.add_argument("action", choices=["install", "uninstall", "status", "run"])
+    parser.add_argument("--gateway-plist", type=Path)
+    parser.add_argument("--gateway-label")
+    parser.add_argument("--domain", default=f"gui/{os.getuid()}")
+    args = parser.parse_args(argv)
+    from hermes_cli import gateway
+    home = get_hermes_home()
+    target = args.gateway_plist or gateway.get_launchd_plist_path()
+    label = args.gateway_label or gateway.get_launchd_label()
+    import pwd
+    path = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
+    if args.action == "status":
+        print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()}")
+        return 0
+    if args.action == "uninstall":
+        subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10)
+        path.unlink(missing_ok=True)
+        print("Guardian uninstalled")
+        return 0
+    if not enabled(home):
+        parser.error("gateway.guardian.enabled must be true to install or run the guardian")
+    if args.action == "run":
+        outcome = run_once(home, target, label, domain=args.domain)
+        print(outcome)
+        return 0 if outcome in {"healthy", "stopped", "repaired", "rolled_back", "waiting", "locked"} else 1
+    if sys.platform != "darwin":
+        parser.error("guardian install requires macOS launchd")
+    paths = ReleasePaths.for_home(home)
+    if not paths.current.is_symlink() or not _release_is_ready(paths.current.resolve(), paths.current.resolve().name):
+        parser.error("a valid immutable current release is required")
+    body = guardian_plist(home, target, label, domain=args.domain)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (home / "logs/guardian").mkdir(parents=True, exist_ok=True)
+    if path.is_file() and path.read_bytes() == body:
+        if _launch_state(args.domain, GUARDIAN_LABEL) == "unloaded":
+            subprocess.run(["launchctl", "bootstrap", args.domain, str(path)], check=True, timeout=10)
+        print(f"Guardian already installed: {path}")
+        return 0
+    if path.exists():
+        parser.error("existing guardian plist differs; uninstall before reinstalling")
+    path.write_bytes(body)
+    subprocess.run(["launchctl", "bootstrap", args.domain, str(path)], check=True, timeout=10)
+    print(f"Guardian installed: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

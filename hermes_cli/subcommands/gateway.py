@@ -87,6 +87,9 @@ def build_gateway_parser(
     _flag(gateway_restart, "--force", help=_FORCE_SERVED_PROFILE_HELP)
     _add_compat_platform_flag(gateway_restart)
 
+    guardian = gateway_subparsers.add_parser("guardian", help="Manage the independent macOS gateway guardian")
+    guardian.add_argument("guardian_command", choices=("install", "uninstall", "status"))
+
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     _flag(gateway_status, "--deep", help="Deep status check")
     _flag(gateway_status, "-l", "--full",

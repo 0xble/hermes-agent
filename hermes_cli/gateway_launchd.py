@@ -606,6 +606,9 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
 
 
 def launchd_install(force: bool = False, *, start_now: bool = True):
+    if start_now:
+        from hermes_cli.gateway_guardian import set_intent
+        set_intent(_gw().get_hermes_home(), stopped=False)
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
@@ -670,6 +673,8 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
 
 
 def launchd_uninstall():
+    from hermes_cli.gateway_guardian import set_intent
+    set_intent(_gw().get_hermes_home(), stopped=True)
     plist_path = _gw().get_launchd_plist_path()
     # Captured: uninstalling an already-unloaded job is fine — don't print Boot-out failed: 3.
     subprocess.run(
@@ -682,6 +687,8 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    from hermes_cli.gateway_guardian import set_intent
+    set_intent(_gw().get_hermes_home(), stopped=False)
     plist_path = _gw().get_launchd_plist_path()
     label = _gw().get_launchd_label()
 
@@ -732,6 +739,8 @@ def _launchd_ok(message: str) -> None:
 
 
 def launchd_stop():
+    from hermes_cli.gateway_guardian import set_intent
+    set_intent(_gw().get_hermes_home(), stopped=True)
     target = f"{_launchd_domain()}/{get_launchd_label()}"
     _gw()._mark_planned_stop()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
