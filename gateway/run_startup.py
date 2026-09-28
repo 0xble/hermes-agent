@@ -1789,6 +1789,21 @@ class GatewayStartupMixin:
         if await self._abort_startup_if_shutdown_requested():
             return True
         self.delivery_router.adapters = self.adapters
+        if getattr(self.config, "durable_outbox_enabled", False):
+            from gateway.outbox import Outbox, recover
+            from gateway.run import _multiplex_profile_homes
+            from hermes_constants import get_hermes_home
+
+            destinations = [(get_hermes_home(), self.adapters.get(Platform.TELEGRAM))]
+            for profile_name, profile_home in _multiplex_profile_homes(self.config):
+                if profile_name != "default":
+                    adapters = (getattr(self, "_profile_adapters", None) or {}).get(profile_name, {})
+                    destinations.append((Path(profile_home), adapters.get(Platform.TELEGRAM)))
+            for home, adapter in destinations:
+                if adapter is not None:
+                    sent, held = await recover(Outbox(home), adapter)
+                    if sent or held:
+                        logger.info("Gateway outbox recovery for %s: sent=%s held=%s", home, sent, held)
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()
