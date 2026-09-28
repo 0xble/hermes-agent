@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 from functools import partial
+from datetime import datetime
 
 from hermes_constants import get_routing_process_hermes_home
 from gateway.session_recovery import SessionRecoveryMixin
@@ -32,31 +33,38 @@ def pending_home_for_key(runner, session_key: str) -> Path | None:
 
 
 def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, breaker_tripped=False):
-    if breaker_tripped and hasattr(runner.session_store, "_lock"):
-        with runner.session_store._lock:
-            runner.session_store._ensure_loaded_locked()
-            entry = runner.session_store._entries.get(key)
-            if entry and entry.resume_pending and entry.session_id == session_id:
-                return None
     # A queued message is a future turn; appending it to the interrupted transcript
     # makes the recovery note answer that message instead.
     if platform is not None and key in eligible and eligible[key].origin.platform != platform:
         return OTHER_PLATFORM_PENDING
-    if key not in eligible:
+    if key not in eligible and not breaker_tripped:
+        return False
+    if breaker_tripped and not hasattr(runner.session_store, "_lock"):
         return False
     if any(getattr(event, "_hermes_recovery_spool", None) == path
            for event in getattr(runner, "_startup_restore_queue", ())):
         return OTHER_PLATFORM_PENDING  # claimed by this process already
     store = runner.session_store
-    with store._lock:
-        store._ensure_loaded_locked()
-        entry = store._entries.get(key)
+    with store._lock:  # noqa: SLF001 — inspect the same snapshot as the breaker
+        store._ensure_loaded_locked()  # noqa: SLF001
+        entry = store._entries.get(key)  # noqa: SLF001
+        if breaker_tripped and entry and entry.resume_pending and entry.session_id == session_id:
+            return None
         if not (entry and entry is eligible.get(key) and entry.resume_pending
                 and entry.session_id == session_id and entry.origin):
             return False
+    from gateway.run import _auto_continue_freshness_window
+    marker = entry.last_resume_marked_at or entry.updated_at
+    if marker is not None and (datetime.now() - marker).total_seconds() > _auto_continue_freshness_window():
+        return False
+    if runner._is_session_running(key):
+        return False
+    source = runner._restored_source(entry)
+    if not runner._resume_owner_authorized(key, source):
+        return False
     ready = runner._auto_resume_ready(entry, require_adapter=False)
     if ready is None:
-        return None
+        return False
     # Older spools lack authorship; never guess who issued a command in shared chats.
     author_id = data.get("source_user_id") or data.get("user_id")
     if not isinstance(author_id, str) or not author_id.strip():

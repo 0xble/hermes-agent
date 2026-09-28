@@ -841,10 +841,9 @@ class GatewayAdapterLifecycleMixin:
                     "Reconnect restore released after %.0fs with %d resume turn(s) still running",
                     "background reconnect auto-resume task failed", level=logging.DEBUG,
                 )
-            if not self._startup_restore_in_progress:
-                # Drain under our own gate. A concurrent inbound on these keys must queue behind
-                # the older follow-up, while an overlapping reconnect still owns its separate claim.
-                await self._drain_startup_restore_queue(keys, owned_keys=keys)
+            # Drain under our own gate even while boot restore is active. Boot skips
+            # keys held here, so skipping here too strands them after both gates open.
+            await self._drain_startup_restore_queue(keys, owned_keys=keys)
         finally:
             # The timeout deliberately fails open after a bounded wait; unfinished resume turns
             # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.

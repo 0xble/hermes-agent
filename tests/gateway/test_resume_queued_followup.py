@@ -3,7 +3,7 @@
 import asyncio
 import json
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -151,6 +151,25 @@ def test_breaker_keeps_pending_followup_spooled(tmp_path, monkeypatch):
     assert recover_pending_shutdown_flush(runner, candidates=None) == 0
     assert list((tmp_path / "pending_messages").glob("*.json"))
     db.append_message.assert_not_called()
+
+
+@pytest.mark.parametrize("reason", ["stale", "unauthorized", "running"])
+def test_ineligible_resume_appends_followup(tmp_path, monkeypatch, reason):
+    runner, _, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    entry = runner.session_store._entries[key]
+    if reason == "stale":
+        entry.last_resume_marked_at = datetime.now() - timedelta(hours=3)
+    elif reason == "unauthorized":
+        runner._is_user_authorized_for_source = MagicMock(return_value=False)
+    else:
+        runner._is_session_running = MagicMock(return_value=True)
+    assert flush_pending_to_file({key: MessageEvent(text="queued", source=source, user_id="u1")}) == 1
+    path, = (tmp_path / "pending_messages").glob("*.json")
+    assert recover_pending_shutdown_flush(runner) == 1
+    assert not path.exists()
+    assert runner._startup_restore_queue == []
+    db.append_message.assert_called_once()
+    assert db.append_message.call_args.kwargs["content"] == "queued"
 
 
 def test_shared_followup_replays_under_real_author_and_preserves_context(tmp_path, monkeypatch):
@@ -359,6 +378,49 @@ async def test_overlapping_reconnects_hold_only_owned_sessions(tmp_path, monkeyp
     await second
     assert not runner._reconnect_restore_keys
     assert seen == ["first", "second", "held"]
+
+
+@pytest.mark.asyncio
+async def test_boot_drain_logs_undrained_reconnect_owned_count(tmp_path, monkeypatch, caplog):
+    runner, _, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_queue = [MessageEvent(text="held", source=source)]
+    runner._reconnect_restore_keys = {key: 1}
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        assert await runner._drain_startup_restore_queue() == 0
+    assert "left 1 queued message(s)" in caplog.text
+    assert len(runner._startup_restore_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_boot_drain_replays_owned_followup_first(tmp_path, monkeypatch, caplog):
+    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
+    runner._await_startup_warmup = AsyncMock()
+    assert flush_pending_to_file({key: MessageEvent(text="older", source=source, user_id="u1")}) == 1
+    seen = []
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def handle(event):
+        if event.text == "older":
+            started.set()
+            await release.wait()
+        seen.append(event.text)
+
+    adapter.handle_message = handle
+    reconnect = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(started.wait(), 5)
+    assert await runner._drain_startup_restore_queue() == 0
+    assert "left 1 queued message(s)" not in caplog.text  # already claimed and dispatching
+    release.set()
+    await reconnect
+    # Boot's drain cannot take a key held by the reconnect. The reconnect must
+    # have dispatched it before releasing its ownership, even while boot is gated.
+    assert seen == ["older"]
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
+    await runner._finish_startup_restore()
+    assert seen == ["older"]
+    assert not runner._startup_restore_queue
+    db.append_message.assert_not_called()
 
 
 @pytest.mark.asyncio

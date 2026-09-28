@@ -137,6 +137,8 @@ class GatewayStartupMixin:
                 logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
                 continue
             drained += 1
+        if queue and keys is None:
+            logger.warning("Startup-restore drain left %d queued message(s) awaiting a reconnect owner", len(queue))
         return drained
 
     @staticmethod
