@@ -58,6 +58,7 @@ class Host:
     def __init__(self, root: Path, tenants: dict[str, T.Tenant], secrets: dict[str, str],
                  backend: T.ServeBackend) -> None:
         self.root, self.tenants, self.secrets, self.backend = root, tenants, secrets, backend
+        self.sessions: dict[str, str] = {}
 
     def get(self, path: str, profile: str | None) -> tuple[int, Any]:
         query = f"?profile={profile}" if profile else ""
@@ -102,7 +103,8 @@ def host(tmp_path_factory: pytest.TempPathFactory):
         h = Host(root, tenants, secrets, backend)
         # one Desktop session per profile: each spawns that profile's MCP servers
         for name in PROFILES:
-            backend.ok("session.create", {} if name == "default" else {"profile": name})
+            reply = backend.ok("session.create", {} if name == "default" else {"profile": name})
+            h.sessions[name] = reply["session_id"]
         yield h
     finally:
         backend.close()
@@ -151,8 +153,45 @@ def test_plugin_route_runs_in_requesting_profile_scope(host: Host, scenario: str
 
 
 def test_mcp_subprocess_env_holds_only_own_profile_secrets(host: Host) -> None:
-    envs = {name: poll(lambda n=name: host.dump(n).is_file() and json.loads(host.dump(n).read_text()), 90,
-                       f"{name}'s MCP server to dump its env") for name in PROFILES}
+    envs = {}
+    for name in PROFILES:
+        try:
+            envs[name] = poll(lambda n=name: host.dump(n).is_file() and json.loads(host.dump(n).read_text()),
+                              90, f"{name}'s MCP server to dump its env")
+        except AssertionError as exc:
+            # A missing dump alone cannot distinguish a never-scheduled agent build from a
+            # failed MCP connect or a spawned child blocked before its first write.
+            status = {n: host.dump(n).is_file() for n in PROFILES}
+            # Snapshot unread WS notifications as well as consumed ones: session.create returns
+            # before agent construction, and a background build error may never be consumed by
+            # another RPC. Report event *types* and the sanitized error (not tool/env payloads).
+            with host.backend._q.mutex:
+                pending = list(host.backend._q.queue)
+            events = {}
+            for profile, sid in host.sessions.items():
+                seen = [m.get("params") or {} for m in [*host.backend.seen, *pending]
+                        if m.get("method") == "event" and (m.get("params") or {}).get("session_id") == sid]
+                events[profile] = [(p.get("type"), p.get("message", "") if p.get("type") == "error" else "")
+                                   for p in seen]
+            states = {}
+            for profile in PROFILES:
+                try:
+                    result = host.backend.ok("mcp.servers.status", {"profile": profile}, timeout=5)
+                    states[profile] = [(s["name"], s["status"]) for s in result["servers"]]
+                except (AssertionError, TimeoutError) as state_exc:
+                    states[profile] = [f"status unavailable: {type(state_exc).__name__}"]
+            serve_log = (host.root / "serve.log").read_text(errors="replace")
+            # Keep random provider/API keys and the configured secret out of CI failure output.
+            for t in host.tenants.values():
+                for value in (*t.canaries().values(), host.secrets[t.name], host.backend.token):
+                    serve_log = serve_log.replace(value, "<redacted>")
+                    events = {n: [(kind, message.replace(value, "<redacted>")) for kind, message in values]
+                              for n, values in events.items()}
+            # Show only MCP-specific stderr and exceptions, not arbitrary application output.
+            lines = [line for line in serve_log.splitlines() if "MCP" in line or "Traceback" in line
+                     or "agent init" in line.lower()]
+            raise AssertionError(f"{exc}; dump exists: {status}; MCP status: {states}; "
+                                 f"session events: {events}; MCP/exception stderr: {lines[-30:]}") from exc
     problems: list[str] = []
     for name, env in envs.items():
         blob = json.dumps(env)
