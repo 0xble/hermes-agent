@@ -558,10 +558,10 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
     from tools.browser_tool_snapshot import _truncate_snapshot
     from tools.browser_tool import get_browser_snapshot_threshold
     data = _snapshot_data(session)
-    from agent.redact import has_vault_date_components, redact_registered_vault_snapshot
+    from agent.redact import has_vault_scoped_components, redact_registered_vault_snapshot
     task = session.get("task_id", "default")
     origin = ""
-    if has_vault_date_components(task):
+    if has_vault_scoped_components(task):
         from tools.browser_vault_tool import _current_page_origin
         origin = _current_page_origin(task) or ""
     snapshot = redact_registered_vault_snapshot(data.get("snapshot", ""), tab=task, origin=origin)

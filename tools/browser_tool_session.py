@@ -409,7 +409,7 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
 def _discard_timed_out_browser_session(task_id: str, session_info: Dict[str, Any], task_socket_dir: str) -> None:
     """Drop a stuck client generation without losing cloud cleanup state."""
-    from agent.redact import has_vault_date_components
+    from agent.redact import clear_vault_date_components, has_vault_date_components
     if has_vault_date_components(task_id):
         # A timeout cannot prove the browser died; keep its ownership and
         # protections until an acknowledged close can be retried.
@@ -432,6 +432,8 @@ def _discard_timed_out_browser_session(task_id: str, session_info: Dict[str, Any
         if _bt._last_active_session_key.get(bare_task_id) == task_id:
             _bt._last_active_session_key.pop(bare_task_id, None)
 
+    # A replacement generation must not inherit the old page's card metadata.
+    clear_vault_date_components(task_id)
     session_name = str(session_info.get("session_name") or "")
     if session_name and os.path.isfile(os.path.join(task_socket_dir, f"{session_name}.pid")):
         daemon_pid = _read_browser_daemon_pid(task_socket_dir, session_name)
