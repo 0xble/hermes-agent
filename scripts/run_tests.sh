@@ -51,7 +51,18 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV=""
 VENV_PYTHON=""
 SKIPPED_VENVS=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
+# A linked worktree (.worktrees/<name>) has no venv of its own; the dev venv
+# lives in the primary checkout. Resolve it through git's common dir so a
+# worktree (and a reviewer inspecting one) runs the suite instead of failing.
+PRIMARY_ROOT=""
+if COMMON_DIR="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+  PRIMARY_ROOT="$(dirname "$COMMON_DIR")"
+  [ "$PRIMARY_ROOT" = "$REPO_ROOT" ] && PRIMARY_ROOT=""
+fi
+CANDIDATES=("$REPO_ROOT/.venv" "$REPO_ROOT/venv")
+[ -n "$PRIMARY_ROOT" ] && CANDIDATES+=("$PRIMARY_ROOT/.venv" "$PRIMARY_ROOT/venv")
+CANDIDATES+=("$HOME/.hermes/hermes-agent/venv")
+for candidate in "${CANDIDATES[@]}"; do
   if [ -f "$candidate/bin/activate" ]; then
     if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
       VENV="$candidate"
