@@ -690,7 +690,7 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+def _sanitize_gateway_final_response(platform: Any, text: str, *, interrupted: bool = False) -> str:
     """Sanitize final gateway replies for chat surfaces: concise, secret-redacted provider failure
     categories instead of raw HTTP bodies, request IDs, leaked credentials, or policy text."""
     if not text or _gateway_surface_passes_raw_text(platform):
@@ -718,6 +718,10 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     # Cancellation metadata, not prose; ACP/TUI already suppress this sentinel, chat surfaces should too.
     # See #7921.
+    # Interrupted turns return diagnostic placeholders for local callers; none is chat text.
+    # The result flag distinguishes these from genuine non-interrupted failure replies.
+    if interrupted and str(text).strip().startswith("Operation interrupted"):
+        return ""
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
 

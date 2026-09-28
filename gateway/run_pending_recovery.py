@@ -37,7 +37,8 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, 
     # makes the recovery note answer that message instead.
     if platform is not None and key in eligible and eligible[key].origin.platform != platform:
         return OTHER_PLATFORM_PENDING
-    if key not in eligible and not breaker_tripped:
+    drain_deferred = data.get("drain_deferred") is True
+    if key not in eligible and not breaker_tripped and not drain_deferred:
         return False
     if breaker_tripped and not hasattr(runner.session_store, "_lock"):
         return False
@@ -50,24 +51,31 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, 
         entry = store._entries.get(key)  # noqa: SLF001
         if breaker_tripped and entry and entry.resume_pending and entry.session_id == session_id:
             return None
-        if not (entry and entry is eligible.get(key) and entry.resume_pending
-                and entry.session_id == session_id and entry.origin):
+        if drain_deferred:
+            if not entry or entry.session_id != session_id or not entry.origin or entry.suspended:
+                return None  # keep the spool until its session can be safely restored
+        elif not (entry and entry is eligible.get(key) and entry.resume_pending
+                  and entry.session_id == session_id and entry.origin):
             return False
     from gateway.run import _auto_continue_freshness_window
-    marker = entry.last_resume_marked_at or entry.updated_at
-    if marker is not None and (datetime.now() - marker).total_seconds() > _auto_continue_freshness_window():
-        return False
+    if not drain_deferred:
+        marker = entry.last_resume_marked_at or entry.updated_at
+        if marker is not None and (datetime.now() - marker).total_seconds() > _auto_continue_freshness_window():
+            return False
     if runner._is_session_running(key):
-        return False
+        return None if drain_deferred else False
     source = runner._restored_source(entry)
+    if platform is not None and source.platform != platform:
+        return OTHER_PLATFORM_PENDING
     if not runner._resume_owner_authorized(key, source):
-        return False
-    ready = runner._auto_resume_ready(entry, require_adapter=False)
+        return None if drain_deferred else False
+    ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
+             runner._auto_resume_ready(entry, require_adapter=False))
     if ready is None:
         return False
     # Older spools lack authorship; never guess who issued a command in shared chats.
     author_id = data.get("source_user_id") or data.get("user_id")
-    if not isinstance(author_id, str) or not author_id.strip():
+    if not data.get("internal") and (not isinstance(author_id, str) or not author_id.strip()):
         return False
     adapter, source = ready
     if adapter is None:
@@ -90,6 +98,9 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, 
         media_urls=data.get("media_urls") or data.get("media") or [],
         media_types=data.get("media_types") or [],
         reply_to_message_id=data.get("reply_to_message_id") or data.get("reply_to"),
+        internal=bool(data.get("internal", False)),
+        allow_gateway_control=bool(data.get("allow_gateway_control", True)),
+        metadata=data.get("metadata") or {},
     )
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)

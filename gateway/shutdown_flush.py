@@ -86,7 +86,7 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
     for session_key, value in list(pending.items()):
         if value is not None:
-            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason, ts=ts)
+            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason, ts=ts, seq=-1)
     if flushed:
         logger.info("Flushed %d pending message(s) to %s (reason=%s)", flushed, flush_dir, reason)
     return flushed
@@ -203,6 +203,13 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None and _json_safe(val):
                 result[attr] = val
+        if getattr(value, "_drain_deferred", False):
+            result["drain_deferred"] = True
+            result["internal"] = bool(getattr(value, "internal", False))
+            result["allow_gateway_control"] = bool(getattr(value, "allow_gateway_control", False))
+            metadata = getattr(value, "metadata", None)
+            if isinstance(metadata, dict) and _json_safe(metadata):
+                result["metadata"] = metadata
         source = getattr(value, "source", None)
         if source is not None:
             for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
@@ -228,7 +235,15 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
     gateways); ``None`` falls back to ``session_db``. ``deferred_followup`` may claim a resolved
     payload as a separate turn before it is appended to history. Returns the number recovered.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
+    def pending_order(path):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return (payload.get("ts", 0), payload.get("session_key", ""),
+                    payload.get("seq", -1), path.name)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return (0, "", -1, path.name)
+
+    flush_files = sorted(_get_flush_dir().glob("*.json"), key=pending_order)
     if not flush_files:
         return 0
     own_db = session_db is None
