@@ -11,7 +11,6 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures
-import dataclasses
 import json
 import os
 import re
@@ -1349,12 +1348,7 @@ class GatewayInboundMixin:
         token = scoped_turn_entry()
         result = None
         try:
-            handler = getattr(type(self), "_handle_admitted_message", None)
-            # Spec'd mock runners lack class methods; invoke the real ingress
-            # logic rather than the mock's auto-created AsyncMock.
-            if handler is None:
-                handler = GatewayInboundMixin._handle_admitted_message
-            result = await handler(self, event)
+            result = await self._handle_admitted_message(event)
             return result
         finally:
             turn_id = getattr(event, "_outbox_turn_id", None)
@@ -1375,8 +1369,8 @@ class GatewayInboundMixin:
             return None
         event, source, is_internal = _admitted
         if getattr(event, "_outbox_duplicate", False):
-            # The original result is retained on the event for transport-level
-            # acknowledgement; returning it here would SEND it a second time.
+            # The original response was already acknowledged. Returning it
+            # here would send it a second time.
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).

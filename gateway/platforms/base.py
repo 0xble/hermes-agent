@@ -4171,7 +4171,6 @@ class BasePlatformAdapter(ABC):
                     store_for(home).lookup, str(event.source.profile or "default"),
                     "telegram", event_id, event_kind(event))
                 if original:
-                    setattr(event, "_outbox_original_result", original[1])
                     event._gateway_accepted = True
                     return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()

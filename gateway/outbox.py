@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 import weakref
@@ -32,14 +33,16 @@ _CURRENT_TURN: contextvars.ContextVar[tuple[Path, str, asyncio.Task | None] | No
 _BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("gateway_outbox_transport", default=False)
 _TURN_LOCKS: weakref.WeakValueDictionary[tuple[Path, str], asyncio.Lock] = weakref.WeakValueDictionary()
 _STORES: dict[Path, "Outbox"] = {}
+_STORES_LOCK = threading.Lock()
 _RETRY_TASKS: dict[tuple[Path, str], asyncio.Task] = {}
 
 
 def store_for(home: Path) -> "Outbox":
     key = Path(home).resolve()
-    if key not in _STORES:
-        _STORES[key] = Outbox(key)
-    return _STORES[key]
+    with _STORES_LOCK:
+        if key not in _STORES:
+            _STORES[key] = Outbox(key)
+        return _STORES[key]
 
 
 def bind_turn(home: Path, turn_id: str) -> None:
@@ -208,12 +211,54 @@ def _uncertain(result) -> bool:
     """Only a transport outcome without a definitive refusal can have been sent."""
     if result.success or result.retry_after is not None or result.raw_response is not None:
         return False
+    from gateway.platforms.base import SEND_ERROR_KINDS
+    kind = result.error_kind
+    if kind == "transient":
+        return True  # A connection may drop after the server accepts the send.
+    if kind in SEND_ERROR_KINDS - {"unknown"}:
+        return False
     error = (result.error or "").lower()
     return (any(marker in error for marker in
                 ("timeout", "timed out", "network error", "connection reset",
                  "connection aborted", "server disconnected")) or
             (result.retryable and not any(marker in error for marker in
              ("not connected", "bad request", "too_long", "draft_rejected", "flood_control"))))
+
+
+async def _store_io(operation, *args, **kwargs):
+    """Finish a started disk operation even when its awaiting turn is cancelled."""
+    task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+def _prepare_row(store, home, turn_id, kind, payload):
+    if store.held_payload(turn_id, kind, payload):
+        return None
+    previous = store.pending_retry(turn_id, kind, payload)
+    if previous is not None:
+        return previous
+    durable = dict(payload)
+    original_media = False
+    for key in ("file_path", "image_path", "video_path", "audio_path"):
+        if key in durable:
+            durable[key] = _snapshot_file(home, durable[key])
+            original_media = True
+    if "images" in durable:
+        from urllib.parse import quote, unquote
+        images = []
+        for url, alt in durable["images"]:
+            if url.startswith("file://"):
+                url = "file://" + quote(_snapshot_file(home, unquote(url[7:])))
+                original_media = True
+            images.append((url, alt))
+        durable["images"] = images
+    if original_media:
+        durable["_outbox_original"] = payload
+    return store.enqueue(turn_id, kind, durable)
 
 
 async def deliver(adapter, kind: str, payload: dict[str, Any], send):
@@ -228,75 +273,72 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
     if turn is None:
         return await send(payload)
     home, turn_id = turn
-    store = store_for(home)
+    store = await _store_io(store_for, home)
     lock = _TURN_LOCKS.setdefault(turn, asyncio.Lock())
     async with lock:
-        # A repeated ambiguous payload cannot be safely retried, but unrelated
-        # output in the same turn must not be starved by that uncertainty.
-        if store.held_payload(turn_id, kind, payload):
+        # Keep the lookup, snapshot and enqueue ordered before transport dispatch.
+        try:
+            row = await _store_io(_prepare_row, store, home, turn_id, kind, payload)
+        except (TypeError, ValueError) as exc:
+            logger.error("Outbox could not serialize %s; refusing unreceipted transport: %s", kind, exc)
+            return SendResult(success=False, error="outbox payload could not be serialized")
+        if row is None:
             return SendResult(success=False, error="outbox payload has an uncertain prior dispatch")
-        # Preserve the original request for certain non-delivery retries: a
-        # scratch file's copied path differs from its original path.
-        previous = store.pending_retry(turn_id, kind, payload)
-        if previous is not None:
-            row = previous
-        else:
-            durable = dict(payload)
-            original_media = False
-            for key in ("file_path", "image_path", "video_path", "audio_path"):
-                if key in durable:
-                    durable[key] = _snapshot_file(home, durable[key])
-                    original_media = True
-            if "images" in durable:
-                from urllib.parse import quote, unquote
-                images = []
-                for url, alt in durable["images"]:
-                    if url.startswith("file://"):
-                        url = "file://" + quote(_snapshot_file(home, unquote(url[7:])))
-                        original_media = True
-                    images.append((url, alt))
-                durable["images"] = images
-            if original_media:
-                durable["_outbox_original"] = payload
-            try:
-                row = store.enqueue(turn_id, kind, durable)
-            except (TypeError, ValueError) as exc:
-                logger.error("Outbox could not serialize %s; refusing unreceipted transport: %s", kind, exc)
-                return SendResult(success=False, error="outbox payload could not be serialized")
-        if not store.begin_send(row):
+        if not await _store_io(store.begin_send, row):
             return SendResult(success=False, error="earlier outbox row is unresolved")
         try:
             with transport_bypass():
                 result = await send(wire_payload(row.payload))
         except BaseException:
-            store.receipt(row, message_id=None, success=False)
+            await _store_io(store.receipt, row, message_id=None, success=False)
             raise
         retry_after = (result.retry_after if kind == "send" and
                        not (isinstance(payload.get("metadata"), dict) and
                             payload["metadata"].get("_interim_send")) else None)
-        scheduled = store.receipt(row, message_id=str(result.message_id) if result.message_id else None,
-                                  success=bool(result.success), uncertain=_uncertain(result),
-                                  retry_after=retry_after)
+        scheduled = await _store_io(store.receipt, row, message_id=str(result.message_id) if result.message_id else None,
+                                    success=bool(result.success), uncertain=_uncertain(result),
+                                    retry_after=retry_after)
         if scheduled:
-            _schedule_retry(store, adapter)
+            await _schedule_retry(store, adapter)
             # The send is accepted for durable redelivery. Consumers must not
             # launch an independent fallback while this row is waiting.
             return SendResult(success=True, deferred=True, retry_after=retry_after)
         if result.success:
-            _discard_delivered_media(home, row.payload)
+            await _store_io(_discard_delivered_media, home, row.payload)
         return result
 
 
-def _schedule_retry(store: "Outbox", adapter) -> None:
+def _retry_profile(adapter) -> str | None:
+    runner = getattr(adapter, "gateway_runner", None)
+    for profile, adapters in (getattr(runner, "_profile_adapters", None) or {}).items():
+        if adapters.get(adapter.platform) is adapter:
+            return profile
+    return None
+
+
+def _current_retry_adapter(adapter, profile: str | None):
+    runner = getattr(adapter, "gateway_runner", None)
+    if profile is not None:
+        return (getattr(runner, "_profile_adapters", None) or {}).get(profile, {}).get(adapter.platform)
+    adapters = getattr(runner, "adapters", None)
+    if adapters is None:
+        return adapter  # Standalone adapter (including tests) has no reconnect registry.
+    return adapters.get(adapter.platform)
+
+
+async def _schedule_retry(store: "Outbox", adapter) -> None:
     """One durable server-directed retry per row, without blocking ingress."""
-    for row, deadline in store.scheduled():
+    profile = _retry_profile(adapter)
+    for row, deadline in await _store_io(store.scheduled):
         key = (store.path, row.idempotency_key)
         if key in _RETRY_TASKS:
             continue
-        async def redeliver(key=key, deadline=deadline):
+        async def redeliver(key=key, deadline=deadline, profile=profile):
             try:
                 await asyncio.sleep(max(0, deadline - time.time()))
-                await recover(store, adapter, startup=False)
+                current = _current_retry_adapter(adapter, profile)
+                if current is not None:
+                    await recover(store, current, startup=False)
             finally:
                 _RETRY_TASKS.pop(key, None)
         task = asyncio.create_task(redeliver())
@@ -307,7 +349,7 @@ async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[in
     """Replay proven-unsent rows; only boot replays fresh unclaimed rows."""
     sent = 0
     while True:
-        pending = store.pending(startup=startup)
+        pending = await _store_io(store.pending, startup=startup)
         if not pending:
             break
         advanced = False
@@ -317,7 +359,7 @@ async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[in
                                 "send_animation", "control_prompt"}:
                 logger.error("Unsupported pending outbox type %s for %s", row.type, row.idempotency_key)
                 continue
-            if not store.begin_send(row):
+            if not await _store_io(store.begin_send, row):
                 continue
             try:
                 with transport_bypass():
@@ -336,28 +378,31 @@ async def recover(store: "Outbox", adapter, *, startup: bool = True) -> tuple[in
                             payload["images"] = [tuple(image) for image in payload["images"]]
                         result = await getattr(adapter, row.type)(**payload)
             except BaseException:
-                store.receipt(row, message_id=None, success=False)
+                await _store_io(store.receipt, row, message_id=None, success=False)
                 logger.exception("Ambiguous outbox dispatch %s", row.idempotency_key)
                 continue
             retry_after = (result.retry_after if row.type == "send" and
                            not (isinstance(row.payload.get("metadata"), dict) and
                                 row.payload["metadata"].get("_interim_send")) else None)
-            scheduled = store.receipt(row, message_id=str(result.message_id) if result.message_id else None,
-                                      success=bool(result.success), uncertain=_uncertain(result),
-                                      retry_after=retry_after)
+            scheduled = await _store_io(store.receipt, row, message_id=str(result.message_id) if result.message_id else None,
+                                        success=bool(result.success), uncertain=_uncertain(result),
+                                        retry_after=retry_after)
             if scheduled:
-                _schedule_retry(store, adapter)
+                await _schedule_retry(store, adapter)
             if result.success:
-                _discard_delivered_media(store.path.parent, row.payload)
+                await _store_io(_discard_delivered_media, store.path.parent, row.payload)
                 sent += 1
                 advanced = True
         if not advanced:
             break
-    ambiguous = store.ambiguous()
+    ambiguous = await _store_io(store.ambiguous)
     for row in ambiguous:
         logger.error("Held ambiguous outbox dispatch: turn=%s sequence=%s key=%s",
                      row.turn_id, row.sequence, row.idempotency_key)
-    _schedule_retry(store, adapter)
+    await _store_io(store.prune, retention_days=getattr(
+        getattr(getattr(adapter, "gateway_runner", None), "config", None),
+        "durable_outbox_retention_days", 7))
+    await _schedule_retry(store, adapter)
     return sent, len(ambiguous)
 
 
@@ -386,6 +431,7 @@ class Outbox:
                     event_kind TEXT NOT NULL,
                     turn_id TEXT NOT NULL,
                     result TEXT,
+                    created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
                     PRIMARY KEY (profile, platform, transport_event_id, event_kind)
                 );
                 CREATE TABLE IF NOT EXISTS outbox (
@@ -407,29 +453,9 @@ class Outbox:
                 );
                 CREATE INDEX IF NOT EXISTS outbox_state ON outbox(state, turn_id, sequence);
             """)
-            schema = db.execute("SELECT sql FROM sqlite_master WHERE name='outbox'").fetchone()[0]
-            if "failed_unsent" not in schema:
-                db.executescript("""
-                    DROP INDEX IF EXISTS outbox_state;
-                    ALTER TABLE outbox RENAME TO outbox_old;
-                    CREATE TABLE outbox (
-                        turn_id TEXT NOT NULL, sequence INTEGER NOT NULL,
-                        type TEXT NOT NULL, payload TEXT NOT NULL,
-                        idempotency_key TEXT NOT NULL UNIQUE, owner_epoch INTEGER NOT NULL,
-                        state TEXT NOT NULL DEFAULT 'pending'
-                            CHECK (state IN ('pending','sending','ambiguous','delivered','failed_unsent','expired_ambiguous')),
-                        message_id TEXT, send_status TEXT, edit_status TEXT,
-                        created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
-                        retry_at REAL, attempts INTEGER NOT NULL DEFAULT 0,
-                        PRIMARY KEY (turn_id, sequence)
-                    );
-                    INSERT INTO outbox (turn_id, sequence, type, payload, idempotency_key,
-                                        owner_epoch, state, message_id, send_status, edit_status)
-                        SELECT turn_id, sequence, type, payload, idempotency_key,
-                               owner_epoch, state, message_id, send_status, edit_status FROM outbox_old;
-                    DROP TABLE outbox_old;
-                    CREATE INDEX outbox_state ON outbox(state, turn_id, sequence);
-                """)
+            if not any(col[1] == "created_at" for col in db.execute("PRAGMA table_info(admissions)")):
+                db.execute("ALTER TABLE admissions ADD COLUMN created_at REAL")
+                db.execute("UPDATE admissions SET created_at=? WHERE created_at IS NULL", (time.time(),))
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -457,8 +483,8 @@ class Outbox:
             try:
                 turn_id = uuid.uuid4().hex
                 inserted = db.execute(
-                    "INSERT OR IGNORE INTO admissions VALUES (?, ?, ?, ?, ?, NULL)",
-                    (profile, platform, str(event_id), event_kind, turn_id),
+                    "INSERT OR IGNORE INTO admissions (profile, platform, transport_event_id, event_kind, turn_id, result, created_at) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                    (profile, platform, str(event_id), event_kind, turn_id, time.time()),
                 ).rowcount
                 if not inserted:
                     turn_id = db.execute(
@@ -546,8 +572,7 @@ class Outbox:
     def scheduled(self) -> list[tuple[OutboxRow, float]]:
         with self._connect() as db:
             return [(self._row(r), r["retry_at"]) for r in db.execute(
-                "SELECT * FROM outbox WHERE state='pending' AND retry_at>? ORDER BY retry_at",
-                (time.time(),))]
+                "SELECT * FROM outbox WHERE state='pending' AND retry_at IS NOT NULL ORDER BY retry_at")]
 
     def all_rows(self) -> list[OutboxRow]:
         with self._connect() as db:
@@ -563,6 +588,27 @@ class Outbox:
                              expired, self.path)
             return [self._row(r) for r in db.execute(
                 "SELECT * FROM outbox WHERE state IN ('sending','ambiguous') ORDER BY rowid")]
+
+    def prune(self, *, retention_days: int = 7) -> None:
+        """Keep uncertain work and unfinished admissions while aging out terminal data."""
+        cutoff = time.time() - retention_days * 86400
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                terminal = db.execute(
+                    "SELECT payload FROM outbox WHERE state IN ('delivered','failed_unsent') "
+                    "AND created_at<?", (cutoff,)).fetchall()
+                for row in terminal:
+                    _discard_delivered_media(self.path.parent, json.loads(row[0]))
+                db.execute("DELETE FROM outbox WHERE state IN ('delivered','failed_unsent') "
+                           "AND created_at<?", (cutoff,))
+                db.execute("DELETE FROM admissions WHERE created_at<? AND result IS NOT NULL "
+                           "AND NOT EXISTS (SELECT 1 FROM outbox WHERE outbox.turn_id=admissions.turn_id "
+                           "AND outbox.state NOT IN ('delivered','failed_unsent'))", (cutoff,))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
 
     def status(self) -> list[dict[str, Any]]:
         self.ambiguous()  # expire old holds and log them
