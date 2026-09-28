@@ -5842,10 +5842,16 @@ async def _start_gateway_shutdown_tail(
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False,
+                        standby: bool = False) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all."""
+    # Standby must never enter the legacy singleton/adapter path. Its isolated registration
+    # cannot claim a token, unlink a socket, or run an autonomous dispatcher.
+    if standby:
+        from gateway.run_generation import serve_standby_generation
+        return await serve_standby_generation(config)
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
 

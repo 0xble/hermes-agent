@@ -336,6 +336,11 @@ def cli(argv: list[str] | None = None) -> int:
     path = Path(pwd.getpwuid(getattr(os, 'getuid')()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
         print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()}")
+        from hermes_cli.gateway_generation_status import read_generation_status
+        for row in read_generation_status(home):
+            lease = ", ".join(row["leases"]) or "none"
+            print(f"generation={row['id']} sha={row['release_sha']} label={row['label']} "
+                  f"pid={row['pid']} lease={lease} state={row['state']}")
         return 0
     if args.action == "uninstall":
         subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10)

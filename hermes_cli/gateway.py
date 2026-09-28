@@ -673,6 +673,14 @@ def _scan_gateway_pids(
                 or command_line_names_hermes_home(command_lc, current_home_lc))
 
     def _consider(pid: int, command: str) -> None:
+        # Passive overlap generations are not gateway dispatchers. Do not count them as
+        # duplicate active gateways in the legacy process-scan fallback.
+        try:
+            import shlex
+            if "--standby" in shlex.split(command):
+                return
+        except ValueError:
+            pass
         matches_runtime = looks_like_gateway_command_line(command) or (
             include_restart_managers and looks_like_gateway_runtime_command_line(command)
         )
@@ -4214,13 +4222,15 @@ async def _acknowledge_release_when_running(*, poll_seconds: float = 1.0) -> Non
                 logger.warning("Pending release reload could not be acknowledged", exc_info=True)
 
 
-def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
+def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
+                force: bool = False, standby: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
     _guard_official_docker_root_gateway()
-    _attach_to_host_gateway_or_guard(force=force, replace=replace)
-    _guard_supervised_gateway_conflict(force=force)
-    _guard_existing_gateway_process_conflict(replace=replace)
+    if not standby:
+        _attach_to_host_gateway_or_guard(force=force, replace=replace)
+        _guard_supervised_gateway_conflict(force=force)
+        _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))
     _apply_startup_watchdog_config()
 
@@ -4279,6 +4289,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     async def _run_with_release_ack() -> bool:
         watcher = asyncio.create_task(_acknowledge_release_when_running())
         try:
+            if standby:
+                return await start_gateway(replace=replace, force=force, verbosity=verbosity, standby=True)
             return await start_gateway(replace=replace, force=force, verbosity=verbosity)
         finally:
             watcher.cancel()
@@ -4712,6 +4724,7 @@ def _cmd_run(args):
     run_gateway(
         getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
         replace=getattr(args, "replace", False), force=getattr(args, "force", False),
+        standby=getattr(args, "standby", False),
     )
 
 
@@ -5177,6 +5190,18 @@ def _status_host_kind() -> str:
     return "windows" if is_windows() else "other"
 
 
+def _print_overlap_generations() -> None:
+    from hermes_cli.gateway_generation_status import read_generation_status
+    rows = read_generation_status(get_hermes_home())
+    if not rows:
+        return
+    print("Overlap generations:")
+    for row in rows:
+        lease = ", ".join(row["leases"]) or "none"
+        print(f"  {row['id']} sha={row['release_sha']} label={row['label']} "
+              f"pid={row['pid']} lease={lease} state={row['state']}")
+
+
 def _cmd_status(args):
     from hermes_cli.gateway_profile_lifecycle import print_parked_status
     deep = getattr(args, "deep", False)
@@ -5230,6 +5255,7 @@ def _cmd_status(args):
             _print_lines(*_STATUS_STOPPED_HINTS[_status_host_kind()])
 
     _print_duplicate_credential_warnings()
+    _print_overlap_generations()
     _print_other_profiles_gateway_status()
     _print_standalone_by_config()
 
