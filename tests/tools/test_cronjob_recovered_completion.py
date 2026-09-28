@@ -57,6 +57,54 @@ def test_dead_waiter_observes_exact_execution_once(monkeypatch, tmp_path, state,
         assert "failed before delivery" in event["summary"]
 
 
+@pytest.mark.parametrize("age_hours, expected", [(23, "running"), (25, "unknown")])
+def test_missing_cron_execution_recovery_is_bounded(monkeypatch, tmp_path, age_hours, expected):
+    from cron import executions
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setattr(ad, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda *_: False)
+    now = 200000.0
+    monkeypatch.setattr(ad.time, "time", lambda: now)
+    record = {
+        "delegation_id": f"missing-{age_hours}", "session_key": "agent:main:telegram:dm:1",
+        "dispatched_at": now - age_hours * 3600, "goal": "run", "role": "cron_run",
+        "cron_execution_id": "pruned-row", "cron_job_id": "job-recovery",
+        "cron_job_name": "Recovery", "cron_deliver": "local",
+    }
+    ad._persist_dispatch(record)
+    assert ad.recover_abandoned_delegations() == int(expected == "unknown")
+    row = ad.get_durable_delegation(record["delegation_id"])
+    assert row["state"] == expected
+    if expected == "unknown":
+        with ad._transaction() as conn:
+            event_json = conn.execute("SELECT event_json FROM async_delegations WHERE delegation_id=?",
+                                      (record["delegation_id"],)).fetchone()[0]
+        assert "execution record missing" in json.loads(event_json)["error"].lower()
+        assert ad.recover_abandoned_delegations() == 0
+
+
+def test_dead_waiter_does_not_mutate_cron_execution_ledger(monkeypatch, tmp_path):
+    from cron import executions
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setattr(ad, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: lambda *_: False)
+    execution = executions.create_execution("job-recovery", source="manual")
+    monkeypatch.setattr(executions, "_PROCESS_ID", "new-gateway")
+    monkeypatch.setattr(executions, "_owner_identity", lambda *_: "dead")
+    ad._persist_dispatch({
+        "delegation_id": "dead-waiter", "session_key": "agent:main:telegram:dm:1",
+        "dispatched_at": ad.time.time(), "goal": "run", "role": "cron_run",
+        "cron_execution_id": execution["id"], "cron_job_id": "job-recovery",
+        "cron_job_name": "Recovery", "cron_deliver": "local",
+    })
+    assert ad.recover_abandoned_delegations() == 0
+    assert executions.get_execution(execution["id"])["status"] == "claimed"
+
+
 def test_manual_completion_uses_exact_ledger_outcome(monkeypatch):
     from cron import executions
     from tools import cronjob_tools

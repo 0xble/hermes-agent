@@ -278,41 +278,45 @@ def recover_abandoned_delegations() -> int:
                 # A cron runner is merely a waiter. Its detached worker owns the
                 # execution and can outlive this process. Do not fabricate a
                 # terminal notification while that worker is still running.
-                from cron.executions import get_execution, recover_interrupted_executions
+                from cron.delivery_queue import MISSING_EXECUTION_GRACE
+                from cron.executions import get_execution
                 execution = get_execution(cron_execution_id)
-                if execution and execution["status"] not in ("completed", "failed", "unknown"):
-                    recover_interrupted_executions()
-                    execution = get_execution(cron_execution_id)
-                    if execution and execution["status"] not in ("completed", "failed", "unknown"):
-                        continue
                 if execution is None:
-                    logger.warning("Cron completion %s: execution %s is not in the ledger; deferring",
-                                   delegation_id, cron_execution_id)
+                    if now - dispatched_at < MISSING_EXECUTION_GRACE.total_seconds():
+                        continue
+                    # A pruned row has no provable outcome. Use the generic
+                    # unknown event below; never rerun or invent a completion.
+                elif execution["status"] not in ("completed", "failed", "unknown"):
+                    # The scheduler owns ledger recovery on its tick. A delegation
+                    # sweep must not mutate the cron store under its own DB lock.
                     continue
-                from tools.cronjob_tools import _manual_run_completion
-                completed = _manual_run_completion(
-                    {}, task["cron_job_id"], task["cron_job_name"],
-                    task["cron_deliver"], dispatched_at,
-                    execution_id=cron_execution_id,
-                )
-                event = {
-                    "type": "async_delegation", "delegation_id": delegation_id,
-                    "session_key": session_key, "origin_ui_session_id": origin_ui,
-                    "origin_session_id": origin_sid or "", "parent_session_id": parent_id,
-                    "goal": task.get("goal", ""), "context": task.get("context"),
-                    "toolsets": task.get("toolsets"), "role": task.get("role"),
-                    "model": task.get("model"), **completed,
-                    "dispatched_at": dispatched_at, "completed_at": now,
-                    **{k: task[k] for k in _ROUTING_KEYS if task.get(k)},
-                }
-                conn.execute("""UPDATE async_delegations SET state=?, completed_at=?,
-                       updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
-                    (completed["status"], now, now, json.dumps(event),
-                     json.dumps(completed), delegation_id))
-                recovered += 1
-                continue
-            error = "Delegation owner exited before recording a terminal result; outcome unknown."
+                else:
+                    from tools.cronjob_tools import _manual_run_completion
+                    completed = _manual_run_completion(
+                        {}, task["cron_job_id"], task["cron_job_name"],
+                        task["cron_deliver"], dispatched_at,
+                        execution_id=cron_execution_id,
+                    )
+                    event = {
+                        "type": "async_delegation", "delegation_id": delegation_id,
+                        "session_key": session_key, "origin_ui_session_id": origin_ui,
+                        "origin_session_id": origin_sid or "", "parent_session_id": parent_id,
+                        "goal": task.get("goal", ""), "context": task.get("context"),
+                        "toolsets": task.get("toolsets"), "role": task.get("role"),
+                        "model": task.get("model"), **completed,
+                        "dispatched_at": dispatched_at, "completed_at": now,
+                        **{k: task[k] for k in _ROUTING_KEYS if task.get(k)},
+                    }
+                    conn.execute("""UPDATE async_delegations SET state=?, completed_at=?,
+                           updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                           WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                        (completed["status"], now, now, json.dumps(event),
+                         json.dumps(completed), delegation_id))
+                    recovered += 1
+                    continue
+            error = ("Cron execution record missing; outcome unknown."
+                     if cron_execution_id else
+                     "Delegation owner exited before recording a terminal result; outcome unknown.")
             recovered_results = _recovered_results(task, result_json, error)
             if recovered_results:
                 done = sum(1 for r in recovered_results if r.get("status") != "unknown")
