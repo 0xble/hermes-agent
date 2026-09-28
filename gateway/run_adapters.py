@@ -804,16 +804,43 @@ class GatewayAdapterLifecycleMixin:
     async def _recover_spool_after_reconnect(self, platform) -> None:
         """Claim owed follow-ups before resume and drain them as separate turns."""
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
-        self._startup_restore_in_progress = True
+        from gateway.run import _startup_restore_drain_timeout_secs
+        candidates = self._resume_pending_candidates()
+        queued_before = len(getattr(self, "_startup_restore_queue", []))
+        tasks = []
+        keys = set()
         try:
-            recover_pending_shutdown_flush(self)
+            recover_pending_shutdown_flush(self, candidates=candidates, platform=platform)
             # Recovery scans all served homes, but only the newly available platform resumes.
-            self._schedule_resume_pending_sessions(platform=platform)
+            self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
+                                                   restore_tasks=tasks, restore_keys=keys)
         except Exception:
             logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
                            exc_info=True)
+        keys.update(self._session_key_for_source(event.source)
+                    for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
+        if not keys and not tasks:
+            return
+        counts = getattr(self, "_reconnect_restore_keys", None)
+        if counts is None:
+            counts = self._reconnect_restore_keys = {}
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1
+        try:
+            if tasks:
+                await self._wait_bounded_or_release(
+                    set(tasks), _startup_restore_drain_timeout_secs(),
+                    "Reconnect restore released after %.0fs with %d resume turn(s) still running",
+                    "background reconnect auto-resume task failed", level=logging.DEBUG,
+                )
         finally:
-            await self._finish_startup_restore()
+            for key in keys:
+                counts[key] -= 1
+                if not counts[key]:
+                    del counts[key]
+            if not self._startup_restore_in_progress:
+                await self._drain_startup_restore_queue(keys)
+
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""

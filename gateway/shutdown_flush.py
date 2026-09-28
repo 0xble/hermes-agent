@@ -306,7 +306,9 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return False
     if deferred_followup is not None:
         claim = deferred_followup(session_key, session_id, data)
-        if claim is None:  # resume still pending, but its delivery adapter is offline
+        if claim is None:  # resume deferred until its delivery path is ready
+            logger.warning("Pending message for %s retained in %s: delivery adapter offline or "
+                           "resume awaiting platform reconnect", session_key, path)
             return False
         if claim:
             return True

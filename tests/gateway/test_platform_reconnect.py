@@ -303,9 +303,12 @@ class TestPlatformReconnectWatcher:
         runner._redeliver_failed_obligations_for_platform.assert_awaited_once_with(
             Platform.TELEGRAM
         )
-        runner._schedule_resume_pending_sessions.assert_called_once_with(
-            platform=Platform.TELEGRAM
-        )
+        call = runner._schedule_resume_pending_sessions.call_args
+        assert runner._schedule_resume_pending_sessions.call_count == 1
+        assert call.kwargs["platform"] == Platform.TELEGRAM
+        assert call.kwargs["candidates"] == []
+        assert call.kwargs["restore_tasks"] == []
+        assert call.kwargs["restore_keys"] == set()
 
 
     @pytest.mark.asyncio

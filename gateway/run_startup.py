@@ -94,12 +94,18 @@ class GatewayStartupMixin:
                 source.chat_id if source else "unknown",
             )
 
-    async def _drain_startup_restore_queue(self) -> int:
-        """Replay inbound messages queued while startup auto-resume ran."""
+    async def _drain_startup_restore_queue(self, keys=None) -> int:
+        """Replay ready inbound, leaving sessions owned by another restore in order."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
-        while queue:
-            event = queue.pop(0)
+        while True:
+            index = next((i for i, event in enumerate(queue)
+                          if (keys is None or self._session_key_for_source(event.source) in keys)
+                          and not getattr(self, "_reconnect_restore_keys", {}).get(
+                              self._session_key_for_source(event.source))), None)
+            if index is None:
+                break
+            event = queue.pop(index)
             try:
                 source = getattr(event, "source", None)
                 adapter = self._intake_adapter_for(source)
@@ -580,35 +586,37 @@ class GatewayStartupMixin:
             logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
         return False
 
-    def _schedule_resume_pending_sessions(self, platform=None) -> int:
+    def _auto_resume_ready(self, entry, *, require_adapter=True) -> tuple | None:
+        """Shared admission for deferred follow-ups and synthetic resume turns."""
+        from gateway.run import _auto_continue_freshness_window
+        marker = entry.last_resume_marked_at or entry.updated_at
+        if marker is not None and (datetime.now() - marker).total_seconds() > _auto_continue_freshness_window():
+            return None
+        if self._is_session_running(entry.session_key):
+            return None
+        source = self._restored_source(entry)
+        adapter = self._delivery_adapter_for(source)
+        if not self._resume_owner_authorized(entry.session_key, source) or (require_adapter and adapter is None):
+            return None
+        return adapter, source
+
+    def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None, candidates=None) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
-        from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
-        window = _auto_continue_freshness_window()
-        candidates = self._resume_pending_candidates(platform)
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        candidates = self._resume_pending_candidates(platform) if candidates is None else candidates
         if candidates is None:
             return 0
-        now = datetime.now()
         scheduled = 0
         for entry in candidates:
-            marker = entry.last_resume_marked_at or entry.updated_at
-            if marker is not None and (now - marker).total_seconds() > window:
+            if platform is not None and entry.origin.platform != platform:
                 continue
-            # Already being resumed (e.g. scheduled at startup, still in-flight) — no second turn.
-            if self._is_session_running(entry.session_key):
+            ready = self._auto_resume_ready(entry)
+            if ready is None:
                 continue
-            source = self._restored_source(entry)
-            adapter = self._delivery_adapter_for(source)
-            if adapter is None:
-                logger.debug(
-                    "Skipping auto-resume for %s: adapter not ready for %s", entry.session_key,
-                    getattr(source.platform, "value", source.platform),
-                )
-                continue
-            if not self._resume_owner_authorized(entry.session_key, source):
-                continue
+            adapter, source = ready
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
             _resume_state = self._session_state(entry.session_key)
@@ -621,6 +629,10 @@ class GatewayStartupMixin:
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )
+            if restore_tasks is not None:
+                restore_tasks.append(task)
+            if restore_keys is not None:
+                restore_keys.add(entry.session_key)
             if getattr(self, "_startup_restore_in_progress", False):
                 tasks = getattr(self, "_startup_restore_tasks", None)
                 if tasks is None:
@@ -1656,13 +1668,14 @@ class GatewayStartupMixin:
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
+        candidates = self._resume_pending_candidates()
         try:
-            recover_pending_shutdown_flush(self)
+            recover_pending_shutdown_flush(self, candidates=candidates)
         except Exception:
             logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
-        self._schedule_resume_pending_sessions()
+        self._schedule_resume_pending_sessions(candidates=candidates)
         await self._finish_startup_restore()
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
         # The async delegation watcher performs the route/authorization preflight and durable

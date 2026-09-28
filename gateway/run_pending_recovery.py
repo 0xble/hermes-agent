@@ -29,26 +29,43 @@ def pending_home_for_key(runner, session_key: str) -> Path | None:
     return Path(served[owner]) if owner in served else None
 
 
-def recover_pending_shutdown_flush(runner) -> int:
+def recover_pending_shutdown_flush(runner, *, candidates=None, platform=None) -> int:
     """Visit the launch home and every served home; leave failed spools for a later boot."""
     from gateway.run import _profile_runtime_scope
 
+    # Snapshot once per recovery pass: the loop breaker must not be counted per payload.
+    if candidates is None and hasattr(runner, "_resume_pending_candidates"):
+        candidates = runner._resume_pending_candidates()
+    eligible = {entry.session_key: entry for entry in (candidates or [])}
     launch_home = Path(get_routing_process_hermes_home())
     homes = [launch_home, *((getattr(runner, "_served_profile_homes", None) or {}).values())]
     recovered = 0
     def defer_followup(key, session_id, data):
         # A queued message is a *future* turn. Appending it to the interrupted
         # transcript before auto-resume makes the recovery note answer that message.
-        entry = getattr(runner.session_store, "_entries", {}).get(key)
-        if not (entry and entry.resume_pending and entry.session_id == session_id and entry.origin):
+        if platform is not None and key in eligible and eligible[key].origin.platform != platform:
+            return None
+        if key not in eligible:
+            return False
+        store = runner.session_store
+        with store._lock:
+            store._ensure_loaded_locked()
+            entry = store._entries.get(key)
+            if not (entry and entry is eligible.get(key) and entry.resume_pending
+                    and entry.session_id == session_id and entry.origin):
+                return False
+        # Admission is shared with the scheduler, including freshness, running slot,
+        # authorization and the boot's restart-loop decision (eligible snapshot).
+        ready = runner._auto_resume_ready(entry, require_adapter=False)
+        if ready is None:
             return False
         # Older spools lack authorship. A guessed author would authorize a queued command as
         # the session starter in shared chats, so recover those only as transcript text.
         author_id = data.get("source_user_id") or data.get("user_id")
         if not isinstance(author_id, str) or not author_id.strip():
             return False
-        source = runner._restored_source(entry)
-        if runner._delivery_adapter_for(source) is None:
+        source = ready[1]
+        if ready[0] is None:
             return None
         from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session_identity import replace_source
@@ -75,6 +92,8 @@ def recover_pending_shutdown_flush(runner) -> int:
 
     for home in dict.fromkeys(Path(home) for home in homes):
         try:
+            if not (home / "pending_messages").is_dir() or not any((home / "pending_messages").glob("*.json")):
+                continue
             with _profile_runtime_scope(home, prepared_secret_scope={}):
                 def resolve_here(key, *, not_after=None):
                     owner_home = pending_home_for_key(runner, key)

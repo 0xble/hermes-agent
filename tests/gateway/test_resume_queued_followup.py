@@ -150,7 +150,7 @@ def test_multiplexed_recovery_uses_profile_delivery_adapter(tmp_path, monkeypatc
     key = runner._session_key_for_source(origin)
     runner.session_store._entries[key] = SessionEntry(
         session_key=key, session_id="other-sid", created_at=datetime.now(), updated_at=datetime.now(),
-        origin=origin, resume_pending=True,
+        origin=origin, resume_pending=True, resume_reason="restart_interrupted",
     )
     other_adapter = object()
     runner._delivery_adapter_for = MagicMock(return_value=other_adapter)
@@ -170,11 +170,12 @@ def test_multiplexed_recovery_uses_profile_delivery_adapter(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_offline_followup_retried_on_primary_reconnect(tmp_path, monkeypatch):
+async def test_offline_followup_retried_on_primary_reconnect(tmp_path, monkeypatch, caplog):
     runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
     assert flush_pending_to_file({key: MessageEvent(text="later", source=source, user_id="u1")}) == 1
     runner.adapters.clear()
     assert recover_pending_shutdown_flush(runner) == 0
+    assert "delivery adapter offline" in caplog.text
     assert list((tmp_path / "pending_messages").glob("*.json"))
     runner._startup_restore_in_progress = False
     runner._failed_platforms = {source.platform: {}}
@@ -191,3 +192,110 @@ async def test_offline_followup_retried_on_primary_reconnect(tmp_path, monkeypat
     adapter.handle_message.assert_awaited_once()
     assert adapter.handle_message.call_args.args[0].text == "later"
     db.append_message.assert_not_called()
+
+
+def test_direct_session_id_spool_skips_resolver_and_queues(tmp_path, monkeypatch):
+    runner, _, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    path = tmp_path / "pending_messages" / "direct.json"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps({"session_key": key, "ts": int(datetime.now().timestamp()),
+                                "data": {"text": "separate", "session_id": "sid",
+                                         "source_user_id": "u1"}}))
+    runner.session_store.resolve_session_id_for_key.side_effect = AssertionError("resolver must be skipped")
+    assert recover_pending_shutdown_flush(runner) == 1
+    assert [event.text for event in runner._startup_restore_queue] == ["separate"]
+    assert not path.exists()
+
+
+def test_non_auto_resume_reason_appends_to_transcript(tmp_path, monkeypatch):
+    runner, _, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner.session_store._entries[key].resume_reason = "manual_pause"
+    assert flush_pending_to_file({key: MessageEvent(text="ordinary", source=source, user_id="u1")}) == 1
+    assert recover_pending_shutdown_flush(runner) == 1
+    assert not runner._startup_restore_queue
+    db.append_message.assert_called_once()
+    assert db.append_message.call_args.kwargs["content"] == "ordinary"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_without_work_does_not_gate_other_chat(tmp_path, monkeypatch):
+    runner, _, source, _, _ = _spooled_runner(tmp_path, monkeypatch, pending=False)
+    runner._startup_restore_in_progress = False
+    await runner._recover_spool_after_reconnect(source.platform)
+    assert not runner._startup_restore_in_progress
+    assert not getattr(runner, "_reconnect_restore_keys", {})
+    assert not runner._startup_restore_queue
+
+
+@pytest.mark.asyncio
+async def test_overlapping_reconnects_hold_only_owned_sessions(tmp_path, monkeypatch):
+    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner._await_startup_warmup = AsyncMock()
+    first_started, second_started = asyncio.Event(), asyncio.Event()
+    first_release, second_release = asyncio.Event(), asyncio.Event()
+    seen = []
+    async def handle(event):
+        if event.internal:
+            if event.source.chat_id == source.chat_id:
+                first_started.set()
+                await first_release.wait()
+                seen.append("first")
+            else:
+                second_started.set()
+                await second_release.wait()
+                seen.append("second")
+        else:
+            seen.append(event.text)
+    adapter.handle_message = handle
+    first = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(first_started.wait(), 5)
+    other = replace(source, chat_id="other")
+    other_key = runner._session_key_for_source(other)
+    runner.session_store._entries[other_key] = SessionEntry(
+        session_key=other_key, session_id="other-sid", created_at=datetime.now(), updated_at=datetime.now(),
+        origin=other, resume_pending=True, resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    second = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(second_started.wait(), 5)
+    assert runner._reconnect_restore_keys.get(key)
+    assert runner._reconnect_restore_keys.get(other_key)
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._admit_bot_message_for_source = MagicMock(return_value=True)
+    unrelated = replace(source, chat_id="unrelated")
+    free_event = MessageEvent(text="free", source=unrelated)
+    free_admission = await runner._hm_admit_event(free_event)
+    assert free_admission is not None and free_admission[0] is free_event
+    held_event = MessageEvent(text="held", source=other)
+    assert await runner._hm_admit_event(held_event) is None
+    assert runner._startup_restore_queue[-1] is held_event
+    first_release.set()
+    await first
+    assert runner._reconnect_restore_keys.get(other_key)
+    assert not runner._startup_restore_in_progress
+    second_release.set()
+    await second
+    assert not runner._reconnect_restore_keys
+    assert seen == ["first", "second", "held"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_keeps_other_platforms_followup_until_its_resume(tmp_path, monkeypatch):
+    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch, pending=False)
+    runner._startup_restore_in_progress = False
+    other = replace(source, platform=Platform.DISCORD, chat_id="discord-room")
+    other_key = runner._session_key_for_source(other)
+    runner.session_store._entries[other_key] = SessionEntry(
+        session_key=other_key, session_id="other-sid", created_at=datetime.now(), updated_at=datetime.now(),
+        origin=other, resume_pending=True, resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store.resolve_session_id_for_key = MagicMock(return_value=("other-sid", MagicMock()))
+    runner.adapters[Platform.DISCORD] = adapter
+    assert flush_pending_to_file({other_key: MessageEvent(text="discord followup", source=other, user_id="u1")}) == 1
+    await runner._recover_spool_after_reconnect(Platform.TELEGRAM)
+    assert list((tmp_path / "pending_messages").glob("*.json"))
+    assert not runner._startup_restore_queue
