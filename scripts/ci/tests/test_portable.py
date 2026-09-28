@@ -22,6 +22,24 @@ def clean_git_env():
 
 
 class PortableGateTests(unittest.TestCase):
+    def test_shards_cover_every_ordinary_python_and_safe_e2e_file_once(self):
+        from scripts.run_tests_parallel import _discover_files
+
+        ordinary = {p.relative_to(ci.ROOT).as_posix()
+                    for p in _discover_files([ci.ROOT / 'tests'])}
+        e2e = {p.relative_to(ci.ROOT).as_posix()
+               for p in _discover_files([ci.ROOT / 'tests/e2e'])
+               if not p.is_relative_to(ci.ROOT / ci.NIGHTLY_ONLY_E2E[0])
+               and p != ci.ROOT / ci.NIGHTLY_ONLY_E2E[1]}
+        expected = ordinary | e2e
+        buckets = ci.shard_files(ci.ROOT, 10)
+        self.assertEqual(set().union(*(set(bucket) for bucket in buckets)), expected)
+        self.assertEqual(sum(map(len, buckets)), len(expected))
+        self.assertEqual(buckets, ci.shard_files(ci.ROOT, 10))
+        self.assertTrue(all(buckets))
+        with self.assertRaisesRegex(ValueError, 'positive'):
+            ci.shard_files(ci.ROOT, 0)
+
     def test_container_jobs_install_git_and_configure_safe_directory_before_checkout(self):
         import yaml
 
