@@ -180,6 +180,62 @@ def test_merge_commits_need_no_trailer(tmp_path, monkeypatch):
     assert checker.check_trailers(base) == []
 
 
+def test_immutable_home_checks_promoted_history_not_stale_checkout(tmp_path, monkeypatch, capsys):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    _units(tmp_path, "fixture")
+    git("add", "-A")
+    git("commit", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "promoted")
+    git("commit", "--allow-empty", "-qm", "missing trailer in promoted commit")
+    promoted = git("rev-parse", "HEAD")
+    git("checkout", "-q", "HEAD~1")
+    release = tmp_path / "releases" / promoted
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(promoted + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "check_extensions", lambda home: [])
+    monkeypatch.setattr(checker, "check_receipt", lambda home: [])
+    assert checker.check_trailers(base, floor) == []  # stale source HEAD misses the commit
+    assert checker.main(["--home", str(tmp_path), "--baseline", base,
+                         "--trailer-floor", floor, "--skip-config"]) == 1
+    assert "missing trailer in promoted commit" in capsys.readouterr().out
+
+
+def test_immutable_home_reads_ownership_from_the_release_not_the_stale_worktree(tmp_path, monkeypatch, capsys):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    _units(tmp_path, "old-identity")
+    git("add", "-A")
+    git("commit", "-qm", "units at the stale checkout", "--trailer", "Fork-Patch: old-identity")
+    stale = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "promoted")
+    _units(tmp_path, "old-identity", "new-identity")
+    git("add", "-A")
+    git("commit", "-qm", "own the new identity", "--trailer", "Fork-Patch: new-identity")
+    promoted = git("rev-parse", "HEAD")
+    git("checkout", "-q", stale)  # working tree lags: new-identity is unowned here
+    release = tmp_path / "releases" / promoted
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(promoted + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "check_extensions", lambda home: [])
+    monkeypatch.setattr(checker, "check_receipt", lambda home: [])
+    # The working-tree contract does not own the promoted identity.
+    assert any("new-identity" in f for f in checker.check_trailers(base, floor, revision=promoted))
+    # The release's own contract does.
+    assert checker.check_trailers(base, floor, revision=promoted, contract=promoted) == []
+    assert checker.main(["--home", str(tmp_path), "--baseline", base,
+                         "--trailer-floor", floor, "--skip-config"]) == 0
+
+
 def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
     git = _repo(tmp_path)
     (tmp_path / "FORK_PATCHES.md").write_text("obsolete ledger", encoding="utf-8")

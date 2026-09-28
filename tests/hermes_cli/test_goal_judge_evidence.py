@@ -180,18 +180,19 @@ def test_repeated_disputed_completion_pauses_for_the_user(hermes_home):
     mgr = GoalManager(session_id=sid)
     mgr.set("Write the systems wiki", max_turns=100)
 
-    with patch.object(goals, "judge_goal", side_effect=_judge_sequence(DISPUTED, DISPUTED)):
-        first = mgr.evaluate_after_turn(CLAIM_ONLY_REPLY)
-        second = mgr.evaluate_after_turn(CLAIM_ONLY_REPLY)
+    limit = goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES
+    with patch.object(goals, "judge_goal", side_effect=_judge_sequence(*[DISPUTED] * limit)):
+        decisions = [mgr.evaluate_after_turn(CLAIM_ONLY_REPLY) for _ in range(limit)]
 
-    assert first["should_continue"] is True
-    assert second["should_continue"] is False
-    assert second["verdict"] == "disputed"
-    assert "/goal clear" in second["message"] and "/goal resume" in second["message"]
+    assert all(d["should_continue"] for d in decisions[:-1])
+    last = decisions[-1]
+    assert last["should_continue"] is False
+    assert last["verdict"] == "disputed"
+    assert "/goal clear" in last["message"] and "/goal resume" in last["message"]
     persisted = load_goal(sid)
     assert persisted.status == "paused"
     assert persisted.paused_reason.startswith(goals._DISPUTED_PAUSE_PREFIX)
-    assert persisted.turns_used == 2
+    assert persisted.turns_used == limit
 
 
 def test_dispute_streak_resets_on_other_verdicts_and_resume(hermes_home):
@@ -212,9 +213,11 @@ def test_dispute_streak_resets_on_other_verdicts_and_resume(hermes_home):
 def test_disputed_pause_is_not_revived_by_ordinary_user_input(hermes_home):
     mgr = GoalManager(session_id="dispute-no-revive")
     mgr.set("ship it", max_turns=100)
-    with patch.object(goals, "judge_goal", side_effect=_judge_sequence(DISPUTED, DISPUTED)):
-        mgr.evaluate_after_turn("done")
-        mgr.evaluate_after_turn("done")
+    limit = goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES
+    with patch.object(goals, "judge_goal", side_effect=_judge_sequence(*[DISPUTED] * limit)):
+        for _ in range(limit):
+            mgr.evaluate_after_turn("done")
+    assert mgr.state.status == "paused"
     assert mgr.resume_for_user_input() is False
     assert mgr.state.status == "paused"
 
