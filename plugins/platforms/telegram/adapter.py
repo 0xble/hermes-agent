@@ -3963,10 +3963,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # The rest of teardown is best-effort against a half-dead transport. See #80598.
         # The legacy updater releases early for bounded teardown. Controlled polling
         # may not do so: an abandoned HTTP request can still confirm an offset.
-        if self._controlled_journal is None:
+        poller = getattr(self, "_controlled_poller", None)
+        if getattr(self, "_controlled_journal", None) is None:
             self._release_platform_lock()
-        elif self._controlled_poller is not None and self._controlled_poller.running:
-            await self._controlled_poller.stop()
+        elif poller is not None and poller.running:
+            await poller.stop()
             self._release_platform_lock()
         else:
             self._release_platform_lock()
