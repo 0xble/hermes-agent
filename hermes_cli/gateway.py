@@ -4257,13 +4257,14 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
             pass  # best-effort; don't block gateway startup
 
     from gateway.run import start_gateway
-    print("┌─────────────────────────────────────────────────────────┐")
-    print("│           ☤ Hermes Gateway Starting...                 │")
-    print("├─────────────────────────────────────────────────────────┤")
-    print("│  Messaging platforms + cron scheduler                    │")
-    print("│  Press Ctrl+C to stop                                   │")
-    print("└─────────────────────────────────────────────────────────┘")
-    print()
+    if not standby:
+        print("┌─────────────────────────────────────────────────────────┐")
+        print("│           ☤ Hermes Gateway Starting...                 │")
+        print("├─────────────────────────────────────────────────────────┤")
+        print("│  Messaging platforms + cron scheduler                    │")
+        print("│  Press Ctrl+C to stop                                   │")
+        print("└─────────────────────────────────────────────────────────┘")
+        print()
 
     # Exit 1 if no platform connects so systemd Restart=always retries transient errors.
     verbosity = None if quiet else verbose
@@ -4287,10 +4288,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
         _exit_after_graceful_shutdown(code)
 
     async def _run_with_release_ack() -> bool:
+        if standby:
+            return await start_gateway(replace=replace, force=force, verbosity=verbosity, standby=True)
         watcher = asyncio.create_task(_acknowledge_release_when_running())
         try:
-            if standby:
-                return await start_gateway(replace=replace, force=force, verbosity=verbosity, standby=True)
             return await start_gateway(replace=replace, force=force, verbosity=verbosity)
         finally:
             watcher.cancel()

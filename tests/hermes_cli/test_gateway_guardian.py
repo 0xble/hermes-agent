@@ -46,6 +46,24 @@ def fake_launchctl(monkeypatch, label, *, loaded=False):
     return calls
 
 @pytest.mark.macos_only
+def test_explicit_grace_does_not_load_flag_off_config(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: false\n")
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective",
+                        lambda *args, **kwargs: pytest.fail("flag-off config loaded"))
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    assert guardian.run_once(home, plist, label, grace=12) == "healthy"
+
+
+@pytest.mark.macos_only
+def test_explicit_grace_ignores_unrelated_invalid_config(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("updates: [unclosed\n")
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    assert guardian.run_once(home, plist, label, grace=12) == "healthy"
+
+
+@pytest.mark.macos_only
 @pytest.mark.parametrize("value", ["text", 0, -1, ".nan", ".inf"])
 def test_invalid_grace_writes_alert_receipt(tmp_path, value, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)

@@ -101,7 +101,8 @@ class ActiveGeneration:
         if len(os.fsencode(socket_path)) >= 100:
             raise RuntimeError("generation control socket path exceeds UNIX socket limit")
         self.server = GenerationControlServer(self.home, self.paths["socket"])
-        await self.server.start()
+        if not await self.server.start():
+            raise RuntimeError("generation control socket unavailable")
         self.socket_stat = self.paths["socket"].stat()
         write_generation_record(self.paths["state"], self.identity, state="serving", socket_path=self.paths["socket"])
         self.task = asyncio.create_task(self._heartbeat())
@@ -123,8 +124,8 @@ class ActiveGeneration:
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(1)
-            self._sync_runtime_status()
-            self.coordinator.heartbeat(self.identity.id)
+            await asyncio.to_thread(self._sync_runtime_status)
+            await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id)
 
     async def close(self) -> None:
         if self.task:
@@ -199,7 +200,7 @@ async def serve_standby_generation(config=None) -> bool:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
-                coordinator.heartbeat(identity.id)
+                await asyncio.to_thread(coordinator.heartbeat, identity.id)
     finally:
         server.close()
         await server.wait_closed()

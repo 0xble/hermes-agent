@@ -134,7 +134,27 @@ class GenerationCoordinator:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT epoch,generation_id,state FROM leases WHERE resource=?", (resource,)).fetchone()
             if row and row["state"] != "released" and row["generation_id"] != generation_id:
-                raise RuntimeError(f"lease {resource!r} is held by another generation")
+                from gateway.status import _get_process_start_time, _pid_exists
+                holder = conn.execute(
+                    "SELECT pid,boot_id,start_fingerprint,heartbeat_at FROM generations WHERE id=?",
+                    (row["generation_id"],),
+                ).fetchone()
+                if holder is None:
+                    raise RuntimeError(f"lease {resource!r} has no generation record; takeover refused")
+                pid = int(holder["pid"])
+                # Unknown process start is not death proof. Fail closed while the PID lives.
+                alive = _pid_exists(pid)
+                actual_start = _get_process_start_time(pid) if alive else None
+                dead = (holder["boot_id"] != _boot_id() or not alive or
+                        (actual_start is not None and holder["start_fingerprint"] != f"{pid}:{actual_start}"))
+                if dead:
+                    conn.execute("UPDATE generations SET state='failed' WHERE id=?", (row["generation_id"],))
+                else:
+                    if time.time() - holder["heartbeat_at"] > 5:
+                        conn.execute("UPDATE generations SET state='suspect' WHERE id=?", (row["generation_id"],))
+                        conn.commit()
+                        raise RuntimeError(f"lease {resource!r} is suspect: holder PID {pid} is alive; takeover refused")
+                    raise RuntimeError(f"lease {resource!r} is held by another generation")
             epoch = (int(row["epoch"]) + 1) if row else 1
             conn.execute(
                 "INSERT OR REPLACE INTO leases(resource,epoch,generation_id,state) VALUES(?,?,?,?)",
@@ -214,7 +234,7 @@ def remove_generation_files(home: Path, identity: GenerationIdentity) -> None:
 def overlap_handover_enabled(config: Any) -> bool:
     value = config
     if isinstance(config, dict):
-        value = config.get("gateway", {}).get("overlap_handover", {}).get("enabled", False)
+        value = (config.get("gateway") or {}).get("overlap_handover", {}).get("enabled", False)
     else:
         value = getattr(config, "overlap_handover_enabled", False)
     return bool(value)
