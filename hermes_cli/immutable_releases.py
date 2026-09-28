@@ -1173,6 +1173,33 @@ def migration_plist(home: Path) -> tuple[Path, bytes] | None:
     return Path(data["plist"]["path"]), base64.b64decode(data["plist"]["body"], validate=True)
 
 
+def abandon_failed_switch(home: Path, *, candidate: Path, previous: Path) -> None:
+    """Archive a verified unacknowledged promotion before a guardian rollback.
+
+    The forward WAL cannot be passed to rollback(), because recovery would
+    complete that failed promotion first. Archive the exact WAL bytes, which
+    retain the plist backup path and hash for postmortem inspection; the backup
+    remains at that path. Remove only this matched WAL.
+    """
+    paths = ReleasePaths.for_home(home)
+    record = _read_txn(paths)
+    if record is None:
+        return
+    if (record.get("operation") != "promote" or record.get("reload_ack") or
+            not record.get("reload_issued") or record.get("candidate") != str(candidate) or
+            record.get("previous_intended") != str(previous)):
+        raise RuntimeError("pending release transaction is not the failed promotion")
+    _verify_transaction(paths, record)
+    pending = _txn_path(paths)
+    archive = paths.home / f"release-abandoned-{uuid.uuid4().hex}.json"
+    _atomic_bytes(archive, pending.read_bytes())
+    # If the transaction changed while the archive was written, do not delete it.
+    if json.loads(pending.read_text(encoding="utf-8")) != record:
+        raise RuntimeError("release transaction changed during guardian archive")
+    pending.unlink()
+    _sync_dir(paths.home)
+
+
 def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | None = None,
              reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
