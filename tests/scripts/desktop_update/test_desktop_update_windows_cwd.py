@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import psutil
 import pytest
 
 
@@ -27,28 +28,54 @@ def _run_cwd_self_test(
     env = os.environ.copy()
     env["TEMP"] = str(temp_dir)
     env["TMP"] = str(temp_dir)
-    return subprocess.run(
-        [
-            powershell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(WINDOWS_UPDATE_PS1),
-            "-InstallRoot",
-            str(install_root),
-            "-SelfTestWorkingDirectory",
-            "-NoUi",
-        ],
+    command = [
+        powershell,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(WINDOWS_UPDATE_PS1),
+        "-InstallRoot",
+        str(install_root),
+        "-SelfTestWorkingDirectory",
+        "-NoUi",
+    ]
+    with subprocess.Popen(
+        command,
         cwd=launch_cwd,
         env=env,
         text=True,
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=60,
-        check=False,
-    )
+    ) as process:
+        try:
+            output, _ = process.communicate(timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            # Snapshot before killing PowerShell: subprocess.run kills it first,
+            # erasing the process tree that could distinguish a stuck handoff
+            # from a surviving pipe-holding descendant on the hosted runner.
+            try:
+                parent = psutil.Process(process.pid)
+                children = parent.children(recursive=True)
+                tree = [(child.pid, child.name(), child.status()) for child in children]
+            except (psutil.Error, OSError) as error:
+                tree = f"unavailable: {error}"
+            exc.add_note(
+                f"PowerShell poll={process.poll()}; descendants={tree}; "
+                f"partial stdout={exc.output!r}"
+            )
+            process.kill()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # An inherited pipe can remain open after the parent dies.
+                # Close our read end so Popen's context manager cannot wait on it.
+                assert process.stdout is not None
+                process.stdout.close()
+                process.wait(timeout=5)
+            raise
+    return subprocess.CompletedProcess(command, process.returncode, output)
 
 
 def test_handoff_children_run_from_install_root(tmp_path: Path) -> None:
