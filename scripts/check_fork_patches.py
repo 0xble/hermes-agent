@@ -9,7 +9,7 @@ Asserts the things a successful ``hermes update`` does not itself prove:
   sync cannot silently drop a patch, and a new patch cannot land without a documented owner);
 - the candidate extensions are installed in the profile and register through real plugin discovery;
 - the configuration keys the slices depend on resolve to the expected values;
-- the newest update receipt, when present, records the same source SHA the checkout is at.
+- the newest update receipt, when present, matches the active release (or legacy checkout).
 
 Exit 0 when every check passes, 1 otherwise, with one line per failure. Read-only.
 """
@@ -128,39 +128,53 @@ def _recorded_baseline() -> str | None:
     return module.accepted_release_baseline(REPO)
 
 
-def _is_ancestor(sha: str) -> bool:
+def _verification_revision(home: Path) -> tuple[str, str, str | None]:
+    """Resolve the deployed commit, retaining checkout semantics for legacy homes."""
+    from hermes_cli.immutable_releases import ReleasePaths, resolved_release
+
+    current = ReleasePaths.for_home(home).current
+    if current.is_symlink():
+        release = resolved_release(home)
+        if release is None:
+            return "", "release", "current release pointer does not identify a ready release"
+        return release.name, "release", None
+    return _git("rev-parse", "HEAD"), "checkout", None
+
+
+def _is_ancestor(sha: str, revision: str = "HEAD") -> bool:
     return subprocess.run(
-        ["git", "-C", str(REPO), "merge-base", "--is-ancestor", sha, "HEAD"], capture_output=True,
+        ["git", "-C", str(REPO), "merge-base", "--is-ancestor", sha, revision], capture_output=True,
     ).returncode == 0
 
 
-def _resolve_floor(floor: str, baseline: str, subject: str | None) -> tuple[str | None, str | None]:
-    """Return ``(sha, failure)``. The floor must be reachable from HEAD: after a sync rebase the old
-    object may still exist in the store, so existence is not enough. Fall back to the exact subject."""
-    if _is_ancestor(floor):
+def _resolve_floor(floor: str, baseline: str, subject: str | None, revision: str = "HEAD") -> tuple[str | None, str | None]:
+    """Return ``(sha, failure)``. The floor must be reachable from the checked revision:
+    after a sync rebase the old object may still exist in the store. Fall back to the exact subject."""
+    if _is_ancestor(floor, revision):
         return floor, None
     if subject:
         by_subject = [
-            sha for sha in _git("rev-list", "--reverse", f"{baseline}..HEAD").split()
+            sha for sha in _git("rev-list", "--reverse", f"{baseline}..{revision}").split()
             if _git("log", "-1", "--format=%s", sha) == subject
         ]
         if len(by_subject) == 1:
             return by_subject[0], None
     return None, (
-        f"trailer floor {floor[:12]} is not an ancestor of HEAD (rewritten by a sync?) and no single commit "
+        f"trailer floor {floor[:12]} is not an ancestor of {revision} (rewritten by a sync?) and no single commit "
         f"above the baseline has its subject; pass --trailer-floor <sha> for the last pre-contract commit")
 
 
-def check_trailers(baseline: str, floor: str | None = None, floor_subject: str | None = None) -> list[str]:
+def check_trailers(baseline: str, floor: str | None = None, floor_subject: str | None = None,
+                   revision: str = "HEAD") -> list[str]:
     """Every commit above ``floor`` (default: ``baseline``) carries only owned ``Fork-Patch`` identities."""
     owned = _owned_identities()
     if owned is None:
         return [f"{MAINTENANCE_ROOT} and {MAINTENANCE_DIR}/ are missing; patch identities have no owner"]
-    if not _is_ancestor(baseline):
-        return [f"release baseline {baseline} is not an ancestor of HEAD"]
+    if not _is_ancestor(baseline, revision):
+        return [f"release baseline {baseline} is not an ancestor of {revision}"]
     start = baseline
     if floor:
-        start, failure = _resolve_floor(floor, baseline, floor_subject)
+        start, failure = _resolve_floor(floor, baseline, floor_subject, revision)
         if failure:
             return [failure]
     failures: list[str] = []
@@ -173,7 +187,7 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
             backfills[patch_id] = identity.strip()
     # Classify fork commits after the floor, excluding the verified upstream release
     # ancestry. A release merge introduces upstream commits without fork trailers.
-    for sha in _git("rev-list", "--reverse", "--no-merges", "HEAD", f"^{start}", f"^{baseline}").split():
+    for sha in _git("rev-list", "--reverse", "--no-merges", revision, f"^{start}", f"^{baseline}").split():
         short = sha[:12]
         body = _git("log", "-1", "--format=%B", sha)
         identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]
@@ -255,11 +269,13 @@ def check_receipt(home: Path) -> list[str]:
     failures: list[str] = []
     post = receipt.get("post_update") if isinstance(receipt.get("post_update"), dict) else {}
     recorded = str(post.get("sha") or "")
-    head = _git("rev-parse", "HEAD")
+    revision, target, pointer_failure = _verification_revision(home)
+    if pointer_failure:
+        return [pointer_failure]
     if not recorded:
         failures.append("update receipt records no post_update sha")
-    elif recorded != head:
-        failures.append(f"update receipt records post_update {recorded[:12]} but the checkout is at {head[:12]}")
+    elif recorded != revision:
+        failures.append(f"update receipt records post_update {recorded[:12]} but the {target} is at {revision[:12]}")
     outcome = str(receipt.get("outcome") or "")
     # Steps are only evidence on a non-success receipt: the updater records an opted-out backup as
     # ``ok: false`` and still finalizes ``success``.
@@ -271,13 +287,16 @@ def check_receipt(home: Path) -> list[str]:
     # drained an in-flight turn past that window is recorded ``stale`` even though launchd relaunched it
     # on the new code moments later. The live fleet is the truth for "is the running code current";
     # the receipt only says what the updater saw. So a stale (or down) row fails only when the live
-    # fleet does not prove that profile current at the checkout HEAD. A ``partial`` outcome is excused
+    # fleet does not prove that profile current at the deployed revision. A ``partial`` outcome is excused
     # only when such a row was re-verified live AND the receipt's restart bookkeeping records no other
     # cause (failed restart units, an incomplete restart phase, an unaccounted runtime). Causes the
     # updater does not write into the receipt (desktop rebuild, SQLite remediation) cannot be seen here.
     # ``external`` rows serve a separate checkout this update did not touch; their code is not this one.
+    # Immutable releases also check currently healthy receipt rows against the live gateway: the
+    # source HEAD cannot establish which revision that gateway actually loaded.
     needs_live = [row for row in receipt.get("fleet") or [] if isinstance(row, dict) and row.get("state") != "external"
-                  and (str(row.get("state") or "") in ("stale", "down") or (row.get("code_sha") and str(row.get("code_sha")) != head))]
+                  and (target == "release" or str(row.get("state") or "") in ("stale", "down")
+                       or (row.get("code_sha") and str(row.get("code_sha")) != revision))]
     live = _live_fleet() if needs_live else {}
     live_verified: list[str] = []
     for row in needs_live:
@@ -285,12 +304,13 @@ def check_receipt(home: Path) -> list[str]:
         sha = str(row.get("code_sha") or "")
         profile = str(row.get("profile") or "?")
         live_row = live.get(profile) if live else None
-        if live_row is not None and str(live_row.get("code_sha") or "") == head:
-            print(f"note receipt row for profile {profile!r} is {state} (pid {row.get('pid', '?')}, settle window expired); "
-                  f"live gateway pid {live_row.get('pid', '?')} verified current at {head[:12]}")
-            live_verified.append(profile)
+        if live_row is not None and str(live_row.get("code_sha") or "") == revision:
+            if state != "current" or sha != revision:
+                print(f"note receipt row for profile {profile!r} is {state} (pid {row.get('pid', '?')}, settle window expired); "
+                      f"live gateway pid {live_row.get('pid', '?')} verified current at {revision[:12]}")
+                live_verified.append(profile)
             continue
-        failures.append(f"running profile {profile!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; checkout is {head[:12]}"
+        failures.append(f"running profile {profile!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; {target} is {revision[:12]}"
                         + ("" if live is not None else " (live fleet probe unavailable)"))
     if outcome != "success" and not failed_steps:
         other = _other_partial_causes(receipt)
@@ -358,7 +378,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     # The subject fallback belongs to the default floor only; a custom --trailer-floor must resolve as given.
     floor_subject = DEFAULT_TRAILER_FLOOR_SUBJECT if args.trailer_floor == DEFAULT_TRAILER_FLOOR else None
-    failures = check_trailers(args.baseline, args.trailer_floor, floor_subject)
+    revision, _, pointer_failure = _verification_revision(args.home) if not args.source_only else ("HEAD", "checkout", None)
+    failures = [pointer_failure] if pointer_failure else check_trailers(
+        args.baseline, args.trailer_floor, floor_subject, revision=revision)
     if not args.source_only:
         failures += check_extensions(args.home)
         if not args.skip_config:

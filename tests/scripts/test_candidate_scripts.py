@@ -89,6 +89,32 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     assert any("not a native" in p for p in mod.check_receipt(tmp_path))
 
 
+def test_check_receipt_uses_immutable_release_not_source_head(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    source_head, active = "a" * 40, "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: source_head)
+    release = tmp_path / "releases" / active
+    release.mkdir(parents=True)
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (release / marker).write_text(active + "\n", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    row = {"profile": "default", "pid": 9, "code_sha": active, "state": "current"}
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": row})
+    _receipt(tmp_path, fleet=[row])
+    assert mod.check_receipt(tmp_path) == []
+
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": dict(row, code_sha=source_head)})
+    assert any("running profile" in p and "release" in p for p in mod.check_receipt(tmp_path))
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": row})
+    _receipt(tmp_path, post_update={"sha": source_head}, fleet=[row])
+    assert any("post_update" in p and "release" in p for p in mod.check_receipt(tmp_path))
+    _receipt(tmp_path, fleet=[dict(row, code_sha=source_head)])
+    assert mod.check_receipt(tmp_path) == []  # receipt fleet snapshot may lag the live gateway
+    (tmp_path / "current").unlink()
+    (tmp_path / "current").symlink_to(tmp_path / "releases" / ("c" * 40))
+    assert any("current release" in p for p in mod.check_receipt(tmp_path))
+
+
 def test_check_receipt_trusts_the_live_fleet_over_a_stale_snapshot(tmp_path, monkeypatch, capsys):
     """A gateway that drained past the updater's settle window is recorded stale and the outcome
     partial, but launchd relaunched it on the new code: the live fleet, not the snapshot, decides."""
