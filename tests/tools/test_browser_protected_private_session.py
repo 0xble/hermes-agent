@@ -214,6 +214,24 @@ def test_timeout_does_not_discard_protected_browser(monkeypatch, tmp_path):
         clear_vault_date_components(task)
 
 
+def test_timed_out_card_session_discards_stale_scope(monkeypatch, tmp_path):
+    from agent.redact import (
+        clear_vault_date_components, has_vault_scoped_components,
+        register_vault_card_component,
+    )
+    from tools.browser_tool_session import _discard_timed_out_browser_session
+
+    task = "card-timeout-check"
+    session = {"session_key": task, "session_name": "", "features": {"local": True}}
+    monkeypatch.setattr(browser_tool, "_active_sessions", {task: session})
+    register_vault_card_component("exp_year", "2029", tab=task, origin="https://checkout.test")
+    try:
+        _discard_timed_out_browser_session(task, session, str(tmp_path))
+        assert task not in browser_tool._active_sessions
+        assert not has_vault_scoped_components(task)
+    finally:
+        clear_vault_date_components(task)
+
 @pytest.mark.parametrize("close_result", [RuntimeError("close failed"), {"success": False}])
 def test_failed_close_keeps_pixels_blocked_and_session_tracked(close_result, monkeypatch):
     task = "close-check"

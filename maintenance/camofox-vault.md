@@ -60,7 +60,11 @@ the browser vault fill tool, or the 1Password backends.
   (including padded/unpadded month and four-/two-digit year), and billing ZIP use whole-token
   redaction only on the filled browser session and origin. Neither terminal/log output nor
   other tabs/origins inherit these low-entropy matches; card fills do not trigger the
-  protected-birthday pixel quarantine. Address fills remain non-secret.
+  protected-birthday pixel quarantine. Browser close (including a failed card-only
+  close that releases session resources), force-reap, and timed-out generation discard
+  clear the scoped card metadata so a reused task key cannot inherit it. Protected
+  birthday fills instead retain quarantine until a confirmed close. Address fills
+  remain non-secret.
 - Configured 1Password protected fields expose only an opaque handle and semantic token. They
   remain exact-origin bound, resolve server-side, and fill only a matching supported control
   in a verified task-owned local Chromium session. Birth-date fills refuse all Camofox
