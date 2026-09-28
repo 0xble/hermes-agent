@@ -441,8 +441,9 @@ def test_noop_update_promotes_before_pending_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **kw: True)
     monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a: None)
-    def restart(*, defer):
+    def restart(*, defer, checkout_complete):
         assert defer is False
+        assert checkout_complete is True
         assert (home / "current").resolve() == b
     monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", restart)
     plan = SimpleNamespace(auto_stash_ref=None, parked_branch_switched=False,
