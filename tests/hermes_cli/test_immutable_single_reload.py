@@ -194,6 +194,34 @@ def test_acknowledged_release_catchup_verifies_without_second_relaunch(release_j
 
 
 @pytest.mark.macos_only
+def test_stale_credited_gateway_gets_one_relaunch(release_job, monkeypatch):
+    job = release_job
+    monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
+    worker = _ack_after_spawn(job, job.b, job.initial["pid"])
+    assert update_cmd._activate_immutable_release(sha=job.b.name, source=job.a)
+    worker.join(timeout=5)
+    job.log.write_text("")
+    monkeypatch.setattr(update_cmd_fleet, "_pending_fleet_restart_needed", lambda: True)
+    identity = update_receipt._socket_identity
+    def stale_until_relaunch(home):
+        observed = identity(home)
+        if observed and not any(line.startswith(("bootout ", "kickstart "))
+                                for line in job.log.read_text().splitlines()):
+            pid, status = observed
+            return pid, {**status, "code_sha": job.a.name}
+        return observed
+    monkeypatch.setattr(update_receipt, "_socket_identity", stale_until_relaunch)
+    update_receipt.begin_update_receipt()
+    update_cmd._apply_pending_fleet_restart_catchup()
+    row = job.observed(job.b, job.initial["pid"])
+    assert row["pid"] != job.initial["pid"]
+    mutations = [line for line in job.log.read_text().splitlines()
+                 if line.startswith(("bootout ", "bootstrap ", "kickstart ")) and job.label in line]
+    assert [line.split()[0] for line in mutations] == ["kickstart"]
+    assert update_receipt.read_latest_receipt()["outcome"] == "success"
+
+
+@pytest.mark.macos_only
 def test_release_to_release_rollback_reload_once(release_job):
     job = release_job
     releases.promote(job.home, job.b)

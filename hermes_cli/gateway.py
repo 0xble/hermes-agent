@@ -2950,17 +2950,31 @@ def _detect_venv_dir() -> Path | None:
 
 
 def get_python_path() -> str:
-    try:
-        from hermes_cli.immutable_releases import resolved_release
-        release = resolved_release(get_hermes_home())
-        if release:
-            # Service definitions must keep the lexical pointer: launchd resolves it
-            # afresh at each spawn, while the worker launcher pins the resolved path.
-            candidate = get_hermes_home() / "current" / (".venv/Scripts/python.exe" if is_windows() else ".venv/bin/python")
-            if candidate.exists():
-                return str(candidate)
-    except Exception:
-        pass
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _release_is_ready
+
+    home = get_hermes_home()
+    paths = ReleasePaths.for_home(home)
+    current = paths.current
+    if current.exists() or current.is_symlink():
+        try:
+            release = read_pointer(current)
+            if release is None:
+                raise ValueError("pointer target is missing or unreadable")
+            if release.parent != paths.releases.resolve():
+                raise ValueError(f"pointer targets outside releases: {release}")
+            if not _release_is_ready(release, release.name):
+                raise ValueError(f"release is not ready: {release}")
+            # Service definitions keep the lexical pointer so launchd resolves it at spawn.
+            candidate = current / (".venv/Scripts/python.exe" if is_windows() else ".venv/bin/python")
+            if not candidate.is_file():
+                raise ValueError(f"interpreter missing: {candidate}")
+            return str(candidate)
+        except (OSError, ValueError, TypeError) as exc:
+            if current.is_symlink() or (home / "release-layout.json").exists():
+                raise RuntimeError(
+                    f"Invalid immutable release current pointer {current}: {exc}. "
+                    "Inspect release-txn.json and the release; repair the pointer or "
+                    "run hermes update --rollback from the source checkout.") from exc
     venv = _detect_venv_dir()
     if venv is not None:
         try:
