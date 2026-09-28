@@ -85,6 +85,72 @@ def test_cited_evidence_outside_the_recent_window_reaches_the_judge(hermes_home,
     assert "exact_sha=94d6cf5" not in prompts[0].split("Tool results recorded")[1]
 
 
+@pytest.mark.parametrize("ellipsis", ["…", "..."])
+def test_truncated_identifier_matches_real_prefix_and_shows_full_output(hermes_home, ellipsis):
+    sid = "cite-truncated"
+    db = _db(sid)
+    _tool(db, sid, "terminal", {"command": "deploy"},
+          "deployed dpl_EtykL1234567890abcdef successfully", "deploy")
+
+    needle = f"dpl_EtykL{ellipsis}"
+    result = goals.resolve_cited_evidence(sid, f"Deployment `{needle}`.")
+
+    assert result["unresolved"] == []
+    assert result["cited"][0]["needle"] == needle
+    assert "dpl_EtykL1234567890abcdef" in result["cited"][0]["excerpt"]
+
+
+@pytest.mark.parametrize("host,short", [("github.com/0xble/agents", False),
+                                         ("git.example.org/acme/repo", True)])
+def test_commit_url_matches_hash_in_tool_result_not_an_invented_url(hermes_home, host, short):
+    sid = "cite-commit-url"
+    db = _db(sid)
+    sha = "9351a5317f1e063690e0f3698677f3a832e1251a"
+    _tool(db, sid, "terminal", {"command": "git rev-parse HEAD"}, f"{sha}\n", "sha")
+    cited_hash = sha[:7] if short else sha
+    url = f"https://{host}/commit/{cited_hash}"
+
+    result = goals.resolve_cited_evidence(sid, f"Committed `{url}`.")
+
+    assert result["unresolved"] == []
+    cited = next(c for c in result["cited"] if c["needle"] == url)
+    assert any(sha in c["excerpt"] for c in result["cited"])
+    assert "matched by commit hash" in cited["excerpt"]
+    assert "URL not verified" in goals._render_cited_block(result)
+
+
+def test_fabricated_truncations_and_commit_urls_stay_unresolved(hermes_home):
+    sid = "cite-fabricated-shapes"
+    db = _db(sid)
+    _tool(db, sid, "terminal", {"command": "deploy"}, "dpl_EtykL1234567890abcdef dpl_123extra", "deploy")
+    _tool(db, sid, "terminal", {"command": "git rev-parse HEAD"},
+          "9351a5317f1e063690e0f3698677f3a832e1251a", "sha")
+    missing_id = "dpl_NoSuch123…"
+    short_id = "dpl_123…"
+    missing_url = "https://github.com/0xble/agents/commit/deadbeefcafe1234567890123456789012345678"
+    result = goals.resolve_cited_evidence(
+        sid, f"Evidence: `{missing_id}`, `{short_id}`, and `{missing_url}`.")
+
+    assert missing_id in result["unresolved"]
+    assert short_id in result["unresolved"]
+    assert missing_url in result["unresolved"]
+    assert not any(c["needle"] in (missing_id, short_id, missing_url) for c in result["cited"])
+
+
+def test_shortened_shapes_do_not_launder_bookkeeping_or_typed_user_text(hermes_home):
+    sid = "cite-shape-provenance"
+    db = _db(sid)
+    sha = "9351a5317f1e063690e0f3698677f3a832e1251a"
+    _tool(db, sid, "memory", {"action": "add"}, f"dpl_EtykL1234567890 {sha}", "mem")
+    db.append_message(sid, "user", f"[ASYNC DELEGATION BATCH COMPLETE] dpl_EtykL1234567890 {sha}")
+    url = f"https://github.com/0xble/agents/commit/{sha}"
+
+    result = goals.resolve_cited_evidence(sid, f"`dpl_EtykL…` `{url}`")
+
+    assert "dpl_EtykL…" in result["unresolved"] and url in result["unresolved"]
+    assert not any(c["needle"] in ("dpl_EtykL…", url) for c in result["cited"])
+
+
 def test_fabricated_citations_are_listed_as_unverified(hermes_home, monkeypatch):
     sid = "cite-fake"
     db = _db(sid)
