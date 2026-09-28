@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import uuid
+import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -280,13 +281,27 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         except BlockingIOError:
             return "locked"
         try:
+            from hermes_cli.config import _validate_updates
             if grace is None:
                 from hermes_cli.config_effective import load_user_config_effective
                 config = load_user_config_effective(home / "config.yaml", fail_closed=True)
-                grace = float((config.get("updates") or {}).get(
-                    "release_acknowledgement_timeout_seconds", 180.0))
-            return _run(home, Path(plist), label, grace=grace, domain=domain)
-        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+            else:
+                config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
+            updates = config.get("updates")
+            if updates is not None and not isinstance(updates, dict):
+                raise ValueError("updates must be a mapping")
+            scoped = {"updates": {"release_acknowledgement_timeout_seconds":
+                                   (updates or {}).get("release_acknowledgement_timeout_seconds", 180.0)}}
+            issues = []
+            _validate_updates(scoped, issues)
+            if issues:
+                raise ValueError("; ".join(issue.message for issue in issues))
+            if grace is None:
+                grace = (config.get("updates") or {}).get(
+                    "release_acknowledgement_timeout_seconds", 180.0)
+            assert grace is not None
+            return _run(home, Path(plist), label, grace=float(grace), domain=domain)
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, yaml.YAMLError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"
 

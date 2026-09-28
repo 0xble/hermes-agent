@@ -300,6 +300,10 @@ class UpdateConfigurationLoadError(Exception):
     """Config could not be read before updater options were resolved."""
 
 
+class UpdateConfigurationError(ValueError):
+    """The authored updates section failed validation."""
+
+
 def _updates_config() -> dict:
     """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors."""
     from hermes_cli.config import load_config, validate_config_structure
@@ -310,7 +314,7 @@ def _updates_config() -> dict:
     issues = [issue for issue in validate_config_structure({"updates": config.get("updates")})
               if issue.severity == "error"]
     if issues:
-        raise ValueError("Invalid update configuration: " + "; ".join(issue.message for issue in issues))
+        raise UpdateConfigurationError("Invalid update configuration: " + "; ".join(issue.message for issue in issues))
     section = config.get("updates", {})
     return section if isinstance(section, dict) else {}
 
@@ -1928,9 +1932,11 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 print(f"✗ {detail}")
                 _finalize_receipt("partial", "Immutable release activation failed: %s")
                 raise SystemExit(1)
-            _record_update_step("immutable_activation", True,
-                                "staged; activation deferred" if opts.no_gateway_restart else
-                                f"activated release {release.name} ({release})")
+            if opts.no_gateway_restart:
+                _record_update_skip("immutable_activation", "staged; activation deferred")
+            else:
+                _record_update_step("immutable_activation", True,
+                                    f"activated release {release.name} ({release})")
             if not opts.no_gateway_restart:
                 restart = _restart_gateway_fleet_after_update(
                     _pre_update_plan, gateway_mode, acknowledged_release_root=release)

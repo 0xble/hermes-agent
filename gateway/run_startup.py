@@ -1826,7 +1826,7 @@ class GatewayStartupMixin:
             return True
         self.delivery_router.adapters = self.adapters
         if getattr(self.config, "durable_outbox_enabled", False):
-            from gateway.outbox import Outbox, recover
+            from gateway.outbox import open_outbox, recover
             from gateway.run import _multiplex_profile_homes
             from hermes_constants import get_hermes_home
 
@@ -1837,7 +1837,7 @@ class GatewayStartupMixin:
                     destinations.append((Path(profile_home), adapters.get(Platform.TELEGRAM)))
             for home, adapter in destinations:
                 if adapter is not None:
-                    sent, held = await recover(Outbox(home), adapter)
+                    sent, held = await recover(await open_outbox(home), adapter)
                     if sent or held:
                         logger.info("Gateway outbox recovery for %s: sent=%s held=%s", home, sent, held)
         self._wire_teams_pipeline_runtime()
