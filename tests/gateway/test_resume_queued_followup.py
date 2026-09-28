@@ -91,6 +91,21 @@ def _spooled_runner(tmp_path, monkeypatch, *, pending=True, session_id="sid"):
 
 
 @pytest.mark.asyncio
+async def test_reconnect_during_drain_retains_arrival_for_boot(tmp_path, monkeypatch):
+    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch, pending=False)
+    runner._startup_restore_in_progress = False
+    runner._draining = True
+    event = MessageEvent(text="after drain", source=source, user_id="u1")
+    event._drain_deferred = True
+    assert flush_pending_to_file({key: event}, reason="drain_arrival") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    await runner._recover_spool_after_reconnect(source.platform)
+    assert spool.exists()
+    assert runner._startup_restore_queue == []
+    db.append_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["offline", "raise", "accepted"])
 async def test_claimed_spool_survives_until_replay_acceptance(tmp_path, monkeypatch, outcome):
     runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
