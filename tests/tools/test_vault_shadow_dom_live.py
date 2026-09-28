@@ -24,6 +24,19 @@ from tools.browser_use_cli import _attach_vault_supervisor
 from tools.registry import registry
 
 
+# A payment processor's card form. The parent page cannot read it across the origin boundary, so it
+# reports its own card inputs (count and whether any holds a value) through postMessage on request.
+_PROCESSOR_FRAME = b"""<!doctype html><title>processor</title><body>
+<input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc">
+<script>
+addEventListener('message', (e) => {
+  const inputs = [...document.querySelectorAll('input')];
+  e.source.postMessage({cardInputs: inputs.filter(i => i.autocomplete === 'cc-number').length,
+                        filled: inputs.some(i => i.value !== '')}, '*');
+});
+</script></body>"""
+
+
 @pytest.fixture
 def browser(tmp_path):
     executable = next((shutil.which(n) for n in ("chromium", "chromium-browser", "google-chrome")
@@ -39,7 +52,8 @@ def browser(tmp_path):
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            self.wfile.write(b"<!doctype html><title>vault regression</title><body></body>")
+            self.wfile.write(_PROCESSOR_FRAME if self.path == '/processor'
+                             else b"<!doctype html><title>vault regression</title><body></body>")
 
         def log_message(self, *args):
             pass
@@ -276,3 +290,80 @@ def test_vault_fill_finds_shadow_login_not_unrelated_first_tab(browser, aliased_
                                       'password': 'another-dummy'}, origin='https://absent.invalid')
     refusal = json.loads(registry.dispatch('browser_vault_fill', {'handle': other.id}, task_id=task))
     assert refusal['error_type'] == 'origin_mismatch'
+
+
+_TEST_CARD = {'card_number': '4111111111111111', 'cardholder_name': 'A User', 'exp_month': '7',
+              'exp_year': '2029', 'cvc': '123', 'billing_postal_code': '94110'}
+
+
+def test_card_fill_asks_only_when_a_real_page_can_take_the_card(browser, monkeypatch):
+    """Real Chrome, real cross-origin frame: the Healthchecks-shaped checkout never prompts."""
+    from agent.vault_store import get_vault_store
+
+    sup, task, origin, new_page = browser
+    shop = origin.replace('127.0.0.1', 'localhost')
+    new_page(shop + '/checkout')
+    card = get_vault_store().add_item('payment', 'synthetic card', dict(_TEST_CARD), origin=shop)
+    prompts = []
+
+    def confirm(label, page_origin):
+        prompts.append(page_origin)
+        return answer['value']
+
+    answer = {'value': True}
+    monkeypatch.setattr(vault, '_confirm_payment_fill', confirm)
+
+    def fill():
+        raw = registry.dispatch('browser_vault_fill', {'handle': card.id}, task_id=task)
+        assert '4111111111111111' not in raw and '"123"' not in raw
+        return json.loads(raw)
+
+    # Card inputs live only in a processor iframe on another origin (the page's own
+    # cardholder name and ZIP are fillable, but without a card number the fill cannot pay).
+    evaluate(sup, f"""new Promise((resolve) => {{
+      document.body.innerHTML = `<form>
+        <input autocomplete="cc-name"><input autocomplete="postal-code">
+        <iframe src="{origin}/processor"></iframe></form>`;
+      document.querySelector('iframe').onload = resolve;
+    }})""")
+
+    def processor_state():
+        # The frame's state, read across the origin boundary through its postMessage reply.
+        return evaluate(sup, """new Promise((resolve) => {
+          addEventListener('message', (e) => resolve(e.data), {once: true});
+          document.querySelector('iframe').contentWindow.postMessage('state', '*');
+        })""")
+
+    assert processor_state() == {'cardInputs': 1, 'filled': False}
+    assert fill()['error_type'] == 'no_payment_fields'
+    assert prompts == []
+    assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")
+    assert processor_state() == {'cardInputs': 1, 'filled': False}
+
+    # A declined prompt writes nothing.
+    evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
+      <input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"></form>`""")
+    answer['value'] = False
+    assert fill()['error_type'] == 'payment_declined'
+    assert prompts == [shop]
+    assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")
+
+    # Approved: exactly one prompt, and the card lands in the page's own fields.
+    answer['value'] = True
+    result = fill()
+    assert result['success'], result
+    assert prompts == [shop, shop]
+    assert evaluate(sup, "document.querySelector('[autocomplete=cc-number]').value") == '4111111111111111'
+
+    # The form is replaced while the prompt waits: the post-consent inspection finds
+    # no card target, so nothing is written to the new page.
+    def swap_then_confirm(label, page_origin):
+        prompts.append(page_origin)
+        evaluate(sup, "document.body.innerHTML = '<form><input autocomplete=\"cc-name\"></form>'")
+        return True
+
+    monkeypatch.setattr(vault, '_confirm_payment_fill', swap_then_confirm)
+    evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
+      <input autocomplete="cc-number"></form>`""")
+    assert fill()['error_type'] == 'no_payment_fields'
+    assert evaluate(sup, "document.querySelector('input').value") == ''
