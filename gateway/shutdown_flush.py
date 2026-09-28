@@ -235,28 +235,32 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
     gateways); ``None`` falls back to ``session_db``. ``deferred_followup`` may claim a resolved
     payload as a separate turn before it is appended to history. Returns the number recovered.
     """
-    def pending_order(path):
+    entries = []
+    for path in _get_flush_dir().glob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            return (payload.get("ts", 0), payload.get("session_key", ""),
-                    payload.get("seq", -1), path.name)
-        except (OSError, ValueError, TypeError, AttributeError):
-            return (0, "", -1, path.name)
-
-    flush_files = sorted(_get_flush_dir().glob("*.json"), key=pending_order)
-    if not flush_files:
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
+            order = (payload.get("ts", 0), payload.get("session_key", ""),
+                     payload.get("seq", -1), path.name)
+            # A malformed ordering key should not prevent healthy files from replaying.
+            if not isinstance(order[0], (int, float)) or not isinstance(order[1], str) or not isinstance(order[2], int):
+                raise ValueError("invalid pending-message ordering fields")
+            entries.append((order, path, payload))
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Skipping malformed pending message from %s: %s", path, exc)
+    if not entries:
         return 0
+    flush_files = sorted(entries, key=lambda entry: entry[0])
     own_db = session_db is None
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
     recovered = 0
     try:
-        for path in flush_files:
-            # One unparseable payload or rejected append must only skip THIS file: the file is
-            # never unlinked, so aborting the pass would re-poison every later boot.
+        for _order, path, payload in flush_files:
+            # One rejected append must only skip THIS file; its spool is preserved.
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":

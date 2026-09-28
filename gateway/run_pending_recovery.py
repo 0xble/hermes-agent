@@ -65,7 +65,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, 
     if runner._is_session_running(key):
         return None if drain_deferred else False
     source = runner._restored_source(entry)
-    if platform is not None and source.platform != platform:
+    if drain_deferred and platform is not None and source.platform != platform:
         return OTHER_PLATFORM_PENDING
     if not runner._resume_owner_authorized(key, source):
         return None if drain_deferred else False

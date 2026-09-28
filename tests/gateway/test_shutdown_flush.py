@@ -222,6 +222,30 @@ def test_recover_skips_failing_payload_and_continues(tmp_path, monkeypatch):
 
 
 
+def test_recover_reads_each_payload_once_and_warns_about_malformed(tmp_path, monkeypatch, caplog):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    healthy = _write_flush_file(flush_dir, "pending-good.json", "sid", "ready")
+    malformed = flush_dir / "pending-bad.json"
+    malformed.write_text("{not json", encoding="utf-8")
+    reads = {healthy: 0, malformed: 0}
+    original = Path.read_text
+
+    def counted_read(path, *args, **kwargs):
+        if path in reads:
+            reads[path] += 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read)
+    db = MagicMock()
+    with caplog.at_level("WARNING", logger="gateway.shutdown_flush"):
+        assert recover_pending_to_db(db) == 1
+    assert reads == {healthy: 1, malformed: 1}
+    assert "pending-bad.json" in caplog.text
+    assert malformed.exists() and not healthy.exists()
+    db.append_message.assert_called_once()
+
+
 def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
     """Flush dir must use get_hermes_home(), not hardcoded Path.home()."""
     import gateway.shutdown_flush as mod

@@ -1,6 +1,8 @@
 """Gateway drain admission remains silent and its pending turns survive shutdown."""
 
+import asyncio
 from datetime import datetime
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -182,6 +184,143 @@ async def test_idle_quick_command_drain_gate_queues_without_notice():
     assert await runner._hm_dispatch_quick_and_plugin_commands(event, source, "custom") == (True, None, "custom")
     assert adapter.sent == []
     assert adapter._pending_messages[runner._session_key_for_source(source)] is event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,busy", [
+    ("new turn", False), ("/custom", False), ("busy arrival", True),
+])
+async def test_adapter_drain_preserves_one_turn_without_reentering_handler(
+    text, busy, tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    runner._draining = True
+    if text == "/custom":
+        # Drain starts after admission, before quick/plugin dispatch: this
+        # exercises the second idle drain gate through the adapter task.
+        async def admit(event):
+            runner._draining = False
+            return event, source, False
+
+        async def resolve(_event, _source, _key):
+            runner._draining = True
+            return False, None, "custom", "custom"
+
+        runner._hm_admit_event = admit
+        runner._hm_resolve_command = resolve
+        runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+        runner._hm_evict_idle_stale_agent = lambda _key: None
+        runner._is_session_running = lambda _key: False
+        runner._hm_estop_gate = lambda *_args: None
+        runner._quick_command_alias_text = lambda _event: None
+        runner._hm_dispatch_canonical_command = AsyncMock(return_value=(False, None))
+    else:
+        runner._hm_admit_event = AsyncMock(side_effect=lambda event: (event, source, False))
+    runner._session_state = lambda _key: SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
+    runner._peek_session_state = runner._session_state
+    calls = []
+
+    async def handle(event):
+        calls.append(event.text)
+        return await runner._handle_admitted_message(event)
+
+    adapter.set_message_handler(handle)
+    busy_calls = []
+    original_busy_handler = adapter._busy_session_handler
+
+    async def busy_handler(event, session_key):
+        busy_calls.append(event.text)
+        return await original_busy_handler(event, session_key)
+
+    adapter.set_busy_session_handler(busy_handler)
+    event = MessageEvent(text=text, source=source, user_id="u1")
+    if busy:
+        # A live adapter task owns the guard; the new event takes the busy path.
+        active = asyncio.Event()
+        entered = asyncio.Event()
+        original_handler = adapter._message_handler
+
+        async def active_handler(first):
+            entered.set()
+            await active.wait()
+            return None
+
+        adapter.set_message_handler(active_handler)
+        await adapter.handle_message(MessageEvent(text="existing turn", source=source, user_id="u1"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        adapter.set_message_handler(original_handler)
+    await adapter.handle_message(event)
+    if busy:
+        assert calls == []
+        active.set()
+    # The active task must settle without spawning another one.
+    for _ in range(300):
+        if key not in adapter._session_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert calls == ([] if busy else [text])
+    assert busy_calls == ([text] if busy else [])
+    assert key not in adapter._session_tasks
+    assert adapter.sent == []
+    assert adapter._pending_messages[key].text == text
+    assert flush_pending_to_file(dict(adapter._pending_messages)) == 1
+
+    now = datetime.now()
+    runner.session_store._lock = MagicMock()
+    runner.session_store._ensure_loaded_locked = lambda: None
+    runner.session_store._entries[key] = SessionEntry(
+        session_key=key, session_id="sid", created_at=now, updated_at=now, origin=source,
+    )
+    runner._is_session_running = lambda _key: False
+    runner._restored_source = lambda entry: entry.origin
+    runner._resume_owner_authorized = lambda *_args: True
+    runner._startup_restore_queue = []
+    db = MagicMock()
+    spool = next((tmp_path / "pending_messages").glob("*.json"))
+    recover = partial(
+        recover_pending_to_db, db, session_resolver=lambda *_a, **_kw: ("sid", db),
+        deferred_followup=partial(_defer_for_test, runner),
+    )
+    assert recover() == 1
+    assert recover() == 0
+    assert [e.text for e in runner._startup_restore_queue] == [text]
+    assert spool.exists()
+    assert adapter.sent == []
+    db.append_message.assert_not_called()
+
+
+def _defer_for_test(runner, key, sid, data, path):
+    from gateway.run_pending_recovery import _defer_followup
+    return _defer_followup(runner, {}, None, key, sid, data, path)
+
+
+def test_non_drain_followup_platform_mismatch_can_fall_back_to_history(tmp_path):
+    from gateway.config import Platform
+    from gateway.run_pending_recovery import _defer_followup
+
+    runner, _adapter = make_restart_runner()
+    key = runner._session_key_for_source(make_restart_source())
+    source = make_restart_source()
+    source_for_entry = source.__class__(platform=Platform.SLACK, chat_id=source.chat_id,
+                                         chat_type=source.chat_type, user_id=source.user_id)
+    entry = SessionEntry(session_key=key, session_id="sid", created_at=datetime.now(),
+                         updated_at=datetime.now(), origin=source_for_entry, resume_pending=True)
+    runner.session_store._lock = MagicMock()
+    runner.session_store._ensure_loaded_locked = lambda: None
+    runner.session_store._entries[key] = entry
+    runner._is_session_running = lambda _key: False
+    runner._restored_source = lambda _entry: source
+    runner._resume_owner_authorized = lambda *_args: True
+    runner._auto_resume_ready = lambda *_args, **_kw: (_adapter, source)
+    runner._startup_restore_queue = []
+    assert _defer_followup(runner, {key: entry}, Platform.SLACK, key, "sid",
+                           {"text": "ordinary followup", "source_user_id": "u1"},
+                           tmp_path / "ordinary.json") is True
+    assert [event.text for event in runner._startup_restore_queue] == ["ordinary followup"]
 
 
 @pytest.mark.asyncio
