@@ -8,8 +8,9 @@ here so ``--preview`` / ``--aggressive`` and the lock-skip wording cannot drift 
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 #: Every surface renders the same refusal; hard truncation has no persistence path outside the guarded
 #: ``_compress_context`` rotation, so ``--aggressive`` is refused rather than mis-parsed as a focus topic.
@@ -27,6 +28,42 @@ class CompressRequest:
     partial: bool = False
     keep_last: int = 2
     focus_topic: Optional[str] = None
+    level: int = 1  # ``--level N``: 1 = configured retention, higher levels keep less verbatim
+
+
+#: Per-level ``(tail token budget as a fraction of the configured one, summary token ceiling)``. Level 1 is
+#: absent: it runs the configured compressor untouched. Level 3's zero budget leaves only the anchors
+#: ``_find_tail_cut_by_tokens`` always keeps: the latest user request and the latest reply.
+_LEVEL_OVERRIDES = {2: (0.25, 5_000), 3: (0.0, 2_000)}
+#: Recent messages whose tool results a tightened run still leaves unpruned.
+_LEVEL_PROTECT_LAST_N = 2
+
+
+@contextlib.contextmanager
+def compression_level(compressor: Any, level: int) -> Iterator[None]:
+    """Tighten ``compressor``'s verbatim tail and summary ceiling for one manual run, then restore them.
+
+    Only the built-in ``ContextCompressor`` has these knobs; a plugin context engine keeps its own policy
+    and ``--level`` is a no-op there."""
+    from agent.context_compressor import ContextCompressor
+
+    override = _LEVEL_OVERRIDES.get(level)
+    if override is None or not isinstance(compressor, ContextCompressor):
+        yield
+        return
+    tail_scale, summary_cap = override
+    protect_last_n, min_tail_users = compressor.protect_last_n, compressor.min_tail_user_messages
+    try:
+        compressor.tail_token_budget = max(1, int(compressor.tail_token_budget * tail_scale))
+        compressor.max_summary_tokens = min(compressor.max_summary_tokens, summary_cap)
+        compressor.protect_last_n = min(protect_last_n, _LEVEL_PROTECT_LAST_N)
+        compressor.min_tail_user_messages = 1
+        yield
+    finally:
+        # The two budgets are derived from the model window and may be re-derived mid-run (aux-context
+        # ceiling, model update), so they are cleared back to lazy rather than restored from a stale copy.
+        compressor._tail_token_budget = compressor._max_summary_tokens = None
+        compressor.protect_last_n, compressor.min_tail_user_messages = protect_last_n, min_tail_users
 
 
 @dataclass
@@ -48,11 +85,13 @@ class CompressResult:
 
 def parse_compress_args(raw_args: str) -> CompressRequest:
     """One parser for every surface: flags anywhere, then the boundary-aware / focus positional forms."""
-    from hermes_cli.partial_compress import extract_compress_flags, parse_partial_compress_args
+    from hermes_cli.partial_compress import (
+        extract_compress_flags, extract_compress_level, parse_partial_compress_args)
     rest, preview, aggressive = extract_compress_flags((raw_args or "").strip())
+    rest, level = extract_compress_level(rest)
     partial, keep_last, focus_topic = parse_partial_compress_args(rest)
     return CompressRequest(preview=preview, aggressive=aggressive, partial=partial, keep_last=keep_last,
-                           focus_topic=focus_topic or None)
+                           focus_topic=focus_topic or None, level=level)
 
 
 def estimate_request_tokens(agent: Any, messages: Sequence[Dict[str, Any]]) -> int:
@@ -83,11 +122,8 @@ def compress_now(
     ``_compress_context`` still does useful work there — codex_app_server native compaction, and the
     phase-1 tool-result prune / blank-echo drop that ``ContextCompressor.compress`` commits even when no
     summary window exists."""
-    from agent.context_compressor import _DB_PERSISTED_MARKER, _fresh_compaction_message_copy
-    from agent.conversation_compression import finalize_context_engine_compression_notification
-    from agent.manual_compression_feedback import summarize_manual_compression
     from hermes_cli.partial_compress import (
-        rejoin_compressed_head_and_tail, split_history_for_partial_compress, summarize_compress_preview)
+        MAX_COMPRESS_LEVEL, split_history_for_partial_compress, summarize_compress_preview)
 
     before = list(history)
     before_tokens = estimate_request_tokens(agent, before)
@@ -97,8 +133,33 @@ def compress_now(
         if not tail:  # degenerate split: nothing to keep verbatim → full compression
             head = before
     if request.preview:
-        report = summarize_compress_preview(before, request.partial, request.keep_last, request.focus_topic, before_tokens)
+        report = summarize_compress_preview(before, request.partial, request.keep_last, request.focus_topic, before_tokens,
+                                            level=request.level)
         return CompressResult("preview", before, before, before_tokens, before_tokens, request, lines=report["lines"])
+
+    compressor = getattr(agent, "context_compressor", None)
+    # ``here N`` already chose what stays verbatim, so the head is summarized at the tightest level: only the
+    # head's own latest exchange rides along, which the compressor keeps so a real user turn follows the summary.
+    level = MAX_COMPRESS_LEVEL if tail else request.level
+    if level > 1 and getattr(agent, "_compression_feasibility_checked", True) is False:
+        # The first attempt's lazy aux-feasibility probe may recalibrate the retention budgets, which would
+        # silently discard the per-run override, so the probe runs before the override is applied.
+        from agent.conversation_compression import check_compression_model_feasibility
+        check_compression_model_feasibility(agent)
+        agent._compression_feasibility_checked = True
+    with compression_level(compressor, level):
+        return _compress_head(agent, before, head, tail, before_tokens, request, system_message=system_message,
+                              task_id=task_id, skip_without_window=skip_without_window)
+
+
+def _compress_head(
+    agent: Any, before: List[Dict[str, Any]], head: List[Dict[str, Any]], tail: List[Dict[str, Any]],
+    before_tokens: int, request: CompressRequest, *, system_message: Any, task_id: str, skip_without_window: bool,
+) -> CompressResult:
+    from agent.context_compressor import _DB_PERSISTED_MARKER, _fresh_compaction_message_copy
+    from agent.conversation_compression import finalize_context_engine_compression_notification
+    from agent.manual_compression_feedback import summarize_manual_compression
+    from hermes_cli.partial_compress import rejoin_compressed_head_and_tail
 
     compressor = getattr(agent, "context_compressor", None)
     has_content = getattr(compressor, "has_content_to_compress", None)
