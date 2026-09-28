@@ -2,7 +2,7 @@
 
 Patch identity: `seamless-restart`.
 
-> **Status (2026-09-27):** S1–S3 shipped on fork `main` and run live on this Mac; S4 is not started. See [Shipped Status](#shipped-status). Later changes still follow repository policy, specialist instructions, verification, review, and delivery requirements.
+> **Status (2026-09-28):** S1–S3, the H1 hardening fixes, the S4.1 durable outbox and the G1 guardian shipped on fork `main` and run live on this Mac. S4 stopped at S4.1: the router/executor split (S4.2) and version handover (S4.3) were not built, so restarts remain drain-first. See [Shipped Status](#shipped-status) and [S4 Stop Decision](#s4-stop-decision). Later changes still follow repository policy, specialist instructions, verification, review, and delivery requirements.
 
 **Goal:** Promote a new Hermes gateway release without interrupting active cron executions or in-flight conversations, while making failure and rollback observable.
 
@@ -40,11 +40,11 @@ Likely surfaces: `cron/executions.py`, `cron/scheduler.py`, `cron/delivery_queue
 
 ## S4: Router And Per-Release Executors
 
-**Dependency:** S3. **Status:** Design, not an implemented handoff. S2 still reloads the monolithic gateway. The split is opt-in (`gateway.router_executor.enabled: false` by default), per profile and transport. An unsupported adapter stays on the existing monolithic route; it must never accidentally share a polling token with a router. The first implementation targets Telegram. Keep the global invariants above, especially one admitted owner, no automatic retry of an interrupted execution, and prompt-cache stability.
+**Dependency:** S3. **Status:** Stopped at S4.1 on 2026-09-27 (see [S4 Stop Decision](#s4-stop-decision)). S4.1 shipped. The S4.2 and S4.3 design below is kept for reference, not as an implemented handoff. S2 still reloads the monolithic gateway. The split is opt-in (`gateway.router_executor.enabled: false` by default), per profile and transport. An unsupported adapter stays on the existing monolithic route; it must never accidentally share a polling token with a router. The first implementation targets Telegram. Keep the global invariants above, especially one admitted owner, no automatic retry of an interrupted execution, and prompt-cache stability.
 
 ### Seven-Day Baseline
 
-Measured 2026-09-20 15:56 through 2026-09-27 15:56 PDT. The analysis script is local scratch at `~/.hermes/cache/scratch/seamless/p2/s4-baseline.py`, not a repository evidence artifact (there is no `maintenance/evidence/` convention). It reads all `gateway.log*` rotations, update receipts, `state.db` in SQLite `mode=ro` with a five-second busy timeout, and delegation `live/*/manifest.json`. Dates below are local. A replacement is a `Gateway running with` boot, deduplicated across rotation boundaries; a receipt or planned-stop/request marker within the stop/boot window calls it planned. Others are **unclassified**, not proven crashes. Assistant interruption markers within 120 seconds of a logged stop are temporal proxies, not causal attribution; all markers include unrelated model interruptions. Delegation counts are shutdown log counts, not deduplicated task identities. Manifests independently reported 242 interrupted tasks grouped by batch start date, which cannot be assigned reliably to a particular stop. The live data can change between reads.
+Measured 2026-09-20 15:56 through 2026-09-27 15:56 PDT. The analysis script is local evidence at `~/.hermes/cache/seamless-p2-evidence/s4-baseline.py` (scratch copies are pruned), not a repository evidence artifact (there is no `maintenance/evidence/` convention). It reads all `gateway.log*` rotations, update receipts, `state.db` in SQLite `mode=ro` with a five-second busy timeout, and delegation `live/*/manifest.json`. Dates below are local. A replacement is a `Gateway running with` boot, deduplicated across rotation boundaries; a receipt or planned-stop/request marker within the stop/boot window calls it planned. Others are **unclassified**, not proven crashes. Assistant interruption markers within 120 seconds of a logged stop are temporal proxies, not causal attribution; all markers include unrelated model interruptions. Delegation counts are shutdown log counts, not deduplicated task identities. Manifests independently reported 242 interrupted tasks grouped by batch start date, which cannot be assigned reliably to a particular stop. The live data can change between reads.
 
 | Date | Planned boots | Other boots | Near-stop turn markers | Shutdown delegation count |
 |---|---:|---:|---:|---:|
@@ -127,17 +127,74 @@ Every row merged with an independent `review_candidate` approval on its exact he
 | Synthetic reply anchors (restart replay) | [#202](https://github.com/0xble/hermes-agent/pull/202) | `ceabe38a5a` |
 | S2: immutable releases and rollback | [#192](https://github.com/0xble/hermes-agent/pull/192) | `d64abc4778` |
 | S2: one reload per release switch | [#211](https://github.com/0xble/hermes-agent/pull/211) | `784396c5ec` |
+| S4 design and 7-day baseline | [#213](https://github.com/0xble/hermes-agent/pull/213) | `2748219c1e` |
+| H1: update receipt order, pointer, config | [#217](https://github.com/0xble/hermes-agent/pull/217) | `6e7f26c95c` |
+| H1: manual cron outcome and delivery | [#216](https://github.com/0xble/hermes-agent/pull/216) | `24bb7b9256` |
+| H1: bounded manual-run recovery | [#221](https://github.com/0xble/hermes-agent/pull/221) | `f368d1e772` |
+| S4.1: durable outbox and admissions | [#218](https://github.com/0xble/hermes-agent/pull/218) | `6b2138ed2e` |
+| G1: guardian launchd job | [#219](https://github.com/0xble/hermes-agent/pull/219) | `d6e1738b37` |
+| G1: grace from config, stale status | [#225](https://github.com/0xble/hermes-agent/pull/225) | `c3ab78c94d` |
+| S4.1: egress off loop, retention | [#226](https://github.com/0xble/hermes-agent/pull/226) | `fbef2e6be3` |
+| H1: update config errors | [#220](https://github.com/0xble/hermes-agent/pull/220) | `b633a3532c` |
+| H1: resumed turn reply attribution | [#214](https://github.com/0xble/hermes-agent/pull/214) | `96f6a8eb2f` |
+| Part 2 review follow-ups | [#228](https://github.com/0xble/hermes-agent/pull/228) | `f7d27da20d` |
+
+Drafts [#215](https://github.com/0xble/hermes-agent/pull/215) (S4.2 spike) and [#224](https://github.com/0xble/hermes-agent/pull/224) (S4.2 rerun spike) were closed unmerged.
 
 S3 landed before S2 (its code-SHA ledger column works without releases). S2 is **opt-in** with `updates.immutable_releases: true` and macOS launchd only; its runbook, state table and qualification contract live in [seamless-restart-s2.md](seamless-restart-s2.md). One shared observe-only wait (`wait_for_release_acknowledgement`, `updates.release_acknowledgement_timeout_seconds`, default 180) completes every switch, rollback, pending-switch finish and service repair only after the new gateway acknowledges from the intended release. Each switch reloads launchd exactly once: the fleet step credits the acknowledged gateway instead of relaunching it. Disposable rehearsals with real launchd jobs and every `launchctl` call captured proved first migration, release→release, rollback, first-migration rollback, timeout recovery, repeated rollback and repair.
 
 **Live on this Mac (2026-09-27).** Config: `platforms.telegram.extra.drop_pending_on_cold_boot: false`, `platforms.telegram.gateway_restart_notification: false`, `updates.immutable_releases: true`. Promotion took two updates: the pre-S2 updater pulled `784396c5ec` into the source checkout, then the S2 updater's no-pull reconciliation performed the first migration (receipt `update_20260927_151424_22786.json`): `current` → `releases/784396c5…`, `previous` → the source checkout, launchd `ProgramArguments`/`WorkingDirectory` through `current`, one reload, gateway acknowledgement recorded in `release-last-txn.json`. A controlled restart afterwards showed: a 240 s cron probe started before the restart kept running under its pinned release interpreter and completed once with `code_sha` and one delivery; a Telegram message sent while the old gateway was down was answered after boot; a follow-up queued behind an active turn was preserved and replayed; per-chat and home-channel notices were suppressed; teardown took 2.3 s against `ExitTimeOut` 60 with the pending-message flush recovered on boot.
 
+**Part 2 live on this Mac (2026-09-27/28).**
+- **Promotion to `96f6a8eb2f`:** ran `hermes update` from 23:53 to 23:55 PT.
+  - The receipt is `update_20260927_235526_59534.json`.
+  - Its steps, in order: `pre_update_backup`, `immutable_maintenance`, `immutable_release`, `immutable_activation`, `release_retention`, and outcome `success`.
+  - `current` points to `releases/96f6a8eb…` and `previous` to `releases/ed54722316…`. The gateway acknowledged from the new release.
+  - A pinned cron worker started under `ed54722` kept running through the reload and completed once.
+  - One session interrupted by the reload was auto-resumed, and its answer was delivered to its original topic.
+- **Outbox:** `gateway.durable_outbox.enabled: true` has been live since 23:57. `gateway-outbox.db` records inbound admissions and outbound sends. The first reply recorded one attempt, the Telegram message id, `delivered`, and no duplicate idempotency key.
+- **Second promotion, to `f7d27da20d` (#228):** ran 00:51–00:53 PT on 2026-09-28. `current` points to `releases/f7d27da…` and `previous` to `releases/96f6a8eb…`, so both retained releases contain G1.
+- **Guardian:** `gateway.guardian.enabled: true`. Installed with the release CLI (`~/.hermes/current/.venv/bin/hermes gateway guardian install`), not the source-checkout `hermes` shim, which predates G1.
+  - `ai.hermes.gateway-guardian` is loaded in `gui/501` with `StartInterval` 30 and `RunAtLoad`, and pins `current/.venv/bin/python`.
+  - Its first seven runs each printed `healthy`, exited 0, and wrote no stderr and no repair receipts.
+  - The item-7 E2E ran at `f7d27da20d` against real launchd with disposable labels (`test_gateway_guardian_launchd_real.py`, 36 passed together with the guardian unit tests):
+    - an unloaded service was re-bootstrapped within 60 s;
+    - the stop marker was honoured;
+    - an unacknowledged switch rolled back to the verified `previous` release;
+    - no labels were left behind.
+  - The production gateway was not deliberately unloaded, because doing that would cut every in-flight turn to prove a path the disposable run already covers.
+- **H1 evidence:**
+  - Receipt ordering and resumed-reply attribution were observed live.
+  - The pointer and config validation were reproduced in a disposable `HERMES_HOME` with the release interpreter.
+  - The error-surface, manual-cron, double-fork and commit/enqueue-gap items are covered by named regression tests: 30 passed at `96f6a8eb2f`. No live trigger occurred for them.
+
 **Remaining risks.**
 
-- An in-flight chat turn is still interrupted by a restart (`restart_drain_timeout: 0`); it auto-resumes with a restart note, but its tool call is not retried. Background delegations of that gateway are interrupted too. Removing this is S4.
-- An unloaded or corrupted launchd service after a failed switch needs operator inspection when the opt-in G1 guardian is disabled, capped, or unable to prove the current and previous release identities. A corrupt `current` pointer can make `get_python_path()` fall back to the source venv; G1 explicitly refuses that fallback.
-- In a rare no-pull catch-up where checkout repair is incomplete, the receipt can read `success` while the command exits 1 (review finding on #211). `release-last-txn.json` persists, so a repeatedly failing fleet verification on the credited label never falls back to a relaunch; `hermes gateway restart` remains the remedy.
-- Manually stopped cron runs still record a misleading "scheduler restarted" `unknown`, and manual runs are not kill-protected. A double-forked descendant that escapes the worker session is not swept, and a kill between ledger commit and delivery enqueue leaves `unknown` with no resend.
-- The full unscoped update path can only be proven live; disposable rehearsals cover it with throwaway launchd labels.
+- **Restarts stay drain-first.** An in-flight chat turn or background delegation running during a restart or update is still cut, because `restart_drain_timeout: 0`.
+  - A cut chat turn auto-resumes with a restart note, and its answer lands in the original topic. The interrupted tool call is not retried.
+  - Detached cron workers are not cut, because they are pinned to their release.
+  - Removing this cost required S4.2/S4.3, which stopped (see [S4 Stop Decision](#s4-stop-decision)).
+- **Send outcome is uncertain after a crash.** The outbox holds any send whose outcome is unknown and never resends it. A crash between the platform accepting a message and the receipt commit can therefore leave a reply unconfirmed in the outbox while the user did receive it. A refused connection is treated as definitely unsent. Missing platform ids get random ids, and a multi-part send shares one record.
+- **The guardian never force-repairs.** It leaves a loaded-but-unhealthy gateway alone, stops after three repairs per hour, and treats a wedged heartbeat older than 120 s as unhealthy. It never repairs a corrupt `current` pointer from the source checkout.
+- **Some hardening paths have only test evidence.** The manual-run kill, double-fork sweep and commit/enqueue-gap paths have regression tests but no live trigger yet.
+- **The full unscoped update path can only be proven live.** Disposable rehearsals cover it with throwaway launchd labels.
 
-**Next.** Decide S4 after measuring post-promotion interruptions: the remaining user-visible cost of a restart is the interrupted in-flight turn or delegation.
+## S4 Stop Decision
+
+On 2026-09-27, two disposable-profile spikes tested whether a router/executor split could meet the S4 acceptance bar on top of S4.1: real delegation, approval routing, streaming across a router replacement, two pinned releases, one Telegram poller, and zero duplicate sends.
+
+- **First spike (draft #215): STOP.** A toy prototype proved only a subset of the bar and exposed a duplicate-send window.
+- **Rerun (draft #224): STOP on all seven required proofs.**
+  - The only component proof that passed: 20 randomized SIGKILLs between provider acceptance and outbox receipt were all held as ambiguous, with 0 duplicates.
+  - Real turns, delegations, approvals, busy-guard queueing, streaming resume and an actual router `getUpdates` loop were never exercised across a process boundary.
+  - The invasiveness estimate (25–40 production files) stood.
+
+Brian chose to stop S4 at S4.1. S4.2 (executor process) and S4.3 (version handover) were not built, and the router/executor acceptance items were descoped. What shipped instead is listed above:
+- H1 hardening;
+- the S4.1 durable outbox, live;
+- the G1 guardian;
+- resumed-turn attribution for restart-cut sessions.
+
+The design above stays as reference. Resuming it needs a new spike that passes all seven native proofs, not the component proof alone. The two-gateway overlap is not a safe fallback until it proves the same token, ownership and receipt invariants.
+
+**Next.** Revisit S4 only if restart-cut turns or delegations become a measurable cost. To measure it, rerun the seven-day baseline above over `gateway.log` and `state.db` after a normal week of updates.
