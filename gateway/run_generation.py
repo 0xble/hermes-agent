@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 from contextlib import suppress
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+
+from gateway.control_socket import GatewayControlServer
 
 from gateway.generation import (
     GenerationCoordinator,
@@ -48,6 +51,38 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
     return active
 
 
+class GenerationControlServer(GatewayControlServer):
+    """Generation-scoped control endpoint that never touches legacy paths."""
+
+    def __init__(self, home: Path, socket_path: Path) -> None:
+        super().__init__(home)
+        self._generation_socket_path = socket_path
+
+    async def _start_posix(self) -> bool:
+        bind_path = self._generation_socket_path
+        bind_path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            if bind_path.exists():
+                bind_path.unlink()
+        old_umask = os.umask(0o177)
+        try:
+            self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path))
+        finally:
+            os.umask(old_umask)
+        os.chmod(bind_path, 0o600)
+        self._bind_path = bind_path
+        return True
+
+    async def stop(self) -> None:
+        # The base cleanup unlinks unconditionally. Retain the bind path for an
+        # inode-fenced unlink by ActiveGeneration.close instead.
+        self._bind_path = None
+        await super().stop()
+
+    async def _start_windows(self) -> bool:
+        return False
+
+
 class ActiveGeneration:
     """Generation-scoped identity and heartbeat alongside the existing active dispatcher."""
 
@@ -55,39 +90,40 @@ class ActiveGeneration:
                  identity: GenerationIdentity, epoch: int):
         self.home, self.coordinator, self.identity, self.epoch = home, coordinator, identity, epoch
         self.paths = generation_paths(home, identity)
-        self.server: asyncio.AbstractServer | None = None
+        self.server: GatewayControlServer | None = None
         self.task: asyncio.Task | None = None
         self.socket_stat = None
 
     async def start(self) -> None:
-        import json
         for name in ("pid", "host"):
             write_generation_record(self.paths[name], self.identity, state="serving")
         socket_path = self.paths["socket"]
         if len(os.fsencode(socket_path)) >= 100:
             raise RuntimeError("generation control socket path exceeds UNIX socket limit")
-
-        async def identify(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            writer.write((json.dumps({"generation_id": self.identity.id, "state": "ready",
-                                     "release_sha": self.identity.release_sha,
-                                     "lease_epoch": self.epoch}) + "\n").encode())
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-
-        self.server = await asyncio.start_unix_server(identify, path=str(socket_path))
-        self.socket_stat = socket_path.stat()
-        write_generation_record(self.paths["state"], self.identity, state="serving", socket_path=socket_path)
+        self.server = GenerationControlServer(self.home, self.paths["socket"])
+        await self.server.start()
+        self.socket_stat = self.paths["socket"].stat()
+        write_generation_record(self.paths["state"], self.identity, state="serving", socket_path=self.paths["socket"])
         self.task = asyncio.create_task(self._heartbeat())
 
     def mark_ready(self) -> None:
-        write_generation_record(self.paths["state"], self.identity, state="ready",
-                                socket_path=self.paths["socket"])
+        self._sync_runtime_status()
         self.coordinator.heartbeat(self.identity.id, state="ready")
+
+    def _sync_runtime_status(self) -> None:
+        from gateway.status import read_runtime_status
+        runtime = read_runtime_status(self.home / "gateway_state.json") or {}
+        # The singleton PID and lease both belong to this process before it may
+        # project the compatibility status to the generation-scoped record.
+        if runtime.get("pid") != self.identity.pid:
+            runtime = {}
+        write_generation_record(self.paths["state"], self.identity, state="ready",
+                                socket_path=self.paths["socket"], runtime=runtime)
 
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(1)
+            self._sync_runtime_status()
             self.coordinator.heartbeat(self.identity.id)
 
     async def close(self) -> None:
@@ -96,8 +132,7 @@ class ActiveGeneration:
             with suppress(asyncio.CancelledError):
                 await self.task
         if self.server:
-            self.server.close()
-            await self.server.wait_closed()
+            await self.server.stop()
         if self.socket_stat:
             with suppress(FileNotFoundError):
                 current = self.paths["socket"].stat()

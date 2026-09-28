@@ -42,6 +42,7 @@ def test_active_and_passive_generations_use_distinct_records(request):
     domain = f"gui/{os.getuid()}"
     labels = [f"ai.hermes.p3test-{uuid.uuid4().hex}" for _ in range(2)]
     plists = []
+    bound_sockets: list[Path] = []
     for label in labels:
         plist = tmp_path / f"{label}.plist"
         plist.write_bytes(plistlib.dumps({
@@ -95,6 +96,18 @@ def test_active_and_passive_generations_use_distinct_records(request):
         assert active["label"] == labels[0]
         standby = next(row for row in rows if not row["leases"])
         assert standby["label"] == labels[1]
+        assert active["leases"][0].startswith("active_generation@")
+        from gateway.control_socket import CONTROL_PROTOCOL_VERSION
+        import socket
+        active_state = json.loads((home / f"gateway_state.{active['id']}.json").read_text())
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(3)
+            sock.connect(active_state["socket_path"])
+            sock.sendall(b'{"id":1,"verb":"identify","protocol":1}\n')
+            answer = json.loads(sock.makefile("rb").readline())
+        assert answer["ok"] is True
+        assert answer["protocol"] == CONTROL_PROTOCOL_VERSION
+        assert answer["result"]["pid"] == active["pid"]
         for row in rows:
             suffix = row["id"]
             assert (home / f"gateway.{suffix}.pid").is_file()
@@ -102,6 +115,7 @@ def test_active_and_passive_generations_use_distinct_records(request):
             state = json.loads((home / f"gateway_state.{suffix}.json").read_text())
             assert state["state"] == "ready"
             assert Path(state["socket_path"]).exists()
+            bound_sockets.append(Path(state["socket_path"]))
         status = subprocess.run(
             [str(python), "-m", "hermes_cli.main", "gateway", "status"],
             cwd=repository, env={**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(repository),
@@ -128,4 +142,5 @@ def test_active_and_passive_generations_use_distinct_records(request):
             time.sleep(.2)
         assert not list(home.glob("gateway.*.pid"))
         assert not list(home.glob("gateway_state.*.json"))
+        assert not any(path.exists() for path in bound_sockets)
         assert not read_generation_status(home)[0]["leases"]

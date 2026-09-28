@@ -182,8 +182,10 @@ def generation_paths(home: Path, identity: GenerationIdentity) -> dict[str, Path
 
 
 def write_generation_record(path: Path, identity: GenerationIdentity, *, state: str = "standby",
-                            socket_path: Path | None = None) -> None:
-    payload = identity.as_record(state=state)
+                            socket_path: Path | None = None,
+                            runtime: dict[str, Any] | None = None) -> None:
+    payload = dict(runtime or {})
+    payload.update(identity.as_record(state=state))
     if socket_path is not None:
         payload["socket_path"] = str(socket_path)
     path.parent.mkdir(parents=True, exist_ok=True)
