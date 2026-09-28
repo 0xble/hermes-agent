@@ -119,8 +119,10 @@ the browser vault fill tool, or the 1Password backends.
   filtering while preserving unbound cards), and
   `vault-payment-consent-order` (own fork fix, 2026-09-28: prompt only once card targets are
   found, then re-inspect after consent). `vault-card-redaction-scope` (own fork fix,
-  2026-09-28: use the existing tab/origin component registry for low-entropy card values;
-  PAN/CVC remain global). At inspected `upstream/main` (`226eeeb4c21ca6d9fb3880bf6aa3b9093f69530a`), upstream's vault fill registers every
+  2026-09-28: keep low-entropy card values in a separately bounded tab/origin
+  registry, independent of protected-birthday markers and components; PAN/CVC
+  remain global). At inspected `upstream/main`
+  (`226eeeb4c21ca6d9fb3880bf6aa3b9093f69530a`), upstream's vault fill registers every
   card secret through `register_vault_redaction_value`, and its `agent/redact.py` replaces
   each registered value as an unbounded substring across model-facing output; it has no
   scoped card equivalent. No matching issue or PR in the upstream `vault card redaction`

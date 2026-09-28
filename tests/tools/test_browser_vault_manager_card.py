@@ -145,6 +145,55 @@ def test_card_fill_scopes_low_entropy_values_but_not_pan_or_cvc(monkeypatch):
         redact.clear_vault_redaction_values()
 
 
+def test_card_registrations_cannot_evict_birthday_quarantine():
+    from agent import redact
+    tab, origin = "mixed-vault-tab", "https://checkout.test"
+    redact.mark_vault_protected_tab(tab, origin)
+    redact.register_vault_date_component("bday-year", "1984", tab=tab, origin=origin)
+    try:
+        for index in range(64):
+            redact.register_vault_card_component(
+                "cardholder_name", f"Cardholder {index}", tab=tab, origin=origin,
+            )
+        assert redact.has_vault_date_components(tab)
+        assert redact.has_any_vault_date_components()
+        assert redact.redact_registered_vault_values("born 1984", tab=tab, origin="https://other.test") == (
+            "born «redacted-vault-secret»"
+        )
+    finally:
+        redact.clear_vault_date_components(tab)
+
+
+def test_card_registration_cannot_mask_empty_protected_marker():
+    from agent import redact
+    tab, origin = "marked-vault-tab", "https://checkout.test"
+    redact.mark_vault_protected_tab(tab, origin)
+    try:
+        redact.register_vault_card_component("exp_year", "2029", tab=tab, origin=origin)
+        assert redact.has_vault_date_components(tab)
+        assert redact.has_any_vault_date_components()
+    finally:
+        redact.clear_vault_date_components(tab)
+
+
+def test_card_only_scope_redacts_only_on_filled_origin_without_birthday_quarantine():
+    from agent import redact
+    tab, origin = "card-only-vault-tab", "https://checkout.test"
+    redact.register_vault_card_component("cardholder_name", "Synthetic Cardholder", tab=tab, origin=origin)
+    try:
+        assert redact.has_vault_scoped_components(tab)
+        assert not redact.has_vault_date_components(tab)
+        assert not redact.has_any_vault_date_components()
+        assert redact.redact_registered_vault_values("Synthetic Cardholder", tab=tab, origin=origin) == (
+            "«redacted-vault-secret»"
+        )
+        assert redact.redact_registered_vault_values("Synthetic Cardholder", tab=tab, origin="https://other.test") == (
+            "Synthetic Cardholder"
+        )
+    finally:
+        redact.clear_vault_date_components(tab)
+
+
 def test_manager_card_uses_the_focused_checkout_tab_over_the_default_page():
     from agent import redact
     try:
