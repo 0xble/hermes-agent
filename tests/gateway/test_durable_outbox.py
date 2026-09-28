@@ -5,13 +5,15 @@ import contextlib
 import multiprocessing as mp
 import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from gateway.outbox import Outbox, active_turn, bind_turn, clear_turn, recover
+from gateway.outbox import Outbox, active_turn, bind_turn, clear_turn, recover, _uncertain
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -354,10 +356,12 @@ async def test_flood_wait_retries_once_without_a_second_final(tmp_path):
 async def test_final_retry_does_not_compete_with_inline_retry(tmp_path):
     sends = []
     adapter = _fake_adapter(True, sends)
+    second_send = asyncio.Event()
     async def limited(chat_id, content, reply_to, metadata):
         sends.append(content)
         if len(sends) == 1:
             return SendResult(False, error="flood_control:0.01", retry_after=0.01)
+        second_send.set()
         return SendResult(True, message_id="one-final")
     adapter._send_text_locked = limited
     bind_turn(tmp_path, "single-final")
@@ -365,9 +369,14 @@ async def test_final_retry_does_not_compete_with_inline_retry(tmp_path):
         result = await adapter._send_with_retry("chat", "answer", max_retries=2, base_delay=0)
         assert result.success and result.deferred
         assert [r.state for r in Outbox(tmp_path).all_rows()] == ["pending"]
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(second_send.wait(), timeout=10)
         assert sends == ["answer", "answer"]
         rows = Outbox(tmp_path).all_rows()
+        for _ in range(60):
+            if rows[0].state == "delivered":
+                break
+            await asyncio.sleep(0.05)
+            rows = Outbox(tmp_path).all_rows()
         assert len(rows) == 1 and rows[0].state == "delivered"
         assert rows[0].turn_id == "single-final"
     finally:
@@ -421,23 +430,18 @@ async def test_recovery_restores_image_pairs_and_control_parse_mode(tmp_path):
     assert seen == [[("https://example.com/a.png", "alt")], "HTML"]
 
 
-def test_schema_upgrades_old_outbox_without_losing_receipts(tmp_path):
+def test_additive_admission_timestamp_preserves_existing_receipt(tmp_path):
     path = tmp_path / "gateway-outbox.db"
     with sqlite3.connect(path) as db:
-        db.execute("CREATE TABLE outbox (turn_id TEXT NOT NULL, sequence INTEGER NOT NULL, "
-                   "type TEXT NOT NULL, payload TEXT NOT NULL, idempotency_key TEXT UNIQUE NOT NULL, "
-                   "owner_epoch INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending' "
-                   "CHECK (state IN ('pending','sending','ambiguous','delivered')), "
-                   "message_id TEXT, send_status TEXT, edit_status TEXT, "
-                   "PRIMARY KEY (turn_id, sequence))")
-        db.execute("INSERT INTO outbox VALUES ('t', 1, 'send', '{}', 'old', 0, "
-                   "'delivered', 'm1', 'success', NULL)")
+        db.execute("CREATE TABLE admissions (profile TEXT, platform TEXT, transport_event_id TEXT, "
+                   "event_kind TEXT, turn_id TEXT, result TEXT, "
+                   "PRIMARY KEY (profile, platform, transport_event_id, event_kind))")
+        db.execute("INSERT INTO admissions VALUES ('default', 'telegram', 'event', 'message', 'turn', 'completed')")
     store = Outbox(tmp_path)
-    assert store.all_rows()[0].message_id == "m1"
-    second = store.enqueue("t", "send", {"content": "no"})
-    assert store.begin_send(second)
-    store.receipt(second, message_id=None, success=False, uncertain=False)
-    assert store.all_rows()[-1].state == "failed_unsent"
+    assert store.lookup("default", "telegram", "event", "message") == ("turn", "completed")
+    assert store.admit("default", "telegram", "new", "message")[1]
+    with sqlite3.connect(path) as db:
+        assert all(row[0] is not None for row in db.execute("SELECT created_at FROM admissions"))
 
 
 def test_additive_schema_does_not_disturb_existing_store(tmp_path):
@@ -570,11 +574,13 @@ async def test_stream_final_deferral_has_one_durable_retry_no_fallback(tmp_path)
     from gateway.outbox import run_turn_child
     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
     sends = []
+    second_send = asyncio.Event()
     adapter = _fake_adapter(True, sends)
     async def limited(chat_id, content, reply_to, metadata):
         sends.append(content)
         if len(sends) == 1:
             return SendResult(False, error="flood_control:0.01", retry_after=0.01)
+        second_send.set()
         return SendResult(True, message_id="final")
     adapter._send_text_locked = limited
     bind_turn(tmp_path, "stream-deferred")
@@ -586,8 +592,12 @@ async def test_stream_final_deferral_has_one_durable_retry_no_fallback(tmp_path)
         consumer.finish("answer")
         await task
         assert consumer.delivered_final_matches("answer")
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(second_send.wait(), timeout=10)
         assert sends == ["answer", "answer"]
+        for _ in range(60):
+            if [row.state for row in Outbox(tmp_path).all_rows()] == ["delivered"]:
+                break
+            await asyncio.sleep(0.05)
         assert [row.state for row in Outbox(tmp_path).all_rows()] == ["delivered"]
     finally:
         clear_turn()
@@ -625,3 +635,169 @@ async def test_ledger_covers_outbox_event_without_active_send_binding(tmp_path, 
     obligation = await adapter._record_delivery_obligation(event, "session", "answer", adapter, False)
     assert obligation is not None
     assert len(recorded) == 1 and recorded[0]["content"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_slow_receipt_does_not_block_other_coroutines(tmp_path, monkeypatch):
+    store = Outbox(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    completed_while_waiting = []
+    original = store.enqueue
+
+    def slow_enqueue(*args, **kwargs):
+        entered.set()
+        completed_while_waiting.append(release.wait(timeout=3))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "enqueue", slow_enqueue)
+    monkeypatch.setattr("gateway.outbox.store_for", lambda home: store)
+    adapter = _fake_adapter(True, [])
+    bind_turn(tmp_path, "slow")
+    try:
+        async def pulse():
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+            release.set()
+
+        ticker = asyncio.create_task(pulse())
+        sending = asyncio.create_task(_send_bound(adapter, tmp_path, "slow"))
+        await asyncio.wait_for(sending, timeout=5)
+        await ticker
+        assert completed_while_waiting == [True]
+    finally:
+        release.set()
+        clear_turn()
+
+
+async def _send_bound(adapter, home, turn):
+    bind_turn(home, turn)
+    try:
+        return await adapter.send("chat", "answer")
+    finally:
+        clear_turn()
+
+
+def test_prune_retains_unresolved_and_recent_rows_and_removes_terminal_media(tmp_path):
+    store = Outbox(tmp_path)
+    media = tmp_path / "gateway-outbox-media" / "copy.txt"
+    media.parent.mkdir()
+    media.write_text("owned")
+    old = time.time() - 9 * 86400
+    delivered = store.enqueue("old", "send_document", {
+        "file_path": str(media), "_outbox_original": {"file_path": "source"}})
+    store.begin_send(delivered)
+    store.receipt(delivered, message_id="one", success=True)
+    failed_media = tmp_path / "gateway-outbox-media" / "failed.txt"
+    failed_media.write_text("failed-owned")
+    failed = store.enqueue("old", "send_document", {
+        "file_path": str(failed_media), "_outbox_original": {"file_path": "source2"}})
+    store.begin_send(failed)
+    store.receipt(failed, message_id=None, success=False, uncertain=False)
+    ambiguous = store.enqueue("old", "send", {"content": "uncertain"})
+    store.begin_send(ambiguous)
+    pending = store.enqueue("old", "send", {"content": "pending"})
+    recent = store.enqueue("recent", "send", {"content": "recent"})
+    old_turn, _ = store.admit("default", "telegram", "old", "message")
+    store.finish_admission(old_turn, "completed")
+    recent_turn, _ = store.admit("default", "telegram", "recent", "message")
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=? WHERE turn_id='old'", (old,))
+        db.execute("UPDATE admissions SET created_at=? WHERE turn_id=?", (old, old_turn))
+    store.prune(retention_days=7)
+    assert {r.idempotency_key for r in store.all_rows()} == {
+        ambiguous.idempotency_key, pending.idempotency_key, recent.idempotency_key}
+    assert not media.exists() and not failed_media.exists()
+    assert store.original_result(old_turn) is None
+    assert store.lookup("default", "telegram", "recent", "message") == (recent_turn, None)
+
+
+def test_structured_transport_error_takes_precedence_over_message():
+    assert _uncertain(SendResult(False, error="timeout", error_kind="not_found")) is False
+    assert _uncertain(SendResult(False, error="connection reset", error_kind="transient")) is True
+    assert _uncertain(SendResult(False, error="connection reset", error_kind="transient", retry_after=2)) is False
+    assert _uncertain(SendResult(False, error="timeout", error_kind="unknown")) is True
+    assert _uncertain(SendResult(False, error="timeout", raw_response={"ok": False})) is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_retry_uses_reconnected_adapter(tmp_path):
+    original_sends, replacement_sends = [], []
+    old = _fake_adapter(True, original_sends)
+    current = _fake_adapter(True, replacement_sends)
+    registry = {Platform.TELEGRAM: old}
+    old.gateway_runner.adapters = registry
+    current.gateway_runner.adapters = registry
+
+    async def rate_limited(chat_id, content, reply_to, metadata):
+        original_sends.append((chat_id, content))
+        return SendResult(False, error="rate limited", retry_after=0.15)
+
+    old._send_text_locked = rate_limited
+    bind_turn(tmp_path, "reconnected")
+    try:
+        assert (await old.send("chat", "answer")).deferred
+        registry[Platform.TELEGRAM] = current
+        await asyncio.sleep(0.35)
+        assert original_sends == [("chat", "answer")]
+        assert replacement_sends == [("chat", "answer")]
+        assert [row.state for row in Outbox(tmp_path).all_rows()] == ["delivered"]
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_retry_deadline_passed_during_scheduling_is_dispatched(tmp_path, monkeypatch):
+    sends = []
+    store = Outbox(tmp_path)
+    original_scheduled = store.scheduled
+
+    def slow_scheduled():
+        time.sleep(0.06)
+        return original_scheduled()
+
+    monkeypatch.setattr(store, "scheduled", slow_scheduled)
+    monkeypatch.setattr("gateway.outbox.store_for", lambda home: store)
+    adapter = _fake_adapter(True, sends)
+    completed = asyncio.Event()
+
+    async def rate_limited(chat_id, content, reply_to, metadata):
+        sends.append(content)
+        if len(sends) == 1:
+            return SendResult(False, error="flood_control", retry_after=0.01)
+        completed.set()
+        return SendResult(True, message_id="delivered")
+
+    adapter._send_text_locked = rate_limited
+    bind_turn(tmp_path, "overdue")
+    try:
+        result = await adapter.send("chat", "answer")
+        assert result.success and result.deferred
+        await asyncio.wait_for(completed.wait(), timeout=3)
+        assert sends == ["answer", "answer"]
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_boot_sweep_uses_profile_retention(tmp_path):
+    store = Outbox(tmp_path)
+    row = store.enqueue("old", "send", {"content": "sent"})
+    store.begin_send(row)
+    store.receipt(row, message_id="one", success=True)
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE outbox SET created_at=?", (time.time() - 3 * 86400,))
+    adapter = _fake_adapter(True, [])
+    adapter.gateway_runner.config.durable_outbox_retention_days = 2
+    assert await recover(store, adapter) == (0, 0)
+    assert store.all_rows() == []
+
+
+def test_retention_config_parses_and_rejects_invalid_age():
+    config = GatewayConfig.from_dict({"gateway": {"durable_outbox": {
+        "enabled": True, "retention_days": 3}}})
+    assert config.durable_outbox_retention_days == 3
+    assert config.to_dict()["durable_outbox"]["retention_days"] == 3
+    for age in (0, -1, True, 1.5, "7"):
+        with pytest.raises(ValueError, match="retention_days"):
+            GatewayConfig.from_dict({"gateway": {"durable_outbox": {"retention_days": age}}})
