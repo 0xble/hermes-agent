@@ -280,7 +280,12 @@ class CodexAppServerClient:
         return self._take(self._server_requests, timeout)
 
     def stderr_tail(self, n: int = 20) -> list[str]:
-        """Return last n lines of codex's stderr (for error reports)."""
+        """Return last n lines; after process exit, drain its stderr reader first."""
+        if self._proc.poll() is not None and threading.current_thread() is not self._stderr_reader:
+            # poll() can see death before the other pipe's reader has copied the
+            # crash diagnostic. Bound the drain: inherited pipe FDs in descendants
+            # can keep stderr open even after the app-server itself exits.
+            self._stderr_reader.join(timeout=2.0)
         with self._stderr_lock:
             return list(self._stderr_lines[-n:])
 
