@@ -286,3 +286,89 @@ def test_in_place_compress_never_clones_a_row_a_merge_already_carried(session_db
 
     contents = [m["content"] for m in session_db.get_messages_as_conversation("sid")]
     assert sum("second half 9931" in c for c in contents) == 1
+
+
+def _long_exchanges(n):
+    return [{"role": role, "content": f"{role} {i} " + " ".join([word] * 300)}
+            for i in range(n) for role, word in (("user", "question"), ("assistant", "answer"))]
+
+
+def _summary_budgets(agent, history, raw):
+    """Run ``/compress <raw>`` with a stub summarizer; return the result and the summary token targets it chose."""
+    from agent.context_compressor import ContextCompressor
+    budgets = []
+    real = ContextCompressor._compute_summary_budget
+
+    def _spy(self, turns):
+        budgets.append(real(self, turns))
+        return budgets[-1]
+
+    with patch.object(ContextCompressor, "_compute_summary_budget", _spy):
+        return _compress(agent, history, raw), budgets
+
+
+def test_higher_levels_keep_less_and_summarize_shorter(tmp_path):
+    """``/compress --level 2`` and ``--level 3`` (the ``/cc`` and ``/ccc`` aliases) must each leave strictly less
+    verbatim context and target a shorter summary than the level below, and put the compressor back afterwards
+    so automatic compaction keeps its configured policy."""
+    from hermes_state import SessionDB
+    kept, caps = [], []
+    for level in (1, 2, 3):
+        db = SessionDB(db_path=tmp_path / f"level{level}.db")
+        agent, loaded = _stored_agent(db, _long_exchanges(120))
+        compressor = agent.context_compressor
+        policy = (compressor.tail_token_budget, compressor.max_summary_tokens, compressor.protect_last_n,
+                  compressor.min_tail_user_messages)
+        result, budgets = _summary_budgets(agent, loaded, f"--level {level}")
+        assert result.status == "compressed" and result.request.focus_topic is None
+        kept.append(len(result.after_messages))
+        caps.append(max(budgets))
+        assert (compressor.tail_token_budget, compressor.max_summary_tokens, compressor.protect_last_n,
+                compressor.min_tail_user_messages) == policy
+        # The newest request and reply survive at every level.
+        assert _live(result.after_messages[-2:]) == _live(loaded[-2:])
+        db.close()
+    assert kept[0] > kept[1] > kept[2], kept
+    assert caps[0] > caps[1] > caps[2], caps
+
+
+@pytest.mark.parametrize("keep", [1, 2])
+def test_here_n_keeps_only_the_requested_exchanges(session_db, keep):
+    """``/compress here N`` promises to summarize everything before the last N exchanges. The head must not carry
+    the compressor's own recent-tail window past the summary: at most the head's latest exchange rides along (the
+    compressor keeps a real user turn after its summary), so ``here N`` never keeps more than plain ``/compress``."""
+    agent, loaded = _stored_agent(session_db, _long_exchanges(40))
+    result = _compress(agent, loaded, f"here {keep}")
+    assert result.status == "compressed"
+    assert _live(result.after_messages[-2 * keep:]) == _live(loaded[-2 * keep:])
+    summary_at = next(i for i, m in enumerate(result.after_messages) if "Numbered fruit questions" in m["content"])
+    assert len(result.after_messages) - summary_at - 1 <= 2 * keep + 3
+
+
+@pytest.mark.parametrize("raw", ["--level 3", "here 1"])
+def test_level_survives_the_first_attempt_feasibility_recalibration(tmp_path, raw):
+    """The first manual compression runs the lazy aux-feasibility probe, which may clamp the threshold to a
+    smaller summariser window and re-derive the tail budget. That must not undo the per-run level: the run keeps
+    exactly what it keeps when the probe already ran."""
+    from agent import conversation_compression
+    from agent.conversation_compression import _lower_threshold_to_aux_context
+    probes = []
+
+    def _clamping_probe(agent):
+        probes.append(agent.context_compressor.tail_token_budget)
+        _lower_threshold_to_aux_context(agent, aux_model="small-aux", aux_context=agent.context_compressor.threshold_tokens,
+                                        aux_provider="test", aux_base_url="")
+
+    from hermes_state import SessionDB
+    kept = []
+    for probe_pending in (False, True):
+        db = SessionDB(db_path=tmp_path / f"probe_pending_{probe_pending}.db")
+        agent, loaded = _stored_agent(db, _long_exchanges(120))
+        agent._compression_feasibility_checked = not probe_pending
+        with patch.object(conversation_compression, "check_compression_model_feasibility", _clamping_probe):
+            result = _compress(agent, loaded, raw)
+        assert result.status == "compressed"
+        kept.append(len(result.after_messages))
+        db.close()
+    assert probes, "the pending probe must run"
+    assert kept[0] == kept[1], kept

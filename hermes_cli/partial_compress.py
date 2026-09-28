@@ -17,6 +17,39 @@ DEFAULT_KEEP_LAST = 2
 #: Hard ceiling so a fat-fingered ``/compress here 9999`` clamps instead of no-op'ing.
 MAX_KEEP_LAST = 100
 
+#: ``/compress --level N`` range: 1 is the configured compression, each higher level keeps less verbatim.
+MAX_COMPRESS_LEVEL = 3
+
+
+def extract_compress_level(raw_args: str) -> Tuple[str, int]:
+    """Strip ``--level N`` / ``--level=N`` (anywhere in the string) and return ``(remaining_args, level)``.
+
+    A missing or unparseable value means level 1; out-of-range values clamp to ``[1, MAX_COMPRESS_LEVEL]``.
+    """
+    tokens = (raw_args or "").split()
+    kept: List[str] = []
+    level = 1
+    i = 0
+    while i < len(tokens):
+        low = tokens[i].lower()
+        if low == "--level":
+            level = _coerce_level(tokens[i + 1] if i + 1 < len(tokens) else "")
+            i += 2
+            continue
+        if low.startswith("--level="):
+            level = _coerce_level(low.split("=", 1)[1])
+        else:
+            kept.append(tokens[i])
+        i += 1
+    return " ".join(kept), level
+
+
+def _coerce_level(value: str) -> int:
+    try:
+        return max(1, min(int(value), MAX_COMPRESS_LEVEL))
+    except (TypeError, ValueError):
+        return 1
+
 
 def parse_partial_compress_args(raw_args: str) -> Tuple[bool, int, Optional[str]]:
     """Parse the argument string after ``/compress`` into ``(partial, keep_last, focus_topic)``.
@@ -75,6 +108,7 @@ def summarize_compress_preview(
     keep_last: int,
     focus_topic: Optional[str],
     approx_tokens: int,
+    level: int = 1,
 ) -> Dict[str, Any]:
     """Build the ``/compress --preview`` report — pure, no side effects.
 
@@ -103,6 +137,8 @@ def summarize_compress_preview(
         lines.append("Boundary: 'here' split would keep everything — falling back to full compression.")
     if focus_topic:
         lines.append(f'Focus topic: "{focus_topic}"')
+    if level > 1 and not effective_partial:
+        lines.append(f"Level {level}: keeps less verbatim and writes a shorter summary than plain /compress.")
     lines.append("Run the command again without --preview to apply.")
 
     return {

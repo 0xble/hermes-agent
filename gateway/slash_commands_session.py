@@ -68,7 +68,7 @@ def _manual_compression_reply_lines(summary: dict, compressor, focus_topic) -> l
     return lines
 
 
-def _compress_preview_reply(history, partial: bool, keep_last, focus_topic, agg_note: str) -> str:
+def _compress_preview_reply(history, partial: bool, keep_last, focus_topic, agg_note: str, level: int = 1) -> str:
     """``/compress --preview``: report what WOULD be compressed — no agent, no writes."""
     from agent.model_metadata import estimate_request_tokens_rough
     from hermes_cli.partial_compress import summarize_compress_preview
@@ -76,7 +76,7 @@ def _compress_preview_reply(history, partial: bool, keep_last, focus_topic, agg_
     pv_msgs = [{"role": m.get("role"), "content": m.get("content")} for m in history
                if m.get("role") in {"user", "assistant"} and m.get("content")]
     report = summarize_compress_preview(pv_msgs, partial, keep_last, focus_topic,
-                                        estimate_request_tokens_rough(pv_msgs))
+                                        estimate_request_tokens_rough(pv_msgs), level=level)
     lines = [f"🗜️ {line}" for line in report["lines"]]
     if agg_note:
         lines.append(agg_note)
@@ -516,7 +516,8 @@ class GatewaySessionCommandsMixin:
         if request.aggressive and not request.preview:
             return _agg_note
         if request.preview:
-            return _compress_preview_reply(history, request.partial, request.keep_last, request.focus_topic, _agg_note)
+            return _compress_preview_reply(history, request.partial, request.keep_last, request.focus_topic, _agg_note,
+                                           request.level)
         try:
             return await self._run_manual_compression(source, session_entry, history, request)
         except Exception as e:

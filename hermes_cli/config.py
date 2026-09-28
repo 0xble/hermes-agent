@@ -1240,6 +1240,10 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     issues: List[ConfigIssue] = []
     _validate_voice(config, issues)
+    guardian = (config.get("gateway") or {}).get("guardian", {})
+    if not isinstance(guardian, dict) or type(guardian.get("enabled", False)) is not bool:
+        _issue(issues, "error", "gateway.guardian.enabled must be a boolean",
+               "Set gateway.guardian.enabled to true or false")
     _validate_timezone(config, issues)
     _validate_updates(config, issues)
     cp = config.get("custom_providers")

@@ -44,7 +44,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/retry` | Retry the last message (resend to agent) |
 | `/undo` | Remove the last user/assistant exchange |
 | `/title` | Set a title for the current session (usage: /title My Session Name) |
-| `/compress [here [N] \| focus topic]` | Manually compress conversation context (flush memories + summarize). `/compress here [N]` summarizes everything except the most recent N exchanges (default 2), kept verbatim — pick your own compression boundary. A focus topic narrows what a full summary preserves. |
+| `/compress [here [N] \| focus topic] [--level 1-3]` | Manually compress conversation context (flush memories + summarize). `/compress here [N]` summarizes everything except the most recent N exchanges (default 2), kept verbatim — pick your own compression boundary. A focus topic narrows what a full summary preserves. `--level 2` keeps about a quarter of the usual verbatim recent context with a summary capped at 5K tokens; `--level 3` keeps only the latest request and reply with a summary capped at 2K tokens. |
 | `/rollback` | List or restore filesystem checkpoints (usage: /rollback [number]) |
 | `/diff [staged\|all\|session] [--stat] [path...]` | Show git changes in the working directory. Default: unstaged changes plus untracked files. `staged` shows what's staged for commit, `all` everything since HEAD, and `session` the cumulative diff of everything Hermes changed here (from the earliest retained checkpoint baseline — requires checkpoints to be enabled; complements `/rollback diff <N>`). `--stat` prints just the changed-file summary; path arguments restrict the diff. |
 | `/snapshot [create\|restore <id>\|prune]` (alias: `/snap`) | Create or restore state snapshots of Hermes config/state. `create [label]` saves a snapshot, `restore <id>` reverts to it, `prune [N]` removes old snapshots, or list all with no args. Database restores write through SQLite's backup API so live processes (gateway, dashboard) see the restored data safely; if that path fails while another process still holds the database open, the restore refuses instead of risking corruption — stop the holder and retry. |
@@ -252,7 +252,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/retry` | Retry the last message. |
 | `/undo` | Remove the last exchange. |
 | `/sethome` (alias: `/set-home`) | Mark the current chat as the platform home channel for deliveries. |
-| `/compress [here [N] \| focus topic]` | Manually compress conversation context. `/compress here [N]` keeps the most recent N exchanges (default 2) verbatim and summarizes the rest. A focus topic narrows what a full summary preserves. |
+| `/compress [here [N] \| focus topic] [--level 1-3]` | Manually compress conversation context. `/compress here [N]` keeps the most recent N exchanges (default 2) verbatim and summarizes the rest. A focus topic narrows what a full summary preserves. `--level 2` and `--level 3` keep progressively less verbatim and write shorter summaries. |
 | `/topic [off\|help\|session-id]` | **Telegram DM only.** Manage user-managed multi-session topic mode. `/topic` enables it or shows status; `/topic off` disables it and clears bindings; `/topic help` shows usage; `/topic <session-id>` inside a topic restores a previous session. See [Multi-session DM mode](../user-guide/messaging/telegram.md#multi-session-dm-mode-topic). |
 | `/title [name]` | Set or show the session title. |
 | `/resume [name]` | Resume a previously named session. |
