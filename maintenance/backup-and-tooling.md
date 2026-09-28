@@ -23,7 +23,10 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   A successful open alone is insufficient.
 - `scripts/sync_fork_candidate.py` builds candidates only; `scripts/check_fork_patches.py`
   proves trailers, unit ownership, extension registration, config keys, and the native
-  update receipt; `scripts/rollback_fork_runtime.sh` reaches recovery when reinstall fails.
+  update receipt; with immutable releases, compare receipt and live gateway to the
+  ready `current` release and check trailers through its commit, not the stale source
+  HEAD. Legacy homes still use checkout HEAD. Broken pointers and mismatched code fail.
+  `scripts/rollback_fork_runtime.sh` reaches recovery when reinstall fails.
   Scheduled copies live under `$HERMES_HOME/scripts` per [runtime ownership](runtime-ownership.md).
 - Cron: per-job IANA `job_timezone` with civil-time scheduling and a migration dry-run
   diff; contention skips are persisted truthfully. Fallback routing is owned by

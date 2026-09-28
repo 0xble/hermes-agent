@@ -1,11 +1,11 @@
-"""C4 summarizer faults: a failed summary never commits, and failure is bounded and visible.
+"""C4 summarizer faults: a bad summary never commits, and failure is bounded and visible.
 
 Same real chain and per-turn invariants as ``test_compaction_auto`` (see ``_helpers``), with the
 summarizer scripted to answer empty / refusal / truncated (finish_reason=length) / slower than the
 compression timeout / HTTP 500. For every fault: the session keeps running, the summarizer is asked a
 bounded number of times per turn, the user is told, and state.db never archives history behind a bad
-summary (a 500 may commit only the designed deterministic fallback -- never with
-``abort_on_summary_failure``).
+summary. The slow route explicitly opts out of deterministic fallback: without that setting a
+second stall may legitimately commit a fallback summary without using the failed model's output.
 """
 
 from __future__ import annotations
@@ -20,7 +20,11 @@ FAILING_MODES = ("empty", "refusal", "truncated", "slow")
 @pytest.mark.parametrize("mode", FAILING_MODES)
 @pytest.mark.parametrize("seed", SEEDS[:2])
 def test_failed_summary_never_commits(make_scenario, tmp_path, seed, mode):
-    sc = make_scenario(mode)
+    # A timeout is not always a failed compaction: repeated stalls intentionally commit a
+    # deterministic summary. Opt out here to test the actual no-archive contract, including
+    # the cancelled worker's late result, regardless of which stall-fallback route runs.
+    extra = "  abort_on_summary_failure: true\n" if mode == "slow" else ""
+    sc = make_scenario(mode, extra=extra)
     drive(sc, seed, tmp_path / "work")
     assert sc.summary_calls, "the seeded session never crossed the compaction trigger"
     assert sc.committed_compactions() == 0, f"a {mode} summary committed a compaction (history archived)"

@@ -283,12 +283,32 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             return "locked"
         try:
             from hermes_cli.config import _validate_updates
+            from hermes_cli.config_effective import load_user_config_effective
             config: dict[str, Any]
-            if grace is None or (home / "config.yaml").is_file():
-                from hermes_cli.config_effective import load_user_config_effective
+            if grace is None:
                 config = load_user_config_effective(home / "config.yaml", fail_closed=True)
             else:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
+                # Explicit grace historically needs no config load. Only inspect the
+                # opt-in marker when present; a malformed unrelated config cannot alert.
+                config_path = home / "config.yaml"
+                try:
+                    flag_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+                except (OSError, UnicodeError):
+                    return "waiting"  # Unreadable flag cannot authorize legacy repair.
+                if "overlap_handover" in flag_text:
+                    try:
+                        flag_config = yaml.safe_load(flag_text) or {}
+                    except yaml.YAMLError:
+                        return "waiting"  # Cannot safely rule out an opt-in generation.
+                    if not isinstance(flag_config, dict):
+                        return "waiting"
+                    raw_gateway = flag_config.get("gateway") or {}
+                    overlap = raw_gateway.get("overlap_handover") if isinstance(raw_gateway, dict) else None
+                    if overlap is not None and (not isinstance(overlap, dict) or
+                                                overlap.get("enabled") is not False):
+                        return "waiting"
+                    config["gateway"] = raw_gateway
             # The legacy guardian only knows one launchd label. Until overlap repair has
             # its own fenced protocol, it must not bootstrap or roll back either generation.
             gateway_config = config.get("gateway") or {}

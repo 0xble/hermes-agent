@@ -35,7 +35,6 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE, COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE, IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE)
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
@@ -690,7 +689,7 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+def _sanitize_gateway_final_response(platform: Any, text: str, *, interrupted: bool = False) -> str:
     """Sanitize final gateway replies for chat surfaces: concise, secret-redacted provider failure
     categories instead of raw HTTP bodies, request IDs, leaked credentials, or policy text."""
     if not text or _gateway_surface_passes_raw_text(platform):
@@ -716,9 +715,18 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if _eos_start >= 0:
         text = text[:_eos_start].rstrip()
 
-    # Cancellation metadata, not prose; ACP/TUI already suppress this sentinel, chat surfaces should too.
-    # See #7921.
-    if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+    # Interrupted turns return local diagnostics rather than assistant prose. A prior
+    # diagnostic can also be echoed by a later, normally completed model turn, so the
+    # flag alone is insufficient. Match only complete, known diagnostic shapes.
+    if interrupted and str(text).strip().startswith("Operation interrupted"):
+        return ""
+    if re.fullmatch(
+        r"Operation interrupted(?:\.|: (?:waiting for model response|handling API error|"
+        r"retrying API call after error|waiting for the provider to recover|"
+        r"retrying empty response from model) \([^\n]{1,100}\)\.|"
+        r" during retry \([^\n]{1,100}\)\.)",
+        str(text).strip(),
+    ):
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))

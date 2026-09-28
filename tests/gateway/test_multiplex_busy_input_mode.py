@@ -238,17 +238,16 @@ async def test_busy_change_updates_only_routed_profile(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("default_mode", "secondary_mode", "queued"),
+    ("default_mode", "secondary_mode"),
     [
-        ("interrupt", "queue", True),
-        ("queue", "interrupt", False),
+        ("interrupt", "queue"),
+        ("queue", "interrupt"),
     ],
 )
 async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
     tmp_path,
     default_mode,
     secondary_mode,
-    queued,
 ):
     runner = _runner(default_mode=default_mode)
     adapter = await _load_profile_snapshot(
@@ -262,7 +261,7 @@ async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
     session_key = runner._session_key_for_source(event.source)
 
     assert await runner._handle_active_session_busy_message(event, session_key) is True
-    assert (session_key in adapter._pending_messages) is queued
+    assert adapter._pending_messages[session_key] is event
 
 
 @pytest.mark.asyncio
@@ -287,8 +286,7 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
 
     response = await runner._handle_message(event)
 
-    assert isinstance(response, str)
-    assert "queued" in response
+    assert response is None
     assert adapter._pending_messages[session_key] is event
     agent.interrupt.assert_not_called()
 

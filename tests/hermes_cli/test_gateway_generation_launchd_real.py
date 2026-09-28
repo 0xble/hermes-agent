@@ -6,6 +6,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import signal
 import tempfile
 import shutil
 import time
@@ -24,11 +25,11 @@ def _sweep(request):
 
 
 @pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
 def test_active_and_passive_generations_use_distinct_records(request):
     """Boot a real active gateway beside a strictly passive standby."""
-    notes = Path.home() / ".hermes/cache/seamless-p3"
-    tmp_path = Path(tempfile.mkdtemp(prefix="slice1-launchd-", dir=notes))
-    request.addfinalizer(lambda: shutil.rmtree(tmp_path))
+    tmp_path = Path(tempfile.mkdtemp(prefix="p3g-", dir="/tmp"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
     home = tmp_path / "profile"
     home.mkdir()
     (home / "config.yaml").write_text(
@@ -43,6 +44,8 @@ def test_active_and_passive_generations_use_distinct_records(request):
     labels = [f"ai.hermes.p3test-{uuid.uuid4().hex}" for _ in range(2)]
     plists = []
     bound_sockets: list[Path] = []
+    active = None
+    active_state = None
     for label in labels:
         plist = tmp_path / f"{label}.plist"
         plist.write_bytes(plistlib.dumps({
@@ -79,9 +82,8 @@ def test_active_and_passive_generations_use_distinct_records(request):
                 "jobs": [subprocess.run(["launchctl", "print", f"{domain}/{label}"],
                                         capture_output=True, text=True, timeout=5).stdout[-1000:] for label in labels],
             }
-            Path.home().joinpath(".hermes/cache/seamless-p3/slice1-active-probe.json").write_text(
-                json.dumps(diagnostic, indent=2))
-        assert ready(), "active probe diagnostics saved to notes dir"
+            (tmp_path / "diagnostics.json").write_text(json.dumps(diagnostic, indent=2))
+        assert ready(), f"active probe diagnostics: {tmp_path / 'diagnostics.json'}"
         rows = read_generation_status(home)
         assert {row["label"] for row in rows} == set(labels)
         assert len({row["pid"] for row in rows}) == 2
@@ -126,6 +128,28 @@ def test_active_and_passive_generations_use_distinct_records(request):
         assert all(label in status.stdout for label in labels)
         assert "Overlap generations:" in status.stdout
         assert "Gateway is running (PID:" in status.stdout
+
+        # KeepAlive must recover from an unclean exit without stealing a live lease.
+        from gateway.status import _get_process_start_time
+        assert active["start_fingerprint"] == f"{active['pid']}:{_get_process_start_time(active['pid'])}"
+        os.kill(active["pid"], signal.SIGKILL)
+        deadline = time.monotonic() + 60
+        successor = None
+        while time.monotonic() < deadline:
+            candidates = [row for row in read_generation_status(home)
+                          if row["label"] == labels[0] and row["id"] != active["id"]
+                          and row["state"] == "ready" and row["leases"]]
+            if candidates:
+                successor = candidates[0]
+                break
+            time.sleep(.25)
+        assert successor is not None, (tmp_path / f"{labels[0]}.err").read_text(errors="replace")[-3000:]
+        assert successor["pid"] != active["pid"]
+        from gateway.generation import GenerationCoordinator
+        assert next(row for row in GenerationCoordinator(home).generations()
+                    if row["id"] == active["id"])["state"] == "failed"
+        assert successor["leases"][0] != active["leases"][0]
+        bound_sockets.append(Path(json.loads((home / f"gateway_state.{successor['id']}.json").read_text())["socket_path"]))
     finally:
         for label in labels:
             subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
@@ -138,9 +162,15 @@ def test_active_and_passive_generations_use_distinct_records(request):
             assert subprocess.run(["launchctl", "print", f"{domain}/{label}"], capture_output=True,
                                   timeout=5).returncode != 0
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and list(home.glob("gateway.*.pid")):
+        while time.monotonic() < deadline and [p for p in home.glob("gateway.*.pid")
+                                                 if active is None or p.name != f"gateway.{active['id']}.pid"]:
             time.sleep(.2)
-        assert not list(home.glob("gateway.*.pid"))
-        assert not list(home.glob("gateway_state.*.json"))
-        assert not any(path.exists() for path in bound_sockets)
-        assert not read_generation_status(home)[0]["leases"]
+        if active is not None:
+            assert not [p for p in home.glob("gateway.*.pid") if p.name != f"gateway.{active['id']}.pid"]
+            assert not [p for p in home.glob("gateway_state.*.json") if p.name != f"gateway_state.{active['id']}.json"]
+            assert not any(row["leases"] for row in read_generation_status(home) if row["id"] != active["id"])
+        if active_state is not None:
+            assert not any(path.exists() for path in bound_sockets if path != Path(active_state["socket_path"]))
+        standby_out = tmp_path / f"{labels[1]}.out"
+        if standby_out.exists():
+            assert "Messaging platforms + cron scheduler" not in standby_out.read_text()

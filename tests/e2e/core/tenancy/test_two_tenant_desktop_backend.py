@@ -23,6 +23,7 @@ and no RPC reply/event for a session carries another tenant's canary.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -94,9 +95,31 @@ def _start(root: Path, tenants: dict[str, H.Tenant], backends: list[H.ServeBacke
     return b
 
 
+def _cron_state(t: H.Tenant) -> str:
+    """Failure-only, secret-free evidence: distinguish no tick from a claimed but stalled job."""
+    cron = t.home / "cron"
+    markers = {}
+    for name in ("ticker_heartbeat", "ticker_last_success"):
+        try:
+            markers[name] = round(max(0.0, time.time() - float((cron / name).read_text())), 1)
+        except (OSError, ValueError):
+            markers[name] = None
+    try:
+        jobs = json.loads((cron / "jobs.json").read_text())
+        jobs = jobs.get("jobs", []) if isinstance(jobs, dict) else jobs
+        state = [(j.get("last_status"), j.get("next_run_at"), j.get("running"))
+                 for j in jobs if j.get("name") == "tenancy-canary"]
+    except (OSError, ValueError, TypeError):
+        state = "unavailable"
+    return f"{t.name}: requests={H.cron_requests(t)}, marker_age_seconds={markers}, job_state={state}"
+
+
 def _await_cron(tenants: dict[str, H.Tenant], fires: int) -> None:
-    H.poll(lambda: all(H.cron_requests(t) >= 2 * fires for t in tenants.values()), 150,
-           f"cron fire #{fires} in every profile")
+    try:
+        H.poll(lambda: all(H.cron_requests(t) >= 2 * fires for t in tenants.values()), 150,
+               f"cron fire #{fires} in every profile")
+    except AssertionError as exc:
+        raise AssertionError(f"{exc}; " + "; ".join(_cron_state(t) for t in tenants.values())) from exc
 
 
 def test_desktop_backend_never_crosses_tenants(fleet, request: pytest.FixtureRequest) -> None:
