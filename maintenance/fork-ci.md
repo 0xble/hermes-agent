@@ -32,6 +32,14 @@ The test still uses a local origin with no network and seeds a v45 user config t
 exercise the MCP disabled → enabled migration even when the release binary is v46.
 A missing upstream tag fetch fails the nightly rather than silently narrowing coverage.
 
+The macOS immutable-release plugin rejection matrix builds one real checkout and
+candidate venv, then tests each plugin kind through the existing-candidate smoke
+path. The previous five parametrized cases each independently rebuilt the entire
+web UI and venv. On hosted macOS this exhausted the 300-second per-file bound
+partway through the fourth case, not in launchd. Reusing a ready, immutable
+candidate preserves each kind's import rejection, unflipped pointer, and partial
+receipt without repeatedly testing unrelated build tooling.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
@@ -191,6 +199,23 @@ The adaptation keeps the fork's portable `TestPlayBeep` and Linux-only WSL2
 class, and omits upstream opt-out tests the fork already removed. A logging
 `afplay` shim on `PATH` recorded one call on the base and none with the patch.
 Retire when a released upstream revision carries equivalent guard coverage.
+
+## Linked worktree test venv
+
+The `fork-ci-reliability` identity also covers the canonical runner's venv
+probe. `scripts/run_tests.sh` looked only at the checkout's own `.venv`/`venv`
+and the release venv, which has no pytest. A linked worktree under
+`.worktrees/<name>` therefore exited "no virtualenv with pytest found" unless
+the caller exported `HERMES_PYTHON`, and exact-candidate reviewers inspecting
+worktrees approved from static reading. The runner now also probes the primary
+checkout's `.venv`/`venv`, found through `git rev-parse --git-common-dir`,
+after the worktree-local ones. `scripts/ci/tests/test_python_scratch.py`
+builds a real linked worktree whose only pytest-capable venv is in the primary
+checkout, and fails on the previous probe order. Upstream main (after
+`v2026.9.24`) replaces the probe list with per-checkout activation
+(`scripts/_activation.sh`, `activate`), which builds a test environment for
+each worktree. Retire this probe when the fork adopts a released upstream
+runner with that activation.
 
 ## Verification and retirement
 

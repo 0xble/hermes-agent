@@ -580,6 +580,7 @@ class TestBrowserVaultTools:
             with patch("agent.vault_store.get_vault_store", return_value=store), \
                  patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
                  patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret), \
+                 patch("tools.approval_context.get_current_session_key", return_value="new-session"), \
                  patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
                 raw = browser_vault_tool.browser_vault_fill(meta.id)
             out = json.loads(raw)

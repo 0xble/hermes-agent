@@ -126,6 +126,34 @@ if __name__ == '__main__':
             self.assertTrue(scratch.is_dir())
             self.assertEqual(list(scratch.iterdir()), [])
 
+    def test_linked_worktree_uses_the_primary_checkout_venv(self):
+        # Worktrees under .worktrees/<name> have no venv of their own. Before this probe the
+        # runner exited "no virtualenv with pytest found", so reviewers could not run tests.
+        with tempfile.TemporaryDirectory() as directory:
+            primary = Path(directory) / 'primary'
+            (primary / 'scripts').mkdir(parents=True)
+            for name in ('run_tests.sh', 'run_tests_parallel.py'):
+                shutil.copy2(ROOT / 'scripts' / name, primary / 'scripts' / name)
+            (primary / 'tests').mkdir()
+            (primary / 'tests/test_probe.py').write_text('def test_probe(): pass\n', encoding='utf-8')
+            git = ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-C', str(primary)]
+            subprocess.run(['git', 'init', '-q', str(primary)], check=True)
+            subprocess.run([*git, 'add', '.'], check=True)
+            subprocess.run([*git, 'commit', '-q', '-m', 'init'], check=True)
+            worktree = primary / '.worktrees' / 'change'
+            subprocess.run([*git, 'worktree', 'add', '-q', str(worktree)], check=True)
+            subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(primary / '.venv')], check=True)
+            # The venv's own site-packages gets a stand-in pytest, so only this venv passes the probe.
+            site = next((primary / '.venv' / 'lib').glob('python*/site-packages'))
+            (site / 'pytest.py').write_text("if __name__ == '__main__':\n    print('1 passed in 0.01s')\n",
+                                            encoding='utf-8')
+            env = {key: value for key, value in os.environ.items() if key != 'HERMES_PYTHON'}
+            env['HOME'] = str(Path(directory) / 'home')
+            result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=worktree, env=env,
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('1 tests passed', result.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()

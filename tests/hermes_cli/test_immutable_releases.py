@@ -981,9 +981,8 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
 
 
 @pytest.mark.macos_only
-@pytest.mark.parametrize("kind", ["standalone", "backend", "platform", "exclusive", "model-provider"])
-def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch, kind):
-    """Exercise checkout -> candidate venv -> plugin probe -> updater receipt, not a mocked smoke."""
+def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch):
+    """Build one real checkout candidate; each plugin kind must fail its import probe before promotion."""
     from hermes_cli import update_cmd, update_receipt
 
     remote = Path(__file__).resolve().parents[2]
@@ -996,31 +995,37 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
     monkeypatch.setattr(releases, "restore_active_distributions", lambda *a, **kw: None)
     home = tmp_path / "profile"
     home.mkdir()
-    plugin = home / "plugins" / "candidate-test"
-    plugin.mkdir(parents=True)
-    (home / "config.yaml").write_text("plugins:\n  enabled: [candidate-test]\n", encoding="utf-8")
-    (plugin / "plugin.yaml").write_text(
-        f"name: candidate-test\nversion: '1.0'\nkind: {kind}\n", encoding="utf-8")
-    (plugin / "__init__.py").write_text(
-        "from hermes_cli.symbol_that_does_not_exist import broken\n", encoding="utf-8")
     a = home / "releases" / "A"
     _fake_release(a, "A")
     releases.promote(home, a)
+    # Stage the complete checkout and real candidate venv once. Reusing this
+    # immutable candidate exercises the production 'existing' smoke path for
+    # each kind without rebuilding npm and uv five times in one test file.
+    candidate, action = releases.stage_release(source, home)
+    assert action == "staged" and candidate == home / "releases" / sha
+    plugin = home / "plugins" / "candidate-test"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [candidate-test]\n", encoding="utf-8")
+    (plugin / "__init__.py").write_text(
+        "from hermes_cli.symbol_that_does_not_exist import broken\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
-    update_receipt.begin_update_receipt()
-    try:
-        assert update_cmd._activate_immutable_release() is False
-        update_receipt.finalize_update_receipt("partial")
-        assert (home / "current").resolve() == a.resolve()
-        assert (home / "previous").exists() is False
-        receipt = json.loads((home / "logs" / "update_receipts" / "latest.json").read_text(encoding="utf-8"))
-        assert receipt["outcome"] == "partial"
-        assert any(s["name"] == "immutable_release" and not s["ok"] and
-                   "candidate plugin smoke failed" in s["detail"] for s in receipt["steps"])
-    finally:
-        update_receipt.finalize_update_receipt("partial")
+    for kind in ("standalone", "backend", "platform", "exclusive", "model-provider"):
+        (plugin / "plugin.yaml").write_text(
+            f"name: candidate-test\nversion: '1.0'\nkind: {kind}\n", encoding="utf-8")
+        update_receipt.begin_update_receipt()
+        try:
+            assert update_cmd._activate_immutable_release() is False, kind
+            update_receipt.finalize_update_receipt("partial")
+            assert (home / "current").resolve() == a.resolve(), kind
+            assert (home / "previous").exists() is False, kind
+            receipt = json.loads((home / "logs" / "update_receipts" / "latest.json").read_text(encoding="utf-8"))
+            assert receipt["outcome"] == "partial", kind
+            assert any(s["name"] == "immutable_release" and not s["ok"] and
+                       "candidate plugin smoke failed" in s["detail"] for s in receipt["steps"]), kind
+        finally:
+            update_receipt.finalize_update_receipt("partial")
 
 
 def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path, monkeypatch):
