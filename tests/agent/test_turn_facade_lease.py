@@ -1,4 +1,5 @@
 """Unit tests for agent.turn_facade_lease (admission + lease bracket)."""
+import sqlite3
 import threading
 from types import SimpleNamespace
 
@@ -117,6 +118,55 @@ def test_timeout_and_interrupt_early_results():
     admission = _admit(agent)
     assert admission.early_result["interrupted"] is True
     assert admission.early_result["interrupt_message"] == "stop"
+
+
+def _active_lease(db):
+    agent = _agent(db)
+    calls = []
+    agent.interrupt = lambda msg, **kw: calls.append(msg)
+    lease = DurableTurnLease(agent, db, "s1", "h")
+    lease.turn_active = True
+    return lease, calls
+
+
+def test_refresh_tick_sqlite_lock_keeps_the_turn():
+    db = _Db()
+
+    def locked(session_id, holder, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.refresh_session_turn_lease = locked
+    lease, calls = _active_lease(db)
+
+    # False would cancel the refresher; a lock is a missed tick, not a lost lease.
+    assert lease.refresh_tick() is None
+    assert calls == []
+    assert lease.interrupt_message is None
+    assert lease.stop.is_set() is False
+
+
+def test_refresh_tick_real_loss_still_interrupts():
+    db = _Db()
+    db.refresh_session_turn_lease = lambda session_id, holder, **kwargs: False
+    lease, calls = _active_lease(db)
+
+    assert lease.refresh_tick() is False
+    assert calls == ["Session turn lease lost; stopping to protect the transcript."]
+
+
+def test_refresh_tick_non_lock_error_still_interrupts():
+    db = _Db()
+
+    def broken(session_id, holder, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    db.refresh_session_turn_lease = broken
+    lease, calls = _active_lease(db)
+
+    assert lease.refresh_tick() is False
+    assert calls == [
+        "Session turn lease could not be refreshed; stopping to protect the transcript."
+    ]
 
 
 def test_interrupt_turn_only_while_active():

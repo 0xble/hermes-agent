@@ -180,8 +180,9 @@ class DurableTurnLease:
                 _set_interrupt(False, agent._execution_thread_id)
 
     def refresh_tick(self):
-        """One periodic renewal (every ``refresh_interval`` via the shared scheduler); a miss or
-        error interrupts the turn. Returning False stops the timer.
+        """One periodic renewal (every ``refresh_interval`` via the shared scheduler). A real
+        miss (rowcount 0) or a non-lock error interrupts the turn. A SQLite lock is only a
+        missed tick: the timer stays armed. Returning False stops the timer.
 
         The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
         finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
@@ -199,9 +200,20 @@ class DurableTurnLease:
                 "Lost session turn lease while turn is active: %s", self._current_session_id()
             )
             self._interrupt_turn("Session turn lease lost; stopping to protect the transcript.")
-        except Exception:
+        except Exception as exc:
             if self.stop.is_set():
                 return False
+            # A lock is contention, not a lost holder. The row is still ours
+            # (release is holder-qualified), so a convoy must not kill the turn.
+            # Keep the timer: the next tick retries, and one miss fits inside the TTL.
+            from hermes_state_errors import is_sqlite_lock_error
+
+            if is_sqlite_lock_error(exc):
+                logger.warning(
+                    "Session turn lease refresh hit a SQLite lock; will retry: %s",
+                    self._current_session_id(),
+                )
+                return None
             logger.warning(
                 "Failed to refresh session turn lease: %s", self._current_session_id(), exc_info=True,
             )
