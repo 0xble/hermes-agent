@@ -2461,7 +2461,7 @@ def cmd_update(args):
     # Exit code for the Windows hand-off child's hard exit (see finally); None
     # = not SystemExit-shaped, so real exceptions keep their traceback.
     _update_handoff_exit_code: int | None = None
-    from hermes_cli.update_cmd import _cmd_update_impl, UpdateConfigurationLoadError
+    from hermes_cli.update_cmd import _cmd_update_impl, UpdateConfigurationError, UpdateConfigurationLoadError
 
     try:
         _cmd_update_impl(args, gateway_mode=gateway_mode)
@@ -2475,12 +2475,9 @@ def cmd_update(args):
             _update_exit.code if isinstance(_update_exit.code, int) else 0
         )
         raise
-    except (ValueError, UpdateConfigurationLoadError) as _update_exc:
-        if isinstance(_update_exc, ValueError) and not str(_update_exc).startswith("Invalid update configuration: "):
-            _finalize_update_receipt(1, f"ValueError: {_update_exc}")
-            raise
+    except (UpdateConfigurationError, UpdateConfigurationLoadError) as _update_exc:
         from hermes_cli import update_receipt
-        if update_receipt._current is None:
+        if not update_receipt.has_active_update_receipt():
             update_receipt.begin_update_receipt()
         message = (f"Could not load configuration: {_update_exc}"
                    if isinstance(_update_exc, UpdateConfigurationLoadError) else str(_update_exc))

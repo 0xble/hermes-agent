@@ -534,6 +534,19 @@ def test_gateway_interpreter_honors_managed_immutable_opt_in(tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="Invalid immutable release current pointer"):
         gateway.get_python_path()
 
+@pytest.mark.macos_only
+def test_gateway_interpreter_existing_current_does_not_read_config(tmp_path, monkeypatch):
+    from hermes_cli import gateway, config_effective
+    home = tmp_path / "profile"
+    release = home / "releases" / ("a" * 40)
+    _fake_release(release, release.name)
+    home.mkdir(exist_ok=True)
+    (home / "current").symlink_to(release)
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(config_effective, "load_user_config_effective",
+                        lambda *a, **kw: pytest.fail("current pointer must not read config"))
+    assert gateway.get_python_path() == str(home / "current/.venv/bin/python")
+
 
 @pytest.mark.linux_only
 def test_gateway_interpreter_ignores_unsupported_dangling_pointer(tmp_path, monkeypatch):

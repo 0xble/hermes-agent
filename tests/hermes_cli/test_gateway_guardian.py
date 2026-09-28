@@ -45,13 +45,39 @@ def fake_launchctl(monkeypatch, label, *, loaded=False):
     monkeypatch.setattr(guardian.subprocess, "run", run)
     return calls
 
+@pytest.mark.macos_only
+@pytest.mark.parametrize("value", ["text", 0, -1, ".nan", ".inf"])
+def test_invalid_grace_writes_alert_receipt(tmp_path, value, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    (home / "config.yaml").write_text(f"updates:\n  release_acknowledgement_timeout_seconds: {value}\n")
+    assert guardian.run_once(home, plist, label) == "alert"
+    assert any(json.loads(path.read_text())["outcome"] == "alert"
+               for path in (home / "logs/guardian").glob("*.json"))
+
+@pytest.mark.macos_only
+def test_invalid_yaml_writes_alert_receipt(tmp_path):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("updates: [unclosed\n")
+    assert guardian.run_once(home, plist, label) == "alert"
+    assert any(json.loads(path.read_text())["outcome"] == "alert"
+               for path in (home / "logs/guardian").glob("*.json"))
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("grace", [0, -1, float("nan"), float("inf"), "invalid"])
+def test_explicit_invalid_grace_writes_alert_receipt(tmp_path, monkeypatch, grace):
+    home, plist, label, *_ = layout(tmp_path)
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    assert guardian.run_once(home, plist, label, grace=grace) == "alert"
+
 
 @pytest.mark.macos_only
 def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
-    assert guardian.run_once(home, plist, label, grace=0) == "repaired"
+    assert guardian.run_once(home, plist, label, grace=0.000001) == "repaired"
     assert [row[1] for row in calls].count("bootstrap") == 1
     assert calls[-1][1] == "print"
     assert any(json.loads(path.read_text(encoding="utf-8"))["outcome"] == "repaired"
@@ -155,7 +181,7 @@ def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch
     assert guardian.run_once(home, plist, label, grace=180) == "waiting"
     txn["reload_ack"] = {"gateway_pid": 123}
     last.write_text(json.dumps(txn), encoding="utf-8")
-    assert guardian.run_once(home, plist, label, grace=0) == "waiting"
+    assert guardian.run_once(home, plist, label, grace=0.000001) == "waiting"
     assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
 
 
@@ -201,7 +227,7 @@ def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch
     assert guardian.run_once(home, plist, label, grace=180, domain="gui/501") == "waiting"
     assert not any(row[1] == "bootstrap" for row in calls)
     monkeypatch.setattr(guardian, "rollback_switch", lambda *args, **kwargs: True)
-    assert guardian.run_once(home, plist, label, grace=0, domain=f"gui/{os.getuid()}") == "rolled_back"
+    assert guardian.run_once(home, plist, label, grace=0.000001, domain=f"gui/{os.getuid()}") == "rolled_back"
     assert not any(row[1] == "bootstrap" for row in calls)
 
 
@@ -356,9 +382,9 @@ def test_failed_switch_rolls_back_only_verified_previous(tmp_path, monkeypatch):
     monkeypatch.setattr(guardian, "healthy", lambda *args: False)
     done = []
     monkeypatch.setattr(guardian, "rollback_switch", lambda *args, **kwargs: done.append(True) or True)
-    assert guardian.run_once(home, plist, label, grace=0) == "rolled_back"
+    assert guardian.run_once(home, plist, label, grace=0.000001) == "rolled_back"
     assert done == [True]
     (a / ".release-ready").unlink()
     done.clear()
-    assert guardian.run_once(home, plist, label, grace=0) == "alert"
+    assert guardian.run_once(home, plist, label, grace=0.000001) == "alert"
     assert done == []
