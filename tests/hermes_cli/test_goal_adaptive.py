@@ -1,0 +1,304 @@
+"""Adaptive goals: cited evidence reaches the judge, disputes pause only without new evidence,
+long responses keep their closing evidence, and goal revisions are versioned and authority-checked.
+
+Regression sources (read-only replay of the live store, 2026-09-28): two disputed pauses where the
+judge said the gate result / plugin test count was missing while the tool results sat 69 and 16
+results before the completion claim, outside the last-8 evidence window; and goals whose user
+descoping could only be appended as subgoals while the superseded criteria stayed binding.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from unittest.mock import patch
+
+import pytest
+
+from hermes_cli import goals
+from hermes_cli.goals import GoalContract, GoalManager, load_goal
+
+
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
+
+
+def _db(session_id):
+    db = goals._get_session_db()
+    assert db is not None
+    db.ensure_session(session_id, source="telegram")
+    return db
+
+
+def _tool(db, sid, name, args, output, call_id):
+    db.append_message(sid, "assistant", "", tool_calls=[{
+        "id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}])
+    db.append_message(sid, "tool", output, tool_name=name, tool_call_id=call_id)
+
+
+def _capture(monkeypatch, replies):
+    prompts, replies = [], iter(replies)
+
+    def capture(_call, _system, prompt, _timeout):
+        prompts.append(prompt)
+        return next(replies)
+
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", capture)
+    return prompts
+
+
+GATE = json.dumps({"output": "gate_exit=0 exact_sha=94d6cf5891ffe6f42ba720d4966a2b6a466f29d3", "exit_code": 0})
+CLAIM = ("Done. Evidence: the gate `exact_sha=94d6cf5891ffe6f42ba720d4966a2b6a466f29d3` exited 0 "
+         "and the suite printed `65 passed in 32.49s`.")
+
+
+# ── cited evidence ─────────────────────────────────────────────────────
+
+
+def test_cited_evidence_outside_the_recent_window_reaches_the_judge(hermes_home, monkeypatch):
+    sid = "cite-old"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it", contract=GoalContract(verification="gate passes on the exact head; tests pass"))
+    _tool(db, sid, "terminal", {"command": "./bin/ci gate"}, GATE, "gate")
+    _tool(db, sid, "terminal", {"command": "pytest"}, '{"output": "65 passed in 32.49s"}', "tests")
+    for i in range(goals._EVIDENCE_MAX_ENTRIES + 20):
+        _tool(db, sid, "read_file", {"path": f"f{i}"}, f"content {i}", f"r{i}")
+    prompts = _capture(monkeypatch, ['{"verdict":"done","reason":"cited evidence located"}'])
+
+    decision = mgr.evaluate_after_turn(CLAIM)
+
+    assert decision["verdict"] == "done"
+    cited = prompts[0].split("Evidence the response cites")[1]
+    assert "gate_exit=0 exact_sha=94d6cf5891ffe6f42ba720d4966a2b6a466f29d3" in cited
+    assert "65 passed in 32.49s" in cited
+    # Outside the recency window: the ledger alone would not have shown them.
+    assert "exact_sha=94d6cf5" not in prompts[0].split("Tool results recorded")[1]
+
+
+def test_fabricated_citations_are_listed_as_unverified(hermes_home, monkeypatch):
+    sid = "cite-fake"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    _tool(db, sid, "terminal", {"command": "./bin/ci gate"}, GATE, "gate")
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","disputed":true,"reason":"unverified"}'])
+
+    mgr.evaluate_after_turn("Done: `exact_sha=deadbeefcafe0000111122223333444455556666` and `999 passed in 0.01s`.")
+
+    assert "NOT found in any recorded tool result" in prompts[0]
+    unresolved = prompts[0].split("NOT found in any recorded tool result")[1]
+    assert "deadbeefcafe0000111122223333444455556666" in unresolved and "999 passed" in unresolved
+    assert "Evidence the response cites" not in prompts[0]
+
+
+def test_agent_prose_and_bookkeeping_tools_never_count_as_cited_evidence(hermes_home):
+    sid = "cite-prose"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    db.append_message(sid, "assistant", "I ran it: `release_id=rel_abcdef123456`")
+    _tool(db, sid, "memory", {"action": "add"}, "noted release_id=rel_abcdef123456", "mem")
+    _tool(db, sid, "goal_set", {"action": "status"}, "release_id=rel_abcdef123456", "gs")
+
+    result = goals.resolve_cited_evidence(sid, "Evidence: `release_id=rel_abcdef123456`", since=mgr.state.created_at)
+
+    assert result["cited"] == []
+    assert "release_id=rel_abcdef123456" in result["unresolved"]
+
+
+def test_cited_command_resolves_to_its_result_and_notices_count(hermes_home):
+    sid = "cite-command"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    _tool(db, sid, "terminal", {"command": "agentkit check-live --mode enforce"},
+          '{"output": "passed=True findings=0"}', "cl")
+    db.append_message(sid, "user", "[ASYNC DELEGATION BATCH COMPLETE — deleg_1]\n"
+                      '```json\n{"head_sha": "249640ec2cce05aa9e742e0543fb4535239ae91b", "verdict": "approve"}\n```')
+
+    result = goals.resolve_cited_evidence(
+        sid, 'Ran `check-live --mode enforce`; review `"verdict": "approve"` on '
+             '`249640ec2cce05aa9e742e0543fb4535239ae91b`.', since=mgr.state.created_at)
+
+    by_needle = {c["needle"]: c for c in result["cited"]}
+    assert "passed=True findings=0" in by_needle["check-live --mode enforce"]["excerpt"]
+    assert by_needle['"verdict": "approve"']["tool"].startswith("delegation result")
+    assert result["unresolved"] == []
+
+
+def test_ordinary_user_text_is_not_citable_evidence(hermes_home):
+    sid = "cite-user"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    db.append_message(sid, "user", "please make sure `build_id=bld_12345678` is live")
+
+    result = goals.resolve_cited_evidence(sid, "Live: `build_id=bld_12345678`", since=mgr.state.created_at)
+
+    assert result["cited"] == [] and "build_id=bld_12345678" in result["unresolved"]
+
+
+def test_cited_excerpts_are_redacted(hermes_home):
+    sid = "cite-redact"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    secret = "ghp_" + "b" * 36
+    _tool(db, sid, "terminal", {"command": "deploy"}, f"deploy_id=dep_0123456789 token={secret}", "d")
+
+    result = goals.resolve_cited_evidence(sid, "Deployed `deploy_id=dep_0123456789`.", since=mgr.state.created_at)
+
+    assert result["cited"] and secret not in result["cited"][0]["excerpt"]
+
+
+def test_extraction_prefers_the_closing_evidence_and_skips_bare_words():
+    body = " ".join(f"`item_{i:04d}_x`" for i in range(60))
+    text = f"Summary {body}\n\nEvidence: `exact_sha=abcdef1234567` and 12 passed. `independent`"
+    needles = goals.extract_citations(text)
+    assert needles[0] == "12 passed" or "exact_sha=abcdef1234567" in needles[:3]
+    assert "independent" not in needles
+    assert len(needles) <= goals._CITATION_MAX_NEEDLES
+
+
+def test_prompt_without_citations_is_unchanged(monkeypatch):
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'] * 2)
+    goals.judge_goal("Finish the work", "did a thing", timeout=1)
+    goals.judge_goal("Finish the work", "did a thing", citations={"cited": [], "unresolved": []}, timeout=1)
+    assert prompts[0] == prompts[1]
+    assert "Evidence the response cites" not in prompts[0] and "Revision history" not in prompts[0]
+
+
+# ── response window ───────────────────────────────────────────────────
+
+
+def test_judge_sees_the_closing_evidence_of_a_long_response(monkeypatch):
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
+    response = "intro " + "x" * 12000 + " EVIDENCE: gate exit 0"
+    goals.judge_goal("Finish", response, timeout=1)
+    assert "EVIDENCE: gate exit 0" in prompts[0]
+    assert "chars omitted" in prompts[0]
+    assert response not in prompts[0]
+
+
+# ── dispute stall breaker ─────────────────────────────────────────────
+
+DISPUTED = ("continue", "tests missing", False, {"disputed": True}, False)
+
+
+def test_disputes_with_new_evidence_do_not_pause(hermes_home):
+    mgr = GoalManager(session_id="dispute-progress")
+    mgr.set("ship", max_turns=100)
+    fingerprints = iter([{"cited": [], "unresolved": [], "fingerprint": f"fp{i}"} for i in range(5)])
+    with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
+            patch.object(goals, "resolve_cited_evidence", side_effect=lambda *a, **k: next(fingerprints)):
+        decisions = [mgr.evaluate_after_turn("done") for _ in range(5)]
+    assert all(d["should_continue"] for d in decisions)
+    assert mgr.state.consecutive_disputes == 1
+
+
+def test_disputes_without_new_evidence_pause_at_the_limit(hermes_home):
+    mgr = GoalManager(session_id="dispute-stuck")
+    mgr.set("ship", max_turns=100)
+    same = {"cited": [], "unresolved": [], "fingerprint": "same"}
+    with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
+            patch.object(goals, "resolve_cited_evidence", return_value=same):
+        decisions = [mgr.evaluate_after_turn("done") for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES)]
+    assert all(d["should_continue"] for d in decisions[:-1])
+    assert decisions[-1]["verdict"] == "disputed" and not decisions[-1]["should_continue"]
+    assert "without new evidence" in decisions[-1]["message"]
+    assert load_goal("dispute-stuck").paused_reason.startswith(goals._DISPUTED_PAUSE_PREFIX)
+
+
+# ── revisions ─────────────────────────────────────────────────────────
+
+
+def test_agent_may_restructure_verification_without_user_authority(hermes_home, monkeypatch):
+    mgr = GoalManager(session_id="rev-verify")
+    mgr.set("Ship X", contract=GoalContract(verification="12-item checklist"))
+    result = mgr.revise(reason="checklist moved to plan file", contract={"verification": "outcome holds live"},
+                        user_messages=[])
+    assert result["ok"] and result["version"] == 2
+    persisted = load_goal("rev-verify")
+    assert persisted.contract.verification == "outcome holds live"
+    assert persisted.revisions[0]["before"] == {"verification": "12-item checklist"}
+    assert persisted.revisions[0]["actor"] == "agent" and persisted.revisions[0]["user_quote"] == ""
+
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
+    mgr.evaluate_after_turn("working")
+    history = prompts[0].split("Revision history")[1]
+    assert "agent, no user authority" in history and "was verification: 12-item checklist" in history
+    assert "cannot lower the bar" in prompts[0]
+
+
+@pytest.mark.parametrize("change", [
+    {"goal": "Ship a smaller X"},
+    {"contract": {"constraints": ""}},
+    {"subgoals": []},
+])
+def test_objective_constraints_and_dropped_criteria_need_a_real_user_quote(hermes_home, change):
+    mgr = GoalManager(session_id="rev-authority")
+    mgr.set("Ship X", contract=GoalContract(constraints="no downtime"))
+    mgr.add_subgoal("also migrate Willow")
+
+    missing = mgr.revise(reason="descoped", user_messages=["drop Willow and ship a smaller X, skip downtime rule"],
+                         **change)
+    invented = mgr.revise(reason="descoped", user_quote="the user said drop everything",
+                          user_messages=["drop Willow and ship a smaller X, skip downtime rule"], **change)
+    real = mgr.revise(reason="descoped", user_quote="drop Willow and ship a smaller X",
+                      user_messages=["ok. drop Willow and ship a smaller X,   skip downtime rule"], **change)
+
+    assert missing["error_code"] == "user_authority_required"
+    assert invented["error_code"] == "user_quote_not_found"
+    assert real["ok"] and load_goal("rev-authority").revisions[-1]["user_quote"] == "drop Willow and ship a smaller X"
+
+
+def test_user_quote_is_checked_against_real_user_messages_only(hermes_home):
+    sid = "rev-session"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship X")
+    time.sleep(0.01)
+    db.append_message(sid, "user", "[Continuing toward your standing goal]\nGoal: Ship a smaller X")
+    db.append_message(sid, "user", '[Replying to: "Want me to ship a smaller X instead?"]\n\nno, keep going')
+    db.append_message(sid, "assistant", "I will ship a smaller X")
+
+    spoofed = mgr.revise(reason="descope", goal="Ship a smaller X", user_quote="ship a smaller X")
+    db.append_message(sid, "user", "fine, just ship a smaller X for now")
+    real = mgr.revise(reason="descope", goal="Ship a smaller X", user_quote="just ship a smaller X")
+
+    assert spoofed["error_code"] == "user_quote_not_found"
+    assert real["ok"]
+
+
+def test_revision_validation(hermes_home):
+    mgr = GoalManager(session_id="rev-validate")
+    mgr.set("Ship X")
+    assert mgr.revise(reason="", contract={"verification": "v"})["error_code"] == "reason_required"
+    assert mgr.revise(reason="r")["error_code"] == "no_change"
+    assert mgr.revise(reason="r", contract={"bogus": "v"})["error_code"] == "unknown_field"
+
+
+def test_revision_resets_the_dispute_streak_and_round_trips(hermes_home):
+    mgr = GoalManager(session_id="rev-roundtrip")
+    mgr.set("Ship X", max_turns=100)
+    mgr.state.consecutive_disputes = 2
+    mgr.revise(reason="clarify", contract={"outcome": "X live"}, user_messages=[])
+    assert mgr.state.consecutive_disputes == 0
+    state = load_goal("rev-roundtrip")
+    assert goals.GoalState.from_json(state.to_json()).revisions == state.revisions
+
+
+def test_legacy_state_without_revisions_loads():
+    legacy = json.dumps({"goal": "g", "status": "active", "turns_used": 3})
+    state = goals.GoalState.from_json(legacy)
+    assert state.revisions == [] and state.last_dispute_evidence == "" and state.render_revisions_block() == ""

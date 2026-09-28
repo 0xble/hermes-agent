@@ -117,6 +117,29 @@ The first non-field line(s) are the goal headline; recognized field prefixes (`v
 
 Use `/goal show` to review the active contract. Contracts persist in `SessionDB.state_meta` alongside the goal, so they survive `/resume`. Old goals from before this feature load unchanged (no contract). Contracts and `/subgoal` criteria compose: subgoals fold into the contract as extra criteria the judge must also satisfy.
 
+### Writing goals that adapt
+
+A goal names the end state, not the route. Plans change during long work, and a contract that encodes the route turns every change of method into a dispute with the judge.
+
+- **One objective, one checkable end state.** Say what must be true when you are done and how you would check it on the live system, for example "the gateway runs the merged SHA and the restart canary passes." Avoid per-step receipts such as a review for every PR or a named list of files.
+- **Constraints are hard limits only.** Include things that must never happen or must stay true, not preferences.
+- **Keep the steps in a plan file.** Put the checklist, the PR list and the order of work in a plan the agent updates, and reference it from the goal. Codex's guidance is the same: keep the objective short and point it at a file for detail.
+- **Leave long waits out.** Multi-day soaks, weekly runs or "three clean days" don't finish inside a session. Finish the deliverable, then hand the wait to a cron or watcher.
+- **Revise instead of accumulating.** When scope changes, revise the goal (see below) rather than adding contradictory subgoals.
+
+### Evidence the judge can see
+
+The judge sees the start and the end of the agent's reply, the most recent tool results, and **every identifier the reply cites**. Backticked values, quoted strings, commit SHAs, URLs, run or deploy ids and `N passed` lines are looked up verbatim in every tool result recorded since the goal was set, even ones from hundreds of calls earlier or already compacted out of context. The judge gets the matching excerpts. Citations that match no recorded result are listed as unproven, so a made-up SHA or test count cannot pass as evidence.
+
+The continuation prompt asks the agent to end a completion claim with an Evidence section that quotes these identifiers. A dispute names the single criterion that lacks evidence and the check that would prove it. The goal pauses as "judge disputed completion" only after 3 disputes in a row that bring no newly located evidence.
+
+### Revising a goal
+
+The agent can revise the active goal through its `goal_set` tool (`action=revise`) with a reason. Each revision is versioned and sent to you as a notice. The judge sees the revision history and the continuation prompt carries the current version, so superseded wording stops binding.
+
+- The agent may reword or restructure the outcome, verification, boundaries and stop condition. The judge still holds it to any earlier requirement such a revision weakened.
+- Changing the objective or the constraints, or dropping a subgoal, needs your authority. The agent must quote your instruction verbatim from a message you sent since the goal was set, or the revision is rejected.
+
 ## Adding criteria mid-goal: `/subgoal`
 
 While a goal is active you can append extra acceptance criteria with `/subgoal <text>` without resetting the loop. Each call adds one numbered item to the goal's subgoal list; the **continuation prompt** the agent sees on the next turn includes the original goal plus an "Additional criteria the user added mid-loop" block, and the **judge prompt** is rewritten so the verdict must consider every subgoal — the goal isn't marked done until the original objective **and** every subgoal are met.

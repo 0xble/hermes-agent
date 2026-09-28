@@ -1089,6 +1089,64 @@ class SessionMessagesMixin:
                 rows.reverse()
         return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
 
+    def find_messages_containing(self, session_id: str, needle: str, *, role: str = "tool",
+                                 since: float = 0.0, limit: int = 1) -> List[Dict[str, Any]]:
+        """Newest-first rows of ``role`` whose content contains ``needle`` byte-exactly (``instr``, so no
+        LIKE wildcards or case folding). Scans every row including compaction-archived and superseded
+        ones: a recorded tool result stays evidence after the transcript that showed it was summarized."""
+        if not session_id or not needle:
+            return []
+        rows = self._read_all(
+            """SELECT id, tool_call_id, tool_name, content, timestamp FROM messages
+                WHERE session_id = ? AND role = ? AND timestamp >= ? AND instr(content, ?) > 0
+                ORDER BY id DESC LIMIT ?""",
+            (session_id, role, float(since or 0.0), needle, max(int(limit), 1)))
+        return [{"id": row[0], "tool_call_id": row[1], "tool_name": row[2], "content": row[3],
+                 "timestamp": row[4]} for row in rows]
+
+    def messages_by_role(self, session_id: str, role: str, *, since: float = 0.0,
+                         limit: int = 500) -> List[Dict[str, Any]]:
+        """Newest-first ``{id, content, timestamp}`` rows of one role at or after ``since``, every row
+        state included (audit read, not display)."""
+        if not session_id:
+            return []
+        rows = self._read_all(
+            """SELECT id, content, timestamp FROM messages
+                WHERE session_id = ? AND role = ? AND timestamp >= ? ORDER BY id DESC LIMIT ?""",
+            (session_id, role, float(since or 0.0), max(int(limit), 1)))
+        return [{"id": row[0], "content": row[1], "timestamp": row[2]} for row in rows]
+
+    def find_tool_results_for_call(self, session_id: str, needle: str, *, since: float = 0.0,
+                                   limit: int = 4) -> List[Dict[str, Any]]:
+        """Newest-first tool results whose originating call's arguments contain ``needle`` byte-exactly,
+        each with the call ``arguments``. Every row state is scanned (audit read)."""
+        if not session_id or not needle:
+            return []
+        calls = self._read_all(
+            """SELECT tool_calls FROM messages WHERE session_id = ? AND role = 'assistant'
+                AND timestamp >= ? AND instr(tool_calls, ?) > 0 ORDER BY id DESC LIMIT ?""",
+            (session_id, float(since or 0.0), needle, max(int(limit), 1)))
+        wanted: Dict[str, str] = {}
+        for (raw,) in calls:
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, ValueError):
+                continue
+            for call in parsed if isinstance(parsed, list) else []:
+                fn = (call or {}).get("function") or {}
+                args = str(fn.get("arguments") or "")
+                if call.get("id") and needle in args:
+                    wanted[str(call["id"])] = args
+        if not wanted:
+            return []
+        rows = self._read_all(
+            f"""SELECT id, tool_call_id, tool_name, content, timestamp FROM messages
+                WHERE session_id = ? AND role = 'tool' AND tool_call_id IN ({_placeholders(list(wanted))})
+                ORDER BY id DESC LIMIT ?""",
+            (session_id, *wanted, max(int(limit), 1)))
+        return [{"id": row[0], "tool_call_id": row[1], "tool_name": row[2], "content": row[3],
+                 "timestamp": row[4], "arguments": wanted.get(str(row[1]), "")} for row in rows]
+
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
         """Tool results containing ``/pull/``: a deliberately loose scan, oldest-first so the caller takes the last."""
         ids = [s for s in session_ids if s]
