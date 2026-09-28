@@ -82,7 +82,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[new [name]|list|prune [--dry-run]]",
                subcommands=("new", "list", "prune")),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
-               aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]",
+               aliases=("compact",), args_hint="[here [N] | focus topic | --level 1-3 | --preview|--dry-run]",
                busy_policy="defer_until_idle"),
     CommandDef("rollback", "List or restore filesystem checkpoints (restores keep your hand-edits; --all overrides)", "Session",
                args_hint="[number] [--all]"),
