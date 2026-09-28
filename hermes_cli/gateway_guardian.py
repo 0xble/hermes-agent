@@ -16,6 +16,7 @@ import uuid
 import yaml
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from hermes_constants import get_hermes_home
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
@@ -282,8 +283,12 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             return "locked"
         try:
             from hermes_cli.config import _validate_updates
-            from hermes_cli.config_effective import load_user_config_effective
-            config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+            config: dict[str, Any]
+            if grace is None or (home / "config.yaml").is_file():
+                from hermes_cli.config_effective import load_user_config_effective
+                config = load_user_config_effective(home / "config.yaml", fail_closed=True)
+            else:
+                config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
             # The legacy guardian only knows one launchd label. Until overlap repair has
             # its own fenced protocol, it must not bootstrap or roll back either generation.
             gateway_config = config.get("gateway") or {}
