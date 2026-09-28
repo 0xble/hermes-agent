@@ -67,6 +67,78 @@ class TestBrowserCleanup:
         assert mock_run.call_args.args[:2] == ("task-1", "close")
 
 
+    def test_closed_card_session_does_not_redact_reused_session(self):
+        from agent.redact import (
+            clear_vault_date_components, has_vault_date_components,
+            has_vault_scoped_components, register_vault_card_component,
+        )
+        from agent.browser_output_egress import scrub_browser_result
+        from tools import browser_tool
+
+        task, origin = "card-close-check", "https://checkout.test"
+        browser_tool._active_sessions[task] = {
+            "session_key": task, "session_name": "", "bb_session_id": None,
+            "features": {"local": True},
+        }
+        register_vault_card_component("billing_postal_code", "94110", tab=task, origin=origin)
+        try:
+            assert has_vault_scoped_components(task)
+            assert not has_vault_date_components(task)
+            with patch("tools.browser_tool_lifecycle._bt._is_camofox_mode", return_value=False), \
+                 patch("tools.browser_tool_lifecycle._cdp._stop_cdp_supervisor"), \
+                 patch("tools.browser_tool_lifecycle._bt._maybe_stop_recording"), \
+                 patch("tools.browser_tool_lifecycle._session_has_expired", return_value=False), \
+                 patch("tools.browser_tool_lifecycle._session._run_browser_command", return_value={"success": True}) as close:
+                bt_lifecycle.cleanup_browser(task)
+            close.assert_called_once_with(task, "close", [], timeout=10)
+            assert task not in browser_tool._active_sessions
+            assert not has_vault_scoped_components(task)
+
+            # The next browser generation can use the same task key and origin.
+            browser_tool._active_sessions[task] = {
+                "session_key": task, "session_name": "", "bb_session_id": None,
+                "features": {"local": True},
+            }
+            with patch("tools.browser_vault_tool._current_page_origin", return_value=origin):
+                result = scrub_browser_result("browser_snapshot", '{"snapshot":"postal=94110"}', task)
+            assert result == '{"snapshot":"postal=94110"}'
+        finally:
+            clear_vault_date_components(task)
+
+    def test_failed_card_close_releases_scope_on_force_reap(self):
+        from agent.redact import (
+            clear_vault_date_components, has_vault_scoped_components,
+            register_vault_card_component,
+        )
+        from tools import browser_tool
+
+        task = "card-reap-check"
+        browser_tool._active_sessions[task] = {
+            "session_key": task, "session_name": "", "bb_session_id": None,
+            "features": {"local": True},
+        }
+        register_vault_card_component("exp_month", "07", tab=task, origin="https://checkout.test")
+        try:
+            with patch("tools.browser_tool_lifecycle._cdp._stop_cdp_supervisor"), \
+                 patch("tools.browser_tool_lifecycle._bt._maybe_stop_recording"), \
+                 patch("tools.browser_tool_lifecycle._session_has_expired", return_value=False), \
+                 patch("tools.browser_tool_lifecycle._session._run_browser_command", return_value={"success": False}):
+                bt_lifecycle.cleanup_browser(task)
+            assert task not in browser_tool._active_sessions
+            assert not has_vault_scoped_components(task)
+
+            browser_tool._active_sessions[task] = {
+                "session_key": task, "session_name": "", "bb_session_id": None,
+                "features": {"local": True},
+            }
+            register_vault_card_component("exp_month", "07", tab=task, origin="https://checkout.test")
+            with patch("tools.browser_tool_lifecycle._cdp._stop_cdp_supervisor"):
+                bt_lifecycle._force_reap_browser_session(task)
+            assert task not in browser_tool._active_sessions
+            assert not has_vault_scoped_components(task)
+        finally:
+            clear_vault_date_components(task)
+
     def test_emergency_cleanup_clears_all_tracking_state(self):
         browser_tool = self.browser_tool
         browser_tool._cleanup_done = False

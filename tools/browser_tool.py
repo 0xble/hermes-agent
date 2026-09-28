@@ -731,9 +731,9 @@ def _snapshot_fields(snap_result: Dict[str, Any], nav_session_key: str = "defaul
     data = snap_result.get("data", {})
     snapshot_text = data.get("snapshot", "")
     refs = data.get("refs", {})
-    from agent.redact import has_vault_date_components, redact_registered_vault_snapshot
+    from agent.redact import has_vault_scoped_components, redact_registered_vault_snapshot
     origin = ""
-    if has_vault_date_components(nav_session_key):
+    if has_vault_scoped_components(nav_session_key):
         from tools.browser_vault_tool import _current_page_origin
         origin = _current_page_origin(nav_session_key) or ""
     snapshot_text = redact_registered_vault_snapshot(snapshot_text, tab=nav_session_key, origin=origin)
