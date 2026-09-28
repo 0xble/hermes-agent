@@ -121,6 +121,9 @@ async def test_reason_progress_and_final_survive_restart_and_delivery_failure(tm
         assert read_pending(tmp_path)[1]["reason"] == reason
         adapter.send.side_effect = None
         adapter.send.return_value = SimpleNamespace(success=True)
+        marker, record = read_pending(tmp_path)
+        record["notice_retry_at"] = 0  # advance beyond the persisted backoff
+        marker.write_text(json.dumps(record), encoding="utf-8")
         results = await asyncio.gather(second._send_update_notification(), second._send_update_notification())
         assert results.count(True) == 1
         assert read_pending(tmp_path) is None
@@ -159,7 +162,13 @@ async def test_stream_retry_only_sends_unsent_chunk(tmp_path):
         watcher = asyncio.create_task(runner._watch_update_progress(
             poll_interval=.01, stream_interval=.01, timeout=10))
         try:
+            retry_advanced = False
             for _ in range(300):
+                if failed and not retry_advanced:
+                    marker, record = read_pending(tmp_path)
+                    record["notice_retry_at"] = 0
+                    marker.write_text(json.dumps(record), encoding="utf-8")
+                    retry_advanced = True
                 if failed and read_pending(tmp_path)[1].get("output_offset") == output.stat().st_size:
                     break
                 await asyncio.sleep(.01)
@@ -196,6 +205,9 @@ async def test_final_retry_only_sends_unsent_chunk_and_then_final(tmp_path):
         assert await runner._send_update_notification() is False
         assert read_pending(tmp_path)[1]["output_offset"] == 3500
         assert not any(text.startswith("✅") for text in calls)
+        marker, record = read_pending(tmp_path)
+        record["notice_retry_at"] = 0
+        marker.write_text(json.dumps(record), encoding="utf-8")
         assert await runner._send_update_notification() is True
     chunks = [text for text in calls if text.startswith("```")]
     assert sum("A" in text for text in chunks) == 1
@@ -320,6 +332,89 @@ async def test_failed_legacy_update_output_never_claims_success(tmp_path):
     assert "Hermes update failed" in sent and "code 7" in sent
     assert "successfully" not in sent
     assert read_pending(tmp_path) is None
+
+
+@pytest.mark.asyncio
+async def test_housekeeping_retries_undelivered_notice_after_watcher_deadline(tmp_path):
+    from gateway.run import _start_gateway_housekeeping
+    pending(tmp_path)
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    # A completed watcher has stopped trying; the regular tick must recover it.
+    runner._update_notification_task = asyncio.get_running_loop().create_future()
+    runner._update_notification_task.set_result(None)
+    stop = __import__("threading").Event()
+    loop = asyncio.get_running_loop()
+
+    def tick(*_args):
+        stop.set()
+
+    with patch("gateway.run._hermes_home", tmp_path), \
+         patch("gateway.run._write_runtime_status_quiet"), \
+         patch("gateway.run._housekeeping_chore", side_effect=lambda label, fn: fn() if label == "Update notice retry" else None), \
+         patch("gateway.run_delivery_queue_watch.wait_for_next_tick", side_effect=tick):
+        await asyncio.to_thread(_start_gateway_housekeeping, stop, loop=loop, runner=runner)
+        for _ in range(100):
+            if read_pending(tmp_path) is None:
+                break
+            await asyncio.sleep(.01)
+    assert read_pending(tmp_path) is None
+    assert any("Update Complete" in call.args[1] for call in adapter.send.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_superseded_watcher_cannot_clear_new_marker(tmp_path):
+    data = pending(tmp_path)
+    finalize_update(tmp_path)
+    runner = _make_runner()
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=False, error="flood_control:120")))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    from gateway.update_launcher import launch_native_update
+    with patch("gateway.run._hermes_home", tmp_path):
+        old = asyncio.create_task(runner._watch_update_progress(poll_interval=.01, stream_interval=.01, timeout=1))
+        for _ in range(100):
+            if read_pending(tmp_path)[1].get("notice_retry_at"):
+                break
+            await asyncio.sleep(.01)
+        assert read_pending(tmp_path)[1].get("notice_retry_at")
+        assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"],
+                                    pending={**data, "reason": "second request"}, spawn=Mock())["started"]
+        await asyncio.wait_for(old, 2)
+    current = read_pending(tmp_path)
+    assert current is not None and current[1]["reason"] == "second request"
+
+
+@pytest.mark.asyncio
+async def test_notice_retry_honors_flood_delay_and_prior_result(tmp_path):
+    from gateway.update_notifications import save_pending
+    data = pending(tmp_path)
+    marker, data = read_pending(tmp_path)
+    data["previous_outcome"] = {"reason": "Earlier change", "success": True,
+                                "detail": "Verified earlier revision"}
+    save_pending(marker, data)
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(
+        success=False, error="flood_control:7200")))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert not await runner._send_update_notification()
+        marker, deferred = read_pending(tmp_path)
+        assert deferred["notice_retry_at"] - datetime.now(timezone.utc).timestamp() > 7100
+        before = adapter.send.call_count
+        runner._retry_update_notice_if_due()
+        await asyncio.sleep(0)
+        assert adapter.send.call_count == before
+        deferred["notice_retry_at"] = 0
+        save_pending(marker, deferred)
+        adapter.send.return_value = SimpleNamespace(success=True)
+        runner._retry_update_notice_if_due()
+        await runner._update_notice_retry_task
+    assert read_pending(tmp_path) is None
+    text = adapter.send.call_args_list[-1].args[1]
+    assert "Earlier change" in text and "Verified earlier revision" in text
 
 
 @pytest.mark.asyncio
