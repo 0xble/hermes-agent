@@ -53,10 +53,10 @@ class _Manager(LoginBackend):
         return dict(_CARD)
 
 
-def _run_fill(page_url, decision="accept", focused=None):
+def _run_fill(page_url, decision="accept", focused=None, controls=_CONTROLS, after_consent=None):
     from tools import browser_vault_tool
-    prompts, secret_exprs, focus_calls = [], [], []
-    page = {"url": page_url}
+    prompts, secret_exprs, focus_calls, order, nonces = [], [], [], [], []
+    page = {"url": page_url, "controls": controls}
 
     def fake_focus(task_id, origin, kind):
         # Mirrors _focus_bound_origin: returns the requested origin (or the focused tab's URL when asked
@@ -70,14 +70,19 @@ def _run_fill(page_url, decision="accept", focused=None):
     def fake_eval(task_id, expression):
         if "location.href" in expression:
             return {"success": True, "result": page["url"]}
-        return {"success": True, "result": json.dumps(_CONTROLS)}
+        order.append("inspect")
+        nonces.append(expression.split("const nonce = ", 1)[1].split(";", 1)[0])
+        return {"success": True, "result": json.dumps(page["controls"])}
 
     def fake_eval_secret(task_id, expression):
         secret_exprs.append(expression)
         return {"success": True, "result": json.dumps({"filled": 3})}
 
     def consent(message, description, **kw):
+        order.append("prompt")
         prompts.append(message)
+        if after_consent is not None:
+            page["controls"] = after_consent  # the page changed while the prompt waited
         return decision
 
     backend = _Manager()
@@ -88,6 +93,8 @@ def _run_fill(page_url, decision="accept", focused=None):
          patch("tools.approval_prompt.request_elicitation_consent", side_effect=consent):
         raw = browser_vault_tool.browser_vault_fill("mg:card")
     _run_fill.focus_calls = focus_calls
+    _run_fill.order = order
+    _run_fill.nonces = nonces
     return raw, prompts, secret_exprs
 
 
@@ -123,6 +130,38 @@ def test_manager_card_declined_writes_nothing():
     raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout", decision="decline")
     assert json.loads(raw)["error_type"] == "payment_declined"
     assert prompts == ["Fill payment card 'Amex' on https://shop.test"] and secret_exprs == []
+    # The user is asked only after the page was inspected and found to hold card targets.
+    assert _run_fill.order == ["inspect", "prompt"]
+
+
+@pytest.mark.parametrize("controls", [
+    [],  # card inputs live in a processor's cross-origin frame the inspection never enters
+    [{"autocomplete": "postal-code", "index": 0, "type": "text"},
+     {"autocomplete": "cc-name", "index": 1, "type": "text"}],  # billing inputs only, card number framed
+], ids=["no-controls", "no-card-number"])
+def test_card_fill_that_cannot_pay_never_prompts(controls):
+    raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout", controls=controls)
+    out = json.loads(raw)
+    assert out["success"] is False and out["error_type"] == "no_payment_fields"
+    assert prompts == [] and secret_exprs == []
+
+
+def test_card_fill_writes_only_targets_stamped_after_consent():
+    from agent import redact
+    try:
+        raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout")
+        assert json.loads(raw)["success"] is True and len(prompts) == 1
+        assert _run_fill.order == ["inspect", "prompt", "inspect"]
+        pre, post = _run_fill.nonces
+        assert pre != post and post in secret_exprs[0] and pre not in secret_exprs[0]
+    finally:
+        redact.clear_vault_redaction_values()
+
+
+def test_card_fields_gone_during_the_prompt_write_nothing():
+    raw, prompts, secret_exprs = _run_fill("https://shop.test/checkout", after_consent=[])
+    assert json.loads(raw)["error_type"] == "no_payment_fields"
+    assert len(prompts) == 1 and secret_exprs == []
 
 
 def test_manager_card_without_a_page_is_refused_before_prompting():

@@ -42,6 +42,12 @@ the browser vault fill tool, or the 1Password backends.
   `resolve_secret` onto the local-vault `PAYMENT_FIELDS` shape. A manager's card binds to the
   current page origin at fill time and the existing payment confirmation names that origin;
   local-vault cards keep their saved-origin binding. A card handle never resolves as a login.
+- A payment fill prompts only after the origin check and a stamped inspection find a card-number
+  target. A page without one returns `no_payment_fields` and never asks: card inputs in a payment
+  processor's cross-origin frame are unreachable by design. That inspection only decides whether to
+  ask. After consent the page is inspected again with a fresh nonce, and only those stamps are
+  written. Card consent is one-shot: the prompt offers Allow Once and Deny, and a session or
+  permanent answer never approves or consumes it (adopted from upstream PR 118429).
 - Configured 1Password protected fields expose only an opaque handle and semantic token. They
   remain exact-origin bound, resolve server-side, and fill only a matching supported control
   in a verified task-owned local Chromium session. Birth-date fills refuse all Camofox
@@ -88,6 +94,10 @@ the browser vault fill tool, or the 1Password backends.
   `op-quota-resilience` (own fork fix: last-good 1Password secrets on rate limit or
   outage, a display-only listing cache, https for bare-host websites, and a stop at the
   first 429 with a 15-minute per-identity cooldown shared across processes).
+  `vault-payment-consent-order` (own fork fix, 2026-09-28: prompt only once card targets are
+  found, then re-inspect after consent). Plus `mcp-elicitation-one-shot`, adopted from upstream
+  [PR 118429](https://github.com/NousResearch/hermes-agent/pull/118429) at
+  `7617f8ef5a95d3f653b1f9c8788bb6798f00cd55` (open, CI awaiting maintainer approval).
   Upstream batching [PR #116616](https://github.com/NousResearch/hermes-agent/pull/116616)
   now has [cooldown composition evidence](https://github.com/NousResearch/hermes-agent/pull/116616#issuecomment-5851006887).
   Batching alone is not equivalent to last-good reads and shared cooldown.
@@ -114,7 +124,8 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),
 `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
-`tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome). Check for synthetic
+`tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome), and for card consent
+`tests/gateway/test_mcp_consent_scope.py` and `tests/tools/test_mcp_trust_gating.py`. Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
 
 ## Retirement and rollback
@@ -139,3 +150,7 @@ Tests cover expiry, disabled fallback and non-finite input through the registere
 The existing identity fingerprint and first-rate-limit cooldown remain unchanged.
 Its commit touches only `agent/secret_sources/`,
 `agent/vault_backends/onepassword.py`, and 1Password tests.
+Retire `mcp-elicitation-one-shot` when PR 118429 or an equivalent ships in a released tag.
+Retire `vault-payment-consent-order` when a released upstream prompts for a card only after
+finding fillable card targets and writes only targets stamped after consent. Its commit
+touches only the payment branch of `browser_vault_fill`, the manager-card tests and this unit.
