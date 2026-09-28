@@ -190,7 +190,7 @@ async def serve_standby_generation(config=None) -> bool:
     installed: list[signal.Signals] = []
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(sig, stop.set)  # windows-footgun: ok — caught below
         except (NotImplementedError, RuntimeError):
             continue
         installed.append(sig)
