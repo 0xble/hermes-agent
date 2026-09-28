@@ -115,6 +115,36 @@ def test_manager_card_binds_to_current_page_and_confirmation_names_it():
         redact.clear_vault_redaction_values()
 
 
+def test_card_fill_scopes_low_entropy_values_but_not_pan_or_cvc(monkeypatch):
+    from agent import redact
+    from agent.browser_output_egress import scrub_browser_result
+    from tools import browser_vault_tool
+    monkeypatch.setitem(_CARD, "billing_postal_code", "94110")
+    monkeypatch.setitem(_CARD, "exp_month", "7")
+    try:
+        with patch.object(browser_vault_tool, "_browser_key", return_value="sidecar"):
+            assert json.loads(_run_fill("https://shop.test/checkout")[0])["success"]
+        log = "2029-09-28 12:39:07,821 INFO user=A User line 708 postal=94110"
+        assert redact.redact_registered_vault_values(log) == log
+        assert redact.redact_registered_vault_values(log, tab="elsewhere", origin="https://shop.test") == log
+        assert redact.redact_registered_vault_values(log, tab="sidecar", origin="https://other.test") == log
+        assert redact.redact_sensitive_text(log, force=True) == log
+        assert not redact.has_vault_date_components("sidecar")  # card metadata must not block pixels
+        page = 'name=A User zip=94110 month=7 padded=07 year=2029 short=29 n=1708 x94110y'
+        with patch.object(browser_vault_tool, "_current_page_origin", return_value="https://other.test"):
+            assert json.loads(scrub_browser_result("browser_snapshot", json.dumps({"snapshot": page}), "sidecar"))["snapshot"] == page
+        with patch.object(browser_vault_tool, "_current_page_origin", return_value="https://shop.test"):
+            output = json.loads(scrub_browser_result("browser_snapshot", json.dumps({"snapshot": page}), "sidecar"))["snapshot"]
+        assert "name=A User" not in output and "zip=94110" not in output
+        assert "month=7" not in output and "padded=07" not in output
+        assert "year=2029" not in output and "short=29" not in output
+        assert "n=1708 x94110y" in output
+        for value in (_CARD["card_number"], _CARD["cvc"]):
+            assert redact.redact_registered_vault_values(f"secret={value}", tab="elsewhere") == "secret=«redacted-vault-secret»"
+    finally:
+        redact.clear_vault_redaction_values()
+
+
 def test_manager_card_uses_the_focused_checkout_tab_over_the_default_page():
     from agent import redact
     try:

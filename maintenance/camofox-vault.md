@@ -56,6 +56,11 @@ the browser vault fill tool, or the 1Password backends.
 - Vault listing accepts optional kind and exact normalized page origin filters, including
   manager multi-origin matches and unbound cards. No filters preserve the full listing;
   locked backend and error reports remain visible.
+- Payment PAN and CVC remain profile-global exact-value redactions. Name, expiry month/year
+  (including padded/unpadded month and four-/two-digit year), and billing ZIP use whole-token
+  redaction only on the filled browser session and origin. Neither terminal/log output nor
+  other tabs/origins inherit these low-entropy matches; card fills do not trigger the
+  protected-birthday pixel quarantine. Address fills remain non-secret.
 - Configured 1Password protected fields expose only an opaque handle and semantic token. They
   remain exact-origin bound, resolve server-side, and fill only a matching supported control
   in a verified task-owned local Chromium session. Birth-date fills refuse all Camofox
@@ -109,7 +114,13 @@ the browser vault fill tool, or the 1Password backends.
   model responses; retire when released upstream supports equivalent optional kind/origin
   filtering while preserving unbound cards), and
   `vault-payment-consent-order` (own fork fix, 2026-09-28: prompt only once card targets are
-  found, then re-inspect after consent). Plus `mcp-elicitation-one-shot`, adopted from upstream
+  found, then re-inspect after consent). `vault-card-redaction-scope` (own fork fix,
+  2026-09-28: use the existing tab/origin component registry for low-entropy card values;
+  PAN/CVC remain global). At inspected `upstream/main` (`226eeeb4c21ca6d9fb3880bf6aa3b9093f69530a`), upstream's vault fill registers every
+  card secret through `register_vault_redaction_value`, and its `agent/redact.py` replaces
+  each registered value as an unbounded substring across model-facing output; it has no
+  scoped card equivalent. No matching issue or PR in the upstream `vault card redaction`
+  tracker search. Plus `mcp-elicitation-one-shot`, adopted from upstream
   [PR 118429](https://github.com/NousResearch/hermes-agent/pull/118429) at
   `7617f8ef5a95d3f653b1f9c8788bb6798f00cd55` (open, CI awaiting maintainer approval).
   Upstream batching [PR #116616](https://github.com/NousResearch/hermes-agent/pull/116616)
@@ -165,6 +176,10 @@ The existing identity fingerprint and first-rate-limit cooldown remain unchanged
 Its commit touches only `agent/secret_sources/`,
 `agent/vault_backends/onepassword.py`, and 1Password tests.
 Retire `mcp-elicitation-one-shot` when PR 118429 or an equivalent ships in a released tag.
-Retire `vault-payment-consent-order` when a released upstream prompts for a card only after
+Retire `vault-card-redaction-scope` only after a released upstream tag scopes low-entropy
+card metadata to the filled tab and origin with whole-token matching while keeping PAN/CVC
+redacted globally. The fork does not register formatted PAN variants (spaced/dashed): those
+would add global values without evidence the current fill writes them; revisit if a checkout
+normalizes the number. Retire `vault-payment-consent-order` when a released upstream prompts for a card only after
 finding fillable card targets and writes only targets stamped after consent. Its commit
 touches only the payment branch of `browser_vault_fill`, the manager-card tests and this unit.
