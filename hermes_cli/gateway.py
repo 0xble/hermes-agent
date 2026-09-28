@@ -5061,6 +5061,9 @@ def _cmd_restart(args):
     # unreachable for `-p X gateway restart --all` (it printed a bare `gateway restart` instead).
     if not restart_all:
         _guard_named_profile_under_multiplexer(force=force)
+    if sys.platform == "darwin" and not restart_all:
+        from hermes_cli.gateway_guardian import set_intent
+        set_intent(get_hermes_home(), stopped=False)
     if restart_all and _dispatch_all_via_service_manager_if_s6("restart"):
         return
     if not restart_all and _dispatch_via_service_manager_if_s6("restart"):

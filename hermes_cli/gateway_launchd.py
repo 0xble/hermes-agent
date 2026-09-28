@@ -779,6 +779,8 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    from hermes_cli.gateway_guardian import set_intent
+    set_intent(_gw().get_hermes_home(), stopped=False)
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"

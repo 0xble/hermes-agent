@@ -24,10 +24,32 @@ INTERVAL = 30
 MAX_REPAIRS = 3
 
 
-def _domain() -> str:
+def _domain(label: str) -> str:
     if sys.platform != "darwin":
         raise RuntimeError("gateway guardian requires macOS launchd")
-    return f"gui/{getattr(os, 'getuid')()}"
+    from hermes_cli.gateway_launchd import _probe_launchd_domain_for_label
+    return _probe_launchd_domain_for_label(label)
+
+
+def _gateway_domain(label: str, preferred: str | None) -> str:
+    """Observe both domains before trusting a saved domain or starting an unloaded job."""
+    domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")
+    if preferred is not None and preferred not in domains:
+        raise RuntimeError("guardian domain is not a gateway launchd domain for this user")
+    states = {}
+    for candidate in domains:
+        try:
+            states[candidate] = _launch_state(candidate, label)
+        except RuntimeError:
+            states[candidate] = "unknown"
+    loaded = [candidate for candidate, state in states.items() if state == "loaded"]
+    if len(loaded) > 1:
+        raise RuntimeError("gateway label is loaded in both launchd domains")
+    if loaded:
+        return loaded[0]
+    if "unknown" in states.values():
+        raise RuntimeError("cannot prove gateway unloaded in both launchd domains")
+    return preferred or _domain(label)
 
 
 def intent_path(home: Path) -> Path:
@@ -46,8 +68,19 @@ def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
     directory = home / "logs" / "guardian"
     directory.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
-    path = directory / f"{now.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
+    cutoff = now.timestamp() - 3600
     payload = {"at": now.isoformat(), "action": action, "outcome": outcome, **detail}
+    for prior in directory.glob("*.json"):
+        try:
+            if prior.stat().st_mtime < cutoff:
+                prior.unlink()
+            elif outcome in {"alert", "capped"}:
+                old = json.loads(prior.read_text(encoding="utf-8"))
+                if {k: v for k, v in old.items() if k != "at"} == {k: v for k, v in payload.items() if k != "at"}:
+                    return prior
+        except (OSError, ValueError):
+            continue
+    path = directory / f"{now.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
@@ -61,7 +94,7 @@ def enabled(home: Path) -> bool:
     return value
 
 
-def _switch(home: Path, *, grace: float) -> dict | None:
+def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
     for name in ("release-txn.json", "release-last-txn.json"):
         path = home / name
         if not path.exists():
@@ -70,15 +103,15 @@ def _switch(home: Path, *, grace: float) -> dict | None:
         if not isinstance(record, dict) or record.get("version") != 1:
             raise ValueError(f"invalid release receipt: {path}")
         if record.get("operation") not in {"promote", "first-migration"} or record.get("reload_ack"):
-            return None
+            return "none", None
         issued = record.get("reload_issued")
         if not isinstance(issued, dict) or not isinstance(issued.get("at"), str):
-            return None
+            return "none", None
         age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(issued["at"]).timestamp()
         if age < grace:
-            return None
-        return record
-    return None
+            return "waiting", None
+        return "expired", record
+    return "none", None
 
 
 def healthy(home: Path, label: str, expected: Path) -> bool:
@@ -130,10 +163,18 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
-    domain = domain or _domain()
+    domain = domain or _domain(label)
     def reload_target():
+        import psutil
+        from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
+        old_pid = _launchctl_supervised_pid(label)
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
-        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
+        if old_pid is not None:
+            try:
+                psutil.Process(old_pid).wait(timeout=30)
+            except psutil.NoSuchProcess:
+                pass
+        _launchctl_bootstrap(domain, plist, label, timeout=30)
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
     if result.get("reload_pending"):
@@ -148,7 +189,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
-def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str) -> str:
+def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
     if intent_path(home).exists():
         return "stopped"
@@ -169,9 +210,18 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str) -> s
     if Path(definition.get("WorkingDirectory", "")).resolve() != current:
         receipt(home, "inspect", "alert", reason="gateway plist is not rooted in current release")
         return "alert"
-    switch = _switch(home, grace=grace)
+    switch_state, switch = _switch(home, grace=grace)
+    if switch_state == "waiting":
+        return "waiting"
+    domain = _gateway_domain(label, domain)
     state = _launch_state(domain, label)
     if state == "loaded" and healthy(home, label, current):
+        pending = home / "release-txn.json"
+        if pending.exists():
+            record = json.loads(pending.read_text(encoding="utf-8"))
+            if record.get("operation") in {"rollback", "first-migration-rollback"}:
+                from hermes_cli.immutable_releases import acknowledge_running_release
+                acknowledge_running_release(home)
         return "healthy"
     if switch:
         old = Path(switch["previous_intended"])
@@ -230,7 +280,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float = 180,
         except BlockingIOError:
             return "locked"
         try:
-            return _run(home, Path(plist), label, grace=grace, domain=domain or _domain())
+            return _run(home, Path(plist), label, grace=grace, domain=domain)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"
@@ -257,11 +307,11 @@ def cli(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if sys.platform != "darwin":
         parser.error("gateway guardian requires macOS launchd")
-    args.domain = args.domain or _domain()
     from hermes_cli import gateway
     home = get_hermes_home()
     target = args.gateway_plist or gateway.get_launchd_plist_path()
     label = args.gateway_label or gateway.get_launchd_label()
+    args.domain = args.domain or _domain(GUARDIAN_LABEL if args.action == "uninstall" else label)
     import pwd
     path = Path(pwd.getpwuid(getattr(os, 'getuid')()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
@@ -278,8 +328,6 @@ def cli(argv: list[str] | None = None) -> int:
         outcome = run_once(home, target, label, domain=args.domain)
         print(outcome)
         return 0 if outcome in {"healthy", "stopped", "repaired", "rolled_back", "waiting", "locked"} else 1
-    if sys.platform != "darwin":
-        parser.error("guardian install requires macOS launchd")
     paths = ReleasePaths.for_home(home)
     if not paths.current.is_symlink() or not _release_is_ready(paths.current.resolve(), paths.current.resolve().name):
         parser.error("a valid immutable current release is required")

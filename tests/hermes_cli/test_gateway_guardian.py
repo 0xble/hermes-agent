@@ -4,7 +4,7 @@ import json
 import os
 import plistlib
 import subprocess
-import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -35,8 +35,10 @@ def fake_launchctl(monkeypatch, label, *, loaded=False):
     def run(argv, **kwargs):
         calls.append(argv)
         if argv[1] == "print":
-            is_loaded = state["loaded"]
+            is_loaded = state["loaded"] and argv[2].startswith(f"gui/{os.getuid()}/")
             return subprocess.CompletedProcess(argv, 0 if is_loaded else 113, stdout="pid = 123\n" if is_loaded else "", stderr="Could not find service" if not is_loaded else "")
+        if argv[1] == "managername":
+            return subprocess.CompletedProcess(argv, 0, stdout="Aqua", stderr="")
         if argv[1] == "bootstrap":
             state["loaded"] = True
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
@@ -50,7 +52,8 @@ def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypa
     calls = fake_launchctl(monkeypatch, label)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     assert guardian.run_once(home, plist, label, grace=0) == "repaired"
-    assert [row[1] for row in calls] == ["print", "bootstrap", "print"]
+    assert [row[1] for row in calls].count("bootstrap") == 1
+    assert calls[-1][1] == "print"
     assert any(json.loads(path.read_text(encoding="utf-8"))["outcome"] == "repaired"
                for path in (home / "logs/guardian").glob("*.json"))
 
@@ -70,7 +73,7 @@ def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
     calls = fake_launchctl(monkeypatch, label, loaded=True)
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     assert guardian.run_once(home, plist, label) == "healthy"
-    assert [row[1] for row in calls] == ["print"]
+    assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
 
 
 @pytest.mark.macos_only
@@ -141,7 +144,6 @@ def test_acknowledged_or_mismatched_switch_is_not_abandoned(tmp_path):
 
 @pytest.mark.macos_only
 def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch):
-    from datetime import datetime, timezone
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)
     monkeypatch.setattr(guardian, "healthy", lambda *args: False)
@@ -158,6 +160,131 @@ def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch
 
 
 @pytest.mark.macos_only
+@pytest.mark.parametrize("operation", ["promote", "first-migration"])
+def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch, operation):
+    home, plist, label, a, b = layout(tmp_path)
+    calls = fake_launchctl(monkeypatch, label)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    txn = {"version": 1, "operation": operation, "candidate": str(b),
+           "previous_intended": str(a), "reload_issued": {"at": datetime.now(timezone.utc).isoformat()}}
+    (home / "release-last-txn.json").write_text(json.dumps(txn))
+    assert guardian.run_once(home, plist, label, grace=180, domain="gui/501") == "waiting"
+    assert not any(row[1] == "bootstrap" for row in calls)
+    monkeypatch.setattr(guardian, "rollback_switch", lambda *args, **kwargs: True)
+    assert guardian.run_once(home, plist, label, grace=0, domain=f"gui/{os.getuid()}") == "rolled_back"
+    assert not any(row[1] == "bootstrap" for row in calls)
+
+
+@pytest.mark.macos_only
+def test_launchd_restart_clears_stopped_intent(tmp_path, monkeypatch):
+    from hermes_cli import gateway, gateway_launchd
+    from gateway import status
+    home, *_ = layout(tmp_path)
+    guardian.set_intent(home, stopped=True)
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.test.guardian")
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: f"gui/{os.getuid()}")
+    monkeypatch.setattr(status, "get_running_pid", lambda: 123)
+    monkeypatch.setattr(gateway, "_request_gateway_self_restart", lambda pid: True)
+    gateway_launchd.launchd_restart()
+    assert not guardian.intent_path(home).exists()
+
+
+@pytest.mark.macos_only
+def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeypatch):
+    home, plist, label, a, b = layout(tmp_path)
+    calls = []
+    from hermes_cli import gateway_launchd
+    import psutil
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: 123)
+    class Previous:
+        def __init__(self, pid):
+            assert pid == 123
+        def wait(self, timeout):
+            calls.append("drained")
+    monkeypatch.setattr(psutil, "Process", Previous)
+    def run(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] == "bootstrap" and calls.count("bootstrap") == 1:
+            raise subprocess.CalledProcessError(5, argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    monkeypatch.setattr(guardian, "rollback", lambda *args, **kwargs:
+                        kwargs["reload_callback"]() and {"reload_pending": False})
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    assert guardian.rollback_switch(home, plist, label, a, domain=f"gui/{os.getuid()}")
+    assert calls[:4] == ["bootout", "drained", "bootstrap", "bootout"]
+    assert calls[-1] == "bootstrap"
+
+
+@pytest.mark.macos_only
+def test_repeated_alerts_are_deduplicated_and_old_receipts_pruned(tmp_path):
+    home, *_ = layout(tmp_path)
+    old = guardian.receipt(home, "inspect", "alert", reason="old")
+    os.utime(old, (0, 0))
+    first = guardian.receipt(home, "inspect", "alert", reason="persistent")
+    second = guardian.receipt(home, "inspect", "alert", reason="persistent")
+    assert first == second
+    assert not old.exists()
+    assert guardian._repair_count(home) == 0
+
+
+@pytest.mark.macos_only
+def test_healthy_rollback_is_acknowledged_on_subsequent_run(tmp_path, monkeypatch):
+    home, plist, label, a, b = layout(tmp_path)
+    fake_launchctl(monkeypatch, label, loaded=True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    pending = home / "release-txn.json"
+    pending.write_text(json.dumps({"version": 1, "operation": "rollback", "candidate": str(b)}))
+    from hermes_cli import immutable_releases
+    def acknowledge(path):
+        assert path == home
+        pending.unlink()
+        return True
+    monkeypatch.setattr(immutable_releases, "acknowledge_running_release", acknowledge)
+    assert guardian.run_once(home, plist, label) == "healthy"
+    assert not pending.exists()
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("domain", ["gui", "user"])
+def test_guardian_resolves_existing_gateway_domain(tmp_path, monkeypatch, domain):
+    home, plist, label, a, b = layout(tmp_path)
+    import os
+    selected = f"{domain}/{os.getuid()}"
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "print":
+            found = argv[2] == f"{selected}/{label}"
+            return subprocess.CompletedProcess(argv, 0 if found else 113,
+                stdout="pid = 123" if found else "", stderr="" if found else "Could not find service")
+        if argv[1] == "managername":
+            return subprocess.CompletedProcess(argv, 0, stdout="Aqua", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    assert guardian.run_once(home, plist, label) == "healthy"
+    assert all(row[1] not in {"bootstrap", "bootout"} for row in calls)
+    assert [row[2] for row in calls if row[1] == "print"][-1] == f"{selected}/{label}"
+
+
+@pytest.mark.macos_only
+def test_user_domain_stays_healthy_when_gui_probe_errors(tmp_path, monkeypatch):
+    home, plist, label, a, b = layout(tmp_path)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "print" and argv[2].startswith(f"gui/{os.getuid()}/"):
+            return subprocess.CompletedProcess(argv, 5, stdout="", stderr="Input/output error")
+        return subprocess.CompletedProcess(argv, 0, stdout="pid = 123", stderr="")
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    assert guardian.run_once(home, plist, label) == "healthy"
+    assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
+
+
+@pytest.mark.macos_only
 def test_unknown_launchctl_failure_is_alert_not_bootstrap(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = []
@@ -166,7 +293,7 @@ def test_unknown_launchctl_failure_is_alert_not_bootstrap(tmp_path, monkeypatch)
         return subprocess.CompletedProcess(argv, 113, stdout="", stderr="Input/output error")
     monkeypatch.setattr(guardian.subprocess, "run", run)
     assert guardian.run_once(home, plist, label) == "alert"
-    assert len(calls) == 1 and calls[0][1] == "print"
+    assert len(calls) == 2 and all(row[1] == "print" for row in calls)
 
 
 @pytest.mark.macos_only

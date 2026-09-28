@@ -1177,8 +1177,9 @@ def abandon_failed_switch(home: Path, *, candidate: Path, previous: Path) -> Non
     """Archive a verified unacknowledged promotion before a guardian rollback.
 
     The forward WAL cannot be passed to rollback(), because recovery would
-    complete that failed promotion first. Preserve its exact bytes and plist
-    backup for postmortem inspection, then remove only this matched WAL.
+    complete that failed promotion first. Archive the exact WAL bytes, which
+    retain the plist backup path and hash for postmortem inspection; the backup
+    remains at that path. Remove only this matched WAL.
     """
     paths = ReleasePaths.for_home(home)
     record = _read_txn(paths)
