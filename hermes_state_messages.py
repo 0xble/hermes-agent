@@ -1132,6 +1132,27 @@ class SessionMessagesMixin:
             (session_id, role, float(since or 0.0), max(int(limit), 1)))
         return [{"id": row[0], "content": row[1], "timestamp": row[2]} for row in rows]
 
+    @staticmethod
+    def _decoded_argument_text(arguments: str) -> str:
+        """String values of a call's JSON ``arguments``, newline-joined; ``""`` when not JSON."""
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            return ""
+        out: List[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, str):
+                out.append(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+        walk(parsed)
+        return "\n".join(out)
+
     def find_tool_results_for_call(self, session_id: str, needle: str, *, since: float = 0.0,
                                    limit: int = 4, exclude_tools: Sequence[str] = (),
                                    exclude_prefixes: Sequence[str] = (),
@@ -1139,16 +1160,21 @@ class SessionMessagesMixin:
         """Newest-first tool results whose originating call's arguments contain ``needle`` byte-exactly,
         each with the call ``arguments``. Every row state is scanned (audit read). Calls to excluded
         tools are skipped before ``limit`` is applied; at most ``scan_limit`` matching assistant rows
-        are read."""
+        are read. The needle is matched against decoded argument values, so a command containing
+        quotes or backslashes matches although ``tool_calls`` stores it escaped twice."""
         if not session_id or not needle:
             return []
         limit = max(int(limit), 1)
         excluded = set(exclude_tools)
         prefixes = tuple(exclude_prefixes)
+        # SQL prefilter on the longest run that serializes unchanged (ASCII, no quote/backslash/control).
+        probe = max(re.split(r'["\\\x00-\x1f\x7f-\U0010ffff]', needle), key=len)
+        if len(probe) < 4:
+            return []
         calls = self._read_all(
             """SELECT tool_calls FROM messages WHERE session_id = ? AND role = 'assistant'
                 AND timestamp >= ? AND instr(tool_calls, ?) > 0 ORDER BY id DESC LIMIT ?""",
-            (session_id, float(since or 0.0), needle, max(int(scan_limit), limit)))
+            (session_id, float(since or 0.0), probe, max(int(scan_limit), limit)))
         wanted: Dict[str, str] = {}
         for (raw,) in calls:
             if len(wanted) >= limit:
@@ -1163,7 +1189,7 @@ class SessionMessagesMixin:
                 if name in excluded or (prefixes and name.startswith(prefixes)):
                     continue
                 args = str(fn.get("arguments") or "")
-                if call.get("id") and needle in args:
+                if call.get("id") and (needle in args or needle in self._decoded_argument_text(args)):
                     wanted[str(call["id"])] = args
         if not wanted:
             return []

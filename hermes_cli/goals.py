@@ -1649,18 +1649,9 @@ _REPLY_QUOTE_RE = re.compile(r'^\[Replying to: ".*?"\]\n\s*', re.DOTALL)
 
 
 _REVISION_QUOTE_MIN_CHARS = 12
-# Context kept around a quoted user instruction: long enough to judge what it asks for.
-_REVISION_SOURCE_CHARS = 1200
-
-
-def _quote_context(message: str, quote: str) -> str:
-    """The user message, or a window of it centred on the quote when the message is long."""
-    if len(message) <= _REVISION_SOURCE_CHARS:
-        return message
-    at = message.find(quote)
-    pad = max(0, (_REVISION_SOURCE_CHARS - len(quote)) // 2)
-    start, end = max(0, at - pad), min(len(message), at + len(quote) + pad)
-    return ("…" if start else "") + message[start:end] + ("…" if end < len(message) else "")
+# Longest user message a revision may cite. The judge decides authority from the complete message,
+# so a longer one is refused rather than excerpted: an excerpt can drop the context that negates it.
+_REVISION_SOURCE_MAX_CHARS = 4000
 
 
 def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> List[str]:
@@ -1898,11 +1889,16 @@ class GoalManager:
                 return {"ok": False, "error_code": "user_quote_too_short",
                         "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
             pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-            source = next((" ".join(m.split()) for m in pool if quote in " ".join(m.split())), "")
-            if not source:
+            sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
+            if not sources:
                 return {"ok": False, "error_code": "user_quote_not_found",
                         "error": "user_quote does not match any user message sent since the goal was set"}
-            source = _quote_context(source, quote)
+            source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
+            if not source:
+                return {"ok": False, "error_code": "user_message_too_long",
+                        "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
+                                 "long to judge whether it authorizes this change; ask the user to state the "
+                                 "change in a short message and quote that"}
         revision = {"at": time.time(), "actor": actor, "reason": reason, "user_quote": quote,
                     "user_message": source,
                     "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}}

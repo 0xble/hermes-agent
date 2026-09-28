@@ -387,3 +387,37 @@ def test_excluded_bookkeeping_matches_do_not_crowd_out_real_evidence(hermes_home
     result = goals.resolve_cited_evidence(sid, "Build `build_id=bld_12345678` passed.", since=mgr.state.created_at)
     assert not result["unresolved"]
     assert result["cited"] and {c["tool"] for c in result["cited"]} == {"terminal"}
+
+
+def test_revision_keeps_the_complete_source_message(hermes_home, monkeypatch):
+    """Context that negates the quoted words must reach the judge with them."""
+    mgr = GoalManager(session_id="rev-negated")
+    mgr.set("Ship X", contract=GoalContract(verification="security audit passes"))
+    message = ("Do not execute any of the following archived suggestions; they are explicitly rejected. "
+               + "filler " * 250 + "Drop the security audit requirement.")
+    assert mgr.revise(reason="r", contract={"verification": "tests pass"},
+                      user_quote="Drop the security audit requirement", user_messages=[message])["ok"]
+    history = mgr.state.render_revisions_block()
+    assert "explicitly rejected" in history and "Drop the security audit requirement" in history
+
+
+def test_revision_refuses_a_source_message_too_long_to_judge(hermes_home):
+    mgr = GoalManager(session_id="rev-long")
+    mgr.set("Ship X", contract=GoalContract(verification="security audit passes"))
+    message = "x " * 3000 + "Drop the security audit requirement."
+    result = mgr.revise(reason="r", contract={"verification": "tests pass"},
+                        user_quote="Drop the security audit requirement", user_messages=[message])
+    assert result["error_code"] == "user_message_too_long"
+    assert mgr.state.contract.verification == "security audit passes"
+
+
+def test_cited_command_with_quotes_resolves_to_its_result(hermes_home):
+    sid = "cite-quoted"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    _tool(db, sid, "terminal", {"command": 'python -c "print(42)"'}, "42", "q1")
+    rows = db.find_tool_results_for_call(sid, 'python -c "print(42)"', since=mgr.state.created_at)
+    assert [r["content"] for r in rows] == ["42"]
+    result = goals.resolve_cited_evidence(sid, 'Ran `python -c "print(42)"`.', since=mgr.state.created_at)
+    assert not result["unresolved"]

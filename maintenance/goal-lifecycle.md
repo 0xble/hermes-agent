@@ -89,9 +89,10 @@ Failed or interrupted model turns do not run completion judging.
     continuation prompt shows the current version. Changing the objective or
     constraints, or dropping a subgoal, needs a verbatim quote of 12+ characters
     from a real user message sent since the goal was set. The runtime proves only
-    that the user said it. The judge decides whether that message plainly
-    instructs the specific change, and otherwise holds the agent to the earlier
-    requirement.
+    that the user said it. The judge sees the complete source message, which may
+    be at most 4,000 characters (longer ones are refused, never excerpted), and
+    decides whether it plainly instructs the specific change. Otherwise it holds
+    the agent to the earlier requirement.
   The judge prompt judges the end state, not the route. A remedied state
   invariant stops blocking `done`, while a breached irreversible prohibition
   returns BLOCKED.
