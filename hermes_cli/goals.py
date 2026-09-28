@@ -67,9 +67,8 @@ _EVIDENCE_EXCLUDED_TOOL_PREFIXES = ("hindsight_",)
 _EVIDENCE_EXCLUSION_KW = {"exclude_tools": tuple(sorted(_EVIDENCE_EXCLUDED_TOOLS)),
                           "exclude_prefixes": _EVIDENCE_EXCLUDED_TOOL_PREFIXES}
 
-# Cited evidence: exact identifiers the response quotes (backtick spans, quoted strings, SHAs, URLs,
-# long ids) are located verbatim in every tool result recorded since the goal started, so proof
-# gathered hundreds of tool calls earlier still reaches the judge.
+# Cited evidence: quoted identifiers are located in tool results since the goal started.
+# Truncated ids can match by a sufficiently long prefix; commit URLs can match by hash.
 _CITATION_MAX_NEEDLES = 24
 _CITATION_MIN_CHARS = 6
 _CITATION_MAX_CHARS = 200
@@ -1296,7 +1295,10 @@ def extract_citations(text: str) -> List[str]:
     found: List[str] = []
     # Latest first: a closeout's Evidence section sits at the end, so it survives the cap.
     for _pos, value in sorted(hits, key=lambda h: -h[0]):
-        value = value.strip().strip(".,;:")
+        value = value.strip()
+        # Keep a deliberate ASCII ellipsis inside a quoted identifier; strip sentence punctuation.
+        if not value.endswith("..."):
+            value = value.strip(".,;:")
         # Bare words ("independent") match anything; require a digit, a symbol or a phrase.
         specific = any(ch.isdigit() or ch in "=:/._-#@ " for ch in value)
         if specific and _CITATION_MIN_CHARS <= len(value) <= _CITATION_MAX_CHARS and value not in found:
@@ -1305,8 +1307,10 @@ def extract_citations(text: str) -> List[str]:
 
 
 def _citation_variants(needle: str) -> List[str]:
-    """The needle, plus the text after ``=``/``: `` for ``key=value`` citations, so
-    ``exact_sha=94d6cf5`` also matches ``"exact_sha": "94d6cf5…"`` in JSON output."""
+    """Lookups for an exact citation, a key/value citation, or a safe shortened shape.
+
+    An ellipsis needs an eight-character prefix; commit URLs can fall back to their
+    7–40 digit hex hash. The returned variant must occur in recorded evidence."""
     variants = [needle]
     if '"' in needle:
         # Tool results are stored as JSON, so quotes inside nested output are escaped.
@@ -1316,6 +1320,14 @@ def _citation_variants(needle: str) -> List[str]:
             value = needle.split(sep, 1)[1].strip().strip("'\"")
             if len(value) >= _CITATION_MIN_CHARS and value not in variants:
                 variants.append(value)
+    if needle.endswith(("…", "...")):
+        prefix = needle[:-1] if needle.endswith("…") else needle[:-3]
+        # A shorter prefix is too ambiguous to establish evidence, even if the literal ellipsis
+        # happens to appear in a result.
+        return [prefix] if len(prefix) >= 8 else []
+    commit = re.search(r"/commit/([0-9a-fA-F]{7,40})$", needle)
+    if needle.startswith(("https://", "http://")) and commit:
+        variants.append(commit.group(1))
     return variants
 
 
@@ -1378,12 +1390,16 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
     half = _CITATION_CONTEXT_CHARS // 2
     for needle in needles:
         matches: List[Tuple[Dict[str, Any], str, bool]] = []
+        variants = _citation_variants(needle)
+        if not variants:
+            unresolved.append(needle)
+            continue
         try:
             # A cited command resolves to what running it returned; anything else to where it appears.
-            if call_finder is not None and len(needle) >= 8:
+            if call_finder is not None and len(needle) >= 8 and not needle.endswith(("…", "...")):
                 matches += [(r, needle, True) for r in call_finder(session_id, needle, since=since, limit=4,
                                                                    **_EVIDENCE_EXCLUSION_KW)]
-            for variant in _citation_variants(needle):
+            for variant in variants:
                 if len(matches) >= _CITATION_ROWS_PER_NEEDLE * 2:
                     break
                 matches += [(r, variant, False) for r in finder(session_id, variant, role="tool", since=since,
@@ -1395,7 +1411,11 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
         if not matches:
             # Runtime-delivered results arrive as user-role notices, never agent prose.
             try:
-                for variant in _citation_variants(needle):
+                for variant in variants:
+                    # A composed commit URL is only corroborated by a hash in a tool result.
+                    if variant != needle and needle.startswith(("https://", "http://")) and \
+                            re.search(r"/commit/[0-9a-fA-F]{7,40}$", needle):
+                        continue
                     notices = [r for r in finder(session_id, variant, role="user", since=since, limit=4)
                                if _runtime_notice_label(r)]
                     if notices:
@@ -1411,6 +1431,9 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
         for row, hit, via_call in matches:
             if kept >= _CITATION_ROWS_PER_NEEDLE or len(cited) >= _CITATION_MAX_EXCERPTS:
                 break
+            commit = re.search(r"/commit/([0-9a-fA-F]{7,40})$", needle)
+            match_note = (f"(matched by commit hash {hit}; URL not verified) "
+                          if commit and hit == commit.group(1) and hit != needle else "")
             content = str(row.get("content") or "")
             if via_call:
                 span = (-1, -1)   # the call's own result tail: one excerpt per row
@@ -1423,7 +1446,7 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
             kept += 1
             if covered is not None:
                 cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"),
-                              "excerpt": f"(inside the excerpt of result #{row.get('id')} above)",
+                              "excerpt": match_note + f"(inside the excerpt of result #{row.get('id')} above)",
                               "timestamp": float(row.get("timestamp") or 0.0), "message_id": row.get("id")})
                 continue
             if via_call:
@@ -1437,7 +1460,7 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
                     ("…" if end < len(content) else "")
             if redact_sensitive_text is not None:
                 excerpt = redact_sensitive_text(excerpt, force=True)
-            cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"), "excerpt": excerpt,
+            cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"), "excerpt": match_note + excerpt,
                           "timestamp": float(row.get("timestamp") or 0.0), "message_id": row.get("id")})
     evidence_ids = sorted({str(c["message_id"]) for c in cited if c.get("message_id") is not None})
     return {"cited": cited, "unresolved": unresolved, "evidence_ids": evidence_ids}
