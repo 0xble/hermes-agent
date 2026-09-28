@@ -1486,29 +1486,31 @@ class TestSystemUnitHermesHome:
         assert gateway_cli.systemd_unit_is_current(system=False)
         assert 'LD_LIBRARY_PATH=/opt/cuda/lib64:/opt/pct%%dir/lib' in gateway_cli.generate_systemd_unit(system=False)
 
-    def test_system_unit_remaps_caller_home_ld_library_path_components(self, monkeypatch):
-        """#14613: under sudo the caller's /root/... library dirs are unreadable to the target
+    def test_system_unit_remaps_caller_home_ld_library_path_components(self, monkeypatch, tmp_path):
+        """#14613: under sudo the caller's library dirs are unreadable to the target
         user, so each colon-separated component is remapped like the PATH entries are."""
-        monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
-        monkeypatch.delenv("HERMES_HOME", raising=False)
+        caller_home, target_home = tmp_path / "root", tmp_path / "alice"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
         monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
-            lambda run_as_user=None: ("alice", "alice", "/home/alice", 1001),
+            lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
         )
         monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
-        monkeypatch.setenv("LD_LIBRARY_PATH", "/root/cuda/lib:/opt/cuda/lib64")
+        monkeypatch.setenv("LD_LIBRARY_PATH", f"{caller_home}/cuda/lib:/opt/cuda/lib64")
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
-        assert 'Environment="LD_LIBRARY_PATH=/home/alice/cuda/lib:/opt/cuda/lib64"' in unit
+        assert f'Environment="LD_LIBRARY_PATH={target_home}/cuda/lib:/opt/cuda/lib64"' in unit
 
-    def test_system_unit_uses_target_user_home_not_calling_user(self, monkeypatch):
-        # Simulate sudo: Path.home() returns /root, target user is alice
-        monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
-        monkeypatch.delenv("HERMES_HOME", raising=False)
+    def test_system_unit_uses_target_user_home_not_calling_user(self, monkeypatch, tmp_path):
+        # Simulate sudo with both homes in a disposable tree, never /root/.hermes.
+        caller_home, target_home = tmp_path / "root", tmp_path / "alice"
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: caller_home))
+        monkeypatch.setenv("HERMES_HOME", str(caller_home / ".hermes"))
         monkeypatch.setattr(
             gateway_cli, "_system_service_identity",
-            lambda run_as_user=None: ("alice", "alice", "/home/alice", 1001),
+            lambda run_as_user=None: ("alice", "alice", str(target_home), 1001),
         )
         monkeypatch.setattr(
             gateway_cli, "_build_user_local_paths",
@@ -1517,8 +1519,8 @@ class TestSystemUnitHermesHome:
 
         unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
-        assert 'HERMES_HOME=/home/alice/.hermes' in unit
-        assert '/root/.hermes' not in unit
+        assert f'HERMES_HOME={target_home}/.hermes' in unit
+        assert str(caller_home / ".hermes") not in unit
 
     def test_user_unit_unaffected_by_change(self):
         # User-scope units should still use the calling user's HERMES_HOME

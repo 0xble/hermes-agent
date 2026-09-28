@@ -3761,7 +3761,29 @@ def _commit_compaction(
                 from agent.context_compressor import PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, stamp_db_persisted_markers
                 # Tail rows tagged by compress() are archived as superseded duplicates, not
                 # compacted=1. Count against the FINAL list — salvage may have dropped rows.
-                tail_count = sum(1 for m in compressed if id(m) in _tail_tagged_ids)
+                def _tail_row_is_still_verbatim(message: dict) -> bool:
+                    row_id = message.get("_row_id")
+                    if not isinstance(row_id, int) or isinstance(row_id, bool) or row_id <= 0:
+                        return True
+                    source = next(
+                        (candidate for candidate in messages
+                         if isinstance(candidate, dict) and candidate.get("_row_id") == row_id),
+                        None,
+                    )
+                    if source is None:
+                        return True
+                    return (
+                        source.get("role") == message.get("role")
+                        and source.get("content") == message.get("content")
+                        and source.get("tool_calls") == message.get("tool_calls")
+                    )
+                # The rewind below is positional (newest `tail_count` durable rows), so a rewritten carrier can
+                # only be left out of the count at the OLDEST end of the tail, where the summary seam folds into
+                # it. Excluding one from the middle would shift the window onto a still-verbatim neighbour.
+                _tail_rows = [m for m in compressed if id(m) in _tail_tagged_ids and isinstance(m, dict)]
+                _leading_rewritten = next(
+                    (i for i, m in enumerate(_tail_rows) if _tail_row_is_still_verbatim(m)), len(_tail_rows))
+                tail_count = len(_tail_rows) - _leading_rewritten
                 # The rewind takes the newest `tail_count` durable rows as the tail's originals, so a tail row
                 # with none (this turn's user row, which the CLI and gateway persist after preflight; unflushed
                 # scaffolding) would flag a summarized row superseded instead: gone from display and search.

@@ -27,7 +27,9 @@ from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label
 
 @pytest.fixture(scope="module", autouse=True)
 def _sweep_disposable_jobs(request):
-    sweep_prior_sessions(request)
+    # The cleanup command is launchd-only; unmarked transaction invariants still run on Linux.
+    if sys.platform == "darwin":
+        sweep_prior_sessions(request)
 
 
 # The tags are durable mutation destinations, not line numbers. Occurrence 2 of

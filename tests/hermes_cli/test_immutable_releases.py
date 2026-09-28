@@ -372,6 +372,7 @@ def test_normal_update_without_layout_opt_in_does_not_touch_release_or_plist(tmp
     assert plist.read_bytes() == b"original"
 
 
+@pytest.mark.macos_only
 def test_deferred_update_stages_without_promoting_or_reloading(tmp_path, monkeypatch):
     from hermes_cli import update_cmd, gateway
     home = tmp_path / "profile"
@@ -390,6 +391,7 @@ def test_deferred_update_stages_without_promoting_or_reloading(tmp_path, monkeyp
     assert not (home / "previous").exists()
 
 
+@pytest.mark.macos_only
 @pytest.mark.parametrize("first_stage_fails", [False, True])
 def test_outstanding_release_is_promoted_before_catchup_restart(tmp_path, monkeypatch, first_stage_fails):
     from hermes_cli import update_cmd
@@ -425,6 +427,7 @@ def test_outstanding_release_is_promoted_before_catchup_restart(tmp_path, monkey
     assert attempted
 
 
+@pytest.mark.macos_only
 def test_noop_update_promotes_before_pending_restart(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import update_cmd
@@ -977,6 +980,7 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
         worker.wait(timeout=5)
 
 
+@pytest.mark.macos_only
 @pytest.mark.parametrize("kind", ["standalone", "backend", "platform", "exclusive", "model-provider"])
 def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch, kind):
     """Exercise checkout -> candidate venv -> plugin probe -> updater receipt, not a mocked smoke."""
@@ -1019,7 +1023,8 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
         update_receipt.finalize_update_receipt("partial")
 
 
-def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path):
+def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "broken-model"
     plugin.mkdir(parents=True)
@@ -1033,6 +1038,7 @@ def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path):
 
 
 def test_candidate_smoke_cannot_pass_via_inherited_stale_pythonpath(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "broken"
     plugin.mkdir(parents=True)
@@ -1150,6 +1156,7 @@ def test_promote_and_rollback_refuse_mismatched_build_stamp(tmp_path):
 
 
 
+@pytest.mark.macos_only
 def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway, update_cmd
@@ -1312,7 +1319,8 @@ def test_pre_s2_revision_fails_with_clear_message(tmp_path):
     assert not (home / "releases" / "A").exists()
 
 
-def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profile(tmp_path):
+def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "candidate-test"
     plugin.mkdir(parents=True)
