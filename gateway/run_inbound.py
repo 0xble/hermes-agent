@@ -95,7 +95,7 @@ class GatewayInboundMixin:
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    event = dataclasses.replace(event, text=_new_text)
+                    event.text = _new_text
                 break
             if _action == "allow":
                 break
@@ -254,6 +254,27 @@ class GatewayInboundMixin:
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
+        if getattr(_config, "durable_outbox_enabled", False) and source.platform == Platform.TELEGRAM:
+            from gateway.outbox import store_for, bind_turn, event_kind, transport_id
+            import uuid
+
+            home = getattr(self, "_resolve_profile_home_for_source")(source)
+            profile = getattr(source, "profile", None) or "default"
+            kind = event_kind(event)
+            event_id = transport_id(event)
+            if not event_id:
+                event_id = uuid.uuid4().hex
+                setattr(event, "_outbox_transport_id", event_id)
+            store = store_for(home)
+            turn_id, fresh = await asyncio.to_thread(
+                store.admit, str(profile), "telegram", event_id, kind)
+            setattr(event, "_outbox_turn_id", turn_id)
+            setattr(event, "_outbox_home", home)
+            if not fresh:
+                setattr(event, "_outbox_duplicate", True)
+                logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
+            else:
+                bind_turn(home, turn_id)
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
@@ -1326,6 +1347,28 @@ class GatewayInboundMixin:
             return event, source, is_internal
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from gateway.outbox import scoped_turn_entry, restore_turn, store_for
+        token = scoped_turn_entry()
+        result = None
+        try:
+            handler = getattr(type(self), "_handle_admitted_message", None)
+            # Spec'd mock runners lack class methods; invoke the real ingress
+            # logic rather than the mock's auto-created AsyncMock.
+            if handler is None:
+                handler = GatewayInboundMixin._handle_admitted_message
+            result = await handler(self, event)
+            return result
+        finally:
+            turn_id = getattr(event, "_outbox_turn_id", None)
+            try:
+                if turn_id and not getattr(event, "_outbox_duplicate", False):
+                    await asyncio.to_thread(
+                        store_for(getattr(event, "_outbox_home")).finish_admission,
+                        turn_id, "completed" if result is not None else "empty")
+            finally:
+                restore_turn(token)
+
+    async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -1333,6 +1376,10 @@ class GatewayInboundMixin:
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        if getattr(event, "_outbox_duplicate", False):
+            # The original result is retained on the event for transport-level
+            # acknowledgement; returning it here would SEND it a second time.
+            return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).
         alias_text = self._quick_command_alias_text(event)
