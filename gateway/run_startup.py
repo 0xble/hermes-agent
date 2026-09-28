@@ -1750,6 +1750,8 @@ class GatewayStartupMixin:
         logger.info("Starting Hermes Gateway...")
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
+        # Spools remain on disk on early aborts: only a boot with an initialized session
+        # store and connected adapters can safely claim a deferred follow-up for delivery.
         if await self._abort_startup_if_shutdown_requested():
             return True
         if self._start_check_access_policy():

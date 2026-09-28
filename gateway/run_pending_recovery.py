@@ -42,15 +42,33 @@ def recover_pending_shutdown_flush(runner) -> int:
         entry = getattr(runner.session_store, "_entries", {}).get(key)
         if not (entry and entry.resume_pending and entry.session_id == session_id and entry.origin):
             return False
+        # Older spools lack authorship. A guessed author would authorize a queued command as
+        # the session starter in shared chats, so recover those only as transcript text.
+        author_id = data.get("source_user_id") or data.get("user_id")
+        if not isinstance(author_id, str) or not author_id.strip():
+            return False
         source = runner._restored_source(entry)
         if runner._delivery_adapter_for(source) is None:
             return None
         from gateway.platforms.event import MessageEvent, MessageType
         from gateway.session_identity import replace_source
         message_id = data.get("message_id")
-        source = replace_source(source, message_id=message_id)
-        event = MessageEvent(text=data["text"], message_type=MessageType.TEXT,
-                             source=source, message_id=message_id)
+        source = replace_source(
+            source, message_id=message_id, user_id=author_id,
+            user_name=data.get("source_user_name") or data.get("user_name"),
+            user_id_alt=data.get("source_user_id_alt"),
+            is_bot=bool(data.get("source_is_bot", False)),
+            role_authorized=bool(data.get("source_role_authorized", False)),
+        )
+        event = MessageEvent(
+            text=data["text"], message_type=MessageType.TEXT, source=source,
+            user_id=data.get("user_id") or author_id,
+            user_name=data.get("user_name") or source.user_name,
+            message_id=message_id,
+            media_urls=data.get("media_urls") or data.get("media") or [],
+            media_types=data.get("media_types") or [],
+            reply_to_message_id=data.get("reply_to_message_id") or data.get("reply_to"),
+        )
         setattr(event, "_hermes_recovered_followup", True)
         runner._queue_startup_restore_event(event)
         return True

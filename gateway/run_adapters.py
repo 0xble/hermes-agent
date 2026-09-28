@@ -801,6 +801,20 @@ class GatewayAdapterLifecycleMixin:
             ))
             task.add_done_callback(self._late_failure_callback("planned-restart notification replay failed"))
 
+    async def _recover_spool_after_reconnect(self, platform) -> None:
+        """Claim owed follow-ups before resume and drain them as separate turns."""
+        from gateway.run_pending_recovery import recover_pending_shutdown_flush
+        self._startup_restore_in_progress = True
+        try:
+            recover_pending_shutdown_flush(self)
+            # Recovery scans all served homes, but only the newly available platform resumes.
+            self._schedule_resume_pending_sessions(platform=platform)
+        except Exception:
+            logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
+                           exc_info=True)
+        finally:
+            await self._finish_startup_restore()
+
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""
         self._publish_primary_adapter(platform, adapter)
@@ -830,11 +844,9 @@ class GatewayAdapterLifecycleMixin:
         with suppress(Exception):
             from gateway.channel_directory import build_channel_directory
             await build_channel_directory(self.adapters)
-        # A platform offline at startup skipped its restart-interrupted sessions; resume them now.
-        try:
-            self._schedule_resume_pending_sessions(platform=platform)
-        except Exception:
-            logger.debug("resume-pending reschedule after %s reconnect failed", platform.value, exc_info=True)
+        # A spool held while this adapter was offline must be reclaimed before its
+        # interrupted session resumes, then replayed after the resumed answer.
+        await self._recover_spool_after_reconnect(platform)
 
     async def _cancel_secondary_profile_reconnect_tasks(self) -> None:
         """Cancel profile-scoped reconnects before tearing down their registry, so a reconnect
@@ -1288,11 +1300,7 @@ class GatewayAdapterLifecycleMixin:
                             # What a primary reconnect replays too: the owed notice spans served profiles' home
                             # channels, and sessions boot skipped for this offline adapter wait for this call.
                             self._schedule_planned_restart_replay()
-                            try:
-                                self._schedule_resume_pending_sessions(platform=platform)
-                            except Exception:
-                                logger.debug("resume-pending reschedule after %s reconnect failed (profile: %s)",
-                                             platform.value, profile_name, exc_info=True)
+                            await self._recover_spool_after_reconnect(platform)
                             return
                     # Not installed (newer reconnect won the slot, shutdown began, or connect failed):
                     # release partial resources; stop only for a non-retryable fatal.

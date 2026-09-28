@@ -198,6 +198,16 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
+        for attr in ("user_id", "user_name", "media_urls", "media_types", "reply_to_message_id"):
+            val = getattr(value, attr, None)
+            if val is not None and _json_safe(val):
+                result[attr] = val
+        source = getattr(value, "source", None)
+        if source is not None:
+            for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
+                val = getattr(source, attr, None)
+                if val is not None and _json_safe(val):
+                    result[f"source_{attr}"] = val
         return result
     if isinstance(value, str):  # runner-level _pending_messages
         return {"text": value}
