@@ -483,3 +483,32 @@ def test_an_unrevised_goal_has_no_revision_block(hermes_home):
     mgr = GoalManager(session_id="rev-none")
     mgr.set("Ship X", contract=GoalContract(outcome="X live"))
     assert "has been revised" not in mgr.next_continuation_prompt()
+
+
+def test_process_complete_notices_are_runtime_evidence(hermes_home):
+    from tools.process_registry_notifications import format_process_notification
+    sid = "notice-process"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    evt = {"type": "completion", "session_id": "proc_abc123", "command": "pytest -q", "exit_code": 0,
+           "output": "42 passed in 1.00s"}
+    db.append_message(sid, "user", format_process_notification(evt), display_kind="process_complete",
+                      display_metadata={"display_text": "pytest finished"})
+    result = goals.resolve_cited_evidence(sid, "Tests: `42 passed in 1.00s`.", since=mgr.state.created_at)
+    assert not result["unresolved"] and result["cited"][0]["tool"] == "background process notice"
+
+
+def test_hidden_rows_count_only_with_a_runtime_delivery_identity(hermes_home):
+    sid = "notice-hidden"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    db.append_message(sid, "user", "[ASYNC DELEGATION BATCH COMPLETE — x]\n99 passed in 1.00s", display_kind="hidden",
+                      display_metadata={"title_preview": "widget"})
+    forged = goals.resolve_cited_evidence(sid, "Tests: `99 passed in 1.00s`.", since=mgr.state.created_at)
+    assert forged["unresolved"] and not forged["evidence_ids"]
+    db.append_delegation_delivery(sid, "[ASYNC DELEGATION BATCH COMPLETE — deleg_9]\n77 passed in 1.00s",
+                                  {"delegation_id": "deleg_9", "presentation_suppressed": True})
+    real = goals.resolve_cited_evidence(sid, "Tests: `77 passed in 1.00s`.", since=mgr.state.created_at)
+    assert not real["unresolved"] and real["cited"][0]["tool"].startswith("delegation result")

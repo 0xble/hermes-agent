@@ -1113,12 +1113,14 @@ class SessionMessagesMixin:
             return []
         excl, excl_params = self._tool_exclusion_sql(exclude_tools, exclude_prefixes)
         rows = self._read_all(
-            f"""SELECT id, tool_call_id, tool_name, content, timestamp, display_kind FROM messages
+            f"""SELECT id, tool_call_id, tool_name, content, timestamp, display_kind, display_metadata
+                FROM messages
                 WHERE session_id = ? AND role = ? AND timestamp >= ? AND instr(content, ?) > 0{excl}
                 ORDER BY id DESC LIMIT ?""",
             (session_id, role, float(since or 0.0), needle, *excl_params, max(int(limit), 1)))
         return [{"id": row[0], "tool_call_id": row[1], "tool_name": row[2], "content": row[3],
-                 "timestamp": row[4], "display_kind": row[5]} for row in rows]
+                 "timestamp": row[4], "display_kind": row[5],
+                 "display_metadata": self._decode_display_metadata(row[6])} for row in rows]
 
     def messages_by_role(self, session_id: str, role: str, *, since: float = 0.0,
                          limit: int = 500) -> List[Dict[str, Any]]:

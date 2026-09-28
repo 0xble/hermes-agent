@@ -1326,8 +1326,10 @@ _RUNTIME_NOTICE_LABELS = (
 )
 
 
-# display_kind values only the runtime writes on the user-role rows it injects.
-_RUNTIME_NOTICE_KINDS = frozenset({"internal_notification", "async_delegation_complete", "hidden"})
+# display_kind values only the runtime writes on the user-role rows it injects. "hidden" is not
+# among them: clients may submit hidden prompts, so a hidden row counts only with the runtime's
+# delegation-delivery identity (see _runtime_notice_label).
+_RUNTIME_NOTICE_KINDS = frozenset({"internal_notification", "async_delegation_complete", "process_complete"})
 # display_kind values of user-role rows the person typed: none, or a mid-turn /steer message.
 _USER_TYPED_KINDS = frozenset({"", "steer"})
 
@@ -1337,7 +1339,12 @@ def _runtime_notice_label(row: Dict[str, Any]) -> str:
 
     The persisted ``display_kind`` authenticates the row; the text prefix only picks the label.
     A user message that merely starts with the same words is typed input, never evidence."""
-    if str(row.get("display_kind") or "") not in _RUNTIME_NOTICE_KINDS:
+    kind = str(row.get("display_kind") or "")
+    meta = row.get("display_metadata") if isinstance(row.get("display_metadata"), dict) else {}
+    # A suppressed delegation delivery is stored hidden with its delegation_id; a client-submitted
+    # hidden prompt can carry only a title preview.
+    runtime_hidden = kind == "hidden" and bool(meta.get("delegation_id"))
+    if kind not in _RUNTIME_NOTICE_KINDS and not runtime_hidden:
         return ""
     content = row.get("content")
     text = content.lstrip() if isinstance(content, str) else ""
