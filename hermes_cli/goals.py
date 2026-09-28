@@ -63,6 +63,9 @@ _EVIDENCE_EXCLUDED_TOOLS = frozenset({
     "session_search", "todo", "todo_list", "clarify", "goal_set",
 })
 _EVIDENCE_EXCLUDED_TOOL_PREFIXES = ("hindsight_",)
+# Passed to the SessionDB finders so exclusions apply before their row limits.
+_EVIDENCE_EXCLUSION_KW = {"exclude_tools": tuple(sorted(_EVIDENCE_EXCLUDED_TOOLS)),
+                          "exclude_prefixes": _EVIDENCE_EXCLUDED_TOOL_PREFIXES}
 
 # Cited evidence: exact identifiers the response quotes (backtick spans, quoted strings, SHAs, URLs,
 # long ids) are located verbatim in every tool result recorded since the goal started, so proof
@@ -1347,11 +1350,13 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
         try:
             # A cited command resolves to what running it returned; anything else to where it appears.
             if call_finder is not None and len(needle) >= 8:
-                matches += [(r, needle, True) for r in call_finder(session_id, needle, since=since, limit=4)]
+                matches += [(r, needle, True) for r in call_finder(session_id, needle, since=since, limit=4,
+                                                                   **_EVIDENCE_EXCLUSION_KW)]
             for variant in _citation_variants(needle):
                 if len(matches) >= _CITATION_ROWS_PER_NEEDLE * 2:
                     break
-                matches += [(r, variant, False) for r in finder(session_id, variant, role="tool", since=since, limit=4)]
+                matches += [(r, variant, False) for r in finder(session_id, variant, role="tool", since=since,
+                                                                limit=4, **_EVIDENCE_EXCLUSION_KW)]
         except Exception as exc:
             logger.debug("goal evidence: citation lookup failed: %s", exc)
             return empty

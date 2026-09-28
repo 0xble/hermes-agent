@@ -372,3 +372,18 @@ def test_rewording_or_dropping_citations_is_not_new_evidence(hermes_home):
             patch.object(goals, "resolve_cited_evidence", side_effect=lambda *a, **k: next(seq)):
         decisions = [mgr.evaluate_after_turn("done") for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES)]
     assert decisions[-1]["verdict"] == "disputed" and not decisions[-1]["should_continue"]
+
+
+def test_excluded_bookkeeping_matches_do_not_crowd_out_real_evidence(hermes_home):
+    """Recent goal_set calls quoting an identifier must not hide the older result that proves it."""
+    sid = "cite-crowd"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it")
+    _tool(db, sid, "terminal", {"command": "build"}, "build_id=bld_12345678 status=passed", "real")
+    for i in range(6):
+        _tool(db, sid, "goal_set", {"action": "subgoal", "text": f"check build_id=bld_12345678 #{i}"},
+              f"noted build_id=bld_12345678 #{i}", f"bk{i}")
+    result = goals.resolve_cited_evidence(sid, "Build `build_id=bld_12345678` passed.", since=mgr.state.created_at)
+    assert not result["unresolved"]
+    assert result["cited"] and {c["tool"] for c in result["cited"]} == {"terminal"}
