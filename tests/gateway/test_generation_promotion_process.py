@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import time
@@ -23,6 +24,13 @@ TOKEN = "123456:LOCAL_STUB_ONLY"
 def _worker(standby: bool):
     from gateway.config import load_gateway_config
     from gateway.run import start_gateway
+    if not standby and os.environ.get("TEST_PAUSE_TRANSFER"):
+        from gateway.run_generation import ActiveGeneration
+        async def paused_transfer(self, new_id: str) -> dict:
+            Path(os.environ["TEST_PAUSE_TRANSFER"]).touch()
+            await asyncio.Event().wait()
+            return {}
+        ActiveGeneration.transfer_requested = paused_transfer
     print(f"WORKER:{'B' if standby else 'A'}", flush=True)
     success = asyncio.run(start_gateway(load_gateway_config(), standby=standby))
     print(f"EXIT:{success}", flush=True)
@@ -32,7 +40,8 @@ def _worker(standby: bool):
 @pytest.mark.asyncio
 async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path):
     api = BotAPI()
-    command = "sleep 60"
+    started = tmp_path / "tool-running"
+    command = f"touch {shlex.quote(str(started))} && sleep 60"
     def model(record):
         messages = record["body"]["messages"]
         if messages and messages[-1].get("role") == "tool":
@@ -85,9 +94,9 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             if not standby:
                 api.add(1001, 1001, text="old-boundary")
                 end = time.monotonic() + 25
-                while len(llm.main_requests()) < 1 and time.monotonic() < end:
+                while not started.exists() and time.monotonic() < end:
                     await asyncio.sleep(.1)
-                assert llm.main_requests(), "A did not start the scripted turn"
+                assert started.exists(), "A did not launch the 60-second tool call"
                 await asyncio.sleep(.3)
                 with api.lock:
                     assert not any("old-turn-complete" in item["text"] for item in api.sent)
@@ -107,7 +116,15 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                     break
             await asyncio.sleep(.1)
         else:
-            raise AssertionError(f"B did not answer new session; sent={api.sent}; model calls={len(llm.main_requests())}; B rc={processes[1].poll()}")
+            raise AssertionError("B did not answer new session")
+        processes[1].kill()
+        await asyncio.to_thread(processes[1].wait, 5)
+        with api.lock:
+            post_kill_polls = len(api.offsets)
+        await asyncio.sleep(1)
+        with api.lock:
+            assert len(api.offsets) == post_kill_polls, "A resumed polling after B died"
+        assert processes[0].poll() is None, "A did not preserve its in-flight turn"
         end = time.monotonic() + 85
         while time.monotonic() < end:
             with api.lock:
@@ -135,6 +152,61 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                     await asyncio.to_thread(proc.wait, 5)
         api.close()
         llm.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path):
+    api = BotAPI()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "gateway:\n  overlap_handover:\n    enabled: true\n"
+        "platforms:\n  telegram:\n    enabled: true\n    token: '" + TOKEN + "'\n"
+        "    extra:\n      base_url: '" + api.url + "'\n"
+        "      base_file_url: '" + api.url + "'\n"
+        "      allow_from: ['1']\n      drop_pending_on_cold_boot: false\n")
+    marker = tmp_path / "stop-requested"
+    env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
+           "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+           "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "TEST_PAUSE_TRANSFER": str(marker)}
+    processes = []
+    try:
+        for standby in (False, True):
+            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+                                     "worker", "standby" if standby else "active"],
+                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            processes.append(proc)
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                rows = GenerationCoordinator(home).generations()
+                if len(rows) == len(processes) and rows[-1]["state"] == "ready":
+                    break
+                assert proc.poll() is None, f"gateway died {proc.returncode}"
+                await asyncio.sleep(.1)
+            else:
+                raise AssertionError("generation did not become ready")
+        db = GenerationCoordinator(home)
+        successor = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway-b")
+        request = asyncio.create_task(asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=5))
+        deadline = time.monotonic() + 15
+        while not marker.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(.1)
+        assert marker.exists(), (f"old never entered stop protocol; request={request.exception() if request.done() else 'pending'}; "
+                                 f"rows={db.generations()}; api={api.offsets}; stderr={processes[0].stderr.read() if processes[0].poll() is not None else ''}")
+        processes[0].kill()
+        await asyncio.to_thread(processes[0].wait, 5)
+        with pytest.raises(RuntimeError):
+            await request
+        assert db.leases()[0]["generation_id"] != successor["id"]
+        assert next(row for row in db.generations() if row["id"] == successor["id"])["state"] == "ready"
+        with api.lock:
+            assert api.maximum <= 1
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.kill()
+                await asyncio.to_thread(proc.wait, 5)
+        api.close()
 
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "worker":

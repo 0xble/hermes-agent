@@ -50,8 +50,11 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
     return response["result"]
 
 
-def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45) -> int:
+def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
+                           drain_seconds: float = 7200) -> int:
     """Internal updater entry point; never ask the lease holder to relinquish by force."""
+    if not 1 <= drain_seconds <= 86400:
+        raise ValueError("drain_seconds must be between 1 and 86400")
     coordinator = GenerationCoordinator(home)
     lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
     if not lease or lease["state"] != "active":
@@ -71,7 +74,7 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45) -> in
     ack = _generation_request(path, "transfer_requested", params={"to": to_id}, timeout=timeout)
     if (ack.get("generation_id"), ack.get("epoch"), ack.get("poller_stopped")) != (old_id, epoch, True):
         raise RuntimeError("old generation did not prove poller stopped")
-    promoted = coordinator.commit_transfer(old_id, to_id, epoch)
+    promoted = coordinator.commit_transfer(old_id, to_id, epoch, drain_seconds=drain_seconds)
     successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})
     successor_socket = generation_paths(home, successor_identity)["socket"]
     deadline = time.monotonic() + timeout
