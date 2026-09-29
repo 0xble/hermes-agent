@@ -111,45 +111,39 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
 
 
 def _observe_admission(home: Path, generation_id: str, epoch: int, *,
-                       timeout: float = 30) -> dict:
-    """Require B's authorized Telegram input AND its durable delivered send.
+                       after: float = 0, timeout: float = 30) -> dict:
+    """Require a newly accepted Telegram poll update and its delivered reply.
 
-    A poll-status receipt alone is not a successful update. A new authorized
-    inbound turn must pass the native admission path and reach the outbox.
+    The owned inbox only records routed obligations, not every locally handled
+    turn. The polling journal is the durable admission record for fresh input.
+    The caller must first prove B owns the sole polling lease, then fence the
+    observation with ``after`` so A's earlier turns cannot satisfy the proof.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         coordinator = GenerationCoordinator(home)
         with coordinator.connect() as db:
             rows = db.execute(
-                "SELECT profile_home,source_event_id,authorized_source FROM inbox "
-                "WHERE owner_id=? AND owner_epoch=? AND state='accepted' "
-                "AND transport='telegram' AND kind='message'",
-                (generation_id, epoch)).fetchall()
-        for row in rows:
-            import json
-            try:
-                source = json.loads(row["authorized_source"])
-            except (ValueError, TypeError):
-                continue
-            if source.get("authorized") is not True or source.get("home") != row["profile_home"]:
-                continue
-            outbox = Path(row["profile_home"]) / "gateway-outbox.db"
-            if not outbox.is_file():
-                continue
+                "SELECT update_id FROM telegram_updates WHERE state='accepted' "
+                "AND received_at>=? ORDER BY received_at DESC",
+                (after,)).fetchall()
+        outbox = home / "gateway-outbox.db"
+        if outbox.is_file():
             with sqlite3.connect(f"file:{outbox}?mode=ro", uri=True, timeout=2) as db:
-                delivery = db.execute(
-                    "SELECT a.turn_id, o.message_id FROM admissions a JOIN outbox o "
-                    "ON o.turn_id=a.turn_id WHERE a.platform='telegram' "
-                    "AND a.transport_event_id=? AND a.event_kind='message' "
-                    "AND o.state='delivered' AND o.message_id IS NOT NULL LIMIT 1",
-                    (f"update:{row['source_event_id']}",)).fetchone()
-            if delivery:
-                return {"source_event_id": row["source_event_id"],
-                        "turn_id": delivery[0], "message_id": delivery[1],
-                        "generation_id": generation_id, "epoch": epoch}
+                for row in rows:
+                    delivery = db.execute(
+                        "SELECT a.turn_id, o.message_id FROM admissions a JOIN outbox o "
+                        "ON o.turn_id=a.turn_id WHERE a.platform='telegram' "
+                        "AND a.transport_event_id=? AND a.event_kind='text' "
+                        "AND a.created_at>=? AND o.state='delivered' "
+                        "AND o.message_id IS NOT NULL LIMIT 1",
+                        (f"update:{row['update_id']}", int(after))).fetchone()
+                    if delivery:
+                        return {"source_event_id": str(row["update_id"]),
+                                "turn_id": delivery[0], "message_id": delivery[1],
+                                "generation_id": generation_id, "epoch": epoch}
         time.sleep(.2)
-    raise RuntimeError("successor has not proved an authorized admitted and delivered reply")
+    raise RuntimeError("successor has not proved a newly accepted and delivered reply")
 
 
 def verified_overlap(home: Path, proof: dict) -> bool:
@@ -166,7 +160,12 @@ def verified_overlap(home: Path, proof: dict) -> bool:
         return False
     if not _observe_poller(home, active).get("polling"):
         return False
-    return _observe_admission(home, active["id"], epoch, timeout=.2) == admission
+    try:
+        return _observe_admission(home, active["id"], epoch,
+                                  after=proof.get("admission_after", float("inf")),
+                                  timeout=.2) == admission
+    except RuntimeError:
+        return False
 
 
 def _launch_agents_dir() -> Path:
@@ -248,6 +247,7 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
         promoted_epoch = handover_to_generation(home, successor["id"], timeout=min(timeout, 45),
                                                 drain_seconds=drain_seconds)
         poller = _observe_poller(home, successor)
+        admission_after = time.time()
         activate_release(home, candidate)  # Flip only after B owns and polls.
         # The loaded job keeps its standby argv; the next login must start the
         # committed owner as active, not an inert standby.
@@ -288,4 +288,5 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
     return {"old_id": old["id"], "new_id": successor["id"],
             "old_sha": old["release_sha"], "new_sha": sha,
             "old_label": old["label"], "new_label": label, "epoch": promoted_epoch,
-            "poller": poller, "previous": str(old_release), "current": str(candidate)}
+            "poller": poller, "admission_after": admission_after,
+            "previous": str(old_release), "current": str(candidate)}

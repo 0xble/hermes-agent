@@ -267,7 +267,9 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                     return False
                 from hermes_cli.gateway_overlap import _observe_admission
                 try:
-                    result["admission"] = _observe_admission(Path(home), result["new_id"], result["epoch"])
+                    result["admission"] = _observe_admission(
+                        Path(home), result["new_id"], result["epoch"],
+                        after=result.get("admission_after", float("inf")))
                 except Exception as exc:
                     record_overlap_generation({**result, "outcome": "blocked", "failure": str(exc)})
                     raise
