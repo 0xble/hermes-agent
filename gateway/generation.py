@@ -434,7 +434,7 @@ def generation_paths(home: Path, identity: GenerationIdentity) -> dict[str, Path
     if len(os.fsencode(socket)) >= 100:
         import hashlib
         digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:16]
-        socket = Path(os.path.sep, "tmp", f"hg-{getattr(os, 'getuid', lambda: 0)()}-{digest}") / f"{suffix[:12]}.sock"
+        socket = Path(os.path.sep, "tmp", f"hg-{getattr(os, 'getuid', lambda: 0)()}-{digest}") / f"{suffix[:32]}.sock"
     return {
         "pid": root / f"gateway.{suffix}.pid",
         "socket": socket,

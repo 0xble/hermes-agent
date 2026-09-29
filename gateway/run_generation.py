@@ -154,18 +154,53 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
     return active
 
 
+def _generation_socket_owner_path(socket_path: Path) -> Path:
+    return socket_path.with_name(f".{socket_path.name}.owner.json")
+
+
+def _socket_accepts_connections(socket_path: Path) -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(str(socket_path))
+        return True
+    except OSError:
+        return False
+
+
+def _generation_owner_is_dead(socket_path: Path) -> bool:
+    try:
+        owner = json.loads(_generation_socket_owner_path(socket_path).read_text())
+        pid = int(owner["pid"])
+        expected_start = owner.get("start_time")
+        from gateway.status import _get_process_start_time, _pid_exists
+        if _pid_exists(pid):
+            return expected_start is not None and _get_process_start_time(pid) != expected_start
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _cleanup_stale_generation_socket_roots(current: Path) -> None:
     root = current.parent
     if root.parent != Path(os.path.sep, "tmp") or not root.name.startswith("hg-"):
         return
     uid = getattr(os, "getuid", lambda: 0)()
     prefix = f"hg-{uid}-"
+    grace_period = 10 * 60
     for sibling in root.parent.glob(f"{prefix}*"):
         if sibling == root or not sibling.is_dir():
             continue
         try:
             mode = stat.S_IMODE(sibling.stat().st_mode)
             if sibling.stat().st_uid != uid or mode & 0o077:
+                continue
+            if time.time() - sibling.stat().st_mtime < grace_period:
+                continue
+            sockets = list(sibling.glob("*.sock"))
+            if not sockets or any(_socket_accepts_connections(path) for path in sockets):
+                continue
+            if not all(_generation_owner_is_dead(path) for path in sockets):
                 continue
             shutil.rmtree(sibling)
         except OSError:
@@ -201,8 +236,10 @@ class GenerationControlServer(GatewayControlServer):
     async def _start_posix(self) -> bool:
         bind_path = self._generation_socket_path
         bind_path.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            if bind_path.exists():
+        if bind_path.exists():
+            if _socket_accepts_connections(bind_path):
+                raise RuntimeError(f"generation control socket is already live: {bind_path}")
+            with contextlib.suppress(OSError):
                 bind_path.unlink()
         old_umask = os.umask(0o177)
         try:
@@ -210,6 +247,8 @@ class GenerationControlServer(GatewayControlServer):
         finally:
             os.umask(old_umask)
         os.chmod(bind_path, 0o600)
+        from gateway.status import _build_pid_record
+        _generation_socket_owner_path(bind_path).write_text(json.dumps(_build_pid_record()))
         self._bind_path = bind_path
         return True
 
@@ -457,6 +496,8 @@ class ActiveGeneration:
                 current = self.paths["socket"].stat()
                 if (current.st_dev, current.st_ino) == (self.socket_stat.st_dev, self.socket_stat.st_ino):
                     self.paths["socket"].unlink()
+        with suppress(OSError):
+            _generation_socket_owner_path(self.paths["socket"]).unlink()
         _remove_empty_generation_socket_parent(self.paths["socket"])
         await asyncio.to_thread(self.coordinator.project_stopped_summary,
                                 self.identity, self.epoch)
