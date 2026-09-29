@@ -274,6 +274,51 @@ class TestReclaim:
             name: name for name in names
         }
 
+    @pytest.mark.parametrize("with_dangling", [False, True])
+    def test_ignored_directory_archives_nested_links_without_following_them(
+        self, repo, tmp_path, monkeypatch, with_dangling,
+    ):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        # The ignore rule is versioned in the repo, not supplied by host config.
+        (repo / ".gitignore").write_text("ignored/\n")
+        _git(["add", ".gitignore"], repo)
+        _git(["commit", "-m", "ignore scratch"], repo)
+        _git(["push", "origin", "main"], repo)
+        tree, _ = _add_worktree(repo, "hermes-ignored-links")
+        ignored = tree / "ignored"
+        nested = ignored / "nested"
+        nested.mkdir(parents=True)
+        (ignored / "link").symlink_to("../README.md")
+        if with_dangling:
+            (nested / "dangling").symlink_to("missing")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret").write_text("not archive content")
+        (nested / "directory-link").symlink_to(outside, target_is_directory=True)
+        (nested / "note").write_text("scratch")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-ignored-links")
+        assert record.verdict == "reap-archive"
+        assert record.untracked == ["ignored/"]
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed hermes-ignored-links" in action for action in actions)
+        assert not tree.exists()
+        archives = list((archive_home / "archive" / "worktree-prune").glob("hermes-ignored-links-*"))
+        assert len(archives) == 1
+        archived = archives[0] / "ignored"
+        links = [
+            (archived / "link", "../README.md"),
+            (archived / "nested" / "directory-link", str(outside)),
+        ]
+        if with_dangling:
+            links.append((archived / "nested" / "dangling", "missing"))
+        for path, target in links:
+            assert path.is_symlink(), f"archive lost symlink: {path}"
+            assert os.readlink(path) == target
+        assert (archived / "nested" / "note").read_text() == "scratch"
+
     def test_reclaim_keeps_tree_when_an_untracked_file_cannot_be_archived(self, repo, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "archive-home"))
         tree, _ = _add_worktree(repo, "hermes-missing")
