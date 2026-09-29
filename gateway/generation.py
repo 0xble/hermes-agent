@@ -366,8 +366,13 @@ def generation_paths(home: Path, identity: GenerationIdentity) -> dict[str, Path
     socket = root / f"gateway.{suffix}.sock"
     if len(os.fsencode(socket)) >= 100:
         import hashlib
+        digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:16]
         scratch = Path(os.getenv("TMPDIR", str(root)))
         socket = scratch / f"hg-{hashlib.sha256(os.fsencode(root / suffix)).hexdigest()[:16]}.sock"
+        if len(os.fsencode(socket)) >= 100:
+            # TMPDIR itself may exceed the kernel's UNIX socket path limit.
+            # Keep the endpoint in a private, deterministic per-home directory.
+            socket = Path(os.path.sep, "tmp", f"hg-{getattr(os, 'getuid', lambda: 0)()}-{digest}") / f"{suffix[:12]}.sock"
     return {
         "pid": root / f"gateway.{suffix}.pid",
         "socket": socket,

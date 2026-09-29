@@ -96,7 +96,11 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                 end = time.monotonic() + 25
                 while not started.exists() and time.monotonic() < end:
                     await asyncio.sleep(.1)
-                assert started.exists(), "A did not launch the 60-second tool call"
+                if not started.exists():
+                    proc.kill()
+                    await asyncio.to_thread(proc.wait, 8)
+                    raise AssertionError(f"A did not launch tool: model calls={len(llm.main_requests())}, sent={api.sent}, "
+                                         f"offsets={api.offsets}, stderr={proc.stderr.read()[-4000:] if proc.stderr else ''}")
                 await asyncio.sleep(.3)
                 with api.lock:
                     assert not any("old-turn-complete" in item["text"] for item in api.sent)

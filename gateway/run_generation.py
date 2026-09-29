@@ -7,6 +7,7 @@ import logging
 import json
 import socket
 import os
+import stat
 import signal
 import time
 from contextlib import suppress
@@ -271,6 +272,11 @@ class ActiveGeneration:
         for name in ("pid", "host"):
             write_generation_record(self.paths[name], self.identity, state="serving")
         socket_path = self.paths["socket"]
+        if socket_path.parent.parent == Path(os.path.sep, "tmp") and socket_path.parent.name.startswith("hg-"):
+            socket_path.parent.mkdir(mode=0o700, exist_ok=True)
+            st = socket_path.parent.lstat()
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+                raise RuntimeError("generation control socket directory is not private")
         if len(os.fsencode(socket_path)) >= 100:
             raise RuntimeError("generation control socket path exceeds UNIX socket limit")
         loop = asyncio.get_running_loop()

@@ -22,6 +22,13 @@ from gateway.generation import (
 )
 
 
+def test_long_temp_root_still_produces_usable_unix_control_socket(tmp_path, monkeypatch):
+    home = tmp_path / ("h" * 100)
+    monkeypatch.setenv("TMPDIR", str(tmp_path / ("t" * 100)))
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    assert len(os.fsencode(generation_paths(home, identity)["socket"])) < 100
+
+
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
     from gateway import generation
     import platform
