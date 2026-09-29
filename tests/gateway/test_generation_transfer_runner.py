@@ -111,6 +111,38 @@ async def test_unscoped_background_process_and_watcher_hold_generation_until_del
 
 
 @pytest.mark.asyncio
+async def test_session_keyed_process_without_claim_keeps_draining_owner_until_notice(tmp_path, monkeypatch):
+    from tools.process_registry import process_registry
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    stopped = []
+    async def stop():
+        stopped.append(True)
+    active.runner = Mock(_overlap_draining=True, _active_work_count=lambda: 0,
+                         _pending_approvals={}, stop=stop)
+    process = Mock(session_key="agent:default:cron:ended", exited=False)
+    monkeypatch.setattr(process_registry, "_running", {"session-bound": process})
+    monkeypatch.setattr(process_registry, "_refresh_detached_session", lambda s: s)
+    monkeypatch.setattr(process_registry, "pending_watchers", [])
+    assert not await active.finish_draining_once()
+    assert stopped == []
+    process.exited = True
+    notice = {"session_key": process.session_key, "type": "complete"}
+    process_registry.pending_watchers.append(notice)
+    assert not await active.finish_draining_once()
+    assert process_registry.pending_watchers.pop() is notice
+    assert await active.finish_draining_once()
+    assert stopped == [True]
+
+
+@pytest.mark.asyncio
 async def test_deadline_exit_releases_outstanding_claim_for_successor(tmp_path):
     import time
     db = GenerationCoordinator(tmp_path)

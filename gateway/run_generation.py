@@ -397,9 +397,11 @@ class ActiveGeneration:
         if record is None or record["state"] != "draining":
             return False
         from tools.process_registry import process_registry
-        busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals)
-                or process_registry.has_unscoped_active()
-                or bool(process_registry.pending_watchers))
+        # A claim covers only its session. A process from an ended cron turn can
+        # have a key but no claim; stopping this owner would kill it before notice.
+        if process_registry.has_any_active() or process_registry.pending_watchers:
+            return False
+        busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals))
         with contextlib.closing(self.coordinator.connect()) as conn:
             queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
                                   (self.identity.id,)).fetchone()

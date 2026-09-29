@@ -103,7 +103,9 @@ class OwnedRouting:
             return True
         if adapter._is_sender_authorized(event.source.user_id, event.source.chat_type,
                                          event.source.chat_id, thread_id=event.source.thread_id) is not True:
-            return True
+            return False  # The native runner owns pairing and unauthorized-DM replies.
+        if event.platform_update_id is None:
+            return False  # Synthetic prompts have no transport ID for deduplication.
         home = self._home(event.source)
         payload = lambda: json.dumps({"event": _event_payload(event)}, ensure_ascii=False).encode()
         envelope = json.dumps({"version": 1, "authorized": True,
@@ -117,16 +119,19 @@ class OwnedRouting:
             self.generation.identity.id, self.generation.epoch)
         if row["owner_id"] == self.generation.identity.id:
             if not fresh:
-                return True
+                return not (row["payload"] == b"{}" and
+                            getattr(event, "_owned_local_pending", None) == row["id"])
             if row["payload"] != b"{}":
                 return True  # An earlier replay row owns this lane; drain in sequence.
+            event._owned_local_pending = row["id"]
             return False
         return True
 
     async def route_callback(self, adapter, update, source, key):
         identity = identity_of(source)
         if identity is None:
-            raise RuntimeError("unresolved callback identity")
+            await update.callback_query.answer(text="This action is unavailable.")
+            return True
         home = self._home(source)
         envelope = json.dumps({"version": 1, "authorized": True,
                                "sender": source.user_id, "chat": source.chat_id,

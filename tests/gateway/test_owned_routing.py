@@ -305,6 +305,91 @@ async def test_callback_replay_marker_is_scoped_to_its_task():
 
 
 @pytest.mark.asyncio
+async def test_unauthorized_dm_falls_through_to_pairing_once(tmp_path):
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "slot-a")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="999", chat_type="dm", user_id="999")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    adapter = SimpleNamespace(_is_sender_authorized=lambda *a, **kw: False)
+    runner = SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
+    replies = []
+    async def native(event):
+        if not await routing.route_message(adapter, event, "chat"):
+            replies.append("pairing code")
+    await native(MessageEvent(text="hello", source=source, platform_update_id=7))
+    assert replies == ["pairing code"]
+    with store.connect() as db:
+        assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_two_goal_prompts_without_update_ids_both_reach_native_path(tmp_path):
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "slot-a")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    adapter = SimpleNamespace(_is_sender_authorized=lambda *a, **kw: True)
+    runner = SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
+    processed = []
+    for text in ("goal continuation 1", "goal continuation 2"):
+        event = MessageEvent(text=text, source=source)
+        if not await routing.route_message(adapter, event, "chat"):
+            processed.append(event.text)
+    assert processed == ["goal continuation 1", "goal continuation 2"]
+    with store.connect() as db:
+        assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_redispatched_local_event_survives_placeholder_without_second_copy(tmp_path):
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "slot-a")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    adapter = SimpleNamespace(_is_sender_authorized=lambda *a, **kw: True)
+    runner = SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
+    event = MessageEvent(text="held", source=source, platform_update_id=13)
+    assert await routing.route_message(adapter, event, "chat") is False
+    # The first native dispatch was cancelled before processing; Telegram holds
+    # the same event object and re-dispatches it on reconnect.
+    processed = []
+    if not await routing.route_message(adapter, event, "chat"):
+        processed.append(event.text)
+    assert processed == ["held"]
+    assert await routing.route_message(adapter, MessageEvent(text="held", source=source,
+        platform_update_id=13), "chat") is True
+    with store.connect() as db:
+        assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_callback_is_answered_without_dispatch(tmp_path):
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "slot-a")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    answers = []
+    async def answer(**kwargs):
+        answers.append(kwargs)
+    update = SimpleNamespace(update_id=14, callback_query=SimpleNamespace(answer=answer))
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch))
+    assert await routing.route_callback(None, update, source, "chat") is True
+    assert len(answers) == 1
+    with store.connect() as db:
+        assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_anonymous_admin_event_drops_without_reopening(tmp_path):
     store = GenerationCoordinator(tmp_path)
     owner = _identity("a", "slot-a")
