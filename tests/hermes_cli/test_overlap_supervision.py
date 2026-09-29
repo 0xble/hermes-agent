@@ -27,6 +27,52 @@ def _generations(home: Path):
     return coordinator, first, second, epoch
 
 
+@pytest.mark.parametrize("rollback_blocks", [False, True])
+def test_promotion_returns_rolled_back_proof_after_committed_observation_failure(tmp_path, monkeypatch, rollback_blocks):
+    from hermes_cli import gateway_overlap
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, first, second, epoch = _generations(home)
+    paths = home / "releases"
+    for identity in (first, second):
+        release = paths / identity.release_sha
+        release.mkdir(parents=True)
+        for marker in (".release-ready", ".hermes_build_sha"):
+            (release / marker).write_text(identity.release_sha)
+    (home / "current").symlink_to(paths / first.release_sha)
+    from dataclasses import asdict
+    monkeypatch.setattr(gateway_overlap, "_active_and_prior", lambda _: (coordinator, asdict(first), None, epoch))
+    monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
+    monkeypatch.setattr(gateway_overlap, "render_generation_launchd_plist", lambda **kwargs: "test")
+    monkeypatch.setattr(gateway_overlap, "bootstrap_generation_plist", lambda **kwargs: None)
+    monkeypatch.setattr(gateway_overlap, "_ready_successor", lambda *args, **kwargs: asdict(second))
+    def activate(_, release, **kwargs):
+        pointer = home / "current"
+        pointer.unlink()
+        pointer.symlink_to(release)
+    monkeypatch.setattr(gateway_overlap, "activate_release", activate)
+    def commit_then_fail(*args, **kwargs):
+        coordinator.request_transfer(first.id, second.id, epoch, set())
+        coordinator.commit_transfer(first.id, second.id, epoch)
+        raise RuntimeError("committed but unverified")
+    monkeypatch.setattr(gateway_overlap, "handover_to_generation", commit_then_fail)
+    def rollback(*args, **kwargs):
+        if rollback_blocks:
+            raise RuntimeError("successor wire-stop unavailable")
+        restored = coordinator.rollback_transfer(second.id, first.id, epoch + 1, poller_stopped=True)
+        activate(home, paths / first.release_sha)
+        return {"epoch": restored, "to_id": first.id}
+    monkeypatch.setattr(gateway_overlap, "rollback_overlap", rollback)
+    if rollback_blocks:
+        with pytest.raises(RuntimeError, match="overlap blocked.*wire-stop unavailable"):
+            gateway_overlap.promote_overlap(home, paths / second.release_sha, second.release_sha)
+        assert coordinator.leases()[0]["generation_id"] == second.id
+    else:
+        result = gateway_overlap.promote_overlap(home, paths / second.release_sha, second.release_sha)
+        assert result["outcome"] == "rolled_back" and result["rollback"]["to_id"] == first.id
+        assert coordinator.leases()[0]["generation_id"] == first.id
+
+
 def test_rollback_requires_stopped_successor_and_increments_epoch(tmp_path):
     coordinator, first, second, epoch = _generations(tmp_path)
     coordinator.request_transfer(first.id, second.id, epoch, set())

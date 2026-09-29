@@ -139,22 +139,35 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
         promoted_epoch = handover_to_generation(home, successor["id"], timeout=min(timeout, 45),
                                                 drain_seconds=drain_seconds)
         poller = _observe_poller(home, successor)
-    except Exception:
-        # If B acquired the lease, rollback is fenced and may fail closed. Never
-        # bootout the candidate or resume A merely because the updater failed.
-        lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
-        if lease and lease["generation_id"] == successor["id"]:
-            rollback_overlap(home, successor["id"], old["id"], lease["epoch"])
-        else:
-            if not lease or (lease["generation_id"], lease["epoch"]) != (old["id"], epoch):
-                raise RuntimeError("active lease became unknown during failed overlap promotion")
-            coordinator.abort_transfer(old["id"], successor["id"], epoch)
-            resumed = _generation_request(_generation_socket(home, old), "resume_uncommitted_transfer",
-                                          params={"epoch": epoch}, timeout=15)
-            if resumed.get("generation_id") != old["id"] or resumed.get("polling") is not True:
-                raise RuntimeError("old generation did not prove restored polling")
-            activate_release(home, old_release, operation="rollback")
-        raise
+    except Exception as failure:
+        # A committed lease cannot be inferred from a missing handover reply.
+        # Record a rollback only after readback proves A owns the wire and the
+        # immutable pointer was restored; an unprovable recovery is blocked.
+        try:
+            lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
+            if lease and lease["generation_id"] == successor["id"]:
+                rollback = rollback_overlap(home, successor["id"], old["id"], lease["epoch"],
+                                            drain_seconds=drain_seconds)
+            else:
+                if not lease or (lease["generation_id"], lease["epoch"]) != (old["id"], epoch):
+                    raise RuntimeError("active lease became unknown during failed overlap promotion")
+                coordinator.abort_transfer(old["id"], successor["id"], epoch)
+                resumed = _generation_request(_generation_socket(home, old), "resume_uncommitted_transfer",
+                                              params={"epoch": epoch}, timeout=15)
+                if resumed.get("generation_id") != old["id"] or resumed.get("polling") is not True:
+                    raise RuntimeError("old generation did not prove restored polling")
+                activate_release(home, old_release, operation="rollback")
+                rollback = {"to_id": old["id"], "epoch": epoch, "polling": True}
+            current = next((row for row in coordinator.leases()
+                            if row["resource"] == "active_generation"), None)
+            if (current is None or current["generation_id"] != old["id"] or
+                    current["epoch"] != rollback["epoch"] or paths.current.resolve() != old_release):
+                raise RuntimeError("rollback readback did not prove old lease and release")
+            return {"outcome": "rolled_back", "failure": str(failure), "rollback": rollback,
+                    "old_id": old["id"], "new_id": successor["id"],
+                    "old_sha": old["release_sha"], "new_sha": sha}
+        except Exception as rollback_error:
+            raise RuntimeError(f"overlap blocked after {failure}: {rollback_error}") from rollback_error
     return {"old_id": old["id"], "new_id": successor["id"],
             "old_sha": old["release_sha"], "new_sha": sha,
             "old_label": old["label"], "new_label": label, "epoch": promoted_epoch,
