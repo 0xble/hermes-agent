@@ -513,6 +513,23 @@ def test_overlap_gate_defaults_off_and_reads_nested_config(tmp_path, monkeypatch
     assert not overlap_handover_enabled({"gateway": {"overlap_handover": None}})
 
 
+def test_overlap_status_names_old_draining_pid(tmp_path, monkeypatch, capsys):
+    from hermes_cli.gateway import _print_overlap_generations
+    import hermes_cli.gateway as gateway_cli
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="slot-a", pid=12345)
+    new = GenerationIdentity.create(release_sha="b", label="slot-b", pid=12346)
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+    _print_overlap_generations()
+    assert f"old generation draining pid={old.pid}" in capsys.readouterr().out.lower()
+
+
 def test_terminal_generations_are_bounded_and_status_is_compact(tmp_path):
     from hermes_cli.gateway_generation_status import read_generation_status
     coordinator = GenerationCoordinator(tmp_path)

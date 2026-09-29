@@ -52,6 +52,104 @@ async def test_old_runner_retains_work_after_polling_stops(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_abandoned_transfer_rearms_old_generation_and_allows_retry(tmp_path, monkeypatch):
+    import gateway.run_generation as generation_run
+
+    monkeypatch.setattr(generation_run, "HANDOVER_REQUEST_TIMEOUT", .2, raising=False)
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    try:
+        deadline = asyncio.get_running_loop().time() + 3
+        while not adapter.resumed and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(.05)
+        assert adapter.resumed
+        assert runner._overlap_draining is False
+        with db.connect() as conn:
+            row = conn.execute("SELECT state FROM generation_transfers WHERE old_id=?", (old.id,)).fetchone()
+        assert row["state"] == "aborted"
+        db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    finally:
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_committed_transfer_cannot_be_aborted_by_old_deadline(tmp_path, monkeypatch):
+    import gateway.run_generation as generation_run
+
+    monkeypatch.setattr(generation_run, "HANDOVER_REQUEST_TIMEOUT", .2, raising=False)
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False,
+                  _active_work_count=lambda: 1, _pending_approvals={})
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    try:
+        db.commit_transfer(old.id, new.id, epoch)
+        await asyncio.sleep(1.3)
+        assert not adapter.resumed
+        assert runner._overlap_draining is True
+        assert db.leases()[0]["generation_id"] == new.id
+        with db.connect() as conn:
+            row = conn.execute("SELECT state FROM generation_transfers WHERE old_id=?", (old.id,)).fetchone()
+        assert row["state"] == "committed"
+    finally:
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_transfer_nonce_lookup_does_not_block_event_loop(tmp_path, monkeypatch):
+    import threading
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.bind_runner(Mock(adapters={}, _overlap_draining=False))
+    db.request_transfer(old.id, new.id, epoch, set())
+    original = db.transfer_attempt_nonce
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_nonce(*args):
+        entered.set()
+        release.wait(3)
+        return original(*args)
+
+    monkeypatch.setattr(db, "transfer_attempt_nonce", slow_nonce)
+    task = asyncio.create_task(active.transfer_requested(new.id))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert not task.done()  # The nonce read did not freeze the event loop.
+    finally:
+        release.set()
+        await task
+        assert active._drain_task is not None
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_old_generation_waits_for_real_work_then_exits(tmp_path):
     db = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="a", label="a")
@@ -241,6 +339,48 @@ async def test_polling_stop_failure_keeps_old_lease(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_partial_rearm_failure_keeps_dispatch_fenced_and_recovers_other_pollers(tmp_path, caplog):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    first, second, third = (PollingAdapter(name) for name in ("first", "second", "third"))
+
+    async def failed_rearm(receipt):
+        raise RuntimeError("first poller cannot restart")
+
+    async def failed_stop():
+        raise RuntimeError("original stop failure")
+
+    first.start_polling_from_transfer = failed_rearm
+    third.stop_polling_for_transfer = failed_stop
+    runner = Mock(adapters={"one": first, "two": second, "three": third}, _overlap_draining=False)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {
+        adapter._controlled_journal.token_hash for adapter in (first, second, third)})
+    with pytest.raises(RuntimeError, match="re-arm failed") as exc:
+        await active.transfer_requested(new.id)
+    assert isinstance(exc.value.__cause__, RuntimeError)
+    assert "original stop failure" in str(exc.value.__cause__)
+    assert second.resumed
+    assert runner._overlap_draining is True
+    assert first._controlled_journal.token_hash in caplog.text
+    assert "original stop failure" in caplog.text
+    assert db.leases()[0]["generation_id"] == old.id
+    active._sync_runtime_status()
+    from gateway.status import read_runtime_status
+    health = read_runtime_status(active.paths["state"])
+    assert health["needs_attention"] is True and health["polling"] is False
+    assert first._controlled_journal.token_hash in health["error_message"]
+    from hermes_cli.gateway_generation_status import read_generation_status
+    old_status = next(row for row in read_generation_status(tmp_path) if row["id"] == old.id)
+    assert old_status["needs_attention"] is True and old_status["polling"] is False
+
+
+@pytest.mark.asyncio
 async def test_transfer_fences_cron_and_goal_before_poller_stops(tmp_path, monkeypatch):
     db = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="a", label="a")
@@ -331,6 +471,48 @@ async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path,
     assert await active.finish_draining_once()
     assert stopped == [True]
     assert len([r for r in caplog.records if "missing drain deadline" in r.message]) == 1
+
+
+@pytest.mark.asyncio
+async def test_takeover_releases_failed_claim_before_retry(monkeypatch):
+    import gateway.run_generation as generation_run
+    import gateway.status as status
+
+    held = False
+    attempts = 0
+    removed = []
+
+    def claim():
+        nonlocal held, attempts
+        attempts += 1
+        held = True
+        if attempts == 1:
+            raise SystemExit(75)
+        return True
+
+    def release():
+        nonlocal held
+        held = False
+
+    async def start_socket():
+        return "claimed"
+
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay):
+        assert delay <= 5
+        await real_sleep(0)
+
+    monkeypatch.setattr(status, "get_running_pid", lambda: None)
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda: held)
+    monkeypatch.setattr(status, "owns_gateway_runtime_lock", lambda: held, raising=False)
+    monkeypatch.setattr(status, "remove_pid_file", lambda: removed.append(True))
+    monkeypatch.setattr(status, "release_gateway_runtime_lock", release)
+    monkeypatch.setattr(generation_run.asyncio, "sleep", sleep)
+    identity = GenerationIdentity.create(release_sha="b", label="b")
+    assert await asyncio.wait_for(generation_run.take_over_legacy_gateway_resources(
+        identity, claim=claim, start_socket=start_socket, refresh=lambda: None), 2) == "claimed"
+    assert attempts == 2 and removed == [True]
 
 
 @pytest.mark.asyncio
