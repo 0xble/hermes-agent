@@ -319,6 +319,64 @@ async def test_transfer_abort_failure_surfaces_attention_status(tmp_path, monkey
     assert runner._overlap_draining is True
 
 
+
+
+@pytest.mark.asyncio
+async def test_draining_coordinator_io_does_not_block_event_loop(tmp_path, monkeypatch):
+    import threading
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    stopped = []
+
+    async def stop():
+        stopped.append(True)
+
+    runner = Mock(adapters={}, _overlap_draining=True, _pending_approvals={},
+                  _active_work_count=lambda: 0, stop=stop)
+    active.bind_runner(runner)
+    original_generations = db.generations
+    original_connect = db.connect
+    generations_entered, generations_release = threading.Event(), threading.Event()
+    connect_entered, connect_release = threading.Event(), threading.Event()
+
+    def slow_generations():
+        generations_entered.set()
+        generations_release.wait(3)
+        return original_generations()
+
+    def slow_connect():
+        connect_entered.set()
+        connect_release.wait(3)
+        return original_connect()
+
+    monkeypatch.setattr(db, "generations", slow_generations)
+    monkeypatch.setattr(db, "connect", slow_connect)
+    task = asyncio.create_task(active.finish_draining_once())
+    assert await asyncio.to_thread(generations_entered.wait, 2)
+    tick = asyncio.Event()
+    asyncio.get_running_loop().call_soon(tick.set)
+    await asyncio.wait_for(tick.wait(), 1)
+    assert not task.done()
+
+    generations_release.set()
+    assert await asyncio.to_thread(connect_entered.wait, 2)
+    tick = asyncio.Event()
+    asyncio.get_running_loop().call_soon(tick.set)
+    await asyncio.wait_for(tick.wait(), 1)
+    assert not task.done()
+    connect_release.set()
+    assert await task is True
+    assert stopped == [True]
+
+
 @pytest.mark.asyncio
 async def test_transfer_fences_cron_and_goal_before_poller_stops(tmp_path, monkeypatch):
     db = GenerationCoordinator(tmp_path)
