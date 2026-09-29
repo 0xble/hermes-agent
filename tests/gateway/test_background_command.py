@@ -161,6 +161,37 @@ class TestHandleBtwCommand:
 
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("lobby_thread_id", [None, "1"])
+    async def test_recovered_dm_topic_answer_drops_lobby_reply_anchor(self, lobby_thread_id):
+        runner = _make_runner()
+        event = _make_event(text="/btw which file?", chat_id="67890")
+        event.source.chat_type = "dm"
+        event.source.thread_id = lobby_thread_id
+        event.source.message_id = "lobby-message"
+        event.message_id = "lobby-message"
+        store = AsyncMock()
+        store.get_or_create_session.return_value = MagicMock(session_id="s1")
+        store.load_transcript.return_value = [{"role": "user", "content": "fix foo.py"}]
+        store._store = runner.session_store
+        runner._async_session_store = store
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("test-model", {"api_key": "k", "provider": "p"})
+        )
+        adapter = AsyncMock()
+        runner._delivery_adapter_for = MagicMock(return_value=adapter)
+
+        with patch.object(runner, "_recover_telegram_topic_thread_id", return_value="42"), \
+             patch("agent.side_question.answer_side_question", return_value="foo.py"):
+            await runner._handle_btw_command(event)
+            await asyncio.gather(*runner._background_tasks)
+
+        store.get_or_create_session.assert_awaited_once_with(event.source)
+        metadata = adapter.send.await_args.kwargs["metadata"]
+        assert metadata["direct_messages_topic_id"] == "42"
+        assert metadata["thread_id"] == "42"
+        assert "telegram_reply_to_message_id" not in metadata
+
+    @pytest.mark.asyncio
     async def test_dispatches_side_question_and_sends_answer(self):
         runner = _make_runner()
         store = AsyncMock()
