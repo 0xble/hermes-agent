@@ -463,6 +463,10 @@ class GenerationCoordinator(OwnedAdmissionMixin):
         legacy clients need B's PID after transfer, so A's exit must never
         unlink this projection. Only the fenced lease holder may overwrite it.
         """
+        from gateway.status import _build_pid_record, _clear_running_pid_cache
+        # Keep both projections inside the write transaction: committing the lease check before
+        # these writes would let a successor acquire the lease and then be overwritten by this
+        # stale writer before the legacy files are updated.
         with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
@@ -470,7 +474,6 @@ class GenerationCoordinator(OwnedAdmissionMixin):
                 return False
             write_generation_record(self.home / "gateway_state.json", identity,
                                     state="serving", runtime=runtime)
-            from gateway.status import _build_pid_record, _clear_running_pid_cache
             write_generation_record(self.home / "gateway.pid", identity,
                                     state="serving", runtime=_build_pid_record())
             _clear_running_pid_cache()

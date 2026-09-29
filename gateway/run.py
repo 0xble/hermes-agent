@@ -5898,7 +5898,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
     from gateway.status import get_running_pid
-    existing_pid = get_running_pid() if promoted_generation is None and not force else None
+    existing_pid = get_running_pid() if promoted_generation is None else None
     if (existing_pid is not None and existing_pid != os.getpid()
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
         return False

@@ -420,10 +420,16 @@ class ActiveGeneration:
                                                       self.identity.id, new_id, self.epoch,
                                                       attempt_nonce=nonce)
                 except Exception:
+                    message = "poller stop failed and transfer abort could not be proved"
+                    self._rearm_errors = [message]
                     logger.exception("transfer abort failed after poller stop failure")
-                    raise RuntimeError("poller stop failed and transfer abort could not be proved") from original
+                    await asyncio.to_thread(self._sync_runtime_status)
+                    raise RuntimeError(message) from original
                 if not aborted:
-                    raise RuntimeError("poller stop failed and transfer attempt changed") from original
+                    message = "poller stop failed and transfer attempt changed"
+                    self._rearm_errors = [message]
+                    await asyncio.to_thread(self._sync_runtime_status)
+                    raise RuntimeError(message) from original
                 errors = await self._rearm_stopped_pollers()
                 if errors:
                     logger.error("poller stop failed: %s; re-arm failed for %s",
@@ -514,17 +520,20 @@ class ActiveGeneration:
     async def transfer_aborted(self, new_id: str, attempt_nonce: str | None = None) -> dict:
         """Re-arm only for the same aborted attempt under the old lease."""
         async with self._transfer_lock:
-            lease = next((row for row in self.coordinator.leases()
+            lease = next((row for row in await asyncio.to_thread(self.coordinator.leases)
                           if row["resource"] == "active_generation"), None)
             if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (
                     self.identity.id, self.epoch, "active"):
                 raise RuntimeError("old generation no longer owns admission")
             if not getattr(self.runner, "_overlap_draining", False):
                 return {"rearmed": True}
-            with contextlib.closing(self.coordinator.connect()) as conn:
-                transfer = conn.execute(
-                    "SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND new_id=? AND epoch=?",
-                    (self.identity.id, new_id, self.epoch)).fetchone()
+            def read_transfer():
+                with contextlib.closing(self.coordinator.connect()) as conn:
+                    return conn.execute(
+                        "SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND new_id=? AND epoch=?",
+                        (self.identity.id, new_id, self.epoch)).fetchone()
+
+            transfer = await asyncio.to_thread(read_transfer)
             if transfer is None or transfer["state"] != "aborted" or (
                     attempt_nonce is not None and transfer["attempt_nonce"] != attempt_nonce):
                 raise RuntimeError("transfer has not been aborted for this attempt")
@@ -578,7 +587,7 @@ class ActiveGeneration:
         """Stop A only after B owns the lease and all locally owned work has settled."""
         if self.runner is None or not getattr(self.runner, "_overlap_draining", False):
             return False
-        rows = self.coordinator.generations()
+        rows = await asyncio.to_thread(self.coordinator.generations)
         record = next((row for row in rows if row["id"] == self.identity.id), None)
         if record is None or record["state"] != "draining":
             return False
@@ -588,11 +597,16 @@ class ActiveGeneration:
         if process_registry.has_any_active() or process_registry.pending_watchers:
             return False
         busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals))
-        with contextlib.closing(self.coordinator.connect()) as conn:
-            queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
-                                  (self.identity.id,)).fetchone()
-            claims = conn.execute("SELECT 1 FROM sessions WHERE generation_id=? LIMIT 1",
-                                  (self.identity.id,)).fetchone()
+
+        def read_pending_work():
+            with contextlib.closing(self.coordinator.connect()) as conn:
+                queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
+                                      (self.identity.id,)).fetchone()
+                claims = conn.execute("SELECT 1 FROM sessions WHERE generation_id=? LIMIT 1",
+                                      (self.identity.id,)).fetchone()
+                return queued, claims
+
+        queued, claims = await asyncio.to_thread(read_pending_work)
         deadline = record["drain_deadline"]
         if deadline is None and not self._missing_deadline_warned:
             logger.warning("generation missing drain deadline; treating as expired")
@@ -665,6 +679,8 @@ class ActiveGeneration:
             if not isinstance(new_id, str):
                 raise RuntimeError("successor generation ID required")
             future = asyncio.run_coroutine_threadsafe(self.transfer_requested(new_id), loop)
+            # Control-socket handlers are rare, bounded operations; waiting here keeps the
+            # synchronous socket protocol simple without occupying an event-loop thread.
             return future.result(timeout=45)
 
         def _abort_handler(params: dict) -> dict:
