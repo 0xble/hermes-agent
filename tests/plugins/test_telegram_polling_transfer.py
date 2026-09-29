@@ -239,6 +239,30 @@ async def test_journal_io_runs_off_loop_and_queue_join_backpressures(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stop_waits_for_queued_dispatch_and_times_out_if_unfinished(tmp_path):
+    journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
+    class Bot:
+        async def get_updates(self, **kwargs):
+            await asyncio.Event().wait()
+    class App:
+        bot = Bot()
+        update_queue = asyncio.Queue()
+    poller = ControlledPoller(App(), journal, timeout=.05)
+    # A completed wire request may coexist with an update already handed to PTB.
+    poller._task = asyncio.create_task(asyncio.sleep(0))
+    await poller._task
+    await App.update_queue.put(Update(update_id=4))
+    stop = asyncio.create_task(poller.stop())
+    await asyncio.sleep(.02)
+    assert not stop.done()
+    assert (await stop) == {"stopped": False, "error": "PollDrainTimeout"}
+    update = App.update_queue.get_nowait()
+    assert update.update_id == 4
+    App.update_queue.task_done()
+    assert await poller.stop() == {"stopped": True}
+
+
+@pytest.mark.asyncio
 async def test_failed_poller_exception_observed_once_without_disconnect(tmp_path, caplog):
     journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
     poller = ControlledPoller(object(), journal)

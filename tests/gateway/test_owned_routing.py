@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import threading
 from types import SimpleNamespace
 
 from gateway.config import Platform
@@ -387,6 +388,135 @@ async def test_unresolved_callback_is_answered_without_dispatch(tmp_path):
     assert len(answers) == 1
     with store.connect() as db:
         assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 0
+
+
+def test_buffered_text_photo_and_group_claim_session_keys(tmp_path):
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    key = "agent:default:telegram:chat-1"
+    event = MessageEvent(text="part", source=SessionSource(platform=Platform.TELEGRAM, chat_id="1"))
+    adapter = SimpleNamespace(
+        platform=Platform.TELEGRAM, _active_sessions={}, _pending_messages={},
+        _pending_text_batches={key: event},
+        _pending_photo_batches={f"{key}:album:42": event},
+        _media_group_events={"42": event},
+        _event_session_key=lambda e: key,
+    )
+    # These are the actual key shapes supplied by the base text batcher and
+    # Telegram's photo/group batchers, not three copies of the session key.
+    assert BasePlatformAdapter._text_batch_key(adapter, event) == key
+    assert TelegramAdapter._photo_batch_key(adapter, event, SimpleNamespace(media_group_id="42")) == f"{key}:album:42"
+    route = OwnedRouting(SimpleNamespace(runner=SimpleNamespace(adapters={"telegram": adapter}, _pending_approvals={})))
+    assert route._live_keys() == {key}
+
+
+def test_unknown_event_fields_are_ignored_on_replay():
+    from gateway.owned_routing import _event_payload
+    event = MessageEvent(text="hello", source=SessionSource(platform=Platform.TELEGRAM, chat_id="1"),
+                         platform_update_id=3)
+    payload = _event_payload(event)
+    payload["future_wire_field"] = "safe to ignore"
+    adapter = SimpleNamespace(build_source=lambda **kw: SessionSource(platform=Platform.TELEGRAM, **kw),
+                              _canonicalize=lambda source: None)
+    restored = _restore_event(json.dumps(payload), adapter)
+    assert restored.text == event.text and restored.platform_update_id == event.platform_update_id
+
+
+@pytest.mark.asyncio
+async def test_observed_group_without_sender_uses_native_owner_or_routes_to_old(tmp_path):
+    store = GenerationCoordinator(tmp_path)
+    old, new = _identity("a", "old"), _identity("b", "new")
+    store.register(old, state="serving")
+    store.register(new, state="ready")
+    old_epoch = store.acquire_lease("active_generation", old.id)
+    key = "agent:default:telegram:group-1"
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="group", user_id=None)
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    adapter = SimpleNamespace(_is_sender_authorized=lambda *a, **kw: False)
+    runner = SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)
+    old_route = OwnedRouting(SimpleNamespace(coordinator=store, identity=old, epoch=old_epoch, runner=runner))
+    event = lambda update: MessageEvent(text="observed", source=source, platform_update_id=update)
+    assert await old_route.route_message(adapter, event(1), key) is False
+    store.freeze_session(str(tmp_path), "telegram", key, old.id, old_epoch)
+    store.release_lease("active_generation", old.id, old_epoch)
+    store.heartbeat(old.id, state="draining")
+    new_epoch = store.acquire_lease("active_generation", new.id)
+    new_route = OwnedRouting(SimpleNamespace(coordinator=store, identity=new, epoch=new_epoch, runner=runner))
+    assert await new_route.route_message(adapter, event(2), key) is True
+    with store.connect() as db:
+        row = db.execute("SELECT owner_id FROM inbox WHERE source_event_id='2'").fetchone()
+    assert row["owner_id"] == old.id
+
+
+@pytest.mark.asyncio
+async def test_bot_authored_allowed_message_retains_identity_on_owner_replay(tmp_path):
+    from gateway.owned_routing import _event_payload
+    store = GenerationCoordinator(tmp_path)
+    old, new = _identity("a", "old"), _identity("b", "new")
+    store.register(old, state="serving")
+    store.register(new, state="ready")
+    old_epoch = store.acquire_lease("active_generation", old.id)
+    key = "agent:default:telegram:chat-1"
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="7", is_bot=True)
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    event = MessageEvent(text="bot message", source=source, platform_update_id=2)
+    store.claim_session(str(tmp_path), "telegram", key, old.id, old_epoch, outstanding_work=1)
+    store.release_lease("active_generation", old.id, old_epoch)
+    store.heartbeat(old.id, state="draining")
+    new_epoch = store.acquire_lease("active_generation", new.id)
+    adapter = SimpleNamespace(platform=Platform.TELEGRAM, _active_sessions={}, _pending_messages={},
+        _owner_transport_profile=lambda: None,
+        _is_sender_authorized=lambda *a, **kw: True,
+        build_source=lambda **kw: SessionSource(platform=Platform.TELEGRAM, **kw),
+        _canonicalize=lambda s: setattr(s, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path)),
+        _source_session_key=lambda s: key)
+    runner = SimpleNamespace(adapters={"telegram": adapter}, _resolve_profile_home_for_source=lambda s: tmp_path,
+                             _overlap_draining=False)
+    route = OwnedRouting(SimpleNamespace(coordinator=store, identity=new, epoch=new_epoch, runner=runner))
+    assert await route.route_message(adapter, event, key) is True
+    with store.connect() as db:
+        row = db.execute("SELECT * FROM inbox WHERE source_event_id='2'").fetchone()
+    assert row["owner_id"] == old.id
+    assert json.loads(row["authorized_source"])["is_bot"] is True
+    restored = _restore_event(json.dumps(json.loads(row["payload"])["event"]), adapter)
+    assert restored.source.is_bot is True
+    seen = []
+    async def handle(replayed):
+        seen.append((replayed.source.is_bot, replayed.text))
+        replayed._gateway_accepted = True
+    adapter.handle_message = handle
+    store.set_outstanding(str(tmp_path), "telegram", key, old.id, old_epoch, 0)
+    store.transfer_session(str(tmp_path), "telegram", key, old.id, old_epoch, new.id, new_epoch)
+    await route._drain_once()
+    assert seen == [(True, "bot message")]
+
+
+@pytest.mark.asyncio
+async def test_inbox_read_keeps_event_loop_responsive(tmp_path, monkeypatch):
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "owner")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    route = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch,
+        runner=SimpleNamespace(adapters={}, _overlap_draining=False)))
+    original = store._transaction
+    entered, release = threading.Event(), threading.Event()
+    def slow_transaction():
+        entered.set()
+        release.wait(2)
+        return original()
+    monkeypatch.setattr(store, "_transaction", slow_transaction)
+    task = asyncio.create_task(route._drain_once())
+    try:
+        # A concurrent ticker must run while the SQLite connection is blocked.
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), 2)
+        tick = asyncio.create_task(asyncio.sleep(.05))
+        await asyncio.wait_for(tick, .5)
+        assert not task.done()
+    finally:
+        release.set()
+        await task
 
 
 @pytest.mark.asyncio

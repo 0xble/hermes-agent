@@ -274,6 +274,38 @@ async def test_session_keyed_process_without_claim_keeps_draining_owner_until_no
 
 
 @pytest.mark.asyncio
+async def test_registry_process_and_pending_notice_each_wait_until_deadline(tmp_path, monkeypatch):
+    import gateway.run_generation as generation_run
+    from tools.process_registry import process_registry
+    db = GenerationCoordinator(tmp_path)
+    old, new = GenerationIdentity.create(release_sha="a", label="a"), GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    now = [1000.0]
+    monkeypatch.setattr(generation_run.time, "time", lambda: now[0])
+    with db.connect() as conn:
+        conn.execute("UPDATE generations SET drain_deadline=? WHERE id=?", (now[0] + 5, old.id))
+    for held_by_process in (True, False):
+        active = ActiveGeneration(tmp_path, db, old, epoch)
+        stopped = []
+        async def stop():
+            stopped.append(True)
+        active.runner = Mock(_overlap_draining=True, _active_work_count=lambda: 0,
+                             _pending_approvals={}, stop=stop)
+        monkeypatch.setattr(process_registry, "has_any_active", lambda: held_by_process)
+        monkeypatch.setattr(process_registry, "pending_watchers", [] if held_by_process else [{"type": "complete"}])
+        now[0] = 1000.0
+        assert not await active.finish_draining_once()
+        assert stopped == []
+        now[0] = 1005.0
+        assert await active.finish_draining_once()
+        assert stopped == [True]
+
+
+@pytest.mark.asyncio
 async def test_deadline_exit_releases_outstanding_claim_for_successor(tmp_path):
     import time
     db = GenerationCoordinator(tmp_path)
