@@ -1,6 +1,7 @@
 """Read-only view of opt-in gateway generations."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,14 @@ def read_generation_status(home: Path) -> list[dict[str, Any]]:
                     f"{row['resource']}@{row['epoch']}:{row['state']}")
             for row in rows:
                 row["leases"] = leases.get(row["id"], [])
+                state_file = Path(home) / f"gateway_state.{row['id']}.json"
+                try:
+                    health = json.loads(state_file.read_text(encoding="utf-8"))
+                    if health.get("id") == row["id"] and health.get("start_fingerprint") == row["start_fingerprint"]:
+                        row["needs_attention"] = health.get("needs_attention", False)
+                        row["polling"] = health.get("polling")
+                except (OSError, ValueError, TypeError):
+                    pass
             return rows
     except (sqlite3.Error, OSError):
         return []

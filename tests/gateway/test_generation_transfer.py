@@ -62,7 +62,7 @@ def test_aborted_transfer_can_be_rearmed_and_old_receipt_is_rejected(tmp_path):
     db, old, new, epoch = _pair(tmp_path)
     db.request_transfer(old.id, new.id, epoch, {"first"})
     first_nonce = db.transfer_attempt_nonce(old.id, epoch)
-    db.abort_transfer(old.id, new.id, epoch)
+    assert db.abort_transfer(old.id, new.id, epoch, attempt_nonce=first_nonce)
     db.request_transfer(old.id, new.id, epoch, {"first"})
     second_nonce = db.transfer_attempt_nonce(old.id, epoch)
     assert second_nonce != first_nonce
@@ -70,6 +70,23 @@ def test_aborted_transfer_can_be_rearmed_and_old_receipt_is_rejected(tmp_path):
         db.record_poller_stopped(old.id, epoch, "first", 1, attempt_nonce=first_nonce)
     db.record_poller_stopped(old.id, epoch, "first", 2, attempt_nonce=second_nonce)
     assert db.commit_transfer(old.id, new.id, epoch) == epoch + 1
+
+
+def test_stale_abort_cannot_cancel_retried_or_committed_transfer(tmp_path):
+    db, old, new, epoch = _pair(tmp_path)
+    db.request_transfer(old.id, new.id, epoch, {"first"})
+    first_nonce = db.transfer_attempt_nonce(old.id, epoch)
+    assert db.abort_transfer(old.id, new.id, epoch, attempt_nonce=first_nonce)
+    db.request_transfer(old.id, new.id, epoch, {"first"})
+    second_nonce = db.transfer_attempt_nonce(old.id, epoch)
+    assert not db.abort_transfer(old.id, new.id, epoch, attempt_nonce=first_nonce)
+    with pytest.raises(TypeError):
+        db.abort_transfer(old.id, new.id, epoch)
+    db.record_poller_stopped(old.id, epoch, "first", 2, attempt_nonce=second_nonce)
+    assert db.commit_transfer(old.id, new.id, epoch) == epoch + 1
+    with pytest.raises(RuntimeError, match="committed"):
+        db.abort_transfer(old.id, new.id, epoch, attempt_nonce=second_nonce)
+    assert db.leases()[0]["generation_id"] == new.id
 
 
 def test_transfer_cannot_steal_live_holder_without_request(tmp_path):

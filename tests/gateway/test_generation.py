@@ -335,8 +335,8 @@ async def test_promoted_exit_projects_stopped_status_without_stale_pid(tmp_path)
                                            "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
                             capture_output=True, text=True, timeout=20)
     assert status.returncode == 0, status.stderr
-    assert "gateway is not running" in status.stdout.lower(), status.stdout
     assert "state=exited" in status.stdout, status.stdout
+    assert "lease=none" in status.stdout, status.stdout
 
 
 def test_lease_cannot_be_stolen_and_release_is_fenced(tmp_path):
@@ -500,6 +500,23 @@ def test_overlap_gate_defaults_off_and_reads_nested_config(tmp_path, monkeypatch
     assert overlap_handover_enabled({"gateway": {"overlap_handover": {"enabled": True}}})
     assert not overlap_handover_enabled(object())
     assert not overlap_handover_enabled({"gateway": {"overlap_handover": None}})
+
+
+def test_overlap_status_names_old_draining_pid(tmp_path, monkeypatch, capsys):
+    from hermes_cli.gateway import _print_overlap_generations
+    import hermes_cli.gateway as gateway_cli
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="slot-a", pid=12345)
+    new = GenerationIdentity.create(release_sha="b", label="slot-b", pid=12346)
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+    _print_overlap_generations()
+    assert f"old generation draining pid={old.pid}" in capsys.readouterr().out.lower()
 
 
 def test_terminal_generations_are_bounded_and_status_is_compact(tmp_path):
