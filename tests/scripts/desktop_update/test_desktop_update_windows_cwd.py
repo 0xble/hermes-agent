@@ -5,16 +5,62 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import psutil
 import pytest
 
 
-pytestmark = pytest.mark.windows_only
-
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 WINDOWS_UPDATE_PS1 = REPO_ROOT / "scripts" / "desktop-update" / "windows.ps1"
+
+
+def _communicate_with_timeout_diagnostics(
+    process: subprocess.Popen[str], timeout: float
+) -> str:
+    try:
+        output, _ = process.communicate(timeout=timeout)
+        return output
+    except subprocess.TimeoutExpired as exc:
+        # Capture the live tree before killing either process; a parent may
+        # already have exited while a descendant still holds the pipe open.
+        parent_state = process.poll()
+        children: list[psutil.Process] = []
+        try:
+            children = psutil.Process(process.pid).children(recursive=True)
+            tree = []
+            for child in children:
+                try:
+                    tree.append((child.pid, child.name(), child.status()))
+                except psutil.Error:
+                    tree.append((child.pid, "exited", "unavailable"))
+        except (psutil.Error, OSError) as error:
+            tree = f"unavailable: {error}"
+
+        # On Windows communicate's reader thread owns the buffered stdout lock
+        # until EOF. Kill all snapshotted writers before attempting to drain it;
+        # never close stdout from this thread if the bounded drain still fails.
+        for child in reversed(children):
+            try:
+                child.kill()
+            except (psutil.Error, OSError):
+                pass  # It may have exited between the snapshot and kill.
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            output, _ = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as cleanup_exc:
+            output = cleanup_exc.output or exc.output
+        exc.add_note(
+            f"PowerShell poll={parent_state}; descendants={tree}; "
+            f"partial stdout={output!r}"
+        )
+        raise
 
 
 def _run_cwd_self_test(
@@ -40,7 +86,7 @@ def _run_cwd_self_test(
         "-SelfTestWorkingDirectory",
         "-NoUi",
     ]
-    with subprocess.Popen(
+    process = subprocess.Popen(
         command,
         cwd=launch_cwd,
         env=env,
@@ -48,36 +94,36 @@ def _run_cwd_self_test(
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-    ) as process:
-        try:
-            output, _ = process.communicate(timeout=60)
-        except subprocess.TimeoutExpired as exc:
-            # Snapshot before killing PowerShell: subprocess.run kills it first,
-            # erasing the process tree that could distinguish a stuck handoff
-            # from a surviving pipe-holding descendant on the hosted runner.
-            try:
-                parent = psutil.Process(process.pid)
-                children = parent.children(recursive=True)
-                tree = [(child.pid, child.name(), child.status()) for child in children]
-            except (psutil.Error, OSError) as error:
-                tree = f"unavailable: {error}"
-            exc.add_note(
-                f"PowerShell poll={process.poll()}; descendants={tree}; "
-                f"partial stdout={exc.output!r}"
-            )
-            process.kill()
-            try:
-                process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                # An inherited pipe can remain open after the parent dies.
-                # Close our read end so Popen's context manager cannot wait on it.
-                assert process.stdout is not None
-                process.stdout.close()
-                process.wait(timeout=5)
-            raise
+    )
+    output = _communicate_with_timeout_diagnostics(process, timeout=60)
     return subprocess.CompletedProcess(command, process.returncode, output)
 
 
+def test_timeout_diagnostics_kill_pipe_holding_process_tree() -> None:
+    # A real grandchild inherits stdout and keeps the pipe open even if its
+    # parent is killed. The timeout path must kill it before draining output.
+    script = (
+        "import subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+        "print('cwd entered', flush=True); time.sleep(30)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as raised:
+        _communicate_with_timeout_diagnostics(process, timeout=0.5)
+    assert time.monotonic() - started < 8
+    note = "\n".join(raised.value.__notes__)
+    assert "descendants=[(" in note
+    assert "cwd entered" in note
+    assert process.poll() is not None
+
+
+@pytest.mark.windows_only
 def test_handoff_children_run_from_install_root(tmp_path: Path) -> None:
     install_root = tmp_path / "checkout"
     launch_cwd = tmp_path / "profile-home"
@@ -90,6 +136,7 @@ def test_handoff_children_run_from_install_root(tmp_path: Path) -> None:
     assert "WORKING-DIRECTORY SELF-TEST: PASS" in result.stdout
 
 
+@pytest.mark.windows_only
 def test_handoff_fails_closed_when_install_root_cannot_be_entered(tmp_path: Path) -> None:
     install_root = tmp_path / "missing" / "checkout"
     launch_cwd = tmp_path / "profile-home"
