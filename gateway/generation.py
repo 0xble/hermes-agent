@@ -440,16 +440,20 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             conn.commit()
             return epoch + 1
 
-    def abort_transfer(self, old_id: str, new_id: str, epoch: int) -> None:
-        """Allow the old process to resume only while it still owns admission."""
+    def abort_transfer(self, old_id: str, new_id: str, epoch: int,
+                       *, attempt_nonce: str) -> bool:
+        """CAS abort against the old lease and exact attempt, never a committed successor."""
         with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active"):
                 raise RuntimeError("cannot abort a committed transfer")
-            conn.execute("UPDATE generation_transfers SET state='aborted' WHERE old_id=? AND new_id=? AND epoch=? AND state='requested'",
-                         (old_id, new_id, epoch))
+            changed = conn.execute(
+                "UPDATE generation_transfers SET state='aborted' WHERE old_id=? AND new_id=? "
+                "AND epoch=? AND state='requested' AND attempt_nonce=?",
+                (old_id, new_id, epoch, attempt_nonce)).rowcount
             conn.commit()
+            return changed == 1
 
     def project_active_summary(self, identity: GenerationIdentity, epoch: int,
                                runtime: dict[str, Any]) -> bool:

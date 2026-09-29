@@ -34,6 +34,9 @@ TOKEN = "123456:LOCAL_STUB_ONLY"
 def _worker(standby: bool):
     from gateway.config import load_gateway_config
     from gateway.run import start_gateway
+    if os.environ.get("TEST_SHORT_TRANSFER_WINDOW") and not standby:
+        from gateway import run_generation
+        run_generation.HANDOVER_REQUEST_TIMEOUT = 2
     if not standby and os.environ.get("TEST_PAUSE_TRANSFER"):
         from gateway.run_generation import ActiveGeneration
         async def paused_transfer(self, new_id: str) -> dict:
@@ -568,6 +571,128 @@ async def test_successor_stops_wire_before_restoring_old_polling(short_gateway_h
         api.close()
         llm.__exit__(None, None, None)
 
+
+@pytest.mark.integration
+@pytest.mark.spawns_gateway_lookalike
+@pytest.mark.asyncio
+async def test_driver_killed_after_stop_receipt_rearms_old_and_retry_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
+    api = BotAPI()
+    llm = FakeLLMServer(lambda record: Text("ok"))
+    llm.__enter__()
+    home = Path(tempfile.mkdtemp(prefix="hermes-p3-", dir="/tmp"))
+    (home / "config.yaml").write_text(
+        "model:\n  provider: custom\n  default: fake-model\n"
+        f"  base_url: {llm.base_url}\n  key_env: OPENAI_API_KEY\n"
+        "agent:\n  api_max_retries: 1\n"
+        "approvals:\n  mode: 'off'\n"
+        "gateway:\n  overlap_handover:\n    enabled: true\n"
+        "updates:\n  check: false\n"
+        "platforms:\n  telegram:\n    enabled: true\n    token: '" + TOKEN + "'\n"
+        "    extra:\n      base_url: '" + api.url + "'\n"
+        "      base_file_url: '" + api.url + "'\n"
+        "      allow_from: ['1']\n      drop_pending_on_cold_boot: false\n")
+    env = {**{key: value for key, value in os.environ.items() if not key.startswith("HERMES_")},
+           "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
+           "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1",
+           "HERMES_RELEASE_SHA": "a" * 40, "TEST_SHORT_TRANSFER_WINDOW": "1"}
+    worker_path = tmp_path / "gateway" / "run.py"
+    worker_path.parent.mkdir()
+    worker_path.symlink_to(Path(__file__).resolve())
+    processes = []
+    marker = tmp_path / "driver-acknowledged"
+    try:
+        db = GenerationCoordinator(home)
+        for standby in (False, True):
+            proc = subprocess.Popen([sys.executable, str(worker_path), "worker",
+                                     "standby" if standby else "active"],
+                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            processes.append(proc)
+            end = time.monotonic() + 30
+            while time.monotonic() < end:
+                rows = db.generations()
+                if len(rows) == len(processes) and rows[-1]["state"] in (
+                        {"ready"} if standby else {"serving", "ready"}):
+                    break
+                assert proc.poll() is None, f"gateway exited {proc.returncode}: {proc.stderr.read()}"
+                await asyncio.sleep(.1)
+            else:
+                raise AssertionError("generation did not become ready")
+        successor = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway-b")
+        old = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway")
+        old_identity = GenerationIdentity(**{key: old[key] for key in
+            ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")})
+        old_socket = generation_paths(home, old_identity)["socket"]
+        from gateway.run_generation import _generation_request
+        end = time.monotonic() + 25
+        while time.monotonic() < end:
+            status = await asyncio.to_thread(_generation_request, old_socket, "polling_status", timeout=.5)
+            if status and status.get("polling") is True:
+                break
+            await asyncio.sleep(.1)
+        else:
+            raise AssertionError("A did not reach dispatch readiness")
+        driver = subprocess.Popen([sys.executable, str(worker_path), "driver", str(home),
+                                   successor["id"], str(marker)], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        processes.append(driver)
+        end = time.monotonic() + 15
+        while not marker.exists() and time.monotonic() < end:
+            assert driver.poll() is None, (f"driver died: {driver.stderr.read()}; "
+                                           f"old_stderr={processes[0].stderr.read() if processes[0].poll() is not None else ''}; "
+                                           f"gateway_log={(home / 'logs' / 'gateway.log').read_text()[-5000:] if (home / 'logs' / 'gateway.log').exists() else 'none'}")
+            await asyncio.sleep(.1)
+        assert marker.exists(), "driver did not reach the post-ack boundary"
+        assert processes[0].poll() is None
+        receipts = db.transfer_receipts(db.leases()[0]["generation_id"], db.leases()[0]["epoch"])
+        assert receipts and all(row["poller_stopped"] for row in receipts)
+        driver.kill()
+        await asyncio.to_thread(driver.wait, 5)
+        with api.lock:
+            before = len(api.offsets)
+        end = time.monotonic() + 9
+        while time.monotonic() < end:
+            with api.lock:
+                resumed = len(api.offsets) > before
+            if resumed:
+                break
+            await asyncio.sleep(.1)
+        assert resumed, "A never resumed real polling after the driver died"
+        with api.lock:
+            assert api.maximum == 1 and not api.errors
+        with db.connect() as conn:
+            state = conn.execute("SELECT state FROM generation_transfers").fetchone()[0]
+        assert state == "aborted"
+        assert db.leases()[0]["generation_id"] != successor["id"]
+        assert next(row for row in db.generations() if row["id"] == successor["id"])["state"] == "ready"
+        assert await asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=15) > 1
+        with api.lock:
+            assert api.maximum == 1 and not api.errors
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    await asyncio.to_thread(proc.wait, 8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    await asyncio.to_thread(proc.wait, 5)
+        api.close()
+        llm.__exit__(None, None, None)
+        shutil.rmtree(home)
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "driver":
+    from gateway.generation import GenerationCoordinator
+    from gateway.run_generation import handover_to_generation
+
+    ack_marker = Path(sys.argv[4])
+    def pause_commit(self, *args, **kwargs):
+        ack_marker.touch()
+        time.sleep(60)
+    GenerationCoordinator.commit_transfer = pause_commit
+    handover_to_generation(Path(sys.argv[2]), sys.argv[3], timeout=20)
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "worker":
     raise SystemExit(_worker(sys.argv[2] == "standby"))

@@ -264,6 +264,10 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
         receipt(home, "overlap", "alert", reason="active generation heartbeat is stale",
                 generation_id=owner["id"])
         return "alert"
+    if owner.get("needs_attention"):
+        receipt(home, "overlap", "alert", reason="active generation poller needs attention",
+                generation_id=owner["id"])
+        return "alert"
     # The drainer retains its in-process obligations. An exited generation is
     # healthy history, never a reason to reload the active label.
     drainers = [row for row in rows if row["state"] == "draining"]

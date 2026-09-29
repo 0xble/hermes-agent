@@ -27,6 +27,19 @@ def _generations(home: Path):
     return coordinator, first, second, epoch
 
 
+def test_guardian_reports_attention_without_repairing_active_poller(tmp_path, monkeypatch):
+    coordinator, first, _second, _epoch = _generations(tmp_path)
+    (tmp_path / f"gateway_state.{first.id}.json").write_text(json.dumps({
+        "id": first.id, "start_fingerprint": first.start_fingerprint,
+        "needs_attention": True, "polling": False,
+    }), encoding="utf-8")
+    row = next(row for row in read_generation_status(tmp_path) if row["id"] == first.id)
+    assert row["needs_attention"] is True and row["polling"] is False
+    monkeypatch.setattr(guardian, "_launch_state", lambda *_: pytest.fail("unexpected repair"))
+    assert guardian._run_overlap(tmp_path) == "alert"
+    assert coordinator.leases()[0]["generation_id"] == first.id
+
+
 @pytest.mark.parametrize("rollback_blocks", [False, True])
 def test_promotion_returns_rolled_back_proof_after_committed_observation_failure(tmp_path, monkeypatch, rollback_blocks):
     from hermes_cli import gateway_overlap
