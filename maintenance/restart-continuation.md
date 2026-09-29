@@ -27,6 +27,12 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   This strengthens open upstream [#120758](https://github.com/NousResearch/hermes-agent/pull/120758)
   with a conditional clear instead of an unconditional write after awaits.
 - A follow-up dequeued as a turn finishes during shutdown is flushed through `gateway/shutdown_flush.py` before its local reference is cleared, so startup recovery can restore its user message. Empty text is not written as an invalid pending payload; errors are logged rather than silently claiming preservation.
+- A tool-result tail interrupted before an assistant reply closes with a non-empty
+  internal marker, not the legacy `Operation interrupted.` text. Exact marker
+  echoes and legacy diagnostics are suppressed at delivery; unrelated prose is
+  not. The shared closer filters local diagnostics for early-abort callers too.
+  Existing transcript rows are never rewritten, preserving prompt-cache prefixes.
+  Delegated-child summaries skip this synthetic row and retain earlier real output.
 - All remaining adapter slots, runner pending slots, and FIFO overflow tails are spooled under the session key's owning served profile (including a secondary reached via the primary bot). Startup recovery walks the launch home and every served home in that home's runtime scope; a failed profile replay retains its spool without stopping other profiles.
 
 ## Provenance and patches

@@ -265,5 +265,11 @@ def test_stop_during_empty_response_recovery_keeps_the_executed_tool_call_live(r
     assert real_loop.ledger.read_text() == "PAYMENT #1 SENT\n"
     assert result["interrupted"] is True
     _assert_saved_tool_pairs_stay_live(result, real_loop.db, real_loop.sid)
-    # The Stop owner strips the nudge scaffold itself and closes with its own reason.
-    assert result["messages"][-1]["content"] == result["final_response"]
+    # The Stop reason remains in the result for diagnostics, not in the model-visible
+    # transcript as if the assistant said it. The closing row keeps role alternation.
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["content"] == (
+        "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
+    )
+    assert real_loop.db.get_messages_as_conversation(real_loop.sid)[-1]["content"] == result["messages"][-1]["content"]
+    assert result["final_response"].startswith("Operation interrupted:")
