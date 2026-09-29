@@ -5,7 +5,7 @@ loopback pages and a temporary local vault. No personal browser or manager.
 """
 import http.server
 import json
-import shutil
+import os
 import subprocess
 import threading
 import time
@@ -39,13 +39,19 @@ addEventListener('message', (e) => {
 
 @pytest.fixture
 def browser(tmp_path):
-    executable = next((shutil.which(n) for n in ("chromium", "chromium-browser", "google-chrome")
-                       if shutil.which(n)), None)
-    mac = Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
-    if not executable and mac.exists():
-        executable = str(mac)
-    if not executable:
-        pytest.skip("Chrome/Chromium is required for the live DOM regression")
+    if os.environ.get('CI'):
+        from playwright import sync_api as playwright
+    else:
+        playwright = pytest.importorskip(
+            "playwright.sync_api",
+            reason="Playwright is required for the live DOM regression",
+        )
+    with playwright.sync_playwright() as pw:
+        executable = Path(pw.chromium.executable_path)
+    if not executable.is_file():
+        if os.environ.get('CI'):
+            pytest.fail("Hosted gate requires Playwright's bundled Chromium")
+        pytest.skip("Playwright's bundled Chromium is not installed")
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -63,7 +69,7 @@ def browser(tmp_path):
     thread.start()
     origin = f'http://127.0.0.1:{server.server_port}'
     profile = tmp_path / 'chrome'
-    process = subprocess.Popen([executable, '--headless=new', '--no-sandbox',
+    process = subprocess.Popen([str(executable), '--headless=new', '--no-sandbox',
                                 '--disable-dev-shm-usage', '--no-first-run',
                                 '--no-default-browser-check', '--remote-debugging-port=0',
                                 # The portable gate replaces HOME, so a real macOS Chrome
@@ -310,7 +316,7 @@ def test_card_fill_asks_only_when_a_real_page_can_take_the_card(browser, monkeyp
         prompts.append(page_origin)
         return answer['value']
 
-    answer = {'value': True}
+    answer = {'value': 'accept'}
     monkeypatch.setattr(vault, '_confirm_payment_fill', confirm)
 
     def fill():
@@ -340,19 +346,13 @@ def test_card_fill_asks_only_when_a_real_page_can_take_the_card(browser, monkeyp
     assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")
     assert processor_state() == {'cardInputs': 1, 'filled': False}
 
-    # A declined prompt writes nothing.
+    # Approved: exactly one prompt, and the card lands in the page's own fields.
     evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
       <input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"></form>`""")
-    answer['value'] = False
-    assert fill()['error_type'] == 'payment_declined'
-    assert prompts == [shop]
-    assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")
-
-    # Approved: exactly one prompt, and the card lands in the page's own fields.
-    answer['value'] = True
+    answer['value'] = 'accept'
     result = fill()
     assert result['success'], result
-    assert prompts == [shop, shop]
+    assert prompts == [shop]
     assert evaluate(sup, "document.querySelector('[autocomplete=cc-number]').value") == '4111111111111111'
 
     # The form is replaced while the prompt waits: the post-consent inspection finds
@@ -360,10 +360,20 @@ def test_card_fill_asks_only_when_a_real_page_can_take_the_card(browser, monkeyp
     def swap_then_confirm(label, page_origin):
         prompts.append(page_origin)
         evaluate(sup, "document.body.innerHTML = '<form><input autocomplete=\"cc-name\"></form>'")
-        return True
+        return 'accept'
 
     monkeypatch.setattr(vault, '_confirm_payment_fill', swap_then_confirm)
     evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
       <input autocomplete="cc-number"></form>`""")
     assert fill()['error_type'] == 'no_payment_fields'
     assert evaluate(sup, "document.querySelector('input').value") == ''
+
+    # Declining is terminal for this task and origin; no repeat prompt or card write.
+    monkeypatch.setattr(vault, '_confirm_payment_fill', confirm)
+    evaluate(sup, """document.body.innerHTML = `<form><input autocomplete="cc-name">
+      <input autocomplete="cc-number"><input autocomplete="cc-exp"><input autocomplete="cc-csc"></form>`""")
+    answer['value'] = 'decline'
+    assert fill()['error_type'] == 'payment_declined'
+    assert fill()['error_type'] == 'payment_retry_refused'
+    assert prompts == [shop, shop, shop]
+    assert evaluate(sup, "[...document.querySelectorAll('input')].every(i => i.value === '')")
