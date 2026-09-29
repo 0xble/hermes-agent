@@ -334,7 +334,7 @@ async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_pat
             maximum = max(maximum, active)
             started.set()
             try:
-                await asyncio.sleep(20)
+                await asyncio.sleep(0.35)
                 return 200, b'{"ok":true,"result":[]}'
             except asyncio.CancelledError:
                 cancelled += 1
@@ -347,7 +347,7 @@ async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_pat
 
     adapters = []
     housekeeping = []
-    presence = []
+    statuses = []
     receipt = None
     token = "987654:IDLE_POLL_TEST"
     try:
@@ -357,9 +357,9 @@ async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_pat
             adapters.append(adapter)
             monkeypatch.setattr(adapter, "_build_ptb_requests", lambda adapter=adapter: build(adapter))
             adapter._start_post_connect_housekeeping = lambda index=index: housekeeping.append(index)
-            async def status_indicator(online, index=index):
-                presence.append((index, online))
-            adapter._set_status_indicator = status_indicator
+            async def record_status(*, online, index=index):
+                statuses.append((index, online))
+            monkeypatch.setattr(adapter, "_set_status_indicator", record_status)
             # The request is deliberately idle, so bypass only the startup progress gate.
             monkeypatch.setattr(adapter, "_await_cold_start_readiness", lambda *args: asyncio.sleep(0))
             assert await adapter.connect(polling_standby=bool(index))
@@ -380,11 +380,10 @@ async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_pat
             if index == 0:
                 receipt = await adapter.stop_polling_for_transfer()
             await asyncio.wait_for(adapter.disconnect(), 4)
-            if index == 0:
-                assert (0, False) not in presence, "retired predecessor must not mark B offline"
             assert adapter._app is None and adapter._polling_heartbeat_task is None
             assert active == 0 and maximum == 1
-        assert cancelled == 2
+        assert cancelled == 0
+        assert statuses == [(1, False)]  # Predecessor may not override the successor's Online status.
         assert threads and all(ident != threading.get_ident() for ident in threads)
     finally:
         for adapter in adapters:
@@ -444,7 +443,9 @@ async def test_controlled_disconnect_fences_stubborn_poll_until_task_ends(tmp_pa
         await asyncio.wait_for(adapter._controlled_poller._task, 2)
     await asyncio.sleep(0.05)
     assert not token_has_active_poller(journal.token_hash)
-    from gateway.status import acquire_scoped_lock, release_scoped_lock
+    from gateway.status import _get_scope_lock_path, acquire_scoped_lock, release_scoped_lock
+    assert _get_scope_lock_path("telegram-bot-token", token).exists()  # Same-PID lock acquisition is reentrant.
+    adapter._release_platform_lock()
     acquired, _ = acquire_scoped_lock("telegram-bot-token", token)
     assert acquired
     release_scoped_lock("telegram-bot-token", token)
@@ -479,6 +480,88 @@ async def test_controlled_transient_probe_does_not_rebuild_adapter():
     adapter._schedule_polling_recovery(OSError("one probe"), reason="heartbeat probe")
     assert not adapter.has_fatal_error
     assert not adapter._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_failed_transfer_stop_preserves_lock_and_refuses_receipt(tmp_path, monkeypatch):
+    from gateway.generation import GenerationCoordinator
+    from gateway.status import _get_scope_lock_path
+    from plugins.platforms.telegram.polling_transfer import PollingJournal
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    token = "123456:LOCK_TEST"
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token=token))
+    adapter._controlled_journal = PollingJournal(GenerationCoordinator(tmp_path), token)
+    assert adapter._acquire_platform_lock("telegram-bot-token", token, "Telegram bot token")
+    class UnprovedPoller:
+        async def stop(self):
+            return {"stopped": False, "error": "PollDrainTimeout"}
+    monkeypatch.setattr(adapter, "_controlled_poller", UnprovedPoller())
+    try:
+        with pytest.raises(RuntimeError, match="wire did not stop"):
+            await adapter.stop_polling_for_transfer()
+        assert _get_scope_lock_path("telegram-bot-token", token).exists()
+    finally:
+        adapter._release_platform_lock()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [b'not json', b'{"ok":true,"result":{}}'])
+async def test_malformed_successful_poll_is_logged_before_ptb_error(tmp_path, caplog, payload):
+    from gateway.generation import GenerationCoordinator
+    from plugins.platforms.telegram.polling_transfer import PollingJournal
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    adapter._controlled_journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:test-token")
+    generation, _ = adapter._begin_polling_generation()
+    request = adapter._instrument_polling_request(_EnvelopeRequest(payload))
+    context = tg_adapter._POLLING_GENERATION_CONTEXT.set(generation)
+    try:
+        with pytest.raises((ValueError, TelegramError)):
+            await request.post("https://api.telegram.org/bot-token/getUpdates")
+    finally:
+        tg_adapter._POLLING_GENERATION_CONTEXT.reset(context)
+    assert "Malformed successful Telegram getUpdates response" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_transfer_retries_conflict_and_stops_on_final_failure(tmp_path, monkeypatch, permanent):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:CONFLICT_TEST"))
+    housekeeping = []
+    adapter._start_post_connect_housekeeping = lambda: housekeeping.append(True)
+
+    class ConflictRequest(_GeneralRequest):
+        calls = 0
+        async def do_request(self, url, method, request_data=None, **kwargs):
+            if url.endswith("/getUpdates"):
+                self.calls += 1
+                if permanent or self.calls == 1:
+                    return 409, b'{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}'
+                await asyncio.sleep(0.02)
+                return 200, b'{"ok":true,"result":[]}'
+            return await super().do_request(url, method, request_data, **kwargs)
+
+    request = ConflictRequest()
+    async def build():
+        return _GeneralRequest(), adapter._instrument_polling_request(request)
+    monkeypatch.setattr(adapter, "_build_ptb_requests", build)
+    assert await adapter.connect(polling_standby=True)
+    receipt = adapter._controlled_journal.stop_receipt()
+    try:
+        if permanent:
+            with pytest.raises(OSError, match="did not clear"):
+                await adapter.start_polling_from_transfer(receipt)
+            assert not adapter._controlled_poller.running
+            assert not housekeeping
+        else:
+            await adapter.start_polling_from_transfer(receipt)
+            assert adapter._controlled_standby is False
+            assert housekeeping == [True]
+            assert adapter._controlled_poller.running
+        assert request.calls >= 2
+    finally:
+        await adapter.disconnect()
 
 
 @pytest.mark.asyncio

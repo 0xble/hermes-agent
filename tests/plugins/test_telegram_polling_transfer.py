@@ -125,9 +125,12 @@ async def test_controlled_poller_replays_before_first_poll_and_drains_inflight(t
     poller = ControlledPoller(App(), journal, timeout=20)
     await poller.start()
     await asyncio.wait_for(request_started.wait(), 2)
-    assert (await asyncio.wait_for(poller.stop(), 3))["stopped"]
+    stop = asyncio.create_task(poller.stop())
+    await asyncio.sleep(0.02)
+    assert not stop.done()  # A cancelled task is not evidence the wire has closed.
+    release_request.set()
+    assert (await asyncio.wait_for(stop, 3))["stopped"]
     assert not poller.running
-    assert not release_request.is_set()  # The idle 20-second request was interrupted.
 
 
 @pytest.mark.asyncio
@@ -206,13 +209,15 @@ async def test_journal_io_runs_off_loop_and_queue_join_backpressures(tmp_path):
             pass
         async def join(self):
             await release_join.wait()
+    stop_request = asyncio.Event()
     class Bot:
         calls = 0
         async def get_updates(self, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 return [Update(update_id=5)]
-            await asyncio.Future()
+            await stop_request.wait()
+            return []
     class App:
         bot = Bot()
         update_queue = Queue()
@@ -229,6 +234,7 @@ async def test_journal_io_runs_off_loop_and_queue_join_backpressures(tmp_path):
         await asyncio.sleep(0.01)
     assert App.bot.calls >= 2  # safe_offset before and after the returned batch
     assert worker_threads and all(ident != main_thread for ident in worker_threads)
+    stop_request.set()
     assert (await asyncio.wait_for(poller.stop(), 1))["stopped"]
 
 
@@ -244,6 +250,61 @@ async def test_failed_poller_exception_observed_once_without_disconnect(tmp_path
     await asyncio.sleep(0)
     assert await poller.stop() == {"stopped": False, "error": "OSError"}
     assert sum("Controlled Telegram poller failed" in record.message for record in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_unfinished_poll_cannot_produce_transfer_receipt(tmp_path):
+    journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    class Bot:
+        async def get_updates(self, **_kwargs):
+            started.set()
+            await release.wait()
+            return []
+    class Queue:
+        async def join(self):
+            pass
+    class App:
+        bot = Bot()
+        update_queue = Queue()
+    poller = ControlledPoller(App(), journal, timeout=0.02)
+    await poller.start()
+    await started.wait()
+    try:
+        assert await poller.stop() == {"stopped": False, "error": "PollDrainTimeout"}
+        assert poller.running
+    finally:
+        release.set()
+        task = poller._task
+        assert task is not None
+        await task
+
+
+@pytest.mark.asyncio
+async def test_replay_quarantines_corrupt_row_and_continues(tmp_path):
+    journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
+    journal.record_response(b'{"ok":true,"result":[{"update_id":9},{"update_id":10}]}')
+    with journal._connect() as db:
+        db.execute("UPDATE telegram_updates SET raw_update=? WHERE update_id=9", (b'{"update_id":9,"message":[]}',))
+    received = []
+    class Queue:
+        async def put(self, update):
+            received.append(update.update_id)
+        async def join(self):
+            pass
+    class Bot:
+        async def get_updates(self, **_kwargs):
+            return []
+    class App:
+        bot = Bot()
+        update_queue = Queue()
+    poller = ControlledPoller(App(), journal)
+    await poller.start()
+    assert received == [10]
+    assert await poller.stop() == {"stopped": True}
+    with journal._connect() as db:
+        assert db.execute("SELECT state FROM telegram_updates WHERE update_id=9").fetchone()[0] == "quarantined"
 
 
 @pytest.mark.asyncio
