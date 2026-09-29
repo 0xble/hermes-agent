@@ -1,5 +1,7 @@
 """Local Bot API with Telegram offset confirmation for polling-transfer tests."""
 import json
+import select
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +72,10 @@ class BotAPI:
                                 with state.lock:
                                     result = [item for item in state.updates if item["update_id"] >= offset][:100]
                                 if result or time.monotonic() >= deadline:
+                                    break
+                                # A cancelled client request no longer owns a long poll.
+                                readable, _, _ = select.select([self.connection], [], [], 0)
+                                if readable and not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
                                     break
                                 time.sleep(0.005)
                         finally:
