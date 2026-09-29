@@ -215,7 +215,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             gateway_log = (home / "logs" / "gateway.log").read_text()
             assert ("Gateway runtime lock is already held" in third_output
                     or "Gateway runtime lock is already held" in gateway_log
-                    or "already owns the host" in third_output)
+                    or "already owns this host" in third_output)
             assert "EXIT:False" in third.stdout, third.stdout + third.stderr
             assert processes[1].poll() is None, "third start displaced promoted B"
     finally:
