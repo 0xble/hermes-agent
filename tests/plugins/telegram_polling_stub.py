@@ -68,6 +68,7 @@ class BotAPI:
                             state.maximum = max(state.maximum, state.inflight)
                             state.offsets.append(offset)
                             state.confirmed = max(state.confirmed, offset - 1)
+                        closed_early = False
                         try:
                             deadline = time.monotonic() + min(timeout, 0.35)
                             while True:
@@ -78,9 +79,13 @@ class BotAPI:
                                 # A cancelled client request no longer owns a long poll.
                                 readable, _, _ = select.select([self.connection], [], [], 0)
                                 if readable and not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                                    closed_early = True
                                     break
                                 time.sleep(0.005)
                         finally:
+                            if closed_early:
+                                # Client cancellation finishes before server-side unwinding.
+                                time.sleep(0.02)
                             with state.lock:
                                 state.inflight -= 1
                     elif method == "getme":

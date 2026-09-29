@@ -119,9 +119,24 @@ class PollingJournal:
 
     def pending(self) -> list[dict]:
         with self._connect() as db:
-            rows = db.execute("SELECT raw_update FROM telegram_updates WHERE token_hash=? AND state='received' ORDER BY update_id",
+            rows = db.execute("SELECT update_id,raw_update FROM telegram_updates WHERE token_hash=? AND state='received' ORDER BY update_id",
                               (self.token_hash,)).fetchall()
-        return [json.loads(row["raw_update"]) for row in rows]
+        pending = []
+        for row in rows:
+            try:
+                decoded = json.loads(row["raw_update"])
+                if not isinstance(decoded, dict) or decoded.get("update_id") != row["update_id"]:
+                    raise ValueError("invalid replayed update identity")
+                pending.append(decoded)
+            except (ValueError, TypeError):
+                logger.warning("Quarantining undecodable Telegram update %s", row["update_id"])
+                self.quarantine(row["update_id"])
+        return pending
+
+    def quarantine(self, update_id: int) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE telegram_updates SET state='quarantined' WHERE token_hash=? AND update_id=? AND state='received'",
+                       (self.token_hash, update_id))
 
     async def claim(self, update_id: int) -> bool:
         def write() -> bool:
@@ -209,7 +224,15 @@ class ControlledPoller:
         # Rows in processing may have crossed a handler's external-effect boundary.
         # Only explicitly failed pre-handoff claims reopen; do not replay ambiguous crashes.
         for raw in await asyncio.to_thread(self.journal.pending):
-            await self.app.update_queue.put(Update.de_json(raw, self.app.bot))
+            try:
+                update = Update.de_json(raw, self.app.bot)
+                if update is None or type(update.update_id) is not int:
+                    raise ValueError("invalid replayed update")
+            except Exception:
+                logger.warning("Quarantining undecodable Telegram update %s", raw.get("update_id"), exc_info=True)
+                await asyncio.to_thread(self.journal.quarantine, raw["update_id"])
+                continue
+            await self.app.update_queue.put(update)
         await self._join_queue("replayed update")
         self._task = asyncio.create_task(self._run(), name="telegram-controlled-poller")
         _active_pollers[self.journal.token_hash] = self._task
@@ -283,13 +306,17 @@ class ControlledPoller:
     async def stop(self):
         self._stop.set()
         if self._task is not None:
-            if not self._task.done():
-                self._task.cancel()  # Interrupt the in-flight long poll rather than waiting 20 seconds.
             try:
-                await asyncio.shield(self._task)
+                # A cancelled HTTP task can finish before the Bot API has closed its
+                # long poll. Only a complete response (or a finished request error)
+                # proves the old request cannot overlap the successor.
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=self.timeout + 1)
+            except asyncio.TimeoutError:
+                return {"stopped": False, "error": "PollDrainTimeout"}
             except asyncio.CancelledError:
                 if not self._task.cancelled():
-                    raise  # Caller cancellation does not prove polling ended.
+                    raise
+                return {"stopped": False, "error": "CancelledError"}
             except Exception as exc:
                 return {"stopped": False, "error": type(exc).__name__}
         return {"stopped": True}
