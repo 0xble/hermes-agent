@@ -17,7 +17,11 @@ from hermes_cli.immutable_releases import ReleasePaths, activate_release, _relea
 
 
 def _identity(row: dict) -> GenerationIdentity:
-    return GenerationIdentity(**{key: row[key] for key in GenerationIdentity.__dataclass_fields__})
+    required = set(GenerationIdentity.__dataclass_fields__)
+    missing = required - row.keys()
+    if missing:
+        raise RuntimeError(f"generation identity missing fields: {sorted(missing)}")
+    return GenerationIdentity(**{key: row[key] for key in required})
 
 
 def _live(row: dict) -> bool:

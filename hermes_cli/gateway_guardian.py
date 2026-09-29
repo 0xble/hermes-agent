@@ -191,8 +191,17 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
+def _overlap_drain_seconds(config: dict) -> float:
+    raw = config.get("drain_seconds", 7200)
+    if type(raw) not in (int, float) or not 1 <= raw <= 86400:
+        raise ValueError("gateway.overlap_handover.drain_seconds must be between 1 and 86400")
+    return float(raw)
+
+
 def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
     """Inspect the active lease before any repair. Unknown identities never authorize launchd writes."""
+    if intent_path(home).exists():
+        return "stopped"
     from hermes_cli.gateway_generation_status import read_generation_status
     from gateway.status import _get_process_start_time, _pid_exists
     rows = read_generation_status(home)
@@ -369,7 +378,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                                                     type(overlap.get("enabled")) is not bool):
                             raise ValueError("invalid overlap_handover gate")
                         if overlap and overlap["enabled"]:
-                            return _run_overlap(home)
+                            return _run_overlap(home, drain_seconds=_overlap_drain_seconds(overlap))
                     except (yaml.YAMLError, ValueError) as exc:
                         receipt(home, "inspect", "alert", reason=str(exc))
                         return "alert"
@@ -377,7 +386,8 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             if (isinstance(gateway_config, dict) and
                     isinstance(gateway_config.get("overlap_handover"), dict) and
                     gateway_config["overlap_handover"].get("enabled") is True):
-                return _run_overlap(home)
+                return _run_overlap(home, drain_seconds=_overlap_drain_seconds(
+                    gateway_config["overlap_handover"]))
             if grace is not None:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
             updates = config.get("updates")

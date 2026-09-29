@@ -247,11 +247,13 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
             config = load_user_config_effective(Path(home) / "config.yaml", fail_closed=True)
             overlap = ((config.get("gateway") or {}).get("overlap_handover") or {})
             if overlap.get("enabled") is True:
+                from hermes_cli.gateway_guardian import _overlap_drain_seconds
+                drain_seconds = _overlap_drain_seconds(overlap)
                 from hermes_cli.gateway_overlap import promote_overlap
                 # No S2 single-label reload, no release success receipt before B's
                 # active lease and real poll progress have been observed.
                 result = promote_overlap(Path(home), candidate, sha,
-                                         drain_seconds=float(overlap.get("drain_seconds", 7200)))
+                                         drain_seconds=drain_seconds)
                 from hermes_cli.update_receipt import record_release_transition, record_overlap_generation
                 record_release_transition(from_sha=result["old_sha"], to_sha=sha,
                                           from_path=result["previous"], to_path=result["current"],

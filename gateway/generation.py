@@ -368,7 +368,8 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             conn.execute("UPDATE leases SET generation_id=?,epoch=epoch+1 WHERE resource='active_generation' "
                          "AND generation_id=? AND epoch=?", (old_id, failed_id, epoch))
             conn.execute("UPDATE generations SET state='serving',drain_deadline=NULL WHERE id=?", (old_id,))
-            conn.execute("UPDATE generations SET state='draining' WHERE id=? AND state!='failed'", (failed_id,))
+            conn.execute("UPDATE generations SET state='draining',drain_deadline=? "
+                         "WHERE id=? AND state!='failed'", (time.time() + 7200, failed_id))
             conn.execute("UPDATE generation_transfers SET state='rolled_back' WHERE old_id=? AND new_id=? "
                          "AND epoch=?", (old_id, failed_id, epoch - 1))
             conn.commit()

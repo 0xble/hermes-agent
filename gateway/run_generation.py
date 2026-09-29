@@ -299,6 +299,8 @@ class ActiveGeneration:
                 receipts[token] = receipt
             self.runner._overlap_draining = True
             self._poller_paused = True
+            if self._drain_task is None:
+                self._drain_task = asyncio.create_task(self._drain_after_transfer())
             return {"poller_stopped": True, "generation_id": self.identity.id,
                     "epoch": self.epoch, "tokens": len(receipts)}
 

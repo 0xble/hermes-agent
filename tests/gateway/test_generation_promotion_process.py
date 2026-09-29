@@ -221,5 +221,102 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path):
         api.close()
 
 
+@pytest.mark.asyncio
+async def test_successor_stops_wire_before_restoring_old_polling(tmp_path):
+    """A real Bot API stub sees no concurrent poll even across rollback."""
+    from gateway.run_generation import _generation_request
+    api = BotAPI()
+    started = tmp_path / "old-tool-running"
+    command = f"touch {shlex.quote(str(started))} && sleep 35"
+    def model(record):
+        messages = record["body"]["messages"]
+        if messages and messages[-1].get("role") == "tool":
+            return Text("old-completed")
+        if any("old-work" in str(m.get("content", "")) for m in messages if m.get("role") == "user"):
+            return ToolCall("terminal", {"command": command})
+        return Text("restored-owner-answered")
+    llm = FakeLLMServer(model)
+    llm.__enter__()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "model:\n  provider: custom\n  default: fake-model\n"
+        f"  base_url: {llm.base_url}\n  key_env: OPENAI_API_KEY\n"
+        "agent:\n  api_max_retries: 1\n"
+        "approvals:\n  mode: 'off'\n"
+        "gateway:\n  overlap_handover:\n    enabled: true\n"
+        "platforms:\n  telegram:\n    enabled: true\n    token: '" + TOKEN + "'\n"
+        "    extra:\n      base_url: '" + api.url + "'\n"
+        "      base_file_url: '" + api.url + "'\n"
+        "      allow_from: ['1', '2']\n      drop_pending_on_cold_boot: false\n")
+    env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
+           "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+           "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "HERMES_RELEASE_SHA": "a" * 40,
+           "OPENAI_API_KEY": "local-test-key"}
+    processes = []
+    try:
+        for standby in (False, True):
+            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+                                     "worker", "standby" if standby else "active"],
+                                    env={**env, "HERMES_LAUNCHD_LABEL":
+                                         "ai.hermes.gateway-b" if standby else "ai.hermes.gateway"},
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            processes.append(proc)
+            end = time.monotonic() + 25
+            while time.monotonic() < end:
+                rows = GenerationCoordinator(home).generations()
+                if len(rows) >= len(processes) and all(row["state"] == "ready" for row in rows):
+                    break
+                assert proc.poll() is None, proc.stderr.read() if proc.poll() is not None else ""
+                await asyncio.sleep(.1)
+            else:
+                raise AssertionError("gateway readiness timed out")
+            if not standby:
+                api.add(2001, 2001, text="old-work")
+                until = time.monotonic() + 20
+                while not started.exists() and time.monotonic() < until:
+                    await asyncio.sleep(.1)
+                assert started.exists(), "A must hold a native tool obligation during rollback"
+        db = GenerationCoordinator(home)
+        rows = {row["label"]: row for row in db.generations()}
+        assert "ai.hermes.gateway-b" in rows, (rows, [(p.poll(), p.stderr.read() if p.poll() is not None else "") for p in processes])
+        old, new = rows["ai.hermes.gateway"], rows["ai.hermes.gateway-b"]
+        epoch = await asyncio.to_thread(handover_to_generation, home, new["id"], timeout=35)
+        socket_b = generation_paths(home, GenerationIdentity(**{key: new[key] for key in
+            ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")}))["socket"]
+        socket_a = generation_paths(home, GenerationIdentity(**{key: old[key] for key in
+            ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")}))["socket"]
+        stopped = await asyncio.to_thread(_generation_request, socket_b, "stop_for_rollback", timeout=10)
+        assert stopped["poller_stopped"] is True and stopped["tokens"] == 1
+        restored = db.rollback_transfer(new["id"], old["id"], epoch, poller_stopped=True)
+        assert restored == epoch + 1
+        armed = await asyncio.to_thread(_generation_request, socket_a, "restore_after_rollback",
+                                        params={"epoch": restored}, timeout=15)
+        assert armed["polling"] is True
+        with api.lock:
+            polls_before = len(api.offsets)
+        api.add(2002, 2002, text="restored-work", chat_id=2)
+        end = time.monotonic() + 20
+        answered = progressed = False
+        while time.monotonic() < end:
+            with api.lock:
+                answered = any("restored-owner-answered" in row["text"].replace("\\", "") for row in api.sent)
+                progressed = len(api.offsets) > polls_before
+                if answered and progressed:
+                    break
+            await asyncio.sleep(.1)
+        assert answered and progressed, (api.offsets, api.sent)
+        assert db.leases()[0]["generation_id"] == old["id"]
+        with api.lock:
+            assert api.maximum == 1 and not api.errors
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.kill()
+                await asyncio.to_thread(proc.wait, 5)
+        api.close()
+        llm.__exit__(None, None, None)
+
+
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "worker":
     raise SystemExit(_worker(sys.argv[2] == "standby"))

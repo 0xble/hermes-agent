@@ -127,6 +127,8 @@ def test_active_and_passive_generations_use_distinct_records(request):
         assert status.returncode == 0, status.stderr
         assert all(label in status.stdout for label in labels)
         assert "Overlap generations:" in status.stdout
+        assert "polling_owner=True" in status.stdout and "polling_owner=False" in status.stdout
+        assert "draining_count=0" in status.stdout
         assert "Gateway is running (PID:" in status.stdout
 
         # KeepAlive must recover from an unclean exit without stealing a live lease.
