@@ -2,8 +2,8 @@
 
 Order of controls (each is a gate, never skipped by a cache hit): secret-URL
 refusal -> SSRF filter (in web_tools.web_extract_tool) -> provider resolution
-(strict selection) -> per-URL website policy -> disk cache -> vendor call with
-one-shot keyless rescue. Logs under the origin (tools.web_tools) logger.
+(strict selection) -> per-URL website policy -> direct/local route -> disk cache
+-> vendor call with one-shot keyless rescue. Logs under the origin (tools.web_tools) logger.
 """
 
 import asyncio
@@ -204,24 +204,38 @@ async def _extract_safe_urls(provider, safe_urls: List[str], format: Optional[st
     control; policy-blocked URLs are cache misses. Keys include provider and format, so switching either
     within the TTL never serves the other's content."""
     from tools.web_result_cache import extract_cache_get
+    from tools.web_extract_direct import extract_direct
     from tools.website_policy import check_website_access as _check_site
-    cached_results, fetch_urls, fetch_positions = {}, [], []
+    from tools.web_tools import _load_web_config
+    from utils import is_truthy_value
+
+    direct_enabled = is_truthy_value(_load_web_config().get("extract_direct"), default=True)
+    fixed, fetch_urls, fetch_positions = {}, [], []
     for position, url in enumerate(safe_urls):
         try:
-            _policy_block = _check_site(url)
+            policy_block = _check_site(url)
         except Exception:  # noqa: BLE001 — policy errors fail open like dispatch
-            _policy_block = None
-        hit = extract_cache_get(url, format=format, provider=provider.name) if _policy_block is None else None
+            policy_block = None
+        if policy_block is None and direct_enabled:
+            try:
+                direct = await extract_direct(url)
+            except Exception as exc:  # noqa: BLE001 — the direct route is an optimization; any failure is a miss
+                logger.debug("Direct extract miss for %s: %s", url, exc)
+                direct = None
+            if direct is not None:
+                fixed[position] = direct
+                continue
+        hit = extract_cache_get(url, format=format, provider=provider.name) if policy_block is None else None
         if hit is not None:
-            cached_results[position] = hit
+            fixed[position] = hit
         else:
             fetch_urls.append(url)
             fetch_positions.append(position)
 
     if not fetch_urls:
-        return [cached_results[i] for i in range(len(safe_urls))]
+        return [fixed[i] for i in range(len(safe_urls))]
     logger.info("Web extract via %s: %d URL(s)", provider.name, len(fetch_urls))
     results = await _dispatch_extract(provider, fetch_urls, format)
-    if not cached_results:
+    if not fixed:
         return results
-    return _merge_in_order(len(safe_urls), cached_results, fetch_positions, fetch_urls, results)
+    return _merge_in_order(len(safe_urls), fixed, fetch_positions, fetch_urls, results)
