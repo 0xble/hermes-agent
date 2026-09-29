@@ -303,8 +303,9 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, 
 
 @pytest.mark.integration
 @pytest.mark.spawns_gateway_lookalike
+@pytest.mark.parametrize("abort_before_kill", [False, True])
 @pytest.mark.asyncio
-async def test_driver_killed_after_stop_receipt_rearms_old_and_retry_succeeds(tmp_path, monkeypatch):
+async def test_driver_killed_after_stop_receipt_rearms_old_and_retry_succeeds(tmp_path, monkeypatch, abort_before_kill):
     monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
     api = BotAPI()
     llm = FakeLLMServer(lambda record: Text("ok"))
@@ -363,7 +364,7 @@ async def test_driver_killed_after_stop_receipt_rearms_old_and_retry_succeeds(tm
         else:
             raise AssertionError("A did not reach dispatch readiness")
         driver = subprocess.Popen([sys.executable, str(worker_path), "driver", str(home),
-                                   successor["id"], str(marker)], env=env,
+                                   successor["id"], str(marker), str(int(abort_before_kill))], env=env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         processes.append(driver)
         end = time.monotonic() + 15
@@ -418,6 +419,9 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "driver":
 
     ack_marker = Path(sys.argv[4])
     def pause_commit(self, *args, **kwargs):
+        if sys.argv[5] == "1":
+            nonce = self.transfer_attempt_nonce(args[0], args[2])
+            assert self.abort_transfer(*args[:3], attempt_nonce=nonce)
         ack_marker.touch()
         time.sleep(60)
     GenerationCoordinator.commit_transfer = pause_commit
