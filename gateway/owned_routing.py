@@ -57,12 +57,12 @@ class OwnedRouting:
     def bind(self, runner):
         self.generation.runner = runner
         for adapter in runner.adapters.values():
-            if adapter.platform == Platform.TELEGRAM:
+            if getattr(adapter, "platform", None) == Platform.TELEGRAM:
                 adapter._owned_routing = self
 
     def _adapters(self):
         return [adapter for adapter in self.generation.runner.adapters.values()
-                if adapter.platform == Platform.TELEGRAM]
+                if getattr(adapter, "platform", None) == Platform.TELEGRAM]
 
     def _home(self, source):
         return str(self.generation.runner._resolve_profile_home_for_source(source))
@@ -72,7 +72,9 @@ class OwnedRouting:
         for adapter in self._adapters():
             keys.update(getattr(adapter, "_active_sessions", {}))
             keys.update(getattr(adapter, "_pending_messages", {}))
-        keys.update(getattr(self.generation.runner, "_pending_approvals", {}))
+        approvals = getattr(self.generation.runner, "_pending_approvals", None)
+        if isinstance(approvals, dict):
+            keys.update(approvals)
         return keys
 
     def claim_live(self):

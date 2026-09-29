@@ -4210,7 +4210,8 @@ class BasePlatformAdapter(ABC):
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
-            event._gateway_accepted = True
+            if getattr(event, "_owned_replay", False):
+                event._gateway_accepted = True
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
