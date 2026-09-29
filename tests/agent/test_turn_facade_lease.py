@@ -1,6 +1,7 @@
 """Unit tests for agent.turn_facade_lease (admission + lease bracket)."""
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 from agent.turn_facade_lease import (
@@ -143,6 +144,56 @@ def test_refresh_tick_sqlite_lock_keeps_the_turn():
     assert calls == []
     assert lease.interrupt_message is None
     assert lease.stop.is_set() is False
+
+
+def test_repeated_lock_misses_do_not_outlive_the_lease(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    db = _Db()
+
+    def locked(session_id, holder, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    db.refresh_session_turn_lease = locked
+    lease, calls = _active_lease(db)
+    result = None
+    for elapsed in (60, 120, 180, 240, 300):
+        now[0] = 1000.0 + elapsed
+        result = lease.refresh_tick()
+        if result is False:
+            break
+    assert result is False
+    assert calls == [
+        "Session turn lease could not be refreshed; stopping to protect the transcript."
+    ]
+    assert now[0] <= 1000.0 + LEASE_TTL_SECONDS
+
+
+def test_one_lock_then_renewal_opens_a_fresh_window(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    db = _Db()
+    locked = {"on": True}
+
+    def refresh(session_id, holder, **kwargs):
+        if locked["on"]:
+            raise sqlite3.OperationalError("database is locked")
+        return True
+
+    db.refresh_session_turn_lease = refresh
+    lease, calls = _active_lease(db)
+    now[0] = 1060.0
+    assert lease.refresh_tick() is None and calls == []
+    locked["on"] = False
+    now[0] = 1120.0
+    assert lease.refresh_tick() is None and calls == []
+    locked["on"] = True
+    # Original admission deadline was 1300. The renewal moved it to 1420.
+    now[0] = 1300.0
+    assert lease.refresh_tick() is None and calls == []
+    now[0] = 1360.0
+    assert lease.refresh_tick() is False
+    assert calls
 
 
 def test_refresh_tick_real_loss_still_interrupts():
