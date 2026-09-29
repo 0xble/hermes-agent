@@ -382,7 +382,6 @@ class ActiveGeneration:
                 # Keep the shared housekeeping/cron stop event alive. The built-in
                 # ticker observes the overlap dispatch gate; external providers
                 # are explicitly stopped and re-armed on abort.
-                self.runner._overlap_draining = True
                 if self.cron_provider is not None:
                     from cron.scheduler_provider import InProcessCronScheduler
                     if not isinstance(self.cron_provider, InProcessCronScheduler):
@@ -487,8 +486,6 @@ class ActiveGeneration:
         from tools.process_registry import process_registry
         # A claim covers only its session. A process from an ended cron turn can
         # have a key but no claim; stopping this owner would kill it before notice.
-        if process_registry.has_any_active() or process_registry.pending_watchers:
-            return False
         busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals))
 
         def read_pending_work():
@@ -508,7 +505,8 @@ class ActiveGeneration:
             if not self._missing_deadline_warned:
                 logger.warning("generation missing drain deadline; using local drain cap")
                 self._missing_deadline_warned = True
-        if (busy or queued or claims) and time.time() < deadline:
+        if (busy or queued or claims or process_registry.has_any_active()
+                or process_registry.pending_watchers) and time.time() < deadline:
             return False
         if self._drain_stopping:
             return self._drain_stopped

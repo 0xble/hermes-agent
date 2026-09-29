@@ -46,9 +46,12 @@ def _restore_event(payload, adapter):
                                                  "chat_id_alt", "is_bot", "scope_id", "guild_id",
                                                  "parent_chat_id", "message_id", "role_authorized",
                                                  "auto_thread_created", "auto_thread_initial_name"}})
-    event = MessageEvent(**{**data, "source": source,
-                            "message_type": MessageType(data["message_type"]),
-                            "timestamp": datetime.fromisoformat(data["timestamp"])})
+    event_fields = {field.name for field in fields(MessageEvent) if field.init and field.name != "raw_message"}
+    event = MessageEvent(**{name: value for name, value in {
+        **data, "source": source,
+        "message_type": MessageType(data["message_type"]),
+        "timestamp": datetime.fromisoformat(data["timestamp"]),
+    }.items() if name in event_fields})
     adapter._canonicalize(event.source)
     setattr(event, "_owned_replay", True)
     return event
@@ -79,6 +82,13 @@ class OwnedRouting:
         for adapter in self._adapters():
             keys.update(getattr(adapter, "_active_sessions", {}))
             keys.update(getattr(adapter, "_pending_messages", {}))
+            keys.update(getattr(adapter, "_pending_text_batches", {}))
+            for attr in ("_pending_photo_batches", "_media_group_events"):
+                for event in getattr(adapter, attr, {}).values():
+                    try:
+                        keys.add(adapter._event_session_key(event))
+                    except Exception:
+                        continue
         approvals = getattr(self.generation.runner, "_pending_approvals", None)
         if isinstance(approvals, dict):
             keys.update(approvals)
@@ -99,10 +109,11 @@ class OwnedRouting:
         identity = identity_of(event.source)
         if event.internal:
             return False
-        if identity is None or event.source.user_id is None:
+        if identity is None:
             return True
-        if adapter._is_sender_authorized(event.source.user_id, event.source.chat_type,
-                                         event.source.chat_id, thread_id=event.source.thread_id) is not True:
+        if event.source.user_id is not None and adapter._is_sender_authorized(
+                event.source.user_id, event.source.chat_type, event.source.chat_id,
+                thread_id=event.source.thread_id) is not True:
             return False  # The native runner owns pairing and unauthorized-DM replies.
         if event.platform_update_id is None:
             return False  # Synthetic prompts have no transport ID for deduplication.
@@ -110,7 +121,9 @@ class OwnedRouting:
         payload = lambda: json.dumps({"event": _event_payload(event)}, ensure_ascii=False).encode()
         envelope = json.dumps({"version": 1, "authorized": True,
                                "sender": event.source.user_id, "chat": event.source.chat_id,
-                               "thread": event.source.thread_id, "profile": identity.runtime_profile,
+                               "thread": event.source.thread_id,
+                               "is_bot": bool(getattr(event.source, "is_bot", False)),
+                               "profile": identity.runtime_profile,
                                "transport_profile": identity.transport_profile,
                                "home": home}, ensure_ascii=False).encode()
         row, fresh = await asyncio.to_thread(
@@ -169,11 +182,16 @@ class OwnedRouting:
     async def _drain_once(self):
         store = self.generation.coordinator
         owner = self.generation.identity.id
-        with store._transaction() as db:
-            rows = [dict(row) for row in db.execute(
-                "SELECT * FROM inbox WHERE owner_id=? AND state='pending' ORDER BY id", (owner,))]
-            foreign = [row[0] for row in db.execute(
-                "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending'", (owner,))]
+
+        def read_inbox():
+            with store._transaction() as db:
+                rows = [dict(row) for row in db.execute(
+                    "SELECT * FROM inbox WHERE owner_id=? AND state='pending' ORDER BY id", (owner,))]
+                foreign = [row[0] for row in db.execute(
+                    "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending'", (owner,))]
+            return rows, foreign
+
+        rows, foreign = await asyncio.to_thread(read_inbox)
         now = time.monotonic()
         for foreign_owner in foreign:
             if now - self._last_probe.get(foreign_owner, float("-inf")) >= 2:
@@ -193,7 +211,7 @@ class OwnedRouting:
                 data = json.loads(row["payload"])
                 if (envelope.get("authorized") is not True or envelope.get("version") != 1
                         or envelope.get("home") != row["profile_home"]):
-                    store.disposition(row["id"], owner, row["owner_epoch"], "refused")
+                    await asyncio.to_thread(store.disposition, row["id"], owner, row["owner_epoch"], "refused")
                     continue
                 if row["kind"] == "message":
                     event = _restore_event(json.dumps(data["event"]), adapter)
@@ -208,10 +226,13 @@ class OwnedRouting:
                         user_id=str(query.from_user.id), thread_id=str(cb["thread_id"]) if cb["thread_id"] else None)
                     adapter._canonicalize(source)
                 if (source.user_id != envelope.get("sender") or source.chat_id != envelope.get("chat")
-                        or adapter._is_sender_authorized(source.user_id, source.chat_type, source.chat_id,
-                            thread_id=source.thread_id) is not True or self._home(source) != row["profile_home"]
+                        or bool(getattr(source, "is_bot", False)) != bool(envelope.get("is_bot", False))
+                        or (source.user_id is not None and adapter._is_sender_authorized(
+                            source.user_id, source.chat_type, source.chat_id,
+                            thread_id=source.thread_id) is not True)
+                        or self._home(source) != row["profile_home"]
                         or adapter._source_session_key(source) != row["session_key"]):
-                    store.disposition(row["id"], owner, row["owner_epoch"], "refused")
+                    await asyncio.to_thread(store.disposition, row["id"], owner, row["owner_epoch"], "refused")
                     continue
                 if row["kind"] == "message":
                     await adapter.handle_message(event)
@@ -223,30 +244,34 @@ class OwnedRouting:
                     finally:
                         _owned_callback_replay.reset(token)
                     accepted = True
-                if not store.disposition(row["id"], owner, row["owner_epoch"],
-                                         "accepted" if accepted else "refused"):
+                if not await asyncio.to_thread(store.disposition, row["id"], owner, row["owner_epoch"],
+                                               "accepted" if accepted else "refused"):
                     raise RuntimeError("owned dispatch disposition refused after handler returned")
             except Exception:
                 from gateway.run_generation import logger
                 logger.warning("owned dispatch failed; interrupting row %s", row["id"], exc_info=True)
-                store.interrupt_row(row["id"], owner, row["owner_epoch"])
+                await asyncio.to_thread(store.interrupt_row, row["id"], owner, row["owner_epoch"])
         if getattr(self.generation.runner, "_overlap_draining", False):
-            with store._transaction() as db:
-                claims = [dict(row) for row in db.execute(
-                    "SELECT * FROM sessions WHERE generation_id=?", (owner,))]
+            def read_claims():
+                with store._transaction() as db:
+                    return [dict(row) for row in db.execute(
+                        "SELECT * FROM sessions WHERE generation_id=?", (owner,))]
+
+            claims = await asyncio.to_thread(read_claims)
             live = self._live_keys()
             from tools.process_registry import process_registry
             # A claim is retained only for work belonging to its own session.
-            lease = next((x for x in store.leases() if x["resource"] == "active_generation"), None)
+            lease_rows = await asyncio.to_thread(store.leases)
+            lease = next((x for x in lease_rows if x["resource"] == "active_generation"), None)
             if lease and lease["generation_id"] != owner:
                 for claim in claims:
                     key = claim["session_key"]
                     count = int(key in live or key in self.generation.runner._pending_approvals or
                                 process_registry.has_active_for_session(key) or
                                 any(w.get("session_key") == key for w in process_registry.pending_watchers))
-                    store.set_outstanding(claim["profile_home"], claim["transport"], key,
-                                          owner, claim["epoch"], count)
+                    await asyncio.to_thread(store.set_outstanding, claim["profile_home"], claim["transport"], key,
+                                             owner, claim["epoch"], count)
                     if not count:
-                        store.transfer_session(claim["profile_home"], claim["transport"], key,
-                                               owner, claim["epoch"], lease["generation_id"], lease["epoch"])
+                        await asyncio.to_thread(store.transfer_session, claim["profile_home"], claim["transport"], key,
+                                                 owner, claim["epoch"], lease["generation_id"], lease["epoch"])
         return bool(rows or foreign)

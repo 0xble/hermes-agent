@@ -241,9 +241,9 @@ class ControlledPoller:
         if self._task.done():
             await self._task
 
-    async def _join_queue(self, batch: str) -> None:
+    async def _join_queue(self, batch: str, *, ignore_stop: bool = False) -> None:
         """Backpressure until dispatch catches up; a slow handler is not a poll failure."""
-        while not self._stop.is_set():
+        while ignore_stop or not self._stop.is_set():
             try:
                 await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout)
                 return
@@ -311,6 +311,7 @@ class ControlledPoller:
                 # long poll. Only a complete response (or a finished request error)
                 # proves the old request cannot overlap the successor.
                 await asyncio.wait_for(asyncio.shield(self._task), timeout=self.timeout + 1)
+                await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout + 1)
             except asyncio.TimeoutError:
                 return {"stopped": False, "error": "PollDrainTimeout"}
             except asyncio.CancelledError:

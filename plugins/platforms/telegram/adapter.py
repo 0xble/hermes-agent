@@ -3498,7 +3498,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def handle_message(self, event: MessageEvent) -> None:
         self._accept_update()
-        await super().handle_message(event)
+        try:
+            await super().handle_message(event)
+        except BaseException:
+            self._fail_update_preparation()
+            raise
 
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""

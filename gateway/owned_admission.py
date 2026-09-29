@@ -82,8 +82,20 @@ class OwnedAdmissionMixin:
         except (ValueError, UnicodeDecodeError) as exc:
             raise ValueError("invalid source envelope") from exc
         if (not isinstance(envelope, dict) or envelope.get("version") != 1
-                or envelope.get("authorized") is not True or not envelope.get("sender")):
+                or envelope.get("authorized") is not True or "sender" not in envelope):
             raise ValueError("source is not an authorized version 1 envelope")
+        # Probe a foreign owner before taking the write lock. The transaction below
+        # re-checks this after locking, because ownership may change concurrently.
+        with self._transaction() as db:
+            session = db.execute(
+                "SELECT generation_id FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
+                (home, transport, key)).fetchone()
+            if session is not None and session["generation_id"] != active_owner:
+                generation = db.execute(
+                    "SELECT pid,boot_id,start_fingerprint,state FROM generations WHERE id=?",
+                    (session["generation_id"],)).fetchone()
+                if generation is not None and generation["state"] not in ("exited", "failed"):
+                    self._owner_is_dead(generation)
         with self._transaction() as db, db:
             db.execute("BEGIN IMMEDIATE")
             duplicate = db.execute(
