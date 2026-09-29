@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import os
 import sqlite3
@@ -41,6 +42,32 @@ def test_long_temp_root_creates_private_control_directory(tmp_path):
     _ensure_generation_socket_parent(path)
     assert path.parent.is_dir()
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_distinct_generations_with_shared_prefix_keep_both_control_sockets(tmp_path):
+    from gateway.run_generation import ActiveGeneration, _generation_request
+    home = tmp_path / ("h" * 100)
+    home.mkdir()
+    db = GenerationCoordinator(home)
+    old = GenerationIdentity.create(release_sha="old", label="a")
+    new = GenerationIdentity.create(release_sha="new", label="b")
+    successor = replace(new, id=old.id[:12] + new.id[12:])
+    db.register(old, state="serving")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.register(successor, state="ready")
+    first = ActiveGeneration(home, db, old, epoch)
+    second = ActiveGeneration(home, db, successor, epoch + 1)
+    try:
+        await first.start()
+        await second.start()
+        for owner in (first, second):
+            status = await asyncio.to_thread(_generation_request, owner.paths["socket"],
+                                             "polling_status", timeout=2)
+            assert status["generation_id"] == owner.identity.id
+    finally:
+        await second.close()
+        await first.close()
 
 
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):

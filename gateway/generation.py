@@ -414,7 +414,7 @@ def generation_paths(home: Path, identity: GenerationIdentity) -> dict[str, Path
         if len(os.fsencode(socket)) >= 100:
             # The path must be stable across processes even if startup resets TMPDIR.
             # Use a private, deterministic per-home directory under the short root.
-            socket = Path(os.path.sep, "tmp", f"hg-{getattr(os, 'getuid', lambda: 0)()}-{digest}") / f"{suffix[:12]}.sock"
+            socket = Path(os.path.sep, "tmp", f"hg-{getattr(os, 'getuid', lambda: 0)()}-{digest}") / f"{hashlib.sha256(os.fsencode(suffix)).hexdigest()[:32]}.sock"
     return {
         "pid": root / f"gateway.{suffix}.pid",
         "socket": socket,
