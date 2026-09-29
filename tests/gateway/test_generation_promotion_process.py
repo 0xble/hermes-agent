@@ -41,13 +41,14 @@ def _worker(standby: bool):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("approval_route", ["text", "callback", "stop", "steer"])
 @pytest.mark.asyncio
-async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path, monkeypatch):
+async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path, monkeypatch, approval_route):
     monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
     monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
     api = BotAPI()
     started = tmp_path / "tool-running"
-    command = f"touch {shlex.quote(str(started))} && sleep 60"
+    command = f"chmod 777 {shlex.quote(str(tmp_path))} && touch {shlex.quote(str(started))} && sleep 60"
     def model(record):
         messages = record["body"]["messages"]
         if messages and messages[-1].get("role") == "tool":
@@ -67,7 +68,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         "model:\n  provider: custom\n  default: fake-model\n"
         f"  base_url: {llm.base_url}\n  key_env: OPENAI_API_KEY\n"
         "agent:\n  api_max_retries: 1\n"
-        "approvals:\n  mode: 'off'\n"
+        "approvals:\n  mode: manual\n  timeout: 120\n"
         "updates:\n  check: false\n"
         "gateway:\n  overlap_handover:\n    enabled: true\n"
         "platforms:\n  telegram:\n    enabled: true\n    token: '" + TOKEN + "'\n"
@@ -103,13 +104,18 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             if not standby:
                 api.add(1001, 1001, text="old-boundary")
                 end = time.monotonic() + 25
-                while not started.exists() and time.monotonic() < end:
+                while time.monotonic() < end:
+                    with api.lock:
+                        approval_prompt = any("needs your OK" in item["text"] and "chmod" in item["text"] for item in api.sent)
+                    if approval_prompt:
+                        break
                     await asyncio.sleep(.1)
-                if not started.exists():
+                else:
                     proc.kill()
                     await asyncio.to_thread(proc.wait, 8)
-                    raise AssertionError(f"A did not launch tool: model calls={len(llm.main_requests())}, sent={api.sent}, "
+                    raise AssertionError(f"A did not request approval: model calls={len(llm.main_requests())}, sent={api.sent}, "
                                          f"offsets={api.offsets}, stderr={proc.stderr.read()[-4000:] if proc.stderr else ''}")
+                assert not started.exists(), "dangerous command ran before approval"
                 await asyncio.sleep(.3)
                 with api.lock:
                     assert not any("old-turn-complete" in item["text"] for item in api.sent)
@@ -121,7 +127,92 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         result = await asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=35)
         assert result > 1
         assert processes[0].poll() is None, "A exited before its turn completed"
-        api.add(1002, 1002, text="new-boundary", chat_id=2)
+        for update_id, command_text in ((1002, "/status"), (1003, "/queue")):
+            api.add(update_id, update_id, text=command_text)
+            end = time.monotonic() + 10
+            row = None
+            while time.monotonic() < end:
+                with db.connect() as conn:
+                    row = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id=?",
+                                       (str(update_id),)).fetchone()
+                if row and row["state"] != "pending":
+                    break
+                await asyncio.sleep(.1)
+            assert row and row["owner_id"] != successor["id"] and row["state"] == "accepted", command_text
+        callback_data = ""
+        if approval_route == "callback":
+            with api.lock:
+                prompt = next(item for item in api.sent if "needs your OK" in item["text"])
+                buttons = json.loads(prompt["reply_markup"])["inline_keyboard"]
+                callback_data = next(button["callback_data"] for row in buttons for button in row
+                                     if button["callback_data"].startswith("ea:once:"))
+            api.add_callback(1004, callback_data)
+        else:
+            api.add(1004, 1004, text="/approve")
+        end = time.monotonic() + 20
+        while not started.exists() and time.monotonic() < end:
+            await asyncio.sleep(.1)
+        assert started.exists(), "approval via B did not resume A's dangerous tool"
+        approval = None
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            with db.connect() as conn:
+                approval = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1004'").fetchone()
+            if approval and approval["state"] != "pending":
+                break
+            await asyncio.sleep(.1)
+        assert approval and approval["owner_id"] != successor["id"] and approval["state"] == "accepted"
+        if approval_route == "stop":
+            api.add(1005, 1005, text="/stop")
+            end = time.monotonic() + 15
+            stop_row = None
+            while time.monotonic() < end:
+                with db.connect() as conn:
+                    stop_row = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1005'").fetchone()
+                if stop_row and stop_row["state"] != "pending":
+                    break
+                await asyncio.sleep(.1)
+            assert stop_row and stop_row["owner_id"] != successor["id"] and stop_row["state"] == "accepted"
+            await asyncio.to_thread(processes[0].wait, 30)
+            assert processes[0].returncode == 0, processes[0].stderr.read()
+            return
+        if approval_route == "steer":
+            api.add(1005, 1005, text="/steer old-followup")
+            end = time.monotonic() + 20
+            steer_row = None
+            while time.monotonic() < end:
+                with db.connect() as conn:
+                    steer_row = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1005'").fetchone()
+                if steer_row and steer_row["state"] != "pending":
+                    break
+                await asyncio.sleep(.1)
+            assert steer_row and steer_row["owner_id"] != successor["id"] and steer_row["state"] == "accepted"
+            end = time.monotonic() + 80
+            while time.monotonic() < end:
+                with api.lock:
+                    if any("old-followup-complete" in item["text"].replace("\\", "") for item in api.sent):
+                        break
+                await asyncio.sleep(.1)
+            else:
+                with api.lock:
+                    raise AssertionError(f"A did not consume steer: {api.sent}")
+            return
+        if approval_route == "callback":
+            api.add_callback(1005, callback_data)
+        else:
+            api.add(1005, 1005, text="/approve")
+        duplicate = None
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            with db.connect() as conn:
+                duplicate = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1005'").fetchone()
+            if duplicate and duplicate["state"] != "pending":
+                break
+            await asyncio.sleep(.1)
+        assert duplicate and duplicate["owner_id"] != successor["id"] and duplicate["state"] == "accepted"
+        with api.lock:
+            assert sum("needs your OK" in item["text"] for item in api.sent) == 1
+        api.add(1006, 1006, text="new-boundary", chat_id=2)
         end = time.monotonic() + 25
         while time.monotonic() < end:
             with api.lock:
@@ -130,11 +221,11 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             await asyncio.sleep(.1)
         else:
             raise AssertionError("B did not answer new session")
-        api.add(1003, 1003, text="old-followup")
+        api.add(1007, 1007, text="old-followup")
         end = time.monotonic() + 12
         while time.monotonic() < end:
             with db.connect() as conn:
-                row = conn.execute("SELECT owner_id FROM inbox WHERE source_event_id='1003'").fetchone()
+                row = conn.execute("SELECT owner_id FROM inbox WHERE source_event_id='1007'").fetchone()
             if row:
                 assert row["owner_id"] != successor["id"], "B took A's in-flight session"
                 break

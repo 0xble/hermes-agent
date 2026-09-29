@@ -206,11 +206,20 @@ class OwnedRouting:
                 claims = [dict(row) for row in db.execute(
                     "SELECT * FROM sessions WHERE generation_id=?", (owner,))]
             live = self._live_keys()
+            from tools.process_registry import process_registry
+            # A process, watcher, delegation or owed goal may outlive the
+            # adapter's active-turn marker. Preserve claims until the local
+            # generation has no dependent work, rather than moving an idle-
+            # looking session while its completion still belongs to A.
+            dependent_work = bool(self.generation.runner._active_work_count() or
+                                  self.generation.runner._pending_approvals or
+                                  process_registry.has_any_active() or
+                                  process_registry.pending_watchers)
             lease = next((x for x in store.leases() if x["resource"] == "active_generation"), None)
             if lease and lease["generation_id"] != owner:
                 for claim in claims:
                     key = claim["session_key"]
-                    count = int(key in live)
+                    count = int(key in live or dependent_work)
                     store.set_outstanding(claim["profile_home"], claim["transport"], key,
                                           owner, claim["epoch"], count)
                     if not count:
