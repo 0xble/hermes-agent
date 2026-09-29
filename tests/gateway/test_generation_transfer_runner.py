@@ -477,6 +477,49 @@ async def test_serving_successor_is_not_demoted_by_ready_mark(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_drain_inspections_stop_runner_once(tmp_path, monkeypatch):
+    import threading
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    with db.connect() as conn:
+        conn.execute("UPDATE generations SET drain_deadline=0 WHERE id=?", (old.id,))
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    stopped = []
+
+    async def stop():
+        stopped.append(True)
+
+    active.bind_runner(Mock(adapters={}, _overlap_draining=True, _pending_approvals={},
+                            _active_work_count=lambda: 1, stop=stop))
+    entered, release = threading.Event(), threading.Event()
+    original_fence = db.fence_draining_generation
+
+    def slow_fence(*args):
+        entered.set()
+        release.wait(2)
+        return original_fence(*args)
+
+    monkeypatch.setattr(db, "fence_draining_generation", slow_fence)
+    first = asyncio.create_task(active.finish_draining_once())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        second = asyncio.create_task(active.finish_draining_once())
+        await asyncio.sleep(.1)
+    finally:
+        release.set()
+    assert await first is True
+    assert await second in (False, True)
+    assert stopped == [True]
+
+
+@pytest.mark.asyncio
 async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path, caplog):
     db = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="a", label="a")
@@ -494,6 +537,9 @@ async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path,
     active.bind_runner(runner)
     db.request_transfer(old.id, new.id, epoch, set())
     await active.transfer_requested(new.id)
+    assert active._drain_task is not None
+    active._drain_task.cancel()
+    await asyncio.gather(active._drain_task, return_exceptions=True)
     db.commit_transfer(old.id, new.id, epoch)
     with db.connect() as conn:
         conn.execute("UPDATE generations SET drain_deadline=NULL WHERE id=?", (old.id,))

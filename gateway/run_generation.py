@@ -314,6 +314,7 @@ class ActiveGeneration:
         self._transfer_lock = asyncio.Lock()
         self._drain_task: asyncio.Task | None = None
         self._drain_stopping = False
+        self._drain_stopped = False
         self._missing_deadline_warned = False
         self._stopped_receipts: list[tuple[object, dict]] = []
         self._pending_transfer: tuple[str, str, float] | None = None
@@ -488,14 +489,20 @@ class ActiveGeneration:
             self._missing_deadline_warned = True
         if (busy or queued) and deadline is not None and time.time() < deadline:
             return False
-        if not self._drain_stopping:
+        if self._drain_stopping:
+            return self._drain_stopped
+        self._drain_stopping = True
+        try:
             if busy or queued:
                 await asyncio.to_thread(self.coordinator.fence_draining_generation, self.identity.id)
                 # The normal shutdown path marks live turns resume_pending. The cap
                 # is different: interrupted side effects must not auto-run again.
                 self.runner._overlap_cap_interrupted = True
-            self._drain_stopping = True
             await self.runner.stop()
+        except BaseException:
+            self._drain_stopping = False
+            raise
+        self._drain_stopped = True
         return True
 
     async def _drain_after_transfer(self) -> None:
