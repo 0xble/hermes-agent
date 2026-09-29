@@ -391,10 +391,16 @@ class ActiveGeneration:
                                                       self.identity.id, new_id, self.epoch,
                                                       attempt_nonce=nonce)
                 except Exception:
+                    message = "poller stop failed and transfer abort could not be proved"
+                    self._rearm_errors = [message]
                     logger.exception("transfer abort failed after poller stop failure")
-                    raise RuntimeError("poller stop failed and transfer abort could not be proved") from original
+                    await asyncio.to_thread(self._sync_runtime_status)
+                    raise RuntimeError(message) from original
                 if not aborted:
-                    raise RuntimeError("poller stop failed and transfer attempt changed") from original
+                    message = "poller stop failed and transfer attempt changed"
+                    self._rearm_errors = [message]
+                    await asyncio.to_thread(self._sync_runtime_status)
+                    raise RuntimeError(message) from original
                 errors = await self._rearm_stopped_pollers()
                 if errors:
                     logger.error("poller stop failed: %s; re-arm failed for %s",

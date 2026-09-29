@@ -283,6 +283,42 @@ async def test_partial_rearm_failure_keeps_dispatch_fenced_and_recovers_other_po
     assert old_status["needs_attention"] is True and old_status["polling"] is False
 
 
+
+
+@pytest.mark.asyncio
+async def test_transfer_abort_failure_surfaces_attention_status(tmp_path, monkeypatch):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+
+    async def fail_stop():
+        raise RuntimeError("original stop failure")
+
+    adapter.stop_polling_for_transfer = fail_stop
+    def abort_fails(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "abort_transfer", abort_fails)
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+
+    with pytest.raises(RuntimeError, match="abort could not be proved"):
+        await active.transfer_requested(new.id)
+
+    from gateway.status import read_runtime_status
+    status = read_runtime_status(active.paths["state"])
+    assert status["needs_attention"] is True
+    assert status["polling"] is False
+    assert "abort could not be proved" in status["error_message"]
+    assert runner._overlap_draining is True
+
+
 @pytest.mark.asyncio
 async def test_transfer_fences_cron_and_goal_before_poller_stops(tmp_path, monkeypatch):
     db = GenerationCoordinator(tmp_path)
