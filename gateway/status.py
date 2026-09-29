@@ -1035,11 +1035,21 @@ def _is_gateway_runtime_lock_active_strict(lock_path: Path) -> bool:
         raise RuntimeError(f"gateway runtime lock probe failed: {exc}") from exc
 
 
-def write_pid_file() -> None:
-    """Write this process's PID record via O_CREAT|O_EXCL; a racing gateway's FileExistsError
-    propagates for the caller to decide."""
+def write_pid_file(*, projected_identity=None) -> None:
+    """Claim the PID path after acquiring the runtime lock. A promoted generation may
+    replace only its own matching projection; all other existing records retain O_EXCL."""
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    if projected_identity is not None:
+        existing = _read_pid_record(path)
+        if (existing is not None and existing.get("pid") == os.getpid()
+                and existing.get("id") == projected_identity.id
+                and existing.get("start_fingerprint") == projected_identity.start_fingerprint
+                and _get_process_start_time(os.getpid()) is not None
+                and existing.get("start_time") == _get_process_start_time(os.getpid())):
+            _write_json_file(path, _build_pid_record())
+            _clear_running_pid_cache()
+            return
     _write_json_excl(path, _build_pid_record())
     _clear_running_pid_cache()
 

@@ -129,9 +129,140 @@ async def test_polling_stop_failure_keeps_old_lease(tmp_path):
     async def fail():
         raise RuntimeError("poll not stopped")
     adapter.stop_polling_for_transfer = fail
-    active.bind_runner(Mock(adapters={"telegram": adapter}))
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False)
+    active.bind_runner(runner)
     db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
     with pytest.raises(RuntimeError, match="poll not stopped"):
         await active.transfer_requested(new.id)
     assert db.leases()[0]["generation_id"] == old.id
     assert not db.transfer_receipts(old.id, epoch)[0]["poller_stopped"]
+    assert runner._overlap_draining is False
+
+
+@pytest.mark.asyncio
+async def test_transfer_fences_cron_and_goal_before_poller_stops(tmp_path, monkeypatch):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    adapter = PollingAdapter("fake-token")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_stop():
+        entered.set()
+        await release.wait()
+        return {"token_hash": adapter._controlled_journal.token_hash, "safe_offset": 23}
+
+    adapter.stop_polling_for_transfer = slow_stop
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    transfer = asyncio.create_task(active.transfer_requested(new.id))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert runner._overlap_draining is True
+
+        from cron.scheduler_provider import InProcessCronScheduler
+        import cron.scheduler as scheduler
+        import cron.jobs as jobs
+        from gateway.run import GatewayRunner
+
+        calls = []
+        monkeypatch.setattr(scheduler, "tick", lambda **kwargs: calls.append("cron"))
+        monkeypatch.setattr(jobs, "record_ticker_heartbeat", lambda **kwargs: None)
+        monkeypatch.setattr(InProcessCronScheduler, "recover_interrupted", lambda self: 0)
+        stop_event = Mock()
+        stop_event.is_set.side_effect = [False, True]
+        stop_event.wait.return_value = True
+        InProcessCronScheduler().start(
+            stop_event, interval=0, can_dispatch=lambda: not runner._overlap_draining)
+        assert calls == []
+
+        runner._running = True
+        with monkeypatch.context() as context:
+            async def one_scan_sleep(delay):
+                runner._running = False
+            context.setattr(asyncio, "sleep", one_scan_sleep)
+            await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+        assert calls == []
+        runner._warm_goals_session_db.assert_not_called()  # No goal wake scan began.
+    finally:
+        release.set()
+        await transfer
+
+
+@pytest.mark.asyncio
+async def test_serving_successor_is_not_demoted_by_ready_mark(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(identity, state="serving")
+    active = ActiveGeneration(tmp_path, db, identity, 1)
+    await active.mark_ready()
+    assert next(row for row in db.generations() if row["id"] == identity.id)["state"] == "serving"
+
+
+@pytest.mark.asyncio
+async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path, caplog):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    stopped = []
+
+    async def stop():
+        stopped.append(True)
+
+    runner = Mock(adapters={}, _pending_approvals={}, _active_work_count=lambda: 1, stop=stop)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, set())
+    await active.transfer_requested(new.id)
+    db.commit_transfer(old.id, new.id, epoch)
+    with db.connect() as conn:
+        conn.execute("UPDATE generations SET drain_deadline=NULL WHERE id=?", (old.id,))
+    assert await active.finish_draining_once()
+    assert await active.finish_draining_once()
+    assert stopped == [True]
+    assert len([r for r in caplog.records if "missing drain deadline" in r.message]) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_takeover_backs_off_and_warns_once(tmp_path, monkeypatch, caplog):
+    import gateway.run_generation as generation_run
+    import gateway.status as status
+
+    identity = GenerationIdentity.create(release_sha="b", label="b")
+    elapsed = 0.0
+    attempts = 0
+    intervals = []
+
+    def claim():
+        nonlocal attempts
+        attempts += 1
+        return False
+
+    async def sleep(seconds):
+        nonlocal elapsed
+        intervals.append(seconds)
+        elapsed += seconds
+        if elapsed >= 70:
+            raise StopAfterProbe()
+
+    class StopAfterProbe(Exception):
+        pass
+
+    monkeypatch.setattr(status, "get_running_pid", lambda: os.getpid())
+    monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda: False)
+    monkeypatch.setattr(generation_run.asyncio, "sleep", sleep)
+    with pytest.raises(StopAfterProbe):
+        await generation_run.take_over_legacy_gateway_resources(
+            identity, claim=claim, start_socket=lambda: None, refresh=lambda: None)
+    assert attempts <= 8, (attempts, intervals)
+    assert intervals[0] >= 1 and max(intervals) >= 30, intervals
+    assert len([r for r in caplog.records if "retrying slowly" in r.message]) == 1

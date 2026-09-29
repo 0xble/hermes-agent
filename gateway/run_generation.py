@@ -265,6 +265,30 @@ class GenerationControlServer(GatewayControlServer):
         return False
 
 
+async def take_over_legacy_gateway_resources(identity: GenerationIdentity, *, claim, start_socket, refresh):
+    """After the old owner exits, claim the singleton surfaces for the promoted owner."""
+    from gateway.status import get_running_pid, is_gateway_runtime_lock_active
+
+    delay = 1.0
+    failed_claims = 0
+    while True:
+        owner = get_running_pid()
+        if owner in (None, os.getpid()) and not is_gateway_runtime_lock_active():
+            try:
+                if claim():
+                    server = await start_socket()
+                    refresh()
+                    logger.info("Promoted generation %s acquired legacy gateway resources", identity.id)
+                    return server
+            except (RuntimeError, SystemExit):
+                logger.debug("Promoted generation takeover is still fenced", exc_info=True)
+            failed_claims += 1
+            if failed_claims == 5:
+                logger.warning("Promoted generation could not claim legacy gateway resources; retrying slowly")
+        delay = 30.0 if failed_claims >= 5 else min(delay + 1.0, 5.0)
+        await asyncio.sleep(delay)
+
+
 class ActiveGeneration:
     """Generation-scoped identity and heartbeat alongside the existing active dispatcher."""
 
@@ -283,6 +307,7 @@ class ActiveGeneration:
         self._transfer_lock = asyncio.Lock()
         self._drain_task: asyncio.Task | None = None
         self._drain_stopping = False
+        self._missing_deadline_warned = False
         self._stopped_receipts: list[tuple[object, dict]] = []
 
     def bind_runner(self, runner, *, cron_stop=None, cron_provider=None) -> None:
@@ -321,6 +346,7 @@ class ActiveGeneration:
             if {row["token_hash"] for row in transfer} != set(roster):
                 raise RuntimeError("frozen token roster differs from live adapters")
             stopped = []
+            self.runner._overlap_draining = True
             try:
                 for token, adapter in roster.items():
                     receipt = await adapter.stop_polling_for_transfer()
@@ -334,7 +360,6 @@ class ActiveGeneration:
                 # Keep the shared housekeeping/cron stop event alive. The built-in
                 # ticker's dispatch gate observes _overlap_draining; external
                 # providers are explicitly stopped and re-armed on abort.
-                self.runner._overlap_draining = True
                 if self.cron_provider is not None:
                     from cron.scheduler_provider import InProcessCronScheduler
                     if not isinstance(self.cron_provider, InProcessCronScheduler):
@@ -347,10 +372,13 @@ class ActiveGeneration:
             except Exception:
                 # A still holds the lease. Invalidate every partial receipt before
                 # attempting to re-arm: the driver cannot commit while rollback runs.
-                await asyncio.to_thread(self.coordinator.abort_transfer,
-                                        self.identity.id, new_id, self.epoch)
-                for adapter, receipt in stopped:
-                    await adapter.start_polling_from_transfer(receipt)
+                try:
+                    await asyncio.to_thread(self.coordinator.abort_transfer,
+                                            self.identity.id, new_id, self.epoch)
+                    for adapter, receipt in stopped:
+                        await adapter.start_polling_from_transfer(receipt)
+                finally:
+                    self.runner._overlap_draining = False
                 raise
 
     async def transfer_aborted(self, new_id: str) -> dict:
@@ -396,7 +424,11 @@ class ActiveGeneration:
         with contextlib.closing(self.coordinator.connect()) as conn:
             queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
                                   (self.identity.id,)).fetchone()
-        if (busy or queued) and time.time() < record["drain_deadline"]:
+        deadline = record["drain_deadline"]
+        if deadline is None and not self._missing_deadline_warned:
+            logger.warning("generation missing drain deadline; treating as expired")
+            self._missing_deadline_warned = True
+        if (busy or queued) and deadline is not None and time.time() < deadline:
             return False
         if not self._drain_stopping:
             if busy or queued:
@@ -456,7 +488,9 @@ class ActiveGeneration:
 
     async def mark_ready(self) -> None:
         await asyncio.to_thread(self._sync_runtime_status)
-        await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="ready")
+        # A handover may commit while B is starting its runner. Heartbeat without
+        # changing the coordinator's authoritative serving state.
+        await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id)
 
     def _sync_runtime_status(self) -> None:
         from gateway.status import read_runtime_status
@@ -468,7 +502,7 @@ class ActiveGeneration:
         now = time.monotonic()
         if runtime == self._last_runtime and now - self._last_status_write < 30:
             return
-        write_generation_record(self.paths["state"], self.identity, state="ready",
+        write_generation_record(self.paths["state"], self.identity, state="serving",
                                 socket_path=self.paths["socket"], runtime=runtime)
         self.coordinator.project_active_summary(self.identity, self.epoch, runtime)
         self._last_runtime = runtime.copy()
