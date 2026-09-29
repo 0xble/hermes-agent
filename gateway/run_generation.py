@@ -285,8 +285,17 @@ class ActiveGeneration:
                 await asyncio.to_thread(self.coordinator.abort_transfer,
                                         self.identity.id, new_id, self.epoch)
                 for adapter, receipt in stopped:
-                    await adapter.start_polling_from_transfer(receipt)
+                    await self._rearm_adapter(adapter, receipt)
                 raise
+
+    async def _rearm_adapter(self, adapter, receipt: dict) -> None:
+        try:
+            await adapter.start_polling_from_transfer(receipt)
+        except BaseException:
+            # begin_successor may already have consumed the receipt and started a
+            # poll. Teardown must finish before any fresh connect/retry.
+            await adapter.disconnect()
+            raise
 
     async def resume_uncommitted_transfer(self, epoch: int) -> dict:
         """After a failed transfer, A may rearm only while it still owns the lease."""
@@ -300,7 +309,7 @@ class ActiveGeneration:
                 if set(self._transfer_receipts) != set(self._telegram_adapters()):
                     raise RuntimeError("incomplete old poller receipts")
                 for token, adapter in self._telegram_adapters().items():
-                    await adapter.start_polling_from_transfer(self._transfer_receipts[token])
+                    await self._rearm_adapter(adapter, self._transfer_receipts[token])
                 self._transfer_receipts.clear()
                 self._poller_paused = False
                 self.runner._overlap_draining = False
@@ -364,7 +373,7 @@ class ActiveGeneration:
                 self._drain_task = None
             self.epoch = epoch
             for token, adapter in self._telegram_adapters().items():
-                await adapter.start_polling_from_transfer(self._transfer_receipts[token])
+                await self._rearm_adapter(adapter, self._transfer_receipts[token])
             self.runner._overlap_draining = False
             self._transfer_receipts.clear()
             self._poller_paused = False

@@ -863,6 +863,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._controlled_journal = None
         self._controlled_poller = None
         self._controlled_standby = False
+        self._polling_transferred = False
         self._seen_update_ids: dict = {}
         self._inflight_update_ids: dict = {}
         self._update_admission = None
@@ -2292,6 +2293,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cancel_task_attr("_polling_progress_verifier_task", "verifier transfer")
         await self._controlled_poller.stop()
         receipt = await asyncio.to_thread(self._controlled_journal.stop_receipt)
+        self._polling_transferred = True
         self._release_platform_lock()
         return receipt
 
@@ -2315,8 +2317,12 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.to_thread(self._controlled_journal.begin_successor, receipt)
             self._polling_teardown_started = False
             await self._start_controlled_polling()
+            self._polling_transferred = False
             self._mark_connected()
             self._restart_task_attr("_polling_heartbeat_task", self._polling_heartbeat_loop())
+            if self._controlled_standby:
+                self._controlled_standby = False
+                self._start_post_connect_housekeeping()
         except BaseException:
             # Only an ended poll can free its lock. A hanging request remains fenced.
             if self._controlled_poller is None or not self._controlled_poller.running:
@@ -4061,9 +4067,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Cancel the heartbeat (and webhook-mode identity loop) before tearing down the app.
         await self._cancel_task_attr("_polling_heartbeat_task", "heartbeat cancel")
         await self._cancel_task_attr("_bot_identity_refresh_task", "identity-refresh cancel")
-        # Mark the bot "Offline" while its HTTP client is still alive. Opt-in, non-fatal.
-        with contextlib.suppress(Exception):
-            await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
+        # A transferred token is now B's presence; A must not mark it Offline.
+        if not getattr(self, "_polling_transferred", False):
+            with contextlib.suppress(Exception):
+                await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
         await self._await_disconnect_step(self._cancel_pending_delivery_tasks(), _DISCONNECT_STEP_TIMEOUT, "pending-delivery cancel")
         if self._app:
             try:

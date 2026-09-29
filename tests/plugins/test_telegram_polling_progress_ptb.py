@@ -346,6 +346,8 @@ async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_pat
         return _GeneralRequest(), adapter._instrument_polling_request(IdleRequest())
 
     adapters = []
+    housekeeping = []
+    presence = []
     receipt = None
     token = "987654:IDLE_POLL_TEST"
     try:
@@ -354,7 +356,10 @@ async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_pat
             adapter = TelegramAdapter(PlatformConfig(enabled=True, token=token))
             adapters.append(adapter)
             monkeypatch.setattr(adapter, "_build_ptb_requests", lambda adapter=adapter: build(adapter))
-            adapter._start_post_connect_housekeeping = lambda: None
+            adapter._start_post_connect_housekeeping = lambda index=index: housekeeping.append(index)
+            async def status_indicator(online, index=index):
+                presence.append((index, online))
+            adapter._set_status_indicator = status_indicator
             # The request is deliberately idle, so bypass only the startup progress gate.
             monkeypatch.setattr(adapter, "_await_cold_start_readiness", lambda *args: asyncio.sleep(0))
             assert await adapter.connect(polling_standby=bool(index))
@@ -370,10 +375,13 @@ async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_pat
                 assert not adapter.has_fatal_error
                 monkeypatch.setattr(adapter, "_acquire_platform_lock", acquire)
                 await adapter.start_polling_from_transfer(receipt)
+                assert housekeeping == [0, 1]
             await asyncio.wait_for(started.wait(), 2)
             if index == 0:
                 receipt = await adapter.stop_polling_for_transfer()
             await asyncio.wait_for(adapter.disconnect(), 4)
+            if index == 0:
+                assert (0, False) not in presence, "retired predecessor must not mark B offline"
             assert adapter._app is None and adapter._polling_heartbeat_task is None
             assert active == 0 and maximum == 1
         assert cancelled == 2

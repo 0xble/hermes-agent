@@ -77,6 +77,32 @@ async def test_old_generation_waits_for_real_work_then_exits(tmp_path):
     assert stopped == [True]
 
 @pytest.mark.asyncio
+async def test_aborted_transfer_disconnects_adapter_that_fails_to_rearm(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    disconnected = []
+    async def start(_receipt):
+        raise RuntimeError("poll may still be running")
+    async def disconnect():
+        disconnected.append(True)
+    adapter.start_polling_from_transfer = start
+    adapter.disconnect = disconnect
+    active.bind_runner(Mock(adapters={"telegram": adapter}))
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    db.abort_transfer(old.id, new.id, epoch)
+    with pytest.raises(RuntimeError, match="poll may still be running"):
+        await active.transfer_aborted(new.id)
+    assert disconnected == [True]
+
+
+@pytest.mark.asyncio
 async def test_polling_stop_failure_keeps_old_lease(tmp_path):
     db = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="a", label="a")
