@@ -118,6 +118,13 @@ class OwnedAdmissionMixin:
                     owner, epoch = active_owner, active_epoch
                     session = db.execute("SELECT * FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
                                          (home, transport, key)).fetchone()
+            if session["state"] == "interrupted":
+                # A distinct new inbound event explicitly recovers the session.
+                # Pending cut rows remain interrupted and cannot replay on B.
+                if owner != active_owner:
+                    raise RuntimeError("interrupted owner is unavailable for recovery")
+                db.execute("UPDATE sessions SET state='owned' WHERE profile_home=? AND transport=? AND session_key=?",
+                           (home, transport, key))
             # A session with no work and no queued input may move to the active
             # generation atomically with the first subsequent admission.
             pending = db.execute(
@@ -214,6 +221,13 @@ class OwnedAdmissionMixin:
     @staticmethod
     def _release_abandoned(db, owner: str) -> int:
         """Fence cut work and transfer claims atomically to the live lease holder."""
+        # A cut claim is not an ordinary drained release. Preserve that fact
+        # across transfer; only a distinct new inbound event can recover it.
+        db.execute("UPDATE sessions SET state='interrupted' WHERE generation_id=? "
+                   "AND (outstanding_work>0 OR EXISTS (SELECT 1 FROM inbox i WHERE "
+                   "i.profile_home=sessions.profile_home AND i.transport=sessions.transport "
+                   "AND i.session_key=sessions.session_key AND i.owner_id=? AND i.state='pending'))",
+                   (owner, owner))
         interrupted = db.execute("UPDATE inbox SET state='interrupted' WHERE owner_id=? AND state='pending'",
                                  (owner,)).rowcount
         lease = db.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()

@@ -169,6 +169,57 @@ def test_exited_owner_outstanding_claim_moves_without_replaying_cut_work(tmp_pat
 
 
 
+@pytest.mark.parametrize("failure", ["cap", "sigkill"])
+def test_cut_claim_recovers_only_on_next_new_message(tmp_path, failure):
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    store, old, new, epoch = _pair(tmp_path)
+    process = None
+    try:
+        if failure == "sigkill":
+            process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            from gateway.status import _get_process_start_time
+            start = _get_process_start_time(process.pid)
+            with closing(store.connect()) as db, db:
+                db.execute("UPDATE generations SET pid=?,start_fingerprint=? WHERE id=?",
+                           (process.pid, f"{process.pid}:{start}", old.id))
+        store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+        cut, _ = store.enqueue("home-a", "telegram", "chat", "cut", "message",
+                               _source(), b"cut-work", new.id, epoch)
+        if failure == "cap":
+            with closing(store.connect()) as db, db:
+                db.execute("UPDATE generations SET state='draining',drain_deadline=? WHERE id=?",
+                           (time.time() - 1, old.id))
+            assert store.fence_draining_generation(old.id) == 1
+            store.heartbeat(old.id, state="exited")
+            assert store.release_exited_owner(old.id) == 0
+        else:
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            assert store.hold_dead_owner(old.id) == 1
+        with closing(store.connect()) as db:
+            claim = db.execute("SELECT generation_id,state,outstanding_work FROM sessions WHERE session_key='chat'").fetchone()
+            assert tuple(claim) == (new.id, "interrupted", 0)
+        duplicate, fresh = store.enqueue("home-a", "telegram", "chat", "cut", "message",
+                                         _source(), b"cut-work", new.id, epoch)
+        assert not fresh and duplicate["id"] == cut["id"] and duplicate["state"] == "interrupted"
+        row, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                                   _source(), b"new-work", new.id, epoch)
+        assert fresh and row["owner_id"] == new.id and row["state"] == "pending"
+        assert [item["id"] for item in store.pending(new.id, "home-a", "telegram", "chat")] == [row["id"]]
+        assert store.disposition(row["id"], new.id, epoch, "accepted")
+        again, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                                     _source(), b"new-work", new.id, epoch)
+        assert not fresh and again["state"] == "accepted"
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_interrupted_row_does_not_replay_after_handler_failure(tmp_path):
     store, old, new, epoch = _pair(tmp_path)
     row, _ = store.enqueue("home-a", "telegram", "chat", "one", "message",

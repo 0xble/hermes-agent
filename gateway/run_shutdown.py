@@ -882,6 +882,8 @@ class GatewayShutdownMixin:
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if getattr(self, "_overlap_cap_interrupted", False):
+            return []  # Fenced generation: never schedule replay of an interrupted side effect.
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
         # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service

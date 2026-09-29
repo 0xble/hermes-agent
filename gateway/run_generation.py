@@ -87,10 +87,16 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
             raise RuntimeError("old generation did not prove poller stopped")
         promoted = coordinator.commit_transfer(old_id, to_id, epoch, drain_seconds=drain_seconds)
     except Exception:
-        # No commit occurred: abort before re-arming so A's drain loop and poller
-        # cannot race a successor that may have acquired the lease.
-        coordinator.abort_transfer(old_id, to_id, epoch)
-        _generation_request(path, "transfer_aborted", params={"to": to_id}, timeout=timeout)
+        # Never hide the transfer failure with a second failure during recovery.
+        # Attempt both abort and re-arm even if either operation fails.
+        try:
+            coordinator.abort_transfer(old_id, to_id, epoch)
+        except Exception:
+            logger.exception("transfer abort failed after pre-commit failure")
+        try:
+            _generation_request(path, "transfer_aborted", params={"to": to_id}, timeout=timeout)
+        except Exception:
+            logger.exception("poller re-arm failed after pre-commit failure")
         raise
     successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})
     successor_socket = generation_paths(home, successor_identity)["socket"]
@@ -327,6 +333,11 @@ class ActiveGeneration:
         if (busy or queued or claims) and time.time() < record["drain_deadline"]:
             return False
         if not self._drain_stopping:
+            if busy or queued or claims:
+                await asyncio.to_thread(self.coordinator.fence_draining_generation, self.identity.id)
+                # The normal shutdown path marks live turns resume_pending. The cap
+                # is different: interrupted side effects must not auto-run again.
+                self.runner._overlap_cap_interrupted = True
             self._drain_stopping = True
             await self.runner.stop()
         return True
@@ -427,6 +438,8 @@ class ActiveGeneration:
                 if (current.st_dev, current.st_ino) == (self.socket_stat.st_dev, self.socket_stat.st_ino):
                     self.paths["socket"].unlink()
         _remove_empty_generation_socket_parent(self.paths["socket"])
+        await asyncio.to_thread(self.coordinator.project_stopped_summary,
+                                self.identity, self.epoch)
         await asyncio.to_thread(
             self.coordinator.release_lease, "active_generation", self.identity.id, self.epoch)
         await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="exited")

@@ -21,6 +21,16 @@ from plugins.platforms.telegram.polling_transfer import PollingJournal
 from telegram_polling_stub import BotAPI
 
 TOKEN = "123456:LOCAL_STUB_ONLY"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def worker_env(home):
+    env = os.environ.copy()
+    env.pop("HERMES_LAUNCHD_LABEL", None)
+    env.pop("HERMES_RELEASE_SHA", None)
+    env.update(HERMES_HOME=str(home), HERMES_TELEGRAM_DISABLE_FALLBACK_IPS="1",
+               PYTHONPATH=os.pathsep.join(filter(None, (str(REPO_ROOT), env.get("PYTHONPATH")))))
+    return env
 
 
 @pytest.mark.asyncio
@@ -120,8 +130,7 @@ async def test_standby_does_not_poll_and_transfer_receipt_fences_successor(tmp_p
     home.mkdir()
     counts(home)
     (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
-    env = {**os.environ, "HERMES_HOME": str(home),
-           "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "PYTHONPATH": str(Path.cwd())}
+    env = worker_env(home)
     processes = []
 
     async def launch(phase):
@@ -197,8 +206,7 @@ async def test_real_adapter_two_process_five_kill_boundaries(tmp_path):
               "during_long_poll", "after_response")
 
     def launch(phase, threshold):
-        env = {**os.environ, "HERMES_HOME": str(home),
-               "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "PYTHONPATH": str(Path.cwd())}
+        env = worker_env(home)
         (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
         proc = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "worker", api.url,
