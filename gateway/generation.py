@@ -453,7 +453,9 @@ def write_generation_record(path: Path, identity: GenerationIdentity, *, state: 
     if socket_path is not None:
         payload["socket_path"] = str(socket_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    # Heartbeat and status writers can race within one process. A PID-only name lets
+    # one os.replace consume the other's temporary file, crashing promotion.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     os.replace(temporary, path)
 
