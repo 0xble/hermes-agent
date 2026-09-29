@@ -90,6 +90,7 @@ class GatewayBusySessionMixin:
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
+        self._prefetch_queued_voice_transcript(queued_event, adapter)
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -402,8 +403,6 @@ class GatewayBusySessionMixin:
             return False
 
         self._enqueue_fifo(session_key, event, adapter)
-        if getattr(event, "_gateway_accepted", False):
-            self._prefetch_queued_voice_transcript(event, adapter)
         return ((isinstance(pending_slot, dict) and pending_slot.get(session_key) is event)
                 or any(item is event for item in (self._overflow_queue(session_key) or ())))
 
