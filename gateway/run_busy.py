@@ -95,6 +95,7 @@ class GatewayBusySessionMixin:
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
+        self._prefetch_queued_voice_transcript(queued_event, adapter)
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -406,8 +407,6 @@ class GatewayBusySessionMixin:
             return
 
         self._enqueue_fifo(session_key, event, adapter)
-        if getattr(event, "_gateway_accepted", False):
-            self._prefetch_queued_voice_transcript(event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
