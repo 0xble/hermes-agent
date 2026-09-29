@@ -203,6 +203,7 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             if stale:
                 # Preserve committed transfer evidence for the same bounded history
                 # window as its terminal generation. Delete dependent receipts first.
+                # Row-value IN requires SQLite 3.15 or later.
                 conn.executemany("DELETE FROM transfer_tokens WHERE old_id=? OR (old_id,epoch) IN "
                                  "(SELECT old_id,epoch FROM generation_transfers WHERE new_id=?)",
                                  [(row[0], row[0]) for row in stale])
