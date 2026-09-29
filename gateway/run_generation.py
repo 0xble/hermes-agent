@@ -128,7 +128,7 @@ def _ensure_generation_socket_parent(socket_path: Path) -> None:
     if parent.parent == Path(os.path.sep, "tmp") and parent.name.startswith("hg-"):
         parent.mkdir(mode=0o700, exist_ok=True)
         st = parent.lstat()
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != getattr(os, "getuid", lambda: 0)() or st.st_mode & 0o077:
             raise RuntimeError("generation control socket directory is not private")
     else:
         parent.mkdir(parents=True, exist_ok=True)
