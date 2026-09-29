@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("telegram")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins"))
 from telegram_polling_stub import BotAPI
 from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths
@@ -38,8 +40,11 @@ def _worker(standby: bool):
     return 0 if success else 1
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
-async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path):
+async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
+    monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
     api = BotAPI()
     started = tmp_path / "tool-running"
     command = f"touch {shlex.quote(str(started))} && sleep 60"
@@ -67,7 +72,8 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         "    extra:\n      base_url: '" + api.url + "'\n"
         "      base_file_url: '" + api.url + "'\n"
         "      allow_from: ['1', '2']\n      drop_pending_on_cold_boot: false\n")
-    env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
+    env = {**{key: value for key, value in os.environ.items() if not key.startswith("HERMES_")},
+           "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
            "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1"}
     processes = []
@@ -160,7 +166,9 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path):
+async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
+    monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
     api = BotAPI()
     home = tmp_path / "home"
     home.mkdir()
@@ -171,7 +179,8 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path):
         "      base_file_url: '" + api.url + "'\n"
         "      allow_from: ['1']\n      drop_pending_on_cold_boot: false\n")
     marker = tmp_path / "stop-requested"
-    env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
+    env = {**{key: value for key, value in os.environ.items() if not key.startswith("HERMES_")},
+           "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
            "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "TEST_PAUSE_TRANSFER": str(marker)}
     processes = []
@@ -191,6 +200,7 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path):
             else:
                 raise AssertionError("generation did not become ready")
         db = GenerationCoordinator(home)
+        assert all(row["release_sha"] != "inherited-release" for row in db.generations())
         successor = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway-b")
         old = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway")
         path = generation_paths(home, GenerationIdentity(**{key: old[key] for key in
