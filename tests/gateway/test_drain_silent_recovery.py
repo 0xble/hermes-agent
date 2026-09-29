@@ -21,7 +21,6 @@ def _recover(tmp_path, monkeypatch, runner, adapter, key, expected):
     overflow = runner._overflow_queue(key) or []
     assert flush_pending_to_file(slot) == (1 if slot else 0)
     assert flush_overflow_to_file({key: overflow}) == len(overflow)
-    from functools import partial
     from gateway.run_pending_recovery import _defer_followup
     now = datetime.now()
     source = make_restart_source()
@@ -102,7 +101,6 @@ async def test_idle_drain_silently_recovers_human_message(tmp_path, monkeypatch)
     runner._auto_resume_ready = lambda entry, **_kwargs: (adapter, entry.origin)
     runner._startup_restore_queue = []
     assert flush_pending_to_file(dict(adapter._pending_messages)) == 1
-    from functools import partial
     from gateway.run_pending_recovery import _defer_followup
     db = MagicMock()
     assert recover_pending_to_db(
@@ -188,6 +186,16 @@ def test_interrupted_diagnostic_mentioned_in_prose_is_retained():
     from gateway.run import _sanitize_gateway_final_response
 
     prose = "Operation interrupted: waiting for model response is a diagnostic, not a reply."
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, prose) == prose
+
+
+def test_long_complete_interrupt_diagnostic_is_suppressed_not_prose():
+    from gateway.config import Platform
+    from gateway.run import _sanitize_gateway_final_response
+
+    diagnostic = f"Operation interrupted: handling API error ({'x' * 150})."
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, diagnostic) == ""
+    prose = f"The log said {diagnostic} and then continued."
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, prose) == prose
 
 
@@ -528,5 +536,139 @@ async def test_non_drain_busy_queue_still_queues():
     runner._is_user_authorized_for_source = lambda _s: True
     runner._admit_bot_message_for_source = lambda _s: True
     event = MessageEvent(text="normal queue", source=source, user_id="u1")
-    assert await runner._handle_active_session_busy_message(event, key) in (True, False)
+    assert await runner._handle_active_session_busy_message(event, key) is True
     assert adapter._pending_messages[key].text == "normal queue"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap,connected", [(0, True), (1, False)])
+async def test_idle_adapter_drain_spools_when_fifo_cannot_admit(tmp_path, monkeypatch, cap, connected):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    runner._draining = True
+    runner._BUSY_QUEUE_MAX_PENDING = cap
+    runner._hm_admit_event = AsyncMock(side_effect=lambda event: (event, source, False))
+    runner._session_state = lambda _key: SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
+    runner._peek_session_state = runner._session_state
+    if not connected:
+        runner.adapters.clear()
+    adapter.set_message_handler(runner._handle_admitted_message)
+    event = MessageEvent(text="preserve me", source=source, user_id="u1")
+    await adapter.handle_message(event)
+    for _ in range(300):
+        if key not in adapter._session_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert event._gateway_accepted is True  # stamped by the idle adapter before dispatch
+    assert key not in adapter._pending_messages
+    assert len(list((tmp_path / "pending_messages").glob("*.json"))) == 1
+
+
+def test_ordinary_queued_head_precedes_later_drain_spool(tmp_path, monkeypatch):
+    from datetime import timedelta
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    head = MessageEvent(text="head", source=source, user_id="u1",
+                        timestamp=datetime.now() - timedelta(seconds=30))
+    drain = MessageEvent(text="drain", source=source, user_id="u1",
+                         timestamp=datetime.now() - timedelta(seconds=5))
+    assert flush_pending_to_file({key: head}) == 1
+    import json
+    head_spool, = (tmp_path / "pending_messages").glob("*.json")
+    assert json.loads(head_spool.read_text())["ts"] == head.timestamp.timestamp()
+    runner._BUSY_QUEUE_MAX_PENDING = 0
+    runner._preserve_drain_event(key, drain)
+    now = datetime.now()
+    runner.session_store._lock = MagicMock()
+    runner.session_store._ensure_loaded_locked = lambda: None
+    entry = runner.session_store._entries[key] = SessionEntry(
+        session_key=key, session_id="sid", created_at=now, updated_at=now,
+        origin=source, resume_pending=True)
+    runner._is_session_running = lambda _key: False
+    runner._restored_source = lambda entry: entry.origin
+    runner._resume_owner_authorized = lambda *_args: True
+    runner._auto_resume_ready = lambda *_args, **_kw: (adapter, source)
+    runner._startup_restore_queue = []
+    from gateway.run_pending_recovery import _defer_followup
+    db = MagicMock()
+    assert recover_pending_to_db(db, session_resolver=lambda *_a, **_kw: ("sid", db),
+                                 deferred_followup=partial(_defer_followup, runner, {key: entry}, None)) == 2
+    assert [event.text for event in runner._startup_restore_queue] == ["head", "drain"]
+
+
+def test_failed_drain_authorization_keeps_spool_for_next_pass(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    event = MessageEvent(text="keep", source=source, user_id="u1")
+    event._drain_deferred = True
+    assert flush_pending_to_file({key: event}) == 1
+    now = datetime.now()
+    runner.session_store._lock = MagicMock()
+    runner.session_store._ensure_loaded_locked = lambda: None
+    runner.session_store._entries[key] = SessionEntry(
+        session_key=key, session_id="sid", created_at=now, updated_at=now, origin=source)
+    runner._is_session_running = lambda _key: False
+    runner._restored_source = lambda entry: entry.origin
+    runner._is_user_authorized_for_source = MagicMock(side_effect=OSError("allowlist unavailable"))
+    runner._startup_restore_queue = []
+    from gateway.run_pending_recovery import _defer_followup
+    db = MagicMock()
+    recover = partial(recover_pending_to_db, db, session_resolver=lambda *_a, **_kw: ("sid", db),
+                      deferred_followup=partial(_defer_followup, runner, {}, None))
+    assert recover() == 0
+    assert len(list((tmp_path / "pending_messages").glob("*.json"))) == 1
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    assert recover() == 1
+    assert [e.text for e in runner._startup_restore_queue] == ["keep"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_drain_does_not_claim_arrival(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    event = MessageEvent(text="later", source=source, user_id="u1")
+    event._drain_deferred = True
+    assert flush_pending_to_file({key: event}, reason="drain_arrival") == 1
+    now = datetime.now()
+    runner.session_store._lock = MagicMock()
+    runner.session_store._ensure_loaded_locked = lambda: None
+    runner.session_store._entries[key] = SessionEntry(
+        session_key=key, session_id="sid", created_at=now, updated_at=now, origin=source)
+    runner._is_session_running = lambda _key: False
+    runner._restored_source = lambda entry: entry.origin
+    runner._resume_owner_authorized = lambda *_args: True
+    runner._startup_restore_queue = []
+    from gateway.run_pending_recovery import _defer_followup
+    db = MagicMock()
+    runner._draining = True
+    assert recover_pending_to_db(db, session_resolver=lambda *_a, **_kw: ("sid", db),
+                                 deferred_followup=partial(_defer_followup, runner, {}, source.platform,
+                                                           reconnect_recovery=True)) == 0
+    assert runner._startup_restore_queue == []
+    assert len(list((tmp_path / "pending_messages").glob("*.json"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_unbound_adapter_does_not_dispatch_deferred_head():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    adapter.gateway_runner = None
+    deferred = MessageEvent(text="later", source=source, user_id="u1")
+    deferred._drain_deferred = True
+    adapter._pending_messages[key] = deferred
+    adapter._session_tasks[key] = asyncio.current_task()
+    spawn = MagicMock()
+    adapter._spawn_drain_task = spawn
+    adapter._finish_session_task(key, asyncio.Event())
+    spawn.assert_not_called()
+    assert adapter._pending_messages[key] is deferred

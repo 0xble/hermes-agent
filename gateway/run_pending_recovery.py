@@ -32,12 +32,15 @@ def pending_home_for_key(runner, session_key: str) -> Path | None:
     return Path(served[owner]) if owner in served else None
 
 
-def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, breaker_tripped=False):
+def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
+                    breaker_tripped=False, reconnect_recovery=False):
     # A queued message is a future turn; appending it to the interrupted transcript
     # makes the recovery note answer that message instead.
     if platform is not None and key in eligible and eligible[key].origin.platform != platform:
         return OTHER_PLATFORM_PENDING
     drain_deferred = data.get("drain_deferred") is True
+    if reconnect_recovery and drain_deferred and getattr(runner, "_draining", False):
+        return None  # shutdown still owns these arrivals
     if key not in eligible and not breaker_tripped and not drain_deferred:
         return False
     if breaker_tripped and not hasattr(runner.session_store, "_lock"):
@@ -67,8 +70,11 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *, 
     source = runner._restored_source(entry)
     if drain_deferred and platform is not None and source.platform != platform:
         return OTHER_PLATFORM_PENDING
-    if not runner._resume_owner_authorized(key, source):
+    authorization = runner._resume_owner_authorized(key, source)
+    if authorization is not True:
         if drain_deferred:
+            if authorization is None:
+                return None  # transient check failure: keep the only copy for retry
             logger.warning("Dropping unauthorized drain-deferred message from %s", path)
             return DROP_PENDING
         return False
@@ -141,7 +147,8 @@ def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform
                 recovered += recover_pending_to_db(
                     session_resolver=resolve_here,
                     deferred_followup=partial(_defer_followup, runner, eligible, platform,
-                                              breaker_tripped=candidates is None))
+                                              breaker_tripped=candidates is None,
+                                              reconnect_recovery=platform is not None))
         except Exception:
             logger.warning("Pending-message recovery failed for profile home %s; spool retained", home,
                            exc_info=True)

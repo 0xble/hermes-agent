@@ -581,10 +581,8 @@ class GatewayStartupMixin:
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
 
-    def _resume_owner_authorized(self, session_key: str, source) -> bool:
-        """Validate the session owner against the CURRENT allowlist: a session created before the
-        allowlist existed (or whose owner was since removed) must not silently receive a full agent
-        response just because it carries a resume marker."""
+    def _resume_owner_authorized(self, session_key: str, source) -> bool | None:
+        """True for an authorized owner, False for denial, None when checking failed."""
         try:
             if self._is_user_authorized_for_source(source):
                 return True
@@ -594,6 +592,7 @@ class GatewayStartupMixin:
             )
         except Exception as exc:
             logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
+            return None
         return False
 
     def _auto_resume_ready(self, entry, *, require_adapter=True) -> tuple | None:
