@@ -118,6 +118,21 @@ class TestAuditVerdicts:
         assert record.verdict == "reap-archive"
         assert record.untracked == ["PR_BODY_DRAFT.md"]
 
+    def test_host_global_excludes_cannot_hide_untracked_file(self, repo, tmp_path, monkeypatch):
+        """Production cleanup must not let a host global excludesFile hide real work."""
+        host_excludes = tmp_path / "host-global-ignore"
+        host_excludes.write_text("HOST-HIDDEN.txt\n")
+        host_config = tmp_path / "host-global.gitconfig"
+        host_config.write_text(f"[core]\n\texcludesFile = {host_excludes}\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(host_config))
+        tree, _ = _add_worktree(repo, "hermes-host-ignore")
+        (tree / "HOST-HIDDEN.txt").write_text("must survive detection\n")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-host-ignore")
+        assert record.verdict == "reap-archive"
+        assert record.untracked == ["HOST-HIDDEN.txt"]
+
     def test_unique_unpushed_commits_keep(self, repo):
         tree, _ = _add_worktree(repo, "hermes-work")
         (tree / "new.py").write_text("x = 1\n")

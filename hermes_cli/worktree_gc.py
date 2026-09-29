@@ -50,9 +50,10 @@ class BranchRecord:
     reason: str
 
 
-def _run(cmd: list, timeout: int, cwd: Optional[str] = None) -> subprocess.CompletedProcess:
+def _run(cmd: list, timeout: int, cwd: Optional[str] = None,
+         env: Optional[dict[str, str]] = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=timeout, cwd=cwd)
+                          timeout=timeout, cwd=cwd, env=env)
 
 
 @dataclass
@@ -68,13 +69,22 @@ class ExternalTreeRecord:
 
 
 def _git(args: list, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess:
-    """Run git, translating timeouts into returncode 124. Every verdict fails safe toward "keep"
-    on nonzero, so a slow ``git cherry`` on a huge repo degrades to keep instead of aborting the
-    audit mid-list."""
+    """Run git with host-wide config and excludes disabled.
+
+    Worktree cleanup must see files that a user's global ignore rules hide; local
+    repository excludes still apply, because they are part of the repository's
+    own policy and ``--ignored`` below makes those files visible to the safety
+    check as well. Every verdict fails safe toward "keep" on nonzero, so a slow
+    ``git cherry`` on a huge repo degrades to keep instead of aborting the audit
+    mid-list.
+    """
+    env = os.environ.copy()
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     try:
-        return _run(["git", *args], timeout, cwd)
+        return _run(["git", "-c", "core.excludesFile=", *args], timeout, cwd, env=env)
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(args=["git", *args], returncode=124, stdout="",
+        return subprocess.CompletedProcess(args=["git", "-c", "core.excludesFile=", *args], returncode=124, stdout="",
                                            stderr=f"timeout after {timeout}s")
 
 
@@ -88,13 +98,19 @@ def _tree_size_mb(path: Path, timeout: int = 30) -> Optional[int]:
 
 
 def _dirty_split(path: str) -> tuple[bool, List[str]]:
-    """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable."""
+    """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable.
+
+    Ignored-but-present files are included intentionally: cleanup cannot safely
+    delete a worktree merely because repository or host policy hides a file.
+    """
     try:
-        result = _git(["status", "--porcelain"], cwd=path, timeout=10)
+        result = _git([
+            "status", "--porcelain", "--untracked-files=all", "--ignored=matching",
+        ], cwd=path, timeout=10)
         if result.returncode != 0:
             return True, []  # fail safe: treat as real work
         lines = [line for line in result.stdout.splitlines() if line.strip()]
-        untracked = [line[3:].strip() for line in lines if line.startswith("??")]
+        untracked = [line[3:].strip() for line in lines if line.startswith(("??", "!!"))]
         return len(untracked) != len(lines), untracked
     except Exception:
         return True, []
