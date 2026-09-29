@@ -541,9 +541,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `live-vault-test-browser`.
 - The live vault regression fixture searched PATH and then fell back to the installed macOS
   `Google Chrome.app`. Each forced teardown could leave a `code_sign_clone` copy behind. The
-  fixture now resolves Playwright's bundled Chromium and skips when that test browser is absent,
-  so it never launches the user's signed-in browser or its code-signing clone.
-- Regression coverage: `tests/tools/test_vault_shadow_dom_live.py`.
+  fixture now resolves Playwright's bundled Chromium and skips outside CI when that test browser
+  is absent, so it never launches the user's signed-in browser or its code-signing clone. The
+  opt-in browser supervisor integration suite also uses the bundled Chromium instead of a
+  PATH-resolved branded browser. The pinned dev dependency and Python shard provisioning install
+  Chromium on the hosted gate; CI fails if it is missing rather than silently losing coverage.
+- Regression coverage: `tests/tools/test_vault_shadow_dom_live.py`,
+  `tests/tools/test_browser_supervisor.py` (opt-in).
 
 
 ## Kanban worker exit trailers identify the worker
