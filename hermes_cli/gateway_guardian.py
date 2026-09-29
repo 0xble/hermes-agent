@@ -191,6 +191,74 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
+def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
+    """Inspect the active lease before any repair. Unknown identities never authorize launchd writes."""
+    from hermes_cli.gateway_generation_status import read_generation_status
+    from gateway.status import _get_process_start_time, _pid_exists
+    rows = read_generation_status(home)
+    owners = [row for row in rows if row["polling_owner"]]
+    if len(owners) != 1:
+        receipt(home, "overlap", "alert", reason="active generation lease is missing or ambiguous")
+        return "alert"
+    owner = owners[0]
+    pid = owner["pid"]
+    actual = _get_process_start_time(pid) if type(pid) is int and _pid_exists(pid) else None
+    if actual is None or owner["start_fingerprint"] != f"{pid}:{actual}":
+        receipt(home, "overlap", "alert", reason="active generation process identity unknown",
+                generation_id=owner["id"], label=owner["label"])
+        return "alert"
+    if owner["state"] not in {"serving", "ready"}:
+        receipt(home, "overlap", "alert", reason="active generation state is not healthy",
+                generation_id=owner["id"], state=owner["state"])
+        return "alert"
+    if time.time() - owner["heartbeat_at"] > 60:
+        receipt(home, "overlap", "alert", reason="active generation heartbeat is stale",
+                generation_id=owner["id"])
+        return "alert"
+    # The drainer retains its in-process obligations. An exited generation is
+    # healthy history, never a reason to reload the active label.
+    drainers = [row for row in rows if row["state"] == "draining"]
+    for row in drainers:
+        drained_pid = row["pid"]
+        observed = (_get_process_start_time(drained_pid)
+                    if type(drained_pid) is int and _pid_exists(drained_pid) else None)
+        if observed is None or row["start_fingerprint"] != f"{drained_pid}:{observed}":
+            receipt(home, "overlap", "alert", reason="draining generation identity unknown",
+                    generation_id=row["id"])
+            return "alert"
+    if len(drainers) == 1 and drainers[0]["drain_deadline"] is not None:
+        from hermes_cli.gateway_overlap import _observe_poller, rollback_overlap
+        transferred_at = drainers[0]["drain_deadline"] - drain_seconds
+        if transferred_at + 30 <= time.time() <= transferred_at + 60:
+            try:
+                _observe_poller(home, owner, timeout=2)
+            except (RuntimeError, OSError) as exc:
+                if _repair_count(home) >= MAX_REPAIRS:
+                    receipt(home, "overlap", "capped", reason="overlap rollback attempt cap reached")
+                    return "capped"
+                from gateway.generation import GenerationCoordinator
+                lease = next((item for item in GenerationCoordinator(home).leases()
+                              if item["resource"] == "active_generation"), None)
+                if lease is None:
+                    raise RuntimeError("overlap lease vanished during rollback inspection")
+                receipt(home, "rollback", "attempt", reason=str(exc), label=owner["label"])
+                proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"])
+                receipt(home, "rollback", "rolled_back", **proof)
+                return "rolled_back"
+    # A loaded label with a clean exit and no remaining process can be retired.
+    # Never bootout a live drainer, even when its deadline has elapsed.
+    active_labels = {row["label"] for row in rows if row["state"] in {"serving", "ready", "draining"}}
+    for row in rows:
+        if row["state"] != "exited" or row["label"] in active_labels:
+            continue
+        from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+        domain = _gateway_domain(row["label"], None)
+        if _launch_state(domain, row["label"]) == "loaded" and _launchctl_supervised_pid(row["label"]) is None:
+            subprocess.run(["launchctl", "bootout", f"{domain}/{row['label']}"], check=True, timeout=15)
+            receipt(home, "retire", "booted_out", label=row["label"], generation_id=row["id"])
+    return "healthy"
+
+
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
     if intent_path(home).exists():
@@ -284,40 +352,32 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         try:
             from hermes_cli.config import _validate_updates
             from hermes_cli.config_effective import load_user_config_effective
-            config: dict[str, Any]
             if grace is None:
                 config = load_user_config_effective(home / "config.yaml", fail_closed=True)
             else:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
-                # Explicit grace historically needs no config load. Only inspect the
-                # opt-in marker when present; a malformed unrelated config cannot alert.
-                config_path = home / "config.yaml"
-                try:
-                    flag_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
-                except (OSError, UnicodeError):
-                    return "waiting"  # Unreadable flag cannot authorize legacy repair.
-                if "overlap_handover" in flag_text:
+                # The explicit-grace test path deliberately ignores unrelated
+                # malformed config. Read only the opt-in gate before any repair.
+                path = home / "config.yaml"
+                raw = path.read_text(encoding="utf-8") if path.is_file() else ""
+                if "overlap_handover" in raw:
                     try:
-                        flag_config = yaml.safe_load(flag_text) or {}
-                    except yaml.YAMLError as exc:
+                        parsed = yaml.safe_load(raw) or {}
+                        gateway = parsed.get("gateway") if isinstance(parsed, dict) else None
+                        overlap = gateway.get("overlap_handover") if isinstance(gateway, dict) else None
+                        if overlap is not None and (not isinstance(overlap, dict) or
+                                                    type(overlap.get("enabled")) is not bool):
+                            raise ValueError("invalid overlap_handover gate")
+                        if overlap and overlap["enabled"]:
+                            return _run_overlap(home)
+                    except (yaml.YAMLError, ValueError) as exc:
                         receipt(home, "inspect", "alert", reason=str(exc))
                         return "alert"
-                    if not isinstance(flag_config, dict):
-                        receipt(home, "inspect", "alert", reason="overlap_handover config must be a mapping")
-                        return "alert"
-                    raw_gateway = flag_config.get("gateway") or {}
-                    overlap = raw_gateway.get("overlap_handover") if isinstance(raw_gateway, dict) else None
-                    if overlap is not None and (not isinstance(overlap, dict) or
-                                                overlap.get("enabled") is not False):
-                        return "waiting"
-                    config["gateway"] = raw_gateway
-            # The legacy guardian only knows one launchd label. Until overlap repair has
-            # its own fenced protocol, it must not bootstrap or roll back either generation.
             gateway_config = config.get("gateway") or {}
             if (isinstance(gateway_config, dict) and
                     isinstance(gateway_config.get("overlap_handover"), dict) and
                     gateway_config["overlap_handover"].get("enabled") is True):
-                return "waiting"
+                return _run_overlap(home)
             if grace is not None:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
             updates = config.get("updates")

@@ -188,6 +188,12 @@ def record_release_transition(*, from_sha: str | None, to_sha: str, from_path: s
         logger.debug("Could not record release transition: %s", exc)
 
 
+def record_overlap_generation(proof: dict[str, Any]) -> None:
+    """Keep both immutable identities and poll evidence in the S2 receipt."""
+    if _current is not None:
+        _current.data["overlap_generation"] = dict(proof)
+
+
 def record_skip(name: str, reason: str) -> None:
     """Record a skipped step WITH the reason it was skipped."""
     _record("skip", f"update skip {name}", name, reason)

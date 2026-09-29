@@ -5224,7 +5224,8 @@ def _print_overlap_generations() -> None:
     for row in rows:
         lease = ", ".join(row["leases"]) or "none"
         print(f"  {row['id']} sha={row['release_sha']} label={row['label']} "
-              f"pid={row['pid']} lease={lease} state={row['state']}")
+              f"pid={row['pid']} lease={lease} state={row['state']} "
+              f"polling_owner={row['polling_owner']} draining_count={row['draining_count']}")
 
 
 def _cmd_status(args):

@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS transfer_tokens (
   PRIMARY KEY(old_id,epoch,token_hash),
   FOREIGN KEY(old_id,epoch) REFERENCES generation_transfers(old_id,epoch)
 );
+CREATE TABLE IF NOT EXISTS generation_interruptions (
+  generation_id TEXT NOT NULL REFERENCES generations(id),
+  profile_home TEXT NOT NULL, transport TEXT NOT NULL, session_key TEXT NOT NULL,
+  interrupted_at REAL NOT NULL, outstanding_work INTEGER NOT NULL,
+  side_effect_evidence TEXT NOT NULL,
+  PRIMARY KEY(generation_id,profile_home,transport,session_key)
+);
 """
 
 
@@ -307,6 +314,63 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             conn.execute("UPDATE generations SET state='serving' WHERE id=?", (new_id,))
             conn.execute("UPDATE generation_transfers SET state='committed' WHERE old_id=? AND epoch=?",
                          (old_id, epoch))
+            conn.commit()
+            return epoch + 1
+
+    def interrupt_at_drain_cap(self, generation_id: str) -> int:
+        """Fence once and retain unknown side effects; never replay cut work."""
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute("SELECT state,drain_deadline FROM generations WHERE id=?",
+                               (generation_id,)).fetchone()
+            if old is None or old["state"] != "draining" or old["drain_deadline"] is None or time.time() < old["drain_deadline"]:
+                raise RuntimeError("generation has not reached its drain cap")
+            rows = conn.execute("SELECT profile_home,transport,session_key,outstanding_work "
+                                "FROM sessions WHERE generation_id=? AND state!='interrupted' "
+                                "AND (outstanding_work>0 OR EXISTS (SELECT 1 FROM inbox i "
+                                "WHERE i.owner_id=? AND i.profile_home=sessions.profile_home "
+                                "AND i.transport=sessions.transport AND i.session_key=sessions.session_key "
+                                "AND i.state='pending'))", (generation_id, generation_id)).fetchall()
+            for row in rows:
+                conn.execute("INSERT OR IGNORE INTO generation_interruptions VALUES(?,?,?,?,?,?,'unknown; original owner retained')",
+                             (generation_id, row["profile_home"], row["transport"], row["session_key"],
+                              time.time(), row["outstanding_work"]))
+            conn.execute("UPDATE sessions SET state='interrupted' WHERE generation_id=? AND "
+                         "EXISTS (SELECT 1 FROM generation_interruptions g WHERE g.generation_id=? "
+                         "AND g.profile_home=sessions.profile_home AND g.transport=sessions.transport "
+                         "AND g.session_key=sessions.session_key)", (generation_id, generation_id))
+            conn.commit()
+            return len(rows)
+
+    def rollback_transfer(self, failed_id: str, old_id: str, epoch: int,
+                          *, poller_stopped: bool) -> int | None:
+        """Restore an intact prior generation only after the successor's wire is proven idle."""
+        if poller_stopped is not True:
+            raise RuntimeError("successor poller stop not proved")
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
+            if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (failed_id, epoch, "active"):
+                return None
+            old = conn.execute("SELECT state,drain_deadline,pid,start_fingerprint,boot_id "
+                               "FROM generations WHERE id=?", (old_id,)).fetchone()
+            if old is None or old["state"] != "draining":
+                raise RuntimeError("prior generation is not an intact drainer")
+            from gateway.status import _get_process_start_time, _pid_exists
+            pid = old["pid"]
+            actual_start = _get_process_start_time(pid) if _pid_exists(pid) else None
+            if old["boot_id"] != _boot_id() or actual_start is None or old["start_fingerprint"] != f"{pid}:{actual_start}":
+                raise RuntimeError("prior generation identity is not demonstrably healthy")
+            prior = conn.execute("SELECT 1 FROM generation_transfers WHERE old_id=? AND new_id=? "
+                                 "AND epoch=? AND state='committed'", (old_id, failed_id, epoch - 1)).fetchone()
+            if prior is None:
+                raise RuntimeError("prior generation does not own this transfer")
+            conn.execute("UPDATE leases SET generation_id=?,epoch=epoch+1 WHERE resource='active_generation' "
+                         "AND generation_id=? AND epoch=?", (old_id, failed_id, epoch))
+            conn.execute("UPDATE generations SET state='serving',drain_deadline=NULL WHERE id=?", (old_id,))
+            conn.execute("UPDATE generations SET state='draining' WHERE id=? AND state!='failed'", (failed_id,))
+            conn.execute("UPDATE generation_transfers SET state='rolled_back' WHERE old_id=? AND new_id=? "
+                         "AND epoch=?", (old_id, failed_id, epoch - 1))
             conn.commit()
             return epoch + 1
 

@@ -242,6 +242,24 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
         if defer:
             _record_update_step("immutable_release", True, f"staged: {candidate}; activation deferred")
             return True
+        if sys.platform == "darwin":
+            from hermes_cli.config_effective import load_user_config_effective
+            config = load_user_config_effective(Path(home) / "config.yaml", fail_closed=True)
+            overlap = ((config.get("gateway") or {}).get("overlap_handover") or {})
+            if overlap.get("enabled") is True:
+                from hermes_cli.gateway_overlap import promote_overlap
+                # No S2 single-label reload, no release success receipt before B's
+                # active lease and real poll progress have been observed.
+                result = promote_overlap(Path(home), candidate, sha,
+                                         drain_seconds=float(overlap.get("drain_seconds", 7200)))
+                from hermes_cli.update_receipt import record_release_transition, record_overlap_generation
+                record_release_transition(from_sha=result["old_sha"], to_sha=sha,
+                                          from_path=result["previous"], to_path=result["current"],
+                                          kind="overlap_promotion")
+                record_overlap_generation(result)
+                _record_update_step("immutable_release", True,
+                                    f"overlap: {result['old_id']} → {result['new_id']} sha={sha}")
+                return True
         # A pending record owns its target, even if its pointers already moved.
         # Complete it before evaluating a new candidate. The release manager
         # persists the exact intended plist before touching any mutable state.
@@ -1938,6 +1956,16 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _record_update_step("immutable_activation", True,
                                     f"activated release {release.name} ({release})")
             if not opts.no_gateway_restart:
+                from hermes_cli import update_receipt as _overlap_receipt
+                _proof = (_overlap_receipt._current.data.get("overlap_generation")
+                          if _overlap_receipt._current is not None else None)
+                if _proof:
+                    # Never enter the legacy fleet path: it bootouts every
+                    # ai.hermes.gateway* label, including A's live drainer.
+                    _record_update_step("overlap_fleet", False,
+                                        "native authorized-admission and full fleet proof still required")
+                    _finalize_receipt("partial", "Overlap verification incomplete: %s")
+                    raise SystemExit(1)
                 restart = _restart_gateway_fleet_after_update(
                     _pre_update_plan, gateway_mode, acknowledged_release_root=release)
                 _resume_windows_gateways_and_merge_outcome(restart, _windows_gateway_resume, gateway_mode)

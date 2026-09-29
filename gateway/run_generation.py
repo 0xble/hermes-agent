@@ -100,8 +100,17 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
     started = _get_process_start_time(os.getpid())
     if started is None:
         raise RuntimeError("cannot determine process start time for generation identity")
+    release_sha = os.environ.get("HERMES_RELEASE_SHA")
+    if release_sha is None:
+        # First overlap activation starts from the already-running S2 legacy
+        # label. It has no generation-specific environment but is release-pinned.
+        from hermes_cli.immutable_releases import ReleasePaths
+        current = ReleasePaths.for_home(home).current.resolve()
+        if current != Path.cwd().resolve() or len(current.name) != 40:
+            raise RuntimeError("legacy generation is not pinned to the current release")
+        release_sha = current.name
     identity = GenerationIdentity.create(
-        release_sha=os.environ.get("HERMES_RELEASE_SHA", "unknown"),
+        release_sha=release_sha,
         label=os.environ.get("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway"),
         start_fingerprint=f"{os.getpid()}:{started}",
     )
@@ -191,6 +200,8 @@ class ActiveGeneration:
         self._transfer_lock = asyncio.Lock()
         self._drain_task: asyncio.Task | None = None
         self._drain_stopping = False
+        self._transfer_receipts: dict[str, dict] = {}
+        self._poller_paused = False
 
     def bind_runner(self, runner, *, cron_stop=None, cron_provider=None) -> None:
         self.runner = runner
@@ -237,12 +248,11 @@ class ActiveGeneration:
                     await asyncio.to_thread(self.coordinator.record_poller_stopped,
                                             self.identity.id, self.epoch, token, receipt["safe_offset"])
                 # No new autonomous dispatch from A. A's existing turns and egress stay alive.
-                if self.cron_stop is not None:
-                    self.cron_stop.set()
-                if self.cron_provider is not None:
-                    from gateway.run import _stop_cron_provider
-                    _stop_cron_provider(self.cron_provider)
+                # Keep the ticker thread alive but fence dispatch: a guarded
+                # rollback can restore it without reconstructing housekeeping.
                 self.runner._overlap_draining = True
+                self._transfer_receipts = {receipt["token_hash"]: receipt for _adapter, receipt in stopped}
+                self._poller_paused = True
                 self._drain_task = asyncio.create_task(self._drain_after_transfer())
                 return {"poller_stopped": True, "generation_id": self.identity.id,
                         "epoch": self.epoch, "tokens": len(stopped)}
@@ -254,6 +264,67 @@ class ActiveGeneration:
                 for adapter, receipt in stopped:
                     await adapter.start_polling_from_transfer(receipt)
                 raise
+
+    async def resume_uncommitted_transfer(self, epoch: int) -> dict:
+        """After a failed transfer, A may rearm only while it still owns the lease."""
+        async with self._transfer_lock:
+            lease = next((row for row in self.coordinator.leases()
+                          if row["resource"] == "active_generation"), None)
+            if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (
+                    self.identity.id, epoch, "active"):
+                raise RuntimeError("cannot rearm an unowned generation")
+            if self._poller_paused:
+                if set(self._transfer_receipts) != set(self._telegram_adapters()):
+                    raise RuntimeError("incomplete old poller receipts")
+                for token, adapter in self._telegram_adapters().items():
+                    await adapter.start_polling_from_transfer(self._transfer_receipts[token])
+                self._transfer_receipts.clear()
+                self._poller_paused = False
+                self.runner._overlap_draining = False
+                if self._drain_task:
+                    self._drain_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._drain_task
+                    self._drain_task = None
+            return {"generation_id": self.identity.id, "epoch": epoch, "polling": True}
+
+    async def stop_for_rollback(self) -> dict:
+        """Stop successor's wire before any old-generation lease restoration."""
+        async with self._transfer_lock:
+            receipts = {}
+            for token, adapter in self._telegram_adapters().items():
+                receipt = await adapter.stop_polling_for_transfer()
+                if receipt.get("token_hash") != token:
+                    raise RuntimeError("rollback poller stop token mismatch")
+                receipts[token] = receipt
+            self.runner._overlap_draining = True
+            self._poller_paused = True
+            return {"poller_stopped": True, "generation_id": self.identity.id,
+                    "epoch": self.epoch, "tokens": len(receipts)}
+
+    async def restore_after_rollback(self, epoch: int) -> dict:
+        """Rearm A only after the coordinator installed a fresh lease epoch."""
+        async with self._transfer_lock:
+            lease = next((row for row in self.coordinator.leases()
+                          if row["resource"] == "active_generation"), None)
+            if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (
+                    self.identity.id, epoch, "active"):
+                raise RuntimeError("rollback restoration requires owned active lease")
+            if not self._poller_paused or set(self._transfer_receipts) != set(self._telegram_adapters()):
+                raise RuntimeError("rollback has no complete stopped-poller receipts")
+            if self._drain_task:
+                self._drain_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._drain_task
+                self._drain_task = None
+            self.epoch = epoch
+            for token, adapter in self._telegram_adapters().items():
+                await adapter.start_polling_from_transfer(self._transfer_receipts[token])
+            self.runner._overlap_draining = False
+            self._transfer_receipts.clear()
+            self._poller_paused = False
+            await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="serving")
+            return {"generation_id": self.identity.id, "epoch": epoch, "polling": True}
 
     async def finish_draining_once(self) -> bool:
         """Stop A only after B owns the lease and all locally owned work has settled."""
@@ -270,9 +341,13 @@ class ActiveGeneration:
         with contextlib.closing(self.coordinator.connect()) as conn:
             queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
                                   (self.identity.id,)).fetchone()
-        if (busy or queued) and time.time() < record["drain_deadline"]:
+        deadline = record["drain_deadline"]
+        if (busy or queued) and time.time() < deadline:
             return False
         if not self._drain_stopping:
+            if time.time() >= deadline:
+                count = await asyncio.to_thread(self.coordinator.interrupt_at_drain_cap, self.identity.id)
+                logger.warning("generation drain cap reached; fenced %s interrupted session(s)", count)
             self._drain_stopping = True
             await self.runner.stop()
         return True
@@ -302,11 +377,23 @@ class ActiveGeneration:
             future = asyncio.run_coroutine_threadsafe(self.transfer_requested(new_id), loop)
             return future.result(timeout=45)
 
+        def _rollback_handler(verb: str, params: dict) -> dict:
+            epoch = params.get("epoch")
+            if verb != "stop_for_rollback" and type(epoch) is not int:
+                raise RuntimeError("rollback lease epoch required")
+            operations = {"restore_after_rollback": lambda: self.restore_after_rollback(epoch),
+                          "resume_uncommitted_transfer": lambda: self.resume_uncommitted_transfer(epoch),
+                          "stop_for_rollback": self.stop_for_rollback}
+            return asyncio.run_coroutine_threadsafe(operations[verb](), loop).result(timeout=45)
+
         self.server = GenerationControlServer(
             self.home, self.paths["socket"],
             verb_handlers={"transfer_requested": _transfer_handler,
                            "polling_roster": lambda: {"tokens": sorted(self._telegram_adapters())},
-                           "polling_status": self.polling_status})
+                           "polling_status": self.polling_status,
+                           "stop_for_rollback": lambda params: _rollback_handler("stop_for_rollback", params),
+                           "restore_after_rollback": lambda params: _rollback_handler("restore_after_rollback", params),
+                           "resume_uncommitted_transfer": lambda params: _rollback_handler("resume_uncommitted_transfer", params)})
         if not await self.server.start():
             raise RuntimeError("generation control socket unavailable")
         self.socket_stat = self.paths["socket"].stat()

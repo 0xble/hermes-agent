@@ -115,7 +115,7 @@ def test_active_and_passive_generations_use_distinct_records(request):
             assert (home / f"gateway.{suffix}.pid").is_file()
             assert (home / f"gateway_state.{suffix}.json").is_file()
             state = json.loads((home / f"gateway_state.{suffix}.json").read_text())
-            assert state["state"] == "ready"
+            assert state["state"] in ({"ready", "serving"} if row["id"] == active["id"] else {"ready"})
             assert Path(state["socket_path"]).exists()
             bound_sockets.append(Path(state["socket_path"]))
         status = subprocess.run(

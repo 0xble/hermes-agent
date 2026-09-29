@@ -117,8 +117,8 @@ def test_overlap_generation_guardian_is_observe_only(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
     monkeypatch.setattr(guardian, "_run", lambda *a, **kw: pytest.fail("legacy repair reached"))
-    assert guardian.run_once(home, plist, label) == "waiting"
-    assert guardian.run_once(home, plist, label, grace=1) == "waiting"
+    assert guardian.run_once(home, plist, label) == "alert"
+    assert guardian.run_once(home, plist, label, grace=1) == "alert"
 
 
 @pytest.mark.macos_only

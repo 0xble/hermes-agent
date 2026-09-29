@@ -69,7 +69,8 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         "      allow_from: ['1', '2']\n      drop_pending_on_cold_boot: false\n")
     env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
-           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1"}
+           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1",
+           "HERMES_RELEASE_SHA": "a" * 40}
     processes = []
     try:
         for standby in (False, True):
@@ -173,7 +174,8 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path):
     marker = tmp_path / "stop-requested"
     env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
-           "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "TEST_PAUSE_TRANSFER": str(marker)}
+           "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "TEST_PAUSE_TRANSFER": str(marker),
+           "HERMES_RELEASE_SHA": "a" * 40}
     processes = []
     try:
         for standby in (False, True):
