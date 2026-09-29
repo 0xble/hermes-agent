@@ -138,11 +138,14 @@ def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
     try:
         for rel in untracked:
             src = tree / rel
-            if not src.exists() or src.is_symlink():
+            # lexists: a dangling link is still a listed path that must be preserved.
+            if not os.path.lexists(src):
                 logger.warning("Could not archive untracked path %s", src)
                 return None
             (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-            if src.is_dir():
+            if src.is_symlink():
+                os.symlink(os.readlink(src), dest / rel, target_is_directory=src.is_dir())
+            elif src.is_dir():
                 shutil.copytree(src, dest / rel, symlinks=True, dirs_exist_ok=True)
             else:
                 shutil.copy2(src, dest / rel, follow_symlinks=False)

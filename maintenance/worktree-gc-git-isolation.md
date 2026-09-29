@@ -15,8 +15,9 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   (`--untracked-files=all`) and parsed from NUL-delimited output, so a quoted,
   non-ASCII, spaced, or newline-containing path is archived byte-exactly. Rename
   entries keep their extra path field.
-- Archiving preserves symlinks recursively, including symlinked directories and
-  dangling links, and never follows a link target out of the worktree.
+- Archiving preserves symlinks, both top-level listed links and links inside
+  listed directories, including symlinked directories and dangling links, and
+  never follows a link target out of the worktree.
 - Reclaim is fail-safe: if any listed path cannot be found or copied into the
   archive, the worktree is kept rather than removed.
 
@@ -27,7 +28,7 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   `fork-ci-reliability` (see [Fork CI](fork-ci.md)). This unit covers the
   production path those fixtures exercise.
 - Upstream: own [PR #124019](https://github.com/NousResearch/hermes-agent/pull/124019)
-  carries the same change, head `3ca01f0f8b75582b018dbb3f578120bbb4d31d5f` on
+  carries the same change, head `ed525c0b53f59816cf20ef73e3fdf6e7f97598fe` on
   2026-09-28. Its first production revision listed individual files without NUL
   parsing; review reproduced silent loss of a quoted filename followed by a
   full reclaim, and a later review found ignored-directory symlinks archived as

@@ -319,6 +319,32 @@ class TestReclaim:
             assert os.readlink(path) == target
         assert (archived / "nested" / "note").read_text() == "scratch"
 
+    def test_top_level_untracked_links_are_archived_as_links(self, repo, tmp_path, monkeypatch):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        tree, _ = _add_worktree(repo, "hermes-top-links")
+        outside = tmp_path / "outside-dir"
+        outside.mkdir()
+        (outside / "secret").write_text("not archive content")
+        links = {"file-link": "README.md", "dangling": "missing", "dir-link": str(outside)}
+        for name, target in links.items():
+            (tree / name).symlink_to(target, target_is_directory=name == "dir-link")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-top-links")
+        assert record.verdict == "reap-archive"
+        assert sorted(record.untracked) == sorted(links)
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed hermes-top-links" in action for action in actions)
+        assert not tree.exists()
+        archives = list((archive_home / "archive" / "worktree-prune").glob("hermes-top-links-*"))
+        assert len(archives) == 1
+        for name, target in links.items():
+            archived = archives[0] / name
+            assert archived.is_symlink(), f"archive lost symlink: {archived}"
+            assert os.readlink(archived) == target
+        assert (outside / "secret").read_text() == "not archive content"
+
     def test_reclaim_keeps_tree_when_an_untracked_file_cannot_be_archived(self, repo, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "archive-home"))
         tree, _ = _add_worktree(repo, "hermes-missing")
