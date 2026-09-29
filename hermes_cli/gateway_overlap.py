@@ -79,15 +79,36 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
     coordinator = GenerationCoordinator(home)
     rows = {row["id"]: row for row in coordinator.generations()}
     failed, old = rows.get(failed_id), rows.get(old_id)
-    if failed is None or old is None or not _live(old) or not _live(failed):
+    if failed is None or old is None or not _live(old):
         raise RuntimeError("rollback blocked: generation process identity unknown")
     if old["state"] != "draining":
         raise RuntimeError("rollback blocked: prior generation is not draining")
+    dead_successor = not _live(failed)
+    if dead_successor:
+        from gateway.generation import _boot_id
+        from hermes_cli.gateway_guardian import _gateway_domain, _launch_state
+        # A dead process has no wire. A launchd-managed label is not evidence of
+        # death because KeepAlive may already be starting a replacement.
+        if (failed["boot_id"] != _boot_id() or _pid_exists(failed["pid"]) or
+                failed["state"] not in {"serving", "ready"}):
+            raise RuntimeError("rollback blocked: successor death cannot be proved")
+        domain = _gateway_domain(failed["label"], None)
+        if _launch_state(domain, failed["label"]) != "unloaded":
+            raise RuntimeError("rollback blocked: successor label may respawn")
+        # Process death closes the client socket, but the Bot API can still be
+        # finishing a 20-second getUpdates. The cooperative stop receipt waits
+        # for the wire; death has no receipt, so wait past that finite poll cap.
+        time.sleep(25)
+        if _pid_exists(failed["pid"]) or _launch_state(domain, failed["label"]) != "unloaded":
+            raise RuntimeError("rollback blocked: successor returned while poll settled")
     paths = ReleasePaths.for_home(home)
     old_release = (paths.releases / old["release_sha"]).resolve()
     if not _release_is_ready(old_release, old["release_sha"]):
         raise RuntimeError("rollback blocked: prior release is not intact")
-    stopped = _generation_request(_generation_socket(home, failed), "stop_for_rollback", timeout=10)
+    if dead_successor:
+        stopped = {"generation_id": failed_id, "epoch": epoch, "poller_stopped": True}
+    else:
+        stopped = _generation_request(_generation_socket(home, failed), "stop_for_rollback", timeout=10)
     if (stopped.get("generation_id"), stopped.get("epoch"), stopped.get("poller_stopped")) != (
             failed_id, epoch, True):
         raise RuntimeError("rollback blocked: successor wire-stop receipt invalid")

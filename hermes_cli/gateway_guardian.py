@@ -213,6 +213,23 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
     pid = owner["pid"]
     actual = _get_process_start_time(pid) if type(pid) is int and _pid_exists(pid) else None
     if actual is None or owner["start_fingerprint"] != f"{pid}:{actual}":
+        drainers = [row for row in rows if row["state"] == "draining" and
+                    row["drain_deadline"] is not None and time.time() < row["drain_deadline"]]
+        if actual is None and len(drainers) == 1 and type(pid) is int and not _pid_exists(pid):
+            from hermes_cli.gateway_overlap import rollback_overlap
+            from hermes_cli.gateway_generation_status import read_active_generation_lease
+            lease = read_active_generation_lease(home)
+            if lease is not None and _repair_count(home) < MAX_REPAIRS:
+                receipt(home, "rollback", "attempt", reason="successor process exited",
+                        label=owner["label"])
+                try:
+                    proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"],
+                                             drain_seconds=drain_seconds)
+                except (RuntimeError, OSError) as failure:
+                    receipt(home, "rollback", "alert", reason=str(failure), label=owner["label"])
+                    return "alert"
+                receipt(home, "rollback", "rolled_back", **proof)
+                return "rolled_back"
         receipt(home, "overlap", "alert", reason="active generation process identity unknown",
                 generation_id=owner["id"], label=owner["label"])
         return "alert"

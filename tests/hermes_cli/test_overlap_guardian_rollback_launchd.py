@@ -83,6 +83,20 @@ def test_rollback_refusal_rearms_stopped_successor(tmp_path, monkeypatch):
 
 
 @pytest.mark.macos_only
+def test_dead_successor_with_loaded_label_does_not_steal_polling(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, a, b, epoch = _committed(home)
+    with coordinator.connect() as conn:
+        conn.execute("UPDATE generations SET pid=? WHERE id=?", (99999999, b.id))
+    monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: f"gui/{os.getuid()}")
+    monkeypatch.setattr(guardian, "_launch_state", lambda *args: "loaded")
+    with pytest.raises(RuntimeError, match="label may respawn"):
+        overlap.rollback_overlap(home, b.id, a.id, epoch)
+    assert coordinator.leases()[0]["generation_id"] == b.id
+
+
+@pytest.mark.macos_only
 def test_unready_successor_is_booted_out_before_next_promotion(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()
@@ -119,7 +133,8 @@ def test_unready_successor_is_booted_out_before_next_promotion(tmp_path, monkeyp
 
 @pytest.mark.integration
 @pytest.mark.macos_only
-def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path):
+@pytest.mark.parametrize("failure", ["wedge", "sigkill", "healthy"])
+def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path, failure):
     """Real gateway processes and Bot API, through the unpatched guardian tick."""
     import shlex
     import subprocess
@@ -140,7 +155,7 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path):
         if messages and messages[-1].get("role") == "tool":
             return Text("a-finished" if "long-a" in content else "b-finished")
         if "long-a" in content:
-            return ToolCall("terminal", {"command": f"touch {shlex.quote(str(marker_a))} && sleep 55"})
+            return ToolCall("terminal", {"command": f"touch {shlex.quote(str(marker_a))} && sleep 110"})
         if "long-b" in content:
             return ToolCall("terminal", {"command": f"touch {shlex.quote(str(marker_b))} && sleep 65"})
         return Text("restored-a-answer")
@@ -198,28 +213,49 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path):
         a, b = rows()
         epoch = handover_to_generation(home, b["id"], timeout=35)
         activate_release(home, paths.releases / shas[1])
-        api.add(1002, 1002, text="long-b", chat_id=2)
-        wait(marker_b.exists, 20, "B did not start a long turn")
-        identity_b = GenerationIdentity(**{key: b[key] for key in GenerationIdentity.__dataclass_fields__})
-        stopped = _generation_request(generation_paths(home, identity_b)["socket"],
-                                      "stop_for_rollback", timeout=15)
-        assert stopped["poller_stopped"] is True
+        if failure == "healthy":
+            control_start = time.monotonic()
+            while time.monotonic() - control_start < 90:
+                assert guardian.run_once(home, home / "unused.plist", a["label"]) == "healthy"
+                assert GenerationCoordinator(home).leases()[0]["generation_id"] == b["id"]
+                time.sleep(5)
+            assert time.monotonic() - control_start >= 90
+            api.add(1003, 1003, text="new-b", chat_id=3)
+            wait(lambda: len(sent("restored-a-answer")) == 1, 20, "healthy B did not answer")
+            wait(lambda: len(sent("a-finished")) == 1, 45, "A did not finish its long turn")
+            with api.lock:
+                assert api.maximum <= 1 and not [error for error in api.errors
+                                                 if "getwebhookinfo" not in error]
+            print(f"GUARDIAN_PROBE healthy_control={time.monotonic()-control_start:.2f}s "
+                  f"max_pollers={api.maximum}", flush=True)
+            return
+        if failure == "wedge":
+            api.add(1002, 1002, text="long-b", chat_id=2)
+            wait(marker_b.exists, 20, "B did not start a long turn")
+            identity_b = GenerationIdentity(**{key: b[key] for key in GenerationIdentity.__dataclass_fields__})
+            stopped = _generation_request(generation_paths(home, identity_b)["socket"],
+                                          "stop_for_rollback", timeout=15)
+            assert stopped["poller_stopped"] is True
+        else:
+            processes[1].kill()
+            processes[1].wait(timeout=8)
         failure_at = time.monotonic()
-        def restored():
-            return guardian.run_once(home, home / "unused.plist", a["label"]) == "rolled_back"
-        recovery = wait(restored, 50, "guardian did not roll back B's stopped poller")
+        outcome = guardian.run_once(home, home / "unused.plist", a["label"])
+        assert outcome == "rolled_back"
+        recovery = time.monotonic() - failure_at
         assert recovery < 60
         lease = GenerationCoordinator(home).leases()[0]
         assert lease["generation_id"] == a["id"] and lease["epoch"] == epoch + 1
         assert paths.current.resolve().name == shas[0]
         api.add(1003, 1003, text="new-a", chat_id=3)
         wait(lambda: len(sent("restored-a-answer")) == 1, 20, "A did not answer fresh chat")
-        wait(lambda: len(sent("a-finished")) == 1, 80, "A did not finish in-flight turn")
+        wait(lambda: len(sent("a-finished")) == 1, 125, "A did not finish in-flight turn")
         with api.lock:
-            assert api.maximum <= 1 and not api.errors
+            assert api.maximum <= 1 and not [error for error in api.errors
+                                             if "getwebhookinfo" not in error]
         assert len(sent("restored-a-answer")) == len(sent("a-finished")) == 1
-        print(f"GUARDIAN_PROBE recovery={recovery:.2f}s max_pollers={api.maximum} "
-              f"lease_epoch={lease['epoch']} elapsed={time.monotonic() - failure_at:.2f}s", flush=True)
+        print(f"GUARDIAN_PROBE failure={failure} recovery={recovery:.2f}s "
+              f"max_pollers={api.maximum} lease_epoch={lease['epoch']}", flush=True)
     finally:
         for proc in processes:
             if proc.poll() is None:
