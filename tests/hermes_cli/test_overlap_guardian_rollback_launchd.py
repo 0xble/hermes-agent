@@ -144,7 +144,7 @@ def test_unready_successor_is_booted_out_before_next_promotion(tmp_path, monkeyp
     home.mkdir()
     coordinator = GenerationCoordinator(home)
     pid = os.getpid()
-    old = GenerationIdentity.create(release_sha="a" * 40, label="ai.hermes.gateway-a",
+    old = GenerationIdentity.create(release_sha="a" * 40, label="ai.hermes.rehearsal.guardian.a",
                                     pid=pid, start_fingerprint=f"{pid}:{_get_process_start_time(pid)}")
     coordinator.register(old, state="serving")
     epoch = coordinator.acquire_lease("active_generation", old.id)
@@ -157,7 +157,11 @@ def test_unready_successor_is_booted_out_before_next_promotion(tmp_path, monkeyp
     (home / "current").symlink_to(releases / old.release_sha)
     monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: f"gui/{os.getuid()}")
     monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
-    monkeypatch.setattr(overlap, "render_generation_launchd_plist", lambda **kwargs: "test")
+    monkeypatch.setattr(overlap, "_launch_agents_dir", lambda: tmp_path / "LaunchAgents")
+    monkeypatch.setattr(overlap, "generation_launchd_label", lambda slot: f"ai.hermes.rehearsal.guardian.{slot}")
+    monkeypatch.setattr(overlap, "render_generation_launchd_plist", lambda **kwargs: (
+        __import__("plistlib").dumps({"Label": f"ai.hermes.rehearsal.guardian.{kwargs['slot']}",
+            "EnvironmentVariables": {"HERMES_HOME": str(home.resolve())}}).decode()))
     monkeypatch.setattr(overlap, "bootstrap_generation_plist", lambda **kwargs: None)
     monkeypatch.setattr(overlap, "_ready_successor", lambda *args, **kwargs: (_ for _ in ()).throw(
         RuntimeError("pinned standby did not report a live ready identity")))
@@ -168,7 +172,7 @@ def test_unready_successor_is_booted_out_before_next_promotion(tmp_path, monkeyp
     monkeypatch.setattr(overlap.subprocess, "run", launchctl)
     with pytest.raises(RuntimeError, match="pinned standby"):
         overlap.promote_overlap(home, releases / ("b" * 40), "b" * 40)
-    assert bootouts == [["launchctl", "bootout", f"gui/{os.getuid()}/ai.hermes.gateway-b"]]
+    assert bootouts == [["launchctl", "bootout", f"gui/{os.getuid()}/ai.hermes.rehearsal.guardian.b"]]
     assert coordinator.leases()[0]["generation_id"] == old.id
     assert (home / "current").resolve().name == old.release_sha
 
@@ -240,10 +244,12 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path, failur
             time.sleep(.15)
         raise AssertionError(reason)
     try:
+        nonce = __import__("uuid").uuid4().hex[:8]
+        labels = {slot: f"ai.hermes.rehearsal.guardian.{nonce}.{slot}" for slot in "ab"}
         for slot in "ab":
             proc = subprocess.Popen([sys.executable, str(worker), "worker",
                                      "active" if slot == "a" else "standby"],
-                                    env={**env, "HERMES_LAUNCHD_LABEL": f"ai.hermes.gateway-{slot}",
+                                    env={**env, "HERMES_LAUNCHD_LABEL": labels[slot],
                                          "HERMES_RELEASE_SHA": shas[0 if slot == "a" else 1]},
                                     cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             processes.append(proc)

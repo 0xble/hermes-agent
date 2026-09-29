@@ -377,6 +377,8 @@ class GenerationCoordinator(OwnedAdmissionMixin):
                          "EXISTS (SELECT 1 FROM generation_interruptions g WHERE g.generation_id=? "
                          "AND g.profile_home=sessions.profile_home AND g.transport=sessions.transport "
                          "AND g.session_key=sessions.session_key)", (generation_id, generation_id))
+            conn.execute("UPDATE inbox SET state='interrupted' WHERE owner_id=? AND state='pending'",
+                         (generation_id,))
             conn.commit()
             return len(rows)
 
