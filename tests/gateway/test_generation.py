@@ -4,9 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sqlite3
 import stat
+import subprocess
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import MagicMock
 from pathlib import Path
 
@@ -20,6 +25,25 @@ from gateway.generation import (
     remove_generation_files,
     write_generation_record,
 )
+
+
+def test_concurrent_generation_record_writers_do_not_share_temporary_path(tmp_path):
+    identity = GenerationIdentity.create(release_sha="abc", label="ai.hermes.gateway")
+    record = tmp_path / "gateway_state.json"
+    barrier = Barrier(2)
+
+    def write_many():
+        barrier.wait()
+        for _ in range(500):
+            write_generation_record(record, identity, state="serving")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(write_many)
+        second = pool.submit(write_many)
+        first.result()
+        second.result()
+    assert json.loads(record.read_text())["id"] == identity.id
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_long_temp_root_still_produces_usable_unix_control_socket(tmp_path, monkeypatch):
@@ -39,6 +63,44 @@ def test_long_temp_root_creates_private_control_directory(tmp_path):
     _ensure_generation_socket_parent(path)
     assert path.parent.is_dir()
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_generation_socket_root_cleanup_removes_owned_stale_siblings(tmp_path):
+    from gateway.run_generation import _ensure_generation_socket_parent
+    home = tmp_path / ("h" * 100)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    path = generation_paths(home, identity)["socket"]
+    stale = path.parent.parent / f"{path.parent.name}-stale"
+    stale.mkdir(mode=0o700)
+    stale_socket = stale / "old.sock"
+    stale_socket.write_text("stale")
+    stale_socket.with_name(f".{stale_socket.name}.owner.json").write_text(
+        json.dumps({"pid": 999999999, "start_time": 1}))
+    old = time.time() - 11 * 60
+    os.utime(stale, (old, old))
+    _ensure_generation_socket_parent(path)
+    assert not stale.exists()
+
+
+def test_generation_socket_root_cleanup_preserves_live_siblings(tmp_path):
+    from gateway.run_generation import _ensure_generation_socket_parent
+    home = tmp_path / ("h" * 100)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    path = generation_paths(home, identity)["socket"]
+    stale = path.parent.parent / f"{path.parent.name}-live"
+    stale.mkdir(mode=0o700)
+    live_socket = stale / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(live_socket))
+    server.listen(1)
+    old = time.time() - 11 * 60
+    os.utime(stale, (old, old))
+    try:
+        _ensure_generation_socket_parent(path)
+        assert stale.exists()
+        assert live_socket.exists()
+    finally:
+        server.close()
 
 
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
@@ -250,6 +312,41 @@ async def test_old_exit_preserves_successor_legacy_pid_projection(tmp_path):
     assert json.loads((tmp_path / "gateway.pid").read_text()) == projected
 
 
+@pytest.mark.asyncio
+async def test_promoted_exit_projects_stopped_status_without_stale_pid(tmp_path):
+    from gateway.run_generation import ActiveGeneration
+    from gateway.status import read_runtime_status, retained_gateway_state
+    db = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(identity, state="serving")
+    epoch = db.acquire_lease("active_generation", identity.id)
+    active = ActiveGeneration(tmp_path, db, identity, epoch)
+    db.project_active_summary(identity, epoch, {"gateway_state": "running"})
+    await active.close()
+    state = read_runtime_status(tmp_path / "gateway_state.json")
+    assert state is not None
+    assert state["gateway_state"] == "stopped"
+    assert state["pid"] is None
+    assert retained_gateway_state(state) == "stopped"
+    assert db.leases()[0]["state"] == "released"
+    # Exercise the real CLI path, but remove unrelated host gateway PIDs from
+    # this subprocess's process probe. The home still supplies its real records.
+    command = [sys.executable, "-c",
+               "import sys; from hermes_cli import gateway; "
+               "gateway.find_gateway_pids = lambda: []; "
+               "from hermes_cli.main import main; "
+               "sys.argv = ['hermes', 'gateway', 'status']; main()"]
+    status_env = {**os.environ, "HERMES_HOME": str(tmp_path),
+                  "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+                  "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                  "HERMES_LAUNCHD_LABEL": f"ai.hermes.test-{tmp_path.name}"}
+    status = subprocess.run(command, env=status_env,
+                            capture_output=True, text=True, timeout=20)
+    assert status.returncode == 0, status.stderr
+    assert "Gateway is not running" in status.stdout, status.stdout
+    assert "lease=none state=exited" in status.stdout, status.stdout
+
+
 def test_lease_cannot_be_stolen_and_release_is_fenced(tmp_path):
     coordinator = GenerationCoordinator(tmp_path)
     from gateway.status import _get_process_start_time
@@ -334,6 +431,9 @@ async def test_ready_and_close_database_work_does_not_block_loop(tmp_path, monke
     entered.clear()
     release.clear()
     monkeypatch.setattr(coordinator, "release_lease", blocked)
+    # The heartbeat stub does not mark this unregistered owner exited; keep this
+    # test scoped to the close path's nonblocking release-lease call.
+    monkeypatch.setattr(coordinator, "release_exited_owner", lambda owner: 0)
     task = asyncio.create_task(active.close())
     try:
         assert await asyncio.to_thread(entered.wait, 2)
@@ -431,6 +531,49 @@ def test_terminal_generations_are_bounded_and_status_is_compact(tmp_path):
     visible = read_generation_status(tmp_path)
     assert {row["label"] for row in visible} == {"slot-a", "slot-b"}
     assert len(visible) == 3  # live active plus the latest terminal per label
+
+
+def test_terminal_transfer_audit_survives_while_successor_is_live(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="old", label="a", started_at=time.time() - 8 * 86400)
+    new = GenerationIdentity.create(release_sha="new", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    db.heartbeat(old.id, state="exited")
+    db.register(GenerationIdentity.create(release_sha="third", label="c"))
+    assert old.id in {row["id"] for row in db.generations()}
+    with db.connect() as conn:
+        assert conn.execute("SELECT state FROM generation_transfers WHERE old_id=?", (old.id,)).fetchone()[0] == "committed"
+
+
+@pytest.mark.parametrize("count,backdate", [(2, True), (25, False)])
+def test_terminal_transfer_history_can_be_pruned_without_foreign_key_failure(tmp_path, count, backdate):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="old", label="a")
+    new = GenerationIdentity.create(release_sha="new", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, {"token"})
+    db.record_poller_stopped(old.id, epoch, "token", 1)
+    db.commit_transfer(old.id, new.id, epoch)
+    db.release_lease("active_generation", new.id, epoch + 1)
+    db.heartbeat(old.id, state="exited")
+    db.heartbeat(new.id, state="exited")
+    if backdate:
+        with db.connect() as conn:
+            conn.execute("UPDATE generations SET started_at=? WHERE id IN (?,?)",
+                         (time.time() - 8 * 86400, old.id, new.id))
+    for index in range(count):
+        db.register(GenerationIdentity.create(release_sha=str(index), label="other"), state="exited")
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("SELECT count(*) FROM generation_transfers WHERE old_id=?", (old.id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM transfer_tokens WHERE old_id=?", (old.id,)).fetchone()[0] == 0
+    assert old.id not in {row["id"] for row in db.generations()}
 
 
 def test_terminal_prune_removes_released_lease_and_upgrades_existing_schema(tmp_path):

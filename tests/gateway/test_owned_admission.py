@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import sqlite3
 from contextlib import closing
 
 import pytest
 
 from gateway.generation import GenerationCoordinator, GenerationIdentity
+from gateway.status import _get_process_start_time
 
 
 def _pair(tmp_path):
     store = GenerationCoordinator(tmp_path)
-    old = GenerationIdentity.create(release_sha="a", label="slot-a")
-    new = GenerationIdentity.create(release_sha="b", label="slot-b")
+    fingerprint = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
+    old = GenerationIdentity.create(release_sha="a", label="slot-a", start_fingerprint=fingerprint)
+    new = GenerationIdentity.create(release_sha="b", label="slot-b", start_fingerprint=fingerprint)
     store.register(old, state="draining")
     store.register(new, state="serving")
     previous = store.acquire_lease("active_generation", old.id)
@@ -132,6 +135,99 @@ def test_dead_owner_holds_pending_rows_without_replaying(tmp_path, monkeypatch):
     again, fresh = store.enqueue("home-a", "telegram", "chat", "one", "message",
                                  _source(), b"work", new.id, epoch)
     assert not fresh and again["state"] == "interrupted"
+    later, fresh = store.enqueue("home-a", "telegram", "chat", "two", "message",
+                                 _source(), b"next", new.id, epoch)
+    assert fresh and later["owner_id"] == new.id and later["seq"] == 2
+
+
+
+
+
+
+def test_first_message_after_owner_death_moves_to_successor(tmp_path, monkeypatch):
+    store, old, new, epoch = _pair(tmp_path)
+    store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    row, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                               _source(), b"next", new.id, epoch)
+    assert fresh and row["owner_id"] == new.id and row["state"] == "pending"
+
+
+def test_exited_owner_outstanding_claim_moves_without_replaying_cut_work(tmp_path):
+    store, old, new, epoch = _pair(tmp_path)
+    store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+    row, _ = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                           _source(), b"cut-work", new.id, epoch)
+    store.heartbeat(old.id, state="exited")
+    assert store.release_exited_owner(old.id) == 1
+    later, fresh = store.enqueue("home-a", "telegram", "chat", "two", "message",
+                                 _source(), b"next", new.id, epoch)
+    assert fresh and later["owner_id"] == new.id
+    with closing(store.connect()) as db:
+        assert db.execute("SELECT state FROM inbox WHERE id=?", (row["id"],)).fetchone()[0] == "interrupted"
+
+
+
+
+@pytest.mark.parametrize("failure", ["cap", "sigkill"])
+def test_cut_claim_recovers_only_on_next_new_message(tmp_path, failure):
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    store, old, new, epoch = _pair(tmp_path)
+    process = None
+    try:
+        if failure == "sigkill":
+            process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            from gateway.status import _get_process_start_time
+            start = _get_process_start_time(process.pid)
+            with closing(store.connect()) as db, db:
+                db.execute("UPDATE generations SET pid=?,start_fingerprint=? WHERE id=?",
+                           (process.pid, f"{process.pid}:{start}", old.id))
+        store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+        cut, _ = store.enqueue("home-a", "telegram", "chat", "cut", "message",
+                               _source(), b"cut-work", new.id, epoch)
+        if failure == "cap":
+            with closing(store.connect()) as db, db:
+                db.execute("UPDATE generations SET state='draining',drain_deadline=? WHERE id=?",
+                           (time.time() - 1, old.id))
+            assert store.fence_draining_generation(old.id) == 1
+            store.heartbeat(old.id, state="exited")
+            assert store.release_exited_owner(old.id) == 0
+        else:
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            assert store.hold_dead_owner(old.id) == 1
+        with closing(store.connect()) as db:
+            claim = db.execute("SELECT generation_id,state,outstanding_work FROM sessions WHERE session_key='chat'").fetchone()
+            assert tuple(claim) == (new.id, "interrupted", 0)
+        duplicate, fresh = store.enqueue("home-a", "telegram", "chat", "cut", "message",
+                                         _source(), b"cut-work", new.id, epoch)
+        assert not fresh and duplicate["id"] == cut["id"] and duplicate["state"] == "interrupted"
+        row, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                                   _source(), b"new-work", new.id, epoch)
+        assert fresh and row["owner_id"] == new.id and row["state"] == "pending"
+        assert [item["id"] for item in store.pending(new.id, "home-a", "telegram", "chat")] == [row["id"]]
+        assert store.disposition(row["id"], new.id, epoch, "accepted")
+        again, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                                     _source(), b"new-work", new.id, epoch)
+        assert not fresh and again["state"] == "accepted"
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_interrupted_row_does_not_replay_after_handler_failure(tmp_path):
+    store, old, new, epoch = _pair(tmp_path)
+    row, _ = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                           _source(), b"work", new.id, epoch)
+    assert store.interrupt_row(row["id"], new.id, epoch)
+    duplicate, fresh = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                                     _source(), b"work", new.id, epoch)
+    assert not fresh and duplicate["state"] == "interrupted"
 
 
 def test_invalid_source_and_oversized_payload_fail_closed(tmp_path):

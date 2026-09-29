@@ -98,6 +98,23 @@ async def test_failed_commit_rearms_old_polling_and_dispatch(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_cleanup_failure_does_not_hide_original_transfer_failure(tmp_path, monkeypatch):
+    from gateway import run_generation
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    db.acquire_lease("active_generation", old.id)
+    monkeypatch.setattr(run_generation, "_generation_request", lambda *a, **kw: {"tokens": []}
+                        if a[1] == "polling_roster" else (_ for _ in ()).throw(RuntimeError("original stop failure")))
+    monkeypatch.setattr(GenerationCoordinator, "abort_transfer",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("cleanup failure")))
+    with pytest.raises(RuntimeError, match="original stop failure"):
+        await asyncio.to_thread(handover_to_generation, tmp_path, new.id)
+
+
+@pytest.mark.asyncio
 async def test_committed_but_unverified_handover_has_typed_outcome(tmp_path):
     from gateway import run_generation
     db = GenerationCoordinator(tmp_path)

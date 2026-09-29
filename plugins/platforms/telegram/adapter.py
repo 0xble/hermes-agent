@@ -5424,7 +5424,8 @@ class TelegramAdapter(BasePlatformAdapter):
         data = query.data
         cb = self._callback_ctx(query)
         owned = getattr(self, "_owned_routing", None)
-        if owned is not None and not getattr(self, "_owned_replaying_callback", False) and cb["chat_id"] is not None:
+        from gateway.owned_routing import _owned_callback_replay
+        if owned is not None and not _owned_callback_replay.get() and cb["chat_id"] is not None:
             if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
                 return
             source = self.build_source(

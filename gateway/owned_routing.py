@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from contextvars import ContextVar
 from dataclasses import fields
 from datetime import datetime
 
@@ -10,6 +12,9 @@ from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.session_identity import identity_of
+
+
+_owned_callback_replay: ContextVar[bool] = ContextVar("owned_callback_replay", default=False)
 
 
 def _source_payload(source):
@@ -20,8 +25,8 @@ def _source_payload(source):
 
 def _event_payload(event):
     # The normalized event, not a reconstruction from Telegram's prompt message.
-    # Native media is not portable between generation-local caches.
-    if event.media_urls or event.raw_message is None or event.platform_update_id is None:
+    # Cached Telegram media paths are shared under HERMES_HOME across generations.
+    if event.platform_update_id is None:
         raise RuntimeError("event cannot be handed to another generation")
     return {field.name: (getattr(event, field.name).value if field.name == "message_type"
                          else getattr(event, field.name).isoformat() if field.name == "timestamp"
@@ -53,6 +58,8 @@ class OwnedRouting:
     def __init__(self, generation):
         self.generation = generation
         self._task: asyncio.Task | None = None
+        self._last_warning = 0.0
+        self._last_probe: dict[str, float] = {}
 
     def bind(self, runner):
         self.generation.runner = runner
@@ -85,19 +92,20 @@ class OwnedRouting:
                 raise RuntimeError("unscoped session obligation during transfer")
             profile = profile_from_session_key_namespace(key.split(":", 2)[1])
             home = str(self.generation.home if profile == "default" else get_profile_dir(profile))
-            self.generation.coordinator.claim_session(
-                home, "telegram", key, self.generation.identity.id,
-                self.generation.epoch, outstanding_work=1)
+            self.generation.coordinator.freeze_session(
+                home, "telegram", key, self.generation.identity.id, self.generation.epoch)
 
     async def route_message(self, adapter, event, key):
         identity = identity_of(event.source)
-        if identity is None or event.source.user_id is None or event.internal:
-            raise RuntimeError("unresolved external identity")
+        if event.internal:
+            return False
+        if identity is None or event.source.user_id is None:
+            return True
         if adapter._is_sender_authorized(event.source.user_id, event.source.chat_type,
                                          event.source.chat_id, thread_id=event.source.thread_id) is not True:
-            raise RuntimeError("owner admission authorization failed")
+            return True
         home = self._home(event.source)
-        payload = json.dumps({"event": _event_payload(event)}, ensure_ascii=False).encode()
+        payload = lambda: json.dumps({"event": _event_payload(event)}, ensure_ascii=False).encode()
         envelope = json.dumps({"version": 1, "authorized": True,
                                "sender": event.source.user_id, "chat": event.source.chat_id,
                                "thread": event.source.thread_id, "profile": identity.runtime_profile,
@@ -110,8 +118,8 @@ class OwnedRouting:
         if row["owner_id"] == self.generation.identity.id:
             if not fresh:
                 return True
-            if not self.generation.coordinator.disposition(row["id"], row["owner_id"], row["owner_epoch"], "accepted"):
-                raise RuntimeError("local admission disposition failed")
+            if row["payload"] != b"{}":
+                return True  # An earlier replay row owns this lane; drain in sequence.
             return False
         return True
 
@@ -125,7 +133,7 @@ class OwnedRouting:
                                "thread": source.thread_id, "profile": identity.runtime_profile,
                                "transport_profile": identity.transport_profile,
                                "home": home}, ensure_ascii=False).encode()
-        payload = json.dumps({"callback": update.to_dict()}, ensure_ascii=False).encode()
+        payload = lambda: json.dumps({"callback": update.to_dict()}, ensure_ascii=False).encode()
         row, fresh = await asyncio.to_thread(
             self.generation.coordinator.enqueue, home, "telegram", key,
             str(update.update_id), "callback", envelope, payload,
@@ -133,19 +141,25 @@ class OwnedRouting:
         if row["owner_id"] == self.generation.identity.id:
             if not fresh:
                 return True
-            if not self.generation.coordinator.disposition(row["id"], row["owner_id"], row["owner_epoch"], "accepted"):
-                raise RuntimeError("local callback disposition failed")
+            if row["payload"] != b"{}":
+                return True
             return False
         return True
 
     async def drain(self):
+        delay = .1
         while not self.generation._drain_stopping:
             try:
-                await self._drain_once()
+                active = await self._drain_once()
+                delay = .1 if active or getattr(self.generation.runner, "_overlap_draining", False) else min(2., delay * 2)
             except Exception:
                 from gateway.run_generation import logger
-                logger.warning("owned admission drain failed; retaining rows", exc_info=True)
-            await asyncio.sleep(.1)
+                now = time.monotonic()
+                if now - self._last_warning >= 30:
+                    logger.warning("owned admission drain failed; retaining rows", exc_info=True)
+                    self._last_warning = now
+                delay = min(2., delay * 2)
+            await asyncio.sleep(delay)
 
     async def _drain_once(self):
         store = self.generation.coordinator
@@ -155,10 +169,17 @@ class OwnedRouting:
                 "SELECT * FROM inbox WHERE owner_id=? AND state='pending' ORDER BY id", (owner,))]
             foreign = [row[0] for row in db.execute(
                 "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending'", (owner,))]
+        now = time.monotonic()
         for foreign_owner in foreign:
-            await asyncio.to_thread(store.hold_dead_owner, foreign_owner)
+            if now - self._last_probe.get(foreign_owner, float("-inf")) >= 2:
+                await asyncio.to_thread(store.hold_dead_owner, foreign_owner)
+                self._last_probe[foreign_owner] = now
         for row in rows:
-            if row["session_key"] in self._live_keys() or row["owner_epoch"] == self.generation.epoch:
+            # Locally admitted events are already entering the native handler on
+            # this generation; the placeholder is not a cross-owner replay.
+            if row["payload"] == b"{}":
+                continue
+            try:
                 adapter = next((a for a in self._adapters() if a._owner_transport_profile() in
                                 (None, json.loads(row["authorized_source"])["transport_profile"])), None)
                 if adapter is None:
@@ -191,37 +212,36 @@ class OwnedRouting:
                     await adapter.handle_message(event)
                     accepted = event._gateway_accepted
                 else:
-                    adapter._owned_replaying_callback = True
+                    token = _owned_callback_replay.set(True)
                     try:
                         await adapter._handle_callback_query(update, None)
                     finally:
-                        adapter._owned_replaying_callback = False
+                        _owned_callback_replay.reset(token)
                     accepted = True
-                if accepted:
-                    store.disposition(row["id"], owner, row["owner_epoch"], "accepted")
-                else:
-                    store.disposition(row["id"], owner, row["owner_epoch"], "refused")
+                if not store.disposition(row["id"], owner, row["owner_epoch"],
+                                         "accepted" if accepted else "refused"):
+                    raise RuntimeError("owned dispatch disposition refused after handler returned")
+            except Exception:
+                from gateway.run_generation import logger
+                logger.warning("owned dispatch failed; interrupting row %s", row["id"], exc_info=True)
+                store.interrupt_row(row["id"], owner, row["owner_epoch"])
         if getattr(self.generation.runner, "_overlap_draining", False):
             with store._transaction() as db:
                 claims = [dict(row) for row in db.execute(
                     "SELECT * FROM sessions WHERE generation_id=?", (owner,))]
             live = self._live_keys()
             from tools.process_registry import process_registry
-            # A process, watcher, delegation or owed goal may outlive the
-            # adapter's active-turn marker. Preserve claims until the local
-            # generation has no dependent work, rather than moving an idle-
-            # looking session while its completion still belongs to A.
-            dependent_work = bool(self.generation.runner._active_work_count() or
-                                  self.generation.runner._pending_approvals or
-                                  process_registry.has_any_active() or
-                                  process_registry.pending_watchers)
+            # A claim is retained only for work belonging to its own session.
             lease = next((x for x in store.leases() if x["resource"] == "active_generation"), None)
             if lease and lease["generation_id"] != owner:
                 for claim in claims:
                     key = claim["session_key"]
-                    count = int(key in live or dependent_work)
+                    count = int(key in live or key in self.generation.runner._pending_approvals or
+                                process_registry.has_active_for_session(key) or
+                                any(w.get("session_key") == key for w in process_registry.pending_watchers))
                     store.set_outstanding(claim["profile_home"], claim["transport"], key,
                                           owner, claim["epoch"], count)
                     if not count:
                         store.transfer_session(claim["profile_home"], claim["transport"], key,
                                                owner, claim["epoch"], lease["generation_id"], lease["epoch"])
+        return bool(rows or foreign)

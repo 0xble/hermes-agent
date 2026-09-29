@@ -58,6 +58,20 @@ def test_transfer_rejects_forged_receipts_and_stale_epoch(tmp_path):
     assert db.leases()[0]["generation_id"] == old.id
 
 
+def test_aborted_transfer_can_be_rearmed_and_old_receipt_is_rejected(tmp_path):
+    db, old, new, epoch = _pair(tmp_path)
+    db.request_transfer(old.id, new.id, epoch, {"first"})
+    first_nonce = db.transfer_attempt_nonce(old.id, epoch)
+    db.abort_transfer(old.id, new.id, epoch)
+    db.request_transfer(old.id, new.id, epoch, {"first"})
+    second_nonce = db.transfer_attempt_nonce(old.id, epoch)
+    assert second_nonce != first_nonce
+    with pytest.raises(RuntimeError, match="attempt"):
+        db.record_poller_stopped(old.id, epoch, "first", 1, attempt_nonce=first_nonce)
+    db.record_poller_stopped(old.id, epoch, "first", 2, attempt_nonce=second_nonce)
+    assert db.commit_transfer(old.id, new.id, epoch) == epoch + 1
+
+
 def test_transfer_cannot_steal_live_holder_without_request(tmp_path):
     db, old, new, epoch = _pair(tmp_path)
     with pytest.raises(RuntimeError):
