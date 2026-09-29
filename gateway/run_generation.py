@@ -34,6 +34,8 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
     home = Path(get_hermes_home())
     coordinator = GenerationCoordinator(home)
     started = _get_process_start_time(os.getpid())
+    if started is None:
+        raise RuntimeError("cannot determine process start time for generation identity")
     identity = GenerationIdentity.create(
         release_sha=os.environ.get("HERMES_RELEASE_SHA", "unknown"),
         label=os.environ.get("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway"),
@@ -113,9 +115,9 @@ class ActiveGeneration:
         write_generation_record(self.paths["state"], self.identity, state="serving", socket_path=self.paths["socket"])
         self.task = asyncio.create_task(self._heartbeat())
 
-    def mark_ready(self) -> None:
-        self._sync_runtime_status()
-        self.coordinator.heartbeat(self.identity.id, state="ready")
+    async def mark_ready(self) -> None:
+        await asyncio.to_thread(self._sync_runtime_status)
+        await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="ready")
 
     def _sync_runtime_status(self) -> None:
         from gateway.status import read_runtime_status
@@ -157,9 +159,10 @@ class ActiveGeneration:
                 current = self.paths["socket"].stat()
                 if (current.st_dev, current.st_ino) == (self.socket_stat.st_dev, self.socket_stat.st_ino):
                     self.paths["socket"].unlink()
-        self.coordinator.release_lease("active_generation", self.identity.id, self.epoch)
-        self.coordinator.heartbeat(self.identity.id, state="exited")
-        remove_generation_files(self.home, self.identity)
+        await asyncio.to_thread(
+            self.coordinator.release_lease, "active_generation", self.identity.id, self.epoch)
+        await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="exited")
+        await asyncio.to_thread(remove_generation_files, self.home, self.identity)
 
 
 async def serve_standby_generation(config=None) -> bool:
@@ -180,14 +183,13 @@ async def serve_standby_generation(config=None) -> bool:
     release_sha = os.environ.get("HERMES_RELEASE_SHA", "unknown")
     from gateway.status import _get_process_start_time
     started = _get_process_start_time(os.getpid())
+    if started is None:
+        raise RuntimeError("cannot determine process start time for generation identity")
     identity = GenerationIdentity.create(
         release_sha=release_sha, label=label,
         start_fingerprint=f"{os.getpid()}:{started}",
     )
-    coordinator.register(identity)
     paths = generation_paths(home, identity)
-    write_generation_record(paths["pid"], identity, state="standby")
-    write_generation_record(paths["host"], identity, state="standby")
 
     async def report_ready(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         import json
@@ -205,10 +207,31 @@ async def serve_standby_generation(config=None) -> bool:
         server = await asyncio.start_unix_server(report_ready, path=str(socket_path))
     finally:
         os.umask(old_umask)
-    os.chmod(socket_path, 0o600)
-    socket_stat = paths["socket"].stat()
-    write_generation_record(paths["state"], identity, state="ready", socket_path=socket_path)
-    coordinator.heartbeat(identity.id, state="ready")
+    try:
+        os.chmod(socket_path, 0o600)
+        socket_stat = paths["socket"].stat()
+    except BaseException:
+        server.close()
+        await server.wait_closed()
+        socket_path.unlink(missing_ok=True)
+        raise
+    try:
+        coordinator.register(identity)
+        write_generation_record(paths["pid"], identity, state="standby")
+        write_generation_record(paths["host"], identity, state="standby")
+        write_generation_record(paths["state"], identity, state="ready", socket_path=socket_path)
+        coordinator.heartbeat(identity.id, state="ready")
+    except BaseException:
+        server.close()
+        await server.wait_closed()
+        with suppress(FileNotFoundError):
+            current = socket_path.stat()
+            if (current.st_dev, current.st_ino) == (socket_stat.st_dev, socket_stat.st_ino):
+                socket_path.unlink()
+        if any(row["id"] == identity.id for row in coordinator.generations()):
+            coordinator.heartbeat(identity.id, state="failed")
+        remove_generation_files(home, identity)
+        raise
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     installed: list[signal.Signals] = []

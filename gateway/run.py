@@ -6034,7 +6034,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()
     if _active_generation is not None:
-        _active_generation.mark_ready()
+        await _active_generation.mark_ready()
 
     try:
         await runner.wait_for_shutdown()
