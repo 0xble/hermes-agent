@@ -5225,6 +5225,10 @@ def _print_overlap_generations() -> None:
         lease = ", ".join(row["leases"]) or "none"
         print(f"  {row['id']} sha={row['release_sha']} label={row['label']} "
               f"pid={row['pid']} lease={lease} state={row['state']}")
+        if row.get("needs_attention"):
+            print(f"  polling=stopped needs_attention=true pid={row['pid']}")
+        if row["state"] == "draining":
+            print(f"  Old generation draining pid={row['pid']}; gateway stop/--replace targets the active PID first")
 
 
 def _cmd_status(args):

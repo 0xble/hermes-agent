@@ -17,6 +17,7 @@ class BotAPI:
         self.maximum = 0
         self.offsets = []
         self.errors = []
+        self.sent = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.server.daemon_threads = True
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -31,16 +32,17 @@ class BotAPI:
         self.server.server_close()
         self.thread.join(timeout=2)
 
-    def add(self, first, last):
+    def add(self, first, last, *, text="/status", chat_id=1):
         with self.lock:
             self.updates.extend({
                 "update_id": uid,
                 "message": {
                     "message_id": uid, "date": 1800000000,
-                    "chat": {"id": 1, "type": "private"},
-                    "from": {"id": 1, "is_bot": False, "first_name": "Test"},
-                    "text": "/status",
-                    "entities": [{"type": "bot_command", "offset": 0, "length": 7}],
+                    "chat": {"id": chat_id, "type": "private"},
+                    "from": {"id": chat_id, "is_bot": False, "first_name": "Test"},
+                    "text": text,
+                    "entities": ([{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
+                                 if text.startswith("/") else []),
                 },
             } for uid in range(first, last + 1))
 
@@ -91,7 +93,11 @@ class BotAPI:
                     elif method == "deletewebhook":
                         assert form.get("drop_pending_updates", ["false"])[0].lower() != "true"
                         result = True
-                    elif method in {"sendmessage", "setmycommands", "setmyshortdescription"}:
+                    elif method in {"sendmessage", "sendchataction", "setmycommands", "setmyshortdescription"}:
+                        if method == "sendmessage":
+                            with state.lock:
+                                state.sent.append({"chat_id": int(form.get("chat_id", [1])[0]),
+                                                   "text": form.get("text", [""])[0]})
                         result = ({"message_id": 1, "date": 1800000000,
                                    "chat": {"id": 1, "type": "private"}, "text": "ok"}
                                   if method == "sendmessage" else True)
