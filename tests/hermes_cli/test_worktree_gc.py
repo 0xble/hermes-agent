@@ -252,6 +252,41 @@ class TestReclaim:
         assert archived[0].read_text() == "important scribbles\n"
         assert not (native_home / ".hermes").exists()
 
+    def test_reclaim_preserves_quoted_untracked_filenames(self, repo, tmp_path, monkeypatch):
+        """An ordinary file must not mask a quoted filename lost during archive."""
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        tree, _ = _add_worktree(repo, "hermes-quoted")
+        names = ("normal.txt", "é.txt", 'quote"name.txt', "line\nbreak.txt")
+        notes = tree / "notes"
+        notes.mkdir()
+        for name in names:
+            (notes / name).write_text(name)
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        assert _verdict(records, "hermes-quoted").verdict == "reap-archive"
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("removed hermes-quoted" in action for action in actions)
+        assert not tree.exists()
+        archives = list((archive_home / "archive" / "worktree-prune").glob("hermes-quoted-*"))
+        assert len(archives) == 1
+        assert {file.name: file.read_text() for file in (archives[0] / "notes").iterdir()} == {
+            name: name for name in names
+        }
+
+    def test_reclaim_keeps_tree_when_an_untracked_file_cannot_be_archived(self, repo, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "archive-home"))
+        tree, _ = _add_worktree(repo, "hermes-missing")
+        (tree / "normal.txt").write_text("keep this")
+        missing = tree / "gone.txt"
+        missing.write_text("listed at audit")
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        missing.unlink()
+
+        actions = worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert any("kept hermes-missing" in action for action in actions)
+        assert tree.exists() and (tree / "normal.txt").read_text() == "keep this"
+
     def test_dry_run_changes_nothing(self, repo):
         tree, _ = _add_worktree(repo, "hermes-clean")
         records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
