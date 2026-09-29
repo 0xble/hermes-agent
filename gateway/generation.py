@@ -17,9 +17,9 @@ import uuid
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 from gateway.owned_admission import OwnedAdmissionMixin
-from typing import Any
 
 SCHEMA_VERSION = 1
 
@@ -392,7 +392,12 @@ class GenerationCoordinator(OwnedAdmissionMixin):
 
     def project_active_summary(self, identity: GenerationIdentity, epoch: int,
                                runtime: dict[str, Any]) -> bool:
-        """Write legacy active summary while holding the lease's SQLite write fence."""
+        """Project the lease holder to legacy files under the SQLite write fence.
+
+        ``gateway.pid`` is the one sanctioned bypass of generation-scoped files:
+        legacy clients need B's PID after transfer, so A's exit must never
+        unlink this projection. Only the fenced lease holder may overwrite it.
+        """
         with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()

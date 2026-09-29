@@ -5764,6 +5764,7 @@ def _start_gateway_start_cron_and_housekeeping(runner):
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active or
             getattr(runner, "_overlap_draining", False))
+    runner._overlap_cron_start_kwargs = cron_start_kwargs
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(

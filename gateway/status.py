@@ -312,7 +312,9 @@ def set_generation_runtime_status(generation_id: Optional[str]) -> None:
 
 def _get_runtime_status_path() -> Path:
     if _generation_status_id is not None:
-        return _get_process_hermes_home() / f"gateway_state.{_generation_status_id}.json"
+        # Runtime status has its own writer; the generation record is written
+        # exclusively by ActiveGeneration and retains id/socket metadata.
+        return _get_process_hermes_home() / f"gateway_runtime.{_generation_status_id}.json"
     return _get_process_hermes_home() / _RUNTIME_STATUS_FILE
 
 
