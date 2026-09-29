@@ -97,6 +97,10 @@ async def test_cap_fences_queued_work_before_stopping_busy_runner(tmp_path):
                   _active_work_count=lambda: 1, stop=stop)
     active.bind_runner(runner)
     await active.transfer_requested(new.id)
+    # This test owns the cap call; stop the concurrently scheduled drain loop.
+    assert active._drain_task is not None
+    active._drain_task.cancel()
+    await asyncio.gather(active._drain_task, return_exceptions=True)
     db.commit_transfer(old.id, new.id, epoch, drain_seconds=1)
     with db.connect() as conn:
         conn.execute("UPDATE generations SET drain_deadline=? WHERE id=?", (0, old.id))
