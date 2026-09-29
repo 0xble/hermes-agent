@@ -29,12 +29,35 @@ def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
     monkeypatch.setattr(generation.sys, "platform", "darwin")
     monkeypatch.setattr(platform, "node", lambda: "first-host")
     result = MagicMock(stdout="boot-session\n")
-    monkeypatch.setattr(generation.subprocess, "run", lambda *args, **kwargs: result)
+    calls = []
+    def sysctl(*args, **kwargs):
+        calls.append(args)
+        return result
+    monkeypatch.setattr(generation.subprocess, "run", sysctl)
     generation._boot_id.cache_clear()
     try:
         first = generation._boot_id()
         monkeypatch.setattr(platform, "node", lambda: "second-host")
         assert generation._boot_id() == first == "boot-session"
+        assert len(calls) == 1
+    finally:
+        generation._boot_id.cache_clear()
+
+
+@pytest.mark.macos_only
+def test_macos_boot_id_fallback_is_host_independent(monkeypatch):
+    import platform
+    import psutil
+    from gateway import generation
+
+    monkeypatch.setattr(generation.subprocess, "run", lambda *a, **kw: MagicMock(stdout=""))
+    monkeypatch.setattr(psutil, "boot_time", lambda: 123456.9)
+    generation._boot_id.cache_clear()
+    try:
+        monkeypatch.setattr(platform, "node", lambda: "first-host")
+        first = generation._boot_id()
+        monkeypatch.setattr(platform, "node", lambda: "second-host")
+        assert generation._boot_id() == first == "darwin:123456"
     finally:
         generation._boot_id.cache_clear()
 
