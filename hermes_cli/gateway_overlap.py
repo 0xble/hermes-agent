@@ -81,26 +81,60 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
     coordinator = GenerationCoordinator(home)
     rows = {row["id"]: row for row in coordinator.generations()}
     failed, old = rows.get(failed_id), rows.get(old_id)
-    if failed is None or old is None or not _live(old) or not _live(failed):
+    if failed is None or old is None or not _live(old):
         raise RuntimeError("rollback blocked: generation process identity unknown")
     if old["state"] != "draining":
         raise RuntimeError("rollback blocked: prior generation is not draining")
-    stopped = _generation_request(_generation_socket(home, failed), "stop_for_rollback", timeout=10)
+    dead_successor = not _live(failed)
+    if dead_successor:
+        from gateway.generation import _boot_id
+        from hermes_cli.gateway_guardian import _gateway_domain, _launch_state
+        # A dead process has no wire. A launchd-managed label is not evidence of
+        # death because KeepAlive may already be starting a replacement.
+        if (failed["boot_id"] != _boot_id() or _pid_exists(failed["pid"]) or
+                failed["state"] not in {"serving", "ready"}):
+            raise RuntimeError("rollback blocked: successor death cannot be proved")
+        domain = _gateway_domain(failed["label"], None)
+        if _launch_state(domain, failed["label"]) != "unloaded":
+            raise RuntimeError("rollback blocked: successor label may respawn")
+        # Process death closes the client socket, but the Bot API can still be
+        # finishing a 20-second getUpdates. The cooperative stop receipt waits
+        # for the wire; death has no receipt, so wait past that finite poll cap.
+        time.sleep(25)
+        if _pid_exists(failed["pid"]) or _launch_state(domain, failed["label"]) != "unloaded":
+            raise RuntimeError("rollback blocked: successor returned while poll settled")
+    paths = ReleasePaths.for_home(home)
+    old_release = (paths.releases / old["release_sha"]).resolve()
+    if not _release_is_ready(old_release, old["release_sha"]):
+        raise RuntimeError("rollback blocked: prior release is not intact")
+    if dead_successor:
+        stopped = {"generation_id": failed_id, "epoch": epoch, "poller_stopped": True}
+    else:
+        stopped = _generation_request(_generation_socket(home, failed), "stop_for_rollback", timeout=10)
     if (stopped.get("generation_id"), stopped.get("epoch"), stopped.get("poller_stopped")) != (
             failed_id, epoch, True):
         raise RuntimeError("rollback blocked: successor wire-stop receipt invalid")
-    restored = coordinator.rollback_transfer(failed_id, old_id, epoch, poller_stopped=True,
-                                             drain_seconds=drain_seconds)
-    if restored is None:
-        raise RuntimeError("rollback blocked: active lease changed")
+    try:
+        restored = coordinator.rollback_transfer(failed_id, old_id, epoch, poller_stopped=True,
+                                                 drain_seconds=drain_seconds)
+        if restored is None:
+            raise RuntimeError("rollback blocked: active lease changed")
+    except Exception:
+        # A stopped B can be re-armed only if B still owns the same lease.
+        lease = next((item for item in coordinator.leases()
+                      if item["resource"] == "active_generation"), None)
+        if lease and (lease["generation_id"], lease["epoch"], lease["state"]) == (
+                failed_id, epoch, "active"):
+            resumed = _generation_request(_generation_socket(home, failed),
+                                          "resume_uncommitted_transfer",
+                                          params={"epoch": epoch}, timeout=15)
+            if resumed.get("generation_id") != failed_id or resumed.get("polling") is not True:
+                raise RuntimeError("rollback blocked: successor did not re-arm")
+        raise
     response = _generation_request(_generation_socket(home, old), "restore_after_rollback",
                                    params={"epoch": restored}, timeout=15)
     if response.get("generation_id") != old_id or response.get("polling") is not True:
         raise RuntimeError("rollback blocked: prior generation has not restored polling")
-    paths = ReleasePaths.for_home(home)
-    old_release = (paths.releases / old["release_sha"]).resolve()
-    if not _release_is_ready(old_release, old["release_sha"]):
-        raise RuntimeError("rollback polling restored but prior release is not intact")
     activate_release(home, old_release, operation="rollback")
     _set_boot_active(home, old["label"], True)
     _set_boot_active(home, failed["label"], False)

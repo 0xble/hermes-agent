@@ -373,7 +373,7 @@ class ActiveGeneration:
                     await self._rearm_adapter(adapter, receipt)
                 raise
 
-    async def _rearm_adapter(self, adapter, receipt: dict) -> None:
+    async def _rearm_adapter(self, adapter, receipt: dict, *, lease_epoch: int | None = None) -> None:
         try:
             await adapter.start_polling_from_transfer(receipt)
         except Exception:
@@ -385,7 +385,7 @@ class ActiveGeneration:
                           if row["resource"] == "active_generation"), None)
             if (lease is None or
                     (lease["generation_id"], lease["epoch"], lease["state"]) !=
-                    (self.identity.id, self.epoch, "active")):
+                    (self.identity.id, self.epoch if lease_epoch is None else lease_epoch, "active")):
                 raise RuntimeError("cannot reconnect a generation without its active lease")
             journal = adapter._controlled_journal
             if journal is None or await asyncio.to_thread(journal.validate_transfer, receipt):
@@ -477,9 +477,9 @@ class ActiveGeneration:
                 with suppress(asyncio.CancelledError):
                     await self._drain_task
                 self._drain_task = None
-            self.epoch = epoch
             for token, adapter in self._telegram_adapters().items():
-                await self._rearm_adapter(adapter, self._transfer_receipts[token])
+                await self._rearm_adapter(adapter, self._transfer_receipts[token], lease_epoch=epoch)
+            self.epoch = epoch
             self.runner._overlap_draining = False
             self._transfer_receipts.clear()
             self._poller_paused = False
