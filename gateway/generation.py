@@ -13,7 +13,10 @@ import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass
+from contextlib import closing
 from pathlib import Path
+
+from gateway.owned_admission import OwnedAdmissionMixin
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -33,6 +36,24 @@ CREATE TABLE IF NOT EXISTS leases (
   resource TEXT PRIMARY KEY, epoch INTEGER NOT NULL, generation_id TEXT NOT NULL,
   state TEXT NOT NULL, FOREIGN KEY(generation_id) REFERENCES generations(id)
 );
+CREATE TABLE IF NOT EXISTS sessions (
+  profile_home TEXT NOT NULL, transport TEXT NOT NULL, session_key TEXT NOT NULL,
+  generation_id TEXT NOT NULL REFERENCES generations(id), epoch INTEGER NOT NULL,
+  state TEXT NOT NULL, last_seq INTEGER NOT NULL DEFAULT 0,
+  outstanding_work INTEGER NOT NULL DEFAULT 0 CHECK(outstanding_work>=0),
+  PRIMARY KEY(profile_home,transport,session_key)
+);
+CREATE TABLE IF NOT EXISTS inbox (
+  id INTEGER PRIMARY KEY, profile_home TEXT NOT NULL, transport TEXT NOT NULL,
+  session_key TEXT NOT NULL, source_event_id TEXT NOT NULL, kind TEXT NOT NULL,
+  seq INTEGER NOT NULL, owner_id TEXT NOT NULL REFERENCES generations(id),
+  owner_epoch INTEGER NOT NULL, authorized_source BLOB NOT NULL,
+  payload BLOB NOT NULL, state TEXT NOT NULL,
+  FOREIGN KEY(profile_home,transport,session_key) REFERENCES sessions(profile_home,transport,session_key),
+  UNIQUE(profile_home,transport,source_event_id,kind),
+  UNIQUE(profile_home,transport,session_key,seq)
+);
+CREATE INDEX IF NOT EXISTS inbox_owner_pending ON inbox(owner_id,state,profile_home,transport,session_key,seq);
 """
 
 
@@ -78,7 +99,7 @@ def _boot_id() -> str:
     return f"{platform.node()}:{psutil.boot_time():.6f}"
 
 
-class GenerationCoordinator:
+class GenerationCoordinator(OwnedAdmissionMixin):
     """SQLite coordinator with explicit transaction boundaries for generation records."""
 
     def __init__(self, home: Path):
@@ -95,7 +116,7 @@ class GenerationCoordinator:
         return conn
 
     def _initialize(self) -> None:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             conn.executescript(_SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(generations)")}
@@ -111,7 +132,7 @@ class GenerationCoordinator:
 
     def register(self, identity: GenerationIdentity, *, state: str = "standby") -> None:
         now = time.time()
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """INSERT INTO generations
@@ -126,6 +147,8 @@ class GenerationCoordinator:
                 "SELECT g.id,g.started_at FROM generations g "
                 "WHERE g.state IN ('exited','failed') AND NOT EXISTS "
                 "(SELECT 1 FROM leases l WHERE l.generation_id=g.id AND l.state!='released') "
+                "AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.generation_id=g.id) "
+                "AND NOT EXISTS (SELECT 1 FROM inbox i WHERE i.owner_id=g.id) "
                 "ORDER BY g.started_at DESC,g.id DESC"
             ).fetchall()
             stale = [(row["id"],) for rank, row in enumerate(terminal)
@@ -136,7 +159,7 @@ class GenerationCoordinator:
             conn.commit()
 
     def heartbeat(self, generation_id: str, *, state: str | None = None) -> None:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             if state is None:
                 conn.execute(
@@ -149,7 +172,7 @@ class GenerationCoordinator:
             conn.commit()
 
     def acquire_lease(self, resource: str, generation_id: str, *, state: str = "active") -> int:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT epoch,generation_id,state FROM leases WHERE resource=?", (resource,)).fetchone()
             if row and row["state"] != "released" and row["generation_id"] != generation_id:
@@ -186,7 +209,7 @@ class GenerationCoordinator:
             return epoch
 
     def release_lease(self, resource: str, generation_id: str, epoch: int) -> bool:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             changed = conn.execute(
                 "UPDATE leases SET state='released' WHERE resource=? AND generation_id=? "
@@ -197,12 +220,12 @@ class GenerationCoordinator:
             return bool(changed)
 
     def generations(self) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             return [dict(row) for row in conn.execute(
                 "SELECT * FROM generations ORDER BY started_at, id").fetchall()]
 
     def leases(self) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn, conn:
             return [dict(row) for row in conn.execute("SELECT * FROM leases ORDER BY resource").fetchall()]
 
 
