@@ -334,6 +334,9 @@ async def test_ready_and_close_database_work_does_not_block_loop(tmp_path, monke
     entered.clear()
     release.clear()
     monkeypatch.setattr(coordinator, "release_lease", blocked)
+    # The heartbeat stub does not mark this unregistered owner exited; keep this
+    # test scoped to the close path's nonblocking release-lease call.
+    monkeypatch.setattr(coordinator, "release_exited_owner", lambda owner: 0)
     task = asyncio.create_task(active.close())
     try:
         assert await asyncio.to_thread(entered.wait, 2)
