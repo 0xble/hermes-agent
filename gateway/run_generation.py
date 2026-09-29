@@ -324,7 +324,10 @@ class ActiveGeneration:
         record = next((row for row in rows if row["id"] == self.identity.id), None)
         if record is None or record["state"] != "draining":
             return False
-        busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals))
+        from tools.process_registry import process_registry
+        busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals)
+                or process_registry.has_unscoped_active()
+                or bool(process_registry.pending_watchers))
         with contextlib.closing(self.coordinator.connect()) as conn:
             queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
                                   (self.identity.id,)).fetchone()

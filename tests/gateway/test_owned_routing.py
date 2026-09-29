@@ -195,7 +195,93 @@ async def test_local_admission_placeholder_is_not_replayed(tmp_path):
     assert fresh and row["payload"] == b"{}"
     await routing._drain_once()
     with store.connect() as db:
-        assert db.execute("SELECT state FROM inbox WHERE id=?", (row["id"],)).fetchone()[0] == "pending"
+        assert db.execute("SELECT state FROM inbox WHERE id=?", (row["id"],)).fetchone()[0] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_pending_replay_precedes_new_local_update_without_duplicates(tmp_path):
+    store = GenerationCoordinator(tmp_path)
+    old = _identity("a", "slot-a")
+    owner = _identity("b", "slot-b")
+    store.register(old, state="serving")
+    store.register(owner, state="ready")
+    old_epoch = store.acquire_lease("active_generation", old.id)
+    key = "agent:default:telegram:chat-1"
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    handled = []
+    adapter = SimpleNamespace(
+        platform=Platform.TELEGRAM, _is_sender_authorized=lambda *a, **kw: True,
+        _owner_transport_profile=lambda: None, _active_sessions={}, _pending_messages={},
+        build_source=lambda **kw: SessionSource(platform=Platform.TELEGRAM, **kw),
+        _canonicalize=lambda s: setattr(s, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path)),
+        _source_session_key=lambda s: key,
+    )
+    async def handle(event):
+        handled.append(event.text)
+        event._gateway_accepted = True
+    adapter.handle_message = handle
+    runner = SimpleNamespace(adapters={"telegram": adapter},
+        _resolve_profile_home_for_source=lambda s: tmp_path, _overlap_draining=False)
+    def event(text, update_id):
+        return MessageEvent(text=text, source=source, message_type=MessageType.TEXT,
+                            platform_update_id=update_id)
+    envelope = json.dumps({"version": 1, "authorized": True, "sender": "1", "chat": "1",
+                           "transport_profile": "default", "home": str(tmp_path)}).encode()
+    from gateway.owned_routing import _event_payload
+    store.enqueue(str(tmp_path), "telegram", key, "1", "message", envelope,
+        json.dumps({"event": _event_payload(event("replay", 1))}).encode(), old.id, old_epoch)
+    assert store.release_lease("active_generation", old.id, old_epoch)
+    store.heartbeat(old.id, state="draining")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    assert store.transfer_session(str(tmp_path), "telegram", key, old.id, old_epoch, owner.id, epoch)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
+    assert await routing.route_message(adapter, event("new", 2), key) is True
+    assert await routing.route_message(adapter, event("new", 2), key) is True
+    assert handled == []
+    await routing._drain_once()
+    await routing._drain_once()
+    assert handled == ["replay", "new"]
+    with store.connect() as db:
+        assert [(r["source_event_id"], r["state"]) for r in db.execute(
+            "SELECT source_event_id,state FROM inbox ORDER BY seq")] == [("1", "accepted"), ("2", "accepted")]
+
+
+@pytest.mark.asyncio
+async def test_refused_disposition_after_dispatch_interrupts_instead_of_replaying(tmp_path, monkeypatch, caplog):
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "slot-a")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    key = "agent:default:telegram:chat-1"
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    from gateway.owned_routing import _event_payload
+    event = MessageEvent(text="once", source=source, message_type=MessageType.TEXT, platform_update_id=1)
+    envelope = json.dumps({"version": 1, "authorized": True, "sender": "1", "chat": "1",
+                           "transport_profile": "default", "home": str(tmp_path)}).encode()
+    row, _ = store.enqueue(str(tmp_path), "telegram", key, "1", "message", envelope,
+        json.dumps({"event": _event_payload(event)}).encode(), owner.id, epoch)
+    seen = []
+    async def handle(evt):
+        seen.append(evt.text)
+        evt._gateway_accepted = True
+    adapter = SimpleNamespace(platform=Platform.TELEGRAM, _active_sessions={}, _pending_messages={},
+        _owner_transport_profile=lambda: None,
+        build_source=lambda **kw: SessionSource(platform=Platform.TELEGRAM, **kw),
+        _canonicalize=lambda s: setattr(s, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path)),
+        _is_sender_authorized=lambda *a, **kw: True, _source_session_key=lambda s: key,
+        handle_message=handle)
+    runner = SimpleNamespace(adapters={"telegram": adapter},
+        _resolve_profile_home_for_source=lambda s: tmp_path, _overlap_draining=False)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
+    monkeypatch.setattr(store, "disposition", lambda *a: False)
+    await routing._drain_once()
+    await routing._drain_once()
+    assert seen == ["once"]
+    with store.connect() as db:
+        assert db.execute("SELECT state FROM inbox WHERE id=?", (row["id"],)).fetchone()[0] == "interrupted"
+    assert "interrupting row" in caplog.text
 
 
 @pytest.mark.asyncio

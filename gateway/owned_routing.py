@@ -118,8 +118,8 @@ class OwnedRouting:
         if row["owner_id"] == self.generation.identity.id:
             if not fresh:
                 return True
-            if not self.generation.coordinator.disposition(row["id"], row["owner_id"], row["owner_epoch"], "accepted"):
-                raise RuntimeError("local admission disposition failed")
+            if row["payload"] != b"{}":
+                return True  # An earlier replay row owns this lane; drain in sequence.
             return False
         return True
 
@@ -133,7 +133,7 @@ class OwnedRouting:
                                "thread": source.thread_id, "profile": identity.runtime_profile,
                                "transport_profile": identity.transport_profile,
                                "home": home}, ensure_ascii=False).encode()
-        payload = json.dumps({"callback": update.to_dict()}, ensure_ascii=False).encode()
+        payload = lambda: json.dumps({"callback": update.to_dict()}, ensure_ascii=False).encode()
         row, fresh = await asyncio.to_thread(
             self.generation.coordinator.enqueue, home, "telegram", key,
             str(update.update_id), "callback", envelope, payload,
@@ -141,8 +141,8 @@ class OwnedRouting:
         if row["owner_id"] == self.generation.identity.id:
             if not fresh:
                 return True
-            if not self.generation.coordinator.disposition(row["id"], row["owner_id"], row["owner_epoch"], "accepted"):
-                raise RuntimeError("local callback disposition failed")
+            if row["payload"] != b"{}":
+                return True
             return False
         return True
 
@@ -218,10 +218,9 @@ class OwnedRouting:
                     finally:
                         _owned_callback_replay.reset(token)
                     accepted = True
-                if accepted:
-                    store.disposition(row["id"], owner, row["owner_epoch"], "accepted")
-                else:
-                    store.disposition(row["id"], owner, row["owner_epoch"], "refused")
+                if not store.disposition(row["id"], owner, row["owner_epoch"],
+                                         "accepted" if accepted else "refused"):
+                    raise RuntimeError("owned dispatch disposition refused after handler returned")
             except Exception:
                 from gateway.run_generation import logger
                 logger.warning("owned dispatch failed; interrupting row %s", row["id"], exc_info=True)

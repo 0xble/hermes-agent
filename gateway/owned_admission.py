@@ -127,6 +127,11 @@ class OwnedAdmissionMixin:
                            (home, transport, key))
             # A session with no work and no queued input may move to the active
             # generation atomically with the first subsequent admission.
+            # Older local admissions left a non-replayable placeholder pending.
+            # Settle it before testing replay order so it cannot wedge this lane.
+            db.execute("UPDATE inbox SET state='accepted' WHERE profile_home=? AND transport=? "
+                       "AND session_key=? AND state='pending' AND payload=?",
+                       (home, transport, key, b"{}"))
             pending = db.execute(
                 "SELECT 1 FROM inbox WHERE profile_home=? AND transport=? AND session_key=? AND state='pending' LIMIT 1",
                 (home, transport, key),
@@ -141,8 +146,9 @@ class OwnedAdmissionMixin:
                 generation = db.execute("SELECT state FROM generations WHERE id=?", (owner,)).fetchone()
                 if generation is None or generation["state"] not in ("draining", "quiescing", "serving", "ready"):
                     raise RuntimeError("session owner is unavailable; event remains unacknowledged")
+            local_placeholder = callable(payload) and owner == active_owner and pending is None
             if callable(payload):
-                payload = payload() if owner != active_owner else b"{}"
+                payload = b"{}" if local_placeholder else payload()
             if not isinstance(payload, bytes) or len(payload) > MAX_PAYLOAD:
                 raise ValueError("invalid event payload size")
             seq = session["last_seq"] + 1
@@ -150,8 +156,9 @@ class OwnedAdmissionMixin:
                        (seq, home, transport, key))
             cursor = db.execute(
                 "INSERT INTO inbox(profile_home,transport,session_key,source_event_id,kind,seq,owner_id,"
-                "owner_epoch,authorized_source,payload,state) VALUES(?,?,?,?,?,?,?,?,?,?,'pending')",
-                (home, transport, key, event_id, kind, seq, owner, epoch, source, payload),
+                "owner_epoch,authorized_source,payload,state) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (home, transport, key, event_id, kind, seq, owner, epoch, source, payload,
+                 "accepted" if local_placeholder else "pending"),
             )
             return dict(db.execute("SELECT * FROM inbox WHERE id=?", (cursor.lastrowid,)).fetchone()), True
 
