@@ -194,6 +194,12 @@ def record_overlap_generation(proof: dict[str, Any]) -> None:
         _current.data["overlap_generation"] = dict(proof)
 
 
+def current_overlap_generation() -> Optional[dict[str, Any]]:
+    """Snapshot the current command's overlap proof without exposing receipt state."""
+    proof = _current.data.get("overlap_generation") if _current is not None else None
+    return dict(proof) if isinstance(proof, dict) else None
+
+
 def record_skip(name: str, reason: str) -> None:
     """Record a skipped step WITH the reason it was skipped."""
     _record("skip", f"update skip {name}", name, reason)

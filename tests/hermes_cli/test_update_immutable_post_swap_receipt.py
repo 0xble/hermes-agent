@@ -110,6 +110,44 @@ def test_immutable_post_swap_maintains_before_activation_and_receipts_success(po
                for item in receipt["skips"])
 
 
+@pytest.mark.parametrize("proof_valid", [False, True])
+def test_overlap_post_swap_exit_requires_live_admission_readback(post_swap_candidate, monkeypatch, proof_valid):
+    """Exercise the same post-swap entry point as hermes update, not a receipt stub."""
+    from dataclasses import replace
+    from hermes_cli import gateway_overlap
+    home, _paths, _previous, candidate, handoff = post_swap_candidate
+    resolve = update_cmd._resolve_update_options
+    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *args:
+                        replace(resolve(*args), no_gateway_restart=False))
+    monkeypatch.setattr(update_cmd_maint, "strict_immutable_maintenance", lambda *_: None)
+    monkeypatch.setattr(update_cmd, "_run_post_update_maintenance", lambda **_: True)
+    def promote(**_kwargs):
+        update_receipt.record_overlap_generation({
+            "old_id": "a", "new_id": "b", "old_sha": "a" * 40,
+            "new_sha": candidate.name, "epoch": 2,
+            "previous": str(home / "releases" / ("a" * 40)), "current": str(candidate),
+            "admission": {"source_event_id": "42", "message_id": "42"},
+            "poller": {"polling": True, "tokens": ["token"]},
+        })
+        return True
+    monkeypatch.setattr(update_cmd, "_activate_immutable_release", promote)
+    monkeypatch.setattr(gateway_overlap, "verified_overlap", lambda *_: proof_valid)
+    monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update",
+                        lambda *_a, **_k: pytest.fail("legacy fleet bootout would kill A"))
+    exits = []
+    monkeypatch.setattr(update_cmd, "_write_gateway_update_exit_code", exits.append)
+    if proof_valid:
+        update_cmd._run_post_swap_phase(SimpleNamespace(post_swap=str(handoff)), gateway_mode=False)
+    else:
+        with pytest.raises(SystemExit) as failed:
+            update_cmd._run_post_swap_phase(SimpleNamespace(post_swap=str(handoff)), gateway_mode=False)
+        assert failed.value.code == 1
+    receipt = _latest(home)
+    assert receipt["outcome"] == ("success" if proof_valid else "blocked")
+    assert exits == [proof_valid]
+    assert receipt["overlap_generation"].get("outcome") == ("blocked" if not proof_valid else None)
+
+
 @pytest.mark.parametrize("failure", ["raised", "incomplete"])
 def test_immutable_post_swap_failure_is_partial_and_never_activates(post_swap_candidate, monkeypatch, failure):
     home, paths, previous, candidate, handoff = post_swap_candidate
