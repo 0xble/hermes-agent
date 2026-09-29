@@ -98,6 +98,8 @@ class BotAPI:
                                 state.inflight -= 1
                     elif method == "getme":
                         result = {"id": 123456, "is_bot": True, "first_name": "Stub", "username": "stub_bot"}
+                    elif method == "getwebhookinfo":
+                        result = {"url": "", "has_custom_certificate": False, "pending_update_count": 0}
                     elif method == "deletewebhook":
                         assert form.get("drop_pending_updates", ["false"])[0].lower() != "true"
                         result = True

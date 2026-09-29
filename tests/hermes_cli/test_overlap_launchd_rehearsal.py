@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -12,11 +13,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import pytest
 
 from gateway.generation import GenerationCoordinator
+from cron.jobs import create_job, load_jobs, save_jobs, use_cron_store
 from gateway.run_generation import handover_to_generation
 from hermes_cli.gateway_overlap import rollback_overlap
 from hermes_cli.immutable_releases import ReleasePaths, activate_release
@@ -66,6 +69,30 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
     command = (f"chmod 777 {shlex.quote(str(root))} && "
                f"printf 'called\\n' >> {shlex.quote(str(calls))} && "
                f"touch {shlex.quote(str(marker))} && sleep 60")
+    cron_marker = root / "cron-calls"
+    cron_job_id = ""
+    if not rollback_scenario:
+        cron_script = home / "scripts" / "overlap-cron.sh"
+        cron_script.parent.mkdir()
+        cron_script.write_text("#!/bin/sh\n"
+                               f"sleep 25\nprintf '%s\\n' \"$HERMES_RELEASE_SHA\" >> {shlex.quote(str(cron_marker))}\n")
+        cron_script.chmod(0o700)
+        with use_cron_store(home):
+            cron_job_id = create_job(None, "every 1m", name="overlap cron ownership",
+                                     script=str(cron_script), no_agent=True, deliver="local")["id"]
+            stored = load_jobs()
+            stored[0]["next_run_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            save_jobs(stored)
+
+    def cron_rows():
+        db = home / "cron" / "executions.db"
+        if not db.exists():
+            return []
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(row) for row in conn.execute(
+                "SELECT id,job_id,pid,status,claimed_at,finished_at,error FROM executions WHERE job_id=? ORDER BY claimed_at,id",
+                (cron_job_id,))]
 
     def model(record):
         messages = record["body"]["messages"]
@@ -75,6 +102,8 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
             return Text("old-turn-complete")
         user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
         content = str(user.get("content", ""))
+        if "[ASYNC DELEGATION BATCH COMPLETE" in content:
+            return Text("delegation-complete")
         if "child-marker" in content and "delegation-boundary" not in content:
             child_started.set()
             if not child_release.wait(timeout=40):
@@ -160,6 +189,8 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
                     assert not marker.exists(), "tool ran before manual approval"
                     api.add(1002, 1002, text="delegation-boundary", chat_id=3)
                     _wait_for(child_started.is_set, 30, "A did not launch a native async child")
+                    _wait_for(lambda: len(cron_rows()) == 1 and cron_rows()[0]["status"] == "running",
+                              25, lambda: f"A cron did not start: {cron_rows()}")
         old, new = rows()
         assert [old["release_sha"], new["release_sha"]] == shas
         assert [old["label"], new["label"]] == labels
@@ -185,6 +216,21 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
                   f"restored_reply={restored_reply_seconds:.2f}s max_pollers={api.maximum}", flush=True)
             return
         child_release.set()
+        child_seconds = _wait_for(
+            lambda: any("child-finished" in str(m.get("content", ""))
+                        for r in llm.main_requests() for m in r["messages"]),
+            25, "native child did not finish across handover")
+        child_contexts = [r["messages"] for r in llm.main_requests()
+                          if any("[ASYNC DELEGATION BATCH COMPLETE" in str(m.get("content", ""))
+                                 and "child-finished" in str(m.get("content", ""))
+                                 for m in r["messages"])]
+        assert len(child_contexts) == 1, child_contexts
+        assert any("delegation-boundary" in str(m.get("content", ""))
+                   for m in child_contexts[0]), "completion did not re-enter A's originating session"
+        completion_seconds = _wait_for(lambda: len(sent("delegation-complete")) == 1,
+                                       25, lambda: f"completion not delivered; sent={api.sent}, "
+                                       f"tail={child_contexts[0][-2:]}, "
+                                       f"a-log={(root / f'{labels[0]}.err').read_text()[-4000:]}")
         api.add(1003, 1003, text="/approve")
         approval_seconds = _wait_for(marker.exists, 25, "approval via B did not run A's tool")
         with GenerationCoordinator(home).connect() as conn:
@@ -211,7 +257,16 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
                                  capture_output=True, text=True, timeout=5)
         assert old_job.returncode == 0 and "last exit code = 0" in old_job.stdout, old_job.stdout[-3000:]
         assert len(sent("new-turn-complete")) == len(sent("old-turn-complete")) == 1
-        assert len(sent("old-followup-complete")) == 1
+        assert len(sent("old-followup-complete")) == len(sent("delegation-complete")) == 1
+        cron_first_seconds = _wait_for(
+            lambda: cron_rows()[0]["status"] == "completed" if cron_rows() else False,
+            30, lambda: f"A cron did not finish: {cron_rows()}")
+        assert cron_marker.read_text().splitlines() == [shas[0]]
+        cron_next_seconds = _wait_for(
+            lambda: len(cron_rows()) >= 2 and cron_rows()[1]["status"] == "completed",
+            100, lambda: f"B did not finish next cron tick: {cron_rows()}")
+        assert len(cron_rows()) == 2 and [r["status"] for r in cron_rows()] == ["completed", "completed"], cron_rows()
+        assert cron_marker.read_text().splitlines() == shas, cron_rows()
         assert calls.read_text().splitlines() == ["called"]
         assert _inbox_rows(home, "1004") == [{"owner_id": old["id"], "state": "accepted"}]
         with api.lock:
@@ -224,7 +279,9 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
         subprocess.run(["launchctl", "bootout", f"{domain}/{labels[0]}"], check=True, timeout=15)
         assert subprocess.run(["launchctl", "print", f"{domain}/{labels[0]}"],
                               capture_output=True, timeout=5).returncode != 0
-        print(f"NATIVE_LAUNCHD overlap={transfer_seconds:.2f}s approval={approval_seconds:.2f}s "
+        print(f"NATIVE_LAUNCHD overlap={transfer_seconds:.2f}s child_finish={child_seconds:.2f}s "
+              f"child_delivery={completion_seconds:.2f}s cron_A_finish={cron_first_seconds:.2f}s "
+              f"cron_B_next={cron_next_seconds:.2f}s approval={approval_seconds:.2f}s "
               f"B_reply={b_reply_seconds:.2f}s A_reply_wait={a_reply_seconds:.2f}s "
               f"followup={followup_seconds:.2f}s old_sha={shas[0]} new_sha={shas[1]} "
               f"max_pollers={api.maximum}")
