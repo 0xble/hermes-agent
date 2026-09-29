@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -56,6 +57,9 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
     home.mkdir()
     marker = root / "tool-running"
     calls = root / "tool-calls"
+    child_started = threading.Event()
+    child_release = threading.Event()
+    request.addfinalizer(child_release.set)
     api = BotAPI()
     request.addfinalizer(api.close)
     import shlex
@@ -66,9 +70,21 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
     def model(record):
         messages = record["body"]["messages"]
         if messages and messages[-1].get("role") == "tool":
+            if "delegate_task" in str(messages[-1].get("name", "")) or "subagent" in str(messages[-1].get("content", "")):
+                return Text("delegation-started")
             return Text("old-turn-complete")
         user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
         content = str(user.get("content", ""))
+        if "child-marker" in content and "delegation-boundary" not in content:
+            child_started.set()
+            if not child_release.wait(timeout=40):
+                return Text("child-timed-out")
+            return Text("child-finished")
+        if "delegation-boundary" in content:
+            return ToolCall("delegate_task", {"tasks": [{"goal": "Reply child-marker then finish."}],
+                                              "background": True})
+        if "delegation" in content.lower() and "completed" in content.lower():
+            return Text("delegation-complete")
         if "old-boundary" in content:
             return ToolCall("terminal", {"command": command})
         if "old-followup" in content:
@@ -88,7 +104,7 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
         "gateway:\n  overlap_handover:\n    enabled: true\n"
         "platforms:\n  telegram:\n    enabled: true\n    token: '123456:LOCAL_STUB_ONLY'\n"
         f"    extra:\n      base_url: '{api.url}'\n      base_file_url: '{api.url}'\n"
-        "      allow_from: ['1', '2']\n      drop_pending_on_cold_boot: false\n")
+        "      allow_from: ['1', '2', '3']\n      drop_pending_on_cold_boot: false\n")
     repo = Path(__file__).resolve().parents[2]
     python = Path(sys.executable)
     domain = f"gui/{os.getuid()}"
@@ -142,6 +158,8 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
                     _wait_for(lambda: len(sent("needs your OK")) == 1, 25,
                               "A did not show the approval prompt before handover")
                     assert not marker.exists(), "tool ran before manual approval"
+                    api.add(1002, 1002, text="delegation-boundary", chat_id=3)
+                    _wait_for(child_started.is_set, 30, "A did not launch a native async child")
         old, new = rows()
         assert [old["release_sha"], new["release_sha"]] == shas
         assert [old["label"], new["label"]] == labels
@@ -166,6 +184,7 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
             print(f"NATIVE_LAUNCHD guarded_rollback={rollback_seconds:.2f}s "
                   f"restored_reply={restored_reply_seconds:.2f}s max_pollers={api.maximum}", flush=True)
             return
+        child_release.set()
         api.add(1003, 1003, text="/approve")
         approval_seconds = _wait_for(marker.exists, 25, "approval via B did not run A's tool")
         with GenerationCoordinator(home).connect() as conn:
