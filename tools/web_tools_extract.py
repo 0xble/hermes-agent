@@ -217,7 +217,11 @@ async def _extract_safe_urls(provider, safe_urls: List[str], format: Optional[st
         except Exception:  # noqa: BLE001 — policy errors fail open like dispatch
             policy_block = None
         if policy_block is None and direct_enabled:
-            direct = await extract_direct(url)
+            try:
+                direct = await extract_direct(url)
+            except Exception as exc:  # noqa: BLE001 — the direct route is an optimization; any failure is a miss
+                logger.debug("Direct extract miss for %s: %s", url, exc)
+                direct = None
             if direct is not None:
                 fixed[position] = direct
                 continue

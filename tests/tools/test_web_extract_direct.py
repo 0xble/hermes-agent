@@ -150,6 +150,22 @@ def test_invalid_local_docs_path_falls_back_without_aborting_batch(harness, monk
     assert harness.extract.await_args.args[0] == urls
 
 
+@pytest.mark.parametrize("bad_url", [
+    "https://hermes-agent.nousresearch.com:bad/docs/page",
+    "https://site.test:99999/file.txt",
+    "https://[::1/readme.md",
+])
+def test_malformed_url_is_a_direct_miss_not_a_batch_failure(harness, monkeypatch, bad_url):
+    def unusable(request):
+        raise RuntimeError("malformed URL reached the transport")
+
+    _transport(monkeypatch, unusable)
+    urls = [bad_url, "https://site.test/page"]
+    results = _run(urls)
+    assert [r["title"] for r in results] == ["provider", "provider"]
+    assert harness.extract.await_args.args[0] == urls
+
+
 def test_unreadable_local_docs_candidate_falls_back(harness, monkeypatch):
     _transport(monkeypatch, lambda request: pytest.fail("docs must not use HTTP"))
 
