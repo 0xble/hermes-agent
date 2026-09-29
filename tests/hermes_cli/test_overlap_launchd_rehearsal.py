@@ -39,9 +39,9 @@ def _wait_for(predicate, seconds: float, message: str) -> float:
 
 @pytest.mark.macos_only
 @pytest.mark.live_system_guard_bypass
-@pytest.mark.parametrize("failed_successor", [False, True])
-def test_long_turn_survives_native_launchd_overlap(request, failed_successor):
-    """A's long tool finishes while B answers a new chat, never polling concurrently."""
+@pytest.mark.parametrize("rollback_scenario", [False, True])
+def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
+    """A's long tool survives promotion or guarded rollback with one wire poller."""
     root = Path(tempfile.mkdtemp(prefix="p3overlap-", dir="/tmp"))
     request.addfinalizer(lambda: shutil.rmtree(root, ignore_errors=True))
     home = root / "profile"
@@ -131,7 +131,7 @@ def test_long_turn_survives_native_launchd_overlap(request, failed_successor):
         assert epoch > 1
         assert old["state"] == "ready" and marker.exists()
         activate_release(home, paths.releases / shas[1])
-        if failed_successor:
+        if rollback_scenario:
             rollback_start = time.monotonic()
             restored = rollback_overlap(home, new["id"], old["id"], epoch)
             rollback_seconds = time.monotonic() - rollback_start
@@ -153,6 +153,9 @@ def test_long_turn_survives_native_launchd_overlap(request, failed_successor):
                                     "A's long tool did not complete")
         _wait_for(lambda: next(row for row in rows() if row["id"] == old["id"])["state"] == "exited",
                   20, "A did not exit after draining")
+        old_job = subprocess.run(["launchctl", "print", f"{domain}/{labels[0]}"],
+                                 capture_output=True, text=True, timeout=5)
+        assert old_job.returncode == 0 and "last exit code = 0" in old_job.stdout, old_job.stdout[-3000:]
         assert len(sent("new-turn-complete")) == len(sent("old-turn-complete")) == 1
         with api.lock:
             assert api.maximum == 1 and not api.errors
