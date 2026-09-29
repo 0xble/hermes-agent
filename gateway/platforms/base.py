@@ -1670,6 +1670,12 @@ class SendResult:
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
     deferred: bool = False  # accepted by a durable outbox, not yet acknowledged by transport
+    # Refused before any transport request (disconnected or degraded send path): provably unsent,
+    # so the durable outbox may dispatch the same payload again.
+    pre_send: bool = False
+    # The durable outbox refused to dispatch because an earlier attempt may already have landed.
+    # Final: neither a retry nor the plain-text fallback may re-send it.
+    held: bool = False
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -3708,7 +3714,7 @@ class BasePlatformAdapter(ABC):
             return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
-        if result.success or self._send_retry_is_final(result):
+        if result.success or self._send_held(result) or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
         # A rate-limited / flood-capped send is transient: it should back off
@@ -3760,7 +3766,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
-                if self._send_retry_is_final(result):
+                if self._send_held(result) or self._send_retry_is_final(result):
                     return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
@@ -3851,6 +3857,15 @@ class BasePlatformAdapter(ABC):
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
+
+    def _send_held(self, result: "SendResult") -> bool:
+        """True when the durable outbox refused a re-dispatch. The earlier attempt may already be on
+        screen, so a retry or a banner-prefixed plain-text copy would bypass the duplicate guard."""
+        if not result.held:
+            return False
+        logger.warning("[%s] Send held by the durable outbox (earlier dispatch uncertain): %s; "
+                       "not retrying or falling back to plain text", self.name, result.error)
+        return True
 
     def _send_retry_is_final(self, result: "SendResult") -> bool:
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
@@ -4336,21 +4351,26 @@ class BasePlatformAdapter(ABC):
         record_delivery(tts_result)
         return bool(caption and getattr(tts_result, "success", False))
 
-    async def _record_delivery_obligation(
-        self, event: MessageEvent, session_key: str, text_content: str,
-        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool) -> Optional[str]:
-        """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
-        next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
-        or None."""
+    def _outbox_covers_final(self, event: MessageEvent, delivery_adapter: "BasePlatformAdapter") -> bool:
+        """Whether the durable outbox, not the ledger, owns this final's crash recovery."""
         from gateway.outbox import active_turn
         outbox_turn = (getattr(event, "_outbox_home", None), getattr(event, "_outbox_turn_id", None))
-        outbox_covers_send = (
+        return bool(
             getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)
             and delivery_adapter.platform == Platform.TELEGRAM
             and getattr(type(delivery_adapter).send, "_durable_outbox", False)
             and active_turn() == outbox_turn
         )
-        if (is_ephemeral_response or outbox_covers_send or
+
+    async def _record_delivery_obligation(
+        self, event: MessageEvent, session_key: str, text_content: str,
+        delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
+        outbox_refused: bool = False) -> Optional[str]:
+        """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
+        next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
+        or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
+        before sending: the outbox never replays a proven-unsent row, the ledger's reconnect sweep does."""
+        if (is_ephemeral_response or (not outbox_refused and self._outbox_covers_final(event, delivery_adapter)) or
                 str(event.text or "").lstrip().startswith(
                     ("/", self.typed_command_prefix or "!"))):
             return None
@@ -4502,6 +4522,11 @@ class BasePlatformAdapter(ABC):
             await self._release_turn_marker(event)
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        if (obligation_id is None and not result.success and result.pre_send
+                and self._outbox_covers_final(event, delivery_adapter)):
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+                outbox_refused=True)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter

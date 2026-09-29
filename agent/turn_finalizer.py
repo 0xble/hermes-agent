@@ -230,13 +230,9 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
     # providers don't see ``tool → user`` (placeholder: final_response is usually empty).
     if interrupted:
         from agent.message_sanitization import close_interrupted_tool_sequence
-        # The API-interrupt diagnostic is a local result, not assistant text. Persisting
-        # it after a tool result feeds it back to the next model turn as if it had said it.
-        from agent.interrupt_diagnostics import is_interrupt_diagnostic
-        transcript_final = final_response
-        if is_interrupt_diagnostic(transcript_final):
-            transcript_final = None
-        close_interrupted_tool_sequence(messages, transcript_final)
+        # Diagnostic filtering lives in the shared closer so early-abort callers
+        # cannot persist a local status as though it were an assistant reply.
+        close_interrupted_tool_sequence(messages, final_response)
 
     # Recovery ``break`` sites can return a final_response with no closing assistant
     # row; enforce "delivered final_response ⇒ assistant row" here. Compare content,

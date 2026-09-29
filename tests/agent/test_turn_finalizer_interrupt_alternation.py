@@ -178,7 +178,8 @@ def test_interrupted_tool_tail_does_not_persist_delivery_diagnostic():
     )
     assert result["interrupted"] is True
     assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["content"] == "Operation interrupted."
+    assert messages[-1]["content"] == "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
+    assert agent.persisted_messages[-1]["content"] == messages[-1]["content"]
     assert all("waiting for model response" not in str(m) for m in agent.persisted_messages)
 
 
@@ -223,5 +224,5 @@ def test_interrupted_tool_tail_never_persists_local_diagnostic(diagnostic):
     messages = _interrupted_tool_tail()
     _finalize(agent, messages, interrupted=True, final_response=diagnostic)
     assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["content"] == "Operation interrupted."
+    assert messages[-1]["content"] == "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
     assert all(diagnostic not in str(row) for row in agent.persisted_messages)
