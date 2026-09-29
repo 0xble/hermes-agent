@@ -306,6 +306,143 @@ async def test_real_ptb_stop_cleanup_cannot_heal_recovery_generation():
 
 
 @pytest.mark.asyncio
+async def test_controlled_idle_poll_disconnect_tears_down_before_rebuild(tmp_path, monkeypatch):
+    import threading
+    from plugins.platforms.telegram.polling_transfer import PollingJournal
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
+    active = 0
+    maximum = 0
+    started = asyncio.Event()
+    cancelled = 0
+    threads = []
+    original_connect = PollingJournal._connect
+
+    def observe_connect(self):
+        threads.append(threading.get_ident())
+        return original_connect(self)
+
+    monkeypatch.setattr(PollingJournal, "_connect", observe_connect)
+
+    class IdleRequest(_GeneralRequest):
+        async def do_request(self, url, method, request_data=None, **kwargs):
+            nonlocal active, maximum, cancelled
+            if not url.endswith("/getUpdates"):
+                return await super().do_request(url, method, request_data, **kwargs)
+            active += 1
+            maximum = max(maximum, active)
+            started.set()
+            try:
+                await asyncio.sleep(20)
+                return 200, b'{"ok":true,"result":[]}'
+            except asyncio.CancelledError:
+                cancelled += 1
+                raise
+            finally:
+                active -= 1
+
+    async def build(adapter):
+        return _GeneralRequest(), adapter._instrument_polling_request(IdleRequest())
+
+    adapters = []
+    receipt = None
+    token = "987654:IDLE_POLL_TEST"
+    try:
+        for index in range(2):
+            started.clear()
+            adapter = TelegramAdapter(PlatformConfig(enabled=True, token=token))
+            adapters.append(adapter)
+            monkeypatch.setattr(adapter, "_build_ptb_requests", lambda adapter=adapter: build(adapter))
+            adapter._start_post_connect_housekeeping = lambda: None
+            # The request is deliberately idle, so bypass only the startup progress gate.
+            monkeypatch.setattr(adapter, "_await_cold_start_readiness", lambda *args: asyncio.sleep(0))
+            assert await adapter.connect(polling_standby=bool(index))
+            if index:
+                assert receipt is not None
+                acquire = adapter._acquire_platform_lock
+                def busy(*_args):
+                    adapter._set_fatal_error("telegram-bot-token_lock", "busy", retryable=True)
+                    return False
+                monkeypatch.setattr(adapter, "_acquire_platform_lock", busy)
+                with pytest.raises(RuntimeError, match="old Telegram token holder"):
+                    await adapter.start_polling_from_transfer(receipt)
+                assert not adapter.has_fatal_error
+                monkeypatch.setattr(adapter, "_acquire_platform_lock", acquire)
+                await adapter.start_polling_from_transfer(receipt)
+            await asyncio.wait_for(started.wait(), 2)
+            if index == 0:
+                receipt = await adapter.stop_polling_for_transfer()
+            await asyncio.wait_for(adapter.disconnect(), 4)
+            assert adapter._app is None and adapter._polling_heartbeat_task is None
+            assert active == 0 and maximum == 1
+        assert cancelled == 2
+        assert threads and all(ident != threading.get_ident() for ident in threads)
+    finally:
+        for adapter in adapters:
+            if adapter._app is not None:
+                await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_controlled_disconnect_fences_stubborn_poll_until_task_ends(tmp_path, monkeypatch):
+    from gateway.generation import GenerationCoordinator
+    from plugins.platforms.telegram.polling_transfer import ControlledPoller, PollingJournal
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
+    token = "987654:STUBBORN_POLL_TEST"
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token=token))
+    journal = PollingJournal(GenerationCoordinator(tmp_path), token)
+    adapter._controlled_journal = journal
+    assert adapter._acquire_platform_lock("telegram-bot-token", token, "Telegram bot token")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    shutdown = asyncio.Event()
+
+    class Bot:
+        async def get_updates(self, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                await release.wait()  # Simulate a transport that delays cancellation.
+                return []
+    class Queue:
+        async def join(self):
+            pass
+    class App:
+        bot = Bot()
+        update_queue = Queue()
+        running = False
+        updater = None
+        async def shutdown(self):
+            shutdown.set()
+
+    adapter._app = App()
+    adapter._bot = adapter._app.bot
+    adapter._controlled_poller = ControlledPoller(adapter._app, journal)
+    await adapter._controlled_poller.start()
+    await asyncio.wait_for(started.wait(), 2)
+    try:
+        await asyncio.wait_for(adapter.disconnect(), 9)
+        assert shutdown.is_set() and adapter._app is None
+        from plugins.platforms.telegram.polling_transfer import token_has_active_poller
+        assert token_has_active_poller(journal.token_hash)
+        replacement = TelegramAdapter(PlatformConfig(enabled=True, token=token))
+        assert not await replacement.connect()  # Same PID cannot steal a live poll.
+    finally:
+        release.set()
+        await asyncio.wait_for(adapter._controlled_poller._task, 2)
+    await asyncio.sleep(0.05)
+    assert not token_has_active_poller(journal.token_hash)
+    from gateway.status import acquire_scoped_lock, release_scoped_lock
+    acquired, _ = acquire_scoped_lock("telegram-bot-token", token)
+    assert acquired
+    release_scoped_lock("telegram-bot-token", token)
+
+
+@pytest.mark.asyncio
 async def test_controlled_stuck_queue_never_enters_legacy_updater_ladder(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
     adapter._controlled_journal = object()

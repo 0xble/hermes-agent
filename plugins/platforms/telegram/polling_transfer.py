@@ -62,7 +62,7 @@ class PollingJournal:
             raise ValueError("invalid getUpdates result")
         if not updates:
             with self._connect() as db:
-                db.execute("DELETE FROM telegram_updates WHERE token_hash=? AND state='accepted' AND received_at<?",
+                db.execute("DELETE FROM telegram_updates WHERE token_hash=? AND state IN ('accepted','quarantined','processing') AND received_at<?",
                            (self.token_hash, time.time() - _RETENTION_SECONDS))
             return
         rows = []
@@ -82,12 +82,10 @@ class PollingJournal:
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute("SELECT confirmed_offset,updated_at FROM polling_cursors WHERE token_hash=?",
                                 (self.token_hash,)).fetchone()
-            # Telegram may assign random IDs after a week idle. A fresh epoch then
-            # starts at zero; never reset while unadmitted rows still need replay.
+            # Telegram may assign random IDs after a week idle. The cursor's
+            # update time also bounds all unadmitted rows from this token.
             idle = time.time() - cursor["updated_at"] >= _IDLE_RESET_SECONDS
-            pending = db.execute("SELECT 1 FROM telegram_updates WHERE token_hash=? AND state IN ('received','processing') AND received_at>=? LIMIT 1",
-                                 (self.token_hash, time.time() - _IDLE_RESET_SECONDS)).fetchone()
-            if idle and not pending:
+            if idle:
                 db.execute("DELETE FROM telegram_updates WHERE token_hash=?", (self.token_hash,))
                 previous = 0
             else:
@@ -95,7 +93,7 @@ class PollingJournal:
             db.executemany("INSERT OR IGNORE INTO telegram_updates VALUES (?,?,?,?,?)", rows)
             db.execute("UPDATE polling_cursors SET confirmed_offset=?,updated_at=? WHERE token_hash=?",
                        (max(previous, max(row[1] for row in rows) + 1), time.time(), self.token_hash))
-            db.execute("DELETE FROM telegram_updates WHERE token_hash=? AND state='accepted' AND received_at<?",
+            db.execute("DELETE FROM telegram_updates WHERE token_hash=? AND state IN ('accepted','quarantined','processing') AND received_at<?",
                        (self.token_hash, time.time() - _RETENTION_SECONDS))
             db.commit()
 
@@ -106,10 +104,7 @@ class PollingJournal:
             if not row:
                 return 0
             if time.time() - row["updated_at"] >= _IDLE_RESET_SECONDS:
-                pending = db.execute("SELECT 1 FROM telegram_updates WHERE token_hash=? AND state IN ('received','processing') AND received_at>=? LIMIT 1",
-                                     (self.token_hash, time.time() - _IDLE_RESET_SECONDS)).fetchone()
-                if not pending:
-                    return 0
+                return 0
             return row["confirmed_offset"]
 
     def quarantined(self, update_ids: list[int]) -> set[int]:
@@ -182,6 +177,11 @@ class PollingJournal:
 
 
 logger = logging.getLogger(__name__)
+_active_pollers: dict[str, asyncio.Task] = {}
+
+
+def token_has_active_poller(token_hash: str) -> bool:
+    return _active_pollers.get(token_hash) is not None
 
 
 class ControlledPoller:
@@ -203,34 +203,41 @@ class ControlledPoller:
         return self._task is not None and not self._task.done()
 
     async def start(self):
-        if self.running:
-            raise RuntimeError("poller already running")
+        if self.running or token_has_active_poller(self.journal.token_hash):
+            raise RuntimeError("poller already running for token")
         self._stop.clear()
         # Rows in processing may have crossed a handler's external-effect boundary.
         # Only explicitly failed pre-handoff claims reopen; do not replay ambiguous crashes.
-        for raw in self.journal.pending():
+        for raw in await asyncio.to_thread(self.journal.pending):
             await self.app.update_queue.put(Update.de_json(raw, self.app.bot))
         await self._join_queue("replayed update")
         self._task = asyncio.create_task(self._run(), name="telegram-controlled-poller")
+        _active_pollers[self.journal.token_hash] = self._task
+        self._task.add_done_callback(self._observe_task)
         await asyncio.sleep(0)
         if self._task.done():
             await self._task
 
     async def _join_queue(self, batch: str) -> None:
-        """Bound dispatch backlog waits so one blocked handler cannot pin polling forever."""
-        await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout)
+        """Backpressure until dispatch catches up; a slow handler is not a poll failure."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout)
+                return
+            except asyncio.TimeoutError:
+                logger.warning("Telegram polling waiting for %s queue to drain", batch)
 
     async def _run(self):
         failures = 0
         while not self._stop.is_set():
             try:
                 updates = await self.app.bot.get_updates(
-                    offset=self.journal.safe_offset(), timeout=self.timeout,
+                    offset=await asyncio.to_thread(self.journal.safe_offset), timeout=self.timeout,
                     allowed_updates=Update.ALL_TYPES)
                 # The dedicated request hook must have committed every returned ID.
                 # A fake or miswired request is a hard failure, never an unsafe offset.
                 if updates:
-                    safe_offset = self.journal.safe_offset()
+                    safe_offset = await asyncio.to_thread(self.journal.safe_offset)
                     if any(update.update_id >= safe_offset for update in updates):
                         raise RuntimeError("getUpdates response escaped the wire journal")
                     quarantined = await asyncio.to_thread(self.journal.quarantined, [update.update_id for update in updates])
@@ -259,14 +266,30 @@ class ControlledPoller:
                 except asyncio.TimeoutError:
                     pass
 
+    def _forget_task(self, task: asyncio.Task) -> None:
+        if _active_pollers.get(self.journal.token_hash) is task:
+            _active_pollers.pop(self.journal.token_hash, None)
+
+    def _observe_task(self, task: asyncio.Task) -> None:
+        if _active_pollers.get(self.journal.token_hash) is task:
+            # A disconnect may have registered a lock-release callback on this
+            # same task. Keep the in-process fence until that callback runs.
+            asyncio.get_running_loop().call_soon(self._forget_task, task)
+        if not task.cancelled():
+            error = task.exception()  # Consume even if disconnect never runs.
+            if error is not None:
+                logger.warning("Controlled Telegram poller failed: %s", type(error).__name__)
+
     async def stop(self):
         self._stop.set()
         if self._task is not None:
-            # A ten-failure task reports through on_error; stopping returns a clear failed
-            # receipt instead of re-raising into disconnect/transfer teardown.
+            if not self._task.done():
+                self._task.cancel()  # Interrupt the in-flight long poll rather than waiting 20 seconds.
             try:
                 await asyncio.shield(self._task)
+            except asyncio.CancelledError:
+                if not self._task.cancelled():
+                    raise  # Caller cancellation does not prove polling ended.
             except Exception as exc:
-                logger.warning("Controlled Telegram poller stopped after failure: %s", type(exc).__name__)
                 return {"stopped": False, "error": type(exc).__name__}
         return {"stopped": True}

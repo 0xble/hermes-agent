@@ -12,6 +12,7 @@ import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
 from agent.interrupt_compat import request_hard_interrupt
+from agent.message_sanitization import INTERRUPTED_TAIL_MARKER
 from dataclasses import dataclass, field
 from tools import file_state
 from tools.delegate_tool_progress import _quiet, _safe_progress
@@ -566,15 +567,15 @@ def _build_result_entry(
     interrupt_note = ""
     if result.get("interrupted", False):
         status, exit_reason = "interrupted", "interrupted"
-        # The loop's final_response is a placeholder here ("Operation interrupted…", also appended as the closing
-        # assistant row); the completion must carry what the child actually had so far — its last real assistant
-        # text — and keep the placeholder as the error.
+        # The synthetic closing row is not child output; preserve only real earlier assistant text.
         from agent.message_content import flatten_message_text
-        placeholders = {"", summary.strip(), "Operation interrupted."}
+        placeholders = {"", summary.strip(), "Operation interrupted.", INTERRUPTED_TAIL_MARKER}
         partial = next((t for m in reversed(result.get("messages") or []) if m.get("role") == "assistant"
                         and (t := flatten_message_text(m.get("content")).strip()) not in placeholders), "")
         if partial:
-            interrupt_note, summary = summary.strip(), partial
+            interrupt_note, summary = ("" if summary.strip() == INTERRUPTED_TAIL_MARKER else summary.strip()), partial
+        elif summary.strip() == INTERRUPTED_TAIL_MARKER:
+            summary = ""
     elif result.get("failed") or result.get("error"):
         # The loop returns the error text as final_response, which would otherwise read as "completed". Never report a
         # provider rejection as "max_iterations" — that is only truthful for real budget exhaustion.
