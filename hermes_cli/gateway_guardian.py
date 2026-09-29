@@ -191,6 +191,29 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
+def _transient_control_failure(home: Path, owner: dict) -> bool:
+    """Keep a live, heartbeating successor until a control failure is sustained."""
+    path = home / "gateway-overlap-control-probe.json"
+    now = time.time()
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    same_owner = previous.get("generation_id") == owner["id"]
+    first = previous.get("first_at", now) if same_owner else now
+    count = previous.get("count", 0) + 1 if same_owner else 1
+    if not isinstance(first, (int, float)) or not isinstance(count, int):
+        first, count = now, 1
+    pending = path.with_name(f".{path.name}.{uuid.uuid4().hex}.pending")
+    try:
+        pending.write_text(json.dumps({"generation_id": owner["id"],
+                                       "first_at": first, "count": count}), encoding="utf-8")
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+    return count < 3 or now - first < 10
+
+
 def _overlap_drain_seconds(config: dict) -> float:
     raw = config.get("drain_seconds", 7200)
     if type(raw) not in (int, float) or not 1 <= raw <= 86400:
@@ -258,7 +281,11 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
         if transferred_at is not None and time.time() < drainers[0]["drain_deadline"]:
             try:
                 _observe_poller(home, owner, timeout=2)
+                (home / "gateway-overlap-control-probe.json").unlink(missing_ok=True)
             except (RuntimeError, OSError) as exc:
+                if (str(exc).startswith("generation control unavailable:") and
+                        _transient_control_failure(home, owner)):
+                    return "healthy"
                 if _repair_count(home) >= MAX_REPAIRS:
                     receipt(home, "overlap", "capped", reason="overlap rollback attempt cap reached")
                     return "capped"

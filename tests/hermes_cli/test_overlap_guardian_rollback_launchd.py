@@ -1,8 +1,11 @@
 """Rollback supervision regressions for the disposable overlap coordinator."""
 from __future__ import annotations
 
+import json
 import os
+import plistlib
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -39,6 +42,24 @@ def test_explicit_grace_ignores_unrelated_invalid_model_config(tmp_path, monkeyp
 
 
 @pytest.mark.macos_only
+def test_transient_control_socket_failure_requires_sustained_evidence(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, a, b, epoch = _committed(home)
+    monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: f"gui/{os.getuid()}")
+    monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
+    assert guardian._run_overlap(home) == "healthy"
+    assert guardian._run_overlap(home) == "healthy"
+    probe = home / "gateway-overlap-control-probe.json"
+    assert json.loads(probe.read_text())["count"] == 2
+    state = json.loads(probe.read_text())
+    state["first_at"] -= 11
+    probe.write_text(json.dumps(state))
+    assert guardian._run_overlap(home) == "alert"
+    assert coordinator.leases()[0]["generation_id"] == b.id
+
+
+@pytest.mark.macos_only
 def test_late_poller_failure_remains_eligible_for_guarded_rollback(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()
@@ -51,6 +72,12 @@ def test_late_poller_failure_remains_eligible_for_guarded_rollback(tmp_path, mon
     # whose wire-stop proof rejects the operation without changing the lease.
     monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: f"gui/{os.getuid()}")
     monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
+    assert guardian._run_overlap(home) == "healthy"
+    assert guardian._run_overlap(home) == "healthy"
+    probe = home / "gateway-overlap-control-probe.json"
+    state = json.loads(probe.read_text())
+    state["first_at"] -= 11
+    probe.write_text(json.dumps(state))
     outcome = guardian._run_overlap(home)
     assert outcome == "alert"
     reasons = [p.read_text() for p in (home / "logs/guardian").glob("*.json")]
@@ -160,7 +187,7 @@ def test_unready_successor_is_booted_out_before_next_promotion(tmp_path, monkeyp
     monkeypatch.setattr(overlap, "_launch_agents_dir", lambda: tmp_path / "LaunchAgents")
     monkeypatch.setattr(overlap, "generation_launchd_label", lambda slot: f"ai.hermes.rehearsal.guardian.{slot}")
     monkeypatch.setattr(overlap, "render_generation_launchd_plist", lambda **kwargs: (
-        __import__("plistlib").dumps({"Label": f"ai.hermes.rehearsal.guardian.{kwargs['slot']}",
+        plistlib.dumps({"Label": f"ai.hermes.rehearsal.guardian.{kwargs['slot']}",
             "EnvironmentVariables": {"HERMES_HOME": str(home.resolve())}}).decode()))
     monkeypatch.setattr(overlap, "bootstrap_generation_plist", lambda **kwargs: None)
     monkeypatch.setattr(overlap, "_ready_successor", lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -244,7 +271,7 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path, failur
             time.sleep(.15)
         raise AssertionError(reason)
     try:
-        nonce = __import__("uuid").uuid4().hex[:8]
+        nonce = uuid.uuid4().hex[:8]
         labels = {slot: f"ai.hermes.rehearsal.guardian.{nonce}.{slot}" for slot in "ab"}
         for slot in "ab":
             proc = subprocess.Popen([sys.executable, str(worker), "worker",

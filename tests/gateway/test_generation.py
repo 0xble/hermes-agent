@@ -82,6 +82,24 @@ def test_generation_socket_root_cleanup_removes_owned_stale_siblings(tmp_path):
     assert not stale.exists()
 
 
+def test_generation_socket_root_cleanup_preserves_unrelated_files(tmp_path):
+    from gateway.run_generation import _ensure_generation_socket_parent
+    home = tmp_path / ("h" * 100)
+    path = generation_paths(home, GenerationIdentity.create(release_sha="a", label="a"))["socket"]
+    stale = path.parent.parent / f"{path.parent.name}-unrelated"
+    stale.mkdir(mode=0o700)
+    stale_socket = stale / "old.sock"
+    stale_socket.write_text("stale")
+    stale_socket.with_name(f".{stale_socket.name}.owner.json").write_text(
+        json.dumps({"pid": 999999999, "start_time": 1}))
+    sentinel = stale / "unrelated-data"
+    sentinel.write_text("preserve")
+    old = time.time() - 11 * 60
+    os.utime(stale, (old, old))
+    _ensure_generation_socket_parent(path)
+    assert sentinel.read_text() == "preserve"
+
+
 def test_generation_socket_root_cleanup_preserves_live_siblings(tmp_path):
     from gateway.run_generation import _ensure_generation_socket_parent
     home = tmp_path / ("h" * 100)

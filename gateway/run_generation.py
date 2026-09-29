@@ -8,7 +8,6 @@ import json
 import socket
 import os
 import stat
-import shutil
 import signal
 import time
 from contextlib import suppress
@@ -214,7 +213,16 @@ def _cleanup_stale_generation_socket_roots(current: Path) -> None:
                 continue
             if not all(_generation_owner_is_dead(path) for path in sockets):
                 continue
-            shutil.rmtree(sibling)
+            # Never recursively remove a sibling directory: preserve any
+            # unrelated data even if its recorded socket owner is dead.
+            expected = {path.name for path in sockets}
+            expected.update(_generation_socket_owner_path(path).name for path in sockets)
+            if {entry.name for entry in sibling.iterdir()} != expected:
+                continue
+            for path in sockets:
+                path.unlink()
+                _generation_socket_owner_path(path).unlink()
+            sibling.rmdir()
         except OSError:
             continue
 
