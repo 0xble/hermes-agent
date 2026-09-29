@@ -34,7 +34,7 @@ def _three_chunk_text() -> str:
 
 @pytest.mark.asyncio
 async def test_split_send_resumes_from_undelivered_tail_without_resending_head(monkeypatch):
-    """Chunk 2 refused with a 7s RetryAfter (> the 5s adapter cap, < the 60s base cap): the retry
+    """Chunk 2 refused with a RetryAfter beyond the adapter's inline cap: the retry
     delivers chunks 2..3 only — every chunk exactly once, in order."""
     sent: list = []
     calls = {"n": 0}
@@ -42,15 +42,18 @@ async def test_split_send_resumes_from_undelivered_tail_without_resending_head(m
     async def fake_send_message(text: str, **_kw):
         calls["n"] += 1
         if calls["n"] == 2:
-            raise _FloodError(7.0)
+            raise _FloodError(0.05)
         sent.append(text)
         return MagicMock(message_id=1000 + calls["n"])
 
     adapter = _adapter(AsyncMock(side_effect=fake_send_message))
-    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+    adapter._telegram_chat_outbound_slot_secs = 0
+    monkeypatch.setattr("plugins.platforms.telegram.adapter._FLOOD_INLINE_WAIT_CAP_SECS", 0.01)
+    real_sleep = asyncio.sleep
 
-    async def _penalty_elapses(_delay):  # the base retry sleep is mocked; model the window having passed
-        adapter._telegram_send_cooldown_until.clear()
+    async def _penalty_elapses(_delay):
+        # The server deadline is persisted, so let clock time pass instead of clearing an in-memory map.
+        await real_sleep(0.08)
 
     monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", _penalty_elapses)
     content = _three_chunk_text()
@@ -83,7 +86,9 @@ async def test_over_cap_flood_returns_partial_overflow_and_arms_cooldown(monkeyp
     total = len(adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH))
     result = await adapter._send_with_retry(chat_id="4242", content=content)
 
-    assert result.success is False and result.error == "flood_control:120.0"
+    assert result.success is False and result.error.startswith("flood_control:")
+    assert result.retry_after == pytest.approx(120.0, abs=0.01)
+    assert float(result.error.split(":", 1)[1]) == pytest.approx(result.retry_after)
     raw = result.raw_response
     assert raw["partial_overflow"] is True and raw["delivered_chunks"] == 1 and raw["total_chunks"] == total >= 3
     assert raw["last_message_id"] == "1001" and len(raw["undelivered_chunks"]) == total - 1

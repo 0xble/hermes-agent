@@ -21,6 +21,9 @@ class _Adapter:
         self.stopped = True
         return {"token_hash": self._controlled_journal.token_hash, "safe_offset": 7, "epoch": 1}
 
+    async def start_polling_from_transfer(self, receipt):
+        self.stopped = False
+
 
 @pytest.mark.asyncio
 async def test_driver_uses_old_control_socket_before_committing(tmp_path):
@@ -64,3 +67,54 @@ async def test_driver_fails_closed_if_old_process_cannot_acknowledge(tmp_path):
         await asyncio.to_thread(handover_to_generation, tmp_path, new.id, timeout=.2)
     assert db.leases()[0]["generation_id"] == old.id
     assert db.leases()[0]["epoch"] == epoch
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_rearms_old_polling_and_dispatch(tmp_path, monkeypatch):
+    db = GenerationCoordinator(tmp_path)
+    fp = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
+    old = GenerationIdentity.create(release_sha="a", label="a", start_fingerprint=fp)
+    new = GenerationIdentity.create(release_sha="b", label="b", start_fingerprint=fp)
+    db.register(old, state="serving")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = _Adapter()
+    runner = type("Runner", (), {"adapters": {"telegram": adapter}, "_overlap_draining": False})()
+    active.bind_runner(runner)
+    await active.start()
+    db.register(new, state="ready")
+    def fail_commit(*args, **kwargs):
+        raise RuntimeError("injected commit failure")
+    monkeypatch.setattr(GenerationCoordinator, "commit_transfer", fail_commit)
+    try:
+        with pytest.raises(RuntimeError, match="injected commit failure"):
+            await asyncio.to_thread(handover_to_generation, tmp_path, new.id, timeout=4)
+        assert db.leases()[0]["generation_id"] == old.id
+        assert not adapter.stopped
+        assert not runner._overlap_draining
+        assert not await active.finish_draining_once()
+    finally:
+        await active.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_but_unverified_handover_has_typed_outcome(tmp_path):
+    from gateway import run_generation
+    db = GenerationCoordinator(tmp_path)
+    fp = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
+    old = GenerationIdentity.create(release_sha="a", label="a", start_fingerprint=fp)
+    new = GenerationIdentity.create(release_sha="b", label="b", start_fingerprint=fp)
+    db.register(old, state="serving")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.bind_runner(type("Runner", (), {"adapters": {}})())
+    await active.start()
+    db.register(new, state="ready")
+    try:
+        with pytest.raises(run_generation.HandoverCommittedUnverified) as exc:
+            await asyncio.to_thread(handover_to_generation, tmp_path, new.id, timeout=.3)
+        assert exc.value.epoch == epoch + 1
+        assert exc.value.generation_id == new.id
+        assert db.leases()[0]["generation_id"] == new.id
+    finally:
+        await active.close()

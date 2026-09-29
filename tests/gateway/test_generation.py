@@ -228,6 +228,28 @@ def test_generation_files_are_scoped_and_cleanup_is_fenced(tmp_path: Path):
     assert other_paths["state"].exists()
 
 
+@pytest.mark.asyncio
+async def test_old_exit_preserves_successor_legacy_pid_projection(tmp_path):
+    from gateway.run_generation import ActiveGeneration
+    from gateway.status import _get_process_start_time
+    db = GenerationCoordinator(tmp_path)
+    fp = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
+    old = GenerationIdentity.create(release_sha="a", label="a", start_fingerprint=fp)
+    new = GenerationIdentity.create(release_sha="b", label="b", start_fingerprint=fp)
+    db.register(old, state="serving")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    await active.start()
+    db.register(new, state="ready")
+    db.request_transfer(old.id, new.id, epoch, set())
+    promoted = db.commit_transfer(old.id, new.id, epoch)
+    assert db.project_active_summary(new, promoted, {})
+    projected = json.loads((tmp_path / "gateway.pid").read_text())
+    assert projected["id"] == new.id
+    await active.close()
+    assert json.loads((tmp_path / "gateway.pid").read_text()) == projected
+
+
 def test_lease_cannot_be_stolen_and_release_is_fenced(tmp_path):
     coordinator = GenerationCoordinator(tmp_path)
     from gateway.status import _get_process_start_time
