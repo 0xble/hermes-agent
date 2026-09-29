@@ -83,22 +83,35 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
         raise RuntimeError("rollback blocked: generation process identity unknown")
     if old["state"] != "draining":
         raise RuntimeError("rollback blocked: prior generation is not draining")
+    paths = ReleasePaths.for_home(home)
+    old_release = (paths.releases / old["release_sha"]).resolve()
+    if not _release_is_ready(old_release, old["release_sha"]):
+        raise RuntimeError("rollback blocked: prior release is not intact")
     stopped = _generation_request(_generation_socket(home, failed), "stop_for_rollback", timeout=10)
     if (stopped.get("generation_id"), stopped.get("epoch"), stopped.get("poller_stopped")) != (
             failed_id, epoch, True):
         raise RuntimeError("rollback blocked: successor wire-stop receipt invalid")
-    restored = coordinator.rollback_transfer(failed_id, old_id, epoch, poller_stopped=True,
-                                             drain_seconds=drain_seconds)
-    if restored is None:
-        raise RuntimeError("rollback blocked: active lease changed")
+    try:
+        restored = coordinator.rollback_transfer(failed_id, old_id, epoch, poller_stopped=True,
+                                                 drain_seconds=drain_seconds)
+        if restored is None:
+            raise RuntimeError("rollback blocked: active lease changed")
+    except Exception:
+        # A stopped B can be re-armed only if B still owns the same lease.
+        lease = next((item for item in coordinator.leases()
+                      if item["resource"] == "active_generation"), None)
+        if lease and (lease["generation_id"], lease["epoch"], lease["state"]) == (
+                failed_id, epoch, "active"):
+            resumed = _generation_request(_generation_socket(home, failed),
+                                          "resume_uncommitted_transfer",
+                                          params={"epoch": epoch}, timeout=15)
+            if resumed.get("generation_id") != failed_id or resumed.get("polling") is not True:
+                raise RuntimeError("rollback blocked: successor did not re-arm")
+        raise
     response = _generation_request(_generation_socket(home, old), "restore_after_rollback",
                                    params={"epoch": restored}, timeout=15)
     if response.get("generation_id") != old_id or response.get("polling") is not True:
         raise RuntimeError("rollback blocked: prior generation has not restored polling")
-    paths = ReleasePaths.for_home(home)
-    old_release = (paths.releases / old["release_sha"]).resolve()
-    if not _release_is_ready(old_release, old["release_sha"]):
-        raise RuntimeError("rollback polling restored but prior release is not intact")
     activate_release(home, old_release, operation="rollback")
     return {"from_id": failed_id, "to_id": old_id, "from_sha": failed["release_sha"],
             "to_sha": old["release_sha"], "from_label": failed["label"],
@@ -133,7 +146,13 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
                                            interpreter=candidate / ".venv/bin/python", hermes_home=home)
     plist.write_text(body, encoding="utf-8")
     bootstrap_generation_plist(domain=domain, plist_path=plist, label=label)
-    successor = _ready_successor(coordinator, label, sha, timeout=min(timeout, 30))
+    try:
+        successor = _ready_successor(coordinator, label, sha, timeout=min(timeout, 30))
+    except Exception:
+        # A still owns the lease; the newly installed standby is ours to retire.
+        # A failed bootout is not a successful cleanup and must block retry.
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=True, timeout=15)
+        raise
     activate_release(home, candidate)  # No relaunch of either live generation.
     try:
         promoted_epoch = handover_to_generation(home, successor["id"], timeout=min(timeout, 45),

@@ -22,7 +22,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
 
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
-INTERVAL = 30
+INTERVAL = 5
 MAX_REPAIRS = 3
 
 
@@ -238,7 +238,7 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
     if len(drainers) == 1 and drainers[0]["drain_deadline"] is not None:
         from hermes_cli.gateway_overlap import _observe_poller, rollback_overlap
         transferred_at = drainers[0]["transferred_at"]
-        if transferred_at is not None and transferred_at + 30 <= time.time() <= transferred_at + 60:
+        if transferred_at is not None and time.time() < drainers[0]["drain_deadline"]:
             try:
                 _observe_poller(home, owner, timeout=2)
             except (RuntimeError, OSError) as exc:
@@ -250,8 +250,12 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
                 if lease is None:
                     raise RuntimeError("overlap lease vanished during rollback inspection")
                 receipt(home, "rollback", "attempt", reason=str(exc), label=owner["label"])
-                proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"],
-                                         drain_seconds=drain_seconds)
+                try:
+                    proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"],
+                                             drain_seconds=drain_seconds)
+                except (RuntimeError, OSError) as failure:
+                    receipt(home, "rollback", "alert", reason=str(failure), label=owner["label"])
+                    return "alert"
                 receipt(home, "rollback", "rolled_back", **proof)
                 return "rolled_back"
     # A loaded label with a clean exit and no remaining process can be retired.
