@@ -81,6 +81,54 @@ def test_redirect_to_private_address_never_requested(harness, monkeypatch):
     assert seen == ["https://site.test/readme.md"]
 
 
+def test_redirect_to_policy_blocked_site_never_requested(harness, monkeypatch):
+    seen, checked = [], []
+
+    def policy(url):
+        checked.append(url)
+        return {"message": "blocked"} if "blocked.test" in url else None
+
+    def respond(request):
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://blocked.test/secret.txt"})
+
+    monkeypatch.setattr("tools.website_policy.check_website_access", policy)
+    _transport(monkeypatch, respond)
+    assert _run(["https://allowed.test/file.txt"])[0]["title"] == "provider"
+    assert seen == ["https://allowed.test/file.txt"]
+    assert "https://blocked.test/secret.txt" in checked
+
+
+def test_redirect_policy_error_fails_closed(harness, monkeypatch):
+    seen = []
+
+    def policy(url):
+        if "other.test" in url:
+            raise RuntimeError("policy unreadable")
+        return None
+
+    def respond(request):
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://other.test/next.txt"})
+
+    monkeypatch.setattr("tools.website_policy.check_website_access", policy)
+    _transport(monkeypatch, respond)
+    assert _run(["https://allowed.test/file.txt"])[0]["title"] == "provider"
+    assert seen == ["https://allowed.test/file.txt"]
+
+
+def test_allowed_redirect_is_followed(harness, monkeypatch):
+    def respond(request):
+        if request.url.host == "a.test":
+            return httpx.Response(301, headers={"location": "https://b.test/final.txt"})
+        return httpx.Response(200, headers={"content-type": "text/plain"}, text="final body")
+
+    _transport(monkeypatch, respond)
+    result = _run(["https://a.test/start.txt"])[0]
+    assert result["content"] == "final body"
+    harness.extract.assert_not_awaited()
+
+
 def test_docs_hit_index_miss_and_traversal(harness, monkeypatch):
     _transport(monkeypatch, lambda request: pytest.fail("docs must not use HTTP"))
     root = "https://hermes-agent.nousresearch.com/docs/"

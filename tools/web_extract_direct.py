@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import unquote, urljoin, urlsplit
 
+from tools import website_policy
 from tools.url_safety import async_is_safe_url, create_ssrf_safe_async_client
 
 _MAX_BYTES = 5 * 1024 * 1024
@@ -83,6 +84,13 @@ async def _direct_download(url: str) -> Optional[dict[str, Any]]:
                             next_url = urljoin(target, location)
                             # Never send model-supplied or redirect-supplied secrets to another host.
                             if _PREFIX_RE.search(unquote(next_url)):
+                                return None
+                            # The dispatcher checked policy only for the original URL; a redirect must not
+                            # reach a blocked site. Policy errors fail closed here (the provider still runs).
+                            try:
+                                if website_policy.check_website_access(next_url) is not None:
+                                    return None
+                            except Exception:  # noqa: BLE001
                                 return None
                             target = next_url
                             continue
