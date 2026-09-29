@@ -30,6 +30,15 @@ def _committed(home: Path):
 
 
 @pytest.mark.macos_only
+def test_explicit_grace_ignores_unrelated_invalid_model_config(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: [invalid]\n")
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    assert guardian.run_once(home, home / "unused.plist", "ai.hermes.test", grace=12) == "healthy"
+
+
+@pytest.mark.macos_only
 def test_late_poller_failure_remains_eligible_for_guarded_rollback(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()
@@ -50,7 +59,8 @@ def test_late_poller_failure_remains_eligible_for_guarded_rollback(tmp_path, mon
 
 
 @pytest.mark.macos_only
-def test_rollback_refusal_rearms_stopped_successor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("refusal", ["exception", "lease_changed"])
+def test_rollback_refusal_rearms_stopped_successor(tmp_path, monkeypatch, refusal):
     home = tmp_path / "profile"
     home.mkdir()
     coordinator, a, b, epoch = _committed(home)
@@ -76,10 +86,20 @@ def test_rollback_refusal_rearms_stopped_successor(tmp_path, monkeypatch):
     def refuse(*args, **kwargs):
         raise RuntimeError("storage refused transfer")
 
-    monkeypatch.setattr(GenerationCoordinator, "rollback_transfer", refuse)
-    with pytest.raises(RuntimeError, match="storage refused transfer"):
+    monkeypatch.setattr(GenerationCoordinator, "rollback_transfer", refuse if refusal == "exception" else lambda *a, **kw: None)
+    with pytest.raises(RuntimeError, match="storage refused transfer|active lease changed"):
         overlap.rollback_overlap(home, b.id, a.id, epoch)
     assert calls[-1] == ("resume_uncommitted_transfer", {"epoch": epoch})
+
+
+@pytest.mark.macos_only
+def test_missing_old_release_refuses_before_successor_wire_stop(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    _, a, b, epoch = _committed(home)
+    monkeypatch.setattr(overlap, "_generation_request", lambda *args, **kw: pytest.fail("successor was stopped"))
+    with pytest.raises(RuntimeError, match="prior release is not intact"):
+        overlap.rollback_overlap(home, b.id, a.id, epoch)
 
 
 @pytest.mark.macos_only
@@ -94,6 +114,28 @@ def test_dead_successor_with_loaded_label_does_not_steal_polling(tmp_path, monke
     with pytest.raises(RuntimeError, match="label may respawn"):
         overlap.rollback_overlap(home, b.id, a.id, epoch)
     assert coordinator.leases()[0]["generation_id"] == b.id
+
+
+@pytest.mark.asyncio
+async def test_failed_old_poller_rearm_keeps_local_epoch(tmp_path, monkeypatch):
+    from gateway.run_generation import ActiveGeneration
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, a, b, epoch = _committed(home)
+    restored = coordinator.rollback_transfer(b.id, a.id, epoch, poller_stopped=True)
+    assert restored is not None
+    active = ActiveGeneration(home, coordinator, a, epoch - 1)
+    adapter = type("Adapter", (), {"_controlled_journal": type("Journal", (), {"token_hash": "token"})()})()
+    active.runner = type("Runner", (), {"adapters": {"telegram": adapter}, "_overlap_draining": True})()
+    active._poller_paused = True
+    active._transfer_receipts = {"token": {"token_hash": "token"}}
+    async def reject(*args, **kwargs):
+        raise RuntimeError("poller not ready")
+    monkeypatch.setattr(active, "_rearm_adapter", reject)
+    with pytest.raises(RuntimeError, match="poller not ready"):
+        await active.restore_after_rollback(restored)
+    assert active.epoch == epoch - 1
+    assert active._poller_paused and getattr(active.runner, "_overlap_draining")
 
 
 @pytest.mark.macos_only
