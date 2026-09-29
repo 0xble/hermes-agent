@@ -2,6 +2,8 @@
 
 import re
 
+from agent.message_sanitization import INTERRUPTED_TAIL_MARKER
+
 
 _INTERRUPT_DIAGNOSTIC = re.compile(
     r"Operation interrupted(?:\.|: (?:waiting for model response|handling API error|"
@@ -13,4 +15,7 @@ _INTERRUPT_DIAGNOSTIC = re.compile(
 
 def is_interrupt_diagnostic(text: object) -> bool:
     """Only complete, known local diagnostic shapes are disposable."""
-    return isinstance(text, str) and _INTERRUPT_DIAGNOSTIC.fullmatch(text.strip()) is not None
+    return isinstance(text, str) and (
+        text.strip() == INTERRUPTED_TAIL_MARKER
+        or _INTERRUPT_DIAGNOSTIC.fullmatch(text.strip()) is not None
+    )
