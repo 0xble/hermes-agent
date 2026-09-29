@@ -1030,7 +1030,7 @@ class GatewayShutdownMixin:
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
         # A DM topic reaches its private parent, but a forum topic does not replace a group broadcast.
-        private_topic_parents: set[tuple[int, str]] = set()
+        private_topic_parents: set[tuple[str, str]] = set()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1073,7 +1073,7 @@ class GatewayShutdownMixin:
                 ):
                     notified.add(dedup_key)
                     if private_topic:
-                        private_topic_parents.add((id(adapter), chat_id))
+                        private_topic_parents.add((platform_str, chat_id))
             from gateway.warning_notifications import present_notification
             from gateway.run import _async_profile_runtime_scope
             scope = (_async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
@@ -1105,7 +1105,7 @@ class GatewayShutdownMixin:
             dedup_key = _notice_target_key(platform.value, home.chat_id, home.thread_id)
             if dedup_key in notified or (
                 platform == Platform.TELEGRAM and home.thread_id is None
-                and (id(adapter), str(home.chat_id)) in private_topic_parents
+                and (platform.value, str(home.chat_id)) in private_topic_parents
             ):
                 continue
             try:

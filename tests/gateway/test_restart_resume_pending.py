@@ -27,6 +27,7 @@ PRs #9850, #9934, #7536):
 import asyncio
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -966,6 +967,33 @@ async def test_shutdown_notice_suppresses_only_unthreaded_private_parent_broadca
     await runner._notify_active_sessions_of_shutdown()
 
     assert [(chat, (metadata or {}).get("thread_id")) for chat, _, metadata in adapter.sent_calls] == expected_targets
+
+
+@pytest.mark.asyncio
+async def test_shutdown_private_topic_on_secondary_bot_suppresses_shared_parent_broadcast(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    (home / "profiles" / "coder").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner, primary = make_restart_runner()
+    secondary = RestartTestAdapter()
+    runner.config.multiplex_profiles = True
+    runner._profile_adapters = {"coder": {Platform.TELEGRAM: secondary}}
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="parent", name="Home",
+    )
+    source = make_restart_source(chat_id="parent", thread_id="topic-7")
+    source.profile = "coder"
+    key = runner._session_key_for_source(source)
+    runner.session_store._entries[key] = MagicMock(origin=source)
+    runner._running_agents[key] = object()
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert [(chat, (metadata or {}).get("thread_id")) for chat, _, metadata in secondary.sent_calls] == [
+        ("parent", "topic-7"),
+    ]
+    assert primary.sent_calls == [], "the home DM already received the shutdown notice"
 
 
 @pytest.mark.asyncio
