@@ -5,7 +5,6 @@ loopback pages and a temporary local vault. No personal browser or manager.
 """
 import http.server
 import json
-import shutil
 import subprocess
 import threading
 import time
@@ -39,13 +38,14 @@ addEventListener('message', (e) => {
 
 @pytest.fixture
 def browser(tmp_path):
-    executable = next((shutil.which(n) for n in ("chromium", "chromium-browser", "google-chrome")
-                       if shutil.which(n)), None)
-    mac = Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
-    if not executable and mac.exists():
-        executable = str(mac)
-    if not executable:
-        pytest.skip("Chrome/Chromium is required for the live DOM regression")
+    playwright = pytest.importorskip(
+        "playwright.sync_api",
+        reason="Playwright is required for the live DOM regression",
+    )
+    with playwright.sync_playwright() as pw:
+        executable = Path(pw.chromium.executable_path)
+    if not executable.is_file():
+        pytest.skip("Playwright's bundled Chromium is not installed")
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -63,7 +63,7 @@ def browser(tmp_path):
     thread.start()
     origin = f'http://127.0.0.1:{server.server_port}'
     profile = tmp_path / 'chrome'
-    process = subprocess.Popen([executable, '--headless=new', '--no-sandbox',
+    process = subprocess.Popen([str(executable), '--headless=new', '--no-sandbox',
                                 '--disable-dev-shm-usage', '--no-first-run',
                                 '--no-default-browser-check', '--remote-debugging-port=0',
                                 # The portable gate replaces HOME, so a real macOS Chrome

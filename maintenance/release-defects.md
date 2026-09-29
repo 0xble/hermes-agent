@@ -536,6 +536,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Guard: `tests/scripts/test_candidate_scripts.py`
   (`test_check_config_does_not_pin_background_review`).
 
+## Live vault regression launched the user's branded Chrome
+
+- Fork patch identity: `live-vault-test-browser`.
+- The live vault regression fixture searched PATH and then fell back to the installed macOS
+  `Google Chrome.app`. Each forced teardown could leave a `code_sign_clone` copy behind. The
+  fixture now resolves Playwright's bundled Chromium and skips when that test browser is absent,
+  so it never launches the user's signed-in browser or its code-signing clone.
+- Regression coverage: `tests/tools/test_vault_shadow_dom_live.py`.
+
 
 ## Kanban worker exit trailers identify the worker
 
