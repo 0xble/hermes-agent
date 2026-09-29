@@ -291,6 +291,7 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path, failur
     repo = Path(__file__).resolve().parents[2]
     worker = repo / "tests/gateway/test_generation_promotion_process.py"
     processes = []
+    logs = {}
     env = {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(repo),
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
            "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "OPENAI_API_KEY": "local-test-key"}
@@ -309,12 +310,13 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path, failur
     try:
         nonce = uuid.uuid4().hex[:8]
         labels = {slot: f"ai.hermes.rehearsal.guardian.{nonce}.{slot}" for slot in "ab"}
+        logs = {slot: (tmp_path / f"{slot}.err").open("w") for slot in "ab"}
         for slot in "ab":
             proc = subprocess.Popen([sys.executable, str(worker), "worker",
                                      "active" if slot == "a" else "standby"],
                                     env={**env, "HERMES_LAUNCHD_LABEL": labels[slot],
                                          "HERMES_RELEASE_SHA": shas[0 if slot == "a" else 1]},
-                                    cwd=repo, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                                    cwd=repo, stdout=subprocess.DEVNULL, stderr=logs[slot], text=True)
             processes.append(proc)
             wait(lambda: len(rows()) == len(processes) and all(r["state"] == "ready" for r in rows()),
                  30, f"{slot} not ready")
@@ -372,5 +374,7 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path, failur
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=8)
+        for log in logs.values():
+            log.close()
         llm.__exit__(None, None, None)
         api.close()
