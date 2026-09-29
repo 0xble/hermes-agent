@@ -1,6 +1,7 @@
 """Integration coverage for polling progress against the installed PTB runtime."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 pytest.importorskip("telegram.error", reason="python-telegram-bot not installed")
@@ -302,3 +303,50 @@ async def test_real_ptb_stop_cleanup_cannot_heal_recovery_generation():
             await app.updater.stop()
         await _cancel_task(adapter._polling_progress_verifier_task)
         await app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_controlled_stuck_queue_never_enters_legacy_updater_ladder(monkeypatch):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    adapter._controlled_journal = object()
+    adapter._controlled_poller = SimpleNamespace(running=True)
+    adapter._app = SimpleNamespace(updater=SimpleNamespace(start_polling=lambda **kwargs: pytest.fail("PTB updater started")))
+    adapter._webhook_mode = False
+    reasons = []
+    adapter._schedule_polling_recovery = lambda error, *, reason: reasons.append((error, reason))
+    async def legacy(error):
+        pytest.fail("legacy network ladder entered")
+    monkeypatch.setattr(adapter, "_handle_polling_network_error", legacy)
+    class Bot:
+        async def get_webhook_info(self):
+            return SimpleNamespace(pending_update_count=2)
+    await adapter._probe_pending_updates(Bot(), 1)
+    await adapter._probe_pending_updates(Bot(), 1)
+    assert len(reasons) == 1
+    assert isinstance(reasons[0][0], tg_adapter._PollingStallError)
+
+
+@pytest.mark.asyncio
+async def test_controlled_transient_probe_does_not_rebuild_adapter():
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    adapter._controlled_journal = object()
+    adapter._controlled_poller = SimpleNamespace(running=True)
+    adapter._schedule_polling_recovery(OSError("one probe"), reason="heartbeat probe")
+    assert not adapter.has_fatal_error
+    assert not adapter._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_controlled_first_poll_failure_wakes_cold_start_gate(monkeypatch):
+    import plugins.platforms.telegram.polling_transfer as polling_transfer
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    adapter._controlled_journal = object()
+    adapter._app = SimpleNamespace()
+    class FailedPoller:
+        def __init__(self, app, journal, *, on_error, on_failure):
+            self.on_failure = on_failure
+        async def start(self):
+            self.on_failure(OSError("first poll failed"))
+    monkeypatch.setattr(polling_transfer, "ControlledPoller", FailedPoller)
+    with pytest.raises(OSError, match="first poll failed"):
+        await asyncio.wait_for(adapter._start_controlled_polling(), 1)

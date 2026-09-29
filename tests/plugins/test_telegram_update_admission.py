@@ -21,6 +21,8 @@ from telegram.request import BaseRequest
 from gateway.config import PlatformConfig
 from gateway.platforms.event import MessageType
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.polling_transfer import PollingJournal
+from gateway.generation import GenerationCoordinator
 
 
 class NoNetwork(BaseRequest):
@@ -110,6 +112,25 @@ async def connected(monkeypatch, *, extra=None, bot_id=111, is_reconnect=False):
         store = getattr(adapter, "_session_store", None)
         if store is not None:
             store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_journal_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path):
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        journal = PollingJournal(GenerationCoordinator(tmp_path), adapter.config.token)
+        adapter._controlled_journal = journal
+        incoming = update(app.bot, uid=501)
+        journal.record_response(json.dumps({"ok": True, "result": [incoming.to_dict()]}).encode())
+        original = adapter._cache_replied_media
+        monkeypatch.setattr(adapter, "_cache_replied_media", AsyncMock(side_effect=OSError("before handoff")))
+        await app.process_update(incoming)
+        assert journal.pending() and journal.pending()[0]["update_id"] == 501
+        assert not adapter._seen_update_ids
+        monkeypatch.setattr(adapter, "_cache_replied_media", original)
+        await app.process_update(incoming)
+        await asyncio.gather(*adapter._pending_text_batch_tasks.values())
+        assert len(delivered) == 1
+        assert journal.pending() == []
 
 
 @pytest.mark.asyncio

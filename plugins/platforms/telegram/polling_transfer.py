@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 
 from telegram import Update
@@ -26,7 +26,7 @@ _MAX_RAW_UPDATE = 1024 * 1024
 @dataclass
 class PollingJournal:
     coordinator: GenerationCoordinator
-    token: str
+    token: str = field(repr=False)
 
     def __post_init__(self):
         self.token_hash = hashlib.sha256(self.token.encode()).hexdigest()
@@ -68,11 +68,16 @@ class PollingJournal:
         rows = []
         for item in updates:
             if not isinstance(item, dict) or type(item.get("update_id")) is not int:
-                raise ValueError("invalid Telegram update ID")
+                logger.warning("Quarantining malformed Telegram update in polling journal")
+                continue
             raw = json.dumps(item, separators=(",", ":")).encode()
             if len(raw) > _MAX_RAW_UPDATE:
-                raise ValueError("Telegram update exceeds journal envelope limit")
+                logger.warning("Quarantining oversized Telegram update %s", item["update_id"])
+                rows.append((self.token_hash, item["update_id"], b"{}", "quarantined", time.time()))
+                continue
             rows.append((self.token_hash, item["update_id"], raw, "received", time.time()))
+        if not rows:
+            return
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute("SELECT confirmed_offset,updated_at FROM polling_cursors WHERE token_hash=?",
@@ -80,8 +85,8 @@ class PollingJournal:
             # Telegram may assign random IDs after a week idle. A fresh epoch then
             # starts at zero; never reset while unadmitted rows still need replay.
             idle = time.time() - cursor["updated_at"] >= _IDLE_RESET_SECONDS
-            pending = db.execute("SELECT 1 FROM telegram_updates WHERE token_hash=? AND state!='accepted' LIMIT 1",
-                                 (self.token_hash,)).fetchone()
+            pending = db.execute("SELECT 1 FROM telegram_updates WHERE token_hash=? AND state IN ('received','processing') AND received_at>=? LIMIT 1",
+                                 (self.token_hash, time.time() - _IDLE_RESET_SECONDS)).fetchone()
             if idle and not pending:
                 db.execute("DELETE FROM telegram_updates WHERE token_hash=?", (self.token_hash,))
                 previous = 0
@@ -101,11 +106,21 @@ class PollingJournal:
             if not row:
                 return 0
             if time.time() - row["updated_at"] >= _IDLE_RESET_SECONDS:
-                pending = db.execute("SELECT 1 FROM telegram_updates WHERE token_hash=? AND state!='accepted' LIMIT 1",
-                                     (self.token_hash,)).fetchone()
+                pending = db.execute("SELECT 1 FROM telegram_updates WHERE token_hash=? AND state IN ('received','processing') AND received_at>=? LIMIT 1",
+                                     (self.token_hash, time.time() - _IDLE_RESET_SECONDS)).fetchone()
                 if not pending:
                     return 0
             return row["confirmed_offset"]
+
+    def quarantined(self, update_ids: list[int]) -> set[int]:
+        if not update_ids:
+            return set()
+        with self._connect() as db:
+            placeholders = ",".join("?" for _ in update_ids)
+            rows = db.execute(
+                f"SELECT update_id FROM telegram_updates WHERE token_hash=? AND state='quarantined' AND update_id IN ({placeholders})",
+                (self.token_hash, *update_ids)).fetchall()
+        return {row["update_id"] for row in rows}
 
     def pending(self) -> list[dict]:
         with self._connect() as db:
@@ -113,20 +128,31 @@ class PollingJournal:
                               (self.token_hash,)).fetchall()
         return [json.loads(row["raw_update"]) for row in rows]
 
-    def claim(self, update_id: int) -> bool:
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            changed = db.execute("UPDATE telegram_updates SET state='processing' WHERE token_hash=? AND update_id=? AND state='received'",
-                                 (self.token_hash, update_id)).rowcount
-            db.commit()
-            return bool(changed)
+    async def claim(self, update_id: int) -> bool:
+        def write() -> bool:
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                changed = db.execute("UPDATE telegram_updates SET state='processing' WHERE token_hash=? AND update_id=? AND state='received'",
+                                     (self.token_hash, update_id)).rowcount
+                db.commit()
+                return bool(changed)
+        return await asyncio.to_thread(write)
 
-    def accept(self, update_id: int) -> None:
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute("UPDATE telegram_updates SET state='accepted' WHERE token_hash=? AND update_id=? AND state='processing'",
-                       (self.token_hash, update_id))
-            db.commit()
+    async def accept(self, update_id: int) -> None:
+        def write() -> None:
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("UPDATE telegram_updates SET state='accepted' WHERE token_hash=? AND update_id=? AND state='processing'",
+                           (self.token_hash, update_id))
+                db.commit()
+        await asyncio.to_thread(write)
+
+    async def reopen(self, update_id: int) -> None:
+        def write() -> None:
+            with self._connect() as db:
+                db.execute("UPDATE telegram_updates SET state='received' WHERE token_hash=? AND update_id=? AND state='processing'",
+                           (self.token_hash, update_id))
+        await asyncio.to_thread(write)
 
     def stop_receipt(self) -> dict:
         with self._connect() as db:
@@ -136,8 +162,11 @@ class PollingJournal:
     def validate_transfer(self, receipt: dict) -> bool:
         if not isinstance(receipt, dict) or receipt.get("token_hash") != self.token_hash:
             return False
+        safe_offset = receipt.get("safe_offset")
+        if not isinstance(safe_offset, int) or isinstance(safe_offset, bool):
+            raise RuntimeError("polling transfer receipt has an invalid safe_offset")
         current = self.stop_receipt()
-        return receipt.get("epoch") == current["epoch"] and receipt.get("safe_offset") <= current["safe_offset"]
+        return receipt.get("epoch") == current["epoch"] and safe_offset <= current["safe_offset"]
 
     def begin_successor(self, receipt: dict) -> int:
         if not self.validate_transfer(receipt):
@@ -159,11 +188,12 @@ class ControlledPoller:
     """One serial request at a time; stopping never abandons an outstanding request."""
 
     def __init__(self, app, journal: PollingJournal, *, timeout: float = 20,
-                 on_error=None, on_progress=None):
+                 on_error=None, on_failure=None, on_progress=None):
         self.app = app
         self.journal = journal
         self.timeout = timeout
         self.on_error = on_error
+        self.on_failure = on_failure
         self.on_progress = on_progress
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -176,14 +206,19 @@ class ControlledPoller:
         if self.running:
             raise RuntimeError("poller already running")
         self._stop.clear()
-        # Replay before the very first offset that can acknowledge these rows.
+        # Rows in processing may have crossed a handler's external-effect boundary.
+        # Only explicitly failed pre-handoff claims reopen; do not replay ambiguous crashes.
         for raw in self.journal.pending():
             await self.app.update_queue.put(Update.de_json(raw, self.app.bot))
-        await self.app.update_queue.join()
+        await self._join_queue("replayed update")
         self._task = asyncio.create_task(self._run(), name="telegram-controlled-poller")
         await asyncio.sleep(0)
         if self._task.done():
             await self._task
+
+    async def _join_queue(self, batch: str) -> None:
+        """Bound dispatch backlog waits so one blocked handler cannot pin polling forever."""
+        await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout)
 
     async def _run(self):
         failures = 0
@@ -198,9 +233,11 @@ class ControlledPoller:
                     safe_offset = self.journal.safe_offset()
                     if any(update.update_id >= safe_offset for update in updates):
                         raise RuntimeError("getUpdates response escaped the wire journal")
+                    quarantined = await asyncio.to_thread(self.journal.quarantined, [update.update_id for update in updates])
                     for update in updates:
-                        await self.app.update_queue.put(update)
-                    await self.app.update_queue.join()
+                        if update.update_id not in quarantined:
+                            await self.app.update_queue.put(update)
+                    await self._join_queue("received update")
                 failures = 0
                 if self.on_progress is not None:
                     self.on_progress()
@@ -210,6 +247,8 @@ class ControlledPoller:
                 raise
             except Exception as exc:
                 failures += 1
+                if self.on_failure is not None:
+                    self.on_failure(exc)
                 if failures >= 10:
                     if self.on_error is not None:
                         self.on_error(exc)
@@ -223,5 +262,11 @@ class ControlledPoller:
     async def stop(self):
         self._stop.set()
         if self._task is not None:
-            # No deadline: a timeout/cancel is NOT a release receipt.
-            await asyncio.shield(self._task)
+            # A ten-failure task reports through on_error; stopping returns a clear failed
+            # receipt instead of re-raising into disconnect/transfer teardown.
+            try:
+                await asyncio.shield(self._task)
+            except Exception as exc:
+                logger.warning("Controlled Telegram poller stopped after failure: %s", type(exc).__name__)
+                return {"stopped": False, "error": type(exc).__name__}
+        return {"stopped": True}
