@@ -4205,6 +4205,11 @@ class BasePlatformAdapter(ABC):
             if await owned.route_message(self, event, session_key):
                 event._gateway_accepted = True
                 return
+            # Owned admission completed. Any later cancellation belongs to a
+            # handed-off native dispatch, not an unadmitted update to reopen.
+            accept_update = getattr(self, "_accept_update", None)
+            if callable(accept_update):
+                accept_update()
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)

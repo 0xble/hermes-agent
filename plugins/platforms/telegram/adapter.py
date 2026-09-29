@@ -3497,12 +3497,16 @@ class TelegramAdapter(BasePlatformAdapter):
             claim.failed = True
 
     async def handle_message(self, event: MessageEvent) -> None:
-        self._accept_update()
+        if getattr(self, "_owned_routing", None) is None:
+            # Without owned admission, native dispatch may hand work off before
+            # returning (including a task that outlives a cancelled callback).
+            self._accept_update()
         try:
             await super().handle_message(event)
         except BaseException:
             self._fail_update_preparation()
             raise
+        self._accept_update()
 
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""

@@ -144,6 +144,29 @@ def test_dead_owner_holds_pending_rows_without_replaying(tmp_path, monkeypatch):
 
 
 
+def test_dead_owner_probe_runs_before_write_lock_and_rechecks_under_lock(tmp_path, monkeypatch):
+    for prelock_dead, locked_dead in ((False, True), (True, False)):
+        home = tmp_path / str(prelock_dead)
+        store, old, new, epoch = _pair(home)
+        store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+        probes = []
+        def probe(generation):
+            probes.append(generation["pid"])
+            if len(probes) == 1:
+                # A separate writer can enter while the slow process liveness
+                # probe runs; probing under BEGIN IMMEDIATE would fail this.
+                with closing(store.connect()) as other:
+                    other.execute("BEGIN IMMEDIATE")
+                    other.rollback()
+                return prelock_dead
+            return locked_dead
+        monkeypatch.setattr(store, "_owner_is_dead", probe)
+        row, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                                   _source(), b"next", new.id, epoch)
+        assert fresh and len(probes) == 2
+        assert row["owner_id"] == (new.id if locked_dead else old.id)
+
+
 def test_first_message_after_owner_death_moves_to_successor(tmp_path, monkeypatch):
     store, old, new, epoch = _pair(tmp_path)
     store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
