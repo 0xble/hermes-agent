@@ -515,14 +515,19 @@ class ActiveGeneration:
         deadline = record["drain_deadline"]
         if (busy or queued or claims) and time.time() < deadline:
             return False
-        if not self._drain_stopping:
+        if self._drain_stopping:
+            return False
+        self._drain_stopping = True  # Fence concurrent drain inspections before the first await.
+        try:
             if time.time() >= deadline:
                 count = await asyncio.to_thread(self.coordinator.interrupt_at_drain_cap, self.identity.id)
                 logger.warning("generation drain cap reached; fenced %s interrupted session(s)", count)
                 if busy or queued or claims:
                     self.runner._overlap_cap_interrupted = True
-            self._drain_stopping = True
             await self.runner.stop()
+        except BaseException:
+            self._drain_stopping = False
+            raise
         return True
 
     async def _drain_after_transfer(self) -> None:

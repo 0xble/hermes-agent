@@ -161,7 +161,10 @@ async def test_cap_fences_queued_work_before_stopping_busy_runner(tmp_path):
     db.commit_transfer(old.id, new.id, epoch, drain_seconds=1)
     with db.connect() as conn:
         conn.execute("UPDATE generations SET drain_deadline=? WHERE id=?", (0, old.id))
-    assert await active.finish_draining_once()
+    await asyncio.gather(active.finish_draining_once(), active.finish_draining_once())
+    if active._drain_task is not None:
+        await asyncio.wait_for(active._drain_task, timeout=5)
+    assert len(stopped) == 1
     assert stopped == [{"state": "interrupted", "outstanding_work": 1}]
     with db.connect() as conn:
         receipt = conn.execute("SELECT state,payload,owner_id FROM inbox WHERE source_event_id='queued'").fetchone()
