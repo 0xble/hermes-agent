@@ -720,13 +720,8 @@ def _sanitize_gateway_final_response(platform: Any, text: str, *, interrupted: b
     # flag alone is insufficient. Match only complete, known diagnostic shapes.
     if interrupted and str(text).strip().startswith("Operation interrupted"):
         return ""
-    if re.fullmatch(
-        r"Operation interrupted(?:\.|: (?:waiting for model response|handling API error|"
-        r"retrying API call after error|waiting for the provider to recover|"
-        r"retrying empty response from model) \([^\n]{1,100}\)\.|"
-        r" during retry \([^\n]{1,100}\)\.)",
-        str(text).strip(),
-    ):
+    from agent.interrupt_diagnostics import is_interrupt_diagnostic
+    if is_interrupt_diagnostic(text):
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))

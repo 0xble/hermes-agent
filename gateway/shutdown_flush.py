@@ -80,12 +80,11 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
 
 
 def _pending_arrival_ts(value: Any, fallback: int) -> int | float:
-    """Keep drain arrivals ordered even when the FIFO-cap tail spools before its head."""
-    if getattr(value, "_drain_deferred", False):
-        from datetime import datetime
-        stamp = getattr(value, "timestamp", None)
-        if isinstance(stamp, datetime):
-            return stamp.timestamp()
+    """Order MessageEvents by arrival; legacy strings use flush time."""
+    from datetime import datetime
+    stamp = getattr(value, "timestamp", None)
+    if isinstance(stamp, datetime):
+        return stamp.timestamp()
     return fallback
 
 

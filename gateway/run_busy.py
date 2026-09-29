@@ -350,11 +350,12 @@ class GatewayBusySessionMixin:
         "notification_category",
     )
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Return whether this event actually entered the adapter slot or FIFO."""
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
-            return
+            return False
         # FIFO so each follow-up gets its own turn in arrival order (the single pending slot used to
         # be silently OVERWRITTEN). Photo bursts still merge into the head slot (album semantics).
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -391,18 +392,20 @@ class GatewayBusySessionMixin:
                 merge_text=event.message_type == MessageType.TEXT,
             )
             event._gateway_accepted = True
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
         if getattr(event, "_gateway_accepted", False):
             self._prefetch_queued_voice_transcript(event, adapter)
+        return ((isinstance(pending_slot, dict) and pending_slot.get(session_key) is event)
+                or any(item is event for item in (self._overflow_queue(session_key) or ())))
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -484,8 +487,7 @@ class GatewayBusySessionMixin:
     def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> None:
         """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing."""
         setattr(event, "_drain_deferred", True)
-        self._queue_or_replace_pending_event(session_key, event)
-        if getattr(event, "_gateway_accepted", False):
+        if self._queue_or_replace_pending_event(session_key, event):
             return
         # No adapter or a full FIFO: use the same durable shutdown spool rather than lose
         # the turn. Recovery retains the file if its session cannot yet be resolved.
