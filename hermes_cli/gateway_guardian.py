@@ -361,27 +361,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         try:
             from hermes_cli.config import _validate_updates
             from hermes_cli.config_effective import load_user_config_effective
-            if grace is None:
-                config = load_user_config_effective(home / "config.yaml", fail_closed=True)
-            else:
-                config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
-                # The explicit-grace test path deliberately ignores unrelated
-                # malformed config. Read only the opt-in gate before any repair.
-                path = home / "config.yaml"
-                raw = path.read_text(encoding="utf-8") if path.is_file() else ""
-                if "overlap_handover" in raw:
-                    try:
-                        parsed = yaml.safe_load(raw) or {}
-                        gateway = parsed.get("gateway") if isinstance(parsed, dict) else None
-                        overlap = gateway.get("overlap_handover") if isinstance(gateway, dict) else None
-                        if overlap is not None and (not isinstance(overlap, dict) or
-                                                    type(overlap.get("enabled")) is not bool):
-                            raise ValueError("invalid overlap_handover gate")
-                        if overlap and overlap["enabled"]:
-                            return _run_overlap(home, drain_seconds=_overlap_drain_seconds(overlap))
-                    except (yaml.YAMLError, ValueError) as exc:
-                        receipt(home, "inspect", "alert", reason=str(exc))
-                        return "alert"
+            config = load_user_config_effective(home / "config.yaml", fail_closed=True)
             gateway_config = config.get("gateway") or {}
             if (isinstance(gateway_config, dict) and
                     isinstance(gateway_config.get("overlap_handover"), dict) and
