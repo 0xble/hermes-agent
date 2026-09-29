@@ -25,14 +25,14 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import os
 import time
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, HomeChannel, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import (
@@ -661,6 +661,61 @@ async def test_reconnect_reschedule_is_platform_scoped():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs a POSIX process timezone switch")
+@pytest.mark.parametrize("aware_marker", [False, True], ids=["naive-local", "aware-utc"])
+async def test_startup_auto_resume_freshness_survives_spring_forward(monkeypatch, aware_marker):
+    """A session marked 20 minutes before boot is inside a 60-minute window even when a DST
+    spring-forward falls between the two (naive wall-clock subtraction read it as 80 minutes)."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="dst-chat")
+    monkeypatch.setenv("HERMES_AUTO_CONTINUE_FRESHNESS", "3600")
+    original_tz = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        # 2026-03-08: clocks jump 02:00 -> 03:00, so 01:50 -> 03:10 is 20 real minutes.
+        marked = datetime(2026, 3, 8, 1, 50)
+        now = datetime(2026, 3, 8, 3, 10)
+        if aware_marker:
+            marked = datetime.fromtimestamp(marked.timestamp(), tz=timezone.utc)
+
+        class _FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now if tz is None else datetime.fromtimestamp(now.timestamp(), tz=tz)
+
+        # Freeze both wall clocks the startup path could read.
+        monkeypatch.setattr("gateway.run_startup.datetime", _FrozenDatetime, raising=False)
+        monkeypatch.setattr(time, "time", lambda: now.timestamp())
+        entry = SessionEntry(
+            session_key="agent:main:telegram:dm:dst-chat",
+            session_id="sid-dst",
+            created_at=marked,
+            updated_at=marked,
+            origin=source,
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+            resume_reason="restart_interrupted",
+            last_resume_marked_at=marked,
+        )
+        runner.session_store._entries = {entry.session_key: entry}
+        adapter.handle_message = AsyncMock()
+
+        scheduled = runner._schedule_resume_pending_sessions()
+    finally:
+        if original_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = original_tz
+        time.tzset()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_served_profile_reconnect_resumes_what_boot_deferred():
     """A served profile's session whose own bot is offline at boot is deferred (never answered from the
     default bot) "for the reconnect watcher" -- which must then resume it through that profile's bot."""
@@ -970,19 +1025,24 @@ async def test_shutdown_notice_suppresses_only_unthreaded_private_parent_broadca
 
 
 @pytest.mark.asyncio
-async def test_shutdown_private_topic_on_secondary_bot_suppresses_shared_parent_broadcast(tmp_path, monkeypatch):
+async def test_shutdown_private_topic_only_suppresses_own_bots_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     (home / "profiles" / "coder").mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: home)
     monkeypatch.setenv("HERMES_HOME", str(home))
     runner, primary = make_restart_runner()
     secondary = RestartTestAdapter()
     runner.config.multiplex_profiles = True
     runner._profile_adapters = {"coder": {Platform.TELEGRAM: secondary}}
+    runner._profile_configs = {"coder": GatewayConfig(platforms={
+        Platform.TELEGRAM: PlatformConfig(enabled=True, home_channel=HomeChannel(
+            platform=Platform.TELEGRAM, chat_id="4242", name="Coder Home",
+        )),
+    })}
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
-        platform=Platform.TELEGRAM, chat_id="parent", name="Home",
+        platform=Platform.TELEGRAM, chat_id="4242", name="Home",
     )
-    source = make_restart_source(chat_id="parent", thread_id="topic-7")
+    source = make_restart_source(chat_id="4242", thread_id="topic-7")
     source.profile = "coder"
     key = runner._session_key_for_source(source)
     runner.session_store._entries[key] = MagicMock(origin=source)
@@ -991,9 +1051,11 @@ async def test_shutdown_private_topic_on_secondary_bot_suppresses_shared_parent_
     await runner._notify_active_sessions_of_shutdown()
 
     assert [(chat, (metadata or {}).get("thread_id")) for chat, _, metadata in secondary.sent_calls] == [
-        ("parent", "topic-7"),
+        ("4242", "topic-7"),
     ]
-    assert primary.sent_calls == [], "the home DM already received the shutdown notice"
+    assert primary.sent_calls == [("4242", secondary.sent_calls[0][1], {"_interim_send": True})], (
+        "the primary bot's DM is a different conversation, so its home still gets a notice"
+    )
 
 
 @pytest.mark.asyncio
