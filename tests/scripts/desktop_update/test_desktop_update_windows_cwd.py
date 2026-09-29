@@ -99,20 +99,34 @@ def _run_cwd_self_test(
     return subprocess.CompletedProcess(command, process.returncode, output)
 
 
-def test_timeout_diagnostics_kill_pipe_holding_process_tree() -> None:
+def test_timeout_diagnostics_kill_pipe_holding_process_tree(tmp_path: Path) -> None:
     # A real grandchild inherits stdout and keeps the pipe open even if its
     # parent is killed. The timeout path must kill it before draining output.
+    ready_marker = tmp_path / "child-ready"
     script = (
-        "import subprocess, sys, time; "
+        "import pathlib, subprocess, sys, time; "
         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
-        "print('cwd entered', flush=True); time.sleep(30)"
+        "print('cwd entered', flush=True); "
+        "pathlib.Path(sys.argv[1]).write_text('ready', encoding='utf-8'); "
+        "time.sleep(30)"
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", script],
+        [sys.executable, "-c", script, str(ready_marker)],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
+    ready_deadline = time.monotonic() + 30
+    while not ready_marker.exists():
+        if process.poll() is not None:
+            output, _ = process.communicate(timeout=5)
+            pytest.fail(f"self-test child exited before ready marker: {output!r}")
+        if time.monotonic() >= ready_deadline:
+            process.kill()
+            output, _ = process.communicate(timeout=5)
+            pytest.fail(f"self-test child did not become ready: {output!r}")
+        time.sleep(0.05)
+
     started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired) as raised:
         _communicate_with_timeout_diagnostics(process, timeout=0.5)
