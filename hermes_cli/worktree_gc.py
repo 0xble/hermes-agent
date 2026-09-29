@@ -143,9 +143,9 @@ def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
                 return None
             (dest / rel).parent.mkdir(parents=True, exist_ok=True)
             if src.is_dir():
-                shutil.copytree(src, dest / rel, dirs_exist_ok=True)
+                shutil.copytree(src, dest / rel, symlinks=True, dirs_exist_ok=True)
             else:
-                shutil.copy2(src, dest / rel)
+                shutil.copy2(src, dest / rel, follow_symlinks=False)
         return dest if dest.exists() else None
     except Exception as exc:
         logger.warning("Could not archive untracked files from %s: %s", tree, exc)
