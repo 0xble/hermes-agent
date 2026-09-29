@@ -209,7 +209,8 @@ def _discard_delivered_media(home: Path, payload: dict[str, Any]) -> None:
 
 def _uncertain(result) -> bool:
     """Only a transport outcome without a definitive refusal can have been sent."""
-    if result.success or result.retry_after is not None or result.raw_response is not None:
+    if (result.success or result.pre_send or result.retry_after is not None
+            or result.raw_response is not None):
         return False
     from gateway.platforms.base import SEND_ERROR_KINDS
     kind = result.error_kind
@@ -296,9 +297,9 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
             logger.error("Outbox could not serialize %s; refusing unreceipted transport: %s", kind, exc)
             return SendResult(success=False, error="outbox payload could not be serialized")
         if row is None:
-            return SendResult(success=False, error="outbox payload has an uncertain prior dispatch")
+            return SendResult(success=False, error="outbox payload has an uncertain prior dispatch", held=True)
         if not await _store_io(store.begin_send, row):
-            return SendResult(success=False, error="earlier outbox row is unresolved")
+            return SendResult(success=False, error="earlier outbox row is unresolved", held=True)
         try:
             with transport_bypass():
                 result = await send(wire_payload(row.payload))
