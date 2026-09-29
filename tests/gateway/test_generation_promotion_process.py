@@ -41,7 +41,7 @@ def _worker(standby: bool):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("approval_route", ["text", "callback", "stop", "steer"])
+@pytest.mark.parametrize("approval_route", ["text", "callback", "stop", "steer", "clarify"])
 @pytest.mark.asyncio
 async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path, monkeypatch, approval_route):
     monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
@@ -52,10 +52,12 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
     def model(record):
         messages = record["body"]["messages"]
         if messages and messages[-1].get("role") == "tool":
-            return Text("old-turn-complete")
+            return Text("clarify-complete" if approval_route == "clarify" else "old-turn-complete")
         user = next((m for m in reversed(messages) if m.get("role") == "user"), {})
         content = str(user.get("content", ""))
         if "old-boundary" in content:
+            if approval_route == "clarify":
+                return ToolCall("clarify", {"question": "Which colour?", "choices": ["red", "blue"]})
             return ToolCall("terminal", {"command": command})
         if "old-followup" in content:
             return Text("old-followup-complete")
@@ -106,7 +108,9 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                 end = time.monotonic() + 25
                 while time.monotonic() < end:
                     with api.lock:
-                        approval_prompt = any("needs your OK" in item["text"] and "chmod" in item["text"] for item in api.sent)
+                        approval_prompt = any(("Which colour?" in item["text"] if approval_route == "clarify"
+                                               else "needs your OK" in item["text"] and "chmod" in item["text"])
+                                              for item in api.sent)
                     if approval_prompt:
                         break
                     await asyncio.sleep(.1)
@@ -140,6 +144,24 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                 await asyncio.sleep(.1)
             assert row and row["owner_id"] != successor["id"] and row["state"] == "accepted", command_text
         callback_data = ""
+        if approval_route == "clarify":
+            api.add(1004, 1004, text="red")
+            end = time.monotonic() + 20
+            answer_row = None
+            completed = False
+            while time.monotonic() < end:
+                with db.connect() as conn:
+                    answer_row = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1004'").fetchone()
+                with api.lock:
+                    completed = any("clarify-complete" in item["text"].replace("\\", "") for item in api.sent)
+                if answer_row and answer_row["state"] == "accepted" and completed:
+                    break
+                await asyncio.sleep(.1)
+            assert answer_row and answer_row["owner_id"] != successor["id"] and answer_row["state"] == "accepted"
+            assert completed, "A did not consume the clarify answer"
+            await asyncio.to_thread(processes[0].wait, 30)
+            assert processes[0].returncode == 0, processes[0].stderr.read()
+            return
         if approval_route == "callback":
             with api.lock:
                 prompt = next(item for item in api.sent if "needs your OK" in item["text"])
