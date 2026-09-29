@@ -1,0 +1,227 @@
+"""Opt-in, generation-fenced Telegram admission through the owning native adapter."""
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import fields
+from datetime import datetime
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource
+from gateway.session_identity import identity_of
+
+
+def _source_payload(source):
+    return {field.name: (getattr(source, field.name).value if field.name == "platform"
+                         else getattr(source, field.name)) for field in fields(SessionSource)
+            if field.init and field.name != "profile_route_rejected"}
+
+
+def _event_payload(event):
+    # The normalized event, not a reconstruction from Telegram's prompt message.
+    # Native media is not portable between generation-local caches.
+    if event.media_urls or event.raw_message is None or event.platform_update_id is None:
+        raise RuntimeError("event cannot be handed to another generation")
+    return {field.name: (getattr(event, field.name).value if field.name == "message_type"
+                         else getattr(event, field.name).isoformat() if field.name == "timestamp"
+                         else _source_payload(event.source) if field.name == "source"
+                         else getattr(event, field.name))
+            for field in fields(MessageEvent) if field.init and field.name != "raw_message"}
+
+
+def _restore_event(payload, adapter):
+    data = json.loads(payload)
+    source = data.pop("source")
+    source.pop("platform")
+    source.pop("profile", None)
+    source = adapter.build_source(**{name: value for name, value in source.items()
+                                     if name in {"chat_id", "chat_name", "chat_type", "user_id",
+                                                 "user_name", "thread_id", "chat_topic", "user_id_alt",
+                                                 "chat_id_alt", "is_bot", "scope_id", "guild_id",
+                                                 "parent_chat_id", "message_id", "role_authorized",
+                                                 "auto_thread_created", "auto_thread_initial_name"}})
+    event = MessageEvent(**{**data, "source": source,
+                            "message_type": MessageType(data["message_type"]),
+                            "timestamp": datetime.fromisoformat(data["timestamp"])})
+    adapter._canonicalize(event.source)
+    setattr(event, "_owned_replay", True)
+    return event
+
+
+class OwnedRouting:
+    def __init__(self, generation):
+        self.generation = generation
+        self._task: asyncio.Task | None = None
+
+    def bind(self, runner):
+        self.generation.runner = runner
+        for adapter in runner.adapters.values():
+            if getattr(adapter, "platform", None) == Platform.TELEGRAM:
+                adapter._owned_routing = self
+
+    def _adapters(self):
+        return [adapter for adapter in self.generation.runner.adapters.values()
+                if getattr(adapter, "platform", None) == Platform.TELEGRAM]
+
+    def _home(self, source):
+        return str(self.generation.runner._resolve_profile_home_for_source(source))
+
+    def _live_keys(self):
+        keys = set()
+        for adapter in self._adapters():
+            keys.update(getattr(adapter, "_active_sessions", {}))
+            keys.update(getattr(adapter, "_pending_messages", {}))
+        approvals = getattr(self.generation.runner, "_pending_approvals", None)
+        if isinstance(approvals, dict):
+            keys.update(approvals)
+        return keys
+
+    def claim_live(self):
+        from gateway.session import profile_from_session_key_namespace
+        from hermes_cli.profiles import get_profile_dir
+        for key in self._live_keys():
+            if not key.startswith("agent:"):
+                raise RuntimeError("unscoped session obligation during transfer")
+            profile = profile_from_session_key_namespace(key.split(":", 2)[1])
+            home = str(self.generation.home if profile == "default" else get_profile_dir(profile))
+            self.generation.coordinator.claim_session(
+                home, "telegram", key, self.generation.identity.id,
+                self.generation.epoch, outstanding_work=1)
+
+    async def route_message(self, adapter, event, key):
+        identity = identity_of(event.source)
+        if identity is None or event.source.user_id is None or event.internal:
+            raise RuntimeError("unresolved external identity")
+        if adapter._is_sender_authorized(event.source.user_id, event.source.chat_type,
+                                         event.source.chat_id, thread_id=event.source.thread_id) is not True:
+            raise RuntimeError("owner admission authorization failed")
+        home = self._home(event.source)
+        payload = json.dumps({"event": _event_payload(event)}, ensure_ascii=False).encode()
+        envelope = json.dumps({"version": 1, "authorized": True,
+                               "sender": event.source.user_id, "chat": event.source.chat_id,
+                               "thread": event.source.thread_id, "profile": identity.runtime_profile,
+                               "transport_profile": identity.transport_profile,
+                               "home": home}, ensure_ascii=False).encode()
+        row, fresh = await asyncio.to_thread(
+            self.generation.coordinator.enqueue, home, "telegram", key,
+            str(event.platform_update_id), "message", envelope, payload,
+            self.generation.identity.id, self.generation.epoch)
+        if row["owner_id"] == self.generation.identity.id:
+            if not fresh:
+                return True
+            if not self.generation.coordinator.disposition(row["id"], row["owner_id"], row["owner_epoch"], "accepted"):
+                raise RuntimeError("local admission disposition failed")
+            return False
+        return True
+
+    async def route_callback(self, adapter, update, source, key):
+        identity = identity_of(source)
+        if identity is None:
+            raise RuntimeError("unresolved callback identity")
+        home = self._home(source)
+        envelope = json.dumps({"version": 1, "authorized": True,
+                               "sender": source.user_id, "chat": source.chat_id,
+                               "thread": source.thread_id, "profile": identity.runtime_profile,
+                               "transport_profile": identity.transport_profile,
+                               "home": home}, ensure_ascii=False).encode()
+        payload = json.dumps({"callback": update.to_dict()}, ensure_ascii=False).encode()
+        row, fresh = await asyncio.to_thread(
+            self.generation.coordinator.enqueue, home, "telegram", key,
+            str(update.update_id), "callback", envelope, payload,
+            self.generation.identity.id, self.generation.epoch)
+        if row["owner_id"] == self.generation.identity.id:
+            if not fresh:
+                return True
+            if not self.generation.coordinator.disposition(row["id"], row["owner_id"], row["owner_epoch"], "accepted"):
+                raise RuntimeError("local callback disposition failed")
+            return False
+        return True
+
+    async def drain(self):
+        while not self.generation._drain_stopping:
+            try:
+                await self._drain_once()
+            except Exception:
+                from gateway.run_generation import logger
+                logger.warning("owned admission drain failed; retaining rows", exc_info=True)
+            await asyncio.sleep(.1)
+
+    async def _drain_once(self):
+        store = self.generation.coordinator
+        owner = self.generation.identity.id
+        with store._transaction() as db:
+            rows = [dict(row) for row in db.execute(
+                "SELECT * FROM inbox WHERE owner_id=? AND state='pending' ORDER BY id", (owner,))]
+            foreign = [row[0] for row in db.execute(
+                "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending'", (owner,))]
+        for foreign_owner in foreign:
+            await asyncio.to_thread(store.hold_dead_owner, foreign_owner)
+        for row in rows:
+            if row["session_key"] in self._live_keys() or row["owner_epoch"] == self.generation.epoch:
+                adapter = next((a for a in self._adapters() if a._owner_transport_profile() in
+                                (None, json.loads(row["authorized_source"])["transport_profile"])), None)
+                if adapter is None:
+                    continue
+                envelope = json.loads(row["authorized_source"])
+                data = json.loads(row["payload"])
+                if (envelope.get("authorized") is not True or envelope.get("version") != 1
+                        or envelope.get("home") != row["profile_home"]):
+                    store.disposition(row["id"], owner, row["owner_epoch"], "refused")
+                    continue
+                if row["kind"] == "message":
+                    event = _restore_event(json.dumps(data["event"]), adapter)
+                    source = event.source
+                else:
+                    from telegram import Update
+                    update = Update.de_json(data["callback"], adapter._bot)
+                    query = update.callback_query
+                    cb = adapter._callback_ctx(query)
+                    source = adapter.build_source(chat_id=str(cb["chat_id"]),
+                        chat_type="dm" if cb["chat_type"] == "private" else "group",
+                        user_id=str(query.from_user.id), thread_id=str(cb["thread_id"]) if cb["thread_id"] else None)
+                    adapter._canonicalize(source)
+                if (source.user_id != envelope.get("sender") or source.chat_id != envelope.get("chat")
+                        or adapter._is_sender_authorized(source.user_id, source.chat_type, source.chat_id,
+                            thread_id=source.thread_id) is not True or self._home(source) != row["profile_home"]
+                        or adapter._source_session_key(source) != row["session_key"]):
+                    store.disposition(row["id"], owner, row["owner_epoch"], "refused")
+                    continue
+                if row["kind"] == "message":
+                    await adapter.handle_message(event)
+                    accepted = event._gateway_accepted
+                else:
+                    adapter._owned_replaying_callback = True
+                    try:
+                        await adapter._handle_callback_query(update, None)
+                    finally:
+                        adapter._owned_replaying_callback = False
+                    accepted = True
+                if accepted:
+                    store.disposition(row["id"], owner, row["owner_epoch"], "accepted")
+                else:
+                    store.disposition(row["id"], owner, row["owner_epoch"], "refused")
+        if getattr(self.generation.runner, "_overlap_draining", False):
+            with store._transaction() as db:
+                claims = [dict(row) for row in db.execute(
+                    "SELECT * FROM sessions WHERE generation_id=?", (owner,))]
+            live = self._live_keys()
+            from tools.process_registry import process_registry
+            # A process, watcher, delegation or owed goal may outlive the
+            # adapter's active-turn marker. Preserve claims until the local
+            # generation has no dependent work, rather than moving an idle-
+            # looking session while its completion still belongs to A.
+            dependent_work = bool(self.generation.runner._active_work_count() or
+                                  self.generation.runner._pending_approvals or
+                                  process_registry.has_any_active() or
+                                  process_registry.pending_watchers)
+            lease = next((x for x in store.leases() if x["resource"] == "active_generation"), None)
+            if lease and lease["generation_id"] != owner:
+                for claim in claims:
+                    key = claim["session_key"]
+                    count = int(key in live or dependent_work)
+                    store.set_outstanding(claim["profile_home"], claim["transport"], key,
+                                          owner, claim["epoch"], count)
+                    if not count:
+                        store.transfer_session(claim["profile_home"], claim["transport"], key,
+                                               owner, claim["epoch"], lease["generation_id"], lease["epoch"])

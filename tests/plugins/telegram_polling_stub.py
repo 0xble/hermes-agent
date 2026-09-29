@@ -46,6 +46,14 @@ class BotAPI:
                 },
             } for uid in range(first, last + 1))
 
+    def add_callback(self, uid, data, *, chat_id=1):
+        with self.lock:
+            self.updates.append({"update_id": uid, "callback_query": {
+                "id": f"callback-{uid}", "from": {"id": chat_id, "is_bot": False, "first_name": "Test"},
+                "chat_instance": "test-instance", "data": data,
+                "message": {"message_id": 1, "date": 1800000000,
+                            "chat": {"id": chat_id, "type": "private"}, "text": "approval"}}})
+
     def _handler(self):
         state = self
 
@@ -93,14 +101,15 @@ class BotAPI:
                     elif method == "deletewebhook":
                         assert form.get("drop_pending_updates", ["false"])[0].lower() != "true"
                         result = True
-                    elif method in {"sendmessage", "sendchataction", "setmycommands", "setmyshortdescription"}:
+                    elif method in {"sendmessage", "sendchataction", "setmycommands", "setmyshortdescription", "answercallbackquery", "editmessagereplymarkup", "editmessagetext"}:
                         if method == "sendmessage":
                             with state.lock:
                                 state.sent.append({"chat_id": int(form.get("chat_id", [1])[0]),
-                                                   "text": form.get("text", [""])[0]})
+                                                   "text": form.get("text", [""])[0],
+                                                   "reply_markup": form.get("reply_markup", [""])[0]})
                         result = ({"message_id": 1, "date": 1800000000,
                                    "chat": {"id": 1, "type": "private"}, "text": "ok"}
-                                  if method == "sendmessage" else True)
+                                  if method in {"sendmessage", "editmessagetext"} else True)
                     else:
                         raise ValueError(method)
                     body = json.dumps({"ok": True, "result": result}).encode()

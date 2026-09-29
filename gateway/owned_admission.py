@@ -145,6 +145,27 @@ class OwnedAdmissionMixin:
             return bool(db.execute("UPDATE inbox SET state=? WHERE id=? AND state='pending'",
                                    (state, row_id)).rowcount)
 
+    def hold_dead_owner(self, owner: str) -> int:
+        """Interrupt pending rows only with PID/start-fingerprint death proof."""
+        from gateway.status import _get_process_start_time, _pid_exists
+        from gateway.generation import _boot_id
+        with self._transaction() as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            record = db.execute("SELECT pid,boot_id,start_fingerprint FROM generations WHERE id=?",
+                                (owner,)).fetchone()
+            if record is None:
+                raise RuntimeError("unknown owner; cannot prove death")
+            pid = int(record["pid"])
+            alive = _pid_exists(pid)
+            start = _get_process_start_time(pid) if alive else None
+            dead = (record["boot_id"] != _boot_id() or not alive or
+                    (start is not None and record["start_fingerprint"] != f"{pid}:{start}"))
+            if not dead:
+                return 0
+            db.execute("UPDATE generations SET state='failed' WHERE id=?", (owner,))
+            return db.execute("UPDATE inbox SET state='interrupted' WHERE owner_id=? AND state='pending'",
+                              (owner,)).rowcount
+
     def transfer_session(self, home: str, transport: str, key: str, old: str,
                          old_epoch: int, new: str, new_epoch: int) -> bool:
         with self._transaction() as db, db:

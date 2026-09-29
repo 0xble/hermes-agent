@@ -218,12 +218,17 @@ class ActiveGeneration:
         self._drain_stopping = False
         self._transfer_receipts: dict[str, dict] = {}
         self._poller_paused = False
+        self.owned_routing = None
         self._stopped_receipts: list[tuple[object, dict]] = []
 
     def bind_runner(self, runner, *, cron_stop=None, cron_provider=None) -> None:
         self.runner = runner
         self.cron_stop = cron_stop
         self.cron_provider = cron_provider
+        from gateway.owned_routing import OwnedRouting
+        self.owned_routing = OwnedRouting(self)
+        self.owned_routing.bind(runner)
+        self.owned_routing._task = asyncio.create_task(self.owned_routing.drain())
 
     def _telegram_adapters(self) -> dict[str, object]:
         adapters = getattr(self.runner, "adapters", {}) or {}
@@ -264,9 +269,11 @@ class ActiveGeneration:
                     stopped.append((adapter, receipt))
                     await asyncio.to_thread(self.coordinator.record_poller_stopped,
                                             self.identity.id, self.epoch, token, receipt["safe_offset"])
-                # No new autonomous dispatch from A. A's existing turns and egress stay alive.
-                # Keep the ticker thread alive but fence dispatch: a guarded
-                # rollback can restore it without reconstructing housekeeping.
+                # Freeze A's live session obligations before the lease can move.
+                if self.owned_routing is not None:
+                    self.owned_routing.claim_live()
+                # Keep housekeeping and the ticker alive, but fence new dispatch.
+                # A guarded rollback can restore them without reconstruction.
                 self.runner._overlap_draining = True
                 if self.cron_provider is not None:
                     from cron.scheduler_provider import InProcessCronScheduler
@@ -395,8 +402,10 @@ class ActiveGeneration:
         with contextlib.closing(self.coordinator.connect()) as conn:
             queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
                                   (self.identity.id,)).fetchone()
+            claims = conn.execute("SELECT 1 FROM sessions WHERE generation_id=? LIMIT 1",
+                                  (self.identity.id,)).fetchone()
         deadline = record["drain_deadline"]
-        if (busy or queued) and time.time() < deadline:
+        if (busy or queued or claims) and time.time() < deadline:
             return False
         if not self._drain_stopping:
             if time.time() >= deadline:
@@ -497,6 +506,10 @@ class ActiveGeneration:
                     last_warning = now
 
     async def close(self) -> None:
+        if self.owned_routing is not None and self.owned_routing._task is not None:
+            self.owned_routing._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.owned_routing._task
         if self.task:
             self.task.cancel()
             with suppress(asyncio.CancelledError):
