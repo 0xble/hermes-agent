@@ -1,7 +1,7 @@
 """Integration tests for tools.browser_supervisor.
 
-Exercises the supervisor end-to-end against a real local Chrome
-(``--remote-debugging-port``).  Skipped when Chrome is not installed
+Exercises the supervisor end-to-end against Playwright's bundled Chromium
+(``--remote-debugging-port``). Skipped when that test browser is not installed
 — these are the tests that actually verify the CDP wire protocol
 works, since mock-CDP unit tests can only prove the happy paths we
 thought to model.
@@ -12,10 +12,8 @@ They are therefore opt-in, twice over:
 * ``@pytest.mark.integration`` — excluded by the default
   ``addopts = "-m 'not integration'"`` in ``pyproject.toml``, so a bare
   ``pytest`` cannot launch a browser on a developer's desktop by accident.
-* ``HERMES_E2E_BROWSER=1`` — the env gate this docstring has always claimed.
-  It previously existed only in this prose: nothing read the variable, and
-  the sole real gate was "is a Chrome binary on PATH", which is true on most
-  desktops and on ``ubuntu-latest``. Now it is enforced.
+* ``HERMES_E2E_BROWSER=1`` — the explicit opt-in gate; Playwright's bundled
+  Chromium must also be installed. It never launches a PATH-resolved browser.
 
 Run manually:
     HERMES_E2E_BROWSER=1 scripts/run_tests.sh -m integration \\
@@ -36,6 +34,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -46,19 +45,16 @@ pytestmark = [
         os.environ.get("HERMES_E2E_BROWSER", "").strip() != "1",
         reason="real-browser E2E: set HERMES_E2E_BROWSER=1 to opt in",
     ),
-    pytest.mark.skipif(
-        not shutil.which("google-chrome") and not shutil.which("chromium"),
-        reason="Chrome/Chromium not installed",
-    ),
 ]
 
 
 def _find_chrome() -> str:
-    for candidate in ("google-chrome", "chromium", "chromium-browser"):
-        path = shutil.which(candidate)
-        if path:
-            return path
-    pytest.skip("no Chrome binary found")
+    playwright = pytest.importorskip("playwright.sync_api")
+    with playwright.sync_playwright() as pw:
+        binary = Path(pw.chromium.executable_path)
+    if not binary.is_file():
+        pytest.skip("Playwright's bundled Chromium is not installed")
+    return str(binary)
 
 
 @pytest.fixture

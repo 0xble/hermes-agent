@@ -83,6 +83,13 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
     if not files:
         raise RuntimeError(f'Empty Python shard {index}/{count}')
     print(f'Python shard {index}/{count}: {len(files)} files', flush=True)
+    if 'tests/tools/test_vault_shadow_dom_live.py' in files:
+        # This test must execute on the hosted gate, not silently skip because
+        # the runner lacks Playwright's separately downloaded Chromium.
+        env = dict(env, PLAYWRIGHT_BROWSERS_PATH='0')
+        run([python(env), '-m', 'playwright', 'install', 'chromium'], env=env)
+        run([python(env), '-c', 'from pathlib import Path; from playwright.sync_api import sync_playwright; '
+             'p = sync_playwright().start(); assert Path(p.chromium.executable_path).is_file(); p.stop()'], env=env)
     python_tests(env, files, workers)
 
 
