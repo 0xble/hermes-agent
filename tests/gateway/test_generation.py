@@ -7,6 +7,7 @@ import os
 import sqlite3
 import stat
 import time
+from unittest.mock import MagicMock
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,160 @@ from gateway.generation import (
     remove_generation_files,
     write_generation_record,
 )
+
+
+def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
+    from gateway import generation
+    import platform
+
+    monkeypatch.setattr(generation.sys, "platform", "darwin")
+    monkeypatch.setattr(platform, "node", lambda: "first-host")
+    result = MagicMock(stdout="boot-session\n")
+    calls = []
+    def sysctl(*args, **kwargs):
+        calls.append(args)
+        return result
+    monkeypatch.setattr(generation.subprocess, "run", sysctl)
+    generation._boot_id.cache_clear()
+    try:
+        first = generation._boot_id()
+        monkeypatch.setattr(platform, "node", lambda: "second-host")
+        assert generation._boot_id() == first == "boot-session"
+        assert len(calls) == 1
+    finally:
+        generation._boot_id.cache_clear()
+
+
+@pytest.mark.macos_only
+def test_macos_boot_id_fallback_is_host_independent(monkeypatch):
+    import platform
+    import psutil
+    from gateway import generation
+
+    monkeypatch.setattr(generation.subprocess, "run", lambda *a, **kw: MagicMock(stdout=""))
+    monkeypatch.setattr(psutil, "boot_time", lambda: 123456.9)
+    generation._boot_id.cache_clear()
+    try:
+        monkeypatch.setattr(platform, "node", lambda: "first-host")
+        first = generation._boot_id()
+        monkeypatch.setattr(platform, "node", lambda: "second-host")
+        assert generation._boot_id() == first == "darwin:123456"
+    finally:
+        generation._boot_id.cache_clear()
+
+
+def test_coordinator_closes_connections_after_heartbeat(tmp_path, monkeypatch):
+    coordinator = GenerationCoordinator(tmp_path)
+    connection = MagicMock()
+    monkeypatch.setattr(coordinator, "connect", lambda: connection)
+
+    coordinator.heartbeat("generation-id")
+
+    connection.close.assert_called_once_with()
+
+
+def test_two_hundred_heartbeats_do_not_leak_descriptors(tmp_path):
+    import psutil
+
+    coordinator = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="a", label="active")
+    coordinator.register(identity)
+    before = psutil.Process().num_fds()
+    for _ in range(200):
+        coordinator.heartbeat(identity.id)
+    assert psutil.Process().num_fds() <= before + 2
+
+
+@pytest.mark.macos_only
+def test_live_lease_is_not_stolen_after_hostname_change(tmp_path, monkeypatch):
+    import platform
+    from gateway import generation
+    from gateway.status import _get_process_start_time
+
+    generation._boot_id.cache_clear()
+    monkeypatch.setattr(platform, "node", lambda: "first-host")
+    try:
+        coordinator = GenerationCoordinator(tmp_path)
+        holder = GenerationIdentity.create(
+            release_sha="a", label="active",
+            start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
+        contender = GenerationIdentity.create(release_sha="b", label="standby")
+        coordinator.register(holder)
+        coordinator.register(contender)
+        epoch = coordinator.acquire_lease("active_generation", holder.id)
+        monkeypatch.setattr(platform, "node", lambda: "second-host")
+        with pytest.raises(RuntimeError, match="held by another"):
+            coordinator.acquire_lease("active_generation", contender.id)
+        assert coordinator.leases()[0]["epoch"] == epoch
+        assert next(row for row in coordinator.generations() if row["id"] == holder.id)["state"] != "failed"
+    finally:
+        generation._boot_id.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_standby_bind_failure_does_not_register_generation(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway import run_generation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    async def bind_failure(*args, **kwargs):
+        raise OSError("bind failed")
+    monkeypatch.setattr(run_generation.asyncio, "start_unix_server", bind_failure)
+    config = GatewayConfig.from_dict({"gateway": {"overlap_handover": {"enabled": True}}})
+
+    with pytest.raises(OSError, match="bind failed"):
+        await run_generation.serve_standby_generation(config)
+
+    assert GenerationCoordinator(tmp_path).generations() == []
+
+
+@pytest.mark.asyncio
+async def test_standby_chmod_failure_closes_socket_without_registration(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway import run_generation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    def chmod_failure(*args, **kwargs):
+        raise OSError("chmod failed")
+    monkeypatch.setattr(run_generation.os, "chmod", chmod_failure)
+    config = GatewayConfig.from_dict({"gateway": {"overlap_handover": {"enabled": True}}})
+    with pytest.raises(OSError, match="chmod failed"):
+        await run_generation.serve_standby_generation(config)
+    assert GenerationCoordinator(tmp_path).generations() == []
+    assert not list(tmp_path.glob("gateway.*.sock"))
+
+
+@pytest.mark.asyncio
+async def test_standby_record_failure_is_terminal(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway import run_generation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    def record_failure(*args, **kwargs):
+        raise OSError("record failed")
+    monkeypatch.setattr(run_generation, "write_generation_record", record_failure)
+    config = GatewayConfig.from_dict({"gateway": {"overlap_handover": {"enabled": True}}})
+    with pytest.raises(OSError, match="record failed"):
+        await run_generation.serve_standby_generation(config)
+    assert GenerationCoordinator(tmp_path).generations()[0]["state"] == "failed"
+    assert not list(tmp_path.glob("gateway.*.sock"))
+
+
+@pytest.mark.asyncio
+async def test_missing_process_start_time_fails_before_registration(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    from gateway import run_generation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.status._get_process_start_time", lambda pid: None)
+    config = GatewayConfig.from_dict({"gateway": {"overlap_handover": {"enabled": True}}})
+
+    with pytest.raises(RuntimeError, match="cannot determine process start time"):
+        await run_generation.start_active_generation(config)
+    with pytest.raises(RuntimeError, match="cannot determine process start time"):
+        await run_generation.serve_standby_generation(config)
+
+    assert GenerationCoordinator(tmp_path).generations() == []
 
 
 def test_coordinator_registers_heartbeats_and_exposes_leased_generations(tmp_path: Path):
@@ -111,6 +266,41 @@ def test_stale_live_holder_becomes_suspect_without_losing_lease(tmp_path):
         coordinator.acquire_lease("active_generation", second.id)
     assert coordinator.generations()[0]["state"] == "suspect"
     assert coordinator.leases()[0]["epoch"] == epoch
+
+
+@pytest.mark.asyncio
+async def test_ready_and_close_database_work_does_not_block_loop(tmp_path, monkeypatch):
+    import threading
+    from gateway.run_generation import ActiveGeneration
+
+    coordinator = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="a", label="active")
+    active = ActiveGeneration(tmp_path, coordinator, identity, 1)
+    entered, release = threading.Event(), threading.Event()
+    def blocked(*args, **kwargs):
+        entered.set()
+        release.wait(3)
+    monkeypatch.setattr(coordinator, "heartbeat", blocked)
+    monkeypatch.setattr(active, "_sync_runtime_status", lambda: None)
+    task = asyncio.create_task(active.mark_ready())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        await asyncio.wait_for(asyncio.sleep(0), 1)
+        assert not task.done()
+    finally:
+        release.set()
+        await task
+    entered.clear()
+    release.clear()
+    monkeypatch.setattr(coordinator, "release_lease", blocked)
+    task = asyncio.create_task(active.close())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        await asyncio.wait_for(asyncio.sleep(0), 1)
+        assert not task.done()
+    finally:
+        release.set()
+        await task
 
 
 @pytest.mark.asyncio

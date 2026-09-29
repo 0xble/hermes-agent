@@ -6,14 +6,16 @@ schema needed by the first handover slice.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
-import platform
 import sqlite3
+import subprocess
+import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass
 from contextlib import closing
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from gateway.owned_admission import OwnedAdmissionMixin
@@ -87,16 +89,33 @@ class GenerationIdentity:
         return record
 
 
+@functools.lru_cache(maxsize=1)
 def _boot_id() -> str:
-    for path in (Path("/var/run/boot_id"), Path("/proc/sys/kernel/random/boot_id")):
+    if sys.platform == "darwin":
         try:
-            value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
+            result = subprocess.run(
+                ["sysctl", "-n", "kern.bootsessionuuid"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            value = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            value = ""
         if value:
             return value
+        import psutil
+        return f"darwin:{int(psutil.boot_time())}"
+
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    if value:
+        return value
     import psutil
-    return f"{platform.node()}:{psutil.boot_time():.6f}"
+    return f"boot:{int(psutil.boot_time())}"
 
 
 class GenerationCoordinator(OwnedAdmissionMixin):
