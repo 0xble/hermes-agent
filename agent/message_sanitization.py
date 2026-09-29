@@ -282,6 +282,13 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
+# Non-empty closing row for strict role-alternation providers. This is internal
+# transcript scaffolding, not a prior assistant reply or a delivery payload.
+INTERRUPTED_TAIL_MARKER = (
+    "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
+)
+
+
 def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:
     """Append a synthetic assistant turn when an interrupted tail is a tool result: a transcript
     ending on a raw ``tool`` message makes the next user message land as ``tool → user``, an
@@ -291,9 +298,12 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     if not isinstance(last, dict) or last.get("role") != "tool":
         return False
     text = final_response if isinstance(final_response, str) else ""
+    from agent.interrupt_diagnostics import is_interrupt_diagnostic
     from agent.message_metadata import append_message
 
-    append_message(messages, {"role": "assistant", "content": text.strip() or "Operation interrupted."})
+    append_message(messages, {"role": "assistant", "content": (
+        INTERRUPTED_TAIL_MARKER if is_interrupt_diagnostic(text) else text.strip() or INTERRUPTED_TAIL_MARKER
+    )})
     return True
 
 
