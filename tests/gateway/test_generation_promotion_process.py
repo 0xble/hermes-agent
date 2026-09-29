@@ -48,6 +48,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
     monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
     api = BotAPI()
     started = tmp_path / "tool-running"
+    # chmod 777 intentionally triggers the dangerous-command approval detector.
     command = f"chmod 777 {shlex.quote(str(tmp_path))} && touch {shlex.quote(str(started))} && sleep 60"
     def model(record):
         messages = record["body"]["messages"]

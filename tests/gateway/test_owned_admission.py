@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import sqlite3
 from contextlib import closing
 
 import pytest
 
 from gateway.generation import GenerationCoordinator, GenerationIdentity
+from gateway.status import _get_process_start_time
 
 
 def _pair(tmp_path):
     store = GenerationCoordinator(tmp_path)
-    old = GenerationIdentity.create(release_sha="a", label="slot-a")
-    new = GenerationIdentity.create(release_sha="b", label="slot-b")
+    fingerprint = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
+    old = GenerationIdentity.create(release_sha="a", label="slot-a", start_fingerprint=fingerprint)
+    new = GenerationIdentity.create(release_sha="b", label="slot-b", start_fingerprint=fingerprint)
     store.register(old, state="draining")
     store.register(new, state="serving")
     previous = store.acquire_lease("active_generation", old.id)
@@ -132,6 +135,48 @@ def test_dead_owner_holds_pending_rows_without_replaying(tmp_path, monkeypatch):
     again, fresh = store.enqueue("home-a", "telegram", "chat", "one", "message",
                                  _source(), b"work", new.id, epoch)
     assert not fresh and again["state"] == "interrupted"
+    later, fresh = store.enqueue("home-a", "telegram", "chat", "two", "message",
+                                 _source(), b"next", new.id, epoch)
+    assert fresh and later["owner_id"] == new.id and later["seq"] == 2
+
+
+
+
+
+
+def test_first_message_after_owner_death_moves_to_successor(tmp_path, monkeypatch):
+    store, old, new, epoch = _pair(tmp_path)
+    store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    row, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                               _source(), b"next", new.id, epoch)
+    assert fresh and row["owner_id"] == new.id and row["state"] == "pending"
+
+
+def test_exited_owner_outstanding_claim_moves_without_replaying_cut_work(tmp_path):
+    store, old, new, epoch = _pair(tmp_path)
+    store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+    row, _ = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                           _source(), b"cut-work", new.id, epoch)
+    store.heartbeat(old.id, state="exited")
+    assert store.release_exited_owner(old.id) == 1
+    later, fresh = store.enqueue("home-a", "telegram", "chat", "two", "message",
+                                 _source(), b"next", new.id, epoch)
+    assert fresh and later["owner_id"] == new.id
+    with closing(store.connect()) as db:
+        assert db.execute("SELECT state FROM inbox WHERE id=?", (row["id"],)).fetchone()[0] == "interrupted"
+
+
+
+
+def test_interrupted_row_does_not_replay_after_handler_failure(tmp_path):
+    store, old, new, epoch = _pair(tmp_path)
+    row, _ = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                           _source(), b"work", new.id, epoch)
+    assert store.interrupt_row(row["id"], new.id, epoch)
+    duplicate, fresh = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                                     _source(), b"work", new.id, epoch)
+    assert not fresh and duplicate["state"] == "interrupted"
 
 
 def test_invalid_source_and_oversized_payload_fail_closed(tmp_path):

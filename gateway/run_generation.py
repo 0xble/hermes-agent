@@ -318,10 +318,7 @@ class ActiveGeneration:
         record = next((row for row in rows if row["id"] == self.identity.id), None)
         if record is None or record["state"] != "draining":
             return False
-        from tools.process_registry import process_registry
-        busy = (self.runner._active_work_count() or
-                bool(self.runner._pending_approvals) or
-                process_registry.has_any_active() or process_registry.pending_watchers)
+        busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals))
         with contextlib.closing(self.coordinator.connect()) as conn:
             queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
                                   (self.identity.id,)).fetchone()
@@ -433,6 +430,7 @@ class ActiveGeneration:
         await asyncio.to_thread(
             self.coordinator.release_lease, "active_generation", self.identity.id, self.epoch)
         await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="exited")
+        await asyncio.to_thread(self.coordinator.release_exited_owner, self.identity.id)
         await asyncio.to_thread(remove_generation_files, self.home, self.identity)
         runtime_path = self.home / f"gateway_runtime.{self.identity.id}.json"
         from gateway.status import read_runtime_status
