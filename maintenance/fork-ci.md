@@ -22,7 +22,19 @@ smoke manifest for complete discovery.
 
 Portable Python execution passes `--file-retries 0`, including E2E and native OS
 qualification. A fail-once test stays failed at the gate entrypoint. Interactive
-runner defaults remain unchanged. `scripts/ci/tests/test_portable.py` exercises
+runner defaults remain unchanged. The Windows Desktop cwd self-test retains its
+60-second limit; on a timeout it snapshots the PowerShell parent exit state
+and live descendant PIDs/names/statuses, kills the snapshotted process tree,
+then performs a bounded drain to capture partial stdout. If the drain still
+times out, it raises the snapshot without closing a pipe held by a reader thread.
+Nightly 36492811025 timed out inside Python's stdout reader-thread join,
+without child output or process-state evidence. The exact test and updater script
+were unchanged from two earlier successful Windows lanes, so the runner-versus-
+child cause remains unknown. This diagnostic tests the next failure boundary,
+not a claim that process inheritance caused that run. Upstream issue #95971
+records a different updater fixture hanging on hosted Windows; no product change
+or changed timeout is justified by this run alone.
+`scripts/ci/tests/test_portable.py` exercises
 both outcomes with a real pytest file and a persistent attempt counter. The slow
 summary E2E explicitly configures `compression.abort_on_summary_failure: true`
 when asserting no archived history: with the default false, a second stalled
