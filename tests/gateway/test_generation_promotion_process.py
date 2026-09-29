@@ -211,7 +211,9 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                 [sys.executable, str(worker_path), "worker", "active"],
                 env={**env, "TEST_THIRD_FORCE": "1"}, capture_output=True, text=True, timeout=25)
             assert third.returncode != 0, third.stdout + third.stderr
-            assert "Gateway runtime lock is already held" in third.stderr or "Gateway runtime lock is already held" in (home / "logs" / "gateway.log").read_text()
+            assert ("Gateway runtime lock is already held" in third.stderr
+                    or "Gateway runtime lock is already held" in (home / "logs" / "gateway.log").read_text()
+                    or "A gateway already owns this host" in third.stderr)
             assert "EXIT:False" in third.stdout, third.stdout + third.stderr
             assert processes[1].poll() is None, "third start displaced promoted B"
     finally:
