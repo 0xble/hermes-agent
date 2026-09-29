@@ -535,3 +535,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   required routing (`delegation.model`, `auxiliary.review.model`).
 - Guard: `tests/scripts/test_candidate_scripts.py`
   (`test_check_config_does_not_pin_background_review`).
+
+
+## Kanban worker exit trailers identify the worker
+
+- Fork patch identity: `kanban-worker-exit-pid`.
+- Per-task worker logs are append-only across retries. The exit trailer previously carried only the
+  return code, so a fresh dispatcher process could read an exit code from another retry when it
+  reaped a dead PID. Trailers now include the worker PID and the dispatcher selects the matching
+  trailer, while retaining a legacy fallback for old logs.
+- Guard: `tests/hermes_cli/test_kanban_worker_exit_trailer.py`
+  (`test_logged_exit_code_matches_worker_pid_across_appended_retries`).

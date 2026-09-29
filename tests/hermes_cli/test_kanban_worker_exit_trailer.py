@@ -83,6 +83,20 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
             assert run["outcome"] == "rate_limited"
 
 
+def test_logged_exit_code_matches_worker_pid_across_appended_retries(kanban_home):
+    """An append-only task log may contain a later retry's trailer; select the dead PID's code."""
+    tid = "t_pid_match"
+    log = kb.worker_log_path(tid)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE} pid=70001\n"
+        f"{KANBAN_WORKER_EXIT_TRAILER}0 pid=70002\n",
+        encoding="utf-8",
+    )
+    assert kbd._worker_log_exit_code(tid, pid=70001) == kb.KANBAN_RATE_LIMIT_EXIT_CODE
+    assert kbd._worker_log_exit_code(tid, pid=70002) == 0
+
+
 def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
     """The third consecutive clean exit trips the violation budget and ``recompute_ready``
     must not promote the card back the same tick (``consecutive_failures`` is still below
