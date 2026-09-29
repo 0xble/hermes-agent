@@ -46,7 +46,8 @@ def read_generation_status(home: Path) -> list[dict[str, Any]]:
             polling = conn.execute("SELECT generation_id,epoch FROM leases "
                                    "WHERE resource='active_generation' AND state='active'").fetchone()
             outstanding = {row["generation_id"]: row["n"] for row in conn.execute(
-                "SELECT generation_id,SUM(outstanding_work) AS n FROM sessions GROUP BY generation_id")}
+                "SELECT generation_id,SUM(outstanding_work) AS n FROM sessions "
+                "WHERE state!='interrupted' GROUP BY generation_id")}
             for row in rows:
                 row["leases"] = leases.get(row["id"], [])
                 row["polling_owner"] = bool(polling and polling["generation_id"] == row["id"])

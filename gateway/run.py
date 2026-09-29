@@ -5717,28 +5717,33 @@ async def _start_gateway_start_control_socket(runner):
     return _control_server
 
 
-def _start_gateway_start_cron_and_housekeeping(runner):
-    """Start the cron scheduler thread + gateway housekeeping thread; returns
-    ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
-    # The event loop is passed so cron delivery can use live adapters (E2EE support).
+def _resolve_gateway_cron_provider(config):
+    """Resolve the ticker before adapter connection when overlap needs its dispatch fence."""
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
-    cron_stop = threading.Event()
-    # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
-    # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set
-    # on that flag left every non-launch profile's jobs in a store no ticker visited: they
-    # silently never fired.
+    from gateway.generation import overlap_handover_enabled
+
+    # The gateway ticks every profile's store regardless of adapter multiplex mode.
     try:
-        cron_profile_homes = _cron_tick_profile_homes(runner.config)
+        cron_profile_homes = _cron_tick_profile_homes(config)
     except Exception as exc:
         logger.warning("Could not resolve profile homes for cron: %s", exc)
         cron_profile_homes = []
-    # External providers own one unscoped remote registry, so they can only serve a single home.
     cron_provider = scheduler_for_profile_mode(
         resolve_cron_scheduler(), multiplex_profiles=len(cron_profile_homes) > 1)
-    from gateway.run_generation import overlap_handover_enabled
-    if overlap_handover_enabled(runner.config) and not isinstance(cron_provider, InProcessCronScheduler):
+    if overlap_handover_enabled(config) and not isinstance(cron_provider, InProcessCronScheduler):
         raise RuntimeError("overlap requires an in-process cron ticker with a generation dispatch fence")
+    return cron_provider, cron_profile_homes
+
+
+def _start_gateway_start_cron_and_housekeeping(runner, *, resolved_cron=None):
+    """Start the cron scheduler thread + gateway housekeeping thread; returns
+    ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+    # The event loop is passed so cron delivery can use live adapters (E2EE support).
+    from cron.scheduler_provider import InProcessCronScheduler
+    cron_stop = threading.Event()
+    cron_provider, cron_profile_homes = (resolved_cron if resolved_cron is not None
+                                         else _resolve_gateway_cron_provider(runner.config))
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
 
     if isinstance(cron_provider, InProcessCronScheduler) and cron_profile_homes:
@@ -5898,6 +5903,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _start_gateway_configure_logging(verbosity)
 
     runner = GatewayRunner(config)
+    # An external cron provider cannot fence fresh ticks at transfer. Reject it
+    # before this process claims its PID or any adapter opens a token connection.
+    _preflight_cron = (_resolve_gateway_cron_provider(runner.config)
+                       if getattr(runner.config, "overlap_handover_enabled", False) else None)
     # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
     # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
     # See #82936.
@@ -6072,7 +6081,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             await _close_active_generation()
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
-        _start_gateway_start_cron_and_housekeeping(runner))
+        _start_gateway_start_cron_and_housekeeping(runner, resolved_cron=_preflight_cron))
 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()

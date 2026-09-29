@@ -7,8 +7,10 @@ import json
 import os
 import signal
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -406,9 +408,19 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, 
         api.close()
 
 
+@pytest.fixture
+def short_gateway_home():
+    root = Path(tempfile.mkdtemp(prefix="p3proc-", dir="/tmp"))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+@pytest.mark.integration
 @pytest.mark.asyncio
-async def test_successor_stops_wire_before_restoring_old_polling(tmp_path):
+async def test_successor_stops_wire_before_restoring_old_polling(short_gateway_home):
     """A real Bot API stub sees no concurrent poll even across rollback."""
+    tmp_path = short_gateway_home
     from gateway.run_generation import _generation_request
     api = BotAPI()
     started = tmp_path / "old-tool-running"
@@ -466,7 +478,27 @@ async def test_successor_stops_wire_before_restoring_old_polling(tmp_path):
         rows = {row["label"]: row for row in db.generations()}
         assert "ai.hermes.gateway-b" in rows, (rows, [(p.poll(), p.stderr.read() if p.poll() is not None else "") for p in processes])
         old, new = rows["ai.hermes.gateway"], rows["ai.hermes.gateway-b"]
-        epoch = await asyncio.to_thread(handover_to_generation, home, new["id"], timeout=35)
+        old_socket = generation_paths(home, GenerationIdentity(**{key: old[key] for key in
+            ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")}))["socket"]
+        end = time.monotonic() + 15
+        while not old_socket.exists() and time.monotonic() < end:
+            await asyncio.sleep(.1)
+        assert old_socket.exists(), "A registered ready without its control socket"
+        try:
+            epoch = await asyncio.to_thread(handover_to_generation, home, new["id"], timeout=35)
+        except Exception as exc:
+            diagnostics = []
+            for proc in processes:
+                os.set_blocking(proc.stderr.fileno(), False)
+                try:
+                    diagnostics.append(os.read(proc.stderr.fileno(), 100000).decode(errors="replace")[-6000:])
+                except BlockingIOError:
+                    diagnostics.append("")
+            raise AssertionError(
+                f"handover {exc!r}; offsets={api.offsets[-8:]}; sent={api.sent}; "
+                f"leases={db.leases()}; generations={db.generations()}; "
+                f"errors={api.errors}; process_status={[p.poll() for p in processes]}; "
+                f"stderr={diagnostics}") from exc
         socket_b = generation_paths(home, GenerationIdentity(**{key: new[key] for key in
             ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")}))["socket"]
         socket_a = generation_paths(home, GenerationIdentity(**{key: old[key] for key in
