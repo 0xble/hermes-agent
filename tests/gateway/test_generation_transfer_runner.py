@@ -84,6 +84,39 @@ async def test_abandoned_transfer_rearms_old_generation_and_allows_retry(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_driver_aborts_without_ack_and_old_generation_rearms(tmp_path, monkeypatch):
+    import gateway.run_generation as generation_run
+
+    monkeypatch.setattr(generation_run, "HANDOVER_REQUEST_TIMEOUT", .2)
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    assert active._pending_transfer is not None
+    nonce = active._pending_transfer[1]
+    assert db.abort_transfer(old.id, new.id, epoch, attempt_nonce=nonce)
+    assert active._drain_task is not None
+    drain_task = active._drain_task
+    try:
+        await asyncio.wait_for(drain_task, 3)
+        assert adapter.resumed
+        assert active._pending_transfer is None
+        assert runner._overlap_draining is False
+    finally:
+        if not drain_task.done():
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_committed_transfer_cannot_be_aborted_by_old_deadline(tmp_path, monkeypatch):
     import gateway.run_generation as generation_run
 

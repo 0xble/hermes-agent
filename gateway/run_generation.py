@@ -522,6 +522,28 @@ class ActiveGeneration:
                     except Exception:
                         logger.exception("transfer deadline abort failed; old gateway remains fenced")
                     else:
+                        if not aborted:
+                            def read_transfer():
+                                with contextlib.closing(self.coordinator.connect()) as conn:
+                                    return conn.execute(
+                                        "SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
+                                        (self.identity.id, self.epoch)).fetchone()
+
+                            try:
+                                row = await asyncio.to_thread(read_transfer)
+                            except Exception:
+                                logger.exception("transfer deadline status unavailable; old gateway remains fenced")
+                                row = None
+                            if row is not None and row["attempt_nonce"] != nonce:
+                                logger.warning("transfer attempt changed; dropping stale pending recovery for %s", self.identity.id)
+                                self._pending_transfer = None
+                            elif row is not None and row["state"] == "committed":
+                                self._pending_transfer = None
+                            elif row is not None and row["state"] == "aborted":
+                                aborted = True
+                            else:
+                                self._rearm_errors = ["transfer deadline abort could not be proved"]
+                                await asyncio.to_thread(self._sync_runtime_status)
                         if aborted:
                             logger.warning("transfer deadline expired; re-arming old gateway %s", self.identity.id)
                             try:
