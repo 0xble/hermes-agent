@@ -860,30 +860,53 @@ def _stall_source_fingerprint(agent: Any, messages: Any, approx_tokens: Optional
 
 def _record_stall_interrupted_backoff(
     agent: Any, *, commit_fence: Optional[CompressionCommitFence], started_at: float, messages: Any,
-    approx_tokens: Optional[int],
+    approx_tokens: Optional[int], attempt_generation: Optional[int] = None,
 ) -> bool:
-    """Persist a stall-interrupted cooldown after snapshot restore.
-    Must run *after* ``_restore_compressor_attempt_state`` so rollback cannot wipe the new row. Returns True
-    when the backoff was recorded."""
+    """Persist a stall-interrupted cooldown only while this attempt still owns summary work.
+    The host has already recorded a detached worker's timeout; its late unwind must not re-arm a
+    cooldown over a newer attempt's summary. Serialize the ownership check and durable write against
+    the next summary's working claim, just as snapshot rollback is serialized against entry claims."""
     if not compression_attempt_stalled(commit_fence=commit_fence, started_at=started_at):
         return False
     compressor = getattr(agent, "context_compressor", None)
-    # Same timeout cooldown ladder as summary-LLM timeouts (#62452): avoid re-burning the full idle budget
-    # every turn.
-    record = getattr(compressor, "record_timeout_failure", None)
-    if not callable(record):
-        return False
-    error = f"{STALL_INTERRUPTED_FAILURE_CLASS}:{_stall_source_fingerprint(agent, messages, approx_tokens)}"
-    try:
-        record(error, failure_kind="stall_interrupted")
-    except Exception:
-        logger.debug("stall-interrupted compression cooldown persist failed", exc_info=True)
-        return False
+    with _compressor_attempt_serial_lock(compressor):
+        if attempt_generation is not None and not _compressor_attempt_is_current(compressor, attempt_generation):
+            logger.info("Skipping stale stall-interrupted backoff (attempt generation %s)", attempt_generation)
+            return False
+        record = getattr(compressor, "record_timeout_failure", None)
+        if not callable(record):
+            return False
+        error = f"{STALL_INTERRUPTED_FAILURE_CLASS}:{_stall_source_fingerprint(agent, messages, approx_tokens)}"
+        try:
+            record(error, failure_kind="stall_interrupted")
+        except Exception:
+            logger.debug("stall-interrupted compression cooldown persist failed", exc_info=True)
+            return False
     logger.info(
         "Recorded stall-interrupted compression backoff (session=%s, %s)", getattr(agent, "session_id", None) or "none",
         error,
     )
     return True
+
+
+def _record_recovered_stall_backoff(agent: Any) -> None:
+    """The host owns the backoff when a detached primary loses its write to a recovery attempt.
+
+    The fallback may commit before the primary worker unwinds, so the worker's generation-guarded
+    write no longer supplies this backoff. A healthy fallback can also clear an earlier primary
+    write; arm one backoff after recovery unless one is already active.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    record = getattr(compressor, "record_timeout_failure", None)
+    if not callable(record):
+        return
+    with _compressor_attempt_serial_lock(compressor):
+        if getattr(compressor, "_summary_failure_cooldown_until", 0) > time.monotonic():
+            return
+        try:
+            record("host summary route stalled before fallback recovery", failure_kind="stall_interrupted")
+        except Exception:
+            logger.debug("recovered-stall compression cooldown persist failed", exc_info=True)
 
 
 def resolve_compression_fallback_route() -> Optional[dict]:
@@ -1300,6 +1323,8 @@ def run_compress_context_with_progress_timeout(
                 escalate_deterministic=escalate_deterministic,
             )
             if recovered is not None:
+                if telemetry_agent is not None:
+                    _record_recovered_stall_backoff(telemetry_agent)
                 return recovered
         if on_timeout is not None:
             with _swallow('compress_context timeout callback failed', exc_info=True):
@@ -3982,7 +4007,7 @@ def _run_summary_phase(
         # while the lease is still held so the next turn cannot race it.
         _stall_backoff = _record_stall_interrupted_backoff(
             agent, commit_fence=commit_fence, started_at=attempt.started_at, messages=messages,
-            approx_tokens=approx_tokens,
+            approx_tokens=approx_tokens, attempt_generation=attempt.generation,
         )
         _stop_heartbeat("context compression cancelled")
         lease.release()
@@ -4240,7 +4265,7 @@ def compress_context(
                 agent._last_compaction_in_place = False
                 _stall_backoff = _record_stall_interrupted_backoff(
                     agent, commit_fence=commit_fence, started_at=attempt.started_at, messages=messages,
-                    approx_tokens=approx_tokens,
+                    approx_tokens=approx_tokens, attempt_generation=attempt.generation,
                 )
                 _existing_sp = _existing_system_prompt(agent, system_message)
                 _emit_aborted_attempt_telemetry(

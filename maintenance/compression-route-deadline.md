@@ -4,7 +4,7 @@ Load this unit when changing compression worker cancellation, shared route deadl
 
 ## Required behavior
 
-A compression worker that unwinds because the shared route deadline expires is distinct from an explicit stop. A completed worker-side deadline result must still enter the configured fallback ladder, and if no fallback succeeds, an adopted concurrent transcript tail must be returned instead of the stale wrapper snapshot. Explicit stops and successful commits must not retry.
+A compression worker that unwinds because the shared route deadline expires is distinct from an explicit stop. A completed worker-side deadline result must still enter the configured fallback ladder, and if no fallback succeeds, an adopted concurrent transcript tail must be returned instead of the stale wrapper snapshot. Explicit stops and successful commits must not retry. A cancelled worker that unwinds after another compression attempt claims the compressor must not persist its old stall cooldown over that newer attempt. The host records a recovered primary stall after its fallback commits, so suppressing stale writes does not lose the next-turn backoff.
 
 ## Provenance and patches
 
@@ -14,7 +14,7 @@ Ported from archived HERMES-107 (archived commit `4dcb30f6bd62`) after reproduci
 
 ## Verification
 
-`scripts/run_tests.sh tests/agent/test_compression_stall_fallback.py tests/agent/test_compression_attempt_lifecycle.py -j 6`
+`scripts/run_tests.sh tests/agent/test_compression_stall_fallback.py tests/agent/test_compression_attempt_lifecycle.py tests/agent/test_compression_stall_deterministic_fallback.py -j 6`
 
 ## Retirement and rollback
 
