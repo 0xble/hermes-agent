@@ -5379,6 +5379,9 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     return shutdown_signal_handler
 
 
+_pid_cleanup_registered = False
+
+
 def _start_gateway_claim_pid_file(force: bool = False, *, projected_identity=None) -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
     import atexit
@@ -5403,8 +5406,11 @@ def _start_gateway_claim_pid_file(force: bool = False, *, projected_identity=Non
         release_gateway_runtime_lock()
         logger.error("PID file race lost to another gateway instance. Exiting.")
         return False
-    atexit.register(remove_pid_file)
-    atexit.register(release_gateway_runtime_lock)
+    global _pid_cleanup_registered
+    if not _pid_cleanup_registered:
+        atexit.register(remove_pid_file)
+        atexit.register(release_gateway_runtime_lock)
+        _pid_cleanup_registered = True
     _claim_host_gateway_role(force=force)
     return True
 

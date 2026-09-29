@@ -29,6 +29,7 @@ from gateway.generation import (
 
 logger = logging.getLogger(__name__)
 HANDOVER_REQUEST_TIMEOUT = 45  # Same bound as generation control acknowledgements.
+DEFAULT_DRAIN_SECONDS = 7200  # Match the commit cap when the durable deadline is missing.
 
 
 class HandoverCommittedUnverified(RuntimeError):
@@ -74,7 +75,7 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
 
 
 def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
-                           drain_seconds: float = 7200) -> int:
+                           drain_seconds: float = DEFAULT_DRAIN_SECONDS) -> int:
     """Internal updater entry point; never ask the lease holder to relinquish by force."""
     if not 1 <= drain_seconds <= 86400:
         raise ValueError("drain_seconds must be between 1 and 86400")
@@ -315,7 +316,9 @@ class ActiveGeneration:
         self._drain_task: asyncio.Task | None = None
         self._drain_stopping = False
         self.owned_routing = None
+        self._drain_stopped = False
         self._missing_deadline_warned = False
+        self._local_drain_deadline: float | None = None
         self._stopped_receipts: list[tuple[object, dict]] = []
         self._pending_transfer: tuple[str, str, float] | None = None
         self._external_cron_stopped = False
@@ -498,19 +501,29 @@ class ActiveGeneration:
 
         queued, claims = await asyncio.to_thread(read_pending_work)
         deadline = record["drain_deadline"]
-        if deadline is None and not self._missing_deadline_warned:
-            logger.warning("generation missing drain deadline; treating as expired")
-            self._missing_deadline_warned = True
-        if (busy or queued or claims) and deadline is not None and time.time() < deadline:
+        if deadline is None:
+            if self._local_drain_deadline is None:
+                self._local_drain_deadline = time.time() + DEFAULT_DRAIN_SECONDS
+            deadline = self._local_drain_deadline
+            if not self._missing_deadline_warned:
+                logger.warning("generation missing drain deadline; using local drain cap")
+                self._missing_deadline_warned = True
+        if (busy or queued or claims) and time.time() < deadline:
             return False
-        if not self._drain_stopping:
+        if self._drain_stopping:
+            return self._drain_stopped
+        self._drain_stopping = True
+        try:
             if busy or queued or claims:
                 await asyncio.to_thread(self.coordinator.fence_draining_generation, self.identity.id)
                 # The normal shutdown path marks live turns resume_pending. The cap
                 # is different: interrupted side effects must not auto-run again.
                 self.runner._overlap_cap_interrupted = True
-            self._drain_stopping = True
             await self.runner.stop()
+        except BaseException:
+            self._drain_stopping = False
+            raise
+        self._drain_stopped = True
         return True
 
     async def _drain_after_transfer(self) -> None:
@@ -537,6 +550,28 @@ class ActiveGeneration:
                     except Exception:
                         logger.exception("transfer deadline abort failed; old gateway remains fenced")
                     else:
+                        if not aborted:
+                            def read_transfer():
+                                with contextlib.closing(self.coordinator.connect()) as conn:
+                                    return conn.execute(
+                                        "SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
+                                        (self.identity.id, self.epoch)).fetchone()
+
+                            try:
+                                row = await asyncio.to_thread(read_transfer)
+                            except Exception:
+                                logger.exception("transfer deadline status unavailable; old gateway remains fenced")
+                                row = None
+                            if row is not None and row["attempt_nonce"] != nonce:
+                                logger.warning("transfer attempt changed; dropping stale pending recovery for %s", self.identity.id)
+                                self._pending_transfer = None
+                            elif row is not None and row["state"] == "committed":
+                                self._pending_transfer = None
+                            elif row is not None and row["state"] == "aborted":
+                                aborted = True
+                            else:
+                                self._rearm_errors = ["transfer deadline abort could not be proved"]
+                                await asyncio.to_thread(self._sync_runtime_status)
                         if aborted:
                             logger.warning("transfer deadline expired; re-arming old gateway %s", self.identity.id)
                             try:

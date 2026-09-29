@@ -84,6 +84,39 @@ async def test_abandoned_transfer_rearms_old_generation_and_allows_retry(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_driver_aborts_without_ack_and_old_generation_rearms(tmp_path, monkeypatch):
+    import gateway.run_generation as generation_run
+
+    monkeypatch.setattr(generation_run, "HANDOVER_REQUEST_TIMEOUT", .2)
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    assert active._pending_transfer is not None
+    nonce = active._pending_transfer[1]
+    assert db.abort_transfer(old.id, new.id, epoch, attempt_nonce=nonce)
+    assert active._drain_task is not None
+    drain_task = active._drain_task
+    try:
+        await asyncio.wait_for(drain_task, 3)
+        assert adapter.resumed
+        assert active._pending_transfer is None
+        assert runner._overlap_draining is False
+    finally:
+        if not drain_task.done():
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_committed_transfer_cannot_be_aborted_by_old_deadline(tmp_path, monkeypatch):
     import gateway.run_generation as generation_run
 
@@ -544,7 +577,50 @@ async def test_serving_successor_is_not_demoted_by_ready_mark(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path, caplog):
+async def test_concurrent_drain_inspections_stop_runner_once(tmp_path, monkeypatch):
+    import threading
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    with db.connect() as conn:
+        conn.execute("UPDATE generations SET drain_deadline=0 WHERE id=?", (old.id,))
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    stopped = []
+
+    async def stop():
+        stopped.append(True)
+
+    active.bind_runner(Mock(adapters={}, _overlap_draining=True, _pending_approvals={},
+                            _active_work_count=lambda: 1, stop=stop))
+    entered, release = threading.Event(), threading.Event()
+    original_fence = db.fence_draining_generation
+
+    def slow_fence(*args):
+        entered.set()
+        release.wait(2)
+        return original_fence(*args)
+
+    monkeypatch.setattr(db, "fence_draining_generation", slow_fence)
+    first = asyncio.create_task(active.finish_draining_once())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        second = asyncio.create_task(active.finish_draining_once())
+        await asyncio.sleep(.1)
+    finally:
+        release.set()
+    assert await first is True
+    assert await second in (False, True)
+    assert stopped == [True]
+
+
+@pytest.mark.asyncio
+async def test_missing_drain_deadline_uses_local_cap_without_repeated_warning(tmp_path, caplog, monkeypatch):
     db = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
@@ -561,12 +637,21 @@ async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path,
     active.bind_runner(runner)
     db.request_transfer(old.id, new.id, epoch, set())
     await active.transfer_requested(new.id)
-    # The production drain task is concurrent; exercise repeated inspection here.
+    # Isolate the repeated inspection from the production drain task.
     assert active._drain_task is not None
     active._drain_task.cancel()
+    await asyncio.gather(active._drain_task, return_exceptions=True)
     db.commit_transfer(old.id, new.id, epoch)
     with db.connect() as conn:
         conn.execute("UPDATE generations SET drain_deadline=NULL WHERE id=?", (old.id,))
+    import gateway.run_generation as generation_run
+    now = [10_000.0]
+    monkeypatch.setattr(generation_run.time, "time", lambda: now[0])
+    assert not await active.finish_draining_once()
+    now[0] += 7199
+    assert not await active.finish_draining_once()
+    assert stopped == []
+    now[0] += 2
     assert await active.finish_draining_once()
     assert await active.finish_draining_once()
     assert stopped == [True]
@@ -613,6 +698,24 @@ async def test_takeover_releases_failed_claim_before_retry(monkeypatch):
     assert await asyncio.wait_for(generation_run.take_over_legacy_gateway_resources(
         identity, claim=claim, start_socket=start_socket, refresh=lambda: None), 2) == "claimed"
     assert attempts == 2 and removed == [True]
+
+
+@pytest.mark.asyncio
+async def test_claim_retry_registers_exit_cleanup_once(monkeypatch):
+    import atexit
+    import gateway.run as gateway_run
+    import gateway.status as status
+
+    registrations = []
+    monkeypatch.setattr(atexit, "register", lambda fn: registrations.append(fn))
+    monkeypatch.setattr(status, "acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr(status, "get_running_pid", lambda: None)
+    monkeypatch.setattr(status, "write_pid_file", lambda **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_claim_host_gateway_role", lambda **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_pid_cleanup_registered", False, raising=False)
+    assert gateway_run._start_gateway_claim_pid_file()
+    assert gateway_run._start_gateway_claim_pid_file()
+    assert registrations == [status.remove_pid_file, status.release_gateway_runtime_lock]
 
 
 @pytest.mark.asyncio
