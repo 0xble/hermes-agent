@@ -860,6 +860,9 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         extra = self.config.extra
         self._app: Optional[Application] = None
+        self._controlled_journal = None
+        self._controlled_poller = None
+        self._controlled_standby = False
         self._seen_update_ids: dict = {}
         self._inflight_update_ids: dict = {}
         self._update_admission = None
@@ -2221,11 +2224,127 @@ class TelegramAdapter(BasePlatformAdapter):
             async def do_request(self, *args, **kwargs):
                 generation = _POLLING_GENERATION_CONTEXT.get()
                 result = await super().do_request(*args, **kwargs)
+                journal = getattr(adapter, "_controlled_journal", None)
+                if journal is not None and generation is not None and 200 <= result[0] < 300:
+                    # The request is dedicated to getUpdates. Commit the wire bytes
+                    # before PTB parses or another request can confirm their offset.
+                    write = asyncio.create_task(asyncio.to_thread(journal.record_response, result[1]))
+                    try:
+                        await asyncio.shield(write)
+                    except (ValueError, json.JSONDecodeError):
+                        logger.warning("[%s] Malformed successful Telegram getUpdates response", adapter.name)
+                        raise
+                    except asyncio.CancelledError:
+                        # A cancelled poll must not leave a committed response racing
+                        # a successor's first offset. Wait for the durable write.
+                        await write
+                        raise
                 adapter._observe_polling_request_result(self, generation, result)
                 return result
 
         request.__class__ = _InstrumentedPollingRequest
         return request
+
+    def _track_controlled_fatal_handoff(self, error: Exception) -> None:
+        retryable = not self._looks_like_auth_error(error)
+        self._set_fatal_error("telegram_polling_error", _redact_telegram_error_text(error), retryable=retryable)
+        task = asyncio.create_task(self._handoff_polling_fatal_error())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _start_controlled_polling(self, *, require_progress: bool = True,
+                                        retry_conflicts: bool = False) -> None:
+        from plugins.platforms.telegram.polling_transfer import ControlledPoller
+
+        if self._teardown_started or self._controlled_journal is None:
+            raise _PollingLifecycleAbort("controlled polling unavailable")
+        generation, progress = self._begin_polling_generation()
+        strict_error: list[BaseException] = []
+        strict_error_event = asyncio.Event()
+
+        def failed(error):
+            if retry_conflicts and self._looks_like_polling_conflict(error):
+                logger.warning("[%s] Telegram transfer encountered a polling conflict; retrying within startup bound", self.name)
+                return
+            if require_progress and not progress.is_set() and not strict_error:
+                strict_error.append(error)
+                strict_error_event.set()
+
+        poller = ControlledPoller(self._app, self._controlled_journal,
+                                  on_error=self._track_controlled_fatal_handoff,
+                                  on_failure=failed)
+        self._controlled_poller = poller
+        context = _POLLING_GENERATION_CONTEXT.set(generation)
+        try:
+            await poller.start()
+        finally:
+            _POLLING_GENERATION_CONTEXT.reset(context)
+        if require_progress:
+            # Same initial readback gate as PTB; a failed first request is not readiness.
+            try:
+                if retry_conflicts:
+                    await asyncio.wait_for(
+                        self._await_cold_start_readiness(progress, strict_error_event, strict_error), timeout=5)
+                else:
+                    await self._await_cold_start_readiness(progress, strict_error_event, strict_error)
+            except asyncio.TimeoutError as exc:
+                raise OSError("Telegram transfer polling conflict did not clear within 5s") from exc
+            except OSError:
+                if strict_error and isinstance(strict_error[0], Exception) and self._looks_like_auth_error(strict_error[0]):
+                    raise strict_error[0]
+                raise
+        else:
+            self._schedule_polling_progress_verifier(generation, progress)
+
+    async def stop_polling_for_transfer(self) -> dict:
+        """Quiesce the wire before relinquishing the token; never treat timeout as release."""
+        if self._controlled_journal is None or self._controlled_poller is None:
+            raise RuntimeError("controlled poller not active")
+        self._polling_teardown_started = True
+        await self._cancel_task_attr("_polling_heartbeat_task", "heartbeat transfer")
+        await self._cancel_task_attr("_polling_progress_verifier_task", "verifier transfer")
+        stopped = await self._controlled_poller.stop()
+        if not stopped["stopped"]:
+            raise RuntimeError(f"Telegram polling wire did not stop: {stopped['error']}")
+        receipt = await asyncio.to_thread(self._controlled_journal.stop_receipt)
+        self._controlled_handed_off = True
+        self._release_platform_lock()
+        return receipt
+
+    async def start_polling_from_transfer(self, receipt: dict) -> None:
+        """Resume on an initialized standby adapter only after the old scoped lock is gone."""
+        if self._controlled_journal is None or self._app is None or not self._app.running:
+            raise RuntimeError("initialized controlled standby required")
+        if self._controlled_poller is not None and self._controlled_poller.running:
+            raise RuntimeError("poller already active")
+        if not await asyncio.to_thread(self._controlled_journal.validate_transfer, receipt):
+            raise RuntimeError("invalid polling transfer receipt")
+        from plugins.platforms.telegram.polling_transfer import token_has_active_poller
+        if token_has_active_poller(self._controlled_journal.token_hash):
+            raise RuntimeError("old Telegram poller still owns this token")
+        if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
+            # Lock refusal is retryable and must not poison a prepared standby.
+            self._fatal_error_code = self._fatal_error_message = None
+            self._fatal_error_retryable = True
+            raise RuntimeError("old Telegram token holder is still alive")
+        try:
+            await asyncio.to_thread(self._controlled_journal.begin_successor, receipt)
+            self._polling_teardown_started = False
+            await self._start_controlled_polling(retry_conflicts=True)
+            self._controlled_standby = False
+            self._mark_connected()
+            self._restart_task_attr("_polling_heartbeat_task", self._polling_heartbeat_loop())
+            self._start_post_connect_housekeeping()
+        except BaseException:
+            # The successor must not continue polling with the lock held after
+            # cold-start verification fails. An unproved stop retains the fence.
+            if self._controlled_poller is not None:
+                stopped = await self._controlled_poller.stop()
+                if not stopped["stopped"]:
+                    logger.error("[%s] Transfer failure left the polling wire unproved: %s", self.name, stopped["error"])
+                    raise
+            self._release_platform_lock()
+            raise
 
     async def _start_polling_once(
         self, app, *, drop_pending_updates: bool, error_callback, abandon_app_on_timeout: bool = False,
@@ -2322,6 +2441,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """Schedule background polling recovery without failing gateway startup: a transient bootstrap
         failure degrades only this adapter; the reconnect ladder recovers in the background."""
         if self._teardown_started or self.has_fatal_error:
+            return
+        if self._controlled_journal is not None:
+            if isinstance(error, _PollingStallError):
+                self._track_controlled_fatal_handoff(error)
+                return
+            if self._controlled_poller is not None and self._controlled_poller.running:
+                logger.warning("[%s] Controlled polling heartbeat probe failed; retaining serialized poller: %s",
+                               self.name, _redact_telegram_error_text(error))
+                return
+            self._track_controlled_fatal_handoff(error)
             return
         if self._recovery_in_flight():
             logger.debug(
@@ -2665,7 +2794,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._recovery_in_flight():
             self._polling_not_running_count = 0
             return
-        updater = getattr(self._app, "updater", None) if self._app else None
+        updater = (self._controlled_poller if self._controlled_journal is not None
+                   else getattr(self._app, "updater", None) if self._app else None)
         if updater is None:
             self._polling_pending_stuck_count = 0
             return
@@ -2715,6 +2845,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._teardown_started:
             return
         logger.warning(log_message, self.name)
+        if self._controlled_journal is not None:
+            self._schedule_polling_recovery(_PollingStallError(reason), reason="controlled consumer stall")
+            return
         self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))
 
     def _check_ingress_dispatch_stall(self) -> None:
@@ -2798,7 +2931,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._verifier_stale(generation, progress):
             return
         app = self._app
-        if not (app and app.updater and app.updater.running):
+        poller = self._controlled_poller if self._controlled_journal is not None else None
+        if not (poller.running if poller is not None else (app and app.updater and app.updater.running)):
             logger.warning("[%s] Updater made no getUpdates progress and is not running", self.name)
             self._schedule_polling_recovery(
                 RuntimeError("Updater not running after polling progress deadline"),
@@ -3627,6 +3761,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _start_polling_mode(self, *, is_reconnect: bool) -> None:
         """Clear any stale webhook and start resilient long polling."""
+        if self._controlled_standby:
+            return
+        if self._controlled_journal is not None:
+            # Controlled transfer must preserve journaled and server-side updates;
+            # the legacy cold-boot drop option does not apply while this flag is on.
+            if not is_reconnect and self._drop_pending_on_cold_boot:
+                logger.warning("[%s] Controlled polling preserves queued updates; drop_pending_on_cold_boot is ignored", self.name)
+            await self._delete_webhook_best_effort(require_success=not is_reconnect)
+            await self._start_controlled_polling(require_progress=not is_reconnect)
+            return
         # Best-effort: a transient Bot API error must not fail gateway startup — degrade to recovery.
         await self._delete_webhook_best_effort(require_success=not is_reconnect)
         loop = asyncio.get_running_loop()
@@ -3654,7 +3798,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning(
                 "[%s] Connected in degraded Telegram mode: gateway is alive, polling will be retried in the background", self.name)
 
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
+    async def connect(self, *, is_reconnect: bool = False, polling_standby: bool = False) -> bool:
         """Connect via long polling, or a webhook server if ``TELEGRAM_WEBHOOK_URL`` is set.
 
         ``is_reconnect``: False = cold boot (drop the Bot API queue unless
@@ -3674,7 +3818,23 @@ class TelegramAdapter(BasePlatformAdapter):
             self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
             return False
         try:
-            if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
+            from gateway.config import load_gateway_config
+            from gateway.generation import GenerationCoordinator
+            from plugins.platforms.telegram.polling_transfer import PollingJournal, token_has_active_poller
+            from hermes_constants import get_routing_process_hermes_home
+            overlap_enabled = load_gateway_config().overlap_handover_enabled
+            webhook_url = (_get_scoped_secret("TELEGRAM_WEBHOOK_URL") or "").strip()
+            if polling_standby and (not overlap_enabled or webhook_url):
+                raise RuntimeError("polling standby requires controlled polling, not webhook mode")
+            self._controlled_standby = polling_standby
+            self._controlled_handed_off = False
+            self._controlled_journal = (await asyncio.to_thread(
+                PollingJournal, GenerationCoordinator(get_routing_process_hermes_home()), self.config.token)
+                if overlap_enabled and not webhook_url else None)
+            if (not polling_standby and self._controlled_journal is not None
+                    and token_has_active_poller(self._controlled_journal.token_hash)):
+                raise RuntimeError("old Telegram poller still owns this token")
+            if not polling_standby and not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
             from plugins.platforms.telegram.update_admission import TelegramApplication
             builder = Application.builder().token(self.config.token)
@@ -3698,18 +3858,18 @@ class TelegramAdapter(BasePlatformAdapter):
             self._register_handlers(self._app)
             await self._initialize_app_with_retries(builder)
             await self._app.start()
-            # Profile-scoped like TELEGRAM_WEBHOOK_SECRET: under multiplex os.environ holds the DEFAULT
-            # profile's URL, and registering it on a secondary bot pushes that bot's updates to the
-            # default's listener (and stops polling for it).
-            webhook_url = (_get_scoped_secret("TELEGRAM_WEBHOOK_URL") or "").strip()
+            # The scoped URL was read before constructing the controlled journal.
             if webhook_url:
+                if polling_standby:
+                    raise RuntimeError("webhook mode cannot prepare a polling standby")
                 await self._start_webhook_mode(webhook_url, is_reconnect=is_reconnect)
             else:
                 await self._start_polling_mode(is_reconnect=is_reconnect)
-            self._mark_connected()
-            # WARNING, not INFO: "Connecting…" above is WARNING and reaches the terminal; an INFO success
-            # line made healthy startups look stalled at "attempt 1/8".
-            logger.warning("[%s] Connected to Telegram (%s mode)", self.name, "webhook" if self._webhook_mode else "polling")
+            if polling_standby:
+                logger.warning("[%s] Telegram polling standby prepared (no getUpdates consumer)", self.name)
+            else:
+                self._mark_connected()
+                logger.warning("[%s] Connected to Telegram (%s mode)", self.name, "webhook" if self._webhook_mode else "polling")
             # Heartbeat only in polling mode: webhook mode has no long-poll socket to wedge in CLOSE-WAIT.
             # WARNING, not INFO: the "Connecting to Telegram (attempt N/8)…" line above is emitted at
             # WARNING and reaches the terminal (the gateway's default stderr handler is WARNING-only), but
@@ -3717,7 +3877,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # permanently stalled at "attempt 1/8" on the console — the logging illusion in #90835. Both
             # sides of the connect transition must share a terminal-visible level so a real hang is the
             # *absence* of this line, not ambiguity.
-            if not self._webhook_mode:
+            if not self._webhook_mode and not polling_standby:
                 self._restart_task_attr("_polling_heartbeat_task", self._polling_heartbeat_loop())
             # Seed the live identity from PTB's initialize() cache; polling rides the heartbeat's get_me(),
             # webhook mode gets a low-frequency refresh loop (else a BotFather rename breaks routing).
@@ -3731,10 +3891,12 @@ class TelegramAdapter(BasePlatformAdapter):
             # that can stall for certain tokens. Running them here — inside the connect() coroutine that the
             # gateway wraps in a connect timeout — means one slow call blows the whole connect and the
             # adapter never comes up, even though polling/webhook is already live (#46298).
-            self._start_post_connect_housekeeping()
+            if not polling_standby:
+                self._start_post_connect_housekeeping()
             return True
         except Exception as e:
-            self._release_platform_lock()
+            if self._controlled_poller is None or not self._controlled_poller.running:
+                self._release_platform_lock()
             safe_error = _redact_telegram_error_text(e)
             # Classify by exception TYPE (never message text): auth failures can never self-heal, so
             # marking them retryable put agents into a silent eternal reconnect loop.
@@ -3871,7 +4033,28 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_path_degraded = True
         # Release the bot-token lock immediately so a wedged close cannot block the reconnect watcher.
         # The rest of teardown is best-effort against a half-dead transport. See #80598.
-        self._release_platform_lock()
+        # The legacy updater releases early for bounded teardown. Controlled polling
+        # may not do so: an abandoned HTTP request can still confirm an offset.
+        poller = getattr(self, "_controlled_poller", None)
+        if getattr(self, "_controlled_journal", None) is None:
+            self._release_platform_lock()
+        elif poller is not None:
+            stop_task = asyncio.create_task(poller.stop(), name="telegram-controlled-poller-stop")
+            done, _ = await asyncio.wait({stop_task}, timeout=5)
+            if not done:
+                # Fence the lock on the actual poller, not the stop coroutine's
+                # deadline. Same-PID rebuilds also consult the active-poller map.
+                logger.warning("[%s] Controlled poller stop exceeded disconnect deadline; token lock retained", self.name)
+                stop_task.cancel()
+                stop_task.add_done_callback(_consume_abandoned_task)
+            else:
+                receipt = await stop_task
+                if not receipt["stopped"]:
+                    logger.warning("[%s] Controlled poller failed while stopping: %s; token lock retained", self.name, receipt["error"])
+                else:
+                    self._release_platform_lock()
+        else:
+            self._release_platform_lock()
         # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
         # await lets them start a new generation.
         current_task = asyncio.current_task()
@@ -3901,8 +4084,9 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cancel_task_attr("_polling_heartbeat_task", "heartbeat cancel")
         await self._cancel_task_attr("_bot_identity_refresh_task", "identity-refresh cancel")
         # Mark the bot "Offline" while its HTTP client is still alive. Opt-in, non-fatal.
-        with contextlib.suppress(Exception):
-            await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
+        if not getattr(self, "_controlled_handed_off", False):
+            with contextlib.suppress(Exception):
+                await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
         await self._await_disconnect_step(self._cancel_pending_delivery_tasks(), _DISCONNECT_STEP_TIMEOUT, "pending-delivery cancel")
         if self._app:
             try:
