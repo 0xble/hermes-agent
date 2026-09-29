@@ -170,7 +170,7 @@ def _socket_accepts_connections(socket_path: Path) -> bool:
 
 def _generation_owner_is_dead(socket_path: Path) -> bool:
     try:
-        owner = json.loads(_generation_socket_owner_path(socket_path).read_text())
+        owner = json.loads(_generation_socket_owner_path(socket_path).read_text(encoding="utf-8"))
         pid = int(owner["pid"])
         expected_start = owner.get("start_time")
         from gateway.status import _get_process_start_time, _pid_exists
@@ -248,7 +248,7 @@ class GenerationControlServer(GatewayControlServer):
             os.umask(old_umask)
         os.chmod(bind_path, 0o600)
         from gateway.status import _build_pid_record
-        _generation_socket_owner_path(bind_path).write_text(json.dumps(_build_pid_record()))
+        _generation_socket_owner_path(bind_path).write_text(json.dumps(_build_pid_record()), encoding="utf-8")
         self._bind_path = bind_path
         return True
 
