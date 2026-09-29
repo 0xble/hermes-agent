@@ -2729,6 +2729,7 @@ web:
   # Or use per-capability keys to mix providers (e.g. free search + paid extract):
   search_backend: "searxng"
   extract_backend: "firecrawl"
+  extract_direct: true  # default: fetch plain files and local Hermes docs before the extract provider
 
   # Keyless free-tier fallback (default: true). With no backend configured
   # and no API keys present, web tools rotate across the Exa/Parallel/
@@ -2756,6 +2757,8 @@ web:
 | **Tavily** | `TAVILY_API_KEY` (optional — keyless when selected) | ✔ | ✔ |
 | **Perplexity** | `PERPLEXITY_API_KEY` | ✔ | ✔ (query-relevant snippets) |
 | **Exa** | `EXA_API_KEY` (optional — keyless free tier) | ✔ | ✔ |
+
+**Direct extraction:** `web.extract_direct` defaults to `true`. After URL safety and website-policy checks, `web_extract` downloads plain files (including GitHub raw/API URLs and `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.csv`, `.xml`, `.toml`) over HTTP with a 5 MB limit and serves matching Hermes docs from the running checkout's `website/docs`. A failed download, non-text response, missing local page, or missing local `llms.txt` falls back to the configured extract provider. Set `web.extract_direct: false` to route all URLs through the provider again. Local docs may lag the live website until the checkout is updated.
 
 **Backend selection:** The runtime always uses the stored `web.backend` selection (set via `hermes tools`; `nous` routes through the managed Tool Gateway). Only if no web backend has ever been selected is one auto-detected from available API keys: if only `SEARXNG_URL` is set, SearXNG is used; if only `EXA_API_KEY` is set, Exa; if only `TAVILY_API_KEY` is set, Tavily; if only `PERPLEXITY_API_KEY` is set, Perplexity; if only `PARALLEL_API_KEY` is set, Parallel; if only `KEENABLE_API_KEY` is set, Keenable. With **no selection and no credentials at all**, requests rotate round-robin across the keyless free-tier ring (Exa / Parallel / Firecrawl / Keenable) with automatic next-in-line failover on rate limits — see the [Web Search guide](./features/web-search.md) for details. Once a selection exists, adding a key to `.env` does not change the route. Selecting Tavily, Firecrawl, or Keenable in `hermes tools` also works without a key.
 
