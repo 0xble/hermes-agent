@@ -232,9 +232,9 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
         from agent.message_sanitization import close_interrupted_tool_sequence
         # The API-interrupt diagnostic is a local result, not assistant text. Persisting
         # it after a tool result feeds it back to the next model turn as if it had said it.
-        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+        from agent.interrupt_diagnostics import is_interrupt_diagnostic
         transcript_final = final_response
-        if isinstance(transcript_final, str) and transcript_final.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        if is_interrupt_diagnostic(transcript_final):
             transcript_final = None
         close_interrupted_tool_sequence(messages, transcript_final)
 

@@ -4668,8 +4668,9 @@ class BasePlatformAdapter(ABC):
         # A drain-deferred turn belongs to the shutdown spool, not this adapter's
         # post-turn handoff. Keep the FIFO head in its slot until shutdown flush.
         pending = self._pending_messages.get(session_key)
-        if (getattr(getattr(self, "gateway_runner", None), "_draining", False)
-                and getattr(pending, "_drain_deferred", False)):
+        runner = getattr(self, "gateway_runner", None)
+        if (getattr(pending, "_drain_deferred", False)
+                and (runner is None or getattr(runner, "_draining", False))):
             if current_task is not None and self._session_tasks.get(session_key) is current_task:
                 self._cleanup_finished_session_task(session_key, interrupt_event)
             return
