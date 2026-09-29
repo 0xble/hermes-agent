@@ -1882,6 +1882,15 @@ def _immutable_phase_error(phase: str, release: Path, home: Path, reason: str = 
             "recover with: hermes update (or hermes update --rollback if current is unhealthy)")
 
 
+def _overlap_failure_outcome() -> str:
+    """Only a verified rollback or a fail-closed block gets a typed update result."""
+    from hermes_cli import update_receipt
+    current = update_receipt._current
+    proof = current.data.get("overlap_generation") if current is not None else None
+    value = proof.get("outcome") if isinstance(proof, dict) else None
+    return value if value in {"rolled_back", "blocked"} else "partial"
+
+
 def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
     """The tail ``_apply_pulled_update`` / ``_update_via_zip`` used to run in the pre-pull
     interpreter, driven from a hand-off payload."""
@@ -1959,7 +1968,7 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 detail = _immutable_phase_error("immutable_activation", release, paths.home)
                 _record_update_step("immutable_activation", False, detail)
                 print(f"✗ {detail}")
-                _finalize_receipt("partial", "Immutable release activation failed: %s")
+                _finalize_receipt(_overlap_failure_outcome(), "Immutable release activation failed: %s")
                 raise SystemExit(1)
             if opts.no_gateway_restart:
                 _record_update_skip("immutable_activation", "staged; activation deferred")

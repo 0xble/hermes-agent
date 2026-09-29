@@ -57,6 +57,19 @@ def _latest(home):
     return persisted
 
 
+@pytest.mark.parametrize("proof,expected", [
+    ({"outcome": "rolled_back"}, "rolled_back"),
+    ({"outcome": "blocked"}, "blocked"),
+    ({"outcome": "success"}, "partial"),
+    (None, "partial"),
+])
+def test_overlap_failure_receipt_outcome_is_typed_without_claiming_success(monkeypatch, proof, expected):
+    from hermes_cli import update_cmd, update_receipt
+    current = type("Receipt", (), {"data": {"overlap_generation": proof}})()
+    monkeypatch.setattr(update_receipt, "_current", current)
+    assert update_cmd._overlap_failure_outcome() == expected
+
+
 def test_immutable_post_swap_maintains_before_activation_and_receipts_success(post_swap_candidate, monkeypatch):
     home, paths, previous, candidate, handoff = post_swap_candidate
     events = []

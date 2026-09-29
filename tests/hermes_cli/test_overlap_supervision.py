@@ -43,6 +43,7 @@ def test_promotion_returns_rolled_back_proof_after_committed_observation_failure
     from dataclasses import asdict
     monkeypatch.setattr(gateway_overlap, "_active_and_prior", lambda _: (coordinator, asdict(first), None, epoch))
     monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
+    monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: "gui/501")
     monkeypatch.setattr(gateway_overlap, "render_generation_launchd_plist", lambda **kwargs: "test")
     monkeypatch.setattr(gateway_overlap, "bootstrap_generation_plist", lambda **kwargs: None)
     monkeypatch.setattr(gateway_overlap, "_ready_successor", lambda *args, **kwargs: asdict(second))

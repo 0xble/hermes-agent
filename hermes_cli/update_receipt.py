@@ -58,7 +58,7 @@ class UpdateReceipt:
         self.data: dict[str, Any] = {
             "schema": 1, "started_at": _utc_now_iso(), "finished_at": None,
             "argv": list(sys.argv), "pid": os.getpid(),
-            "outcome": "running",  # running | success | partial | failed
+            "outcome": "running",  # running | success | partial | failed | rolled_back | blocked
             "pre_update": _code_identity(), "post_update": {},
             "steps": [], "skips": [], "gateway_restart": {}, "fleet": [],
         }
