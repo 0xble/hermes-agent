@@ -151,6 +151,54 @@ def test_second_consecutive_stall_commits_the_deterministic_fallback_summary(tmp
 
 
 
+def test_cancelled_stale_worker_cannot_rearm_next_attempt_cooldown(tmp_path, fast_timeouts, monkeypatch):
+    """A cancelled worker can unwind after the next summary starts; its backoff belongs to the old attempt."""
+    agent = _make_agent(tmp_path, "stale-backoff")
+    compressor = agent.context_compressor
+    calls = []
+    live = _transcript()
+    stale_record_entered = threading.Event()
+    next_summary_started = threading.Event()
+    stale_record_finished = threading.Event()
+    cooldown_during_next_summary = []
+    original_record = cc._record_stall_interrupted_backoff
+    original_call = _stalling_call_llm(compressor, calls)
+
+    def delayed_record(*args, **kwargs):
+        if not stale_record_entered.is_set():
+            stale_record_entered.set()
+            try:
+                assert next_summary_started.wait(5), "next summary never started"
+                return original_record(*args, **kwargs)
+            finally:
+                stale_record_finished.set()
+        return original_record(*args, **kwargs)
+
+    def stalled_summary(**kwargs):
+        if calls:
+            next_summary_started.set()
+            assert stale_record_finished.wait(5), "cancelled worker did not unwind"
+            cooldown_during_next_summary.append((
+                compressor._summary_failure_cooldown_until > time.monotonic(),
+                compressor._session_db.get_compression_failure_cooldown(compressor._session_id) is not None,
+            ))
+        return original_call(**kwargs)
+
+    monkeypatch.setattr(cc, "_record_stall_interrupted_backoff", delayed_record)
+    with patch("agent.context_compressor.call_llm", side_effect=stalled_summary), \
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value={"fallback_chain": []}):
+        first, _ = agent._compress_context(live, "sys", approx_tokens=50_000)
+        assert first is live
+        assert stale_record_entered.wait(2), "first cancelled worker did not reach the record boundary"
+        compressor._consecutive_timeout_failures = 1
+        compressor._summary_failure_cooldown_until = 0.0
+        compressor._session_db.clear_compression_failure_cooldown(compressor._session_id)
+        agent._compress_context(live, "sys", approx_tokens=50_000)
+
+    assert calls == ["primary", "primary"]
+    assert cooldown_during_next_summary == [(False, False)]
+
+
 def test_deterministic_pin_is_consumed_and_a_real_route_is_left_alone():
     from agent.context_compressor import (
         DETERMINISTIC_SUMMARY_ROUTE, take_deterministic_summary_pin, take_pinned_summary_route,
