@@ -180,8 +180,11 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             third = await asyncio.to_thread(subprocess.run,
                 [sys.executable, str(Path(__file__).resolve()), "worker", "active"],
                 env=env, capture_output=True, text=True, timeout=25)
-            assert third.returncode != 0, third.stdout + third.stderr
-            assert "EXIT:False" in third.stdout, third.stdout + third.stderr
+            # A duplicate start can be rejected either by the singleton lock or
+            # by the host-preflight no-op after B refreshes its host record.
+            assert ("EXIT:False" in third.stdout and third.returncode != 0) or (
+                "already serves profile 'default'" in third.stdout and "EXIT:True" in third.stdout
+                and third.returncode == 0), third.stdout + third.stderr
             assert processes[1].poll() is None, "third start displaced promoted B"
             return
         if approval_route == "callback":
