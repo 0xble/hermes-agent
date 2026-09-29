@@ -380,6 +380,103 @@ async def test_partial_rearm_failure_keeps_dispatch_fenced_and_recovers_other_po
     assert old_status["needs_attention"] is True and old_status["polling"] is False
 
 
+
+
+@pytest.mark.asyncio
+async def test_transfer_abort_failure_surfaces_attention_status(tmp_path, monkeypatch):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+
+    async def fail_stop():
+        raise RuntimeError("original stop failure")
+
+    adapter.stop_polling_for_transfer = fail_stop
+    def abort_fails(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "abort_transfer", abort_fails)
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False)
+    active.bind_runner(runner)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+
+    with pytest.raises(RuntimeError, match="abort could not be proved"):
+        await active.transfer_requested(new.id)
+
+    from gateway.status import read_runtime_status
+    status = read_runtime_status(active.paths["state"])
+    assert status["needs_attention"] is True
+    assert status["polling"] is False
+    assert "abort could not be proved" in status["error_message"]
+    assert runner._overlap_draining is True
+
+
+
+
+@pytest.mark.asyncio
+async def test_draining_coordinator_io_does_not_block_event_loop(tmp_path, monkeypatch):
+    import threading
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    stopped = []
+
+    async def stop():
+        stopped.append(True)
+
+    runner = Mock(adapters={}, _overlap_draining=True, _pending_approvals={},
+                  _active_work_count=lambda: 0, stop=stop)
+    active.bind_runner(runner)
+    # Isolate the drain inspection from the concurrently running admission loop.
+    assert active.owned_routing is not None and active.owned_routing._task is not None
+    active.owned_routing._task.cancel()
+    original_generations = db.generations
+    original_connect = db.connect
+    generations_entered, generations_release = threading.Event(), threading.Event()
+    connect_entered, connect_release = threading.Event(), threading.Event()
+
+    def slow_generations():
+        generations_entered.set()
+        generations_release.wait(3)
+        return original_generations()
+
+    def slow_connect():
+        connect_entered.set()
+        connect_release.wait(3)
+        return original_connect()
+
+    monkeypatch.setattr(db, "generations", slow_generations)
+    monkeypatch.setattr(db, "connect", slow_connect)
+    task = asyncio.create_task(active.finish_draining_once())
+    assert await asyncio.to_thread(generations_entered.wait, 2)
+    tick = asyncio.Event()
+    asyncio.get_running_loop().call_soon(tick.set)
+    await asyncio.wait_for(tick.wait(), 1)
+    assert not task.done()
+
+    generations_release.set()
+    assert await asyncio.to_thread(connect_entered.wait, 2)
+    tick = asyncio.Event()
+    asyncio.get_running_loop().call_soon(tick.set)
+    await asyncio.wait_for(tick.wait(), 1)
+    assert not task.done()
+    connect_release.set()
+    assert await task is True
+    assert stopped == [True]
+
+
 @pytest.mark.asyncio
 async def test_transfer_fences_cron_and_goal_before_poller_stops(tmp_path, monkeypatch):
     db = GenerationCoordinator(tmp_path)
@@ -464,6 +561,9 @@ async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path,
     active.bind_runner(runner)
     db.request_transfer(old.id, new.id, epoch, set())
     await active.transfer_requested(new.id)
+    # The production drain task is concurrent; exercise repeated inspection here.
+    assert active._drain_task is not None
+    active._drain_task.cancel()
     db.commit_transfer(old.id, new.id, epoch)
     with db.connect() as conn:
         conn.execute("UPDATE generations SET drain_deadline=NULL WHERE id=?", (old.id,))
