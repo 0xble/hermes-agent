@@ -25,7 +25,7 @@ def test_updater_promotes_two_pinned_releases_with_native_long_turn(request, tmp
     from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label
     from tests.plugins.telegram_polling_stub import BotAPI
     repo = Path(__file__).resolve().parents[2]
-    a = "f3dc8da3a94021277a1e46ea430dae88b7ccc5e0"
+    a = "3bfdfc01e2a91ad5906e71b0f7041bb5534b89ec"
     b = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
                        capture_output=True, text=True).stdout.strip()
     assert a != b
