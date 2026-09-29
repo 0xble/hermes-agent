@@ -628,14 +628,14 @@ async def test_concurrent_drain_inspections_stop_runner_once(tmp_path, monkeypat
     active.bind_runner(Mock(adapters={}, _overlap_draining=True, _pending_approvals={},
                             _active_work_count=lambda: 1, stop=stop))
     entered, release = threading.Event(), threading.Event()
-    original_fence = db.fence_draining_generation
+    original_interrupt = db.interrupt_at_drain_cap
 
-    def slow_fence(*args):
+    def slow_interrupt(*args):
         entered.set()
         release.wait(2)
-        return original_fence(*args)
+        return original_interrupt(*args)
 
-    monkeypatch.setattr(db, "fence_draining_generation", slow_fence)
+    monkeypatch.setattr(db, "interrupt_at_drain_cap", slow_interrupt)
     first = asyncio.create_task(active.finish_draining_once())
     try:
         assert await asyncio.to_thread(entered.wait, 2)
@@ -682,7 +682,7 @@ async def test_missing_drain_deadline_uses_local_cap_without_repeated_warning(tm
     assert stopped == []
     now[0] += 2
     assert await active.finish_draining_once()
-    assert not await active.finish_draining_once()
+    assert await active.finish_draining_once()
     assert stopped == [True]
     assert len([r for r in caplog.records if "missing drain deadline" in r.message]) == 1
 
