@@ -48,19 +48,21 @@ def _local_docs(url: str) -> Optional[dict[str, Any]]:
     # Decode once more to reject double-encoded traversal; resolve() also contains symlinks.
     if any(part in ("..", ".") for part in unquote(relative).split("/")) or "\\" in relative:
         return None
-    docs = (Path(__file__).resolve().parent.parent / "website" / "docs").resolve()
-    stem = docs / relative
-    candidates = ([stem] if stem.suffix.lower() in {".md", ".mdx"} else
-                  [stem.with_suffix(".md"), stem.with_suffix(".mdx"), stem / "index.md", stem / "index.mdx"])
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved.is_relative_to(docs) and resolved.is_file():
-            try:
-                content = resolved.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                return None
-            return {"url": url, "title": f"{resolved.stem} (local Hermes docs checkout)",
-                    "content": content, "error": None}
+    if "\x00" in relative:
+        return None
+    # Any path or filesystem error (odd names, permissions, loops) is a miss: the provider still runs.
+    try:
+        docs = (Path(__file__).resolve().parent.parent / "website" / "docs").resolve()
+        stem = docs / relative
+        candidates = ([stem] if stem.suffix.lower() in {".md", ".mdx"} else
+                      [stem.with_suffix(".md"), stem.with_suffix(".mdx"), stem / "index.md", stem / "index.mdx"])
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved.is_relative_to(docs) and resolved.is_file():
+                return {"url": url, "title": f"{resolved.stem} (local Hermes docs checkout)",
+                        "content": resolved.read_text(encoding="utf-8"), "error": None}
+    except (OSError, ValueError, RuntimeError, UnicodeError):
+        return None
     return None
 
 

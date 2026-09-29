@@ -141,6 +141,26 @@ def test_docs_hit_index_miss_and_traversal(harness, monkeypatch):
     assert [r["title"] for r in missed] == ["provider"] * 3
 
 
+@pytest.mark.parametrize("bad_path", ["%00.md", "a%00b", "user-guide/%00"])
+def test_invalid_local_docs_path_falls_back_without_aborting_batch(harness, monkeypatch, bad_path):
+    _transport(monkeypatch, lambda request: pytest.fail("docs must not use HTTP"))
+    urls = ["https://hermes-agent.nousresearch.com/docs/" + bad_path, "https://site.test/page"]
+    results = _run(urls)
+    assert [r["title"] for r in results] == ["provider", "provider"]
+    assert harness.extract.await_args.args[0] == urls
+
+
+def test_unreadable_local_docs_candidate_falls_back(harness, monkeypatch):
+    _transport(monkeypatch, lambda request: pytest.fail("docs must not use HTTP"))
+
+    def boom(self, *a, **k):
+        raise PermissionError("unreadable")
+
+    monkeypatch.setattr(direct.Path, "read_text", boom)
+    results = _run(["https://hermes-agent.nousresearch.com/docs/user-guide/configuration", "https://site.test/page"])
+    assert [r["title"] for r in results] == ["provider", "provider"]
+
+
 def test_config_off_uses_provider_even_for_docs_and_plain_file(harness, monkeypatch):
     monkeypatch.setattr(wt, "_load_web_config", lambda: {"extract_direct": False})
     _transport(monkeypatch, lambda request: pytest.fail("disabled route must not use HTTP"))
