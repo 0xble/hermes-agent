@@ -6,12 +6,15 @@ schema needed by the first handover slice.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
-import platform
 import sqlite3
+import subprocess
+import sys
 import time
 import uuid
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -66,16 +69,33 @@ class GenerationIdentity:
         return record
 
 
+@functools.lru_cache(maxsize=1)
 def _boot_id() -> str:
-    for path in (Path("/var/run/boot_id"), Path("/proc/sys/kernel/random/boot_id")):
+    if sys.platform == "darwin":
         try:
-            value = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
+            result = subprocess.run(
+                ["sysctl", "-n", "kern.bootsessionuuid"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            value = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            value = ""
         if value:
             return value
+        import psutil
+        return f"darwin:{int(psutil.boot_time())}"
+
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    if value:
+        return value
     import psutil
-    return f"{platform.node()}:{psutil.boot_time():.6f}"
+    return f"boot:{int(psutil.boot_time())}"
 
 
 class GenerationCoordinator:
@@ -95,7 +115,7 @@ class GenerationCoordinator:
         return conn
 
     def _initialize(self) -> None:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.executescript(_SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(generations)")}
@@ -111,7 +131,7 @@ class GenerationCoordinator:
 
     def register(self, identity: GenerationIdentity, *, state: str = "standby") -> None:
         now = time.time()
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """INSERT INTO generations
@@ -136,7 +156,7 @@ class GenerationCoordinator:
             conn.commit()
 
     def heartbeat(self, generation_id: str, *, state: str | None = None) -> None:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             if state is None:
                 conn.execute(
@@ -149,7 +169,7 @@ class GenerationCoordinator:
             conn.commit()
 
     def acquire_lease(self, resource: str, generation_id: str, *, state: str = "active") -> int:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT epoch,generation_id,state FROM leases WHERE resource=?", (resource,)).fetchone()
             if row and row["state"] != "released" and row["generation_id"] != generation_id:
@@ -186,7 +206,7 @@ class GenerationCoordinator:
             return epoch
 
     def release_lease(self, resource: str, generation_id: str, epoch: int) -> bool:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             changed = conn.execute(
                 "UPDATE leases SET state='released' WHERE resource=? AND generation_id=? "
@@ -197,12 +217,12 @@ class GenerationCoordinator:
             return bool(changed)
 
     def generations(self) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             return [dict(row) for row in conn.execute(
                 "SELECT * FROM generations ORDER BY started_at, id").fetchall()]
 
     def leases(self) -> list[dict[str, Any]]:
-        with self.connect() as conn:
+        with closing(self.connect()) as conn:
             return [dict(row) for row in conn.execute("SELECT * FROM leases ORDER BY resource").fetchall()]
 
 

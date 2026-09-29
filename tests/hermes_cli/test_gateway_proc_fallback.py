@@ -142,7 +142,6 @@ class TestPsFallbackBsdCompat:
         assert "-o" in ps_call and "pid=,command=" in ps_call, ps_call
 
 
-@pytest.mark.macos_only
 def test_scan_ignores_only_gateway_run_standby_flag(monkeypatch):
     """A flag-shaped top-level value cannot hide an active gateway."""
     from types import SimpleNamespace

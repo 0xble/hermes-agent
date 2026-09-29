@@ -299,10 +299,12 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 if "overlap_handover" in flag_text:
                     try:
                         flag_config = yaml.safe_load(flag_text) or {}
-                    except yaml.YAMLError:
-                        return "waiting"  # Cannot safely rule out an opt-in generation.
+                    except yaml.YAMLError as exc:
+                        receipt(home, "inspect", "alert", reason=str(exc))
+                        return "alert"
                     if not isinstance(flag_config, dict):
-                        return "waiting"
+                        receipt(home, "inspect", "alert", reason="overlap_handover config must be a mapping")
+                        return "alert"
                     raw_gateway = flag_config.get("gateway") or {}
                     overlap = raw_gateway.get("overlap_handover") if isinstance(raw_gateway, dict) else None
                     if overlap is not None and (not isinstance(overlap, dict) or

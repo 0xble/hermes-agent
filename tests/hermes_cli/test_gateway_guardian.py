@@ -74,6 +74,16 @@ def test_invalid_grace_writes_alert_receipt(tmp_path, value, monkeypatch):
                for path in (home / "logs/guardian").glob("*.json"))
 
 @pytest.mark.macos_only
+def test_invalid_overlap_config_writes_alert_receipt(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    (home / "config.yaml").write_text("gateway:\n  overlap_handover: [unclosed\n")
+    assert guardian.run_once(home, plist, label, grace=12) == "alert"
+    assert any(json.loads(path.read_text())["outcome"] == "alert"
+               for path in (home / "logs/guardian").glob("*.json"))
+
+
+@pytest.mark.macos_only
 def test_invalid_yaml_writes_alert_receipt(tmp_path):
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("updates: [unclosed\n")
