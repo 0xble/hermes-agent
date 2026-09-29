@@ -51,6 +51,8 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         content = str(user.get("content", ""))
         if "old-boundary" in content:
             return ToolCall("terminal", {"command": command})
+        if "old-followup" in content:
+            return Text("old-followup-complete")
         return Text("new-turn-complete")
     llm = FakeLLMServer(model)
     llm.__enter__()
@@ -122,6 +124,19 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             await asyncio.sleep(.1)
         else:
             raise AssertionError("B did not answer new session")
+        api.add(1003, 1003, text="old-followup")
+        end = time.monotonic() + 12
+        while time.monotonic() < end:
+            with db.connect() as conn:
+                row = conn.execute("SELECT owner_id FROM inbox WHERE source_event_id='1003'").fetchone()
+            if row:
+                assert row["owner_id"] != successor["id"], "B took A's in-flight session"
+                break
+            await asyncio.sleep(.1)
+        else:
+            raise AssertionError("B did not enqueue A's follow-up")
+        with api.lock:
+            assert not any("old-followup-complete" in item["text"] for item in api.sent), "B ran A's follow-up"
         processes[1].kill()
         await asyncio.to_thread(processes[1].wait, 5)
         with api.lock:
@@ -130,21 +145,25 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         with api.lock:
             assert len(api.offsets) == post_kill_polls, "A resumed polling after B died"
         assert processes[0].poll() is None, "A did not preserve its in-flight turn"
-        end = time.monotonic() + 85
+        # The follow-up redirects A's running turn, rather than letting its original
+        # terminal call finish. Its reply proves the owning native adapter ran it.
+        end = time.monotonic() + 25
         while time.monotonic() < end:
             with api.lock:
-                if any("old-turn-complete" in item["text"].replace("\\", "") for item in api.sent):
+                if any("old-followup-complete" in item["text"].replace("\\", "") for item in api.sent):
                     break
             await asyncio.sleep(.1)
         else:
-            raise AssertionError("A did not finish old turn")
+            with api.lock:
+                sent = list(api.sent)
+            raise AssertionError(f"A did not handle its follow-up; sent={sent}; generations={db.generations()}")
         with api.lock:
-            assert sum("old-turn-complete" in item["text"].replace("\\", "") for item in api.sent) == 1
+            assert sum("old-followup-complete" in item["text"].replace("\\", "") for item in api.sent) == 1
             assert sum("new-turn-complete" in item["text"].replace("\\", "") for item in api.sent) == 1
         with api.lock:
             assert len(api.offsets) > before, "B never entered a real getUpdates loop"
             assert api.maximum == 1 and not api.errors
-        await asyncio.to_thread(processes[0].wait, 15)
+        await asyncio.to_thread(processes[0].wait, 75)
         assert processes[0].returncode == 0, processes[0].stderr.read()
     finally:
         for proc in processes:

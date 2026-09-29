@@ -118,6 +118,22 @@ def test_old_coordinator_retains_generation_and_gains_tables(tmp_path):
     assert fresh and row["seq"] == 1
 
 
+def test_dead_owner_holds_pending_rows_without_replaying(tmp_path, monkeypatch):
+    store, old, new, epoch = _pair(tmp_path)
+    store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+    row, _ = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                           _source(), b"work", new.id, epoch)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    assert store.hold_dead_owner(old.id) == 1
+    assert store.pending(old.id, "home-a", "telegram", "chat") == []
+    with closing(store.connect()) as conn:
+        held = conn.execute("SELECT state,owner_id FROM inbox WHERE id=?", (row["id"],)).fetchone()
+        assert tuple(held) == ("interrupted", old.id)
+    again, fresh = store.enqueue("home-a", "telegram", "chat", "one", "message",
+                                 _source(), b"work", new.id, epoch)
+    assert not fresh and again["state"] == "interrupted"
+
+
 def test_invalid_source_and_oversized_payload_fail_closed(tmp_path):
     store, old, new, epoch = _pair(tmp_path)
     with pytest.raises(ValueError):

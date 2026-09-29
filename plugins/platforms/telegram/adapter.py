@@ -5339,9 +5339,22 @@ class TelegramAdapter(BasePlatformAdapter):
         query = update.callback_query
         if not query or not query.data:
             return
-        self._accept_update()
         data = query.data
         cb = self._callback_ctx(query)
+        owned = getattr(self, "_owned_routing", None)
+        if owned is not None and not getattr(self, "_owned_replaying_callback", False) and cb["chat_id"] is not None:
+            if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+                return
+            source = self.build_source(
+                chat_id=str(cb["chat_id"]),
+                chat_type="dm" if str(cb["chat_type"]) == "private" else "group",
+                user_id=str(query.from_user.id),
+                thread_id=str(cb["thread_id"]) if cb["thread_id"] else None)
+            self._canonicalize(source)
+            if await owned.route_callback(self, update, source, self._source_session_key(source)):
+                self._accept_update()
+                return
+        self._accept_update()
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),

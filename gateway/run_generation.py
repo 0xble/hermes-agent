@@ -191,11 +191,16 @@ class ActiveGeneration:
         self._transfer_lock = asyncio.Lock()
         self._drain_task: asyncio.Task | None = None
         self._drain_stopping = False
+        self.owned_routing = None
 
     def bind_runner(self, runner, *, cron_stop=None, cron_provider=None) -> None:
         self.runner = runner
         self.cron_stop = cron_stop
         self.cron_provider = cron_provider
+        from gateway.owned_routing import OwnedRouting
+        self.owned_routing = OwnedRouting(self)
+        self.owned_routing.bind(runner)
+        self.owned_routing._task = asyncio.create_task(self.owned_routing.drain())
 
     def _telegram_adapters(self) -> dict[str, object]:
         adapters = getattr(self.runner, "adapters", {}) or {}
@@ -242,6 +247,9 @@ class ActiveGeneration:
                 if self.cron_provider is not None:
                     from gateway.run import _stop_cron_provider
                     _stop_cron_provider(self.cron_provider)
+                # Freeze A's live session obligations before the lease can move.
+                if self.owned_routing is not None:
+                    self.owned_routing.claim_live()
                 self.runner._overlap_draining = True
                 self._drain_task = asyncio.create_task(self._drain_after_transfer())
                 return {"poller_stopped": True, "generation_id": self.identity.id,
@@ -270,7 +278,9 @@ class ActiveGeneration:
         with contextlib.closing(self.coordinator.connect()) as conn:
             queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
                                   (self.identity.id,)).fetchone()
-        if (busy or queued) and time.time() < record["drain_deadline"]:
+            claims = conn.execute("SELECT 1 FROM sessions WHERE generation_id=? LIMIT 1",
+                                  (self.identity.id,)).fetchone()
+        if (busy or queued or claims) and time.time() < record["drain_deadline"]:
             return False
         if not self._drain_stopping:
             self._drain_stopping = True
@@ -347,6 +357,10 @@ class ActiveGeneration:
                     last_warning = now
 
     async def close(self) -> None:
+        if self.owned_routing is not None and self.owned_routing._task is not None:
+            self.owned_routing._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.owned_routing._task
         if self.task:
             self.task.cancel()
             with suppress(asyncio.CancelledError):
