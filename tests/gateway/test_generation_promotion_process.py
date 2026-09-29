@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import shlex
@@ -14,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins"))
 from telegram_polling_stub import BotAPI
-from gateway.generation import GenerationCoordinator
+from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths
 from gateway.run_generation import handover_to_generation
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
 
@@ -192,10 +193,10 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path):
         db = GenerationCoordinator(home)
         successor = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway-b")
         old = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway")
-        from gateway.generation import GenerationIdentity, generation_paths
         path = generation_paths(home, GenerationIdentity(**{key: old[key] for key in
             ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")}))["socket"]
-        assert path.exists(), f"control socket missing: {path}, entries={list(home.iterdir())}, stderr={processes[0].stderr}"
+        state = json.loads((home / f"gateway_state.{old['id']}.json").read_text())
+        assert path.exists() and state["socket_path"] == str(path)
         request = asyncio.create_task(asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=5))
         deadline = time.monotonic() + 15
         while not marker.exists() and time.monotonic() < deadline:

@@ -123,6 +123,24 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
     return active
 
 
+def _ensure_generation_socket_parent(socket_path: Path) -> None:
+    parent = socket_path.parent
+    if parent.parent == Path(os.path.sep, "tmp") and parent.name.startswith("hg-"):
+        parent.mkdir(mode=0o700, exist_ok=True)
+        st = parent.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise RuntimeError("generation control socket directory is not private")
+    else:
+        parent.mkdir(parents=True, exist_ok=True)
+
+
+def _remove_empty_generation_socket_parent(socket_path: Path) -> None:
+    parent = socket_path.parent
+    if parent.parent == Path(os.path.sep, "tmp") and parent.name.startswith("hg-"):
+        with suppress(OSError):
+            parent.rmdir()  # Never remove another generation's live socket.
+
+
 class GenerationControlServer(GatewayControlServer):
     """Generation-scoped control endpoint that never touches legacy paths."""
 
@@ -272,11 +290,7 @@ class ActiveGeneration:
         for name in ("pid", "host"):
             write_generation_record(self.paths[name], self.identity, state="serving")
         socket_path = self.paths["socket"]
-        if socket_path.parent.parent == Path(os.path.sep, "tmp") and socket_path.parent.name.startswith("hg-"):
-            socket_path.parent.mkdir(mode=0o700, exist_ok=True)
-            st = socket_path.parent.lstat()
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-                raise RuntimeError("generation control socket directory is not private")
+        _ensure_generation_socket_parent(socket_path)
         if len(os.fsencode(socket_path)) >= 100:
             raise RuntimeError("generation control socket path exceeds UNIX socket limit")
         loop = asyncio.get_running_loop()
@@ -344,6 +358,7 @@ class ActiveGeneration:
                 current = self.paths["socket"].stat()
                 if (current.st_dev, current.st_ino) == (self.socket_stat.st_dev, self.socket_stat.st_ino):
                     self.paths["socket"].unlink()
+        _remove_empty_generation_socket_parent(self.paths["socket"])
         await asyncio.to_thread(
             self.coordinator.release_lease, "active_generation", self.identity.id, self.epoch)
         await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="exited")
@@ -385,6 +400,7 @@ async def serve_standby_generation(config=None) -> bool:
         await writer.wait_closed()
 
     socket_path = paths["socket"]
+    _ensure_generation_socket_parent(socket_path)
     if len(os.fsencode(socket_path)) >= 100:
         raise RuntimeError("generation control socket path exceeds UNIX socket limit")
     old_umask = os.umask(0o177)
@@ -454,6 +470,7 @@ async def serve_standby_generation(config=None) -> bool:
                 paths["socket"].unlink()
         except FileNotFoundError:
             pass
+        _remove_empty_generation_socket_parent(socket_path)
         for sig in installed:
             with suppress(Exception):
                 loop.remove_signal_handler(sig)
