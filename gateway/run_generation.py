@@ -549,6 +549,8 @@ class ActiveGeneration:
             if not isinstance(new_id, str):
                 raise RuntimeError("successor generation ID required")
             future = asyncio.run_coroutine_threadsafe(self.transfer_requested(new_id), loop)
+            # Control-socket handlers are rare, bounded operations; waiting here keeps the
+            # synchronous socket protocol simple without occupying an event-loop thread.
             return future.result(timeout=45)
 
         def _abort_handler(params: dict) -> dict:
