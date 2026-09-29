@@ -110,6 +110,10 @@ def test_status_identifies_polling_owner_and_draining_obligations(tmp_path):
     assert rows[first.id]["polling_owner"] is False
     assert rows[first.id]["draining_count"] == 2
     assert rows[second.id]["draining_count"] == 0
+    with coordinator.connect() as conn:
+        conn.execute("UPDATE sessions SET state='interrupted' WHERE session_key='chat:1'")
+    rows = {row["id"]: row for row in read_generation_status(tmp_path)}
+    assert rows[first.id]["draining_count"] == 0
 
 
 def test_guardian_observes_real_status_identity_before_socket_failure(tmp_path):

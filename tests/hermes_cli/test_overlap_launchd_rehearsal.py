@@ -37,6 +37,7 @@ def _wait_for(predicate, seconds: float, message: str) -> float:
     raise AssertionError(message)
 
 
+@pytest.mark.integration
 @pytest.mark.macos_only
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize("rollback_scenario", [False, True])

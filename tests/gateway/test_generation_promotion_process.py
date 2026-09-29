@@ -363,6 +363,7 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, 
         api.close()
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_successor_stops_wire_before_restoring_old_polling(tmp_path):
     """A real Bot API stub sees no concurrent poll even across rollback."""
