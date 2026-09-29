@@ -29,10 +29,9 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 1
-          filter: blob:none
-      - name: Fetch main history for attribution and previous-release checks
+      - name: Fetch main history and blobs for historical upgrade tests
         shell: bash
-        run: git fetch --no-tags --filter=blob:none --unshallow origin '+refs/heads/main:refs/remotes/origin/main'
+        run: git fetch --no-tags --unshallow origin '+refs/heads/main:refs/remotes/origin/main'
       - name: Assert scheduled or dispatched SHA
         shell: bash
         run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
