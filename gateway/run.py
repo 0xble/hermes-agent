@@ -5846,7 +5846,7 @@ async def _start_gateway_shutdown_tail(
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False,
-                        standby: bool = False) -> bool:
+                        standby: bool = False, promoted_generation=None) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all."""
@@ -5855,6 +5855,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if standby:
         from gateway.run_generation import serve_standby_generation
         return await serve_standby_generation(config)
+    if promoted_generation is not None:
+        from gateway.generation import GenerationCoordinator, overlap_handover_enabled
+        promoted_id, promoted_epoch = promoted_generation
+        if not overlap_handover_enabled(config):
+            raise RuntimeError("promoted generation requires overlap handover")
+        lease = next((row for row in GenerationCoordinator(Path(get_hermes_home())).leases()
+                      if row["resource"] == "active_generation"), None)
+        if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (promoted_id.id, promoted_epoch, "active"):
+            raise RuntimeError("standby promotion has no matching admission lease")
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
 
@@ -5867,17 +5876,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
-    _host_decision = await _host_attach_or_none(replace, force)
+    _host_decision = await _host_attach_or_none(replace, force) if promoted_generation is None else None
     if _host_decision is not None:
         return _host_decision
 
     # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
     from gateway.status import get_running_pid
-    existing_pid = get_running_pid()
+    existing_pid = get_running_pid() if promoted_generation is None else None
     if (existing_pid is not None and existing_pid != os.getpid()
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
         return False
 
+    if promoted_generation is not None:
+        from gateway.status import set_generation_runtime_status
+        set_generation_runtime_status(promoted_generation[0].id)
     _start_gateway_configure_logging(verbosity)
 
     runner = GatewayRunner(config)
@@ -5942,13 +5954,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # owner over already freed the lock with that process. Consequence: a live holder this process
     # cannot interrogate (its record never published, or it speaks another HOST_PROTOCOL_VERSION
     # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
-    if not _start_gateway_claim_pid_file(force=force):
+    if promoted_generation is None and not _start_gateway_claim_pid_file(force=force):
         return False
 
-    # An opt-in active generation registers only after winning the legacy singleton lock.
-    # The normal unflagged path never constructs or touches the coordinator.
+    # A promoted B owns its already-registered identity and lease. It never claims,
+    # unlinks, or replaces A's still-live singleton PID and control socket.
     _active_generation = None
-    if getattr(runner.config, "overlap_handover_enabled", False):
+    if promoted_generation is not None:
+        from gateway.generation import GenerationCoordinator
+        from gateway.run_generation import ActiveGeneration
+        promoted_id, promoted_epoch = promoted_generation
+        _active_generation = ActiveGeneration(Path(get_hermes_home()),
+            GenerationCoordinator(Path(get_hermes_home())), promoted_id, promoted_epoch)
+        await _active_generation.start()
+    elif getattr(runner.config, "overlap_handover_enabled", False):
         from gateway.run_generation import start_active_generation
         try:
             _active_generation = await start_active_generation(runner.config)
@@ -5961,9 +5980,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             await _active_generation.close()
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
-    _control_server = await _start_gateway_start_control_socket(runner)
-    # Now the attach channel answers: republish the host record with the settled served set.
-    _refresh_host_gateway_record(runner)
+    _control_server = (await _start_gateway_start_control_socket(runner)
+                       if promoted_generation is None else None)
+    # B leaves A's host record alone while A drains.
+    if promoted_generation is None:
+        _refresh_host_gateway_record(runner)
     _log_standalone_profiles_at_boot(runner)
 
     def _lifecycle_record_startup() -> None:
@@ -6029,6 +6050,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()
     if _active_generation is not None:
+        _active_generation.bind_runner(runner, cron_stop=cron_stop, cron_provider=cron_provider)
         await _active_generation.mark_ready()
 
     try:

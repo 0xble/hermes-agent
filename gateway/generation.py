@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS inbox (
   UNIQUE(profile_home,transport,session_key,seq)
 );
 CREATE INDEX IF NOT EXISTS inbox_owner_pending ON inbox(owner_id,state,profile_home,transport,session_key,seq);
+CREATE TABLE IF NOT EXISTS generation_transfers (
+  old_id TEXT NOT NULL REFERENCES generations(id), new_id TEXT NOT NULL REFERENCES generations(id),
+  epoch INTEGER NOT NULL, state TEXT NOT NULL,
+  PRIMARY KEY(old_id,epoch)
+);
+CREATE TABLE IF NOT EXISTS transfer_tokens (
+  old_id TEXT NOT NULL, epoch INTEGER NOT NULL, token_hash TEXT NOT NULL,
+  safe_offset INTEGER, poller_stopped INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(old_id,epoch,token_hash),
+  FOREIGN KEY(old_id,epoch) REFERENCES generation_transfers(old_id,epoch)
+);
 """
 
 
@@ -226,6 +237,106 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             )
             conn.commit()
             return epoch
+
+    def request_transfer(self, old_id: str, new_id: str, epoch: int,
+                         tokens: set[str]) -> None:
+        """Freeze the expected token roster before asking the old process to stop."""
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
+            successor = conn.execute("SELECT state FROM generations WHERE id=?", (new_id,)).fetchone()
+            if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active"):
+                raise RuntimeError("active generation lease changed; transfer refused")
+            if not successor or successor["state"] != "ready" or old_id == new_id:
+                raise RuntimeError("successor is not ready")
+            if conn.execute("SELECT 1 FROM generation_transfers WHERE old_id=? AND epoch=?", (old_id, epoch)).fetchone():
+                raise RuntimeError("transfer already requested")
+            conn.execute("INSERT INTO generation_transfers VALUES (?,?,?,'requested')", (old_id, new_id, epoch))
+            conn.executemany("INSERT INTO transfer_tokens(old_id,epoch,token_hash) VALUES(?,?,?)",
+                             [(old_id, epoch, token) for token in sorted(tokens)])
+            conn.commit()
+
+    def record_poller_stopped(self, old_id: str, epoch: int, token_hash: str,
+                              safe_offset: int) -> None:
+        """Persist only a receipt for a token in the frozen roster and current lease."""
+        if type(safe_offset) is not int or safe_offset < 0:
+            raise RuntimeError("invalid polling cursor")
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
+            transfer = conn.execute("SELECT state FROM generation_transfers WHERE old_id=? AND epoch=?",
+                                    (old_id, epoch)).fetchone()
+            if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active") or not transfer or transfer["state"] != "requested":
+                raise RuntimeError("poller stop receipt is not for a requested live transfer")
+            changed = conn.execute("UPDATE transfer_tokens SET safe_offset=?,poller_stopped=1 "
+                                   "WHERE old_id=? AND epoch=? AND token_hash=? AND poller_stopped=0",
+                                   (safe_offset, old_id, epoch, token_hash)).rowcount
+            if not changed:
+                raise RuntimeError("token is not pending a stop receipt")
+            conn.commit()
+
+    def transfer_receipts(self, old_id: str, epoch: int) -> list[dict[str, Any]]:
+        with closing(self.connect()) as conn, conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT token_hash,safe_offset,poller_stopped FROM transfer_tokens WHERE old_id=? AND epoch=? ORDER BY token_hash",
+                (old_id, epoch)).fetchall()]
+
+    def commit_transfer(self, old_id: str, new_id: str, epoch: int,
+                        *, drain_seconds: float = 7200) -> int:
+        """CAS promotion; a live old holder never loses its lease without its receipts."""
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            transfer = conn.execute("SELECT new_id,state FROM generation_transfers WHERE old_id=? AND epoch=?",
+                                    (old_id, epoch)).fetchone()
+            lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
+            successor = conn.execute("SELECT state FROM generations WHERE id=?", (new_id,)).fetchone()
+            if not transfer or transfer["new_id"] != new_id or transfer["state"] != "requested" or not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active"):
+                raise RuntimeError("transfer request or lease changed")
+            if not successor or successor["state"] != "ready":
+                raise RuntimeError("successor is not ready")
+            if conn.execute("SELECT 1 FROM transfer_tokens WHERE old_id=? AND epoch=? AND poller_stopped=0 LIMIT 1",
+                            (old_id, epoch)).fetchone():
+                raise RuntimeError("missing poller stop receipt")
+            changed = conn.execute("UPDATE leases SET generation_id=?,epoch=?,state='active' "
+                                   "WHERE resource='active_generation' AND generation_id=? AND epoch=? AND state='active'",
+                                   (new_id, epoch + 1, old_id, epoch)).rowcount
+            if changed != 1:
+                raise RuntimeError("transfer lease compare-and-swap failed")
+            conn.execute("UPDATE generations SET state='draining',drain_deadline=? WHERE id=?",
+                         (time.time() + drain_seconds, old_id))
+            conn.execute("UPDATE generations SET state='serving' WHERE id=?", (new_id,))
+            conn.execute("UPDATE generation_transfers SET state='committed' WHERE old_id=? AND epoch=?",
+                         (old_id, epoch))
+            conn.commit()
+            return epoch + 1
+
+    def abort_transfer(self, old_id: str, new_id: str, epoch: int) -> None:
+        """Allow the old process to resume only while it still owns admission."""
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
+            if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active"):
+                raise RuntimeError("cannot abort a committed transfer")
+            conn.execute("UPDATE generation_transfers SET state='aborted' WHERE old_id=? AND new_id=? AND epoch=? AND state='requested'",
+                         (old_id, new_id, epoch))
+            conn.commit()
+
+    def project_active_summary(self, identity: GenerationIdentity, epoch: int,
+                               runtime: dict[str, Any]) -> bool:
+        """Write legacy active summary while holding the lease's SQLite write fence."""
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
+            if not row or (row["generation_id"], row["epoch"], row["state"]) != (identity.id, epoch, "active"):
+                return False
+            write_generation_record(self.home / "gateway_state.json", identity,
+                                    state="serving", runtime=runtime)
+            from gateway.status import _build_pid_record, _clear_running_pid_cache
+            write_generation_record(self.home / "gateway.pid", identity,
+                                    state="serving", runtime=_build_pid_record())
+            _clear_running_pid_cache()
+            conn.commit()
+            return True
 
     def release_lease(self, resource: str, generation_id: str, epoch: int) -> bool:
         with closing(self.connect()) as conn, conn:

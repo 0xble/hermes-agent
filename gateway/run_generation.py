@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import json
+import socket
 import os
 import signal
 import time
@@ -24,6 +26,64 @@ from gateway.generation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _generation_request(path: Path, verb: str, *, params: dict | None = None,
+                        timeout: float = 30) -> dict:
+    request = json.dumps({"protocol": 1, "verb": verb, "params": params or {}}).encode() + b"\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(path))
+            sock.sendall(request)
+            chunks = bytearray()
+            while b"\n" not in chunks and len(chunks) < 65536:
+                part = sock.recv(65536)
+                if not part:
+                    break
+                chunks.extend(part)
+        response = json.loads(bytes(chunks).partition(b"\n")[0])
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
+    if not isinstance(response, dict) or response.get("ok") is not True or not isinstance(response.get("result"), dict):
+        raise RuntimeError(f"generation control refused {verb}: {response.get('error') if isinstance(response, dict) else 'invalid response'}")
+    return response["result"]
+
+
+def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45) -> int:
+    """Internal updater entry point; never ask the lease holder to relinquish by force."""
+    coordinator = GenerationCoordinator(home)
+    lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
+    if not lease or lease["state"] != "active":
+        raise RuntimeError("no active generation lease to transfer")
+    old_id, epoch = lease["generation_id"], lease["epoch"]
+    identities = {row["id"]: row for row in coordinator.generations()}
+    old, successor = identities.get(old_id), identities.get(to_id)
+    if old is None or successor is None or successor["state"] != "ready":
+        raise RuntimeError("successor is not ready or old generation is missing")
+    old_identity = GenerationIdentity(**{key: old[key] for key in GenerationIdentity.__dataclass_fields__})
+    path = generation_paths(home, old_identity)["socket"]
+    roster = _generation_request(path, "polling_roster", timeout=timeout)
+    tokens = roster.get("tokens")
+    if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
+        raise RuntimeError("invalid old generation polling roster")
+    coordinator.request_transfer(old_id, to_id, epoch, set(tokens))
+    ack = _generation_request(path, "transfer_requested", params={"to": to_id}, timeout=timeout)
+    if (ack.get("generation_id"), ack.get("epoch"), ack.get("poller_stopped")) != (old_id, epoch, True):
+        raise RuntimeError("old generation did not prove poller stopped")
+    promoted = coordinator.commit_transfer(old_id, to_id, epoch)
+    successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})
+    successor_socket = generation_paths(home, successor_identity)["socket"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = _generation_request(successor_socket, "polling_status", timeout=min(2, max(.1, deadline-time.monotonic())))
+            if status.get("generation_id") == to_id and status.get("polling") is True and set(status.get("tokens", [])) == set(tokens):
+                return promoted
+        except RuntimeError:
+            pass
+        time.sleep(.2)
+    raise RuntimeError("successor holds lease but has not proved polling progress")
 
 
 async def start_active_generation(config) -> "ActiveGeneration | None":
@@ -50,6 +110,8 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
     active = ActiveGeneration(home, coordinator, identity, epoch)
     try:
         await active.start()
+        from gateway.status import set_generation_runtime_status
+        set_generation_runtime_status(identity.id)
     except BaseException:
         await active.close()
         coordinator.heartbeat(identity.id, state="failed")
@@ -60,8 +122,8 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
 class GenerationControlServer(GatewayControlServer):
     """Generation-scoped control endpoint that never touches legacy paths."""
 
-    def __init__(self, home: Path, socket_path: Path) -> None:
-        super().__init__(home)
+    def __init__(self, home: Path, socket_path: Path, *, verb_handlers=None) -> None:
+        super().__init__(home, verb_handlers=verb_handlers)
         self._generation_socket_path = socket_path
 
     async def _start_posix(self) -> bool:
@@ -101,6 +163,106 @@ class ActiveGeneration:
         self.socket_stat = None
         self._last_runtime: dict | None = None
         self._last_status_write = 0.0
+        self.runner = None
+        self.cron_stop = None
+        self.cron_provider = None
+        self._transfer_lock = asyncio.Lock()
+        self._drain_task: asyncio.Task | None = None
+        self._drain_stopping = False
+
+    def bind_runner(self, runner, *, cron_stop=None, cron_provider=None) -> None:
+        self.runner = runner
+        self.cron_stop = cron_stop
+        self.cron_provider = cron_provider
+
+    def _telegram_adapters(self) -> dict[str, object]:
+        adapters = getattr(self.runner, "adapters", {}) or {}
+        result = {}
+        for adapter in adapters.values():
+            journal = getattr(adapter, "_controlled_journal", None)
+            if journal is not None:
+                token = journal.token_hash
+                if token in result:
+                    raise RuntimeError("duplicate Telegram token in generation roster")
+                result[token] = adapter
+        return result
+
+    def polling_status(self) -> dict:
+        roster = self._telegram_adapters()
+        return {"generation_id": self.identity.id,
+                "tokens": sorted(roster),
+                "polling": self.runner is not None and all(
+                    getattr(getattr(adapter, "_controlled_poller", None), "running", False)
+                    and getattr(getattr(adapter, "_polling_progress_event", None), "is_set", lambda: False)()
+                    for adapter in roster.values())}
+
+    async def transfer_requested(self, new_id: str) -> dict:
+        """Old owner alone can stop its wire and persist receipts; never stop a live turn."""
+        async with self._transfer_lock:
+            if self.runner is None:
+                raise RuntimeError("active runner has not reached ready state")
+            transfer = self.coordinator.transfer_receipts(self.identity.id, self.epoch)
+            roster = self._telegram_adapters()
+            if {row["token_hash"] for row in transfer} != set(roster):
+                raise RuntimeError("frozen token roster differs from live adapters")
+            stopped = []
+            try:
+                for token, adapter in roster.items():
+                    receipt = await adapter.stop_polling_for_transfer()
+                    if receipt.get("token_hash") != token:
+                        raise RuntimeError("poller stop token mismatch")
+                    stopped.append((adapter, receipt))
+                    await asyncio.to_thread(self.coordinator.record_poller_stopped,
+                                            self.identity.id, self.epoch, token, receipt["safe_offset"])
+                # No new autonomous dispatch from A. A's existing turns and egress stay alive.
+                if self.cron_stop is not None:
+                    self.cron_stop.set()
+                if self.cron_provider is not None:
+                    from gateway.run import _stop_cron_provider
+                    _stop_cron_provider(self.cron_provider)
+                self.runner._overlap_draining = True
+                self._drain_task = asyncio.create_task(self._drain_after_transfer())
+                return {"poller_stopped": True, "generation_id": self.identity.id,
+                        "epoch": self.epoch, "tokens": len(stopped)}
+            except Exception:
+                # A still holds the lease. Invalidate every partial receipt before
+                # attempting to re-arm: the driver cannot commit while rollback runs.
+                await asyncio.to_thread(self.coordinator.abort_transfer,
+                                        self.identity.id, new_id, self.epoch)
+                for adapter, receipt in stopped:
+                    await adapter.start_polling_from_transfer(receipt)
+                raise
+
+    async def finish_draining_once(self) -> bool:
+        """Stop A only after B owns the lease and all locally owned work has settled."""
+        if self.runner is None or not getattr(self.runner, "_overlap_draining", False):
+            return False
+        rows = self.coordinator.generations()
+        record = next((row for row in rows if row["id"] == self.identity.id), None)
+        if record is None or record["state"] != "draining":
+            return False
+        from tools.process_registry import process_registry
+        busy = (self.runner._active_work_count() or
+                bool(self.runner._pending_approvals) or
+                process_registry.has_any_active() or process_registry.pending_watchers)
+        with contextlib.closing(self.coordinator.connect()) as conn:
+            queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
+                                  (self.identity.id,)).fetchone()
+        if (busy or queued) and time.time() < record["drain_deadline"]:
+            return False
+        if not self._drain_stopping:
+            self._drain_stopping = True
+            await self.runner.stop()
+        return True
+
+    async def _drain_after_transfer(self) -> None:
+        while True:
+            try:
+                if await self.finish_draining_once():
+                    return
+            except Exception:
+                logger.warning("generation drain inspection failed; retaining old gateway", exc_info=True)
+            await asyncio.sleep(1)
 
     async def start(self) -> None:
         for name in ("pid", "host"):
@@ -108,7 +270,20 @@ class ActiveGeneration:
         socket_path = self.paths["socket"]
         if len(os.fsencode(socket_path)) >= 100:
             raise RuntimeError("generation control socket path exceeds UNIX socket limit")
-        self.server = GenerationControlServer(self.home, self.paths["socket"])
+        loop = asyncio.get_running_loop()
+
+        def _transfer_handler(params: dict) -> dict:
+            new_id = params.get("to")
+            if not isinstance(new_id, str):
+                raise RuntimeError("successor generation ID required")
+            future = asyncio.run_coroutine_threadsafe(self.transfer_requested(new_id), loop)
+            return future.result(timeout=45)
+
+        self.server = GenerationControlServer(
+            self.home, self.paths["socket"],
+            verb_handlers={"transfer_requested": _transfer_handler,
+                           "polling_roster": lambda: {"tokens": sorted(self._telegram_adapters())},
+                           "polling_status": self.polling_status})
         if not await self.server.start():
             raise RuntimeError("generation control socket unavailable")
         self.socket_stat = self.paths["socket"].stat()
@@ -121,7 +296,7 @@ class ActiveGeneration:
 
     def _sync_runtime_status(self) -> None:
         from gateway.status import read_runtime_status
-        runtime = read_runtime_status(self.home / "gateway_state.json") or {}
+        runtime = read_runtime_status(self.paths["state"]) or {}
         # The singleton PID and lease both belong to this process before it may
         # project the compatibility status to the generation-scoped record.
         if runtime.get("pid") != self.identity.pid:
@@ -131,6 +306,7 @@ class ActiveGeneration:
             return
         write_generation_record(self.paths["state"], self.identity, state="ready",
                                 socket_path=self.paths["socket"], runtime=runtime)
+        self.coordinator.project_active_summary(self.identity, self.epoch, runtime)
         self._last_runtime = runtime.copy()
         self._last_status_write = now
 
@@ -241,6 +417,7 @@ async def serve_standby_generation(config=None) -> bool:
         except (NotImplementedError, RuntimeError):
             continue
         installed.append(sig)
+    promoted_epoch = None
     try:
         last_warning = 0.0
         while not stop.is_set():
@@ -248,6 +425,11 @@ async def serve_standby_generation(config=None) -> bool:
                 await asyncio.wait_for(stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 try:
+                    lease = next((row for row in coordinator.leases()
+                                  if row["resource"] == "active_generation"), None)
+                    if lease and lease["generation_id"] == identity.id and lease["state"] == "active":
+                        promoted_epoch = lease["epoch"]
+                        break
                     await asyncio.to_thread(coordinator.heartbeat, identity.id)
                 except Exception:
                     now = time.monotonic()
@@ -266,6 +448,10 @@ async def serve_standby_generation(config=None) -> bool:
         for sig in installed:
             with suppress(Exception):
                 loop.remove_signal_handler(sig)
-        coordinator.heartbeat(identity.id, state="exited")
-        remove_generation_files(home, identity)
+        if promoted_epoch is None:
+            coordinator.heartbeat(identity.id, state="exited")
+            remove_generation_files(home, identity)
+    if promoted_epoch is not None:
+        from gateway.run import start_gateway
+        return await start_gateway(config, promoted_generation=(identity, promoted_epoch))
     return True
