@@ -102,9 +102,11 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                     raise AssertionError(f"gateway exit {proc.returncode}: {proc.stderr.read()}")
                 if len(GenerationCoordinator(home).generations()) >= expected:
                     rows = GenerationCoordinator(home).generations()
-                    if standby and any(row["state"] == "ready" for row in rows):
+                    if standby and any(row["state"] == "ready" and row["label"] == "ai.hermes.gateway-b"
+                                       for row in rows):
                         break
-                    if not standby and any(row["state"] == "ready" for row in rows):
+                    if not standby and any(row["state"] == "ready" and row["label"] == "ai.hermes.gateway"
+                                           for row in rows):
                         break
                 await asyncio.sleep(.1)
             else:
