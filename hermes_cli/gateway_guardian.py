@@ -16,6 +16,7 @@ import uuid
 import yaml
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from hermes_constants import get_hermes_home
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
@@ -282,10 +283,40 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             return "locked"
         try:
             from hermes_cli.config import _validate_updates
+            from hermes_cli.config_effective import load_user_config_effective
+            config: dict[str, Any]
             if grace is None:
-                from hermes_cli.config_effective import load_user_config_effective
                 config = load_user_config_effective(home / "config.yaml", fail_closed=True)
             else:
+                config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
+                # Explicit grace historically needs no config load. Only inspect the
+                # opt-in marker when present; a malformed unrelated config cannot alert.
+                config_path = home / "config.yaml"
+                try:
+                    flag_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+                except (OSError, UnicodeError):
+                    return "waiting"  # Unreadable flag cannot authorize legacy repair.
+                if "overlap_handover" in flag_text:
+                    try:
+                        flag_config = yaml.safe_load(flag_text) or {}
+                    except yaml.YAMLError:
+                        return "waiting"  # Cannot safely rule out an opt-in generation.
+                    if not isinstance(flag_config, dict):
+                        return "waiting"
+                    raw_gateway = flag_config.get("gateway") or {}
+                    overlap = raw_gateway.get("overlap_handover") if isinstance(raw_gateway, dict) else None
+                    if overlap is not None and (not isinstance(overlap, dict) or
+                                                overlap.get("enabled") is not False):
+                        return "waiting"
+                    config["gateway"] = raw_gateway
+            # The legacy guardian only knows one launchd label. Until overlap repair has
+            # its own fenced protocol, it must not bootstrap or roll back either generation.
+            gateway_config = config.get("gateway") or {}
+            if (isinstance(gateway_config, dict) and
+                    isinstance(gateway_config.get("overlap_handover"), dict) and
+                    gateway_config["overlap_handover"].get("enabled") is True):
+                return "waiting"
+            if grace is not None:
                 config = {"updates": {"release_acknowledgement_timeout_seconds": grace}}
             updates = config.get("updates")
             if updates is not None and not isinstance(updates, dict):
@@ -336,6 +367,11 @@ def cli(argv: list[str] | None = None) -> int:
     path = Path(pwd.getpwuid(getattr(os, 'getuid')()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
         print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()}")
+        from hermes_cli.gateway_generation_status import read_generation_status
+        for row in read_generation_status(home):
+            lease = ", ".join(row["leases"]) or "none"
+            print(f"generation={row['id']} sha={row['release_sha']} label={row['label']} "
+                  f"pid={row['pid']} lease={lease} state={row['state']}")
         return 0
     if args.action == "uninstall":
         subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10)

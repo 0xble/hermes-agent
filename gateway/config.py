@@ -655,6 +655,8 @@ class GatewayConfig:
     # An explicit value (config.yaml, GATEWAY_MULTIPLEX_PROFILES, a constructor argument) is honoured
     # verbatim. Every reader tests truthiness, so an unresolved ``None`` never multiplexes by accident.
     multiplex_profiles: Optional[bool] = None
+    # Opt-in generation overlap. The legacy singleton path remains byte-for-byte unchanged when false.
+    overlap_handover_enabled: bool = False
     # Public HTTPS endpoint for scoped RoomLink calls (an API key alone must never advertise a
     # route); HERMES_ROOM_LINK_URL overrides.
     room_link_url: Optional[str] = None
@@ -840,6 +842,12 @@ class GatewayConfig:
         if type(outbox.get("enabled", False)) is not bool:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
         retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
+        overlap_enabled = _coerce_bool(
+            _coerce_dict(data.get("overlap_handover") or nested_gateway.get("overlap_handover")).get(
+                "enabled", data.get("overlap_handover_enabled")), False,
+        )
+        if overlap_enabled and os.name == "nt":
+            raise ValueError("gateway.overlap_handover.enabled is not supported on Windows")
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -850,6 +858,7 @@ class GatewayConfig:
             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
             stt_echo_transcripts=_coerce_bool(stt_setting("stt_echo_transcripts", "echo_transcripts"), True),
             multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),
+            overlap_handover_enabled=overlap_enabled,
             room_link_url=room_link_url if isinstance(room_link_url, str) else None,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=_coerce_bool(pick("loop_watchdog"), True),
