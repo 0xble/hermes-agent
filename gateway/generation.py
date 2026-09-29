@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE INDEX IF NOT EXISTS inbox_owner_pending ON inbox(owner_id,state,profile_home,transport,session_key,seq);
 CREATE TABLE IF NOT EXISTS generation_transfers (
   old_id TEXT NOT NULL REFERENCES generations(id), new_id TEXT NOT NULL REFERENCES generations(id),
-  epoch INTEGER NOT NULL, state TEXT NOT NULL,
+  epoch INTEGER NOT NULL, state TEXT NOT NULL, attempt_nonce TEXT NOT NULL,
   PRIMARY KEY(old_id,epoch)
 );
 CREATE TABLE IF NOT EXISTS transfer_tokens (
@@ -152,6 +152,10 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(generations)")}
             if "suspect_from_state" not in columns:
                 conn.execute("ALTER TABLE generations ADD COLUMN suspect_from_state TEXT")
+            transfer_columns = {row["name"] for row in conn.execute("PRAGMA table_info(generation_transfers)")}
+            if "attempt_nonce" not in transfer_columns:
+                conn.execute("ALTER TABLE generation_transfers ADD COLUMN attempt_nonce TEXT")
+                conn.execute("UPDATE generation_transfers SET attempt_nonce=? WHERE attempt_nonce IS NULL", (str(uuid.uuid4()),))
             version = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
             if version is None:
                 conn.execute("INSERT INTO schema_meta(key,value) VALUES('version', ?)",
@@ -259,25 +263,45 @@ class GenerationCoordinator(OwnedAdmissionMixin):
                 raise RuntimeError("active generation lease changed; transfer refused")
             if not successor or successor["state"] != "ready" or old_id == new_id:
                 raise RuntimeError("successor is not ready")
-            if conn.execute("SELECT 1 FROM generation_transfers WHERE old_id=? AND epoch=?", (old_id, epoch)).fetchone():
+            existing = conn.execute(
+                "SELECT new_id,state FROM generation_transfers WHERE old_id=? AND epoch=?",
+                (old_id, epoch)).fetchone()
+            if existing and existing["state"] != "aborted":
                 raise RuntimeError("transfer already requested")
-            conn.execute("INSERT INTO generation_transfers VALUES (?,?,?,'requested')", (old_id, new_id, epoch))
+            attempt_nonce = str(uuid.uuid4())
+            if existing:
+                conn.execute("DELETE FROM transfer_tokens WHERE old_id=? AND epoch=?", (old_id, epoch))
+                conn.execute("UPDATE generation_transfers SET new_id=?,state='requested',attempt_nonce=? "
+                             "WHERE old_id=? AND epoch=?", (new_id, attempt_nonce, old_id, epoch))
+            else:
+                conn.execute("INSERT INTO generation_transfers VALUES (?,?,?,'requested',?)",
+                             (old_id, new_id, epoch, attempt_nonce))
             conn.executemany("INSERT INTO transfer_tokens(old_id,epoch,token_hash) VALUES(?,?,?)",
                              [(old_id, epoch, token) for token in sorted(tokens)])
             conn.commit()
 
+    def transfer_attempt_nonce(self, old_id: str, epoch: int) -> str:
+        with closing(self.connect()) as conn:
+            row = conn.execute("SELECT attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
+                               (old_id, epoch)).fetchone()
+        if not row or not row["attempt_nonce"]:
+            raise RuntimeError("transfer attempt is missing")
+        return row["attempt_nonce"]
+
     def record_poller_stopped(self, old_id: str, epoch: int, token_hash: str,
-                              safe_offset: int) -> None:
+                              safe_offset: int, *, attempt_nonce: str | None = None) -> None:
         """Persist only a receipt for a token in the frozen roster and current lease."""
         if type(safe_offset) is not int or safe_offset < 0:
             raise RuntimeError("invalid polling cursor")
         with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
-            transfer = conn.execute("SELECT state FROM generation_transfers WHERE old_id=? AND epoch=?",
+            transfer = conn.execute("SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
                                     (old_id, epoch)).fetchone()
-            if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active") or not transfer or transfer["state"] != "requested":
-                raise RuntimeError("poller stop receipt is not for a requested live transfer")
+            if (not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active")
+                    or not transfer or transfer["state"] != "requested"
+                    or (attempt_nonce is not None and transfer["attempt_nonce"] != attempt_nonce)):
+                raise RuntimeError("poller stop receipt is not for the current transfer attempt")
             changed = conn.execute("UPDATE transfer_tokens SET safe_offset=?,poller_stopped=1 "
                                    "WHERE old_id=? AND epoch=? AND token_hash=? AND poller_stopped=0",
                                    (safe_offset, old_id, epoch, token_hash)).rowcount
@@ -410,11 +434,7 @@ def generation_paths(home: Path, identity: GenerationIdentity) -> dict[str, Path
     if len(os.fsencode(socket)) >= 100:
         import hashlib
         digest = hashlib.sha256(os.fsencode(root)).hexdigest()[:16]
-        socket = root / f"hg-{hashlib.sha256(os.fsencode(root / suffix)).hexdigest()[:16]}.sock"
-        if len(os.fsencode(socket)) >= 100:
-            # The path must be stable across processes even if startup resets TMPDIR.
-            # Use a private, deterministic per-home directory under the short root.
-            socket = Path(os.path.sep, "tmp", f"hg-{getattr(os, 'getuid', lambda: 0)()}-{digest}") / f"{suffix[:12]}.sock"
+        socket = Path(os.path.sep, "tmp", f"hg-{getattr(os, 'getuid', lambda: 0)()}-{digest}") / f"{suffix[:32]}.sock"
     return {
         "pid": root / f"gateway.{suffix}.pid",
         "socket": socket,

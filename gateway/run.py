@@ -5978,12 +5978,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             return False
 
     async def _close_active_generation() -> None:
+        if takeover_task is not None:
+            takeover_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await takeover_task
         if _active_generation is not None:
             await _active_generation.close()
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = (await _start_gateway_start_control_socket(runner)
                        if promoted_generation is None else None)
+    takeover_task = None
+    if promoted_generation is not None:
+        async def _take_over_legacy_gateway_resources() -> None:
+            from gateway.status import get_running_pid
+            while True:
+                if get_running_pid() is None:
+                    try:
+                        if _start_gateway_claim_pid_file(force=False):
+                            nonlocal _control_server
+                            _control_server = await _start_gateway_start_control_socket(runner)
+                            _refresh_host_gateway_record(runner)
+                            logger.info("Promoted generation acquired legacy gateway resources")
+                            return
+                    except (RuntimeError, SystemExit):
+                        logger.debug("Promoted generation takeover is still fenced", exc_info=True)
+                await asyncio.sleep(.2)
+
+        takeover_task = asyncio.create_task(_take_over_legacy_gateway_resources())
     # B leaves A's host record alone while A drains.
     if promoted_generation is None:
         _refresh_host_gateway_record(runner)

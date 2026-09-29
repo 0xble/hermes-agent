@@ -51,8 +51,10 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
     monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
     api = BotAPI()
     started = tmp_path / "tool-running"
+    tool_duration = 60
     # chmod 777 intentionally triggers the dangerous-command approval detector.
-    command = f"chmod 777 {shlex.quote(str(tmp_path))} && touch {shlex.quote(str(started))} && sleep 60"
+    command = (f"chmod 777 {shlex.quote(str(tmp_path))} && "
+               f"touch {shlex.quote(str(started))} && sleep {tool_duration}")
     def model(record):
         messages = record["body"]["messages"]
         if messages and messages[-1].get("role") == "tool":
@@ -132,6 +134,16 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         with api.lock:
             before = len(api.offsets)
             assert before > 0, "A never entered a real getUpdates loop"
+        old = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway")
+        old_identity = GenerationIdentity(**{key: old[key] for key in
+            ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")})
+        old_socket = generation_paths(home, old_identity)["socket"]
+        assert old_socket.exists(), (
+            f"A control socket disappeared: {old_socket}; root={list(old_socket.parent.glob('*'))}; "
+            f"stderr={processes[0].stderr.read() if processes[0].returncode is not None else ''}")
+        assert processes[0].poll() is None, (
+            f"A exited before handover: code={processes[0].returncode}, "
+            f"stderr={processes[0].stderr.read() if processes[0].returncode is not None else ''}")
         result = await asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=35)
         assert result > 1
         assert processes[0].poll() is None, "A exited before its turn completed"
@@ -276,7 +288,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         assert processes[0].poll() is None, "A did not preserve its in-flight turn"
         # The follow-up redirects A's running turn rather than letting its
         # original terminal call finish.
-        end = time.monotonic() + 85
+        end = time.monotonic() + tool_duration + 35
         while time.monotonic() < end:
             with api.lock:
                 if any("old-followup-complete" in item["text"].replace("\\", "") for item in api.sent):

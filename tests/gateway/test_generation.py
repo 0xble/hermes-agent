@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -41,6 +42,44 @@ def test_long_temp_root_creates_private_control_directory(tmp_path):
     _ensure_generation_socket_parent(path)
     assert path.parent.is_dir()
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_generation_socket_root_cleanup_removes_owned_stale_siblings(tmp_path):
+    from gateway.run_generation import _ensure_generation_socket_parent
+    home = tmp_path / ("h" * 100)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    path = generation_paths(home, identity)["socket"]
+    stale = path.parent.parent / f"{path.parent.name}-stale"
+    stale.mkdir(mode=0o700)
+    stale_socket = stale / "old.sock"
+    stale_socket.write_text("stale")
+    stale_socket.with_name(f".{stale_socket.name}.owner.json").write_text(
+        json.dumps({"pid": 999999999, "start_time": 1}))
+    old = time.time() - 11 * 60
+    os.utime(stale, (old, old))
+    _ensure_generation_socket_parent(path)
+    assert not stale.exists()
+
+
+def test_generation_socket_root_cleanup_preserves_live_siblings(tmp_path):
+    from gateway.run_generation import _ensure_generation_socket_parent
+    home = tmp_path / ("h" * 100)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    path = generation_paths(home, identity)["socket"]
+    stale = path.parent.parent / f"{path.parent.name}-live"
+    stale.mkdir(mode=0o700)
+    live_socket = stale / "live.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(live_socket))
+    server.listen(1)
+    old = time.time() - 11 * 60
+    os.utime(stale, (old, old))
+    try:
+        _ensure_generation_socket_parent(path)
+        assert stale.exists()
+        assert live_socket.exists()
+    finally:
+        server.close()
 
 
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
@@ -277,6 +316,8 @@ async def test_promoted_exit_projects_stopped_status_without_stale_pid(tmp_path)
                "from hermes_cli.main import main; "
                "sys.argv = ['hermes', 'gateway', 'status']; main()"]
     status_env = {**os.environ, "HERMES_HOME": str(tmp_path),
+                  "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+                  "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
                   "HERMES_LAUNCHD_LABEL": f"ai.hermes.test-{tmp_path.name}"}
     status = subprocess.run(command, env=status_env,
                             capture_output=True, text=True, timeout=20)
