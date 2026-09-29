@@ -145,7 +145,7 @@ def test_overlap_post_swap_exit_requires_live_admission_readback(post_swap_candi
     receipt = _latest(home)
     assert receipt["outcome"] == ("success" if proof_valid else "blocked")
     assert exits == [proof_valid]
-    assert receipt["overlap_generation"].get("outcome") == ("blocked" if not proof_valid else None)
+    assert receipt["overlap_generation"]["outcome"] == ("success" if proof_valid else "blocked")
 
 
 @pytest.mark.parametrize("failure", ["raised", "incomplete"])

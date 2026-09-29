@@ -124,7 +124,12 @@ def test_updater_promotes_two_pinned_releases_with_native_long_turn(request, tmp
             if predicate():
                 return time.monotonic() - start
             time.sleep(.1)
-        raise AssertionError(f"{why}: {tmp_path / 'a.err'}, {tmp_path / 'b.err'}")
+        logs = []
+        for name in ("a.err", "b.err"):
+            path = tmp_path / name
+            if path.exists():
+                logs.append(f"{name}: {path.read_text(errors='replace')[-4000:]}")
+        raise AssertionError(f"{why}: {' | '.join(logs)}")
     def sent(needle):
         with api.lock:
             return [item for item in api.sent if needle in item["text"].replace("\\", "")]
@@ -146,11 +151,16 @@ def test_updater_promotes_two_pinned_releases_with_native_long_turn(request, tmp
                  GenerationCoordinator(home).generations()[0]["id"], 60, "B did not take lease")
             api.add(1002, 1002, text="new-boundary", chat_id=2)
             b_reply_seconds = wait(lambda: len(sent("B-complete:" + b)) == 1, 30, "B did not reply")
+            assert (paths.releases / a).exists()
+            assert subprocess.run(["launchctl", "print", f"{domain}/{old_label}"],
+                                  capture_output=True, timeout=5).returncode == 0
             result = future.result(timeout=60)
             if not result:
                 import sqlite3
                 with GenerationCoordinator(home).connect() as db:
                     print("INBOX", [dict(row) for row in db.execute("SELECT owner_id,owner_epoch,state,source_event_id,authorized_source FROM inbox")], flush=True)
+                    print("JOURNAL", [dict(row) for row in db.execute("SELECT update_id,state,received_at FROM telegram_updates")], flush=True)
+                print("AFTER", update_receipt.current_overlap_generation(), flush=True)
                 outbox_path = home / "gateway-outbox.db"
                 if outbox_path.exists():
                     with sqlite3.connect(outbox_path) as db:
@@ -178,6 +188,7 @@ def test_updater_promotes_two_pinned_releases_with_native_long_turn(request, tmp
         from hermes_cli.update_receipt import current_overlap_generation
         proof = current_overlap_generation()
         assert proof and proof["admission"]["generation_id"] != old["id"]
+        monkeypatch.setattr(overlap, "_active_and_prior", original_active)
         assert overlap.verified_overlap(home, proof)
         print(f"UPDATER_NATIVE build={build_seconds:.2f}s promote={promote_seconds:.2f}s "
               f"B_reply={b_reply_seconds:.2f}s A_reply_wait={a_reply_seconds:.2f}s "

@@ -111,7 +111,8 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
 
 
 def _observe_admission(home: Path, generation_id: str, epoch: int, *,
-                       after: float = 0, timeout: float = 30) -> dict:
+                       after: float = 0, source_event_id: str | None = None,
+                       timeout: float = 30) -> dict:
     """Require a newly accepted Telegram poll update and its delivered reply.
 
     The owned inbox only records routed obligations, not every locally handled
@@ -125,8 +126,9 @@ def _observe_admission(home: Path, generation_id: str, epoch: int, *,
         with coordinator.connect() as db:
             rows = db.execute(
                 "SELECT update_id FROM telegram_updates WHERE state='accepted' "
-                "AND received_at>=? ORDER BY received_at DESC",
-                (after,)).fetchall()
+                "AND received_at>=? AND (? IS NULL OR update_id=?) "
+                "ORDER BY received_at DESC",
+                (after, source_event_id, source_event_id)).fetchall()
         outbox = home / "gateway-outbox.db"
         if outbox.is_file():
             with sqlite3.connect(f"file:{outbox}?mode=ro", uri=True, timeout=2) as db:
@@ -163,6 +165,7 @@ def verified_overlap(home: Path, proof: dict) -> bool:
     try:
         return _observe_admission(home, active["id"], epoch,
                                   after=proof.get("admission_after", float("inf")),
+                                  source_event_id=admission.get("source_event_id"),
                                   timeout=.2) == admission
     except RuntimeError:
         return False
@@ -244,10 +247,11 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
         _set_boot_active(home, label, False)
         raise
     try:
+        # Fence out A's earlier messages before B can acquire the poller.
+        admission_after = time.time()
         promoted_epoch = handover_to_generation(home, successor["id"], timeout=min(timeout, 45),
                                                 drain_seconds=drain_seconds)
         poller = _observe_poller(home, successor)
-        admission_after = time.time()
         activate_release(home, candidate)  # Flip only after B owns and polls.
         # The loaded job keeps its standby argv; the next login must start the
         # committed owner as active, not an inert standby.

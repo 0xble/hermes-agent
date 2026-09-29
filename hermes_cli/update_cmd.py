@@ -2005,6 +2005,8 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                         raise SystemExit(1)
                     _record_update_step("overlap_fleet", True,
                                         "successor poll progressed and authorized reply delivered")
+                    from hermes_cli.update_receipt import record_overlap_generation
+                    record_overlap_generation({**_proof, "outcome": "success"})
                     _write_gateway_update_exit_code(True)
                     _finalize_receipt("success", "Overlap generation verified: %s")
                     return
