@@ -258,24 +258,34 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
 
 
 _EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)(?:\s+pid=(\d+))?\s*$", re.MULTILINE,
 )
 
 
-def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
-    """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
+def _worker_log_exit_code(
+    task_id: str, board: Optional[str] = None, *, pid: Optional[int] = None,
+) -> Optional[int]:
+    """Exit code from a worker's trailer, preferring the trailer for *pid*.
 
-    The durable twin of ``_recent_worker_exits``: written by the worker itself
-    (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs.
+    Worker logs are append-only across task retries. Older trailers did not carry
+    a PID, so retain the last-trailer fallback for those logs; new trailers are
+    matched to the dead worker and cannot be confused with a later retry.
     """
     try:
         raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
     except Exception:
         return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
+    matches = list(_EXIT_TRAILER_RE.finditer(raw or ""))
+    if pid is not None:
+        for match in reversed(matches):
+            logged_pid = match.group(2)
+            if logged_pid is not None and int(logged_pid) == int(pid):
+                return int(match.group(1))
+        # Legacy trailer without a PID: only use it when no identity-bearing
+        # trailer exists, preserving compatibility without overriding a match.
+        if any(match.group(2) is not None for match in matches):
+            return None
+    return int(matches[-1].group(1)) if matches else None
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -1070,7 +1080,7 @@ def _classify_dead_worker_exit(
     """
     kind, code = _classify_worker_exit(pid)
     if kind == "unknown" and task_id:
-        logged = _worker_log_exit_code(task_id, board=board)
+        logged = _worker_log_exit_code(task_id, board=board, pid=pid)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
     if kind == "clean_exit":
