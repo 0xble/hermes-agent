@@ -237,21 +237,21 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
             return "alert"
     if len(drainers) == 1 and drainers[0]["drain_deadline"] is not None:
         from hermes_cli.gateway_overlap import _observe_poller, rollback_overlap
-        transferred_at = drainers[0]["drain_deadline"] - drain_seconds
-        if transferred_at + 30 <= time.time() <= transferred_at + 60:
+        transferred_at = drainers[0]["transferred_at"]
+        if transferred_at is not None and transferred_at + 30 <= time.time() <= transferred_at + 60:
             try:
                 _observe_poller(home, owner, timeout=2)
             except (RuntimeError, OSError) as exc:
                 if _repair_count(home) >= MAX_REPAIRS:
                     receipt(home, "overlap", "capped", reason="overlap rollback attempt cap reached")
                     return "capped"
-                from gateway.generation import GenerationCoordinator
-                lease = next((item for item in GenerationCoordinator(home).leases()
-                              if item["resource"] == "active_generation"), None)
+                from hermes_cli.gateway_generation_status import read_active_generation_lease
+                lease = read_active_generation_lease(home)
                 if lease is None:
                     raise RuntimeError("overlap lease vanished during rollback inspection")
                 receipt(home, "rollback", "attempt", reason=str(exc), label=owner["label"])
-                proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"])
+                proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"],
+                                         drain_seconds=drain_seconds)
                 receipt(home, "rollback", "rolled_back", **proof)
                 return "rolled_back"
     # A loaded label with a clean exit and no remaining process can be retired.

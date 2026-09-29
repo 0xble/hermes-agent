@@ -297,6 +297,7 @@ class ActiveGeneration:
                 if receipt.get("token_hash") != token:
                     raise RuntimeError("rollback poller stop token mismatch")
                 receipts[token] = receipt
+            self._transfer_receipts = receipts
             self.runner._overlap_draining = True
             self._poller_paused = True
             if self._drain_task is None:

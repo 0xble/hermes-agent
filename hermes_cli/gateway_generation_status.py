@@ -6,6 +6,18 @@ from pathlib import Path
 from typing import Any
 
 
+def read_active_generation_lease(home: Path) -> dict[str, Any] | None:
+    """Observe the active lease without opening a writer or initializing schema."""
+    path = Path(home) / "gateway-coordinator.db"
+    if not path.is_file():
+        return None
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT resource,epoch,generation_id,state FROM leases "
+                           "WHERE resource='active_generation' AND state='active'").fetchone()
+        return dict(row) if row else None
+
+
 def read_generation_status(home: Path) -> list[dict[str, Any]]:
     """Return recorded generations and their leases without creating coordinator state."""
     path = Path(home) / "gateway-coordinator.db"
@@ -15,7 +27,7 @@ def read_generation_status(home: Path) -> list[dict[str, Any]]:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0) as conn:
             conn.row_factory = sqlite3.Row
             recorded = conn.execute(
-                "SELECT id,release_sha,label,pid,start_fingerprint,state,heartbeat_at,drain_deadline "
+                "SELECT id,release_sha,label,pid,started_at,boot_id,start_fingerprint,state,heartbeat_at,drain_deadline,transferred_at "
                 "FROM generations ORDER BY started_at DESC,id DESC").fetchall()
             terminal_labels: set[str] = set()
             rows = []

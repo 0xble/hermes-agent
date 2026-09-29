@@ -69,7 +69,8 @@ def _observe_poller(home: Path, row: dict, *, timeout: float = 5) -> dict:
     return result
 
 
-def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int) -> dict:
+def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
+                     *, drain_seconds: float = 7200) -> dict:
     """Stop B's wire before restoring A's fresh lease, then restore the pointer.
 
     A failed B that cannot answer its control socket is intentionally not taken
@@ -86,7 +87,8 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int) -> dic
     if (stopped.get("generation_id"), stopped.get("epoch"), stopped.get("poller_stopped")) != (
             failed_id, epoch, True):
         raise RuntimeError("rollback blocked: successor wire-stop receipt invalid")
-    restored = coordinator.rollback_transfer(failed_id, old_id, epoch, poller_stopped=True)
+    restored = coordinator.rollback_transfer(failed_id, old_id, epoch, poller_stopped=True,
+                                             drain_seconds=drain_seconds)
     if restored is None:
         raise RuntimeError("rollback blocked: active lease changed")
     response = _generation_request(_generation_socket(home, old), "restore_after_rollback",

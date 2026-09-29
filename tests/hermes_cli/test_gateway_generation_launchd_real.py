@@ -118,9 +118,11 @@ def test_active_and_passive_generations_use_distinct_records(request):
             assert state["state"] in ({"ready", "serving"} if row["id"] == active["id"] else {"ready"})
             assert Path(state["socket_path"]).exists()
             bound_sockets.append(Path(state["socket_path"]))
+        child_env = {k: v for k, v in os.environ.items()
+                     if k not in {"HERMES_LAUNCHD_LABEL", "HERMES_RELEASE_SHA"}}
         status = subprocess.run(
             [str(python), "-m", "hermes_cli.main", "gateway", "status"],
-            cwd=repository, env={**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(repository),
+            cwd=repository, env={**child_env, "HERMES_HOME": str(home), "PYTHONPATH": str(repository),
                                  "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "gateway-locks")},
             capture_output=True, text=True, timeout=30,
         )

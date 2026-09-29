@@ -40,6 +40,17 @@ def test_rollback_requires_stopped_successor_and_increments_epoch(tmp_path):
     assert coordinator.rollback_transfer(second.id, first.id, successor_epoch, poller_stopped=True) is None
 
 
+def test_rollback_uses_selected_drain_cap_and_records_transfer_time(tmp_path):
+    coordinator, first, second, epoch = _generations(tmp_path)
+    coordinator.request_transfer(first.id, second.id, epoch, set())
+    promoted = coordinator.commit_transfer(first.id, second.id, epoch, drain_seconds=90)
+    before = next(row for row in coordinator.generations() if row["id"] == first.id)
+    assert before["drain_deadline"] - before["transferred_at"] == pytest.approx(90)
+    coordinator.rollback_transfer(second.id, first.id, promoted, poller_stopped=True, drain_seconds=45)
+    after = next(row for row in coordinator.generations() if row["id"] == second.id)
+    assert 40 < after["drain_deadline"] - time.time() <= 45
+
+
 def test_status_identifies_polling_owner_and_draining_obligations(tmp_path):
     coordinator, first, second, epoch = _generations(tmp_path)
     coordinator.request_transfer(first.id, second.id, epoch, set())
@@ -52,6 +63,76 @@ def test_status_identifies_polling_owner_and_draining_obligations(tmp_path):
     assert rows[first.id]["polling_owner"] is False
     assert rows[first.id]["draining_count"] == 2
     assert rows[second.id]["draining_count"] == 0
+
+
+def test_guardian_observes_real_status_identity_before_socket_failure(tmp_path):
+    from hermes_cli.gateway_overlap import _observe_poller
+    coordinator, first, second, epoch = _generations(tmp_path)
+    row = next(row for row in read_generation_status(tmp_path) if row["id"] == first.id)
+    with pytest.raises(RuntimeError, match="generation control unavailable"):
+        _observe_poller(tmp_path, row, timeout=.1)
+
+
+def test_guardian_keeps_healthy_successor_polling(tmp_path, monkeypatch):
+    import socket
+    import threading
+    from gateway.generation import generation_paths
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, first, second, epoch = _generations(home)
+    coordinator.request_transfer(first.id, second.id, epoch, set())
+    coordinator.commit_transfer(first.id, second.id, epoch)
+    with coordinator.connect() as conn:
+        conn.execute("UPDATE generations SET pid=?,start_fingerprint=? WHERE id=?",
+                     (first.pid, first.start_fingerprint, second.id))
+        conn.execute("UPDATE generations SET transferred_at=? WHERE id=?",
+                     (time.time() - 40, first.id))
+    path = generation_paths(home, second)["socket"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(path))
+    server.listen(1)
+    def respond():
+        connection, _ = server.accept()
+        with connection:
+            connection.recv(4096)
+            connection.sendall((json.dumps({"ok": True, "result": {
+                "generation_id": second.id, "polling": True, "tokens": ["token"]}}) + "\n").encode())
+    worker = threading.Thread(target=respond, daemon=True)
+    worker.start()
+    try:
+        assert guardian._run_overlap(home) == "healthy"
+    finally:
+        server.close()
+        worker.join(timeout=2)
+    assert coordinator.leases()[0]["generation_id"] == second.id
+
+
+@pytest.mark.asyncio
+async def test_refused_rollback_rearms_successor_from_stopped_receipts(tmp_path):
+    from gateway.run_generation import ActiveGeneration
+    coordinator, first, second, epoch = _generations(tmp_path)
+    coordinator.request_transfer(first.id, second.id, epoch, {"token"})
+    coordinator.record_poller_stopped(first.id, epoch, "token", 0)
+    promoted = coordinator.commit_transfer(first.id, second.id, epoch)
+    class Adapter:
+        def __init__(self):
+            self._controlled_journal = type("Journal", (), {"token_hash": "token"})()
+            self.started = []
+        async def stop_polling_for_transfer(self):
+            return {"token_hash": "token", "safe_offset": 0}
+        async def start_polling_from_transfer(self, receipt):
+            self.started.append(receipt)
+    adapter = Adapter()
+    active = ActiveGeneration(tmp_path, coordinator, second, promoted)
+    active.runner = type("Runner", (), {"adapters": {"telegram": adapter}, "_overlap_draining": False})()
+    stopped = await active.stop_for_rollback()
+    assert stopped["poller_stopped"] is True
+    assert coordinator.rollback_transfer(second.id, first.id, promoted + 1, poller_stopped=True) is None
+    armed = await active.resume_uncommitted_transfer(promoted)
+    assert armed["polling"] is True
+    assert adapter.started == [{"token_hash": "token", "safe_offset": 0}]
+    assert active._drain_task is None
 
 
 def test_drain_cap_fences_only_unfinished_sessions_once(tmp_path):
@@ -80,14 +161,14 @@ def test_guardian_failed_poller_uses_fenced_rollback_within_health_window(tmp_pa
     coordinator.request_transfer(first.id, second.id, epoch, set())
     next_epoch = coordinator.commit_transfer(first.id, second.id, epoch)
     with coordinator.connect() as conn:
-        conn.execute("UPDATE generations SET drain_deadline=? WHERE id=?", (time.time() + 7200 - 40, first.id))
+        conn.execute("UPDATE generations SET transferred_at=? WHERE id=?", (time.time() - 40, first.id))
     from hermes_cli import gateway_overlap
     monkeypatch.setattr(guardian, "_repair_count", lambda home: 0)
     monkeypatch.setattr(guardian, "_gateway_domain", lambda label, preferred: "gui/501")
     monkeypatch.setattr(guardian, "_launch_state", lambda domain, label: "unloaded")
     monkeypatch.setattr(gateway_overlap, "_observe_poller", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no progress")))
     calls = []
-    monkeypatch.setattr(gateway_overlap, "rollback_overlap", lambda *args: calls.append(args) or {"epoch": next_epoch + 1})
+    monkeypatch.setattr(gateway_overlap, "rollback_overlap", lambda *args, **kwargs: calls.append(args) or {"epoch": next_epoch + 1})
     # Both identities are known, but no launchctl mutation is authorized until
     # the guarded helper has proved the successor wire stopped.
     with coordinator.connect() as conn:

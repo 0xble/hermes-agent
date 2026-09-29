@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS generations (
   id TEXT PRIMARY KEY, release_sha TEXT NOT NULL, label TEXT NOT NULL,
   pid INTEGER NOT NULL, started_at REAL NOT NULL, boot_id TEXT NOT NULL,
   start_fingerprint TEXT NOT NULL, state TEXT NOT NULL,
-  heartbeat_at REAL NOT NULL, drain_deadline REAL, suspect_from_state TEXT
+  heartbeat_at REAL NOT NULL, drain_deadline REAL, suspect_from_state TEXT,
+  transferred_at REAL
 );
 CREATE TABLE IF NOT EXISTS leases (
   resource TEXT PRIMARY KEY, epoch INTEGER NOT NULL, generation_id TEXT NOT NULL,
@@ -159,6 +160,8 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(generations)")}
             if "suspect_from_state" not in columns:
                 conn.execute("ALTER TABLE generations ADD COLUMN suspect_from_state TEXT")
+            if "transferred_at" not in columns:
+                conn.execute("ALTER TABLE generations ADD COLUMN transferred_at REAL")
             version = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
             if version is None:
                 conn.execute("INSERT INTO schema_meta(key,value) VALUES('version', ?)",
@@ -309,8 +312,9 @@ class GenerationCoordinator(OwnedAdmissionMixin):
                                    (new_id, epoch + 1, old_id, epoch)).rowcount
             if changed != 1:
                 raise RuntimeError("transfer lease compare-and-swap failed")
-            conn.execute("UPDATE generations SET state='draining',drain_deadline=? WHERE id=?",
-                         (time.time() + drain_seconds, old_id))
+            transferred_at = time.time()
+            conn.execute("UPDATE generations SET state='draining',transferred_at=?,drain_deadline=? WHERE id=?",
+                         (transferred_at, transferred_at + drain_seconds, old_id))
             conn.execute("UPDATE generations SET state='serving' WHERE id=?", (new_id,))
             conn.execute("UPDATE generation_transfers SET state='committed' WHERE old_id=? AND epoch=?",
                          (old_id, epoch))
@@ -343,7 +347,7 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             return len(rows)
 
     def rollback_transfer(self, failed_id: str, old_id: str, epoch: int,
-                          *, poller_stopped: bool) -> int | None:
+                          *, poller_stopped: bool, drain_seconds: float = 7200) -> int | None:
         """Restore an intact prior generation only after the successor's wire is proven idle."""
         if poller_stopped is not True:
             raise RuntimeError("successor poller stop not proved")
@@ -369,7 +373,7 @@ class GenerationCoordinator(OwnedAdmissionMixin):
                          "AND generation_id=? AND epoch=?", (old_id, failed_id, epoch))
             conn.execute("UPDATE generations SET state='serving',drain_deadline=NULL WHERE id=?", (old_id,))
             conn.execute("UPDATE generations SET state='draining',drain_deadline=? "
-                         "WHERE id=? AND state!='failed'", (time.time() + 7200, failed_id))
+                         "WHERE id=? AND state!='failed'", (time.time() + drain_seconds, failed_id))
             conn.execute("UPDATE generation_transfers SET state='rolled_back' WHERE old_id=? AND new_id=? "
                          "AND epoch=?", (old_id, failed_id, epoch - 1))
             conn.commit()
