@@ -978,3 +978,75 @@ async def test_boot_sweep_uses_store_profile_not_launch_retention(tmp_path):
     adapter.gateway_runner.config.durable_outbox_retention_days = 7
     assert await recover(store, adapter) == (0, 0)
     assert store.all_rows() == []
+
+
+async def _retry_with_instant_backoff(adapter, content):
+    from unittest.mock import patch
+    with patch("gateway.platforms.base.asyncio.sleep", new=AsyncMock()):
+        return await adapter._send_with_retry("chat", content)
+
+
+@pytest.mark.asyncio
+async def test_degraded_refusal_is_unsent_and_retry_delivers_once(tmp_path):
+    """A send refused before any request must not hold the retry behind an 'uncertain' row."""
+    sends = []
+    adapter = _fake_adapter(True, sends)
+    adapter._send_path_degraded = True
+
+    async def recover_during_backoff(*_a, **_kw):
+        adapter._send_path_degraded = False
+
+    bind_turn(tmp_path, "degraded")
+    try:
+        from unittest.mock import patch
+        with patch("gateway.platforms.base.asyncio.sleep", new=AsyncMock(side_effect=recover_during_backoff)):
+            result = await adapter._send_with_retry("chat", "final")
+        assert result.success
+        assert sends == [("chat", "final")]
+        assert [row.state for row in Outbox(tmp_path).all_rows()] == ["failed_unsent", "delivered"]
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_outbox_hold_is_final_without_plain_text_copy(tmp_path):
+    """An uncertain first dispatch holds the retry; no banner-prefixed copy may slip past as a new payload."""
+    sends = []
+    adapter = _fake_adapter(True, sends)
+
+    async def maybe_landed(chat_id, content, reply_to, metadata):
+        sends.append(content)
+        return SendResult(False, error="network timeout", retryable=True)
+
+    adapter._send_text_locked = maybe_landed
+    bind_turn(tmp_path, "held")
+    try:
+        result = await _retry_with_instant_backoff(adapter, "final")
+        assert not result.success and result.held
+        assert sends == ["final"]
+        assert [row.state for row in Outbox(tmp_path).all_rows()] == ["ambiguous"]
+    finally:
+        clear_turn()
+
+
+@pytest.mark.asyncio
+async def test_refused_outbox_final_is_ledgered_for_reconnect_redelivery(tmp_path, monkeypatch):
+    """The outbox never replays a proven-unsent final, so the delivery ledger must own it."""
+    from gateway import delivery_ledger as ledger
+    monkeypatch.setattr(ledger, "_db_path", lambda: tmp_path / "state.db")
+    sends = []
+    adapter = _final_fixture(tmp_path, sends)
+    adapter._send_path_degraded = True
+    event = _final_event()
+    event._outbox_home, event._outbox_turn_id = tmp_path, "refused-final"
+    bind_turn(tmp_path, "refused-final")
+    try:
+        from unittest.mock import patch
+        with patch("gateway.platforms.base.asyncio.sleep", new=AsyncMock()):
+            result, _ = await adapter.send_final_ledgered(event, "session", "answer", {}, reply_to=None)
+    finally:
+        clear_turn()
+    assert not result.success and result.pre_send and sends == []
+    assert {row.state for row in Outbox(tmp_path).all_rows()} == {"failed_unsent"}
+    claimed = ledger.sweep_failed_for_runtime("telegram")
+    assert [row["content"] for row in claimed] == ["answer"]

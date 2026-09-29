@@ -63,6 +63,23 @@ async def test_retention_runs_on_empty_poll_response(tmp_path, monkeypatch):
         assert db.execute("SELECT COUNT(*) FROM telegram_updates").fetchone()[0] == 0
 
 
+@pytest.mark.asyncio
+async def test_retention_prunes_terminal_rows_but_preserves_received(tmp_path, monkeypatch):
+    from plugins.platforms.telegram import polling_transfer
+    clock = [1_000_000.0]
+    monkeypatch.setattr(polling_transfer.time, "time", lambda: clock[0])
+    journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
+    journal.record_response(b'{"ok":true,"result":[{"update_id":1},{"update_id":2},{"update_id":3}]}')
+    assert await journal.claim(1)  # Ambiguous effect, never replay.
+    with journal._connect() as db:
+        db.execute("UPDATE telegram_updates SET state='quarantined' WHERE update_id=2")
+    clock[0] += 2 * 24 * 60 * 60
+    journal.record_response(b'{"ok":true,"result":[]}')
+    with journal._connect() as db:
+        assert [(r["update_id"], r["state"]) for r in db.execute(
+            "SELECT update_id,state FROM telegram_updates ORDER BY update_id")] == [(3, "received")]
+
+
 def test_transfer_receipt_fences_epoch_and_bot_identity(tmp_path):
     coordinator = GenerationCoordinator(tmp_path)
     first = PollingJournal(coordinator, "123456:LOCAL_ONLY")
@@ -105,15 +122,12 @@ async def test_controlled_poller_replays_before_first_poll_and_drains_inflight(t
         bot = Bot()
         update_queue = Queue()
 
-    poller = ControlledPoller(App(), journal, timeout=1)
+    poller = ControlledPoller(App(), journal, timeout=20)
     await poller.start()
     await asyncio.wait_for(request_started.wait(), 2)
-    stop = asyncio.create_task(poller.stop())
-    await asyncio.sleep(0.02)
-    assert not stop.done()
-    release_request.set()
-    await asyncio.wait_for(stop, 2)
+    assert (await asyncio.wait_for(poller.stop(), 3))["stopped"]
     assert not poller.running
+    assert not release_request.is_set()  # The idle 20-second request was interrupted.
 
 
 @pytest.mark.asyncio
@@ -169,7 +183,7 @@ def test_poison_update_is_quarantined_without_blocking_valid_ones(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_journal_write_runs_off_loop_and_queue_join_is_bounded(tmp_path):
+async def test_journal_io_runs_off_loop_and_queue_join_backpressures(tmp_path):
     journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
     journal.record_response(b'{"ok":true,"result":[{"update_id":4}]}')
     main_thread = threading.get_ident()
@@ -185,18 +199,51 @@ async def test_journal_write_runs_off_loop_and_queue_join_is_bounded(tmp_path):
     await journal.accept(4)
     assert worker_threads and all(ident != main_thread for ident in worker_threads)
 
+    # One short queue-join deadline must not count as a failed poll.
+    release_join = asyncio.Event()
     class Queue:
         async def put(self, update):
             pass
         async def join(self):
+            await release_join.wait()
+    class Bot:
+        calls = 0
+        async def get_updates(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return [Update(update_id=5)]
             await asyncio.Future()
     class App:
-        bot = object()
+        bot = Bot()
         update_queue = Queue()
     poller = ControlledPoller(App(), journal, timeout=0.02)
     journal.record_response(b'{"ok":true,"result":[{"update_id":5}]}')
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(poller.start(), 1)
+    worker_threads.clear()  # Test fixture write above is synchronous, unlike poller I/O.
+    start = asyncio.create_task(poller.start())
+    await asyncio.sleep(0.08)
+    assert not start.done()
+    release_join.set()
+    await asyncio.wait_for(start, 1)
+    deadline = asyncio.get_running_loop().time() + 2
+    while App.bot.calls < 2 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert App.bot.calls >= 2  # safe_offset before and after the returned batch
+    assert worker_threads and all(ident != main_thread for ident in worker_threads)
+    assert (await asyncio.wait_for(poller.stop(), 1))["stopped"]
+
+
+@pytest.mark.asyncio
+async def test_failed_poller_exception_observed_once_without_disconnect(tmp_path, caplog):
+    journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
+    poller = ControlledPoller(object(), journal)
+    async def exhausted():
+        raise OSError("all retries exhausted")
+    poller._task = asyncio.create_task(exhausted())
+    poller._task.add_done_callback(poller._observe_task)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert await poller.stop() == {"stopped": False, "error": "OSError"}
+    assert sum("Controlled Telegram poller failed" in record.message for record in caplog.records) == 1
 
 
 @pytest.mark.asyncio

@@ -20,8 +20,6 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 from plugins.platforms.telegram.polling_transfer import PollingJournal
 from telegram_polling_stub import BotAPI
 
-pytestmark = pytest.mark.timeout(120)
-
 TOKEN = "123456:LOCAL_STUB_ONLY"
 
 
@@ -135,10 +133,14 @@ async def test_standby_does_not_poll_and_transfer_receipt_fences_successor(tmp_p
         return proc
 
     async def wait(proc, prefix):
+        deadline = asyncio.get_running_loop().time() + 12
         while True:
-            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=12)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise AssertionError("worker did not reach " + prefix)
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
             if not raw:
-                raise AssertionError("worker exited: " + (await proc.stderr.read()).decode())
+                raise AssertionError("worker exited: " + (await asyncio.wait_for(proc.stderr.read(), 5)).decode())
             text = raw.decode().strip()
             if text.startswith(prefix):
                 return text
@@ -178,7 +180,7 @@ async def test_standby_does_not_poll_and_transfer_receipt_fences_successor(tmp_p
         for proc in processes:
             if proc.returncode is None:
                 proc.kill()
-                await proc.wait()
+                await asyncio.wait_for(proc.wait(), 5)
         api.close()
 
 

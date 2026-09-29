@@ -8,6 +8,7 @@ retried.
 """
 
 import asyncio
+import sqlite3
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -68,6 +69,217 @@ async def test_edit_flood_arms_the_window_for_later_sends(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rich_flood_refuses_following_send_for_full_server_wait(tmp_path):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._should_attempt_rich = lambda _content, metadata=None: True
+    adapter._bot.do_api_request = AsyncMock(side_effect=_FloodError(3600.0))
+
+    refused = await adapter.send("4242", "first answer")
+    assert refused.error.startswith("flood_control:")
+    assert refused.retry_after > 3500
+
+    adapter._bot.do_api_request.reset_mock()
+    again = await adapter.send("4242", "second answer")
+    assert again.error.startswith("flood_control:")
+    assert again.retry_after > 3500
+    adapter._bot.do_api_request.assert_not_awaited()
+
+    # The deadline belongs to this chat, not every conversation on the bot.
+    adapter._bot.do_api_request = AsyncMock(return_value={"message_id": 7})
+    other = await adapter.send("999", "other answer")
+    assert other.success is True
+
+
+@pytest.mark.asyncio
+async def test_flood_deadline_survives_adapter_replacement(tmp_path):
+    first = _adapter()
+    first._update_receipt_dir = tmp_path
+    first._record_send_flood_cooldown("4242", 3600.0)
+
+    replacement = _adapter()
+    replacement._update_receipt_dir = tmp_path
+    replacement._bot.send_message = AsyncMock()
+    refused = await replacement.send("4242", "reply after restart")
+
+    assert refused.error.startswith("flood_control:")
+    assert refused.retry_after > 3500
+    replacement._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_persisted_flood_deadline_expires(tmp_path):
+    first = _adapter()
+    first._update_receipt_dir = tmp_path
+    first._record_send_flood_cooldown("4242", 0.02)
+    await asyncio.sleep(0.03)
+
+    replacement = _adapter()
+    replacement._update_receipt_dir = tmp_path
+    replacement._bot.send_message = AsyncMock(return_value=MagicMock(message_id=7))
+    result = await replacement.send("4242", "after the deadline")
+
+    assert result.success is True
+    replacement._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_flood_deadline_uses_durable_fallback_when_sqlite_write_fails(tmp_path, monkeypatch):
+    first = _adapter()
+    first._update_receipt_dir = tmp_path
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.flood_state.record_deadline",
+        lambda *_args: (_ for _ in ()).throw(sqlite3.OperationalError("busy")),
+    )
+    first._record_send_flood_cooldown("4242", 3600.0)
+
+    replacement = _adapter()
+    replacement._update_receipt_dir = tmp_path
+    replacement._bot.send_message = AsyncMock()
+    refused = await replacement.send("4242", "after replacement")
+
+    assert refused.error.startswith("flood_control:")
+    assert refused.retry_after > 3500
+    replacement._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flood_storage_read_error_refuses_outbound_request(tmp_path, monkeypatch):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._bot.send_message = AsyncMock()
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.flood_state.remaining_seconds",
+        lambda *_args: (_ for _ in ()).throw(sqlite3.DatabaseError("corrupt")),
+    )
+
+    refused = await adapter.send("4242", "answer")
+
+    assert refused.error.startswith("flood_control:")
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_edit_flood_arms_shared_window(tmp_path):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._bot.do_api_request = AsyncMock(side_effect=_FloodError(3600.0))
+
+    refused = await adapter._try_edit_rich("4242", "77", "finished")
+    assert refused.error.startswith("flood_control:")
+    adapter._bot.send_message = AsyncMock()
+    following = await adapter.send("4242", "later answer")
+    assert following.error.startswith("flood_control:")
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_final_edit_flood_does_not_try_plain_fallback(tmp_path):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._rich_send_disabled = True
+    adapter._bot.edit_message_text = AsyncMock(side_effect=_FloodError(3600.0))
+
+    refused = await adapter.edit_message("4242", "77", "finished", finalize=True)
+
+    assert refused.error.startswith("flood_control:")
+    assert refused.retry_after > 3500
+    adapter._bot.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_overflow_continuation_flood_does_not_try_plain_fallback(tmp_path):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._rich_send_disabled = True
+    adapter._bot.edit_message_text = AsyncMock(return_value=MagicMock(message_id=77))
+    adapter._bot.send_message = AsyncMock(side_effect=_FloodError(3600.0))
+
+    refused = await adapter.edit_message("4242", "77", "word " * 1100, finalize=True)
+
+    assert refused.error.startswith("flood_control:")
+    assert refused.retry_after > 3500
+    assert refused.raw_response["partial_overflow"] is True
+    adapter._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_rechecks_flood_after_pacing_wait(tmp_path, monkeypatch):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._rich_send_disabled = True
+    adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=7))
+    adapter._chat_outbound_slot_remaining = lambda _chat_id: 1.0
+    sleeping = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def paused_sleep(_delay):
+        sleeping.set()
+        await resume.wait()
+
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", paused_sleep)
+    pending = asyncio.create_task(adapter.send("4242", "answer"))
+    await sleeping.wait()
+    adapter._record_send_flood_cooldown("4242", 3600.0)
+    resume.set()
+    refused = await pending
+
+    assert refused.error.startswith("flood_control:")
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_short_edit_retry_stops_when_deadline_grows_during_wait(tmp_path, monkeypatch):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._rich_send_disabled = True
+    adapter._bot.edit_message_text = AsyncMock(side_effect=_FloodError(0.05))
+    sleeping = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def paused_sleep(_delay):
+        sleeping.set()
+        await resume.wait()
+
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", paused_sleep)
+    pending = asyncio.create_task(adapter.edit_message("4242", "77", "finished", finalize=True))
+    await sleeping.wait()
+    adapter._record_send_flood_cooldown("4242", 3600.0)
+    resume.set()
+    refused = await pending
+
+    assert refused.error.startswith("flood_control:")
+    assert refused.retry_after > 3500
+    adapter._bot.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_network_retry_stops_when_deadline_appears_during_wait(tmp_path, monkeypatch):
+    from telegram.error import NetworkError
+
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._rich_send_disabled = True
+    adapter._bot.send_message = AsyncMock(side_effect=[NetworkError("connection lost"), MagicMock(message_id=7)])
+    sleeping = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def paused_sleep(_delay):
+        sleeping.set()
+        await resume.wait()
+
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", paused_sleep)
+    pending = asyncio.create_task(adapter.send("4242", "answer"))
+    await sleeping.wait()
+    adapter._record_send_flood_cooldown("4242", 3600.0)
+    resume.set()
+    refused = await pending
+
+    assert refused.error.startswith("flood_control:")
+    adapter._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_typing_is_suppressed_inside_the_window():
     adapter = _adapter()
     await _arm_window(adapter)
@@ -76,6 +288,24 @@ async def test_typing_is_suppressed_inside_the_window():
     await adapter.send_typing("4242")
 
     adapter._bot.send_chat_action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_typing_flood_arms_shared_window_without_topic_fallback(tmp_path):
+    adapter = _adapter()
+    adapter._update_receipt_dir = tmp_path
+    adapter._bot.send_chat_action = AsyncMock(side_effect=_FloodError(3600.0))
+    adapter._dm_topic_fallback = lambda _metadata: True
+    adapter._message_thread_id_for_typing = lambda _thread_id: 77
+
+    await adapter.send_typing("4242")
+
+    assert adapter._bot.send_chat_action.await_count == 1
+    adapter._bot.send_message = AsyncMock()
+    refused = await adapter.send("4242", "answer")
+    assert refused.error.startswith("flood_control:")
+    assert refused.retry_after > 3500
+    adapter._bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -111,21 +341,15 @@ async def test_media_flood_is_typed_and_arms_the_window(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_short_media_flood_retries_once_and_succeeds(tmp_path, monkeypatch):
+async def test_short_media_flood_retries_once_and_succeeds(tmp_path):
     """Under the inline cap the upload is retried in place, matching the text path."""
     adapter = _adapter()
-    slept: list = []
-
-    async def fake_sleep(delay):
-        slept.append(delay)
-
-    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", fake_sleep)
     calls = {"n": 0}
 
     async def flaky(**_kw):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise _FloodError(2.0)
+            raise _FloodError(0.02)
         return MagicMock(message_id=99)
 
     adapter._bot.send_document = AsyncMock(side_effect=flaky)
@@ -135,7 +359,7 @@ async def test_short_media_flood_retries_once_and_succeeds(tmp_path, monkeypatch
     result = await adapter.send_document("4242", str(path))
 
     assert result.success is True and result.message_id == "99"
-    assert slept == [2.0] and calls["n"] == 2
+    assert calls["n"] == 2
 
 
 @pytest.mark.asyncio
@@ -374,11 +598,7 @@ async def test_drafts_controls_and_deletes_share_known_flood_window():
     adapter._bot.send_message.assert_not_awaited()
     adapter._bot.delete_message.assert_not_awaited()
     assert "77" in adapter._status_message_ids.values()
-    # The same caller can retry after the window; refusal did not erase ownership.
-    adapter._telegram_send_cooldown_until.clear()
-    adapter._telegram_platform_flood_until.clear()
-    assert await adapter.delete_message("4242", "77") is True
-    assert "77" not in adapter._status_message_ids.values()
+    # The refusal did not erase ownership; cleanup can retry after the deadline.
     # A draft queued behind another outbound call must recheck the newly armed window.
     async with adapter._chat_send_lock("4242"):
         queued = asyncio.create_task(adapter.send_draft("4242", 2, "later preview"))

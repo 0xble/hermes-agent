@@ -167,6 +167,7 @@ async def test_queued_model_echo_of_interrupt_diagnostic_never_sends_before_foll
 
 
 @pytest.mark.parametrize("placeholder", [
+    "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]",
     "Operation interrupted.",
     "Operation interrupted: handling API error (timeout).",
     "Operation interrupted during retry (timeout, attempt 1/3).",
@@ -186,6 +187,9 @@ def test_interrupted_diagnostic_mentioned_in_prose_is_retained():
     from gateway.run import _sanitize_gateway_final_response
 
     prose = "Operation interrupted: waiting for model response is a diagnostic, not a reply."
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, prose) == prose
+    marker = "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
+    prose = f"The transcript contains {marker} and the work continues."
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, prose) == prose
 
 

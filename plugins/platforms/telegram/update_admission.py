@@ -257,8 +257,8 @@ class TelegramApplication(Application):
         if journal is not None and not await journal.claim(update.update_id):
             return
         claim = _Claim(key, asyncio.current_task())
-        # Atomic on PTB's event loop: no await between lookup and claim. Dispatch and its
-        # PTB tasks share ownership; completed-history pressure cannot evict active work.
+        # The journal claim awaits SQLite. A second PTB task can race this lookup,
+        # so the durable claim decides ownership before the in-process pending map.
         pending[key] = claim
         token = self._current_claim.set(claim)
         try:
