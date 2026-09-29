@@ -120,6 +120,42 @@ def test_rollback_refusal_rearms_stopped_successor(tmp_path, monkeypatch, refusa
 
 
 @pytest.mark.macos_only
+def test_failed_old_restore_fences_old_wire_then_rearms_successor(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, a, b, epoch = _committed(home)
+    releases = home / "releases"
+    for identity in (a, b):
+        release = releases / identity.release_sha
+        release.mkdir(parents=True)
+        for marker in (".release-ready", ".hermes_build_sha"):
+            (release / marker).write_text(identity.release_sha)
+    (home / "current").symlink_to(releases / b.release_sha)
+    calls = []
+
+    def request(path, verb, *, params=None, timeout=0):
+        calls.append((verb, params))
+        if verb == "stop_for_rollback":
+            identity = a if len([call for call in calls if call[0] == verb]) == 2 else b
+            return {"generation_id": identity.id,
+                    "epoch": coordinator.leases()[0]["epoch"], "poller_stopped": True}
+        if verb == "restore_after_rollback":
+            raise RuntimeError("old adapter could not rearm")
+        if verb == "resume_uncommitted_transfer":
+            lease = coordinator.leases()[0]
+            assert lease["generation_id"] == b.id
+            return {"generation_id": b.id, "epoch": lease["epoch"], "polling": True}
+        raise AssertionError(verb)
+
+    monkeypatch.setattr(overlap, "_generation_request", request)
+    with pytest.raises(RuntimeError, match="old adapter could not rearm"):
+        overlap.rollback_overlap(home, b.id, a.id, epoch)
+    assert calls[-1][0] == "resume_uncommitted_transfer"
+    assert coordinator.leases()[0]["generation_id"] == b.id
+    assert (home / "current").resolve().name == b.release_sha
+
+
+@pytest.mark.macos_only
 def test_missing_old_release_refuses_before_successor_wire_stop(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()

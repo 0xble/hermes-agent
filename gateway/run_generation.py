@@ -419,6 +419,7 @@ class ActiveGeneration:
                     await self._rearm_adapter(adapter, self._transfer_receipts[token])
                 self._transfer_receipts.clear()
                 self._poller_paused = False
+                self.epoch = epoch
                 self.runner._overlap_draining = False
                 if self._drain_task:
                     self._drain_task.cancel()

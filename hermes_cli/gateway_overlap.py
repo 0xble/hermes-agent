@@ -131,10 +131,31 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
             if resumed.get("generation_id") != failed_id or resumed.get("polling") is not True:
                 raise RuntimeError("rollback blocked: successor did not re-arm")
         raise
-    response = _generation_request(_generation_socket(home, old), "restore_after_rollback",
-                                   params={"epoch": restored}, timeout=15)
-    if response.get("generation_id") != old_id or response.get("polling") is not True:
-        raise RuntimeError("rollback blocked: prior generation has not restored polling")
+    try:
+        response = _generation_request(_generation_socket(home, old), "restore_after_rollback",
+                                       params={"epoch": restored}, timeout=15)
+        if response.get("generation_id") != old_id or response.get("polling") is not True:
+            raise RuntimeError("rollback blocked: prior generation has not restored polling")
+    except Exception as restore_error:
+        # When B is still alive, fence A's wire before giving B a newer lease.
+        # A missing stop receipt is ambiguous, so never risk two pollers.
+        if dead_successor or not _live(failed):
+            raise
+        old_stopped = _generation_request(_generation_socket(home, old),
+                                          "stop_for_rollback", timeout=15)
+        if (old_stopped.get("generation_id") != old_id or
+                old_stopped.get("epoch") not in {epoch - 1, restored} or
+                old_stopped.get("poller_stopped") is not True):
+            raise RuntimeError("rollback blocked: prior generation wire stop unproved") from restore_error
+        resumed_epoch = coordinator.restore_successor_after_failed_rollback(
+            failed_id, old_id, restored, old_poller_stopped=True)
+        resumed = _generation_request(_generation_socket(home, failed),
+                                      "resume_uncommitted_transfer",
+                                      params={"epoch": resumed_epoch}, timeout=15)
+        if (resumed.get("generation_id"), resumed.get("epoch"), resumed.get("polling")) != (
+                failed_id, resumed_epoch, True):
+            raise RuntimeError("rollback blocked: successor did not resume after old restore failure") from restore_error
+        raise
     activate_release(home, old_release, operation="rollback")
     _set_boot_active(home, old["label"], True)
     _set_boot_active(home, failed["label"], False)

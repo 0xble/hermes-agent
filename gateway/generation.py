@@ -415,6 +415,30 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             conn.commit()
             return epoch + 1
 
+    def restore_successor_after_failed_rollback(self, successor_id: str, old_id: str,
+                                                epoch: int, *, old_poller_stopped: bool) -> int:
+        """Return the lease to B only after A's wire is proven stopped."""
+        if old_poller_stopped is not True:
+            raise RuntimeError("prior generation poller stop not proved")
+        with closing(self.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
+            prior = conn.execute("SELECT state FROM generation_transfers WHERE old_id=? AND new_id=? "
+                                 "AND epoch=?", (old_id, successor_id, epoch - 2)).fetchone()
+            successor = conn.execute("SELECT state FROM generations WHERE id=?", (successor_id,)).fetchone()
+            if (not lease or (lease["generation_id"], lease["epoch"], lease["state"]) !=
+                    (old_id, epoch, "active") or not prior or prior["state"] != "rolled_back" or
+                    not successor or successor["state"] != "draining"):
+                raise RuntimeError("failed rollback lease or successor identity changed")
+            conn.execute("UPDATE leases SET generation_id=?,epoch=epoch+1 WHERE resource='active_generation'",
+                         (successor_id,))
+            conn.execute("UPDATE generations SET state='draining' WHERE id=?", (old_id,))
+            conn.execute("UPDATE generations SET state='serving',drain_deadline=NULL WHERE id=?", (successor_id,))
+            conn.execute("UPDATE generation_transfers SET state='committed' WHERE old_id=? AND new_id=? AND epoch=?",
+                         (old_id, successor_id, epoch - 2))
+            conn.commit()
+            return epoch + 1
+
     def abort_transfer(self, old_id: str, new_id: str, epoch: int) -> None:
         """Allow the old process to resume only while it still owns admission."""
         with closing(self.connect()) as conn, conn:
