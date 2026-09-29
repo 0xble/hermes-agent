@@ -10,6 +10,8 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import MagicMock
 from pathlib import Path
 
@@ -23,6 +25,25 @@ from gateway.generation import (
     remove_generation_files,
     write_generation_record,
 )
+
+
+def test_concurrent_generation_record_writers_do_not_share_temporary_path(tmp_path):
+    identity = GenerationIdentity.create(release_sha="abc", label="ai.hermes.gateway")
+    record = tmp_path / "gateway_state.json"
+    barrier = Barrier(2)
+
+    def write_many():
+        barrier.wait()
+        for _ in range(500):
+            write_generation_record(record, identity, state="serving")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(write_many)
+        second = pool.submit(write_many)
+        first.result()
+        second.result()
+    assert json.loads(record.read_text())["id"] == identity.id
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_long_temp_root_still_produces_usable_unix_control_socket(tmp_path, monkeypatch):

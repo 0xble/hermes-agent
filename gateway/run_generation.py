@@ -43,7 +43,10 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
                         timeout: float = 30) -> dict:
     request = json.dumps({"protocol": 1, "verb": verb, "params": params or {}}).encode() + b"\n"
     deadline = time.monotonic() + timeout
-    while True:
+    response: dict | None = None
+    # A live generation keeps its control socket. Tolerate only brief connection
+    # startup/teardown races, not disappearance for the whole request timeout.
+    for attempt in range(3):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 remaining = max(0.1, deadline - time.monotonic())
@@ -59,9 +62,9 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
             response = json.loads(bytes(chunks).partition(b"\n")[0])
             break
         except OSError as exc:
-            if time.monotonic() >= deadline:
+            if attempt == 2 or time.monotonic() >= deadline:
                 raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
-            time.sleep(.1)
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
         except ValueError as exc:
             raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
     if not isinstance(response, dict) or response.get("ok") is not True or not isinstance(response.get("result"), dict):
