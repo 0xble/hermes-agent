@@ -24,12 +24,14 @@ TOKEN = "123456:LOCAL_STUB_ONLY"
 
 
 @pytest.mark.asyncio
-async def test_flag_off_keeps_ptb_updater_and_no_coordinator(tmp_path, monkeypatch):
+@pytest.mark.parametrize("configured_off", [False, True])
+async def test_flag_off_keeps_ptb_updater_and_no_coordinator(tmp_path, monkeypatch, configured_off):
     from gateway.config import load_gateway_config
     api = BotAPI()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "1")
-    (tmp_path / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: false\n")
+    if configured_off:
+        (tmp_path / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: false\n")
     assert not load_gateway_config().overlap_handover_enabled
     adapter = TelegramAdapter(PlatformConfig(
         enabled=True, token=TOKEN, extra={"base_url": api.url, "base_file_url": api.url,
