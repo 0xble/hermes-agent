@@ -298,9 +298,23 @@ class ActiveGeneration:
     async def _rearm_adapter(self, adapter, receipt: dict) -> None:
         try:
             await adapter.start_polling_from_transfer(receipt)
-        except BaseException:
-            # begin_successor may already have consumed the receipt and started a
-            # poll. Teardown must finish before any fresh connect/retry.
+        except Exception:
+            # begin_successor consumes the journal receipt before the first
+            # progress read. Once consumed, a second transfer attempt can never
+            # validate; reconnect under the currently owned generation instead.
+            await adapter.disconnect()
+            lease = next((row for row in self.coordinator.leases()
+                          if row["resource"] == "active_generation"), None)
+            if (lease is None or
+                    (lease["generation_id"], lease["epoch"], lease["state"]) !=
+                    (self.identity.id, self.epoch, "active")):
+                raise RuntimeError("cannot reconnect a generation without its active lease")
+            journal = adapter._controlled_journal
+            if journal is None or await asyncio.to_thread(journal.validate_transfer, receipt):
+                raise  # Receipt was not consumed; preserve the original failure.
+            if not await adapter.connect():
+                raise RuntimeError("fresh generation reconnect did not prove polling")
+        except asyncio.CancelledError:
             await adapter.disconnect()
             raise
 

@@ -182,6 +182,37 @@ async def test_refused_rollback_rearms_successor_from_stopped_receipts(tmp_path)
     assert active._drain_task is None
 
 
+@pytest.mark.asyncio
+async def test_consumed_transfer_rearms_by_fresh_connect_on_owned_generation(tmp_path):
+    from gateway.run_generation import ActiveGeneration
+    coordinator, first, second, epoch = _generations(tmp_path)
+    from plugins.platforms.telegram.polling_transfer import PollingJournal
+    journal = PollingJournal(coordinator, "123456:DISPOSABLE_TEST")
+    receipt = journal.stop_receipt()
+    events = []
+
+    class Adapter:
+        _controlled_journal = journal
+
+        async def start_polling_from_transfer(self, receipt):
+            events.append(("transfer", receipt["epoch"]))
+            journal.begin_successor(receipt)
+            raise OSError("cold start failed after begin_successor")
+
+        async def disconnect(self):
+            events.append(("disconnect",))
+
+        async def connect(self):
+            lease = coordinator.leases()[0]
+            events.append(("connect", lease["generation_id"], lease["epoch"]))
+            return True
+
+    active = ActiveGeneration(tmp_path, coordinator, first, epoch)
+    await active._rearm_adapter(Adapter(), receipt)
+    assert journal.validate_transfer(receipt) is False
+    assert events == [("transfer", receipt["epoch"]), ("disconnect",), ("connect", first.id, epoch)]
+
+
 def test_drain_cap_fences_only_unfinished_sessions_once(tmp_path):
     coordinator, first, second, epoch = _generations(tmp_path)
     coordinator.request_transfer(first.id, second.id, epoch, set())
