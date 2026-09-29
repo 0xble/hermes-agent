@@ -4,6 +4,8 @@ controls who can admit work. Ambiguous process or token state fails closed.
 from __future__ import annotations
 
 import os
+import plistlib
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -100,10 +102,116 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
     if not _release_is_ready(old_release, old["release_sha"]):
         raise RuntimeError("rollback polling restored but prior release is not intact")
     activate_release(home, old_release, operation="rollback")
+    _set_boot_active(home, old["label"], True)
+    _set_boot_active(home, failed["label"], False)
     return {"from_id": failed_id, "to_id": old_id, "from_sha": failed["release_sha"],
             "to_sha": old["release_sha"], "from_label": failed["label"],
             "to_label": old["label"], "epoch": restored,
             "cursor": coordinator.transfer_receipts(old_id, epoch - 1)}
+
+
+def _observe_admission(home: Path, generation_id: str, epoch: int, *,
+                       after: float = 0, source_event_id: str | None = None,
+                       timeout: float = 30) -> dict:
+    """Require a newly accepted Telegram poll update and its delivered reply.
+
+    The owned inbox only records routed obligations, not every locally handled
+    turn. The polling journal is the durable admission record for fresh input.
+    The caller must first prove B owns the sole polling lease, then fence the
+    observation with ``after`` so A's earlier turns cannot satisfy the proof.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        coordinator = GenerationCoordinator(home)
+        with coordinator.connect() as db:
+            rows = db.execute(
+                "SELECT update_id FROM telegram_updates WHERE state='accepted' "
+                "AND received_at>=? AND (? IS NULL OR update_id=?) "
+                "ORDER BY received_at DESC",
+                (after, source_event_id, source_event_id)).fetchall()
+        outbox = home / "gateway-outbox.db"
+        if outbox.is_file():
+            with sqlite3.connect(f"file:{outbox}?mode=ro", uri=True, timeout=2) as db:
+                for row in rows:
+                    delivery = db.execute(
+                        "SELECT a.turn_id, o.message_id FROM admissions a JOIN outbox o "
+                        "ON o.turn_id=a.turn_id WHERE a.platform='telegram' "
+                        "AND a.transport_event_id=? AND a.event_kind='text' "
+                        "AND a.created_at>=? AND o.state='delivered' "
+                        "AND o.message_id IS NOT NULL LIMIT 1",
+                        (f"update:{row['update_id']}", int(after))).fetchone()
+                    if delivery:
+                        return {"source_event_id": str(row["update_id"]),
+                                "turn_id": delivery[0], "message_id": delivery[1],
+                                "generation_id": generation_id, "epoch": epoch}
+        time.sleep(.2)
+    raise RuntimeError("successor has not proved a newly accepted and delivered reply")
+
+
+def verified_overlap(home: Path, proof: dict) -> bool:
+    """Recheck the live owner, pointer, poller and delivered admission at exit."""
+    paths = ReleasePaths.for_home(home)
+    _coordinator, active, _prior, epoch = _active_and_prior(home)
+    admission = proof.get("admission") or {}
+    if (active["id"], active["release_sha"], epoch) != (
+            proof.get("new_id"), proof.get("new_sha"), proof.get("epoch")):
+        return False
+    if (admission.get("generation_id"), admission.get("epoch")) != (active["id"], epoch):
+        return False
+    if paths.current.resolve() != (paths.releases / active["release_sha"]).resolve():
+        return False
+    if not _observe_poller(home, active).get("polling"):
+        return False
+    try:
+        return _observe_admission(home, active["id"], epoch,
+                                  after=proof.get("admission_after", float("inf")),
+                                  source_event_id=admission.get("source_event_id"),
+                                  timeout=.2) == admission
+    except RuntimeError:
+        return False
+
+
+def _launch_agents_dir() -> Path:
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def _install_generation_plist(home: Path, label: str, body: str) -> Path:
+    """Install a pinned boot entry without overwriting another profile's label."""
+    directory = _launch_agents_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    plist = directory / f"{label}.plist"
+    if plist.exists():
+        existing = plistlib.loads(plist.read_bytes())
+        configured_home = existing.get("EnvironmentVariables", {}).get("HERMES_HOME")
+        if existing.get("Label") != label or configured_home != str(home.resolve()):
+            raise RuntimeError("generation launch agent belongs to another installation")
+    pending = directory / f".{label}.{os.getpid()}.pending"
+    try:
+        pending.write_text(body, encoding="utf-8")
+        pending.replace(plist)
+    finally:
+        pending.unlink(missing_ok=True)
+    return plist
+
+
+def _set_boot_active(home: Path, label: str, active: bool) -> None:
+    """Keep only the lease holder eligible to launch on the next login."""
+    plist = _launch_agents_dir() / f"{label}.plist"
+    if not plist.exists():
+        return
+    data = plistlib.loads(plist.read_bytes())
+    if data.get("Label") != label or data.get("EnvironmentVariables", {}).get("HERMES_HOME") != str(home.resolve()):
+        raise RuntimeError("generation boot entry belongs to another installation")
+    data["RunAtLoad"] = active
+    if active:
+        data["ProgramArguments"] = [arg for arg in data.get("ProgramArguments", [])
+                                    if arg != "--standby"]
+    _install_generation_plist(home, label, plistlib.dumps(data).decode("utf-8"))
+
+
+def _bootout_generation(domain: str, label: str) -> None:
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"],
+                   check=True, timeout=15)
 
 
 def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: float = 7200,
@@ -127,18 +235,31 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
         raise RuntimeError("inactive generation label is already loaded; inspect before promotion")
     if old_release.name != old["release_sha"] or not _release_is_ready(old_release, old["release_sha"]):
         raise RuntimeError("active generation does not match an intact current release")
-    plist = home / "generation-plists" / f"{label}.plist"
-    plist.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     body = render_generation_launchd_plist(slot=slot, release_sha=sha, release_root=candidate,
                                            interpreter=candidate / ".venv/bin/python", hermes_home=home)
-    plist.write_text(body, encoding="utf-8")
+    plist = _install_generation_plist(home, label, body)
     bootstrap_generation_plist(domain=domain, plist_path=plist, label=label)
-    successor = _ready_successor(coordinator, label, sha, timeout=min(timeout, 30))
-    activate_release(home, candidate)  # No relaunch of either live generation.
     try:
+        successor = _ready_successor(coordinator, label, sha, timeout=min(timeout, 30))
+    except Exception:
+        # A never stopped polling. Do not leave a crash-looping standby loaded.
+        _bootout_generation(domain, label)
+        _set_boot_active(home, label, False)
+        raise
+    try:
+        # Fence out A's earlier messages before B can acquire the poller.
+        admission_after = time.time()
         promoted_epoch = handover_to_generation(home, successor["id"], timeout=min(timeout, 45),
                                                 drain_seconds=drain_seconds)
         poller = _observe_poller(home, successor)
+        activate_release(home, candidate)  # Flip only after B owns and polls.
+        # The loaded job keeps its standby argv; the next login must start the
+        # committed owner as active, not an inert standby.
+        active_body = render_generation_launchd_plist(
+            slot=slot, release_sha=sha, release_root=candidate,
+            interpreter=candidate / ".venv/bin/python", hermes_home=home, standby=False)
+        _install_generation_plist(home, label, active_body)
+        _set_boot_active(home, old["label"], False)
     except Exception as failure:
         # A committed lease cannot be inferred from a missing handover reply.
         # Record a rollback only after readback proves A owns the wire and the
@@ -171,4 +292,5 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
     return {"old_id": old["id"], "new_id": successor["id"],
             "old_sha": old["release_sha"], "new_sha": sha,
             "old_label": old["label"], "new_label": label, "epoch": promoted_epoch,
-            "poller": poller, "previous": str(old_release), "current": str(candidate)}
+            "poller": poller, "admission_after": admission_after,
+            "previous": str(old_release), "current": str(candidate)}

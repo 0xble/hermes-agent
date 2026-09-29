@@ -260,11 +260,20 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                     record_overlap_generation({"outcome": "blocked", "failure": str(exc),
                                                "new_sha": sha})
                     raise
-                record_overlap_generation(result)
                 if result.get("outcome") == "rolled_back":
+                    record_overlap_generation(result)
                     _record_update_step("immutable_release", False,
                                         f"overlap rolled back: {result['failure']}")
                     return False
+                from hermes_cli.gateway_overlap import _observe_admission
+                try:
+                    result["admission"] = _observe_admission(
+                        Path(home), result["new_id"], result["epoch"],
+                        after=result.get("admission_after", float("inf")))
+                except Exception as exc:
+                    record_overlap_generation({**result, "outcome": "blocked", "failure": str(exc)})
+                    raise
+                record_overlap_generation(result)
                 record_release_transition(from_sha=result["old_sha"], to_sha=sha,
                                           from_path=result["previous"], to_path=result["current"],
                                           kind="overlap_promotion")
@@ -1884,9 +1893,8 @@ def _immutable_phase_error(phase: str, release: Path, home: Path, reason: str = 
 
 def _overlap_failure_outcome() -> str:
     """Only a verified rollback or a fail-closed block gets a typed update result."""
-    from hermes_cli import update_receipt
-    current = update_receipt._current
-    proof = current.data.get("overlap_generation") if current is not None else None
+    from hermes_cli.update_receipt import current_overlap_generation
+    proof = current_overlap_generation()
     value = proof.get("outcome") if isinstance(proof, dict) else None
     return value if value in {"rolled_back", "blocked"} else "partial"
 
@@ -1968,6 +1976,7 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 detail = _immutable_phase_error("immutable_activation", release, paths.home)
                 _record_update_step("immutable_activation", False, detail)
                 print(f"✗ {detail}")
+                _write_gateway_update_exit_code(False)
                 _finalize_receipt(_overlap_failure_outcome(), "Immutable release activation failed: %s")
                 raise SystemExit(1)
             if opts.no_gateway_restart:
@@ -1976,16 +1985,31 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _record_update_step("immutable_activation", True,
                                     f"activated release {release.name} ({release})")
             if not opts.no_gateway_restart:
-                from hermes_cli import update_receipt as _overlap_receipt
-                _proof = (_overlap_receipt._current.data.get("overlap_generation")
-                          if _overlap_receipt._current is not None else None)
-                if _proof:
-                    # Never enter the legacy fleet path: it bootouts every
-                    # ai.hermes.gateway* label, including A's live drainer.
-                    _record_update_step("overlap_fleet", False,
-                                        "native authorized-admission and full fleet proof still required")
-                    _finalize_receipt("partial", "Overlap verification incomplete: %s")
-                    raise SystemExit(1)
+                from hermes_cli.update_receipt import current_overlap_generation
+                _proof = current_overlap_generation()
+                if _proof is not None:
+                    # Legacy fleet restart bootouts A while its turns still drain.
+                    from hermes_cli.gateway_overlap import verified_overlap
+                    try:
+                        verified = verified_overlap(paths.home, _proof)
+                    except Exception as exc:
+                        verified = False
+                        _record_update_step("overlap_fleet", False, f"verification unavailable: {exc}")
+                    if not verified:
+                        _record_update_step("overlap_fleet", False,
+                                            "active lease, pointer, poller or delivered admission unverified")
+                        from hermes_cli.update_receipt import record_overlap_generation
+                        record_overlap_generation({**_proof, "outcome": "blocked"})
+                        _write_gateway_update_exit_code(False)
+                        _finalize_receipt("blocked", "Overlap verification incomplete: %s")
+                        raise SystemExit(1)
+                    _record_update_step("overlap_fleet", True,
+                                        "successor poll progressed and authorized reply delivered")
+                    from hermes_cli.update_receipt import record_overlap_generation
+                    record_overlap_generation({**_proof, "outcome": "success"})
+                    _write_gateway_update_exit_code(True)
+                    _finalize_receipt("success", "Overlap generation verified: %s")
+                    return
                 restart = _restart_gateway_fleet_after_update(
                     _pre_update_plan, gateway_mode, acknowledged_release_root=release)
                 _resume_windows_gateways_and_merge_outcome(restart, _windows_gateway_resume, gateway_mode)
