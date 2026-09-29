@@ -88,18 +88,22 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
            "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1"}
     processes = []
+    stderr_paths = []
     try:
         for standby in (False, True):
-            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
-                                     "worker", "standby" if standby else "active"],
-                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, bufsize=1)
+            stderr_path = tmp_path / ("standby.stderr" if standby else "active.stderr")
+            stderr_paths.append(stderr_path)
+            with stderr_path.open("w") as stderr_file:
+                proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+                                         "worker", "standby" if standby else "active"],
+                                        env=env, stdout=subprocess.PIPE, stderr=stderr_file,
+                                        text=True, bufsize=1)
             processes.append(proc)
             deadline = time.monotonic() + 35
             expected = 2 if standby else 1
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
-                    raise AssertionError(f"gateway exit {proc.returncode}: {proc.stderr.read()}")
+                    raise AssertionError(f"gateway exit {proc.returncode}: {stderr_paths[-1].read_text()}")
                 if len(GenerationCoordinator(home).generations()) >= expected:
                     rows = GenerationCoordinator(home).generations()
                     if standby and any(row["state"] == "ready" and row["label"] == "ai.hermes.gateway-b"
@@ -126,7 +130,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                     proc.kill()
                     await asyncio.to_thread(proc.wait, 8)
                     raise AssertionError(f"A did not request approval: model calls={len(llm.main_requests())}, sent={api.sent}, "
-                                         f"offsets={api.offsets}, stderr={proc.stderr.read()[-4000:] if proc.stderr else ''}")
+                                         f"offsets={api.offsets}, stderr={stderr_paths[-1].read_text()[-4000:]}")
                 assert not started.exists(), "dangerous command ran before approval"
                 await asyncio.sleep(.3)
                 with api.lock:
@@ -142,11 +146,22 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         old_socket = generation_paths(home, old_identity)["socket"]
         assert old_socket.exists(), (
             f"A control socket disappeared: {old_socket}; root={list(old_socket.parent.glob('*'))}; "
-            f"stderr={processes[0].stderr.read() if processes[0].returncode is not None else ''}")
+            f"stderr={stderr_paths[0].read_text() if processes[0].returncode is not None else ''}")
         assert processes[0].poll() is None, (
             f"A exited before handover: code={processes[0].returncode}, "
-            f"stderr={processes[0].stderr.read() if processes[0].returncode is not None else ''}")
-        result = await asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=35)
+            f"stderr={stderr_paths[0].read_text() if processes[0].returncode is not None else ''}")
+        try:
+            result = await asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=35)
+        except Exception as exc:
+            from gateway.run_generation import _generation_request
+            successor_socket = generation_paths(home, GenerationIdentity(**{key: successor[key] for key in
+                ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")}))["socket"]
+            try:
+                status = await asyncio.to_thread(_generation_request, successor_socket, "polling_status", timeout=1)
+            except Exception as status_exc:
+                status = repr(status_exc)
+            raise AssertionError(f"handover failed: {exc!r}; B status={status}; "
+                                 f"B exit={processes[1].poll()}; B stderr={stderr_paths[1].read_text()[-8000:]}") from exc
         assert result > 1
         assert processes[0].poll() is None, "A exited before its turn completed"
         for update_id, command_text in ((1002, "/status"), (1003, "/queue")):
@@ -178,7 +193,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             assert answer_row and answer_row["owner_id"] != successor["id"] and answer_row["state"] == "accepted"
             assert completed, "A did not consume the clarify answer"
             await asyncio.to_thread(processes[0].wait, 30)
-            assert processes[0].returncode == 0, processes[0].stderr.read()
+            assert processes[0].returncode == 0, stderr_paths[0].read_text()
             third = await asyncio.to_thread(subprocess.run,
                 [sys.executable, str(Path(__file__).resolve()), "worker", "active"],
                 env=env, capture_output=True, text=True, timeout=25)
@@ -223,7 +238,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                 await asyncio.sleep(.1)
             assert stop_row and stop_row["owner_id"] != successor["id"] and stop_row["state"] == "accepted"
             await asyncio.to_thread(processes[0].wait, 30)
-            assert processes[0].returncode == 0, processes[0].stderr.read()
+            assert processes[0].returncode == 0, stderr_paths[0].read_text()
             return
         if approval_route == "steer":
             api.add(1005, 1005, text="/steer old-followup")
@@ -310,7 +325,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             assert len(api.offsets) > before, "B never entered a real getUpdates loop"
             assert api.maximum == 1 and not api.errors
         await asyncio.to_thread(processes[0].wait, 75)
-        assert processes[0].returncode == 0, processes[0].stderr.read()
+        assert processes[0].returncode == 0, stderr_paths[0].read_text()
     finally:
         for proc in processes:
             if proc.poll() is None:
