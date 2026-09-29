@@ -86,7 +86,9 @@ async def test_over_cap_flood_returns_partial_overflow_and_arms_cooldown(monkeyp
     total = len(adapter.truncate_message(adapter.format_message(content), adapter.MAX_MESSAGE_LENGTH))
     result = await adapter._send_with_retry(chat_id="4242", content=content)
 
-    assert result.success is False and result.error == "flood_control:120.0"
+    assert result.success is False and result.error.startswith("flood_control:")
+    assert result.retry_after == pytest.approx(120.0, abs=0.01)
+    assert float(result.error.split(":", 1)[1]) == pytest.approx(result.retry_after)
     raw = result.raw_response
     assert raw["partial_overflow"] is True and raw["delivered_chunks"] == 1 and raw["total_chunks"] == total >= 3
     assert raw["last_message_id"] == "1001" and len(raw["undelivered_chunks"]) == total - 1
