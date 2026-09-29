@@ -86,6 +86,8 @@ class OwnedAdmissionMixin:
                 (home, transport, key),
             ).fetchone()
             owner, epoch = session["generation_id"], session["epoch"]
+            if session["state"] == "interrupted":
+                raise RuntimeError("session is interrupted; explicit recovery required")
             # A session with no work and no queued input may move to the active
             # generation atomically with the first subsequent admission.
             pending = db.execute(

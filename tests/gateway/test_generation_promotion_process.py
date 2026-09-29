@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.machinery
 import json
 import os
 import signal
@@ -13,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("telegram")
+telegram_spec = importlib.machinery.PathFinder.find_spec("telegram", sys.path)
+if telegram_spec is None or not isinstance(telegram_spec.origin, str) or not Path(telegram_spec.origin).is_file():
+    pytest.skip("real python-telegram-bot is required for process tests", allow_module_level=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins"))
 from telegram_polling_stub import BotAPI
@@ -41,8 +44,9 @@ def _worker(standby: bool):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("kill_b_early", [True, False])
 @pytest.mark.asyncio
-async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path, monkeypatch):
+async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path, monkeypatch, kill_b_early):
     monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
     monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
     api = BotAPI()
@@ -128,14 +132,15 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             await asyncio.sleep(.1)
         else:
             raise AssertionError("B did not answer new session")
-        processes[1].kill()
-        await asyncio.to_thread(processes[1].wait, 5)
-        with api.lock:
-            post_kill_polls = len(api.offsets)
-        await asyncio.sleep(1)
-        with api.lock:
-            assert len(api.offsets) == post_kill_polls, "A resumed polling after B died"
-        assert processes[0].poll() is None, "A did not preserve its in-flight turn"
+        if kill_b_early:
+            processes[1].kill()
+            await asyncio.to_thread(processes[1].wait, 5)
+            with api.lock:
+                post_kill_polls = len(api.offsets)
+            await asyncio.sleep(1)
+            with api.lock:
+                assert len(api.offsets) == post_kill_polls, "A resumed polling after B died"
+            assert processes[0].poll() is None, "A did not preserve its in-flight turn"
         end = time.monotonic() + 85
         while time.monotonic() < end:
             with api.lock:
@@ -152,6 +157,15 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             assert api.maximum == 1 and not api.errors
         await asyncio.to_thread(processes[0].wait, 15)
         assert processes[0].returncode == 0, processes[0].stderr.read()
+        if not kill_b_early:
+            # A has relinquished its singleton resources; B must still block a
+            # third ordinary start in this same home despite not owning A's lock.
+            third = await asyncio.to_thread(subprocess.run,
+                [sys.executable, str(Path(__file__).resolve()), "worker", "active"],
+                env=env, capture_output=True, text=True, timeout=25)
+            assert third.returncode != 0, third.stdout + third.stderr
+            assert "EXIT:False" in third.stdout, third.stdout + third.stderr
+            assert processes[1].poll() is None, "third start displaced promoted B"
     finally:
         for proc in processes:
             if proc.poll() is None:
@@ -165,6 +179,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         llm.__exit__(None, None, None)
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
