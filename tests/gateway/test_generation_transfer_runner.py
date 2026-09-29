@@ -520,7 +520,7 @@ async def test_concurrent_drain_inspections_stop_runner_once(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path, caplog):
+async def test_missing_drain_deadline_uses_local_cap_without_repeated_warning(tmp_path, caplog, monkeypatch):
     db = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
@@ -543,6 +543,14 @@ async def test_missing_drain_deadline_expires_without_repeated_failure(tmp_path,
     db.commit_transfer(old.id, new.id, epoch)
     with db.connect() as conn:
         conn.execute("UPDATE generations SET drain_deadline=NULL WHERE id=?", (old.id,))
+    import gateway.run_generation as generation_run
+    now = [10_000.0]
+    monkeypatch.setattr(generation_run.time, "time", lambda: now[0])
+    assert not await active.finish_draining_once()
+    now[0] += 7199
+    assert not await active.finish_draining_once()
+    assert stopped == []
+    now[0] += 2
     assert await active.finish_draining_once()
     assert await active.finish_draining_once()
     assert stopped == [True]
@@ -589,6 +597,24 @@ async def test_takeover_releases_failed_claim_before_retry(monkeypatch):
     assert await asyncio.wait_for(generation_run.take_over_legacy_gateway_resources(
         identity, claim=claim, start_socket=start_socket, refresh=lambda: None), 2) == "claimed"
     assert attempts == 2 and removed == [True]
+
+
+@pytest.mark.asyncio
+async def test_claim_retry_registers_exit_cleanup_once(monkeypatch):
+    import atexit
+    import gateway.run as gateway_run
+    import gateway.status as status
+
+    registrations = []
+    monkeypatch.setattr(atexit, "register", lambda fn: registrations.append(fn))
+    monkeypatch.setattr(status, "acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr(status, "get_running_pid", lambda: None)
+    monkeypatch.setattr(status, "write_pid_file", lambda **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_claim_host_gateway_role", lambda **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_pid_cleanup_registered", False, raising=False)
+    assert gateway_run._start_gateway_claim_pid_file()
+    assert gateway_run._start_gateway_claim_pid_file()
+    assert registrations == [status.remove_pid_file, status.release_gateway_runtime_lock]
 
 
 @pytest.mark.asyncio

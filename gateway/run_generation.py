@@ -29,6 +29,7 @@ from gateway.generation import (
 
 logger = logging.getLogger(__name__)
 HANDOVER_REQUEST_TIMEOUT = 45  # Same bound as generation control acknowledgements.
+DEFAULT_DRAIN_SECONDS = 7200  # Match the commit cap when the durable deadline is missing.
 
 
 class HandoverCommittedUnverified(RuntimeError):
@@ -74,7 +75,7 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
 
 
 def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
-                           drain_seconds: float = 7200) -> int:
+                           drain_seconds: float = DEFAULT_DRAIN_SECONDS) -> int:
     """Internal updater entry point; never ask the lease holder to relinquish by force."""
     if not 1 <= drain_seconds <= 86400:
         raise ValueError("drain_seconds must be between 1 and 86400")
@@ -316,6 +317,7 @@ class ActiveGeneration:
         self._drain_stopping = False
         self._drain_stopped = False
         self._missing_deadline_warned = False
+        self._local_drain_deadline: float | None = None
         self._stopped_receipts: list[tuple[object, dict]] = []
         self._pending_transfer: tuple[str, str, float] | None = None
         self._external_cron_stopped = False
@@ -484,10 +486,14 @@ class ActiveGeneration:
 
         queued = await asyncio.to_thread(has_queued_inbox)
         deadline = record["drain_deadline"]
-        if deadline is None and not self._missing_deadline_warned:
-            logger.warning("generation missing drain deadline; treating as expired")
-            self._missing_deadline_warned = True
-        if (busy or queued) and deadline is not None and time.time() < deadline:
+        if deadline is None:
+            if self._local_drain_deadline is None:
+                self._local_drain_deadline = time.time() + DEFAULT_DRAIN_SECONDS
+            deadline = self._local_drain_deadline
+            if not self._missing_deadline_warned:
+                logger.warning("generation missing drain deadline; using local drain cap")
+                self._missing_deadline_warned = True
+        if (busy or queued) and time.time() < deadline:
             return False
         if self._drain_stopping:
             return self._drain_stopped
