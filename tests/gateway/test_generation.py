@@ -43,6 +43,18 @@ def test_long_temp_root_creates_private_control_directory(tmp_path):
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
 
+def test_generation_socket_root_cleanup_removes_owned_stale_siblings(tmp_path):
+    from gateway.run_generation import _ensure_generation_socket_parent
+    home = tmp_path / ("h" * 100)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    path = generation_paths(home, identity)["socket"]
+    stale = path.parent.parent / f"{path.parent.name}-stale"
+    stale.mkdir(mode=0o700)
+    (stale / "old.sock").write_text("stale")
+    _ensure_generation_socket_parent(path)
+    assert not stale.exists()
+
+
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
     from gateway import generation
     import platform
@@ -269,8 +281,10 @@ async def test_promoted_exit_projects_stopped_status_without_stale_pid(tmp_path)
     assert state["pid"] is None
     assert retained_gateway_state(state) == "stopped"
     assert db.leases()[0]["state"] == "released"
-    command = [str(Path(sys.executable).parent / "hermes"), "gateway", "status"]
-    status = subprocess.run(command, env={**os.environ, "HERMES_HOME": str(tmp_path)},
+    command = [sys.executable, "-m", "hermes_cli.main", "gateway", "status"]
+    status = subprocess.run(command, env={**os.environ, "HERMES_HOME": str(tmp_path),
+                                           "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+                                           "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
                             capture_output=True, text=True, timeout=20)
     assert status.returncode == 0, status.stderr
     assert "gateway is not running" in status.stdout.lower(), status.stdout

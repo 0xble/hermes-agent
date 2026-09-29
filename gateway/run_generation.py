@@ -8,6 +8,7 @@ import json
 import socket
 import os
 import stat
+import shutil
 import signal
 import time
 from contextlib import suppress
@@ -41,20 +42,28 @@ class HandoverCommittedUnverified(RuntimeError):
 def _generation_request(path: Path, verb: str, *, params: dict | None = None,
                         timeout: float = 30) -> dict:
     request = json.dumps({"protocol": 1, "verb": verb, "params": params or {}}).encode() + b"\n"
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect(str(path))
-            sock.sendall(request)
-            chunks = bytearray()
-            while b"\n" not in chunks and len(chunks) < 65536:
-                part = sock.recv(65536)
-                if not part:
-                    break
-                chunks.extend(part)
-        response = json.loads(bytes(chunks).partition(b"\n")[0])
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                remaining = max(0.1, deadline - time.monotonic())
+                sock.settimeout(remaining)
+                sock.connect(str(path))
+                sock.sendall(request)
+                chunks = bytearray()
+                while b"\n" not in chunks and len(chunks) < 65536:
+                    part = sock.recv(65536)
+                    if not part:
+                        break
+                    chunks.extend(part)
+            response = json.loads(bytes(chunks).partition(b"\n")[0])
+            break
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
+            time.sleep(.1)
+        except ValueError as exc:
+            raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
     if not isinstance(response, dict) or response.get("ok") is not True or not isinstance(response.get("result"), dict):
         raise RuntimeError(f"generation control refused {verb}: {response.get('error') if isinstance(response, dict) else 'invalid response'}")
     return response["result"]
@@ -145,9 +154,28 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
     return active
 
 
+def _cleanup_stale_generation_socket_roots(current: Path) -> None:
+    root = current.parent
+    if root.parent != Path(os.path.sep, "tmp") or not root.name.startswith("hg-"):
+        return
+    uid = getattr(os, "getuid", lambda: 0)()
+    prefix = f"hg-{uid}-"
+    for sibling in root.parent.glob(f"{prefix}*"):
+        if sibling == root or not sibling.is_dir():
+            continue
+        try:
+            mode = stat.S_IMODE(sibling.stat().st_mode)
+            if sibling.stat().st_uid != uid or mode & 0o077:
+                continue
+            shutil.rmtree(sibling)
+        except OSError:
+            continue
+
+
 def _ensure_generation_socket_parent(socket_path: Path) -> None:
     parent = socket_path.parent
     if parent.parent == Path(os.path.sep, "tmp") and parent.name.startswith("hg-"):
+        _cleanup_stale_generation_socket_roots(socket_path)
         parent.mkdir(mode=0o700, exist_ok=True)
         st = parent.lstat()
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != getattr(os, "getuid", lambda: 0)() or st.st_mode & 0o077:
@@ -258,7 +286,9 @@ class ActiveGeneration:
                         raise RuntimeError("poller stop token mismatch")
                     stopped.append((adapter, receipt))
                     await asyncio.to_thread(self.coordinator.record_poller_stopped,
-                                            self.identity.id, self.epoch, token, receipt["safe_offset"])
+                                            self.identity.id, self.epoch, token, receipt["safe_offset"],
+                                            attempt_nonce=self.coordinator.transfer_attempt_nonce(
+                                                self.identity.id, self.epoch))
                 # Keep the shared housekeeping/cron stop event alive. The built-in
                 # ticker's dispatch gate observes _overlap_draining; external
                 # providers are explicitly stopped and re-armed on abort.
@@ -289,7 +319,7 @@ class ActiveGeneration:
             if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (
                     self.identity.id, self.epoch, "active"):
                 raise RuntimeError("old generation no longer owns admission")
-            if not self.runner._overlap_draining:
+            if not getattr(self.runner, "_overlap_draining", False):
                 return {"rearmed": True}
             with contextlib.closing(self.coordinator.connect()) as conn:
                 transfer = conn.execute(
