@@ -5395,7 +5395,10 @@ def _start_gateway_claim_pid_file(force: bool = False, *, projected_identity=Non
                      "Exiting to avoid double-running.", _current_pid)
         return False
     try:
-        write_pid_file(projected_identity=projected_identity)
+        if projected_identity is None:
+            write_pid_file()
+        else:
+            write_pid_file(projected_identity=projected_identity)
     except FileExistsError:
         release_gateway_runtime_lock()
         logger.error("PID file race lost to another gateway instance. Exiting.")
