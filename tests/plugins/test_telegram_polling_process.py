@@ -270,6 +270,14 @@ async def test_real_adapter_two_process_five_kill_boundaries(tmp_path):
         while time.monotonic() < deadline and counts(home)[0] < 200:
             await asyncio.sleep(0.04)
         assert counts(home) == (200, 0)
+        # Acceptance precedes the next getUpdates offset that acknowledges the
+        # last batch; do not terminate the worker before that poll is observed.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with api.lock:
+                if api.confirmed >= 200:
+                    break
+            await asyncio.sleep(0.02)
         proc.terminate()
         stopped = await asyncio.to_thread(wait, proc, "STOPPED:")
         await asyncio.to_thread(proc.wait, 5)

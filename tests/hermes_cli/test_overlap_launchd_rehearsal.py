@@ -177,7 +177,9 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
     try:
         for index, plist in enumerate(plists):
             subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
-            _wait_for(lambda: len(rows()) == index + 1 and all(row["state"] == "ready" for row in rows()),
+            _wait_for(lambda: len(rows()) == index + 1 and all(
+                row["state"] in ({"ready", "serving"} if row["label"] == labels[0] else {"ready"})
+                for row in rows()),
                       35, f"generation {index} not ready; log: {root / f'{labels[index]}.err'}")
             if not index:
                 api.add(1001, 1001, text="old-boundary")
@@ -198,7 +200,7 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
         epoch = handover_to_generation(home, new["id"], timeout=35)
         transfer_seconds = time.monotonic() - transfer_start
         assert epoch > 1
-        assert old["state"] == "ready" and (marker.exists() or not rollback_scenario)
+        assert old["state"] in {"ready", "serving"} and (marker.exists() or not rollback_scenario)
         activate_release(home, paths.releases / shas[1])
         if rollback_scenario:
             rollback_start = time.monotonic()
@@ -273,7 +275,7 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
             assert api.maximum == 1 and not api.errors
             assert not any("⏳ Gateway" in item["text"] or "Operation interrupted" in item["text"]
                            for item in api.sent)
-        assert next(row for row in rows() if row["id"] == new["id"])["state"] == "ready"
+        assert next(row for row in rows() if row["id"] == new["id"])["state"] == "serving"
         assert next(row for row in rows() if row["id"] == old["id"])["release_sha"] == shas[0]
         assert next(row for row in rows() if row["id"] == new["id"])["release_sha"] == shas[1]
         subprocess.run(["launchctl", "bootout", f"{domain}/{labels[0]}"], check=True, timeout=15)

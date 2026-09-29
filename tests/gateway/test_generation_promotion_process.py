@@ -23,6 +23,8 @@ if telegram_spec is None or not isinstance(telegram_spec.origin, str) or not Pat
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins"))
 from telegram_polling_stub import BotAPI
 from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths
+from gateway.control_socket import query_gateway_control
+from gateway.status import is_gateway_runtime_lock_active
 from gateway.run_generation import handover_to_generation
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
 
@@ -40,12 +42,14 @@ def _worker(standby: bool):
             return {}
         ActiveGeneration.transfer_requested = paused_transfer
     print(f"WORKER:{'B' if standby else 'A'}", flush=True)
-    success = asyncio.run(start_gateway(load_gateway_config(), standby=standby))
+    success = asyncio.run(start_gateway(load_gateway_config(), standby=standby,
+                                        force=bool(os.environ.get("TEST_THIRD_FORCE"))))
     print(f"EXIT:{success}", flush=True)
     return 0 if success else 1
 
 
 @pytest.mark.integration
+@pytest.mark.spawns_gateway_lookalike
 @pytest.mark.parametrize("approval_route", ["text", "callback", "stop", "steer", "clarify"])
 @pytest.mark.asyncio
 async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_path, monkeypatch, approval_route):
@@ -72,8 +76,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
         return Text("new-turn-complete")
     llm = FakeLLMServer(model)
     llm.__enter__()
-    home = tmp_path / "home"
-    home.mkdir()
+    home = Path(tempfile.mkdtemp(prefix="hermes-p3-", dir="/tmp"))  # UNIX socket path limit
     (home / "config.yaml").write_text(
         "model:\n  provider: custom\n  default: fake-model\n"
         f"  base_url: {llm.base_url}\n  key_env: OPENAI_API_KEY\n"
@@ -92,12 +95,15 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
            "HERMES_RELEASE_SHA": "a" * 40}
     processes = []
     stderr_paths = []
+    worker_path = tmp_path / "gateway" / "run.py"
+    worker_path.parent.mkdir()
+    worker_path.symlink_to(Path(__file__).resolve())
     try:
         for standby in (False, True):
             stderr_path = tmp_path / ("standby.stderr" if standby else "active.stderr")
             stderr_paths.append(stderr_path)
             with stderr_path.open("w") as stderr_file:
-                proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+                proc = subprocess.Popen([sys.executable, str(worker_path),
                                          "worker", "standby" if standby else "active"],
                                         env=env, stdout=subprocess.PIPE, stderr=stderr_file,
                                         text=True, bufsize=1)
@@ -112,12 +118,14 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                     if standby and any(row["state"] == "ready" and row["label"] == "ai.hermes.gateway-b"
                                        for row in rows):
                         break
-                    if not standby and any(row["state"] == "ready" and row["label"] == "ai.hermes.gateway"
-                                           for row in rows):
+                    if not standby and any(row["state"] in {"ready", "serving"} and
+                                           row["label"] == "ai.hermes.gateway" for row in rows):
                         break
                 await asyncio.sleep(.1)
             else:
-                raise AssertionError("gateway did not register in time")
+                raise AssertionError(f"gateway did not register in time: rows={GenerationCoordinator(home).generations()}; "
+                                     f"pid={proc.pid} alive={proc.poll() is None}; "
+                                     f"files={[p.name for p in home.iterdir()]}")
             if not standby:
                 api.add(1001, 1001, text="old-boundary")
                 end = time.monotonic() + 25
@@ -197,14 +205,33 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             assert completed, "A did not consume the clarify answer"
             await asyncio.to_thread(processes[0].wait, 30)
             assert processes[0].returncode == 0, stderr_paths[0].read_text()
+            # B must own the real singleton resources after A exits, not merely
+            # appear in projected runtime status.
+            from gateway.status import get_running_pid_identity_strict
+            deadline = time.monotonic() + 10
+            status = None
+            lock_owned = False
+            while time.monotonic() < deadline:
+                status = await asyncio.to_thread(query_gateway_control, home, "status", timeout=.5)
+                lock_owned = is_gateway_runtime_lock_active(home / "gateway.lock")
+                if lock_owned and status is not None and status.get("answering_pid") == processes[1].pid:
+                    break
+                await asyncio.sleep(.1)
+            assert lock_owned and (home / "gateway.sock").exists(), status
+            assert status is not None and status.get("generation_id") == successor["id"], status
+            owner = get_running_pid_identity_strict(home / "gateway.pid")
+            assert owner is not None and owner[0] == processes[1].pid
+            contender = await asyncio.to_thread(subprocess.run,
+                [sys.executable, "-c", "from gateway.status import acquire_gateway_runtime_lock; "
+                 "print(acquire_gateway_runtime_lock())"],
+                env=env, capture_output=True, text=True, timeout=10)
+            assert contender.returncode == 0 and contender.stdout.strip() == "False", contender.stderr
             third = await asyncio.to_thread(subprocess.run,
-                [sys.executable, str(Path(__file__).resolve()), "worker", "active"],
-                env=env, capture_output=True, text=True, timeout=25)
-            # A duplicate start can be rejected either by the singleton lock or
-            # by the host-preflight no-op after B refreshes its host record.
-            assert ("EXIT:False" in third.stdout and third.returncode != 0) or (
-                "already serves profile 'default'" in third.stdout and "EXIT:True" in third.stdout
-                and third.returncode == 0), third.stdout + third.stderr
+                [sys.executable, str(worker_path), "worker", "active"],
+                env={**env, "TEST_THIRD_FORCE": "1"}, capture_output=True, text=True, timeout=25)
+            assert third.returncode != 0 and "EXIT:False" in third.stdout, third.stdout + third.stderr
+            assert ("Gateway runtime lock is already held" in third.stderr or
+                    "Gateway runtime lock is already held" in (home / "logs" / "gateway.log").read_text())
             assert processes[1].poll() is None, "third start displaced promoted B"
             return
         if approval_route == "callback":
@@ -340,16 +367,17 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                     await asyncio.to_thread(proc.wait, 5)
         api.close()
         llm.__exit__(None, None, None)
+        shutil.rmtree(home)
 
 
 @pytest.mark.integration
+@pytest.mark.spawns_gateway_lookalike
 @pytest.mark.asyncio
 async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
     monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
     api = BotAPI()
-    home = tmp_path / "home"
-    home.mkdir()
+    home = Path(tempfile.mkdtemp(prefix="hermes-p3-", dir="/tmp"))  # UNIX socket path limit
     (home / "config.yaml").write_text(
         "gateway:\n  overlap_handover:\n    enabled: true\n"
         "platforms:\n  telegram:\n    enabled: true\n    token: '" + TOKEN + "'\n"
@@ -363,16 +391,19 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, 
            "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1", "TEST_PAUSE_TRANSFER": str(marker),
            "HERMES_RELEASE_SHA": "a" * 40}
     processes = []
+    worker_path = tmp_path / "gateway" / "run.py"
+    worker_path.parent.mkdir()
+    worker_path.symlink_to(Path(__file__).resolve())
     try:
         for standby in (False, True):
-            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+            proc = subprocess.Popen([sys.executable, str(worker_path),
                                      "worker", "standby" if standby else "active"],
                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             processes.append(proc)
             deadline = time.monotonic() + 25
             while time.monotonic() < deadline:
                 rows = GenerationCoordinator(home).generations()
-                if len(rows) == len(processes) and rows[-1]["state"] == "ready":
+                if len(rows) == len(processes) and rows[-1]["state"] in ({"ready"} if standby else {"serving", "ready"}):
                     break
                 assert proc.poll() is None, f"gateway died {proc.returncode}"
                 await asyncio.sleep(.1)
@@ -406,6 +437,7 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, 
                 proc.kill()
                 await asyncio.to_thread(proc.wait, 5)
         api.close()
+        shutil.rmtree(home)
 
 
 @pytest.fixture
@@ -462,7 +494,9 @@ async def test_successor_stops_wire_before_restoring_old_polling(short_gateway_h
             end = time.monotonic() + 25
             while time.monotonic() < end:
                 rows = GenerationCoordinator(home).generations()
-                if len(rows) >= len(processes) and all(row["state"] == "ready" for row in rows):
+                if len(rows) >= len(processes) and all(
+                        row["state"] in ({"ready", "serving"} if row["label"] == "ai.hermes.gateway" else {"ready"})
+                        for row in rows):
                     break
                 assert proc.poll() is None, proc.stderr.read() if proc.poll() is not None else ""
                 await asyncio.sleep(.1)

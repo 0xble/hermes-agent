@@ -318,8 +318,9 @@ def test_guardian_restores_drainer_after_successor_poller_stops(tmp_path, failur
                                          "HERMES_RELEASE_SHA": shas[0 if slot == "a" else 1]},
                                     cwd=repo, stdout=subprocess.DEVNULL, stderr=logs[slot], text=True)
             processes.append(proc)
-            wait(lambda: len(rows()) == len(processes) and all(r["state"] == "ready" for r in rows()),
-                 30, f"{slot} not ready")
+            wait(lambda: len(rows()) == len(processes) and all(
+                r["state"] in ({"ready", "serving"} if r["label"] == labels["a"] else {"ready"})
+                for r in rows()), 30, f"{slot} not ready")
             if slot == "a":
                 api.add(1001, 1001, text="long-a")
                 wait(marker_a.exists, 20, "A did not start a long turn")

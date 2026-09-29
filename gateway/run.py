@@ -5379,22 +5379,26 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     return shutdown_signal_handler
 
 
-def _start_gateway_claim_pid_file(force: bool = False) -> bool:
+def _start_gateway_claim_pid_file(force: bool = False, *, projected_identity=None) -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
     import atexit
     from gateway.status import (
         acquire_gateway_runtime_lock, get_running_pid, release_gateway_runtime_lock,
         remove_pid_file, write_pid_file)
-    _current_pid = get_running_pid()
-    if _current_pid is not None and _current_pid != os.getpid():
-        logger.error("Another gateway instance (PID %d) started during our startup. "
-                     "Exiting to avoid double-running.", _current_pid)
-        return False
     if not acquire_gateway_runtime_lock():
         logger.error("Gateway runtime lock is already held by another instance. Exiting.")
         return False
+    _current_pid = get_running_pid()
+    if _current_pid is not None and _current_pid != os.getpid():
+        release_gateway_runtime_lock()
+        logger.error("Another gateway instance (PID %d) started during our startup. "
+                     "Exiting to avoid double-running.", _current_pid)
+        return False
     try:
-        write_pid_file()
+        if projected_identity is None:
+            write_pid_file()
+        else:
+            write_pid_file(projected_identity=projected_identity)
     except FileExistsError:
         release_gateway_runtime_lock()
         logger.error("PID file race lost to another gateway instance. Exiting.")
@@ -5625,7 +5629,7 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
     return None
 
 
-async def _start_gateway_start_control_socket(runner):
+async def _start_gateway_start_control_socket(runner, *, generation_id: str | None = None):
     """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
     import atexit
     _control_server = None
@@ -5635,7 +5639,7 @@ async def _start_gateway_start_control_socket(runner):
         # a truthful liveness/identity query for updater and fleet consumers. Strictly non-fatal: a bind
         # failure only means consumers fall back to the process-scan/state-file layer, exactly as before
         # this feature. See #92091.
-        from gateway.control_socket import GatewayControlServer
+        from gateway.control_socket import GatewayControlServer, build_status_payload
         from gateway.update_launcher import make_agent_update_handler
         from gateway.slash_commands import _spawn_detached_update
         from hermes_cli.config import is_managed
@@ -5706,7 +5710,9 @@ async def _start_gateway_start_control_socket(runner):
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop),
+                           **({"status": lambda: {**build_status_payload(), "generation_id": generation_id}}
+                              if generation_id is not None else {})})
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5892,7 +5898,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
     from gateway.status import get_running_pid
-    existing_pid = get_running_pid() if promoted_generation is None else None
+    existing_pid = get_running_pid() if promoted_generation is None and not force else None
     if (existing_pid is not None and existing_pid != os.getpid()
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
         return False
@@ -6002,20 +6008,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                        if promoted_generation is None else None)
     takeover_task = None
     if promoted_generation is not None:
+        promoted_id = promoted_generation[0]
         async def _take_over_legacy_gateway_resources() -> None:
-            from gateway.status import get_running_pid
-            while True:
-                if get_running_pid() is None:
-                    try:
-                        if _start_gateway_claim_pid_file(force=False):
-                            nonlocal _control_server
-                            _control_server = await _start_gateway_start_control_socket(runner)
-                            _refresh_host_gateway_record(runner)
-                            logger.info("Promoted generation acquired legacy gateway resources")
-                            return
-                    except (RuntimeError, SystemExit):
-                        logger.debug("Promoted generation takeover is still fenced", exc_info=True)
-                await asyncio.sleep(.2)
+            from gateway.run_generation import take_over_legacy_gateway_resources
+            nonlocal _control_server
+            _control_server = await take_over_legacy_gateway_resources(
+                promoted_id,
+                claim=lambda: _start_gateway_claim_pid_file(force=False, projected_identity=promoted_id),
+                start_socket=lambda: _start_gateway_start_control_socket(runner, generation_id=promoted_id.id),
+                refresh=lambda: _refresh_host_gateway_record(runner),
+            )
 
         takeover_task = asyncio.create_task(_take_over_legacy_gateway_resources())
     # B leaves A's host record alone while A drains.

@@ -361,7 +361,8 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             conn.execute("BEGIN IMMEDIATE")
             old = conn.execute("SELECT state,drain_deadline FROM generations WHERE id=?",
                                (generation_id,)).fetchone()
-            if old is None or old["state"] != "draining" or old["drain_deadline"] is None or time.time() < old["drain_deadline"]:
+            if (old is None or old["state"] != "draining" or
+                    (old["drain_deadline"] is not None and time.time() < old["drain_deadline"])):
                 raise RuntimeError("generation has not reached its drain cap")
             rows = conn.execute("SELECT profile_home,transport,session_key,outstanding_work "
                                 "FROM sessions WHERE generation_id=? AND state!='interrupted' "
@@ -477,7 +478,7 @@ class GenerationCoordinator(OwnedAdmissionMixin):
         with closing(self.connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT state,drain_deadline FROM generations WHERE id=?", (generation_id,)).fetchone()
-            if not row or row["state"] != "draining" or row["drain_deadline"] is None or time.time() < row["drain_deadline"]:
+            if not row or row["state"] != "draining" or (row["drain_deadline"] is not None and time.time() < row["drain_deadline"]):
                 raise RuntimeError("generation has not reached its drain cap")
             changed = conn.execute("UPDATE sessions SET state='interrupted' WHERE generation_id=? AND state='owned'",
                                    (generation_id,)).rowcount
