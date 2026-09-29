@@ -249,6 +249,64 @@ def test_exit_cleanup_kills_foreground_command_still_running(monkeypatch):
         env.cleanup()
 
 
+def test_graceful_cleanup_allows_a_later_foreground_command(monkeypatch):
+    """Cleanup can run in-process without permanently refusing later terminal work."""
+    from tools import terminal_tool_lifecycle
+
+    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
+    env = LocalEnvironment(cwd="/tmp")
+    try:
+        terminal_tool_lifecycle.cleanup_all_environments()
+        result = env.execute("printf 'after cleanup'", timeout=10)
+        assert result["returncode"] == 0
+        assert "after cleanup" in result["output"]
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.parametrize("same_thread", [False, True])
+def test_graceful_cleanup_does_not_wait_forever_for_a_spawn(monkeypatch, same_thread):
+    """A stalled spawn, including a signal-like same-thread cleanup, cannot hang teardown."""
+    from tools.environments import base
+
+    env = LocalEnvironment(cwd="/tmp")
+    entered = threading.Event()
+    release = threading.Event()
+    real_run_bash = env._run_bash
+    durations = []
+    results = []
+
+    def cleanup():
+        start = time.monotonic()
+        base.kill_live_foreground_processes()
+        durations.append(time.monotonic() - start)
+
+    def gated(command, **kwargs):
+        if "printf stalled" in command:
+            entered.set()
+            if same_thread:
+                cleanup()
+            else:
+                assert release.wait(10), "test setup: stalled spawn was not released"
+        return real_run_bash(command, **kwargs)
+
+    monkeypatch.setattr(env, "_run_bash", gated)
+    worker = threading.Thread(target=lambda: results.append(env.execute("printf stalled", timeout=20)), daemon=True)
+    try:
+        worker.start()
+        assert entered.wait(10), "test setup: spawn never reached the gate"
+        if not same_thread:
+            cleanup()
+        else:
+            worker.join(2.0)
+        assert len(durations) == 1 and durations[0] < 2.0, durations
+    finally:
+        release.set()
+        worker.join(10)
+        env.cleanup()
+    assert not worker.is_alive() and results[0]["returncode"] == 0, results
+
+
 @pytest.mark.live_system_guard_bypass  # teardown races the worker's final kill of its own child
 def test_graceful_exit_kills_foreground_spawn_before_publication(monkeypatch):
     """Exit cleanup must not miss a child born before it snapshots the live commands."""

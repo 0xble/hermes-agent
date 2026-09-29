@@ -61,14 +61,15 @@ _live_foreground: dict[int, tuple["BaseEnvironment", "ProcessHandle"]] = {}
 # on a thread that already holds it.
 _live_foreground_cond = threading.Condition(threading.RLock())
 _exit_fenced = False  # one-way, set by the hard-exit kill: no foreground command spawns after it
+_cleanup_fences = 0  # temporary, per graceful cleanup; overlapping callers release only their own fence
 _spawns_in_flight = 0  # past the fence check, child maybe alive, not yet in _live_foreground
-_HARD_KILL_BUDGET_S = 0.5
+_HARD_KILL_BUDGET_S = 0.5  # also bounds the graceful spawn-publication wait; SDK spawn may stall
 
 
 def _enter_foreground_spawn() -> bool:
     global _spawns_in_flight
     with _live_foreground_cond:
-        if _exit_fenced:
+        if _exit_fenced or _cleanup_fences:
             return False
         _spawns_in_flight += 1
         return True
@@ -95,20 +96,30 @@ def _quiet_kill(kill: Callable, proc) -> None:
 def kill_live_foreground_processes(*, now: bool = False) -> int:
     """Kill every in-flight foreground command's process tree; returns how many were signalled.
 
-    Both exit paths fence new spawns and wait for children already spawning to register before
-    taking their snapshot. ``now=True`` is for a caller about to ``os._exit``: the graceful kill
-    TERMs, waits and only then KILLs, so a SIGTERM-ignoring command outlives a hard exit that lands
-    inside that window. The hard path never blocks past ``_HARD_KILL_BUDGET_S``: SDK cancels
-    (Modal, Daytona, Vercel) run on daemon threads under that one deadline."""
-    global _exit_fenced
+    Graceful cleanup temporarily fences new spawns while waiting briefly for children already
+    spawning to register, then kills its snapshot and lifts only its own fence. A remote SDK
+    spawn or a same-thread signal handler may never publish; the wait shares the hard-exit
+    path's 0.5s budget rather than hanging shutdown. ``now=True`` is for a caller about to
+    ``os._exit``: the graceful kill TERMs, waits and only then KILLs, so a SIGTERM-ignoring
+    command outlives a hard exit that lands inside that window. The hard path never blocks
+    past ``_HARD_KILL_BUDGET_S``: SDK cancels (Modal, Daytona, Vercel) run on daemon threads
+    under that one deadline."""
+    global _exit_fenced, _cleanup_fences
     if not now:
         with _live_foreground_cond:
-            _exit_fenced = True
-            _live_foreground_cond.wait_for(lambda: _spawns_in_flight == 0)
-            live = list(_live_foreground.values())
-        for env, proc in live:
-            _quiet_kill(env._kill_process, proc)
-        return len(live)
+            _cleanup_fences += 1
+        try:
+            with _live_foreground_cond:
+                _live_foreground_cond.wait_for(
+                    lambda: _spawns_in_flight == 0, timeout=_HARD_KILL_BUDGET_S)
+                live = list(_live_foreground.values())
+            for env, proc in live:
+                _quiet_kill(env._kill_process, proc)
+            return len(live)
+        finally:
+            with _live_foreground_cond:
+                _cleanup_fences -= 1
+                _live_foreground_cond.notify_all()
     deadline = time.monotonic() + _HARD_KILL_BUDGET_S
     _exit_fenced = True
     if _live_foreground_cond.acquire(timeout=_HARD_KILL_BUDGET_S):
