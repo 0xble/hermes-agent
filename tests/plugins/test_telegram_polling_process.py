@@ -20,6 +20,8 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 from plugins.platforms.telegram.polling_transfer import PollingJournal
 from telegram_polling_stub import BotAPI
 
+pytestmark = pytest.mark.timeout(120)
+
 TOKEN = "123456:LOCAL_STUB_ONLY"
 
 
