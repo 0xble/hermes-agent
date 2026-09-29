@@ -379,6 +379,131 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
 @pytest.mark.integration
 @pytest.mark.spawns_gateway_lookalike
 @pytest.mark.asyncio
+async def test_split_text_batch_flushed_by_old_process_during_promotion(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
+    monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")
+    api = BotAPI()
+    llm = FakeLLMServer(lambda record: Text("split-batch-complete"))
+    llm.__enter__()
+    home = Path(tempfile.mkdtemp(prefix="hermes-p3-batch-", dir="/tmp"))
+    (home / "config.yaml").write_text(
+        "model:\n  provider: custom\n  default: fake-model\n"
+        f"  base_url: {llm.base_url}\n  key_env: OPENAI_API_KEY\n"
+        "updates:\n  check: false\n"
+        "gateway:\n  overlap_handover:\n    enabled: true\n"
+        "platforms:\n  telegram:\n    enabled: true\n    token: '" + TOKEN + "'\n"
+        "    extra:\n      base_url: '" + api.url + "'\n"
+        "      base_file_url: '" + api.url + "'\n"
+        "      allow_from: ['1']\n      text_batch_split_delay_seconds: 4\n"
+        "      drop_pending_on_cold_boot: false\n")
+    env = {**{key: value for key, value in os.environ.items() if not key.startswith("HERMES_")},
+           "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
+           "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1"}
+    worker_path = tmp_path / "gateway" / "run.py"
+    worker_path.parent.mkdir()
+    worker_path.symlink_to(Path(__file__).resolve())
+    processes = []
+    stderr_paths = []
+    try:
+        for standby in (False, True):
+            error_path = tmp_path / ("batch-b.stderr" if standby else "batch-a.stderr")
+            stderr_paths.append(error_path)
+            with error_path.open("w") as stderr_file:
+                process = subprocess.Popen([sys.executable, str(worker_path), "worker",
+                    "standby" if standby else "active"], env=env, stdout=subprocess.PIPE,
+                    stderr=stderr_file, text=True, bufsize=1)
+            processes.append(process)
+            deadline = time.monotonic() + 35
+            while time.monotonic() < deadline:
+                rows = GenerationCoordinator(home).generations()
+                if any(row["label"] == ("ai.hermes.gateway-b" if standby else "ai.hermes.gateway")
+                       and row["state"] in ({"ready"} if standby else {"serving"}) for row in rows):
+                    break
+                if process.poll() is not None:
+                    raise AssertionError(error_path.read_text())
+                await asyncio.sleep(.1)
+            else:
+                raise AssertionError(f"batch gateway not ready: {rows}")
+        db = GenerationCoordinator(home)
+        poll_deadline = time.monotonic() + 25
+        while time.monotonic() < poll_deadline:
+            with api.lock:
+                if api.offsets:
+                    break
+            await asyncio.sleep(.1)
+        else:
+            raise AssertionError("old gateway did not begin polling")
+        old = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway")
+        new = next(row for row in db.generations() if row["label"] == "ai.hermes.gateway-b")
+        from gateway.run_generation import _generation_request
+        old_socket = generation_paths(home, GenerationIdentity(**{key: old[key] for key in
+            ("id", "release_sha", "label", "pid", "started_at", "boot_id", "start_fingerprint")}))["socket"]
+        ready_deadline = time.monotonic() + 20
+        status = None
+        while time.monotonic() < ready_deadline:
+            status = await asyncio.to_thread(_generation_request, old_socket, "polling_status", timeout=1)
+            if status.get("polling"):
+                break
+            await asyncio.sleep(.1)
+        else:
+            raise AssertionError(f"old runner never became ready: {status}")
+        api.add(1, 1, text="split-batch " + "x" * 4000)
+        # The stub accepts a real near-limit split chunk. Ensure it is in the
+        # Telegram journal but has not hit the model before handover starts.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            from plugins.platforms.telegram.polling_transfer import PollingJournal
+            journal = PollingJournal(db, TOKEN)
+            if not journal.pending():
+                with journal._connect() as conn:
+                    seen = conn.execute("SELECT state FROM telegram_updates WHERE update_id=1").fetchone()
+                if seen:
+                    break
+            await asyncio.sleep(.05)
+        else:
+            raise AssertionError("split chunk did not reach old poller")
+        with api.lock:
+            assert not any("split-batch-complete" in row["text"] for row in api.sent)
+        await asyncio.to_thread(handover_to_generation, home, new["id"], timeout=35)
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            with api.lock:
+                replies = [row for row in api.sent if "split-batch-complete" in row["text"].replace("\\", "")]
+            if replies:
+                break
+            await asyncio.sleep(.1)
+        if len(replies) != 1:
+            with db.connect() as conn:
+                inbox = [dict(row) for row in conn.execute("SELECT owner_id,state,source_event_id FROM inbox")]
+            log = home / "logs" / "gateway.log"
+            raise AssertionError(f"split reply count={len(replies)}; inbox={inbox}; "
+                f"model={len(llm.main_requests())}; sent={api.sent}; "
+                f"log={log.read_text()[-5000:] if log.exists() else None}; "
+                f"stderr={[path.read_text()[-3000:] for path in stderr_paths]}")
+        with db.connect() as conn:
+            accepted = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1'").fetchone()
+        assert accepted and accepted["owner_id"] == old["id"] and accepted["state"] == "accepted"
+        await asyncio.sleep(.5)
+        with api.lock:
+            assert sum("split-batch-complete" in row["text"].replace("\\", "") for row in api.sent) == 1
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    await asyncio.to_thread(process.wait, 8)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    await asyncio.to_thread(process.wait, 5)
+        api.close()
+        llm.__exit__(None, None, None)
+        shutil.rmtree(home)
+
+
+@pytest.mark.integration
+@pytest.mark.spawns_gateway_lookalike
+@pytest.mark.asyncio
 async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway")
     monkeypatch.setenv("HERMES_RELEASE_SHA", "inherited-release")

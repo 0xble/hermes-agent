@@ -29,6 +29,56 @@ class PollingAdapter:
 
 
 @pytest.mark.asyncio
+async def test_split_text_batch_buffered_at_handover_flushes_on_old_owner(tmp_path):
+    from gateway.config import Platform
+    from gateway.owned_routing import OwnedRouting
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    adapter.platform = Platform.TELEGRAM
+    key = "agent:default:telegram:chat-1"
+    event = MessageEvent(text="first chunk second chunk", source=SessionSource(platform=Platform.TELEGRAM, chat_id="1"))
+    adapter._pending_text_batches = {key: event}
+    adapter._pending_messages = {}
+    adapter._active_sessions = {}
+    adapter._pending_photo_batches = {}
+    adapter._media_group_events = {}
+    handled = []
+    async def flush(batch_key):
+        buffered = adapter._pending_text_batches.pop(batch_key, None)
+        if buffered:
+            handled.append((old.id, buffered.text))
+            adapter._active_sessions[batch_key] = buffered
+    adapter._flush_text_batch_now = flush
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False, _pending_approvals={})
+    active.runner = runner
+    active.owned_routing = OwnedRouting(active)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    try:
+        assert handled == [(old.id, "first chunk second chunk")]
+        assert adapter._pending_text_batches == {}
+        assert key in active.owned_routing._live_keys()
+        db.commit_transfer(old.id, new.id, epoch)
+        with db.connect() as conn:
+            assert conn.execute("SELECT generation_id FROM sessions WHERE session_key=?", (key,)).fetchone()[0] == old.id
+        # A delayed flush task seeing the emptied buffer cannot deliver twice.
+        await adapter._flush_text_batch_now(key)
+        assert handled == [(old.id, "first chunk second chunk")]
+    finally:
+        assert active._drain_task is not None
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_old_runner_retains_work_after_polling_stops(tmp_path):
     db = GenerationCoordinator(tmp_path)
     fingerprint = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"

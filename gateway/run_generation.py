@@ -376,6 +376,11 @@ class ActiveGeneration:
                     await asyncio.to_thread(self.coordinator.record_poller_stopped,
                                             self.identity.id, self.epoch, token, receipt["safe_offset"],
                                             attempt_nonce=nonce)
+                # No more wire updates can extend a split text batch. Dispatch it
+                # while A still owns the lease, before the successor can receive it.
+                for adapter in roster.values():
+                    for key in tuple(getattr(adapter, "_pending_text_batches", {})):
+                        await adapter._flush_text_batch_now(key)
                 # Freeze A's live session obligations before the lease can move.
                 if self.owned_routing is not None:
                     self.owned_routing.claim_live()
