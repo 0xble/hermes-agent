@@ -34,11 +34,15 @@ def escape_literal_hash_prefixes(text: str) -> str:
 
 
 _FOOTNOTE_REF = r"\[\^[^\]\s]+\]"
-# Within one paragraph: inline code and display math (possibly multiline) are
-# skipped; a reference followed by another reference gets the separator.
+# Within one paragraph, literal regions are consumed first: inline code,
+# display math, backslash escapes, autolinks and inline HTML, and link
+# destinations. A reference followed by another reference gets the separator.
 _ADJACENT_REF_RE = re.compile(
     r"(?P<ticks>`+)(?!`).*?(?<!`)(?P=ticks)(?!`)"
     r"|\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)"
+    r"|\\."
+    r"|<[^<>\n]*>"
+    r"|(?<=\])\((?:[^()\n]|\([^()\n]*\))*\)"
     rf"|(?P<ref>{_FOOTNOTE_REF})(?={_FOOTNOTE_REF}(?!:))",
     re.DOTALL,
 )
