@@ -156,9 +156,8 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
         # When B is still alive, fence A's wire before giving B a newer lease.
         # A missing stop receipt is ambiguous, so never risk two pollers.
         if dead_successor or not _live(failed):
-            if dead_successor:
-                _signal_rollback_attention(
-                    home, reason="restore_after_rollback failed after A reclaimed the active lease")
+            _signal_rollback_attention(
+                home, reason="restore_after_rollback failed after A reclaimed the active lease")
             raise
         old_stopped = _generation_request(_generation_socket(home, old),
                                           "stop_for_rollback", timeout=15)
@@ -167,7 +166,8 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
                 old_stopped.get("poller_stopped") is not True):
             raise RuntimeError("rollback blocked: prior generation wire stop unproved") from restore_error
         resumed_epoch = coordinator.restore_successor_after_failed_rollback(
-            failed_id, old_id, restored, old_poller_stopped=True)
+            failed_id, old_id, restored, old_poller_stopped=True,
+            drain_seconds=drain_seconds)
         resumed = _generation_request(_generation_socket(home, failed),
                                       "resume_uncommitted_transfer",
                                       params={"epoch": resumed_epoch}, timeout=15)

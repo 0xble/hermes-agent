@@ -149,10 +149,58 @@ def test_failed_old_restore_fences_old_wire_then_rearms_successor(tmp_path, monk
 
     monkeypatch.setattr(overlap, "_generation_request", request)
     with pytest.raises(RuntimeError, match="old adapter could not rearm"):
-        overlap.rollback_overlap(home, b.id, a.id, epoch)
+        overlap.rollback_overlap(home, b.id, a.id, epoch, drain_seconds=45)
     assert calls[-1][0] == "resume_uncommitted_transfer"
     assert coordinator.leases()[0]["generation_id"] == b.id
     assert (home / "current").resolve().name == b.release_sha
+    with coordinator.connect() as conn:
+        restored_old = conn.execute(
+            "SELECT transferred_at,drain_deadline,state FROM generations WHERE id=?", (a.id,)
+        ).fetchone()
+    assert restored_old["state"] == "draining"
+    assert restored_old["drain_deadline"] == pytest.approx(restored_old["transferred_at"] + 45)
+
+
+@pytest.mark.macos_only
+def test_live_successor_dies_before_old_restore_failure_signals_attention(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, a, b, epoch = _committed(home)
+    releases = home / "releases"
+    for identity in (a, b):
+        release = releases / identity.release_sha
+        release.mkdir(parents=True)
+        for marker in (".release-ready", ".hermes_build_sha"):
+            (release / marker).write_text(identity.release_sha)
+    (home / "current").symlink_to(releases / b.release_sha)
+    live_checks = {b.id: 0}
+
+    def live(row):
+        if row["id"] == a.id:
+            return True
+        live_checks[b.id] += 1
+        return live_checks[b.id] == 1
+
+    monkeypatch.setattr(overlap, "_live", live)
+    monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: f"gui/{os.getuid()}")
+    monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
+    calls = []
+
+    def request(_path, verb, *, params=None, timeout=0):
+        calls.append(verb)
+        if verb == "stop_for_rollback":
+            return {"generation_id": b.id, "epoch": epoch, "poller_stopped": True}
+        if verb == "restore_after_rollback":
+            raise RuntimeError("old adapter could not rearm")
+        raise AssertionError(verb)
+
+    monkeypatch.setattr(overlap, "_generation_request", request)
+    with pytest.raises(RuntimeError, match="old adapter could not rearm"):
+        overlap.rollback_overlap(home, b.id, a.id, epoch)
+    assert calls == ["stop_for_rollback", "restore_after_rollback"]
+    assert (home / "overlap-rollback-attention.json").exists()
+    assert guardian._run_overlap(home) == "alert"
+    assert coordinator.leases()[0]["generation_id"] == a.id
 
 
 @pytest.mark.macos_only

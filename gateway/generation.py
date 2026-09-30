@@ -434,7 +434,8 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             return epoch + 1
 
     def restore_successor_after_failed_rollback(self, successor_id: str, old_id: str,
-                                                epoch: int, *, old_poller_stopped: bool) -> int:
+                                                epoch: int, *, old_poller_stopped: bool,
+                                                drain_seconds: float = 7200) -> int:
         """Return the lease to B only after A's wire is proven stopped."""
         if old_poller_stopped is not True:
             raise RuntimeError("prior generation poller stop not proved")
@@ -443,14 +444,20 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             prior = conn.execute("SELECT state FROM generation_transfers WHERE old_id=? AND new_id=? "
                                  "AND epoch=?", (old_id, successor_id, epoch - 2)).fetchone()
+            old = conn.execute("SELECT state,transferred_at FROM generations WHERE id=?", (old_id,)).fetchone()
             successor = conn.execute("SELECT state FROM generations WHERE id=?", (successor_id,)).fetchone()
             if (not lease or (lease["generation_id"], lease["epoch"], lease["state"]) !=
                     (old_id, epoch, "active") or not prior or prior["state"] != "rolled_back" or
+                    not old or old["state"] != "serving" or
                     not successor or successor["state"] != "draining"):
                 raise RuntimeError("failed rollback lease or successor identity changed")
             conn.execute("UPDATE leases SET generation_id=?,epoch=epoch+1 WHERE resource='active_generation'",
                          (successor_id,))
-            conn.execute("UPDATE generations SET state='draining' WHERE id=?", (old_id,))
+            transferred_at = old["transferred_at"]
+            drain_deadline = ((transferred_at + drain_seconds) if transferred_at is not None
+                              else time.time() + drain_seconds)
+            conn.execute("UPDATE generations SET state='draining',drain_deadline=? WHERE id=?",
+                         (drain_deadline, old_id))
             conn.execute("UPDATE generations SET state='serving',drain_deadline=NULL WHERE id=?", (successor_id,))
             conn.execute("UPDATE generation_transfers SET state='committed' WHERE old_id=? AND new_id=? AND epoch=?",
                          (old_id, successor_id, epoch - 2))

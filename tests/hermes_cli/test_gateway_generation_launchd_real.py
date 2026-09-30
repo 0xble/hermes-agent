@@ -65,7 +65,12 @@ def test_active_and_passive_generations_use_distinct_records(request):
 
     def ready():
         rows = read_generation_status(home)
-        return len(rows) == 2 and all(row["state"] == "ready" for row in rows)
+        if len(rows) != 2:
+            return False
+        leased = [row for row in rows if row["leases"]]
+        return (len(leased) == 1 and
+                all(row["state"] == "ready" or
+                    row is leased[0] and row["state"] == "serving" for row in rows))
 
     try:
         for plist in plists:
@@ -92,12 +97,13 @@ def test_active_and_passive_generations_use_distinct_records(request):
         control_path = resolve_client_socket_path(home)
         assert control_path is not None and control_path.exists()
         assert (home / "gateway_state.json").exists()
-        assert {row["state"] for row in rows} == {"ready"}
         assert sum(bool(row["leases"]) for row in rows) == 1
         active = next(row for row in rows if row["leases"])
         assert active["label"] == labels[0]
+        assert active["state"] in {"ready", "serving"}
         standby = next(row for row in rows if not row["leases"])
         assert standby["label"] == labels[1]
+        assert standby["state"] == "ready"
         assert active["leases"][0].startswith("active_generation@")
         from gateway.control_socket import CONTROL_PROTOCOL_VERSION
         import socket
