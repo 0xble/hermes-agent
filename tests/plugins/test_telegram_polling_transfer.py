@@ -94,6 +94,18 @@ def test_transfer_receipt_fences_epoch_and_bot_identity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_join_queue_returns_when_polling_is_stopped(tmp_path):
+    from types import SimpleNamespace
+    queue = asyncio.Queue()
+    await queue.put(object())
+    poller = ControlledPoller(SimpleNamespace(update_queue=queue),
+                              PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY"))
+    poller._stop.set()
+    await asyncio.wait_for(poller._join_queue("stopped batch"), timeout=1)
+    assert queue.qsize() == 1
+
+
+@pytest.mark.asyncio
 async def test_controlled_poller_replays_before_first_poll_and_drains_inflight(tmp_path):
     journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
     journal.record_response(b'{"ok":true,"result":[{"update_id":4}]}')

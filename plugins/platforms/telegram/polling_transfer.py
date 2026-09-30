@@ -241,9 +241,9 @@ class ControlledPoller:
         if self._task.done():
             await self._task
 
-    async def _join_queue(self, batch: str, *, ignore_stop: bool = False) -> None:
+    async def _join_queue(self, batch: str) -> None:
         """Backpressure until dispatch catches up; a slow handler is not a poll failure."""
-        while ignore_stop or not self._stop.is_set():
+        while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout)
                 return
