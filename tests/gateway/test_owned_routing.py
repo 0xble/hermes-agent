@@ -518,14 +518,18 @@ async def test_late_dispatch_for_frozen_session_stays_native_on_draining_owner(t
         assert [(row["owner_id"], row["state"]) for row in rows] == [(old.id, "accepted")]
 
 
+@pytest.mark.parametrize("idle_claim", [False, True])
 @pytest.mark.asyncio
-async def test_late_dispatch_for_unowned_session_reaches_successor_once(tmp_path):
+async def test_late_dispatch_for_idle_or_unowned_session_reaches_successor_once(tmp_path, idle_claim):
     store = GenerationCoordinator(tmp_path)
     old = _identity("a", "old")
     new = _identity("b", "new")
     store.register(old, state="serving")
     store.register(new, state="ready")
     old_epoch = store.acquire_lease("active_generation", old.id)
+    key = "agent:default:telegram:new"
+    if idle_claim:
+        store.claim_session(str(tmp_path), "telegram", key, old.id, old_epoch)
     store.request_transfer(old.id, new.id, old_epoch, set())
     new_epoch = store.commit_transfer(old.id, new.id, old_epoch)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
@@ -554,9 +558,12 @@ async def test_late_dispatch_for_unowned_session_reaches_successor_once(tmp_path
         assert db.execute("SELECT generation_id FROM sessions WHERE session_key=?", (key,)).fetchone()[0] == new.id
     runner._overlap_draining = False
     new_route = OwnedRouting(SimpleNamespace(coordinator=store, identity=new, epoch=new_epoch, runner=runner))
+    # B's next enqueue must join the same replay lane, never overlap a native A dispatch.
+    assert await new_route.route_message(adapter, MessageEvent(text="next", source=source,
+        platform_update_id=11), key) is True
     await new_route._drain_once()
     await new_route._drain_once()
-    assert processed == [(new.id, "unowned")]
+    assert processed == [(new.id, "unowned"), (new.id, "next")]
 
 
 @pytest.mark.parametrize("frozen", [True, False])

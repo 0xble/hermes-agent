@@ -122,10 +122,11 @@ class OwnedAdmissionMixin:
             active_lease = (lease is not None and tuple(lease) == (active_owner, active_epoch, "active"))
             if frozen_owner and not active_lease:
                 claim = db.execute(
-                    "SELECT generation_id,epoch,state FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
+                    "SELECT generation_id,epoch,state,outstanding_work FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
                     (home, transport, key),
                 ).fetchone()
-                if claim is None or tuple(claim) != (active_owner, active_epoch, "owned"):
+                if (claim is None or tuple(claim)[:3] != (active_owner, active_epoch, "owned")
+                        or claim["outstanding_work"] <= 0):
                     if lease is None or lease["state"] != "active":
                         raise RuntimeError("no active generation for late dispatch")
                     # A cannot claim new work while draining. Forward the complete
