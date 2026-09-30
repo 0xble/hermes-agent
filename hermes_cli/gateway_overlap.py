@@ -327,12 +327,29 @@ def promote_overlap(home: Path, candidate: Path, sha: str, *, drain_seconds: flo
             else:
                 if not lease or (lease["generation_id"], lease["epoch"]) != (old["id"], epoch):
                     raise RuntimeError("active lease became unknown during failed overlap promotion")
-                coordinator.abort_transfer(old["id"], successor["id"], epoch)
-                resumed = _generation_request(_generation_socket(home, old), "resume_uncommitted_transfer",
-                                              params={"epoch": epoch}, timeout=15)
-                if resumed.get("generation_id") != old["id"] or resumed.get("polling") is not True:
-                    raise RuntimeError("old generation did not prove restored polling")
-                activate_release(home, old_release, operation="rollback")
+                # Handover may fail before requesting a transfer, or may have
+                # already aborted it. Only cancel the matching pending attempt;
+                # the coordinator CAS still fences races with commit/retry.
+                with coordinator.connect() as db:
+                    transfer = db.execute(
+                        "SELECT new_id,state,attempt_nonce FROM generation_transfers "
+                        "WHERE old_id=? AND epoch=?", (old["id"], epoch)).fetchone()
+                if transfer and transfer["state"] != "aborted":
+                    if (transfer["new_id"] != successor["id"] or transfer["state"] != "requested" or
+                            not coordinator.abort_transfer(old["id"], successor["id"], epoch,
+                                                           attempt_nonce=transfer["attempt_nonce"])):
+                        raise RuntimeError("transfer attempt changed during failed overlap promotion")
+                try:
+                    resumed = _generation_request(_generation_socket(home, old), "resume_uncommitted_transfer",
+                                                  params={"epoch": epoch}, timeout=15)
+                    if resumed.get("generation_id") != old["id"] or resumed.get("polling") is not True:
+                        raise RuntimeError("old generation did not prove restored polling")
+                    activate_release(home, old_release, operation="rollback")
+                finally:
+                    # A still owns the lease: clean the unused standby even if
+                    # re-arming A fails. Disable login activation before bootout.
+                    _set_boot_active(home, label, False)
+                    _bootout_generation(domain, label)
                 rollback = {"to_id": old["id"], "epoch": epoch, "polling": True}
             current = next((row for row in coordinator.leases()
                             if row["resource"] == "active_generation"), None)

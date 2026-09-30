@@ -89,6 +89,98 @@ def test_promotion_returns_rolled_back_proof_after_committed_observation_failure
         assert coordinator.leases()[0]["generation_id"] == first.id
 
 
+@pytest.mark.parametrize("transfer_state", ["missing", "requested", "aborted"])
+@pytest.mark.parametrize("recovery_failure", [None, "bootout", "resume"])
+def test_uncommitted_promotion_restores_owner_and_cleans_standby(
+        tmp_path, monkeypatch, transfer_state, recovery_failure):
+    from dataclasses import asdict
+    from hermes_cli import gateway_overlap
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, first, second, epoch = _generations(home)
+    releases = home / "releases"
+    for identity in (first, second):
+        release = releases / identity.release_sha
+        release.mkdir(parents=True)
+        interpreter = release / ".venv/bin/python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch()
+        for marker in (".release-ready", ".hermes_build_sha"):
+            (release / marker).write_text(identity.release_sha)
+    old_release = releases / first.release_sha
+    candidate = releases / second.release_sha
+    (home / "current").symlink_to(old_release)
+    agents = tmp_path / "LaunchAgents"
+    monkeypatch.setattr(gateway_overlap, "_launch_agents_dir", lambda: agents)
+    monkeypatch.setattr(gateway_overlap, "_active_and_prior",
+                        lambda _: (coordinator, asdict(first), None, epoch))
+    monkeypatch.setattr(guardian, "_launch_state", lambda *_: "unloaded")
+    monkeypatch.setattr(guardian, "_gateway_domain", lambda *_: "gui/501")
+    loaded = set()
+    monkeypatch.setattr(gateway_overlap, "bootstrap_generation_plist",
+                        lambda **kwargs: loaded.add(kwargs["label"]))
+    monkeypatch.setattr(gateway_overlap, "_ready_successor", lambda *args, **kwargs: asdict(second))
+    # Every subprocess is forbidden: this exercises real disposable plist I/O,
+    # coordinator state and pointer restoration, never the host launchd service.
+    monkeypatch.setattr(gateway_overlap.subprocess, "run",
+                        lambda *args, **kwargs: pytest.fail("native launchd call"))
+
+    def fail_transfer(*args, **kwargs):
+        if transfer_state != "missing":
+            coordinator.request_transfer(first.id, second.id, epoch, set())
+            if transfer_state == "aborted":
+                coordinator.abort_transfer(first.id, second.id, epoch,
+                    attempt_nonce=coordinator.transfer_attempt_nonce(first.id, epoch))
+        raise RuntimeError("pre-commit transfer failed")
+
+    monkeypatch.setattr(gateway_overlap, "handover_to_generation", fail_transfer)
+    pl = agents / f"{second.label}.plist"
+
+    def bootout(domain, label):
+        assert (domain, label) == ("gui/501", second.label)
+        assert plistlib.loads(pl.read_bytes())["RunAtLoad"] is False
+        if recovery_failure == "bootout":
+            raise RuntimeError("standby bootout failed")
+        loaded.remove(label)
+
+    monkeypatch.setattr(gateway_overlap, "_bootout_generation", bootout)
+    resumed = []
+
+    def resume(socket, verb, *, params, timeout):
+        assert verb == "resume_uncommitted_transfer" and params == {"epoch": epoch}
+        with coordinator.connect() as db:
+            row = db.execute("SELECT state FROM generation_transfers WHERE old_id=? AND epoch=?",
+                             (first.id, epoch)).fetchone()
+        assert row is None if transfer_state == "missing" else row["state"] == "aborted"
+        resumed.append(first.id)
+        if recovery_failure == "resume":
+            raise RuntimeError("old resume failed")
+        return {"generation_id": first.id, "epoch": epoch, "polling": True}
+
+    monkeypatch.setattr(gateway_overlap, "_generation_request", resume)
+    if recovery_failure == "resume":
+        with pytest.raises(RuntimeError, match="overlap blocked.*old resume failed"):
+            gateway_overlap.promote_overlap(home, candidate, second.release_sha)
+        assert resumed == [first.id] and not loaded
+    elif recovery_failure == "bootout":
+        with pytest.raises(RuntimeError, match="overlap blocked.*standby bootout failed"):
+            gateway_overlap.promote_overlap(home, candidate, second.release_sha)
+        assert resumed == [first.id]
+        assert loaded == {second.label}
+        assert (home / "current").resolve() == old_release
+    else:
+        result = gateway_overlap.promote_overlap(home, candidate, second.release_sha)
+        assert result["outcome"] == "rolled_back"
+        assert result["failure"] == "pre-commit transfer failed"
+        assert result["rollback"] == {"to_id": first.id, "epoch": epoch, "polling": True}
+        assert resumed == [first.id] and not loaded
+        assert (home / "current").resolve() == old_release
+    assert plistlib.loads(pl.read_bytes())["RunAtLoad"] is False
+    lease = coordinator.leases()[0]
+    assert (lease["generation_id"], lease["epoch"]) == (first.id, epoch)
+
+
 def test_rollback_requires_stopped_successor_and_increments_epoch(tmp_path):
     coordinator, first, second, epoch = _generations(tmp_path)
     coordinator.request_transfer(first.id, second.id, epoch, set())
