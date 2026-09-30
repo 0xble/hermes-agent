@@ -3,6 +3,7 @@ controls who can admit work. Ambiguous process or token state fails closed.
 """
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import sqlite3
@@ -69,6 +70,20 @@ def _observe_poller(home: Path, row: dict, *, timeout: float = 5) -> dict:
             or not result.get("tokens")):
         raise RuntimeError("successor polling has not progressed on a real token")
     return result
+
+
+def _rollback_attention_path(home: Path) -> Path:
+    return home / "overlap-rollback-attention.json"
+
+
+def _signal_rollback_attention(home: Path, *, reason: str) -> None:
+    path = _rollback_attention_path(home)
+    pending = path.with_name(f".{path.name}.{os.getpid()}.pending")
+    try:
+        pending.write_text(json.dumps({"reason": reason, "at": time.time()}), encoding="utf-8")
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
@@ -141,6 +156,9 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
         # When B is still alive, fence A's wire before giving B a newer lease.
         # A missing stop receipt is ambiguous, so never risk two pollers.
         if dead_successor or not _live(failed):
+            if dead_successor:
+                _signal_rollback_attention(
+                    home, reason="restore_after_rollback failed after A reclaimed the active lease")
             raise
         old_stopped = _generation_request(_generation_socket(home, old),
                                           "stop_for_rollback", timeout=15)

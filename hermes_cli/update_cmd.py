@@ -174,6 +174,15 @@ def _immutable_release_enabled(paths=None) -> bool:
     return bool(_updates_config().get("immutable_releases", False) or resolved_release(paths.home))
 
 
+def _overlap_handover_enabled() -> bool:
+    """Read the shared overlap gate before any legacy single-label repair action."""
+    from hermes_cli.config_effective import load_user_config_effective
+    from gateway.generation import overlap_handover_enabled
+    home = get_hermes_home()
+    config = load_user_config_effective(Path(home) / "config.yaml", fail_closed=True)
+    return overlap_handover_enabled(config)
+
+
 _IMMUTABLE_RELEASE_ACK_CALL_SITES = frozenset({
     "_activate_immutable_release",
     "_finish_pending_release_transaction",
@@ -202,6 +211,8 @@ def _finish_pending_release_transaction(home: Path | None = None) -> dict | None
     paths = ReleasePaths.for_home(home)
     if not (paths.home / "release-txn.json").exists():
         return None
+    if _overlap_handover_enabled():
+        raise RuntimeError("legacy immutable release recovery is disabled while overlap handover is enabled")
     from hermes_cli import gateway, gateway_launchd
     plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
     callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist else None
@@ -1574,6 +1585,12 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
         raise SystemExit(message)
     if not _immutable_release_enabled(paths):
         return
+    if _overlap_handover_enabled():
+        if (paths.home / "release-txn.json").exists():
+            raise RuntimeError("legacy immutable release catch-up is disabled while overlap handover is enabled")
+        _record_update_step("immutable_release_catchup", True,
+                            "skipped: overlap handover owns release promotion and draining")
+        return
     current = read_pointer(paths.current)
     source = source or _m().PROJECT_ROOT
     sha = sha or release_sha(source)
@@ -1701,9 +1718,18 @@ def _finish_already_up_to_date(
     # catch-up is deferred instead (executing it would kill the cron's own gateway).
     # A deferred/failed release promotion is a separate obligation from the
     # pending fleet restart; never restart A when source HEAD already names B.
-    _catch_up_immutable_release(defer=no_gateway_restart)
-    _apply_pending_fleet_restart_catchup(
-        defer=no_gateway_restart, checkout_complete=current_checkout_complete)
+    if _overlap_handover_enabled():
+        if _pending_fleet_restart_needed():
+            message = "legacy fleet restart catch-up is disabled while overlap handover is enabled"
+            _record_update_step("overlap_fleet", False, message)
+            _finalize_receipt("blocked", "Overlap handover requires generation-owned restart: %s")
+            raise SystemExit(1)
+        _record_update_step("overlap_fleet", True,
+                            "skipped: overlap handover owns generation restart")
+    else:
+        _catch_up_immutable_release(defer=no_gateway_restart)
+        _apply_pending_fleet_restart_catchup(
+            defer=no_gateway_restart, checkout_complete=current_checkout_complete)
     if not current_checkout_complete:
         if gateway_mode:
             _write_gateway_update_exit_code(False)
@@ -1737,7 +1763,8 @@ def _apply_fetched_immutable_update(git_cmd, branch, opts, args, *, gateway_mode
     # when the remote has not advanced beyond that exact staged commit.
     if current is not None and current.name == fetched:
         _catch_up_immutable_release(defer=opts.no_gateway_restart, sha=fetched, source=source)
-        _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
+        if not _overlap_handover_enabled():
+            _apply_pending_fleet_restart_catchup(defer=opts.no_gateway_restart)
         return
     # stage_release archives FETCH_HEAD itself, builds web and its own locked
     # environment in a build-aside directory, then atomically publishes it.

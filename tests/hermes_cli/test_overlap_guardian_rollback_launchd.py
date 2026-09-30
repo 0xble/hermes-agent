@@ -156,6 +156,38 @@ def test_failed_old_restore_fences_old_wire_then_rearms_successor(tmp_path, monk
 
 
 @pytest.mark.macos_only
+def test_dead_successor_restore_failure_signals_attention_for_next_guardian_tick(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, a, b, epoch = _committed(home)
+    releases = home / "releases"
+    for identity in (a, b):
+        release = releases / identity.release_sha
+        release.mkdir(parents=True)
+        for marker in (".release-ready", ".hermes_build_sha"):
+            (release / marker).write_text(identity.release_sha)
+    (home / "current").symlink_to(releases / b.release_sha)
+    with coordinator.connect() as conn:
+        conn.execute("UPDATE generations SET boot_id=? WHERE id=?", ("live-boot", a.id))
+        conn.execute("UPDATE generations SET pid=?, boot_id=?, state='ready' WHERE id=?", (99999999, "live-boot", b.id))
+    monkeypatch.setattr("gateway.generation._boot_id", lambda: "live-boot")
+    monkeypatch.setattr(overlap.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: f"gui/{os.getuid()}")
+    monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
+
+    def request(_path, verb, *, params=None, timeout=0):
+        assert verb == "restore_after_rollback"
+        raise RuntimeError("old adapter could not rearm")
+
+    monkeypatch.setattr(overlap, "_generation_request", request)
+    with pytest.raises(RuntimeError, match="old adapter could not rearm"):
+        overlap.rollback_overlap(home, b.id, a.id, epoch)
+    assert (home / "overlap-rollback-attention.json").exists()
+    assert guardian._run_overlap(home) == "alert"
+    assert coordinator.leases()[0]["generation_id"] == a.id
+
+
+@pytest.mark.macos_only
 def test_missing_old_release_refuses_before_successor_wire_stop(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()

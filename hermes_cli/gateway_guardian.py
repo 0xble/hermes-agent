@@ -118,6 +118,8 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
 
 
 def healthy(home: Path, label: str, expected: Path) -> bool:
+    if (home / "overlap-rollback-attention.json").exists():
+        return False
     from gateway.status import read_runtime_status, runtime_status_is_stale
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
     import psutil
@@ -226,6 +228,10 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
     """Inspect the active lease before any repair. Unknown identities never authorize launchd writes."""
     if intent_path(home).exists():
         return "stopped"
+    attention = home / "overlap-rollback-attention.json"
+    if attention.exists():
+        receipt(home, "overlap", "alert", reason="rollback restored the lease but the owner poller did not restore")
+        return "alert"
     from hermes_cli.gateway_generation_status import read_generation_status
     from gateway.status import _get_process_start_time, _pid_exists
     rows = read_generation_status(home)

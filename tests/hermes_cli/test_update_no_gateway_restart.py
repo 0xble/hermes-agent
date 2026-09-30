@@ -42,6 +42,51 @@ def test_already_current_catchup_is_deferred_under_flag():
     mock_clear.assert_not_called()
 
 
+def test_overlap_already_current_skips_legacy_fleet_catchup(monkeypatch):
+    monkeypatch.setattr(uc, "_overlap_handover_enabled", lambda: True)
+    monkeypatch.setattr(uc, "_pending_fleet_restart_needed", lambda: False)
+    monkeypatch.setattr(uc, "_record_update_step", lambda *args: None)
+    monkeypatch.setattr(uc, "_finalize_receipt", lambda *args: None)
+    monkeypatch.setattr(uc, "_catch_up_immutable_release",
+                        lambda **kwargs: pytest.fail("legacy release catch-up"))
+    monkeypatch.setattr(uc, "_apply_pending_fleet_restart_catchup",
+                        lambda **kwargs: pytest.fail("legacy fleet restart"))
+    monkeypatch.setattr(uc, "_repair_current_checkout", lambda **kwargs: True)
+    monkeypatch.setattr(uc, "_resume_windows_gateways_and_merge_outcome", lambda *args: None)
+    monkeypatch.setattr(uc, "_invalidate_update_cache", lambda: None)
+    plan = SimpleNamespace(auto_stash_ref=None, parked_branch_switched=False,
+                           upstream_checked=True)
+    uc._finish_already_up_to_date(
+        ["git"], "main", "main", plan, assume_yes=True, gateway_mode=False,
+        gw_input_fn=None, pre_update_snapshot_id=None,
+        had_desktop_app_before_update=False, active_lazy_features=[],
+        active_tool_dependencies=[], _windows_gateway_resume=None)
+
+
+def test_overlap_release_catchup_fails_closed_before_legacy_service_repair(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    (home / "release-txn.json").write_text("{}")
+    monkeypatch.setattr(uc, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(uc, "_immutable_release_enabled", lambda paths=None: True)
+    monkeypatch.setattr(uc, "_overlap_handover_enabled", lambda: True)
+    monkeypatch.setattr(uc, "_finalize_receipt", lambda *args: None)
+    with pytest.raises(RuntimeError, match="legacy immutable release catch-up"):
+        uc._catch_up_immutable_release(defer=False, sha="a" * 40, source=home)
+
+
+def test_overlap_repair_service_route_does_not_force_reload(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setattr(uc, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(uc, "_immutable_release_enabled", lambda paths=None: True)
+    monkeypatch.setattr(uc, "_overlap_handover_enabled", lambda: True)
+    monkeypatch.setattr(uc, "_record_update_step", lambda *args: None)
+    monkeypatch.setattr(uc, "_release_service_state",
+                        lambda *args: pytest.fail("legacy repair-service inspection"))
+    uc._catch_up_immutable_release(defer=False, sha="a" * 40, source=home)
+
+
 @pytest.mark.macos_only
 def test_pending_release_no_restart_does_not_replay_or_mutate(tmp_path, monkeypatch):
     """A restart-prohibited catch-up cannot alter an unacknowledged transaction."""
