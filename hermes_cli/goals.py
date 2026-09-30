@@ -33,13 +33,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TURNS = 20
 
 
-def _goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> int:
+def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> int:
     """Normalize a goal budget; zero is the explicit unlimited sentinel."""
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return int(default)
     return parsed if parsed >= 0 else int(default)
+
+
+# Private compatibility alias for in-tree callers; plugins use the public helper above.
+_goal_max_turns = normalize_goal_max_turns
 
 
 def _goal_budget_label(turns_used: int, max_turns: int) -> str:
