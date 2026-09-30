@@ -152,31 +152,37 @@ def test_literal_hash_normalization_preserves_markdown_regions(content):
 
 
 def test_adjacent_footnote_refs_get_a_superscript_separator():
-    from plugins.platforms.telegram.rich_markdown import separate_adjacent_footnote_refs
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
 
     content = (
         "Two sources.[^2][^3] Three.[^1][^2][^note] One.[^4]\n\n"
         "Spaced [^1] [^2] and inline `[^1][^2]` stay.\n\n"
         "```\n[^1][^2]\n```\n\n"
+        "$$\nx[^1][^2]\n$$\n\n\\[x=[^1][^2]\\]\n\n"
+        "    [^1][^2] indented code\n\n"
         "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
     )
-    result = separate_adjacent_footnote_refs(content)
-    assert result.startswith(
-        "Two sources.[^2]<sup>,</sup>[^3] Three.[^1]<sup>,</sup>[^2]<sup>,</sup>[^note] One.[^4]\n\n"
-        "Spaced [^1] [^2] and inline `[^1][^2]` stay.\n\n```\n[^1][^2]\n```\n\n[^1]: [One]"
-    )
-    assert separate_adjacent_footnote_refs(result) == result
+    result = normalize_footnotes(content)
+    assert result == content.replace("[^2][^3]", "[^2]<sup>,</sup>[^3]", 1).replace(
+        "[^1][^2][^note]", "[^1]<sup>,</sup>[^2]<sup>,</sup>[^note]", 1)
+    assert normalize_footnotes(result) == result
 
 
 def test_footnote_defs_after_a_list_get_a_spacer():
-    from plugins.platforms.telegram.rich_markdown import separate_footnote_defs_from_lists
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
 
     defs = "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
-    result = separate_footnote_defs_from_lists("- a.[^1]\n- b.[^2]\n\n" + defs)
-    assert result == "- a.[^1]\n- b.[^2]\n\n<!-- -->\n" + defs
-    assert separate_footnote_defs_from_lists(result) == result
-    for unchanged in ("Para.[^1]\n\n" + defs, "- a\n\nTail.[^1]\n\n" + defs, "```\n- a\n[^1]: x\n```"):
-        assert separate_footnote_defs_from_lists(unchanged) == unchanged
+    for body in ("- a.[^1]\n- b.[^2]\n\n", "1. a.[^1]\n\n   more.[^2]\n\n", "- a\nlazy.[^1]\n"):
+        result = normalize_footnotes(body + defs)
+        assert result == body.rstrip("\n") + "\n\n<!-- -->\n" + defs
+        assert normalize_footnotes(result) == result
+    for unchanged in (
+        "Para.[^1]\n\n" + defs,
+        "- a\n\nTail.[^1]\n\n" + defs,
+        "    indented prose.[^1]\n\n" + defs,
+        "```\n- a\n[^1]: x\n```",
+    ):
+        assert normalize_footnotes(unchanged) == unchanged
 
 
 @pytest.mark.asyncio

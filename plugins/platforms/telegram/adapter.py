@@ -1823,16 +1823,11 @@ class TelegramAdapter(BasePlatformAdapter):
         Telegram's rich parser accepts them as headings without the whitespace standard Markdown requires
         (``escape_literal_hash_prefixes``); adjacent footnote references get a superscript comma so
         ``[^2][^3]`` does not read as "23" and footnote definitions are split from a preceding list so the
-        first one is not dropped (``rich_markdown``); currency pairs are then backticked so they cannot pair
-        into inline LaTeX (``_protect_rich_currency``)."""
-        from .rich_markdown import (
-            escape_literal_hash_prefixes,
-            separate_adjacent_footnote_refs,
-            separate_footnote_defs_from_lists,
-        )
+        first one is not dropped (``normalize_footnotes``); currency pairs are then backticked so they cannot
+        pair into inline LaTeX (``_protect_rich_currency``)."""
+        from .rich_markdown import escape_literal_hash_prefixes, normalize_footnotes
 
-        markdown = escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content))
-        markdown = separate_footnote_defs_from_lists(separate_adjacent_footnote_refs(markdown))
+        markdown = normalize_footnotes(escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content)))
         payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(_protect_rich_currency(markdown))}
         if skip_entity_detection:
             payload["skip_entity_detection"] = True

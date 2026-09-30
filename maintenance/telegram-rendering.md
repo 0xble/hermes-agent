@@ -62,15 +62,16 @@ bracketed numeric citation markers such as `[[3](https://example.com)]`.
 Ordinary numeric commit or PR links are not converted into citation markers.
 
 Telegram renders adjacent footnote references (`[^2][^3]`) as one superscript
-run with no separator, so two citations read as "23".
-`separate_adjacent_footnote_refs` (`rich_markdown.py`) inserts `<sup>,</sup>`
-between them, which joins the same run as "2,3" with each number still
-tappable. Telegram's parser also drops the first `[^n]:` definition when the
-definitions directly follow a list, even across blank lines, leaving a literal
-`^n` in the list. `separate_footnote_defs_from_lists` puts an empty `<!-- -->`
-line before such definitions, which ends the list without rendering a block.
-Both skip code and display math, run on send, finalized edit, and draft, and are
-idempotent. Verified against live `sendRichMessage` output on 2026-09-30.
+run with no separator, so two citations read as "23". Telegram's parser also
+drops the first `[^n]:` definition when the definitions directly follow a list,
+even across blank lines, leaving a literal `^n` in the list.
+`normalize_footnotes` (`rich_markdown.py`) inserts `<sup>,</sup>` between
+adjacent references, which joins the same run as "2,3" with each number still
+tappable, and puts an empty `<!-- -->` line before definitions that follow a
+list, which ends the list without rendering a block. Fenced, indented and inline
+code and `$$`/`\[` display math stay literal. It runs on send, finalized edit,
+and draft, and is idempotent. Verified against live `sendRichMessage` output on
+2026-09-30.
 
 ## Provenance and adoption
 
@@ -165,8 +166,8 @@ released upstream rich payload makes the `TestRichOrderedListAfterProse`
 regressions pass without `_rich_separate_ordered_lists`. Retire the footnote
 part when Telegram's own rich parser separates adjacent references and keeps
 the first definition after a list: resend the probes from the footnote
-regressions through raw `sendRichMessage` without the two functions and check
-the returned blocks. Rollback removes both functions and their call in
+regressions through raw `sendRichMessage` without `normalize_footnotes` and
+check the returned blocks. Rollback removes that function and its call in
 `_rich_message_payload`.
 
 To disable rich rendering, use the supported config command to set this mode to
