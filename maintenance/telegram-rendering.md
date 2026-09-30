@@ -68,10 +68,10 @@ even across blank lines, leaving a literal `^n` in the list.
 `normalize_footnotes` (`rich_markdown.py`) inserts `<sup>,</sup>` between
 adjacent references, which joins the same run as "2,3" with each number still
 tappable, and puts an empty `<!-- -->` line before definitions that follow a
-list, which ends the list without rendering a block. A CommonMark parse
-(`markdown-it-py`, already a dependency) decides which lines are code, list or
-prose, so fenced, indented, nested and multiline inline code and display math
-stay literal. It runs on send, finalized edit,
+list, which ends the list without rendering a block. `markdown-it-py` (already a
+dependency) finds both: block tokens locate code and lists, and a custom inline
+rule marks only references it reaches as prose, so code, TeX math, link
+destinations, autolinks, inline HTML and escapes stay literal. It runs on send, finalized edit,
 and draft, and is idempotent. Verified against live `sendRichMessage` output on
 2026-09-30.
 

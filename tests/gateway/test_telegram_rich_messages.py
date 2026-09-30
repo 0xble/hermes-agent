@@ -163,6 +163,8 @@ def test_adjacent_footnote_refs_get_a_superscript_separator():
         "Multiline `code\n[^1][^2]` span.\n\n"
         "A [link](https://example.com/[^1][^2]), <a title=\"[^1][^2]\">html</a>, "
         "<https://example.com/[^1][^2]> and escaped \\[^1][^2] stay.\n\n"
+        "Nested [x](https://e.com/a(b(c[^1][^2]))) and <a title=\"x > [^1][^2]\">y</a> stay.\n\n"
+        "Math \\(x[^1][^2]\\) and $$y[^1][^2]$$ stay.\n\n"
         "- item\n\n      [^1][^2] code inside a list item\n\nClosing prose.\n\n"
         "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
     )
