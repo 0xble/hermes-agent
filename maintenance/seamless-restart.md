@@ -52,7 +52,7 @@ This amendment governs the whole handover design. No generation regains polling 
 
 States, per generation, are forward only:
 
-1. `standby`: process up, no poller, no admission, no cron or kanban dispatch.
+1. `standby`: process up, no poller, no user-facing admission, no cron or kanban dispatch. The only turn it may run is the startup-gate loopback turn below, which never touches a user session or Telegram.
 2. `serving`: holds the `active_generation` lease, polls Telegram, admits new work.
 3. `draining`: lease gone. Finishes its own turns, approvals, delegations, watchers and outbox rows through its own Bot API client. Admits nothing new.
 4. `exited`: process gone after its last obligation, or at the two-hour cap.
@@ -70,7 +70,7 @@ The one allowed resume is before commit. A serving generation that paused `getUp
 
 **Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<id8>`, where `<id8>` is the first eight hex digits of its generation UUID. The label pins its release path and is booted out only after the coordinator records `exited` for that generation. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
 
-**Startup gate.** Before a standby may be named ready, it runs one loopback turn. A synthetic message enters the real admission path on a loopback transport, goes through both busy guards and the runner, and produces a reply row in the outbox with a loopback destination. Nothing goes to Telegram. The turn uses the configured model with a fixed short prompt, which costs one small model call per update. A standby that fails the gate or exceeds its 45-second deadline is marked `failed`, gets booted out, and never takes the poller. This check would have caught the 2026-09-30 failure class: a gateway that polls and accepts input but never reaches the runner.
+**Startup gate.** Before a standby may be named ready, it runs one loopback turn. This is the single, explicit exception to standby's no-admission rule. A synthetic message from a reserved loopback identity enters the same admission code on an isolated loopback transport, goes through both busy guards and the runner, and produces a reply row in the outbox with a loopback destination. It runs in a reserved loopback session that no user session, cron job or goal can route to, and nothing goes to Telegram. The turn uses the configured model with a fixed short prompt, which costs one small model call per update. A standby that fails the gate or exceeds its 45-second deadline never takes the poller. Its own process exits, or the updater stops it after proving it holds no lease. The coordinator records the `failed` verdict and then `exited`, and only after `exited` is recorded is its label booted out. This check would have caught the 2026-09-30 failure class: a gateway that polls and accepts input but never reaches the runner.
 
 **Crash outcomes under the amendment.**
 
@@ -92,7 +92,7 @@ If A′ cannot start and pass its gate within 60 seconds on the live profile, st
 
 - an in-flight turn, a delegation and an approval each finishing exactly once on the old generation;
 - a queued follow-up running;
-- at most one poller at every sampled instant, with any zero-poller window bounded and the confirmed cursor continuous across it (no lost or double-admitted update);
+- at most one poller at any instant, proved from durable evidence rather than sampling: every token-lock acquire and release and every poller start and stop is journaled with its generation and epoch, and the assertion checks that no two poller intervals for a token overlap. Any zero-poller window is bounded and the confirmed cursor is continuous across it (no lost or double-admitted update);
 - the new release answering a fresh message;
 - the old generation exiting after its last work;
 - a release failing its startup gate never polling;
