@@ -57,26 +57,26 @@ States, per generation, are forward only:
 3. `draining`: lease gone. Finishes its own turns, approvals, delegations, watchers and outbox rows through its own Bot API client. Admits nothing new.
 4. `exited`: process gone after its last obligation, or at the two-hour cap.
 
-`failed` remains a coordinator verdict on a dead or refused generation, not a fifth runtime state. A generation in `standby` that never serves goes straight to `exited`.
+`failed` remains a coordinator verdict on a dead or refused generation, not a fifth runtime state. It is stored in the separate, never-cleared `generations.verdict` column, so `state` holds only the four runtime states. A generation in `standby` that never serves goes straight to `exited`.
 
 The lease moves in exactly two ways:
 
 1. **Handover.** Cooperative only. A serving generation stops its poller, acknowledges `poller_stopped(token, epoch, cursor)` and commits the lease to a ready standby. The old generation becomes `draining` in the same transaction. A generation that does not acknowledge within its deadline has not handed over, and still owns the lease.
 2. **Takeover.** A ready standby takes the lease from a generation that is proven dead and retired, in this order:
    1. Death proof: the recorded PID plus start fingerprint is absent. Heartbeat age alone never proves death.
-   2. Retire: the coordinator records `failed` and then `exited` for that `generation_id` in one transaction. A launchd KeepAlive respawn under a generation label is never that generation, because its PID and start fingerprint differ. At its first coordinator check it finds the label's generation already registered and exits 0, whether or not retire has been recorded yet. `KeepAlive={SuccessfulExit=false}` does not respawn it again. It never polls, admits or claims the token, so a respawn cannot race the takeover.
+   2. Retire: in one transaction the coordinator sets the durable `verdict='failed'` with its `verdict_at` and death evidence, then `state='exited'`. The verdict column is never cleared, so readback proves the generation was retired as failed and not drained cleanly. A launchd KeepAlive respawn under a generation label is never that generation, because its PID and start fingerprint differ. At its first coordinator check it finds the label's generation already registered and exits 0, whether or not retire has been recorded yet. `KeepAlive={SuccessfulExit=false}` does not respawn it again. It never polls, admits or claims the token, so a respawn cannot race the takeover.
    3. Bootout: the label is booted out, then read back as not loaded. Booting out a dead or retired generation kills no work.
    4. Takeover: the standby acquires the token lock and the lease with a new epoch.
 
    If a respawn is still live under the retired label when bootout is due, it holds no lease and no token, so booting it out is safe.
 
-The one allowed resume is before commit. A serving generation that paused `getUpdates` for a handover that never committed resumes polling. It never set `draining`, never lost the lease and never stopped admission, so it still owns every piece of runtime state. This is the existing 45-second pre-commit abort. It gets its own native test.
+The one allowed resume is before commit. A serving generation that paused for a handover that never committed resumes. It never set `draining` and never lost the lease. The pre-commit pause fences three things: the `getUpdates` poller, new cron and kanban dispatch, and internal autonomous wakeups. The abort re-enables all three in one step, then reads each back as armed before it counts as resumed. User-facing admission of already-polled updates was never fenced. This is the existing 45-second pre-commit abort. Its native test checks that a fresh message, a fresh cron tick, a kanban claim and a goal wakeup each run after the abort.
 
 **Rollback is a handover.** Rolling back means starting a fresh standby on the previous release, which then takes the lease by cooperative handover (unhealthy but responsive successor) or takeover (dead successor). The draining generation, if any, keeps draining and exits on its own schedule. Three generations can therefore coexist briefly: the original draining A, the failed B (draining or dead), and the fresh A′ on A's release. `previous → current` changes only after A′ acknowledges from its release. Never re-arm the draining A.
 
-**Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<uuid>`, carrying the full 32-hex generation UUID. The generation row, with that label unique in the coordinator, is committed before any launchd action, so bootstrap, bootout and respawn fencing always address exactly one generation. The label pins its release path and is booted out only after the coordinator records `exited` for that generation, whether by clean drain or by the retire step of takeover. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
+**Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<uuid>`, carrying the full 32-hex generation UUID. The generation row, with that label unique in the coordinator (`label ... UNIQUE` in the schema below), is inserted before any launchd action, so a colliding reservation fails the insert and never reaches launchd. The process writes its PID and start fingerprint into that row at its first coordinator check, before it can claim anything, so bootstrap, bootout and respawn fencing always address exactly one generation. The label pins its release path and is booted out only after the coordinator records `exited` for that generation, whether by clean drain or by the retire step of takeover. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
 
-**Startup gate.** Before a standby may be named ready, it runs one loopback turn. This is the single, explicit exception to standby's no-admission rule. A synthetic message from a reserved loopback identity enters the same admission code on an isolated loopback transport, goes through both busy guards and the runner, and produces a reply row in the outbox with a loopback destination. It runs in a reserved loopback session that no user session, cron job or goal can route to. The turn runs with an empty toolset, so the model can only answer in text and cannot call tools, spawn delegations or processes, or write memory or shared state beyond the session and outbox rows. The loopback transport has no network egress. Its reply row is created already terminal with a `synthetic` disposition in the same transaction, so outbox recovery and retry never select it, and no adapter can send it after promotion. The turn uses the configured model with a fixed short prompt, which costs one small model call per update. A standby that fails the gate or exceeds its 45-second deadline never takes the poller. Its own process exits, or the updater stops it after proving it holds no lease. The coordinator records the `failed` verdict and then `exited`, and only after `exited` is recorded is its label booted out. This check would have caught the 2026-09-30 failure class: a gateway that polls and accepts input but never reaches the runner.
+**Startup gate.** Before a standby may be named ready, it runs one loopback turn. This is the single, explicit exception to standby's no-admission rule. A synthetic message from a reserved loopback identity enters the same admission code on an isolated loopback transport, goes through both busy guards and the runner, and produces a reply row in the outbox with a loopback destination. It runs in a reserved loopback session that no user session, cron job or goal can route to. The turn runs with an empty toolset, so the model can only answer in text and cannot call tools, spawn delegations or processes, or write memory or shared state beyond the session and outbox rows. The loopback transport has no network egress. Its reply row is created already terminal with a `synthetic` disposition in the same transaction, so outbox recovery and retry never select it, and no adapter can send it after promotion. The turn uses the configured model with a fixed short prompt, which costs one small model call per update. A standby that fails the gate or exceeds its 45-second deadline never takes the poller. Its own process exits, or the updater stops it after proving it holds no lease. The coordinator then sets the durable `verdict='failed'` and `state='exited'`, and only after that is its label booted out. This check would have caught the 2026-09-30 failure class: a gateway that polls and accepts input but never reaches the runner.
 
 **Crash outcomes under the amendment.**
 
@@ -105,7 +105,7 @@ If A′ cannot start and pass its gate within 60 seconds on the live profile, st
 - the startup gate calling no tool and leaving its reply row terminal and unsent through a later promotion and outbox recovery;
 - a release dying after commit, with its KeepAlive respawn exiting 0 at the coordinator check and A′ answering a fresh message within 60 seconds;
 - a live release with a provably wedged event loop being terminated and replaced by A′, and a live release that neither hands over nor proves wedged being reported blocked with one poller;
-- a pre-commit abort resuming the serving poller;
+- a pre-commit abort re-arming the poller, cron, kanban and autonomous wakeups, each proved by fresh work;
 - SIGKILL of the old generation, the new generation and the updater.
 
 A green hosted gate does not substitute for this suite, because hosted CI cannot run launchd.
@@ -118,9 +118,10 @@ Suggested minimal schema (additive and versioned; timestamps UTC):
 
 ```sql
 CREATE TABLE generations (
-  id TEXT PRIMARY KEY, release_sha TEXT NOT NULL, label TEXT NOT NULL,
-  pid INTEGER NOT NULL, started_at REAL NOT NULL, boot_id TEXT NOT NULL,
-  state TEXT NOT NULL, heartbeat_at REAL NOT NULL, drain_deadline REAL
+  id TEXT PRIMARY KEY, release_sha TEXT NOT NULL, label TEXT NOT NULL UNIQUE,
+  pid INTEGER, start_fingerprint TEXT, started_at REAL NOT NULL, boot_id TEXT NOT NULL,
+  state TEXT NOT NULL, heartbeat_at REAL NOT NULL, drain_deadline REAL,
+  verdict TEXT, verdict_at REAL, verdict_evidence TEXT
 );
 CREATE TABLE leases (
   resource TEXT PRIMARY KEY, epoch INTEGER NOT NULL, generation_id TEXT NOT NULL,
