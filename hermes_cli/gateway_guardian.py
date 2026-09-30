@@ -246,6 +246,7 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
                 receipt(home, "rollback", "attempt", reason="successor process exited",
                         label=owner["label"])
                 try:
+                    _fence_failed_successor(owner["label"])
                     proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"],
                                              drain_seconds=drain_seconds)
                 except (RuntimeError, OSError) as failure:
@@ -384,6 +385,25 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         time.sleep(.25)
     receipt(home, "bootstrap", "failed", label=label, reason="gateway not healthy after bootstrap")
     return "failed"
+
+
+def _fence_failed_successor(label: str) -> None:
+    """Boot out a dead successor before rollback inspects its launchd label.
+
+    KeepAlive can have started a replacement between the PID death probe and
+    rollback_overlap's fence check.  Booting out the disposable label closes
+    that race; rollback_overlap then waits for the finite Telegram poll settle
+    window before restoring the predecessor.
+    """
+    domain = _gateway_domain(label, None)
+    if _launch_state(domain, label) == "loaded":
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=True, timeout=15)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if _launch_state(domain, label) == "unloaded":
+            return
+        time.sleep(.25)
+    raise RuntimeError("successor label remained loaded after bootout")
 
 
 def _repair_count(home: Path) -> int:

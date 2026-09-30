@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -290,3 +291,129 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
     finally:
         for label in labels:
             subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
+
+
+@pytest.mark.integration
+@pytest.mark.macos_only
+@pytest.mark.live_system_guard_bypass
+def test_launchd_guardian_rolls_back_keepalive_successor_failure(request, tmp_path):
+    """The scheduled guardian fences a KeepAlive successor and restores A."""
+    root = tmp_path / "guardian-failure"
+    root.mkdir()
+    home = root / "profile"
+    home.mkdir()
+    api = BotAPI()
+    llm = FakeLLMServer(lambda record: (
+        Text("old-turn-complete") if record["body"]["messages"][-1].get("role") == "tool"
+        else ToolCall("terminal", {"command": f"touch {root / 'old-running'} && sleep 40"})
+        if "old-boundary" in str(record["body"]["messages"][-1].get("content", ""))
+        else Text("restored-a-answer")
+    ))
+    llm.__enter__()
+    request.addfinalizer(api.close)
+    request.addfinalizer(lambda: llm.__exit__(None, None, None))
+    repo = Path(__file__).resolve().parents[2]
+    python = Path(sys.executable)
+    domain = f"gui/{os.getuid()}"
+    nonce = uuid.uuid4().hex
+    labels = [f"ai.hermes.p3test-{nonce}-{slot}" for slot in ("a", "b", "guardian")]
+    shas = ("a" * 40, "b" * 40)
+    paths = ReleasePaths.for_home(home)
+    for sha in shas:
+        release = paths.releases / sha
+        release.mkdir(parents=True)
+        for marker in (".release-ready", ".hermes_build_sha"):
+            (release / marker).write_text(sha)
+    paths.current.symlink_to(paths.releases / shas[0])
+    (home / "config.yaml").write_text(
+        "model:\n  provider: custom\n  default: fake-model\n"
+        f"  base_url: {llm.base_url}\n  key_env: OPENAI_API_KEY\n"
+        "agent:\n  api_max_retries: 1\n"
+        "approvals:\n  mode: off\nupdates:\n  check: false\n"
+        "gateway:\n  overlap_handover:\n    enabled: true\n"
+        "  guardian:\n    enabled: true\n"
+        "platforms:\n  telegram:\n    enabled: true\n    token: '123456:LOCAL_STUB_ONLY'\n"
+        f"    extra:\n      base_url: '{api.url}'\n      base_file_url: '{api.url}'\n"
+        "      allow_from: ['1', '2', '3']\n      drop_pending_on_cold_boot: false\n")
+    plists = {}
+    for index, label in enumerate(labels[:2]):
+        plist = root / f"{label}.plist"
+        plist.write_bytes(plistlib.dumps({
+            "Label": label, "RunAtLoad": True,
+            "KeepAlive": {"SuccessfulExit": False}, "ExitTimeOut": 60,
+            "ProgramArguments": [str(python), "-m", "hermes_cli.main", "gateway", "run"]
+                                + (["--standby"] if index else []),
+            "WorkingDirectory": str(repo),
+            "EnvironmentVariables": {
+                "HERMES_HOME": str(home), "PYTHONPATH": str(repo),
+                "HERMES_RELEASE_SHA": shas[index], "HERMES_LAUNCHD_LABEL": label,
+                "HERMES_GATEWAY_LOCK_DIR": str(root / "locks"),
+                "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1",
+            },
+            "StandardOutPath": str(root / f"{label}.out"),
+            "StandardErrorPath": str(root / f"{label}.err"),
+        }))
+        register_disposable_label(request, label, plist)
+        plists[label] = plist
+    guardian_plist = root / f"{labels[2]}.plist"
+    guardian_plist.write_bytes(plistlib.dumps({
+        "Label": labels[2], "RunAtLoad": True, "StartInterval": 5,
+        "KeepAlive": False,
+        "ProgramArguments": [str(python), "-m", "hermes_cli.gateway_guardian", "run",
+                             "--gateway-plist", str(plists[labels[1]]),
+                             "--gateway-label", labels[1], "--domain", domain],
+        "WorkingDirectory": str(repo),
+        "EnvironmentVariables": {"HERMES_HOME": str(home), "PYTHONPATH": str(repo)},
+        "StandardOutPath": str(root / "guardian.out"),
+        "StandardErrorPath": str(root / "guardian.err"),
+    }))
+    register_disposable_label(request, labels[2], guardian_plist)
+
+    def rows():
+        return GenerationCoordinator(home).generations()
+
+    def sent(needle):
+        with api.lock:
+            return [item for item in api.sent if needle in item["text"].replace("\\\\", "")]
+
+    try:
+        subprocess.run(["launchctl", "bootstrap", domain, str(plists[labels[0]])], check=True, timeout=15)
+        _wait_for(lambda: any(row["label"] == labels[0] and row["state"] in {"serving", "ready"}
+                           for row in rows()), 35, "A did not become ready")
+        api.add(4001, 4001, text="old-boundary")
+        _wait_for(lambda: (root / "old-running").exists(), 20, "A did not start in-flight work")
+        subprocess.run(["launchctl", "bootstrap", domain, str(plists[labels[1]])], check=True, timeout=15)
+        _wait_for(lambda: any(row["label"] == labels[1] and row["state"] == "ready" for row in rows()),
+                  35, "B did not become ready")
+        old, successor = (next(row for row in rows() if row["label"] == label)
+                          for label in (labels[0], labels[1]))
+        epoch = handover_to_generation(home, successor["id"], timeout=35)
+        activate_release(home, paths.releases / shas[1])
+        subprocess.run(["launchctl", "bootstrap", domain, str(guardian_plist)], check=True, timeout=15)
+        failure_at = time.monotonic()
+        os.kill(successor["pid"], signal.SIGKILL)
+        _wait_for(lambda: any(json.loads(path.read_text())["outcome"] == "rolled_back"
+                              for path in (home / "logs/guardian").glob("*.json")),
+                  60, "scheduled guardian did not restore A after B failure")
+        elapsed = time.monotonic() - failure_at
+        lease = GenerationCoordinator(home).leases()[0]
+        assert elapsed < 60
+        assert lease["generation_id"] == old["id"] and lease["epoch"] == epoch + 1
+        assert paths.current.resolve().name == shas[0]
+        assert subprocess.run(["launchctl", "print", f"{domain}/{labels[1]}"],
+                              capture_output=True, timeout=5).returncode != 0
+        api.add(4002, 4002, text="new-a", chat_id=3)
+        _wait_for(lambda: len(sent("restored-a-answer")) == 1, 20, "restored A did not answer fresh chat")
+        assert time.monotonic() - failure_at < 60, "fresh restored answer exceeded the 60-second recovery bound"
+        _wait_for(lambda: len(sent("old-turn-complete")) == 1, 20, "A in-flight result was lost")
+        assert time.monotonic() - failure_at < 60, "in-flight result exceeded the 60-second recovery bound"
+        with api.lock:
+            assert api.maximum == 1 and not api.errors
+            assert not any("Operation interrupted" in item["text"] for item in api.sent)
+        assert len(sent("restored-a-answer")) == len(sent("old-turn-complete")) == 1
+        print(f"NATIVE_LAUNCHD guardian_failure={elapsed:.2f}s max_pollers={api.maximum} "
+              f"lease_epoch={lease['epoch']}", flush=True)
+    finally:
+        for label in labels:
+            subprocess.run(["launchctl", "bootout", f"{domain}/{label}"],
+                           capture_output=True, timeout=15)
