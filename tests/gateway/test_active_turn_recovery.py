@@ -513,6 +513,116 @@ async def test_unclean_restart_delivers_a_persisted_unledgered_reply_instead_of_
     _close_store_db(store)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_alive", [True, False], ids=["living-drainer", "verified-dead-owner"])
+@pytest.mark.parametrize("reply", [None, "the owned final"], ids=["unfinished", "persisted-final"])
+async def test_overlap_recovery_preserves_living_owner_and_never_retries_cut_work(tmp_path, monkeypatch, owner_alive, reply):
+    """Absence of a clean receipt is not death proof during overlap startup."""
+    import subprocess
+    import sys
+    from gateway.delivery_ledger import sweep_recoverable
+    from gateway.generation import GenerationCoordinator, GenerationIdentity
+    from gateway.status import _get_process_start_time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, store = _db_runner(tmp_path)
+    runner.config = GatewayConfig(overlap_handover_enabled=True)
+    source = _turn(store, "owned", marked=True, reply=reply)
+    entry = _entry_for(store, source)
+    token = entry.active_turn_token
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        started = _get_process_start_time(child.pid)
+        assert started is not None
+        db = GenerationCoordinator(tmp_path)
+        old = GenerationIdentity.create(release_sha="old", label="old", pid=child.pid,
+            start_fingerprint=f"{child.pid}:{started}")
+        db.register(old, state="draining")
+        assert db.claim_session(str(tmp_path), "discord", entry.session_key, old.id, 1, outstanding_work=1)
+        if not owner_alive:
+            child.terminate()
+            child.wait(timeout=5)
+        # A second, unowned crash must still recover while A is alive.
+        unowned = _turn(store, "unowned", marked=True, reply=None)
+        resumed, ledgered = await runner._recover_unclean_sessions()
+        assert (resumed, ledgered) == (1, int(not owner_alive and reply is not None))
+        assert _entry_for(store, unowned).resume_pending
+        assert not entry.resume_pending, "cut owned work must never replay on the successor"
+        assert entry.active_turn_token == (None if not owner_alive and reply is not None else token)
+        rows = sweep_recoverable(deliverable_platforms={"discord"})
+        assert [r["content"] for r in rows] == ([] if owner_alive or reply is None else [reply])
+        # A fresh reader must see the same preserved marker: recovery of another
+        # lane must not bulk-save over the living drainer's state.
+        reloaded = _make_db_store(tmp_path)
+        assert _entry_for(reloaded, source).active_turn_token == entry.active_turn_token
+        _close_store_db(reloaded)
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=5)
+        _close_store_db(store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_start", [False, True], ids=["known-identity", "unknown-start-is-not-death"])
+@pytest.mark.parametrize("save_failure", [None, "unavailable", "failed"], ids=["saved", "no-scoped-writer", "scoped-write-failed"])
+async def test_overlap_clean_receipt_cannot_clear_a_living_owners_newer_marker(tmp_path, monkeypatch, unknown_start, save_failure):
+    from gateway.generation import GenerationCoordinator, GenerationIdentity
+    from gateway.status import _get_process_start_time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(overlap_handover_enabled=True)
+    old_store = _make_db_store(tmp_path)
+    source = _turn(old_store, "living", marked=True, reply="old final")
+    unowned = _turn(old_store, "orphan", marked=True, reply=None)
+    entry = _entry_for(old_store, source)
+    old_store.mark_resume_pending(entry.session_key, reason="shutdown_timeout")
+    started = _get_process_start_time(os.getpid())
+    assert started is not None
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="old", label="old",
+        start_fingerprint=f"{os.getpid()}:{started}")
+    # Terminal metadata and stale heartbeats must not authorize recovery either.
+    db.register(old, state="failed")
+    assert db.claim_session(str(tmp_path), "discord", entry.session_key, old.id, 1, outstanding_work=1)
+    with db.connect() as conn:
+        conn.execute("UPDATE generations SET heartbeat_at=0 WHERE id=?", (old.id,))
+    runner, store = _db_runner(tmp_path)
+    runner.config = config
+    stale_token = _entry_for(store, source).active_turn_token
+    fresh_token = old_store.mark_turn_active(entry.session_key)
+    assert fresh_token != stale_token
+    if unknown_start:
+        monkeypatch.setattr("gateway.status._get_process_start_time", lambda pid: None)
+    marker = tmp_path / ".clean_shutdown"
+    marker.write_text("an older clean receipt", encoding="utf-8")
+    try:
+        if save_failure:
+            if save_failure == "unavailable":
+                monkeypatch.setattr(store, "_routing_db_method", lambda name: None)
+            else:
+                real_method = store._routing_db_method
+                monkeypatch.setattr(store, "_routing_db_method", lambda name: (
+                    MagicMock(side_effect=OSError("disk unavailable"))
+                    if name == "save_gateway_routing_entry" else real_method(name)))
+            with pytest.raises(RuntimeError, match="full rewrite would clobber a live owner"):
+                await runner._consume_clean_shutdown_marker(marker)
+            assert marker.exists(), "failed scoped cleanup must not consume the receipt"
+        else:
+            assert await runner._consume_clean_shutdown_marker(marker) == 1
+            assert not marker.exists()
+        assert _entry_for(store, source).active_turn_token == stale_token
+        assert _entry_for(store, unowned).active_turn_token is None
+        assert runner._resume_pending_candidates(record_boot=False) == []
+        reloaded = _make_db_store(tmp_path)
+        assert _entry_for(reloaded, source).active_turn_token == fresh_token
+        assert _entry_for(reloaded, source).resume_pending
+        _close_store_db(reloaded)
+    finally:
+        _close_store_db(store)
+        _close_store_db(old_store)
+
+
 _WAKE = {"display_kind": "internal_notification"}
 
 

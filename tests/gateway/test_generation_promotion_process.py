@@ -505,9 +505,12 @@ async def test_split_text_batch_flushed_by_old_process_during_promotion(tmp_path
         with db.connect() as conn:
             accepted = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1'").fetchone()
         assert accepted and accepted["owner_id"] == old["id"] and accepted["state"] == "accepted"
+        await asyncio.to_thread(processes[0].wait, 30)
+        assert processes[0].returncode == 0, stderr_paths[0].read_text()
         await asyncio.sleep(.5)
         with api.lock:
-            assert sum("split-batch-complete" in row["text"].replace("\\", "") for row in api.sent) == 1
+            assert sum("split-batch-complete" in row["text"].replace("\\", "") for row in api.sent) == 1, api.sent
+        assert len(llm.main_requests()) == 1, "the successor regenerated the old owner's turn"
     finally:
         for process in processes:
             if process.poll() is None:
