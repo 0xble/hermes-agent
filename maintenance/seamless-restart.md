@@ -61,14 +61,20 @@ States, per generation, are forward only:
 
 The lease moves in exactly two ways:
 
-1. **Handover.** A serving generation stops its poller, acknowledges `poller_stopped(token, epoch, cursor)` and commits the lease to a ready standby. The old generation becomes `draining` in the same transaction.
-2. **Takeover.** A ready standby takes the lease from a generation that is proven dead: PID plus start fingerprint absent, and launchd reports the label not running. Heartbeat age alone never proves death.
+1. **Handover.** Cooperative only. A serving generation stops its poller, acknowledges `poller_stopped(token, epoch, cursor)` and commits the lease to a ready standby. The old generation becomes `draining` in the same transaction. A generation that does not acknowledge within its deadline has not handed over, and still owns the lease.
+2. **Takeover.** A ready standby takes the lease from a generation that is proven dead and retired, in this order:
+   1. Death proof: the recorded PID plus start fingerprint is absent. Heartbeat age alone never proves death.
+   2. Retire: the coordinator records `failed` and then `exited` for that `generation_id` in one transaction. A launchd KeepAlive respawn under a generation label is never that generation, because its PID and start fingerprint differ. At its first coordinator check it finds the label's generation already registered and exits 0, whether or not retire has been recorded yet. `KeepAlive={SuccessfulExit=false}` does not respawn it again. It never polls, admits or claims the token, so a respawn cannot race the takeover.
+   3. Bootout: the label is booted out, then read back as not loaded. Booting out a dead or retired generation kills no work.
+   4. Takeover: the standby acquires the token lock and the lease with a new epoch.
+
+   If a respawn is still live under the retired label when bootout is due, it holds no lease and no token, so booting it out is safe.
 
 The one allowed resume is before commit. A serving generation that paused `getUpdates` for a handover that never committed resumes polling. It never set `draining`, never lost the lease and never stopped admission, so it still owns every piece of runtime state. This is the existing 45-second pre-commit abort. It gets its own native test.
 
-**Rollback is a handover.** Rolling back means starting a fresh standby on the previous release, which then takes the lease by handover (unhealthy but live successor) or takeover (dead successor). The draining generation, if any, keeps draining and exits on its own schedule. Three generations can therefore coexist briefly: the original draining A, the failed B (draining or dead), and the fresh A′ on A's release. `previous → current` changes only after A′ acknowledges from its release. Never re-arm the draining A.
+**Rollback is a handover.** Rolling back means starting a fresh standby on the previous release, which then takes the lease by cooperative handover (unhealthy but responsive successor) or takeover (dead successor). The draining generation, if any, keeps draining and exits on its own schedule. Three generations can therefore coexist briefly: the original draining A, the failed B (draining or dead), and the fresh A′ on A's release. `previous → current` changes only after A′ acknowledges from its release. Never re-arm the draining A.
 
-**Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<id8>`, where `<id8>` is the first eight hex digits of its generation UUID. The label pins its release path and is booted out only after the coordinator records `exited` for that generation. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
+**Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<id8>`, where `<id8>` is the first eight hex digits of its generation UUID. The label pins its release path and is booted out only after the coordinator records `exited` for that generation, whether by clean drain or by the retire step of takeover. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
 
 **Startup gate.** Before a standby may be named ready, it runs one loopback turn. This is the single, explicit exception to standby's no-admission rule. A synthetic message from a reserved loopback identity enters the same admission code on an isolated loopback transport, goes through both busy guards and the runner, and produces a reply row in the outbox with a loopback destination. It runs in a reserved loopback session that no user session, cron job or goal can route to, and nothing goes to Telegram. The turn uses the configured model with a fixed short prompt, which costs one small model call per update. A standby that fails the gate or exceeds its 45-second deadline never takes the poller. Its own process exits, or the updater stops it after proving it holds no lease. The coordinator records the `failed` verdict and then `exited`, and only after `exited` is recorded is its label booted out. This check would have caught the 2026-09-30 failure class: a gateway that polls and accepts input but never reaches the runner.
 
@@ -77,8 +83,8 @@ The one allowed resume is before commit. A serving generation that paused `getUp
 - **Updater dies before commit.** The serving generation's pre-commit deadline resumes its poller. The standby stays unready until booted out by the next update or the guardian.
 - **Updater dies after commit.** The new generation serves. The updater is observer-only on recovery, and the receipt is completed from the coordinator.
 - **New generation fails its startup gate.** It never polls. The old generation keeps serving and is never paused.
-- **New generation dies after takeover or handover.** The guardian or updater starts A′ on the previous release, which passes its startup gate and takes the lease from the dead generation. The target is a fresh message answered within 60 seconds of death. Work in the dead generation is marked interrupted once and never replayed.
-- **New generation is live but unhealthy after commit.** A′ is started and takes the lease by handover. The unhealthy generation drains or hits its cap.
+- **New generation dies after takeover or handover.** The guardian or updater starts A′ on the previous release, which passes its startup gate and takes the lease from the dead generation through the ordered death proof, retire, bootout and takeover steps. A KeepAlive respawn of the dead label exits 0 at its coordinator check. The target is a fresh message answered within 60 seconds of death. Work in the dead generation is marked interrupted once and never replayed.
+- **New generation is live but unhealthy after commit.** A′ is started. If the unhealthy generation still responds, it hands over cooperatively and drains or hits its cap. If its event loop is provably wedged by the existing liveness probe (`probe_gateway_loop_liveness`), the updater or guardian terminates it with the existing bounded SIGTERM then SIGKILL path, and the dead-generation case above applies. A live generation that neither acknowledges handover nor proves wedged keeps the lease and its poller. The outcome is recorded as blocked with an alert, never a second poller and never a forced lease move. This case has its own native test.
 - **Old draining generation is SIGKILLed.** Its in-process work is marked interrupted once after death proof. The serving generation is unaffected.
 - **Guardian dies.** The next scheduled run recomputes from the coordinator. No action depends on the guardian's in-memory state.
 
@@ -96,7 +102,8 @@ If A′ cannot start and pass its gate within 60 seconds on the live profile, st
 - the new release answering a fresh message;
 - the old generation exiting after its last work;
 - a release failing its startup gate never polling;
-- a release dying after commit, with A′ answering a fresh message within 60 seconds;
+- a release dying after commit, with its KeepAlive respawn exiting 0 at the coordinator check and A′ answering a fresh message within 60 seconds;
+- a live release with a provably wedged event loop being terminated and replaced by A′, and a live release that neither hands over nor proves wedged being reported blocked with one poller;
 - a pre-commit abort resuming the serving poller;
 - SIGKILL of the old generation, the new generation and the updater.
 
