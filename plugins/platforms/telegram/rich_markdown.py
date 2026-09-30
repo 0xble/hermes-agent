@@ -2,6 +2,8 @@
 
 import re
 
+from markdown_it import MarkdownIt
+
 
 # Consume code/math before looking for block prefixes so their literal contents
 # survive unchanged, including an unfinished code fence in a streaming draft.
@@ -32,35 +34,28 @@ def escape_literal_hash_prefixes(text: str) -> str:
 
 
 _FOOTNOTE_REF = r"\[\^[^\]\s]+\]"
-# Inline literals are skipped; a reference followed by another reference (not a
-# ``[^n]:`` definition) gets the separator.
+# Within one paragraph: inline code and display math (possibly multiline) are
+# skipped; a reference followed by another reference gets the separator.
 _ADJACENT_REF_RE = re.compile(
     r"(?P<ticks>`+)(?!`).*?(?<!`)(?P=ticks)(?!`)"
-    r"|\\\[.*?\\\]|\\\(.*?\\\)"
-    rf"|(?P<ref>{_FOOTNOTE_REF})(?={_FOOTNOTE_REF}(?!:))"
+    r"|\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)"
+    rf"|(?P<ref>{_FOOTNOTE_REF})(?={_FOOTNOTE_REF}(?!:))",
+    re.DOTALL,
 )
 _FOOTNOTE_DEF_RE = re.compile(rf"^{_FOOTNOTE_REF}:")
-_LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-+*]|\d+[.)])(?:[ \t]|$)")
-_FENCE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
-_INDENTED_CODE_RE = re.compile(r"^(?: {4}|\t)")
+_PARSER = MarkdownIt("commonmark")
+_LITERAL_BLOCKS = frozenset({"fence", "code_block", "html_block"})
+_LIST_OPENS = frozenset({"bullet_list_open", "ordered_list_open"})
 FOOTNOTE_SEPARATOR = "<sup>,</sup>"
 LIST_FOOTNOTE_SPACER = "<!-- -->"
 
 
-def _separate_refs(line: str) -> str:
+def _separate_refs(block: str) -> str:
     def replace(match: re.Match[str]) -> str:
         ref = match.group("ref")
         return match.group(0) if ref is None else ref + FOOTNOTE_SEPARATOR
 
-    return _ADJACENT_REF_RE.sub(replace, line)
-
-
-def _display_math_end(stripped: str) -> str:
-    """Closing delimiter for display math opened on this line and left open, else ''."""
-    for opener, closer in (("$$", "$$"), ("\\[", "\\]")):
-        if stripped.startswith(opener):
-            return "" if closer in stripped[len(opener):] else closer
-    return ""
+    return _ADJACENT_REF_RE.sub(replace, block)
 
 
 def normalize_footnotes(text: str) -> str:
@@ -71,40 +66,41 @@ def normalize_footnotes(text: str) -> str:
     number still tappable. The first ``[^n]:`` definition directly after a
     list is dropped, even across blank lines, leaving a literal ``^n``; an
     empty HTML comment before the definitions ends the list without adding a
-    block. Code (fenced, indented, inline) and display math stay literal.
+    block. A CommonMark parse decides which lines are prose, code, or list, so
+    code blocks, inline code, and display math stay literal.
     """
+    if "[^" not in text:
+        return text
+    lines = text.split("\n")
+    literal: set[int] = set()
+    lists: list[tuple[int, int]] = []
+    for token in _PARSER.parse(text):
+        if not token.map:
+            continue
+        first, end = token.map
+        if token.type in _LITERAL_BLOCKS:
+            literal.update(range(first, end))
+        elif token.type in _LIST_OPENS:
+            lists.append((first, end))
+        elif token.type == "inline":
+            separated = _separate_refs("\n".join(lines[first:end])).split("\n")
+            if len(separated) == end - first:
+                lines[first:end] = separated
+
     out: list[str] = []
-    fence = math_end = ""
-    in_list = in_code = False
-    previous_blank = True
-    for line in text.split("\n"):
-        stripped = line.strip()
-        opener = _FENCE_RE.match(line)
-        if fence:
-            if opener and opener.group(1)[0] == fence[0] and len(opener.group(1)) >= len(fence):
-                fence = ""
-        elif math_end:
-            if math_end in stripped:
-                math_end = ""
-        elif opener:
-            fence = opener.group(1)
-        elif stripped.startswith(("$$", "\\[")):
-            math_end = _display_math_end(stripped)
-        elif stripped and _INDENTED_CODE_RE.match(line) and not in_list and (previous_blank or in_code):
-            in_code = True
-        elif stripped:
-            in_code = False
-            if _LIST_ITEM_RE.match(line):
-                in_list = True
-            elif _FOOTNOTE_DEF_RE.match(line):
-                if in_list:
-                    if out and out[-1].strip():
-                        out.append("")
-                    out.append(LIST_FOOTNOTE_SPACER)
-                in_list = False
-            elif previous_blank and not line[:1].isspace():
-                in_list = False
-            line = _separate_refs(line)
-        previous_blank = not stripped
+    previous = -1
+    for index, line in enumerate(lines):
+        if (
+            index not in literal
+            and _FOOTNOTE_DEF_RE.match(line)
+            and previous >= 0
+            and not _FOOTNOTE_DEF_RE.match(lines[previous])
+            and any(first <= previous < end for first, end in lists)
+        ):
+            if out and out[-1].strip():
+                out.append("")
+            out.append(LIST_FOOTNOTE_SPACER)
         out.append(line)
+        if line.strip():
+            previous = index
     return "\n".join(out)
