@@ -118,6 +118,36 @@ class TestGoalManager:
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
 
+    def test_zero_budget_is_persistent_unlimited_and_continues(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        mgr = GoalManager(session_id="unlimited-sid", default_max_turns=0)
+        state = mgr.set("keep going")
+        assert state.max_turns == 0
+        assert load_goal("unlimited-sid").max_turns == 0
+        assert "∞" in mgr.status_line()
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+            for i in range(21):
+                decision = mgr.evaluate_after_turn(f"step {i}")
+                assert decision["should_continue"] is True
+        assert mgr.state.status == "active"
+        assert mgr.state.turns_used == 21
+        assert load_goal("unlimited-sid").turns_used == 21
+
+    def test_finite_budget_still_pauses(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="finite-sid", default_max_turns=2)
+        mgr.set("stop at two")
+        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+            assert mgr.evaluate_after_turn("step 1")["should_continue"] is True
+            decision = mgr.evaluate_after_turn("step 2")
+        assert decision["status"] == "paused"
+        assert mgr.state.paused_reason == "turn budget exhausted (2/2)"
+
 
 
 

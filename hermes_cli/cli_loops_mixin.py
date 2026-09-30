@@ -479,7 +479,8 @@ class CLILoopsMixin:
             def make(sid):
                 try:
                     goals_cfg = (load_config() or {}).get("goals") or {}
-                    max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+                    value = goals_cfg.get("max_turns", 20)
+                    max_turns = int(value) if int(value) >= 0 else 20
                 except Exception:
                     max_turns = 20
                 return GoalManager(session_id=sid, default_max_turns=max_turns)

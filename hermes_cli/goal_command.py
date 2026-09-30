@@ -136,8 +136,9 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         headline, contract = goals.parse_contract(arg)
         contract = contract if not contract.is_empty() else None
     state = mgr.set(headline or arg, contract=contract)
+    budget = "unlimited" if state.max_turns == 0 else str(state.max_turns)
     output = render("gateway.goal.set", "⊙ Goal set ({budget}-turn budget): {goal}",
-                    budget=state.max_turns, goal=state.goal)
+                    budget=budget, goal=state.goal)
     if state.has_contract():
         label = "Drafted completion contract:" if drafting else "Completion contract:"
         output += f"\n{label}\n{state.contract.render_block()}"

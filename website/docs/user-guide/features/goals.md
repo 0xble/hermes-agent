@@ -216,7 +216,7 @@ If the judge errors (network blip, malformed response, unavailable aux client), 
 
 ### Turn budget
 
-Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). When the budget is hit, Hermes auto-pauses and tells you exactly how to proceed:
+Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). Set `goals.max_turns: 0` for a genuinely unlimited goal; zero is preserved in the goal record and disables only the budget pause. Done, blocked, judge-failure, dispute, wait, user pause, and clear controls still behave normally. For finite positive values, when the budget is hit Hermes auto-pauses and tells you exactly how to proceed:
 
 ```
 ⏸ Goal paused — 20/20 turns used. Use /goal resume to keep going, or /goal clear to stop.

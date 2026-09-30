@@ -67,6 +67,8 @@ Failed or interrupted model turns do not run completion judging.
   red without the patch. Rollback reverts the source change; old goal rows load
   with a zero dispute counter and no schema change.
 
+- Fork patch identity: `unlimited-goal-budget`. `goals.max_turns: 0` is a durable unlimited sentinel: config consumers preserve zero, serialized and migrated goal rows round-trip it, and the native plus Kanban continuation checks skip only the finite budget pause. Done, blocked, judge-failure, dispute, wait, pause, resume, clear, and positive finite budgets remain unchanged. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goals.py tests/gateway/test_goal_max_turns_config.py tests/tui_gateway/test_goal_command.py`. Retire when the selected upstream release preserves zero through the same surfaces and passes this proof; rollback reverts this identity's normalization, budget guards, notices, docs, and tests.
+
 - Fork patch identity: `goal-adaptive`. Extends `goal-judge-evidence`. Own fork
   patch, no upstream PR yet. Four parts:
   - **Cited evidence.** Identifiers the response cites (backtick spans, quoted

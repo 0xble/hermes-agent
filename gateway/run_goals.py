@@ -41,7 +41,8 @@ class GatewayGoalsMixin:
                 from hermes_cli.config import load_config
 
                 goals_cfg = (load_config() or {}).get("goals") or {}
-            return int(goals_cfg.get("max_turns", 20) or 20)
+            value = goals_cfg.get("max_turns", 20)
+            return int(value) if int(value) >= 0 else 20
         except Exception:
             return 20
 
