@@ -148,6 +148,54 @@ def test_literal_hash_normalization_preserves_markdown_regions(content):
     assert escape_literal_hash_prefixes(escaped) == escaped
 
 
+# --- Adjacent footnote refs: Telegram merges [^2][^3] into one superscript run that reads "23" ---
+
+
+def test_adjacent_footnote_refs_get_a_superscript_separator():
+    from plugins.platforms.telegram.rich_markdown import separate_adjacent_footnote_refs
+
+    content = (
+        "Two sources.[^2][^3] Three.[^1][^2][^note] One.[^4]\n\n"
+        "Spaced [^1] [^2] and inline `[^1][^2]` stay.\n\n"
+        "```\n[^1][^2]\n```\n\n"
+        "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
+    )
+    result = separate_adjacent_footnote_refs(content)
+    assert result.startswith(
+        "Two sources.[^2]<sup>,</sup>[^3] Three.[^1]<sup>,</sup>[^2]<sup>,</sup>[^note] One.[^4]\n\n"
+        "Spaced [^1] [^2] and inline `[^1][^2]` stay.\n\n```\n[^1][^2]\n```\n\n[^1]: [One]"
+    )
+    assert separate_adjacent_footnote_refs(result) == result
+
+
+def test_footnote_defs_after_a_list_get_a_spacer():
+    from plugins.platforms.telegram.rich_markdown import separate_footnote_defs_from_lists
+
+    defs = "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
+    result = separate_footnote_defs_from_lists("- a.[^1]\n- b.[^2]\n\n" + defs)
+    assert result == "- a.[^1]\n- b.[^2]\n\n<!-- -->\n" + defs
+    assert separate_footnote_defs_from_lists(result) == result
+    for unchanged in ("Para.[^1]\n\n" + defs, "- a\n\nTail.[^1]\n\n" + defs, "```\n- a\n[^1]: x\n```"):
+        assert separate_footnote_defs_from_lists(unchanged) == unchanged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit", "draft"])
+async def test_rich_delivery_separates_adjacent_footnote_refs(operation):
+    adapter = _make_adapter({"rich_messages": "always", "rich_drafts": True})
+    content = "Cited twice.[^2][^3]\n\n[^2]: <https://example.com/2>\n[^3]: <https://example.com/3>"
+    if operation == "send":
+        assert (await adapter.send("12345", content)).success
+    elif operation == "edit":
+        assert (await adapter.edit_message("12345", "123", content, finalize=True)).success
+    else:
+        assert await adapter.send_draft("12345", 123, content)
+    assert adapter._bot is not None
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    assert "[^2]<sup>,</sup>[^3]" in markdown
+    assert "[^2]: <https://example.com/2>" in markdown
+
+
 @pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()
