@@ -75,7 +75,8 @@ def test_promotion_returns_rolled_back_proof_after_committed_observation_failure
     def rollback(*args, **kwargs):
         if rollback_blocks:
             raise RuntimeError("successor wire-stop unavailable")
-        restored = coordinator.rollback_transfer(second.id, first.id, epoch + 1, poller_stopped=True)
+        restored = coordinator.rollback_transfer(second.id, first.id, epoch + 1, poller_stopped=True,
+                                                 successor_dead=True)
         activate(home, paths / first.release_sha)
         return {"epoch": restored, "to_id": first.id}
     monkeypatch.setattr(gateway_overlap, "rollback_overlap", rollback)
@@ -87,6 +88,61 @@ def test_promotion_returns_rolled_back_proof_after_committed_observation_failure
         result = gateway_overlap.promote_overlap(home, paths / second.release_sha, second.release_sha)
         assert result["outcome"] == "rolled_back" and result["rollback"]["to_id"] == first.id
         assert coordinator.leases()[0]["generation_id"] == first.id
+        failed = next(row for row in coordinator.generations() if row["id"] == second.id)
+        assert failed["state"] == "failed" and failed["drain_deadline"] is None
+
+
+def test_dead_successor_rollback_is_terminal_for_guardian_and_next_promotion(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    from hermes_cli import gateway_overlap
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    coordinator, first, second, epoch = _generations(home)
+    coordinator.request_transfer(first.id, second.id, epoch, set())
+    promoted = coordinator.commit_transfer(first.id, second.id, epoch)
+    restored = coordinator.rollback_transfer(second.id, first.id, promoted,
+                                             poller_stopped=True, successor_dead=True)
+    assert restored == promoted + 1
+
+    dead = next(row for row in coordinator.generations() if row["id"] == second.id)
+    assert dead["state"] == "failed" and dead["drain_deadline"] is None
+    assert guardian._run_overlap(home) == "healthy"
+
+    releases = home / "releases"
+    for identity in (first, second):
+        release = releases / identity.release_sha
+        release.mkdir(parents=True)
+        for marker in (".release-ready", ".hermes_build_sha"):
+            (release / marker).write_text(identity.release_sha)
+    third = GenerationIdentity.create(release_sha="c" * 40, label="ai.hermes.gateway-b")
+    coordinator.register(third, state="ready")
+    third_release = releases / third.release_sha
+    third_release.mkdir()
+    for marker in (".release-ready", ".hermes_build_sha"):
+        (third_release / marker).write_text(third.release_sha)
+    (home / "current").symlink_to(releases / first.release_sha)
+
+    monkeypatch.setattr(guardian, "_gateway_domain", lambda *args: "gui/501")
+    monkeypatch.setattr(guardian, "_launch_state", lambda *args: "unloaded")
+    monkeypatch.setattr(gateway_overlap, "render_generation_launchd_plist", lambda **kwargs: "test")
+    monkeypatch.setattr(gateway_overlap, "_install_generation_plist", lambda *args: home / "standby.plist")
+    monkeypatch.setattr(gateway_overlap, "bootstrap_generation_plist", lambda **kwargs: None)
+    monkeypatch.setattr(gateway_overlap, "_set_boot_active", lambda *args: None)
+    monkeypatch.setattr(gateway_overlap, "_ready_successor", lambda *args, **kwargs: asdict(third))
+    monkeypatch.setattr(gateway_overlap, "_observe_poller", lambda *args, **kwargs: {"polling": True})
+    monkeypatch.setattr(gateway_overlap, "activate_release",
+                        lambda _home, release, **kwargs: _home.joinpath("current").unlink() or
+                        _home.joinpath("current").symlink_to(release))
+
+    def handover(_home, successor_id, **kwargs):
+        transfer_epoch = coordinator.leases()[0]["epoch"]
+        coordinator.request_transfer(first.id, successor_id, transfer_epoch, set())
+        return coordinator.commit_transfer(first.id, successor_id, transfer_epoch)
+
+    monkeypatch.setattr(gateway_overlap, "handover_to_generation", handover)
+    result = gateway_overlap.promote_overlap(home, third_release, third.release_sha)
+    assert result["new_id"] == third.id
 
 
 @pytest.mark.parametrize("transfer_state", ["missing", "requested", "aborted"])

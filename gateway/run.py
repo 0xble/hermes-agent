@@ -5917,8 +5917,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     runner = GatewayRunner(config)
     # An external cron provider cannot fence fresh ticks at transfer. Reject it
     # before this process claims its PID or any adapter opens a token connection.
+    from gateway.generation import overlap_handover_enabled
     _preflight_cron = (_resolve_gateway_cron_provider(runner.config)
-                       if getattr(runner.config, "overlap_handover_enabled", False) else None)
+                       if overlap_handover_enabled(runner.config) else None)
     # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
     # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
     # See #82936.
@@ -5993,7 +5994,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _active_generation = ActiveGeneration(Path(get_hermes_home()),
             GenerationCoordinator(Path(get_hermes_home())), promoted_id, promoted_epoch)
         await _active_generation.start()
-    elif getattr(runner.config, "overlap_handover_enabled", False):
+    elif overlap_handover_enabled(runner.config):
         from gateway.run_generation import start_active_generation
         try:
             _active_generation = await start_active_generation(runner.config)

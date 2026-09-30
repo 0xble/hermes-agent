@@ -392,7 +392,8 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             return len(rows)
 
     def rollback_transfer(self, failed_id: str, old_id: str, epoch: int,
-                          *, poller_stopped: bool, drain_seconds: float = 7200) -> int | None:
+                          *, poller_stopped: bool, successor_dead: bool = False,
+                          drain_seconds: float = 7200) -> int | None:
         """Restore an intact prior generation only after the successor's wire is proven idle."""
         if poller_stopped is not True:
             raise RuntimeError("successor poller stop not proved")
@@ -417,8 +418,16 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             conn.execute("UPDATE leases SET generation_id=?,epoch=epoch+1 WHERE resource='active_generation' "
                          "AND generation_id=? AND epoch=?", (old_id, failed_id, epoch))
             conn.execute("UPDATE generations SET state='serving',drain_deadline=NULL WHERE id=?", (old_id,))
-            conn.execute("UPDATE generations SET state='draining',drain_deadline=? "
-                         "WHERE id=? AND state!='failed'", (time.time() + drain_seconds, failed_id))
+            if successor_dead:
+                # The caller has already proved the successor dead under the
+                # generation/launchd identity rules. Keep that proof's state
+                # transition in this same write transaction: a dead successor
+                # is terminal history, not a live drainer.
+                conn.execute("UPDATE generations SET state='failed',drain_deadline=NULL "
+                             "WHERE id=? AND state IN ('serving','ready')", (failed_id,))
+            else:
+                conn.execute("UPDATE generations SET state='draining',drain_deadline=? "
+                             "WHERE id=? AND state!='failed'", (time.time() + drain_seconds, failed_id))
             conn.execute("UPDATE generation_transfers SET state='rolled_back' WHERE old_id=? AND new_id=? "
                          "AND epoch=?", (old_id, failed_id, epoch - 1))
             conn.commit()

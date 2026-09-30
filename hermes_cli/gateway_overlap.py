@@ -116,6 +116,7 @@ def rollback_overlap(home: Path, failed_id: str, old_id: str, epoch: int,
         raise RuntimeError("rollback blocked: successor wire-stop receipt invalid")
     try:
         restored = coordinator.rollback_transfer(failed_id, old_id, epoch, poller_stopped=True,
+                                                 successor_dead=dead_successor,
                                                  drain_seconds=drain_seconds)
         if restored is None:
             raise RuntimeError("rollback blocked: active lease changed")
