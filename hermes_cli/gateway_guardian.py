@@ -391,9 +391,9 @@ def _fence_failed_successor(label: str) -> None:
     """Boot out a dead successor before rollback inspects its launchd label.
 
     KeepAlive can have started a replacement between the PID death probe and
-    rollback_overlap's fence check.  Booting out the disposable label closes
-    that race; rollback_overlap then waits for the finite Telegram poll settle
-    window before restoring the predecessor.
+    rollback_overlap's fence check. This helper fences by label only; it does
+    not verify that a replacement has not acquired a newer generation lease.
+    rollback_overlap checks generation identity only after this bootout.
     """
     domain = _gateway_domain(label, None)
     if _launch_state(domain, label) == "loaded":
