@@ -5,11 +5,9 @@ import json
 import os
 import plistlib
 import signal
-import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -49,14 +47,38 @@ def _inbox_rows(home: Path, update_id: str) -> list[dict]:
             "SELECT owner_id,state FROM inbox WHERE source_event_id=?", (update_id,))]
 
 
+def _assert_no_recovery_guidance(sent: list[dict], requests: list[dict]) -> None:
+    assert not any("⏳ Gateway" in item["text"] or "Operation interrupted" in item["text"]
+                   or "previous turn was interrupted" in item["text"].lower()
+                   or "session restored" in item["text"].lower() for item in sent)
+    # A fake normal answer must not hide recovery injection at the model boundary.
+    assert not any("[System note: The previous turn was interrupted" in
+                   str(message.get("content", ""))
+                   for body in requests for message in body.get("messages", []))
+
+
+def _native_failure_diagnostics(root: Path, api) -> str:
+    # Pytest retains the fixture home, logs and coordinator state. Emit bounded
+    # tails too, so a failed attempt remains diagnosable in the durable test log.
+    with api.lock:
+        metrics = {"max_pollers": api.maximum, "errors": api.errors[-20:],
+                   "sent_count": len(api.sent)}
+    logs = {}
+    for path in sorted(root.glob("*.err")) + sorted(root.glob("*.out")):
+        with path.open("rb") as stream:
+            stream.seek(max(0, path.stat().st_size - 4000))
+            logs[path.name] = stream.read(4000).decode("utf-8", errors="replace")
+    return json.dumps({"fixture_root": str(root), "metrics": metrics, "logs": logs})
+
+
 @pytest.mark.integration
 @pytest.mark.macos_only
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize("rollback_scenario", [False, True])
-def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
+def test_long_turn_survives_native_launchd_overlap(request, tmp_path, rollback_scenario):
     """A's long tool survives promotion or guarded rollback with one wire poller."""
-    root = Path(tempfile.mkdtemp(prefix="p3overlap-", dir="/tmp"))
-    request.addfinalizer(lambda: shutil.rmtree(root, ignore_errors=True))
+    root = tmp_path / "overlap"
+    root.mkdir()
     home = root / "profile"
     home.mkdir()
     marker = root / "tool-running"
@@ -274,8 +296,7 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
         assert _inbox_rows(home, "1004") == [{"owner_id": old["id"], "state": "accepted"}]
         with api.lock:
             assert api.maximum == 1 and not api.errors
-            assert not any("⏳ Gateway" in item["text"] or "Operation interrupted" in item["text"]
-                           for item in api.sent)
+            _assert_no_recovery_guidance(api.sent, llm.main_requests())
         assert next(row for row in rows() if row["id"] == new["id"])["state"] == "serving"
         assert next(row for row in rows() if row["id"] == old["id"])["release_sha"] == shas[0]
         assert next(row for row in rows() if row["id"] == new["id"])["release_sha"] == shas[1]
@@ -288,6 +309,9 @@ def test_long_turn_survives_native_launchd_overlap(request, rollback_scenario):
               f"B_reply={b_reply_seconds:.2f}s A_reply_wait={a_reply_seconds:.2f}s "
               f"followup={followup_seconds:.2f}s old_sha={shas[0]} new_sha={shas[1]} "
               f"max_pollers={api.maximum}")
+    except BaseException:
+        print("NATIVE_LAUNCHD_FAILURE " + _native_failure_diagnostics(root, api), flush=True)
+        raise
     finally:
         for label in labels:
             subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
@@ -409,17 +433,13 @@ def test_launchd_guardian_rolls_back_keepalive_successor_failure(request, tmp_pa
         assert time.monotonic() - failure_at < 60, "in-flight result exceeded the 60-second recovery bound"
         with api.lock:
             assert api.maximum == 1 and not api.errors
-            assert not any("⏳ Gateway" in item["text"] or "Operation interrupted" in item["text"]
-                           or "previous turn was interrupted" in item["text"].lower()
-                           or "session restored" in item["text"].lower() for item in api.sent)
-        # The deterministic fake can mask recovery guidance with a normal
-        # answer. Reject resume injection at the observed model boundary too.
-        assert not any("[System note: The previous turn was interrupted" in
-                       str(message.get("content", ""))
-                       for body in llm.main_requests() for message in body.get("messages", []))
+            _assert_no_recovery_guidance(api.sent, llm.main_requests())
         assert len(sent("restored-a-answer")) == len(sent("old-turn-complete")) == 1
         print(f"NATIVE_LAUNCHD guardian_failure={elapsed:.2f}s max_pollers={api.maximum} "
               f"lease_epoch={lease['epoch']}", flush=True)
+    except BaseException:
+        print("NATIVE_LAUNCHD_FAILURE " + _native_failure_diagnostics(root, api), flush=True)
+        raise
     finally:
         for label in labels:
             subprocess.run(["launchctl", "bootout", f"{domain}/{label}"],
