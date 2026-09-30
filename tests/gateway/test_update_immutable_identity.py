@@ -95,3 +95,14 @@ def test_result_heading_names_the_active_release(tmp_path):
     heading, detail = Mixin._update_result_heading(tmp_path, _pending(), 0)
     assert heading == "✅ Update Complete"
     assert RELEASE[:12] in detail and SOURCE[:12] not in detail
+
+
+@pytest.mark.parametrize("restart", [True, False])
+def test_result_heading_fails_on_transition_pointer_mismatch(tmp_path, restart):
+    """The pointer can move after final_outcome; the heading must not claim success or no-op."""
+    from gateway.run_notifications import GatewayNotificationsMixin as Mixin
+    _release(tmp_path)
+    _receipt(tmp_path, fleet_sha=RELEASE, transition="d" * 40, restart=restart)
+    heading, detail = Mixin._update_result_heading(tmp_path, _pending(), 0)
+    assert heading == "❌ Update Failed"
+    assert "active release" in detail
