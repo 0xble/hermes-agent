@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 from types import SimpleNamespace
 
 from gateway.config import Platform
@@ -633,3 +634,96 @@ async def test_anonymous_admin_event_drops_without_reopening(tmp_path):
     runner = SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)
     routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
     assert await routing.route_message(adapter, MessageEvent(text="anonymous", source=source), "chat") is True
+
+
+@pytest.mark.asyncio
+async def test_settled_inbox_retention_preserves_replay_and_native_obligations(tmp_path, monkeypatch):
+    from plugins.platforms.telegram.polling_transfer import PollingJournal
+
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "owner")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    journal = PollingJournal(store, "test-token")
+    clock = time.time()
+    monkeypatch.setattr(time, "time", lambda: clock)
+    rows = {}
+    for event_id, state, wire_state, key in (
+        (1, "accepted", "accepted", "settled"),
+        (2, "pending", "accepted", "pending"),
+        (3, "processing", "accepted", "processing"),
+        (4, "accepted", "processing", "wire-processing"),
+        (5, "accepted", "received", "replayable"),
+        (6, "accepted", "accepted", "live"),
+        (8, "accepted", "accepted", "legacy"),
+        (9, "accepted", "accepted", "outstanding"),
+    ):
+        journal.record_response(json.dumps({"ok": True, "result": [{"update_id": event_id}]}).encode())
+        if wire_state != "received":
+            assert await journal.claim(event_id)
+            if wire_state == "accepted":
+                await journal.accept(event_id)
+        envelope = {"version": 1, "authorized": True, "sender": "1"}
+        if key != "legacy":
+            envelope["token_hash"] = journal.token_hash
+        if event_id == 1:
+            source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+            setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+            native = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch,
+                runner=SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)))
+            assert await native.route_message(SimpleNamespace(_controlled_journal=journal,
+                _is_sender_authorized=lambda *a, **kw: True),
+                MessageEvent(text="settled", source=source, platform_update_id=1), key) is False
+            with store.connect() as db:
+                row = dict(db.execute("SELECT * FROM inbox WHERE source_event_id='1'").fetchone())
+            assert json.loads(row["authorized_source"])["token_hash"] == journal.token_hash
+        else:
+            row, _ = store.enqueue(str(tmp_path), "telegram", key, str(event_id), "message",
+                                   json.dumps(envelope).encode(), lambda: b"unused", owner.id, epoch)
+        rows[event_id] = row
+        with store.connect() as db:
+            db.execute("UPDATE inbox SET state=? WHERE id=?", (state, row["id"]))
+    store.set_outstanding(str(tmp_path), "telegram", "outstanding", owner.id, epoch, 1)
+    clock += 8 * 86400
+    recent, _ = store.enqueue(str(tmp_path), "telegram", "recent", "7", "message",
+        json.dumps({"version": 1, "authorized": True, "sender": "1", "token_hash": journal.token_hash}).encode(),
+        lambda: b"unused", owner.id, epoch)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch,
+        runner=SimpleNamespace(adapters={}, _overlap_draining=False)))
+    monkeypatch.setattr(routing, "_live_keys", lambda: {"live"})
+    await routing._drain_once()
+    with store.connect() as db:
+        retained = {int(row[0]) for row in db.execute("SELECT source_event_id FROM inbox")}
+    assert retained == {2, 3, 4, 5, 6, 7, 8, 9}
+    # The transport gate still refuses the expired settled update. Retained
+    # receipts still deduplicate, and pending payloads remain available.
+    assert not await journal.claim(1)
+    assert await journal.claim(5)
+    duplicate, fresh = store.enqueue(str(tmp_path), "telegram", "recent", "7", "message",
+        json.dumps({"version": 1, "authorized": True, "sender": "1"}).encode(), b"changed", owner.id, epoch)
+    assert not fresh and duplicate["id"] == recent["id"]
+    assert [row["id"] for row in store.pending(owner.id, str(tmp_path), "telegram", "pending")] == [rows[2]["id"]]
+
+
+def test_existing_inbox_gains_retention_clock_without_losing_receipts(tmp_path):
+    import sqlite3
+    from contextlib import closing
+
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "owner")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    row, _ = store.enqueue(str(tmp_path), "telegram", "chat", "1", "message",
+        json.dumps({"version": 1, "authorized": True, "sender": "1"}).encode(), b"pending", owner.id, epoch)
+    # Exercise the pre-retention schema, not a source-text copy of its DDL.
+    with closing(sqlite3.connect(store.path)) as db:
+        db.execute("DROP INDEX IF EXISTS inbox_retention")
+        if "created_at" in {row[1] for row in db.execute("PRAGMA table_info(inbox)")}:
+            db.execute("ALTER TABLE inbox DROP COLUMN created_at")
+    reopened = GenerationCoordinator(tmp_path)
+    pending = reopened.pending(owner.id, str(tmp_path), "telegram", "chat")
+    assert len(pending) == 1 and pending[0]["id"] == row["id"]
+    assert pending[0]["payload"] == b"pending" and pending[0]["created_at"] > 0
+    duplicate, fresh = reopened.enqueue(str(tmp_path), "telegram", "chat", "1", "message",
+        json.dumps({"version": 1, "authorized": True, "sender": "1"}).encode(), b"changed", owner.id, epoch)
+    assert not fresh and duplicate == pending[0]

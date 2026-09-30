@@ -63,6 +63,7 @@ class OwnedRouting:
         self._task: asyncio.Task | None = None
         self._last_warning = 0.0
         self._last_probe: dict[str, float] = {}
+        self._last_prune = float("-inf")
 
     def bind(self, runner):
         self.generation.runner = runner
@@ -119,7 +120,9 @@ class OwnedRouting:
             return False  # Synthetic prompts have no transport ID for deduplication.
         home = self._home(event.source)
         payload = lambda: json.dumps({"event": _event_payload(event)}, ensure_ascii=False).encode()
+        journal = getattr(adapter, "_controlled_journal", None)
         envelope = json.dumps({"version": 1, "authorized": True,
+                               "token_hash": journal.token_hash if journal is not None else None,
                                "sender": event.source.user_id, "chat": event.source.chat_id,
                                "thread": event.source.thread_id,
                                "is_bot": bool(getattr(event.source, "is_bot", False)),
@@ -146,7 +149,9 @@ class OwnedRouting:
             await update.callback_query.answer(text="This action is unavailable.")
             return True
         home = self._home(source)
+        journal = getattr(adapter, "_controlled_journal", None)
         envelope = json.dumps({"version": 1, "authorized": True,
+                               "token_hash": journal.token_hash if journal is not None else None,
                                "sender": source.user_id, "chat": source.chat_id,
                                "thread": source.thread_id, "profile": identity.runtime_profile,
                                "transport_profile": identity.transport_profile,
@@ -274,4 +279,7 @@ class OwnedRouting:
                     if not count:
                         await asyncio.to_thread(store.transfer_session, claim["profile_home"], claim["transport"], key,
                                                  owner, claim["epoch"], lease["generation_id"], lease["epoch"])
+        if now - self._last_prune >= 60:
+            await asyncio.to_thread(store.prune_settled_inbox, owner, self._live_keys())
+            self._last_prune = now
         return bool(rows or foreign)

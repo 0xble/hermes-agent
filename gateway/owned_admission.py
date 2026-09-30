@@ -6,6 +6,7 @@ and canonicalize before enqueueing, and the owner must re-authorize before use.
 from __future__ import annotations
 
 import json
+import time
 from contextlib import closing
 from typing import Callable
 
@@ -184,11 +185,44 @@ class OwnedAdmissionMixin:
                        (seq, home, transport, key))
             cursor = db.execute(
                 "INSERT INTO inbox(profile_home,transport,session_key,source_event_id,kind,seq,owner_id,"
-                "owner_epoch,authorized_source,payload,state) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "owner_epoch,authorized_source,payload,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (home, transport, key, event_id, kind, seq, owner, epoch, source, payload,
-                 "accepted" if local_placeholder else "pending"),
+                 "accepted" if local_placeholder else "pending", time.time()),
             )
             return dict(db.execute("SELECT * FROM inbox WHERE id=?", (cursor.lastrowid,)).fetchone()), True
+
+    def prune_settled_inbox(self, owner: str, live_keys: set[str]) -> int:
+        """Retain seven days of settled evidence, never a transport replay obligation.
+
+        Seven days matches generation/transfer history and exceeds the wire
+        journal's 24-hour settled-evidence retention. The native poller's claim gate remains
+        authoritative after cleanup. Live buffers and received/processing wire
+        rows retain their receipts. Unattributed legacy rows stay put rather
+        than guessing which token owns them. A 1,000-row batch each minute
+        bounds write-lock work without putting database I/O on the event loop.
+        """
+        with self._transaction() as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('telegram_updates','polling_cursors')")}
+            if tables != {"telegram_updates", "polling_cursors"}:
+                return 0
+            return db.execute(
+                "DELETE FROM inbox WHERE id IN (SELECT i.id FROM inbox i "
+                "JOIN sessions s USING(profile_home,transport,session_key) "
+                "JOIN generations g ON g.id=i.owner_id "
+                "WHERE i.state IN ('accepted','refused','interrupted') AND i.created_at>0 AND i.created_at<? "
+                "AND (i.owner_id=? OR g.state IN ('exited','failed')) AND s.outstanding_work=0 "
+                "AND i.session_key NOT IN (SELECT value FROM json_each(?)) "
+                "AND i.transport='telegram' AND i.source_event_id!='' AND i.source_event_id NOT GLOB '*[^0-9]*' "
+                "AND EXISTS (SELECT 1 FROM polling_cursors c WHERE c.token_hash="
+                "json_extract(CAST(i.authorized_source AS TEXT),'$.token_hash')) "
+                "AND NOT EXISTS (SELECT 1 FROM telegram_updates u WHERE u.token_hash="
+                "json_extract(CAST(i.authorized_source AS TEXT),'$.token_hash') "
+                "AND u.update_id=CAST(i.source_event_id AS INTEGER) AND u.state IN ('received','processing')) "
+                "ORDER BY i.created_at,i.id LIMIT 1000)",
+                (time.time() - 7 * 86400, owner, json.dumps(sorted(live_keys))),
+            ).rowcount
 
     def pending(self, owner: str, home: str, transport: str, key: str) -> list[dict]:
         with self._transaction() as db:
