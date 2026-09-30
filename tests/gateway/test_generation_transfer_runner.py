@@ -78,6 +78,59 @@ async def test_split_text_batch_buffered_at_handover_flushes_on_old_owner(tmp_pa
         await asyncio.gather(active._drain_task, return_exceptions=True)
 
 
+@pytest.mark.parametrize("buffer_name, flush_name, text", [
+    ("_pending_photo_batches", "_flush_photo_batch_now", "photo"),
+    ("_media_group_events", "_flush_media_group_now", "album"),
+])
+@pytest.mark.asyncio
+async def test_media_buffered_at_handover_flushes_on_old_owner(tmp_path, buffer_name, flush_name, text):
+    from gateway.config import Platform
+    from gateway.owned_routing import OwnedRouting
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    adapter.platform = Platform.TELEGRAM
+    key = "agent:default:telegram:chat-1"
+    event = MessageEvent(text=text, source=SessionSource(platform=Platform.TELEGRAM, chat_id="1"))
+    setattr(adapter, buffer_name, {key: event})
+    adapter._pending_text_batches = {}
+    adapter._pending_messages = {}
+    adapter._active_sessions = {}
+    handled = []
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from types import MethodType
+    task_name = "_pending_photo_batch_tasks" if buffer_name == "_pending_photo_batches" else "_media_group_tasks"
+    setattr(adapter, task_name, {})
+    setattr(adapter, flush_name, MethodType(getattr(TelegramAdapter, flush_name), adapter))
+    async def handle(buffered):
+        assert db.leases()[0]["generation_id"] == old.id
+        handled.append((old.id, buffered.text))
+        adapter._active_sessions[key] = buffered
+    adapter.handle_message = handle
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False, _pending_approvals={})
+    active.runner = runner
+    active.owned_routing = OwnedRouting(active)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    try:
+        assert handled == [(old.id, text)]
+        assert getattr(adapter, buffer_name) == {}
+        db.commit_transfer(old.id, new.id, epoch)
+        await getattr(adapter, flush_name)(key)
+        assert handled == [(old.id, text)]
+    finally:
+        assert active._drain_task is not None
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_old_runner_retains_work_after_polling_stops(tmp_path):
     db = GenerationCoordinator(tmp_path)

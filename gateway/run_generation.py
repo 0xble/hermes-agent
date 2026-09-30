@@ -381,6 +381,10 @@ class ActiveGeneration:
                 for adapter in roster.values():
                     for key in tuple(getattr(adapter, "_pending_text_batches", {})):
                         await adapter._flush_text_batch_now(key)
+                    for key in tuple(getattr(adapter, "_pending_photo_batches", {})):
+                        await adapter._flush_photo_batch_now(key)
+                    for key in tuple(getattr(adapter, "_media_group_events", {})):
+                        await adapter._flush_media_group_now(key)
                 # Freeze A's live session obligations before the lease can move.
                 if self.owned_routing is not None:
                     self.owned_routing.claim_live()

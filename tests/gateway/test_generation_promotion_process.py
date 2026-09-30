@@ -44,6 +44,20 @@ def _worker(standby: bool):
             await asyncio.Event().wait()
             return {}
         ActiveGeneration.transfer_requested = paused_transfer
+    if not standby and os.environ.get("TEST_BUFFER_PHOTO"):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+        from gateway.platforms.event import MessageEvent, MessageType
+        original_stop = TelegramAdapter.stop_polling_for_transfer
+        async def stop_with_photo(self):
+            receipt = await original_stop(self)
+            source = self.build_source(chat_id="1", chat_type="dm", user_id="1")
+            self._canonicalize(source)
+            event = MessageEvent(text="/status", source=source, message_type=MessageType.PHOTO,
+                                 platform_update_id=1099)
+            self._enqueue_photo_event(self._photo_batch_key(event, SimpleNamespace(media_group_id=None)), event)
+            return receipt
+        from types import SimpleNamespace
+        TelegramAdapter.stop_polling_for_transfer = stop_with_photo
     print(f"WORKER:{'B' if standby else 'A'}", flush=True)
     success = asyncio.run(start_gateway(load_gateway_config(), standby=standby,
                                         force=bool(os.environ.get("TEST_THIRD_FORCE"))))
@@ -94,7 +108,8 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
     env = {**{key: value for key, value in os.environ.items() if not key.startswith("HERMES_")},
            "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
-           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1"}
+           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1",
+           "TEST_BUFFER_PHOTO": "1"}
     processes = []
     stderr_paths = []
     worker_path = tmp_path / "gateway" / "run.py"
@@ -176,6 +191,9 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             raise AssertionError(f"handover failed: {exc!r}; B status={status}; "
                                  f"B exit={processes[1].poll()}; B stderr={stderr_paths[1].read_text()[-8000:]}") from exc
         assert result > 1
+        with db.connect() as conn:
+            photo_rows = conn.execute("SELECT owner_id,state FROM inbox WHERE source_event_id='1099'").fetchall()
+        assert [(row["owner_id"], row["state"]) for row in photo_rows] == [(old["id"], "accepted")]
         assert processes[0].poll() is None, "A exited before its turn completed"
         for update_id, command_text in ((1002, "/status"), (1003, "/queue")):
             api.add(update_id, update_id, text=command_text)
