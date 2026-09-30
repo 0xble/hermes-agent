@@ -559,3 +559,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   trailer, while retaining a legacy fallback for old logs.
 - Guard: `tests/hermes_cli/test_kanban_worker_exit_trailer.py`
   (`test_logged_exit_code_matches_worker_pid_across_appended_retries`).
+
+## GPT-6.1 Sol support on the Codex route
+
+- Fork patch identity: `gpt-61-sol-support`.
+- The maintained runtime did not recognize `gpt-6.1-sol`, so model metadata fell back to 256K and triggered compaction at 192K on the Codex route. The support correction registers the direct 1.05M context, the 272K Codex context, the model's reasoning and pricing metadata, and the static catalogs. It preserves the later Portal catalog behavior and does not claim an unverified 900K Codex variant.
+- Guard: `tests/hermes_cli/test_gpt6_tiers_registration.py` (`test_gpt61_sol_takes_astra_ladder_without_astra_gating`, `test_openrouter_omits_disable_the_openai_ladder_rejects`, `test_gpt61_sol_resolves_context_and_pricing_like_its_tier`).
