@@ -315,6 +315,7 @@ class ActiveGeneration:
         self._transfer_lock = asyncio.Lock()
         self._drain_task: asyncio.Task | None = None
         self._drain_stopping = False
+        self.owned_routing = None
         self._drain_stopped = False
         self._missing_deadline_warned = False
         self._local_drain_deadline: float | None = None
@@ -327,6 +328,10 @@ class ActiveGeneration:
         self.runner = runner
         self.cron_stop = cron_stop
         self.cron_provider = cron_provider
+        from gateway.owned_routing import OwnedRouting
+        self.owned_routing = OwnedRouting(self)
+        self.owned_routing.bind(runner)
+        self.owned_routing._task = asyncio.create_task(self.owned_routing.drain())
 
     def _telegram_adapters(self) -> dict[str, object]:
         adapters = getattr(self.runner, "adapters", {}) or {}
@@ -358,6 +363,11 @@ class ActiveGeneration:
             roster = self._telegram_adapters()
             if {row["token_hash"] for row in transfer} != set(roster):
                 raise RuntimeError("frozen token roster differs from live adapters")
+            # Invalid obligations must not pause a healthy polling/cron owner.
+            # claim_live validates again after flushing newly materialized work;
+            # that late failure uses the existing abort-and-rearm path.
+            if self.owned_routing is not None:
+                self.owned_routing.validate_live()
             stopped = []
             nonce = await asyncio.to_thread(self.coordinator.transfer_attempt_nonce,
                                             self.identity.id, self.epoch)
@@ -371,9 +381,21 @@ class ActiveGeneration:
                     await asyncio.to_thread(self.coordinator.record_poller_stopped,
                                             self.identity.id, self.epoch, token, receipt["safe_offset"],
                                             attempt_nonce=nonce)
+                # No more wire updates can extend a split text batch. Dispatch it
+                # while A still owns the lease, before the successor can receive it.
+                for adapter in roster.values():
+                    for key in tuple(getattr(adapter, "_pending_text_batches", {})):
+                        await adapter._flush_text_batch_now(key)
+                    for key in tuple(getattr(adapter, "_pending_photo_batches", {})):
+                        await adapter._flush_photo_batch_now(key)
+                    for key in tuple(getattr(adapter, "_media_group_events", {})):
+                        await adapter._flush_media_group_now(key)
+                # Freeze A's live session obligations before the lease can move.
+                if self.owned_routing is not None:
+                    self.owned_routing.claim_live()
                 # Keep the shared housekeeping/cron stop event alive. The built-in
-                # ticker's dispatch gate observes _overlap_draining; external
-                # providers are explicitly stopped and re-armed on abort.
+                # ticker observes the overlap dispatch gate; external providers
+                # are explicitly stopped and re-armed on abort.
                 if self.cron_provider is not None:
                     from cron.scheduler_provider import InProcessCronScheduler
                     if not isinstance(self.cron_provider, InProcessCronScheduler):
@@ -476,15 +498,19 @@ class ActiveGeneration:
         if record is None or record["state"] != "draining":
             return False
         from tools.process_registry import process_registry
-        busy = (self.runner._active_work_count() or
-                bool(self.runner._pending_approvals) or
-                process_registry.has_any_active() or process_registry.pending_watchers)
-        def has_queued_inbox() -> bool:
-            with contextlib.closing(self.coordinator.connect()) as conn:
-                return conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
-                                    (self.identity.id,)).fetchone() is not None
+        # A claim covers only its session. A process from an ended cron turn can
+        # have a key but no claim; stopping this owner would kill it before notice.
+        busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals))
 
-        queued = await asyncio.to_thread(has_queued_inbox)
+        def read_pending_work():
+            with contextlib.closing(self.coordinator.connect()) as conn:
+                queued = conn.execute("SELECT 1 FROM inbox WHERE owner_id=? AND state='pending' LIMIT 1",
+                                      (self.identity.id,)).fetchone()
+                claims = conn.execute("SELECT 1 FROM sessions WHERE generation_id=? LIMIT 1",
+                                      (self.identity.id,)).fetchone()
+                return queued, claims
+
+        queued, claims = await asyncio.to_thread(read_pending_work)
         deadline = record["drain_deadline"]
         if deadline is None:
             if self._local_drain_deadline is None:
@@ -493,13 +519,14 @@ class ActiveGeneration:
             if not self._missing_deadline_warned:
                 logger.warning("generation missing drain deadline; using local drain cap")
                 self._missing_deadline_warned = True
-        if (busy or queued) and time.time() < deadline:
+        if (busy or queued or claims or process_registry.has_any_active()
+                or process_registry.pending_watchers) and time.time() < deadline:
             return False
         if self._drain_stopping:
             return self._drain_stopped
         self._drain_stopping = True
         try:
-            if busy or queued:
+            if busy or queued or claims:
                 await asyncio.to_thread(self.coordinator.fence_draining_generation, self.identity.id)
                 # The normal shutdown path marks live turns resume_pending. The cap
                 # is different: interrupted side effects must not auto-run again.
@@ -646,6 +673,10 @@ class ActiveGeneration:
                     last_warning = now
 
     async def close(self) -> None:
+        if self.owned_routing is not None and self.owned_routing._task is not None:
+            self.owned_routing._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.owned_routing._task
         if self.task:
             self.task.cancel()
             with suppress(asyncio.CancelledError):
@@ -665,6 +696,7 @@ class ActiveGeneration:
         await asyncio.to_thread(
             self.coordinator.release_lease, "active_generation", self.identity.id, self.epoch)
         await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id, state="exited")
+        await asyncio.to_thread(self.coordinator.release_exited_owner, self.identity.id)
         await asyncio.to_thread(remove_generation_files, self.home, self.identity)
         runtime_path = self.home / f"gateway_runtime.{self.identity.id}.json"
         from gateway.status import read_runtime_status

@@ -311,6 +311,7 @@ class ControlledPoller:
                 # long poll. Only a complete response (or a finished request error)
                 # proves the old request cannot overlap the successor.
                 await asyncio.wait_for(asyncio.shield(self._task), timeout=self.timeout + 1)
+                await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout + 1)
             except asyncio.TimeoutError:
                 return {"stopped": False, "error": "PollDrainTimeout"}
             except asyncio.CancelledError:
