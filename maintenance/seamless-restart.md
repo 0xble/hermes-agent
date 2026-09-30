@@ -42,6 +42,66 @@ Likely surfaces: `cron/executions.py`, `cron/scheduler.py`, `cron/delivery_queue
 
 **Status: design only, not enabled.** S1–S3, S4.1 and G1 remain shipped; the router/executor extraction is abandoned. The 2026-09-26 03:47 to 2026-09-28 10:55 baseline supplied for this redesign counted 31 gateway stops, 30 with work in flight, and 149 turns, 18 cron runs and 104 background delegations cut, followed by 211 recovery resumes across 55 sessions. Treat these as observational counts, not proof each stop caused every cut. The replacement is two *complete* release-pinned gateways, A and B. A keeps its agent cache, active turns, pending approvals, async delegations, tool processes, adapter send/edit capability and background watchers until its own work ends. B takes new admission and the sole Telegram polling lease. Neither a two-hour cap nor the outbox can promise unconditional exactly-once Telegram delivery after a transport-success/receipt crash. The overlap is feasible **conditionally**, not yet proven end to end: current singleton PID/control/status paths, PTB's offset handling and the updater/guardian must change behind a default-off flag. A bare second `gateway run` cannot satisfy this design.
 
+### Forward-Only Amendment (2026-09-30)
+
+This amendment supersedes any text below that restores polling or admission to a generation after its lease moved. That includes the "restore A's polling/dispatch" rollback in the crash outcomes, the SIGKILL-of-B rollback to a healthy A, and the slice 4 proof that "a failed B health probe restores A".
+
+**Why.** The rollback that re-armed draining A in place failed the native launchd acceptance test on 2026-09-30 in both the reviewer's and the parent's runs (`test_launchd_guardian_rolls_back_keepalive_successor_failure`). The guardian recorded `rolled_back`, the lease returned to A with a new epoch, exactly one poller ran, and A durably accepted fresh update 4002. A never replied. Six consecutive review rounds on #266 found defects on that path: nonce binding, a dead successor stuck in `draining`, legacy fleet reloads after promotion, unflagged restore failures, a lost drain deadline, and the final dispatch gap. Each fix added state to a process that had already begun to wind down: stopped pollers, the draining flag, drain tasks, transfer receipts and session claims. The amendment removes that path rather than repairing it again.
+
+**Rule.** A generation that has started draining never serves again.
+
+States, per generation, are forward only:
+
+1. `standby`: process up, no poller, no admission, no cron or kanban dispatch.
+2. `serving`: holds the `active_generation` lease, polls Telegram, admits new work.
+3. `draining`: lease gone. Finishes its own turns, approvals, delegations, watchers and outbox rows through its own Bot API client. Admits nothing new.
+4. `exited`: process gone after its last obligation, or at the two-hour cap.
+
+`failed` remains a coordinator verdict on a dead or refused generation, not a fifth runtime state. A generation in `standby` that never serves goes straight to `exited`.
+
+The lease moves in exactly two ways:
+
+1. **Handover.** A serving generation stops its poller, acknowledges `poller_stopped(token, epoch, cursor)` and commits the lease to a ready standby. The old generation becomes `draining` in the same transaction.
+2. **Takeover.** A ready standby takes the lease from a generation that is proven dead: PID plus start fingerprint absent, and launchd reports the label not running. Heartbeat age alone never proves death.
+
+The one allowed resume is before commit. A serving generation that paused `getUpdates` for a handover that never committed resumes polling. It never set `draining`, never lost the lease and never stopped admission, so it still owns every piece of runtime state. This is the existing 45-second pre-commit abort. It gets its own native test.
+
+**Rollback is a handover.** Rolling back means starting a fresh standby on the previous release, which then takes the lease by handover (unhealthy but live successor) or takeover (dead successor). The draining generation, if any, keeps draining and exits on its own schedule. Three generations can therefore coexist briefly: the original draining A, the failed B (draining or dead), and the fresh A′ on A's release. `previous → current` changes only after A′ acknowledges from its release. Never re-arm the draining A.
+
+**Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<id8>`, where `<id8>` is the first eight hex digits of its generation UUID. The label pins its release path and is booted out only after the coordinator records `exited` for that generation. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
+
+**Startup gate.** Before a standby may be named ready, it runs one loopback turn. A synthetic message enters the real admission path on a loopback transport, goes through both busy guards and the runner, and produces a reply row in the outbox with a loopback destination. Nothing goes to Telegram. The turn uses the configured model with a fixed short prompt, which costs one small model call per update. A standby that fails the gate or exceeds its 45-second deadline is marked `failed`, gets booted out, and never takes the poller. This check would have caught the 2026-09-30 failure class: a gateway that polls and accepts input but never reaches the runner.
+
+**Crash outcomes under the amendment.**
+
+- **Updater dies before commit.** The serving generation's pre-commit deadline resumes its poller. The standby stays unready until booted out by the next update or the guardian.
+- **Updater dies after commit.** The new generation serves. The updater is observer-only on recovery, and the receipt is completed from the coordinator.
+- **New generation fails its startup gate.** It never polls. The old generation keeps serving and is never paused.
+- **New generation dies after takeover or handover.** The guardian or updater starts A′ on the previous release, which passes its startup gate and takes the lease from the dead generation. The target is a fresh message answered within 60 seconds of death. Work in the dead generation is marked interrupted once and never replayed.
+- **New generation is live but unhealthy after commit.** A′ is started and takes the lease by handover. The unhealthy generation drains or hits its cap.
+- **Old draining generation is SIGKILLed.** Its in-process work is marked interrupted once after death proof. The serving generation is unaffected.
+- **Guardian dies.** The next scheduled run recomputes from the coordinator. No action depends on the guardian's in-memory state.
+
+If A′ cannot start and pass its gate within 60 seconds on the live profile, stop and decide between a longer rollback bound and a warm standby. A warm standby is a pre-started `standby` generation on the previous release. It fits the four states but costs a resident process.
+
+**What this removes.** `restore_after_rollback`, the rollback re-arm and drain-fence serialization, `restore_successor_after_failed_rollback`, the `rollback_overlap` branches that return the lease to a prior generation, and the rollback-attention branches that exist only for those paths. The generation isolation, polling journal and cursor, owned admission and routing, drain, cap, fleet fences and guardian observation from #239, #243, #258, #261, #265 and #266 stay.
+
+**Simplicity limit.** At most four runtime states and two lease moves. Adding either requires an amendment here first.
+
+**Acceptance.** One native launchd suite in a disposable profile, run on the exact PR commit, passes three consecutive runs. It covers:
+
+- an in-flight turn, a delegation and an approval each finishing exactly once on the old generation;
+- a queued follow-up running;
+- one poller at every sampled instant;
+- the new release answering a fresh message;
+- the old generation exiting after its last work;
+- a release failing its startup gate never polling;
+- a release dying after commit, with A′ answering a fresh message within 60 seconds;
+- a pre-commit abort resuming the serving poller;
+- SIGKILL of the old generation, the new generation and the updater.
+
+A green hosted gate does not substitute for this suite, because hosted CI cannot run launchd.
+
 ### Authority And States
 
 Use a per-install coordinator under the launch home, with per-profile keys for multiplexed sessions and token-scoped polling. The immutable `generation_id` is a UUID plus process PID, start fingerprint, pinned release SHA, launchd label and boot ID. A process cannot claim merely by naming a release. `active_generation` is a monotonically increasing epoch, not a bare PID or `current` symlink. An updater transaction lock serializes promotion, rollback, guardian repair and cap handling. SQLite uses WAL, `busy_timeout=5000`, foreign keys, `BEGIN IMMEDIATE` compare-and-swap transitions, and durable commit before any acceptance or polling offset acknowledgement. The updater owns `preparing → ready → transfer_requested → active` or `aborted`; the old process owns `serving → quiescing → draining → exited` after the corresponding epoch changes; the new process owns `standby → ready → serving`, then `draining` on a later promotion. A watchdog can set `failed` only after proving process death by PID **and** start fingerprint, or a witnessed clean exit. Heartbeat expiry alone makes the state `suspect` and blocks transfer, not `dead` or free to steal.
@@ -220,3 +280,5 @@ S3 landed before S2 (its code-SHA ledger column works without releases). S2 is *
 ## Overlap Design Decision
 
 The earlier S4.2 router/executor split remains stopped: draft PRs [#215](https://github.com/0xble/hermes-agent/pull/215) and [#224](https://github.com/0xble/hermes-agent/pull/224) did not establish the seven native end-to-end proofs. Brian's decision to stop that split is unchanged. The [Overlap Handover](#overlap-handover) instead designs two native gateways with no streaming router/executor IPC; it has not passed a native prototype, and S1–S3/S4.1/G1 remain the shipped fallback. On a failed poller/offset, shared-state or rollback acceptance test, retain the drain-first route rather than enabling a partial handover.
+
+On 2026-09-30 the in-place rollback path failed native acceptance, as described in the [Forward-Only Amendment](#forward-only-amendment-2026-09-30). Rollback now starts a fresh generation on the previous release instead of re-arming a draining one. Handover code must follow the amendment. Code that restores a draining generation does not merge.
