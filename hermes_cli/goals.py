@@ -42,10 +42,6 @@ def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> in
     return parsed if parsed >= 0 else int(default)
 
 
-# Private compatibility alias for in-tree callers; plugins use the public helper above.
-_goal_max_turns = normalize_goal_max_turns
-
-
 def _goal_budget_label(turns_used: int, max_turns: int) -> str:
     return f"{turns_used}/∞" if max_turns == 0 else f"{turns_used}/{max_turns}"
 
@@ -609,7 +605,7 @@ class GoalState:
             goal=data.get("goal", ""),
             mutation_id=str(data.get("mutation_id") or ""),
             status=data.get("status", "active"),
-            max_turns=_goal_max_turns(data.get("max_turns", DEFAULT_MAX_TURNS)),
+            max_turns=normalize_goal_max_turns(data.get("max_turns", DEFAULT_MAX_TURNS)),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
@@ -1784,7 +1780,7 @@ class GoalManager:
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
-        self.default_max_turns = _goal_max_turns(default_max_turns)
+        self.default_max_turns = normalize_goal_max_turns(default_max_turns)
         self._state: Optional[GoalState] = load_goal(session_id)
 
     # --- introspection ------------------------------------------------
@@ -1865,7 +1861,7 @@ class GoalManager:
             raise ValueError("goal text is empty")
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
-            max_turns=self.default_max_turns if max_turns is None else _goal_max_turns(max_turns),
+            max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
         )
         return self._save()
@@ -2535,7 +2531,9 @@ def run_kanban_goal_loop(
     def _result(outcome: str, reason: str) -> Dict[str, Any]:
         return {"outcome": outcome, "turns_used": turns_used, "reason": reason}
 
-    max_turns = _goal_max_turns(max_turns)
+    max_turns = int(max_turns or DEFAULT_MAX_TURNS)
+    if max_turns < 1:
+        max_turns = DEFAULT_MAX_TURNS
 
     last_response = first_response or ""
     turns_used = 1   # the first turn already consumed one unit of budget
@@ -2569,7 +2567,7 @@ def run_kanban_goal_loop(
                 reset_affinity_scope(affinity_token)
         if verdict == "wait":
             verdict = "continue"
-        _log(f"kanban goal loop: turn {_goal_budget_label(turns_used, max_turns)} verdict={verdict} reason={_truncate(reason, 120)}")
+        _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "blocked":
             # Unachievable is NOT done: block the card with the judge's reason now instead of
@@ -2594,11 +2592,11 @@ def run_kanban_goal_loop(
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
 
         # Budget check BEFORE spending another turn.
-        if max_turns > 0 and turns_used >= max_turns:
-            _log(f"kanban goal loop: task {task_id} exhausted {_goal_budget_label(turns_used, max_turns)} turns; blocking")
+        if turns_used >= max_turns:
+            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
             _block(
                 f"Goal-mode worker exhausted its turn budget "
-                f"({_goal_budget_label(turns_used, max_turns)}) without completing the task. "
+                f"({turns_used}/{max_turns}) without completing the task. "
                 f"Last judge verdict: {_truncate(reason, 300)}"
             )
             return _result("blocked_budget", "turn budget exhausted")
@@ -2618,5 +2616,5 @@ __all__ = [
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
     "DRAFT_CONTRACT_SYSTEM_PROMPT", "KANBAN_GOAL_CONTINUATION_TEMPLATE", "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS", "load_goal", "save_goal", "clear_goal", "migrate_goal_to_session", "judge_goal",
-    "run_kanban_goal_loop",
+    "run_kanban_goal_loop", "normalize_goal_max_turns",
 ]

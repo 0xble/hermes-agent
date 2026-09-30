@@ -31,11 +31,7 @@ class PortableGateTests(unittest.TestCase):
                for p in _discover_files([ci.ROOT / 'tests/e2e'])
                if not p.is_relative_to(ci.ROOT / ci.NIGHTLY_ONLY_E2E[0])
                and p != ci.ROOT / ci.NIGHTLY_ONLY_E2E[1]}
-        candidate_extensions = {
-            p.relative_to(ci.ROOT).as_posix()
-            for p in (ci.ROOT / 'candidate-extensions').rglob('test_*.py')
-        }
-        expected = ordinary | e2e | candidate_extensions
+        expected = ordinary | e2e
         buckets = ci.shard_files(ci.ROOT, 10)
         self.assertEqual(set().union(*(set(bucket) for bucket in buckets)), expected)
         self.assertEqual(sum(map(len, buckets)), len(expected))

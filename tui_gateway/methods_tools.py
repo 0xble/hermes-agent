@@ -797,7 +797,7 @@ def _cmd_goal(rid, params, session, name, arg):
             return err
         try:
             value = (_load_cfg().get("goals") or {}).get("max_turns", 20)
-            max_turns = int(value) if int(value) >= 0 else 20
+            max_turns = goals.normalize_goal_max_turns(value)
         except Exception:
             max_turns = 20
         mgr = goals.GoalManager(session_id=sid_key, default_max_turns=max_turns)
