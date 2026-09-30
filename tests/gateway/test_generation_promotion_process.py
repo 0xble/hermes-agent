@@ -420,7 +420,8 @@ async def test_split_text_batch_flushed_by_old_process_during_promotion(tmp_path
     env = {**{key: value for key, value in os.environ.items() if not key.startswith("HERMES_")},
            "HERMES_HOME": str(home), "PYTHONPATH": str(Path.cwd()),
            "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
-           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1"}
+           "OPENAI_API_KEY": "local-test-key", "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": "1",
+           "HERMES_RELEASE_SHA": "a" * 40}
     worker_path = tmp_path / "gateway" / "run.py"
     worker_path.parent.mkdir()
     worker_path.symlink_to(Path(__file__).resolve())
