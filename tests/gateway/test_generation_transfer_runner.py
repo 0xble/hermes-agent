@@ -108,7 +108,9 @@ async def test_media_buffered_at_handover_flushes_on_old_owner(tmp_path, buffer_
     from types import MethodType
     task_name = "_pending_photo_batch_tasks" if buffer_name == "_pending_photo_batches" else "_media_group_tasks"
     setattr(adapter, task_name, {})
-    setattr(adapter, flush_name, MethodType(getattr(TelegramAdapter, flush_name), adapter))
+    flush = getattr(TelegramAdapter, flush_name, None)
+    if flush is not None:
+        setattr(adapter, flush_name, MethodType(flush, adapter))
     async def handle(buffered):
         assert db.leases()[0]["generation_id"] == old.id
         handled.append((old.id, buffered.text))

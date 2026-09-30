@@ -45,19 +45,22 @@ def _worker(standby: bool):
             return {}
         ActiveGeneration.transfer_requested = paused_transfer
     if not standby and os.environ.get("TEST_BUFFER_PHOTO"):
-        from plugins.platforms.telegram.adapter import TelegramAdapter
+        from gateway.run_generation import ActiveGeneration
         from gateway.platforms.event import MessageEvent, MessageType
-        original_stop = TelegramAdapter.stop_polling_for_transfer
-        async def stop_with_photo(self):
-            receipt = await original_stop(self)
-            source = self.build_source(chat_id="1", chat_type="dm", user_id="1")
-            self._canonicalize(source)
-            event = MessageEvent(text="/status", source=source, message_type=MessageType.PHOTO,
-                                 platform_update_id=1099)
-            self._enqueue_photo_event(self._photo_batch_key(event, SimpleNamespace(media_group_id=None)), event)
-            return receipt
+        original_transfer = ActiveGeneration.transfer_requested
+        async def transfer_with_photo(self, new_id):
+            for adapter in self._telegram_adapters().values():
+                adapter._media_batch_delay_seconds = 120
+                source = adapter.build_source(chat_id="1", chat_type="dm", user_id="1")
+                adapter._canonicalize(source)
+                event = MessageEvent(text="/status", source=source, message_type=MessageType.PHOTO,
+                                     platform_update_id=1099)
+                batch_key = adapter._photo_batch_key(event, SimpleNamespace(media_group_id=None))
+                adapter._pending_photo_batches[batch_key] = event
+                adapter._pending_photo_batch_tasks[batch_key] = asyncio.create_task(adapter._flush_photo_batch(batch_key))
+            return await original_transfer(self, new_id)
         from types import SimpleNamespace
-        TelegramAdapter.stop_polling_for_transfer = stop_with_photo
+        ActiveGeneration.transfer_requested = transfer_with_photo
     print(f"WORKER:{'B' if standby else 'A'}", flush=True)
     success = asyncio.run(start_gateway(load_gateway_config(), standby=standby,
                                         force=bool(os.environ.get("TEST_THIRD_FORCE"))))
