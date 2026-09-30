@@ -3,12 +3,15 @@
 Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
+import argparse
 import asyncio
 import contextlib
+import io
 from hermes_cli.cli_output import line_input  # noqa: F401 — resolved lazily by siblings through the facade
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -17,6 +20,7 @@ import sys
 import textwrap
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from hermes_cli import setup_platforms  # noqa: F401 — resolved lazily by siblings through the facade
 
@@ -629,6 +633,34 @@ def _iter_proc_cmdlines(exclude_pids: set[int]):
         yield pid, cmdline.replace("\x00", " ")
 
 
+@lru_cache(maxsize=1)
+def _gateway_scan_parser() -> argparse.ArgumentParser:
+    """Use the actual gateway parser to classify the run mode, not an argv substring."""
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+    parser = argparse.ArgumentParser(add_help=False)
+    groups = parser.add_subparsers(dest="command")
+    noop = lambda *_: None
+    build_gateway_parser(groups, cmd_gateway=noop, cmd_proxy=noop, cmd_gateway_enroll=noop)
+    return parser
+
+
+def _scan_is_standby(command: str) -> bool:
+    try:
+        tokens = shlex.split(command, posix=False)
+    except ValueError:
+        return False
+    run_index = next((i for i in range(len(tokens) - 1)
+                      if tokens[i:i + 2] == ["gateway", "run"]), None)
+    if run_index is None:
+        return False
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            args, _ = _gateway_scan_parser().parse_known_args(tokens[run_index:])
+        return bool(args.standby)
+    except (SystemExit, ValueError, AttributeError):
+        return False
+
+
 def _scan_gateway_pids(
     exclude_pids: set[int], all_profiles: bool = False, include_restart_managers: bool = False
 ) -> list[int]:
@@ -676,7 +708,7 @@ def _scan_gateway_pids(
         matches_runtime = looks_like_gateway_command_line(command) or (
             include_restart_managers and looks_like_gateway_runtime_command_line(command)
         )
-        if matches_runtime and (all_profiles or _matches_current_profile(command)):
+        if matches_runtime and not _scan_is_standby(command) and (all_profiles or _matches_current_profile(command)):
             _append_unique_pid(pids, pid, exclude_pids)
 
     try:
@@ -4214,13 +4246,15 @@ async def _acknowledge_release_when_running(*, poll_seconds: float = 1.0) -> Non
                 logger.warning("Pending release reload could not be acknowledged", exc_info=True)
 
 
-def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
+def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
+                force: bool = False, standby: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
     _guard_official_docker_root_gateway()
-    _attach_to_host_gateway_or_guard(force=force, replace=replace)
-    _guard_supervised_gateway_conflict(force=force)
-    _guard_existing_gateway_process_conflict(replace=replace)
+    if not standby:
+        _attach_to_host_gateway_or_guard(force=force, replace=replace)
+        _guard_supervised_gateway_conflict(force=force)
+        _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))
     _apply_startup_watchdog_config()
 
@@ -4247,13 +4281,14 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
             pass  # best-effort; don't block gateway startup
 
     from gateway.run import start_gateway
-    print("┌─────────────────────────────────────────────────────────┐")
-    print("│           ☤ Hermes Gateway Starting...                 │")
-    print("├─────────────────────────────────────────────────────────┤")
-    print("│  Messaging platforms + cron scheduler                    │")
-    print("│  Press Ctrl+C to stop                                   │")
-    print("└─────────────────────────────────────────────────────────┘")
-    print()
+    if not standby:
+        print("┌─────────────────────────────────────────────────────────┐")
+        print("│           ☤ Hermes Gateway Starting...                 │")
+        print("├─────────────────────────────────────────────────────────┤")
+        print("│  Messaging platforms + cron scheduler                    │")
+        print("│  Press Ctrl+C to stop                                   │")
+        print("└─────────────────────────────────────────────────────────┘")
+        print()
 
     # Exit 1 if no platform connects so systemd Restart=always retries transient errors.
     verbosity = None if quiet else verbose
@@ -4277,6 +4312,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         _exit_after_graceful_shutdown(code)
 
     async def _run_with_release_ack() -> bool:
+        if standby:
+            return await start_gateway(replace=replace, force=force, verbosity=verbosity, standby=True)
         watcher = asyncio.create_task(_acknowledge_release_when_running())
         try:
             return await start_gateway(replace=replace, force=force, verbosity=verbosity)
@@ -4712,6 +4749,7 @@ def _cmd_run(args):
     run_gateway(
         getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
         replace=getattr(args, "replace", False), force=getattr(args, "force", False),
+        standby=getattr(args, "standby", False),
     )
 
 
@@ -5177,6 +5215,22 @@ def _status_host_kind() -> str:
     return "windows" if is_windows() else "other"
 
 
+def _print_overlap_generations() -> None:
+    from hermes_cli.gateway_generation_status import read_generation_status
+    rows = read_generation_status(get_hermes_home())
+    if not rows:
+        return
+    print("Overlap generations:")
+    for row in rows:
+        lease = ", ".join(row["leases"]) or "none"
+        print(f"  {row['id']} sha={row['release_sha']} label={row['label']} "
+              f"pid={row['pid']} lease={lease} state={row['state']}")
+        if row.get("needs_attention"):
+            print(f"  polling=stopped needs_attention=true pid={row['pid']}")
+        if row["state"] == "draining":
+            print(f"  Old generation draining pid={row['pid']}; gateway stop/--replace targets the active PID first")
+
+
 def _cmd_status(args):
     from hermes_cli.gateway_profile_lifecycle import print_parked_status
     deep = getattr(args, "deep", False)
@@ -5230,6 +5284,7 @@ def _cmd_status(args):
             _print_lines(*_STATUS_STOPPED_HINTS[_status_host_kind()])
 
     _print_duplicate_credential_warnings()
+    _print_overlap_generations()
     _print_other_profiles_gateway_status()
     _print_standalone_by_config()
 

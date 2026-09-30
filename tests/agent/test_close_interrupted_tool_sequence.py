@@ -51,6 +51,21 @@ def test_closing_makes_next_user_message_alternation_safe():
     _assert_no_tool_then_user(follow_on)
 
 
+def test_local_diagnostic_from_early_abort_is_not_persisted_as_assistant_reply():
+    messages = _tool_tail()
+    close_interrupted_tool_sequence(messages, "Operation interrupted: handling API error (timeout).")
+    assert messages[-1]["content"] == (
+        "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
+    )
+    assert messages[-1]["role"] == "assistant"
+
+
+def test_real_partial_response_closes_tool_tail_unchanged():
+    messages = _tool_tail()
+    close_interrupted_tool_sequence(messages, "I finished the edit.")
+    assert messages[-1]["content"] == "I finished the edit."
+
+
 def test_assistant_tail_is_left_untouched():
     messages = [
         {"role": "user", "content": "hi"},

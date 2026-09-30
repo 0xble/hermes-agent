@@ -230,6 +230,8 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
     # providers don't see ``tool → user`` (placeholder: final_response is usually empty).
     if interrupted:
         from agent.message_sanitization import close_interrupted_tool_sequence
+        # Diagnostic filtering lives in the shared closer so early-abort callers
+        # cannot persist a local status as though it were an assistant reply.
         close_interrupted_tool_sequence(messages, final_response)
 
     # Recovery ``break`` sites can return a final_response with no closing assistant

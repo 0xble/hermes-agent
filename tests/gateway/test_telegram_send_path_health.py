@@ -64,19 +64,20 @@ async def test_send_long_flood_fails_closed_without_inline_sleep(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_send_short_flood_still_retries_inline(monkeypatch):
-    """Waits of a few seconds keep the existing inline retry."""
+    """A short RetryAfter is retried only after its deadline has elapsed."""
     adapter = _make_adapter()
     adapter._rich_send_disabled = True
     ok = MagicMock(message_id=7)
-    adapter._bot.send_message = AsyncMock(side_effect=[_FloodError(2.0), ok])
-    sleep = AsyncMock()
+    adapter._bot.send_message = AsyncMock(side_effect=[_FloodError(0.02), ok])
+    real_sleep = asyncio.sleep
+    sleep = AsyncMock(side_effect=real_sleep)
     monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
 
     result = await adapter.send("123", "hello")
 
     assert result.success is True
     assert result.message_id == "7"
-    sleep.assert_awaited_once_with(2.0)
+    sleep.assert_awaited_once_with(0.02)
 
 
 @pytest.mark.asyncio

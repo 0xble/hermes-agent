@@ -46,6 +46,24 @@ def fake_launchctl(monkeypatch, label, *, loaded=False):
     return calls
 
 @pytest.mark.macos_only
+def test_explicit_grace_does_not_load_flag_off_config(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: false\n")
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective",
+                        lambda *args, **kwargs: pytest.fail("flag-off config loaded"))
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    assert guardian.run_once(home, plist, label, grace=12) == "healthy"
+
+
+@pytest.mark.macos_only
+def test_explicit_grace_ignores_unrelated_invalid_config(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("updates: [unclosed\n")
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    assert guardian.run_once(home, plist, label, grace=12) == "healthy"
+
+
+@pytest.mark.macos_only
 @pytest.mark.parametrize("value", ["text", 0, -1, ".nan", ".inf"])
 def test_invalid_grace_writes_alert_receipt(tmp_path, value, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
@@ -54,6 +72,16 @@ def test_invalid_grace_writes_alert_receipt(tmp_path, value, monkeypatch):
     assert guardian.run_once(home, plist, label) == "alert"
     assert any(json.loads(path.read_text())["outcome"] == "alert"
                for path in (home / "logs/guardian").glob("*.json"))
+
+@pytest.mark.macos_only
+def test_invalid_overlap_config_writes_alert_receipt(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
+    (home / "config.yaml").write_text("gateway:\n  overlap_handover: [unclosed\n")
+    assert guardian.run_once(home, plist, label, grace=12) == "alert"
+    assert any(json.loads(path.read_text())["outcome"] == "alert"
+               for path in (home / "logs/guardian").glob("*.json"))
+
 
 @pytest.mark.macos_only
 def test_invalid_yaml_writes_alert_receipt(tmp_path):
@@ -82,6 +110,15 @@ def test_unrelated_invalid_update_key_does_not_block_repair(tmp_path, monkeypatc
     monkeypatch.setattr(guardian, "healthy", lambda *args: True)
     assert guardian.run_once(home, plist, label) == "repaired"
     assert [row[1] for row in calls].count("bootstrap") == 1
+
+
+@pytest.mark.macos_only
+def test_overlap_generation_guardian_is_observe_only(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
+    monkeypatch.setattr(guardian, "_run", lambda *a, **kw: pytest.fail("legacy repair reached"))
+    assert guardian.run_once(home, plist, label) == "waiting"
+    assert guardian.run_once(home, plist, label, grace=1) == "waiting"
 
 
 @pytest.mark.macos_only

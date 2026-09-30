@@ -42,12 +42,17 @@ def _pgid_still_alive(pgid: int) -> bool:
 
 def _process_group_snapshot(pgid: int) -> str:
     """Return a process-table snapshot for diagnostics."""
-    return subprocess.run(
-        ["ps", "-o", "pid,ppid,pgid,stat,cmd", "-g", str(pgid)],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
+    import psutil
+
+    members = []
+    for proc in psutil.process_iter(["pid", "ppid", "status", "cmdline"]):
+        try:
+            if os.getpgid(proc.pid) == pgid:
+                members.append(f"{proc.pid} {proc.info['ppid']} {pgid} "
+                               f"{proc.info['status']} {proc.info['cmdline']}")
+        except (ProcessLookupError, PermissionError, psutil.Error):
+            continue
+    return "\n".join(members)
 
 
 def _wait_for_pgid_exit(pgid: int, timeout: float = 60.0) -> bool:
@@ -241,6 +246,110 @@ def test_exit_cleanup_kills_foreground_command_still_running(monkeypatch):
     finally:
         with contextlib.suppress(Exception):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        env.cleanup()
+
+
+def test_graceful_cleanup_allows_a_later_foreground_command(monkeypatch):
+    """Cleanup can run in-process without permanently refusing later terminal work."""
+    from tools import terminal_tool_lifecycle
+
+    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
+    env = LocalEnvironment(cwd="/tmp")
+    try:
+        terminal_tool_lifecycle.cleanup_all_environments()
+        result = env.execute("printf 'after cleanup'", timeout=10)
+        assert result["returncode"] == 0
+        assert "after cleanup" in result["output"]
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.parametrize("same_thread", [False, True])
+def test_graceful_cleanup_does_not_wait_forever_for_a_spawn(monkeypatch, same_thread):
+    """A stalled spawn, including a signal-like same-thread cleanup, cannot hang teardown."""
+    from tools.environments import base
+
+    env = LocalEnvironment(cwd="/tmp")
+    entered = threading.Event()
+    release = threading.Event()
+    real_run_bash = env._run_bash
+    durations = []
+    results = []
+
+    def cleanup():
+        start = time.monotonic()
+        base.kill_live_foreground_processes()
+        durations.append(time.monotonic() - start)
+
+    def gated(command, **kwargs):
+        if "printf stalled" in command:
+            entered.set()
+            if same_thread:
+                cleanup()
+            else:
+                assert release.wait(10), "test setup: stalled spawn was not released"
+        return real_run_bash(command, **kwargs)
+
+    monkeypatch.setattr(env, "_run_bash", gated)
+    worker = threading.Thread(target=lambda: results.append(env.execute("printf stalled", timeout=20)), daemon=True)
+    try:
+        worker.start()
+        assert entered.wait(10), "test setup: spawn never reached the gate"
+        if not same_thread:
+            cleanup()
+        else:
+            worker.join(2.0)
+        assert len(durations) == 1 and durations[0] < 2.0, durations
+    finally:
+        release.set()
+        worker.join(10)
+        env.cleanup()
+    assert not worker.is_alive() and results[0]["returncode"] == 0, results
+
+
+@pytest.mark.live_system_guard_bypass  # teardown races the worker's final kill of its own child
+def test_graceful_exit_kills_foreground_spawn_before_publication(monkeypatch):
+    """Exit cleanup must not miss a child born before it snapshots the live commands."""
+    from tools import terminal_tool_lifecycle
+
+    monkeypatch.setattr(terminal_tool_lifecycle, "_scratch_paths", lambda: [])
+    env = LocalEnvironment(cwd="/tmp")
+    spawned = threading.Event()
+    release = threading.Event()
+    result = {}
+    real_run_bash = env._run_bash
+    proc_holder = []
+
+    def gated(command, **kwargs):
+        proc = real_run_bash(command, **kwargs)
+        if "sleep 3518" in command:
+            proc_holder.append(proc)
+            spawned.set()
+            assert release.wait(20), "test setup: spawn gate was not released"
+        return proc
+
+    monkeypatch.setattr(env, "_run_bash", gated)
+    worker = threading.Thread(target=lambda: result.update(env.execute("sleep 3518", timeout=600)), daemon=True)
+    cleanup = threading.Thread(target=terminal_tool_lifecycle.cleanup_all_environments, daemon=True)
+    try:
+        worker.start()
+        assert spawned.wait(20), "test setup: foreground command never spawned"
+        pgid = os.getpgid(proc_holder[0].pid)
+        cleanup.start()
+        # Allow cleanup to enter the live-process snapshot before registration.
+        time.sleep(0.2)
+        release.set()
+        cleanup.join(timeout=15)
+        assert not cleanup.is_alive(), "exit cleanup did not complete"
+        assert _wait_for_pgid_exit(pgid, timeout=15), (
+            f"foreground command survived exit cleanup:\n{_process_group_snapshot(pgid)}")
+        worker.join(timeout=15)
+        assert not worker.is_alive() and result.get("returncode") not in (None, 0), result
+    finally:
+        release.set()
+        if proc_holder:
+            with contextlib.suppress(Exception):
+                os.killpg(os.getpgid(proc_holder[0].pid), signal.SIGKILL)
         env.cleanup()
 
 

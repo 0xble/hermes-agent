@@ -144,7 +144,6 @@ class TestBusySessionAuthBypass:
 
         runner, sentinel = _make_runner(authorized_users={"user1"})
         runner._draining = True
-        runner._queue_during_drain_enabled = lambda: True
         adapter = _make_adapter()
         runner.adapters[MagicMock(value="slack")] = adapter
 

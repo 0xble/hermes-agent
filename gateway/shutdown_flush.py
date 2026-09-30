@@ -79,6 +79,15 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         return False
 
 
+def _pending_arrival_ts(value: Any, fallback: int) -> int | float:
+    """Order MessageEvents by arrival; legacy strings use flush time."""
+    from datetime import datetime
+    stamp = getattr(value, "timestamp", None)
+    if isinstance(stamp, datetime):
+        return stamp.timestamp()
+    return fallback
+
+
 def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") -> int:
     """Serialise non-empty ``_pending_messages`` slots (``MessageEvent`` or str); return count."""
     if not pending:
@@ -86,7 +95,8 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
     for session_key, value in list(pending.items()):
         if value is not None:
-            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason, ts=ts)
+            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason,
+                                    ts=_pending_arrival_ts(value, ts), seq=-1)
     if flushed:
         logger.info("Flushed %d pending message(s) to %s (reason=%s)", flushed, flush_dir, reason)
     return flushed
@@ -108,7 +118,7 @@ def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str =
         for seq, value in enumerate(list(events)):
             if value is not None:
                 flushed += _flush_value(flush_dir, "overflow", session_key, value, reason=reason,
-                                        ts=ts, seq=seq)
+                                        ts=_pending_arrival_ts(value, ts), seq=seq)
     if flushed:
         logger.info("Flushed %d queued overflow message(s) to %s (reason=%s)", flushed, flush_dir,
                     reason)
@@ -203,6 +213,13 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None and _json_safe(val):
                 result[attr] = val
+        if getattr(value, "_drain_deferred", False):
+            result["drain_deferred"] = True
+            result["internal"] = bool(getattr(value, "internal", False))
+            result["allow_gateway_control"] = bool(getattr(value, "allow_gateway_control", False))
+            metadata = getattr(value, "metadata", None)
+            if isinstance(metadata, dict) and _json_safe(metadata):
+                result["metadata"] = metadata
         source = getattr(value, "source", None)
         if source is not None:
             for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
@@ -228,20 +245,32 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
     gateways); ``None`` falls back to ``session_db``. ``deferred_followup`` may claim a resolved
     payload as a separate turn before it is appended to history. Returns the number recovered.
     """
-    flush_files = sorted(_get_flush_dir().glob("*.json"))
-    if not flush_files:
+    entries = []
+    for path in _get_flush_dir().glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
+            order = (payload.get("ts", 0), payload.get("session_key", ""),
+                     payload.get("seq", -1), path.name)
+            # A malformed ordering key should not prevent healthy files from replaying.
+            if not isinstance(order[0], (int, float)) or not isinstance(order[1], str) or not isinstance(order[2], int):
+                raise ValueError("invalid pending-message ordering fields")
+            entries.append((order, path, payload))
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Skipping malformed pending message from %s: %s", path, exc)
+    if not entries:
         return 0
+    flush_files = sorted(entries, key=lambda entry: entry[0])
     own_db = session_db is None
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
     recovered = 0
     try:
-        for path in flush_files:
-            # One unparseable payload or rejected append must only skip THIS file: the file is
-            # never unlinked, so aborting the pass would re-poison every later boot.
+        for _order, path, payload in flush_files:
+            # One rejected append must only skip THIS file; its spool is preserved.
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
                 # Agent-history snapshots are for manual operator recovery, not automatic DB
                 # insertion.
                 if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
@@ -249,6 +278,9 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
                 result = _recover_one_payload(session_db, path, payload,
                                               session_resolver=session_resolver,
                                               deferred_followup=deferred_followup)
+                if result is DROP_PENDING:
+                    path.unlink(missing_ok=True)
+                    continue
                 if result:
                     recovered += 1
                     if result is not CLAIMED_FOLLOWUP:
@@ -267,6 +299,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
 
 OTHER_PLATFORM_PENDING = object()  # retained for a different adapter's reconnect, not a failure
 CLAIMED_FOLLOWUP = object()  # queued in memory, disk copy retained until adapter accepts replay
+DROP_PENDING = object()  # obsolete or unsafe drain arrival; delete without transcript append
 
 
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
@@ -288,6 +321,18 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")
+    if data.get("drain_deferred") is True:
+        if time.time() - path.stat().st_mtime > 24 * 60 * 60:
+            logger.warning("Dropping expired drain-deferred message from %s", path)
+            return DROP_PENDING
+        from gateway.platforms.event import MessageEvent
+        from hermes_cli.commands import resolve_command
+        command = MessageEvent(
+            text=text, allow_gateway_control=data.get("allow_gateway_control") is not False,
+        ).get_command()
+        if command and resolve_command(command) is not None:
+            logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
+            return DROP_PENDING
     if not text or not session_key:
         logger.warning("Cannot recover structurally invalid pending message from %s; "
                        "the flush file has been preserved", path)
@@ -313,6 +358,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return False
     if deferred_followup is not None:
         claim = deferred_followup(session_key, session_id, data, path)
+        if claim is DROP_PENDING:
+            return DROP_PENDING
         if claim is OTHER_PLATFORM_PENDING:
             logger.debug("Pending message for %s retained until its platform reconnects", session_key)
             return False

@@ -208,10 +208,30 @@ class TelegramApplication(Application):
             claim.failed = True
         claim.owners -= 1
         if claim.owners:
-            return
-        del self.adapter._inflight_update_ids[claim.key]
-        if claim.accepted or (claim.completed and not claim.failed):
-            _record_receipt(self.adapter, claim.key)
+            return None
+        journal = getattr(self.adapter, "_controlled_journal", None)
+        accepted = claim.accepted or (claim.completed and not claim.failed)
+        if journal is None:
+            del self.adapter._inflight_update_ids[claim.key]
+            if accepted:
+                _record_receipt(self.adapter, claim.key)
+            return None
+
+        async def settle():
+            try:
+                update_id = int(claim.key.rsplit(":", 1)[1])
+                if accepted:
+                    await journal.accept(update_id)
+                    _record_receipt(self.adapter, claim.key)
+                else:
+                    await journal.reopen(update_id)
+            finally:
+                self.adapter._inflight_update_ids.pop(claim.key, None)
+
+        settlement = asyncio.create_task(settle(), name="telegram-journal-settlement")
+        self.adapter._background_tasks.add(settlement)
+        settlement.add_done_callback(self.adapter._background_tasks.discard)
+        return settlement
 
     async def process_error(self, update, error, job=None, coroutine=None):
         claim = self._current_claim.get()
@@ -233,9 +253,12 @@ class TelegramApplication(Application):
         pending = self.adapter._inflight_update_ids
         if key in seen or key in pending:
             return
+        journal = getattr(self.adapter, "_controlled_journal", None)
+        if journal is not None and not await journal.claim(update.update_id):
+            return
         claim = _Claim(key, asyncio.current_task())
-        # Atomic on PTB's event loop: no await between lookup and claim. Dispatch and its
-        # PTB tasks share ownership; completed-history pressure cannot evict active work.
+        # The journal claim awaits SQLite. A second PTB task can race this lookup,
+        # so the durable claim decides ownership before the in-process pending map.
         pending[key] = claim
         token = self._current_claim.set(claim)
         try:
@@ -245,4 +268,6 @@ class TelegramApplication(Application):
             raise
         finally:
             self._current_claim.reset(token)
-            self._release_claim(claim)
+            settlement = self._release_claim(claim)
+            if settlement is not None:
+                await asyncio.shield(settlement)

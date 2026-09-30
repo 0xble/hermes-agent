@@ -706,6 +706,11 @@ class GatewayInboundMixin:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if self._draining and not self._hm_is_registered_command(event):
+            if await self._route_plaintext_approval_while_busy(event, _quick_key):
+                return None
+            self._preserve_drain_event(_quick_key, event)
+            return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
             return _result
@@ -723,15 +728,6 @@ class GatewayInboundMixin:
                 return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
             return None
-        if self._draining:
-            queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
-            if queue_during_drain:
-                self._queue_or_replace_pending_event(_quick_key, event)
-            return (
-                f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                if queue_during_drain
-                else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-            )
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
             self._queue_or_replace_pending_event(_quick_key, event)
@@ -1101,13 +1097,22 @@ class GatewayInboundMixin:
         except Exception as e:
             return f"Quick command error: {e}"
 
+    @staticmethod
+    def _hm_is_registered_command(event: "MessageEvent") -> bool:
+        command = event.get_command()
+        if not command:
+            return False
+        from hermes_cli.commands import resolve_command
+        return resolve_command(command) is not None
+
     async def _hm_dispatch_quick_and_plugin_commands(
         self, event: "MessageEvent", source: SessionSource, command: Optional[str]
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
-        if self._draining:
-            return True, f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now.", command
+        if self._draining and not self._hm_is_registered_command(event):
+            self._preserve_drain_event(self._session_key_for_source(source), event)
+            return True, None, command
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         qcmd = self._hm_quick_commands().get(command) if command else None
@@ -1379,6 +1384,9 @@ class GatewayInboundMixin:
         if getattr(event, "_outbox_duplicate", False):
             # The original response was already acknowledged. Returning it
             # here would send it a second time.
+            return None
+        if self._draining and not self._hm_is_registered_command(event):
+            self._preserve_drain_event(self._session_key_for_source(source), event)
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).

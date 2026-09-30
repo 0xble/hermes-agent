@@ -1575,7 +1575,9 @@ class GatewayTurnMixin:
         # Fix for #18765.
         if not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
-            response = _sanitize_gateway_final_response(source.platform, response)
+            response = _sanitize_gateway_final_response(
+                source.platform, response, interrupted=bool(agent_result.get("interrupted")),
+            )
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
@@ -3744,7 +3746,11 @@ class GatewayTurnMixin:
                 logger.debug("Stream consumer wait before queued message failed: %s", e)
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
-        first_response = _delivery_result.get("final_response", "")
+        from gateway.run import _sanitize_gateway_final_response
+        first_response = _sanitize_gateway_final_response(
+            turn_ctx.source.platform, _delivery_result.get("final_response", ""),
+            interrupted=bool(_delivery_result.get("interrupted") or (result or {}).get("interrupted")),
+        )
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )

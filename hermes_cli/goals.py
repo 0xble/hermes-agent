@@ -38,6 +38,8 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 DEFAULT_JUDGE_MAX_TOKENS = 4096
 # Cap how much of the last response we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
+# A closeout usually ends with its evidence, so the judge also sees the response's tail.
+_JUDGE_RESPONSE_TAIL_CHARS = 3000
 # Consecutive judge *parse* failures (empty / non-JSON) before the loop auto-pauses and points at
 # the goal_judge config. API/transport errors do NOT count — those are tracked separately below.
 # Guards against small models that cannot follow the strict JSON contract burning the whole budget.
@@ -48,7 +50,7 @@ DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 # Consecutive CONTINUE verdicts the judge marks ``disputed`` (the agent asserts the goal is done,
 # the judge disagrees) before the loop pauses for the user. Re-poking an agent that believes it is
 # finished only produces restated claims, so a persistent disagreement needs a human decision.
-DEFAULT_MAX_CONSECUTIVE_DISPUTES = 2
+DEFAULT_MAX_CONSECUTIVE_DISPUTES = 3
 # Evidence ledger: recent tool results recorded while the goal was active, shown to the judge so
 # evidence gathered with tools counts without the agent pasting it into its prose reply.
 _EVIDENCE_MAX_ENTRIES = 8
@@ -58,9 +60,33 @@ _EVIDENCE_CALL_CHARS = 240
 # Bookkeeping and retrieval tools prove nothing about the goal's outcome.
 _EVIDENCE_EXCLUDED_TOOLS = frozenset({
     "skill_view", "skills_list", "skill_manage", "tool_search", "tool_describe", "memory",
-    "session_search", "todo", "todo_list", "clarify",
+    "session_search", "todo", "todo_list", "clarify", "goal_set",
 })
 _EVIDENCE_EXCLUDED_TOOL_PREFIXES = ("hindsight_",)
+# Passed to the SessionDB finders so exclusions apply before their row limits.
+_EVIDENCE_EXCLUSION_KW = {"exclude_tools": tuple(sorted(_EVIDENCE_EXCLUDED_TOOLS)),
+                          "exclude_prefixes": _EVIDENCE_EXCLUDED_TOOL_PREFIXES}
+
+# Cited evidence: quoted identifiers are located in tool results since the goal started.
+# Truncated ids can match by a sufficiently long prefix; commit URLs can match by hash.
+_CITATION_MAX_NEEDLES = 24
+_CITATION_MIN_CHARS = 6
+_CITATION_MAX_CHARS = 200
+_CITATION_CONTEXT_CHARS = 280
+_CITATION_MAX_UNRESOLVED_SHOWN = 10
+_CITATION_ROWS_PER_NEEDLE = 2
+_CITATION_MAX_EXCERPTS = 32
+# Result ids remembered across one dispute streak.
+_DISPUTE_SEEN_MAX = 200
+
+
+def _evidence_id_order(value: str) -> Tuple[int, str]:
+    return (int(value), value) if value.isdigit() else (0, value)
+_CITATION_BACKTICK_RE = re.compile(r"`([^`\n]{6,200})`")
+_CITATION_QUOTED_RE = re.compile(r"[\"\u201c]([^\"\u201c\u201d`\n]{8,200})[\"\u201d]")
+_CITATION_URL_RE = re.compile(r"https?://[^\s)\]>`\"']+")
+_CITATION_COUNT_RE = re.compile(r"\b\d+ (?:tests? )?pass(?:ed|es)?\b")
+_CITATION_TOKEN_RE = re.compile(r"\b(?:[0-9a-f]{7,64}|\d{8,}|[A-Za-z]+_[A-Za-z0-9]{8,}|[0-9]{8}T[0-9]{6}Z-[0-9a-f]+)\b")
 
 # ``paused_reason`` prefix of the judge's BLOCKED auto-pause. It is the ONE pause kind a real
 # user message may undo (see ``GoalManager.resume_for_user_input``), so it must be
@@ -86,8 +112,20 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
     "Continue working toward this goal. Take the next concrete step. "
-    "If you believe the goal is complete, state so explicitly and stop. "
+    "If you believe the goal is complete, state so explicitly, cite the proof "
+    "(exact identifiers or output lines from tool results, in backticks), and stop. "
     "If you are blocked and need input from the user, say so clearly and stop."
+)
+
+# Appended to every continuation prompt once the goal has been revised. The runtime cannot tell
+# whether a quoted user message really authorizes a change (the judge decides that after the
+# fact), so the working agent keeps seeing each replaced requirement as binding: a prohibition the
+# agent dropped on its own must still stop it before an irreversible action, not only at judging.
+CONTINUATION_REVISIONS_TEMPLATE = (
+    "\n\nThis goal has been revised. Each earlier requirement listed below still "
+    "binds you unless the user message cited for that revision plainly instructs "
+    "that specific change. When in doubt, honor the earlier requirement.\n"
+    "{revision_lines}"
 )
 
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
@@ -99,10 +137,15 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "{contract_block}\n\n"
     "Continue working toward the outcome above. Take the next concrete step. "
     "Stay within the stated boundaries and do not violate the constraints. "
-    "Before claiming the goal is done, satisfy the Verification criterion and "
-    "show the concrete evidence (command output, file contents, test result). "
-    "If you hit the stated stop condition or are otherwise blocked and need "
-    "user input, say so clearly and stop."
+    "Your method may change as you learn; the end state may not. If a criterion "
+    "has become obsolete or wrong, say so and revise the goal (goal_set "
+    "action=revise when available, quoting the user's words when they changed "
+    "scope) rather than working around it. Before claiming the goal is done, audit each "
+    "Verification item against current state and end with an Evidence section "
+    "that quotes exact identifiers or output lines from tool results in "
+    "backticks (commit SHAs, run ids, URLs, `N passed` lines), so the runtime "
+    "can locate them. If you hit the stated stop condition or are otherwise "
+    "blocked and need user input, say so clearly and stop."
 )
 
 # With /subgoal criteria: surfaced verbatim to the agent and to the judge.
@@ -191,8 +234,12 @@ JUDGE_SYSTEM_PROMPT = (
     "CONTINUE — not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt. When you return "
     "CONTINUE although the response asserts the goal is already complete, "
-    "add \"disputed\": true and name the exact missing evidence in the "
-    "reason.\n\n"
+    "add \"disputed\": true and, in the reason, name the single criterion "
+    "that lacks evidence and the concrete check that would prove it. Before "
+    "disputing, look through the cited evidence and recorded tool results: "
+    "evidence found there counts even if the response only summarizes it.\n\n"
+    "Judge the end state, not the route. The agent may change its method, "
+    "order, tools or plan as it learns; hold it to the outcome.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "blocked", "reason": "<one sentence>"}\n'
@@ -226,9 +273,39 @@ JUDGE_EVIDENCE_BLOCK_TEMPLATE = (
     "since a later change can make an earlier result stale:\n{evidence_lines}\n\n"
 )
 
+# Judge prompt block for citations the runtime located verbatim in recorded tool results (empty when
+# the response cites nothing, so citation-free prompts stay byte-identical).
+JUDGE_CITED_EVIDENCE_BLOCK_TEMPLATE = (
+    "Evidence the response cites, located verbatim by the runtime in tool "
+    "results or runtime notices recorded since this goal started (not written "
+    "by the agent; weigh age, since a later change can make a result stale; a "
+    "delegation result is a subagent's own report):\n{cited_lines}\n\n"
+)
+JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
+    "Cited in the response but NOT found in any recorded tool result: "
+    "{unresolved}\nThese are the agent's own words, not proof. A link the agent "
+    "built from a located id is fine, but a cited command result, test count, "
+    "status or id that was never recorded is unverified: any criterion that "
+    "rests on it is NOT proven, so do not return DONE on its strength. If a "
+    "cited result contradicts the recorded tool results, the claim is false: "
+    "return CONTINUE with disputed and name the contradiction.\n\n"
+)
+
+# Judge prompt block for the goal's revision history (empty without revisions).
+JUDGE_REVISIONS_BLOCK_TEMPLATE = (
+    "Revision history (the goal and criteria above are the CURRENT version). "
+    "A revision may clarify or restructure, but only the user can lower the "
+    "bar. For each earlier requirement a revision dropped or weakened: it is "
+    "superseded only when the cited user message plainly instructs that "
+    "specific change; otherwise, including every revision with no user "
+    "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
+)
+
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
+    "{revisions_block}"
     "Agent's most recent response:\n{response}\n\n"
+    "{cited_block}"
     "{evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
@@ -240,12 +317,14 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Additional criteria the user added mid-loop (all must also be "
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
+    "{revisions_block}"
     "Agent's most recent response:\n{response}\n\n"
+    "{cited_block}"
     "{evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision: For each numbered criterion above, find concrete "
-    "evidence in the agent's response or the recorded tool results that the criterion is "
+    "evidence in the agent's response, the cited evidence, or the recorded tool results that the criterion is "
     "satisfied. Do not accept generic phrases like 'all requirements "
     "met' or 'implying it was done' — require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
@@ -260,19 +339,27 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Completion contract (the authoritative definition of done):\n"
     "{contract_block}\n\n"
+    "{revisions_block}"
     "Agent's most recent response:\n{response}\n\n"
+    "{cited_block}"
     "{evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision rules:\n"
     "- The goal is DONE only when the Verification criterion is satisfied AND "
-    "the response or the recorded tool results show concrete evidence of it "
+    "the response, the cited evidence or the recorded tool results show concrete evidence of it "
     "(a command result, file contents excerpt, test/benchmark output) — not a "
     "claim like 'done' or 'all tests pass' with no supporting evidence.\n"
     "- Verification items no command can prove (a human review, a report to "
     "the user) are satisfied by the response stating them, unless the "
     "evidence contradicts it.\n"
-    "- If any stated Constraint was violated, the goal is NOT done — CONTINUE.\n"
+    "- Judge the end state, not the route: a different method, order or tool "
+    "than the agent first planned is fine when the outcome holds.\n"
+    "- A Constraint describing a state that must hold (e.g. no secret left "
+    "published) blocks DONE only while it is currently violated; a breach that "
+    "was remedied and verified no longer blocks. A breached prohibition on an "
+    "irreversible action (e.g. a message sent to the wrong recipient) cannot be "
+    "undone: return BLOCKED naming it so the user decides.\n"
     "- If the response shows the agent is waiting on a listed background "
     "process to satisfy the Verification criterion (e.g. CI is the "
     "verification and it's still running), return WAIT on that process "
@@ -481,6 +568,12 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # Every durable mutation gets a new token, including pause/resume with equal values.
     mutation_id: str = ""
+    # Versioned revisions of the goal/contract/subgoals: {at, actor, reason, user_quote, before, after}.
+    # Shown to the judge and continuation so superseded wording stops binding. Old rows load as [].
+    revisions: List[Dict[str, Any]] = field(default_factory=list)
+    # Comma-joined ids of recorded results cited during the current dispute streak; a dispute that
+    # cites none beyond these counts toward the stall breaker.
+    last_dispute_evidence: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -510,6 +603,9 @@ class GoalState:
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            revisions=[r for r in (data.get("revisions") or []) if isinstance(r, dict)]
+            if isinstance(data.get("revisions"), list) else [],
+            last_dispute_evidence=str(data.get("last_dispute_evidence") or ""),
             **ints, **floats,
         )
 
@@ -519,6 +615,32 @@ class GoalState:
     def render_subgoals_block(self) -> str:
         """Numbered ``- N. text`` block; empty when there are no subgoals."""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
+
+    def render_revisions_block(self) -> str:
+        """Every revision with every requirement it replaced, in full; empty without revisions.
+
+        Nothing is windowed or truncated: a replaced requirement stays binding unless a user message
+        instructs the change, so dropping it from the prompt would silently lower the bar."""
+        lines = []
+        for i, rev in enumerate(self.revisions, start=1):
+            quote = str(rev.get("user_quote") or "").strip()
+            source = str(rev.get("user_message") or "").strip()
+            if quote:
+                authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
+            else:
+                authority = "agent, no user authority"
+            before, after = rev.get("before") or {}, rev.get("after") or {}
+            changed = [k for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
+            lines.append(f"- v{i + 1} ({rev.get('actor') or 'agent'}, {authority}): "
+                         f"{_truncate(str(rev.get('reason') or ''), 300)} — changed: {', '.join(changed) or 'nothing'}")
+            for key in changed:
+                if key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
+                    lines.append(f"    earlier {key}: {str(before.get(key) or '(empty)')}")
+                elif key == "subgoals":
+                    dropped = [s for s in (before.get(key) or []) if s not in (after.get(key) or [])]
+                    if dropped:
+                        lines.append("    dropped criteria: " + "; ".join(str(s) for s in dropped))
+        return "\n".join(lines)
 
     def clear_wait(self) -> None:
         self.waiting_on_pid = None
@@ -1150,6 +1272,216 @@ def _render_evidence_block(evidence: Optional[List[Dict[str, Any]]], now: Option
     return JUDGE_EVIDENCE_BLOCK_TEMPLATE.format(evidence_lines="\n".join(lines))
 
 
+def _judge_response_window(text: str) -> str:
+    """Head plus tail of a long response: the summary leads and the evidence section usually closes."""
+    text = text or ""
+    head, tail = _JUDGE_RESPONSE_SNIPPET_CHARS, _JUDGE_RESPONSE_TAIL_CHARS
+    if len(text) <= head + tail:
+        return text
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n… [{omitted} chars omitted] …\n{text[-tail:]}"
+
+
+def extract_citations(text: str) -> List[str]:
+    """Exact identifiers a response cites: backtick spans, quoted strings, URLs, SHAs and long ids.
+
+    Ordered by first appearance, deduplicated, bounded; the closing evidence section is scanned
+    first so a long response's proof survives the cap."""
+    text = text or ""
+    hits: List[Tuple[int, str]] = []
+    for regex, group in ((_CITATION_BACKTICK_RE, 1), (_CITATION_QUOTED_RE, 1),
+                         (_CITATION_URL_RE, 0), (_CITATION_TOKEN_RE, 0), (_CITATION_COUNT_RE, 0)):
+        hits += [(m.start(group), m.group(group)) for m in regex.finditer(text)]
+    found: List[str] = []
+    # Latest first: a closeout's Evidence section sits at the end, so it survives the cap.
+    for _pos, value in sorted(hits, key=lambda h: -h[0]):
+        value = value.strip()
+        # Keep a deliberate ASCII ellipsis inside a quoted identifier; strip sentence punctuation.
+        if not value.endswith("..."):
+            value = value.strip(".,;:")
+        # Bare words ("independent") match anything; require a digit, a symbol or a phrase.
+        specific = any(ch.isdigit() or ch in "=:/._-#@ " for ch in value)
+        if specific and _CITATION_MIN_CHARS <= len(value) <= _CITATION_MAX_CHARS and value not in found:
+            found.append(value)
+    return found[:_CITATION_MAX_NEEDLES]
+
+
+def _citation_variants(needle: str) -> List[str]:
+    """Lookups for an exact citation, a key/value citation, or a safe shortened shape.
+
+    An ellipsis needs an eight-character prefix; commit URLs can fall back to their
+    7–40 digit hex hash. The returned variant must occur in recorded evidence."""
+    variants = [needle]
+    if '"' in needle:
+        # Tool results are stored as JSON, so quotes inside nested output are escaped.
+        variants.append(needle.replace('"', '\\"'))
+    for sep in ("=", ": "):
+        if sep in needle:
+            value = needle.split(sep, 1)[1].strip().strip("'\"")
+            if len(value) >= _CITATION_MIN_CHARS and value not in variants:
+                variants.append(value)
+    if needle.endswith(("…", "...")):
+        prefix = needle[:-1] if needle.endswith("…") else needle[:-3]
+        # A shorter prefix is too ambiguous to establish evidence, even if the literal ellipsis
+        # happens to appear in a result.
+        return [prefix] if len(prefix) >= 8 else []
+    commit = re.search(r"/commit/([0-9a-fA-F]{7,40})$", needle)
+    if needle.startswith(("https://", "http://")) and commit:
+        variants.append(commit.group(1))
+    return variants
+
+
+# Runtime-written user-role notices that carry results: a subagent's report or a process exit.
+_RUNTIME_NOTICE_LABELS = (
+    ("[ASYNC DELEGATION", "delegation result (subagent's report)"),
+    ("[IMPORTANT: Background process", "background process notice"),
+)
+
+
+# display_kind values only the runtime writes on the user-role rows it injects. "hidden" is not
+# among them: clients may submit hidden prompts, so a hidden row counts only with the runtime's
+# delegation-delivery identity (see _runtime_notice_label).
+_RUNTIME_NOTICE_KINDS = frozenset({"internal_notification", "async_delegation_complete", "process_complete"})
+# display_kind values of user-role rows the person typed: none, or a mid-turn /steer message.
+_USER_TYPED_KINDS = frozenset({"", "steer"})
+
+
+def _runtime_notice_label(row: Dict[str, Any]) -> str:
+    """Label for a runtime-delivered notice row, or "" when its provenance is not runtime-owned.
+
+    The persisted ``display_kind`` authenticates the row; the text prefix only picks the label.
+    A user message that merely starts with the same words is typed input, never evidence."""
+    kind = str(row.get("display_kind") or "")
+    meta = row.get("display_metadata") if isinstance(row.get("display_metadata"), dict) else {}
+    # A suppressed delegation delivery is stored hidden with its delegation_id; a client-submitted
+    # hidden prompt can carry only a title preview.
+    runtime_hidden = kind == "hidden" and bool(meta.get("delegation_id"))
+    if kind not in _RUNTIME_NOTICE_KINDS and not runtime_hidden:
+        return ""
+    content = row.get("content")
+    text = content.lstrip() if isinstance(content, str) else ""
+    return next((label for prefix, label in _RUNTIME_NOTICE_LABELS if text.startswith(prefix)), "")
+
+
+def resolve_cited_evidence(session_id: Optional[str], response: str, since: float = 0.0) -> Dict[str, Any]:
+    """Locate each identifier the response cites in tool results recorded since ``since``.
+
+    Returns ``{"cited": [{needle, tool, excerpt, timestamp, message_id}], "unresolved": [...],
+    "evidence_ids": [message ids]}``. Only tool-layer rows count, so the agent cannot cite its own prose into
+    evidence. Excerpts are secret-redacted and bounded. Fail-safe: any error yields no citations."""
+    empty: Dict[str, Any] = {"cited": [], "unresolved": [], "evidence_ids": []}
+    needles = extract_citations(response)
+    if not session_id or not needles:
+        return empty
+    db = _get_session_db()
+    finder = getattr(db, "find_messages_containing", None) if db is not None else None
+    call_finder = getattr(db, "find_tool_results_for_call", None) if db is not None else None
+    if finder is None:
+        return empty
+    try:
+        from agent.redact import redact_sensitive_text
+    except Exception:  # pragma: no cover - redaction module is part of the runtime
+        redact_sensitive_text = None
+    cited: List[Dict[str, Any]] = []
+    unresolved: List[str] = []
+    # Excerpted ranges per result row: a citation inside an already-shown range points at it,
+    # while a citation elsewhere in the same long result still gets its own excerpt.
+    shown: Dict[Any, List[Tuple[int, int]]] = {}
+    half = _CITATION_CONTEXT_CHARS // 2
+    for needle in needles:
+        matches: List[Tuple[Dict[str, Any], str, bool]] = []
+        variants = _citation_variants(needle)
+        if not variants:
+            unresolved.append(needle)
+            continue
+        try:
+            # A cited command resolves to what running it returned; anything else to where it appears.
+            if call_finder is not None and len(needle) >= 8 and not needle.endswith(("…", "...")):
+                matches += [(r, needle, True) for r in call_finder(session_id, needle, since=since, limit=4,
+                                                                   **_EVIDENCE_EXCLUSION_KW)]
+            for variant in variants:
+                if len(matches) >= _CITATION_ROWS_PER_NEEDLE * 2:
+                    break
+                matches += [(r, variant, False) for r in finder(session_id, variant, role="tool", since=since,
+                                                                limit=4, **_EVIDENCE_EXCLUSION_KW)]
+        except Exception as exc:
+            logger.debug("goal evidence: citation lookup failed: %s", exc)
+            return empty
+        matches = [m for m in matches if not _evidence_tool_excluded(str(m[0].get("tool_name") or ""))]
+        if not matches:
+            # Runtime-delivered results arrive as user-role notices, never agent prose.
+            try:
+                for variant in variants:
+                    # A composed commit URL is only corroborated by a hash in a tool result.
+                    if variant != needle and needle.startswith(("https://", "http://")) and \
+                            re.search(r"/commit/[0-9a-fA-F]{7,40}$", needle):
+                        continue
+                    notices = [r for r in finder(session_id, variant, role="user", since=since, limit=4)
+                               if _runtime_notice_label(r)]
+                    if notices:
+                        matches = [(dict(r, tool_name=_runtime_notice_label(r)), variant, False)
+                                   for r in notices]
+                        break
+            except Exception as exc:
+                logger.debug("goal evidence: notice lookup failed: %s", exc)
+        if not matches:
+            unresolved.append(needle)
+            continue
+        kept = 0
+        for row, hit, via_call in matches:
+            if kept >= _CITATION_ROWS_PER_NEEDLE or len(cited) >= _CITATION_MAX_EXCERPTS:
+                break
+            commit = re.search(r"/commit/([0-9a-fA-F]{7,40})$", needle)
+            match_note = (f"(matched by commit hash {hit}; URL not verified) "
+                          if commit and hit == commit.group(1) and hit != needle else "")
+            content = str(row.get("content") or "")
+            if via_call:
+                span = (-1, -1)   # the call's own result tail: one excerpt per row
+            else:
+                at = max(0, content.find(hit))
+                span = (at, at + len(hit))
+            ranges = shown.setdefault(row.get("id"), [])
+            covered = next((r for r in ranges if (span == (-1, -1) and r == span)
+                            or (span != (-1, -1) and r[0] <= span[0] and span[1] <= r[1])), None)
+            kept += 1
+            if covered is not None:
+                cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"),
+                              "excerpt": match_note + f"(inside the excerpt of result #{row.get('id')} above)",
+                              "timestamp": float(row.get("timestamp") or 0.0), "message_id": row.get("id")})
+                continue
+            if via_call:
+                ranges.append(span)
+                excerpt = "ran " + _one_line(row.get("arguments"), _EVIDENCE_CALL_CHARS) + " → " + \
+                    _tail(content.strip(), _CITATION_CONTEXT_CHARS).replace("\n", " ⏎ ")
+            else:
+                start, end = max(0, span[0] - half), min(len(content), span[1] + half)
+                ranges.append((start, end))
+                excerpt = ("…" if start else "") + content[start:end].replace("\n", " ⏎ ") + \
+                    ("…" if end < len(content) else "")
+            if redact_sensitive_text is not None:
+                excerpt = redact_sensitive_text(excerpt, force=True)
+            cited.append({"needle": needle, "tool": str(row.get("tool_name") or "tool"), "excerpt": match_note + excerpt,
+                          "timestamp": float(row.get("timestamp") or 0.0), "message_id": row.get("id")})
+    evidence_ids = sorted({str(c["message_id"]) for c in cited if c.get("message_id") is not None})
+    return {"cited": cited, "unresolved": unresolved, "evidence_ids": evidence_ids}
+
+
+def _render_cited_block(citations: Optional[Dict[str, Any]], now: Optional[float] = None) -> str:
+    if not citations:
+        return ""
+    now = time.time() if now is None else now
+    lines = []
+    for item in citations.get("cited") or []:
+        age = max(0, int(now - float(item.get("timestamp") or now)))
+        lines.append(f"- `{item['needle']}` → {item['tool']} result #{item.get('message_id')} ({age}s ago): "
+                     f"{item['excerpt']}")
+    block = JUDGE_CITED_EVIDENCE_BLOCK_TEMPLATE.format(cited_lines="\n".join(lines)) if lines else ""
+    unresolved = list(citations.get("unresolved") or [])[:_CITATION_MAX_UNRESOLVED_SHOWN]
+    if unresolved:
+        block += JUDGE_UNRESOLVED_CITATIONS_TEMPLATE.format(unresolved=", ".join(f"`{u}`" for u in unresolved))
+    return block
+
+
 def _call_goal_judge_llm(call_llm, system_prompt: str, user_prompt: str, timeout: Optional[float]) -> str:
     """Route through call_llm so auxiliary.goal_judge.* config (provider/model, extra_body,
     reasoning_effort, retries) all apply. Returns the raw reply text."""
@@ -1176,6 +1508,8 @@ def judge_goal(
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
     evidence: Optional[List[Dict[str, Any]]] = None,
+    citations: Optional[Dict[str, Any]] = None,
+    revisions_block: str = "",
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1207,8 +1541,11 @@ def judge_goal(
     # dropping later requirements makes the judge evaluate a different goal.
     common = dict(
         goal=goal,
-        response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        response=_judge_response_window(last_response),
         evidence_block=_render_evidence_block(evidence),
+        cited_block=_render_cited_block(citations),
+        revisions_block=(JUDGE_REVISIONS_BLOCK_TEMPLATE.format(revision_lines=revisions_block)
+                         if revisions_block.strip() else ""),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
         current_time=safe_strftime(datetime.now(tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M:%S %Z"),
@@ -1357,6 +1694,56 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
 
 # ── GoalManager — the orchestration surface CLI + gateway talk to ──────
 
+# Runtime-injected user-role messages: never evidence of what the user said. Provenance
+# (display_kind, compression flags) is the primary test; this list catches legacy rows written
+# before the runtime typed every injection.
+_SYNTHETIC_USER_PREFIXES = (
+    "[Continuing toward", "[ASYNC DELEGATION", "[IMPORTANT:", "[System note", "[System:", "[CONTEXT COMPACTION",
+    "[PRIOR CONTEXT", "[STILL IN PROGRESS", "[Cron delivery", "[Your active task list", "[Relay from",
+    "[Goal set]",
+)
+
+
+def _is_user_typed(row: Dict[str, Any]) -> bool:
+    """Whether a user-role row is input the person typed, judged by provenance first."""
+    content = row.get("content")
+    if not isinstance(content, str) or row.get("compressed_summary"):
+        return False
+    if str(row.get("display_kind") or "") not in _USER_TYPED_KINDS:
+        return False
+    if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
+        return False
+    try:
+        from agent.context_compressor import ContextCompressor
+        if ContextCompressor._is_context_summary_content(content):
+            return False
+    except Exception:  # pragma: no cover - compressor is part of the runtime
+        pass
+    return True
+_REPLY_QUOTE_RE = re.compile(r'^\[Replying to: ".*?"\]\n\s*', re.DOTALL)
+
+
+_REVISION_QUOTE_MIN_CHARS = 12
+# Longest user message a revision may cite. The judge decides authority from the complete message,
+# so a longer one is refused rather than excerpted: an excerpt can drop the context that negates it.
+_REVISION_SOURCE_MAX_CHARS = 4000
+
+
+def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> List[str]:
+    """Text the user actually wrote since ``since``: synthetic runtime prompts are dropped and a
+    reply's quoted header (which repeats the assistant's words) is stripped. Fail-safe: ``[]``."""
+    db = _get_session_db()
+    reader = getattr(db, "messages_by_role", None) if db is not None else None
+    if not session_id or reader is None:
+        return []
+    try:
+        rows = reader(session_id, "user", since=since, limit=limit)
+    except Exception as exc:
+        logger.debug("goal revise: user message read failed: %s", exc)
+        return []
+    return [_REPLY_QUOTE_RE.sub("", row["content"], count=1) for row in rows if _is_user_typed(row)]
+
+
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
             "verdict": verdict, "reason": reason, "message": message}
@@ -1485,6 +1872,7 @@ class GoalManager:
         self._state.status = "active"
         self._state.paused_reason = None
         self._state.consecutive_disputes = 0
+        self._state.last_dispute_evidence = ""
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
@@ -1521,6 +1909,77 @@ class GoalManager:
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         self._save()
+
+    # --- revisions ------------------------------------------------------
+
+    # Changes that need an identifiable user instruction: the objective itself, dropping criteria,
+    # and changing constraints. Other contract fields may be restructured by the agent; the judge
+    # still holds an unauthorized revision to any earlier requirement it weakened.
+    _AUTHORITY_FIELDS = ("goal", "constraints")
+
+    def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
+               contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
+               user_quote: str = "", user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Record a versioned revision of the goal, contract fields and/or subgoal list.
+
+        ``contract`` updates only the named fields (``""`` clears one); ``subgoals`` replaces the list.
+        A change to the objective or constraints, or a dropped subgoal, needs ``user_quote``: a verbatim
+        excerpt (12+ chars) of a real user message in ``user_messages`` (defaults to this session's
+        user messages since the goal was set). Returns ``{"ok", "error_code", "error", "revision"}``."""
+        state = self._require_goal()
+        reason = (reason or "").strip()
+        if not reason:
+            return {"ok": False, "error_code": "reason_required", "error": "a revision needs a reason"}
+        before = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals)}
+        after = dict(before)
+        if goal is not None and goal.strip():
+            after["goal"] = goal.strip()
+        for key, value in (contract or {}).items():
+            if key not in _CONTRACT_FIELDS:
+                return {"ok": False, "error_code": "unknown_field", "error": f"unknown contract field: {key}"}
+            after[key] = str(value or "").strip()
+        if subgoals is not None:
+            after["subgoals"] = [str(s).strip() for s in subgoals if str(s).strip()]
+        changed = [k for k in after if after[k] != before[k]]
+        if not changed:
+            return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
+        dropped = [s for s in before["subgoals"] if s not in after["subgoals"]]
+        needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
+        quote = " ".join((user_quote or "").split())
+        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS:
+            return {"ok": False, "error_code": "user_authority_required",
+                    "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
+                             f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session"}
+        source = ""
+        if quote:
+            # Deterministic part: the quote must come from a real user message. Whether that message
+            # authorizes this specific change is judged against the full message, shown with the revision.
+            if len(quote) < _REVISION_QUOTE_MIN_CHARS:
+                return {"ok": False, "error_code": "user_quote_too_short",
+                        "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
+            pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
+            sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
+            if not sources:
+                return {"ok": False, "error_code": "user_quote_not_found",
+                        "error": "user_quote does not match any user message sent since the goal was set"}
+            source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
+            if not source:
+                return {"ok": False, "error_code": "user_message_too_long",
+                        "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
+                                 "long to judge whether it authorizes this change; ask the user to state the "
+                                 "change in a short message and quote that"}
+        revision = {"at": time.time(), "actor": actor, "reason": reason, "user_quote": quote,
+                    "user_message": source,
+                    "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}}
+        state.goal = after["goal"]
+        state.contract = GoalContract.from_dict({k: after[k] for k in _CONTRACT_FIELDS})
+        state.subgoals = after["subgoals"]
+        state.revisions.append(revision)
+        # The bar moved: an earlier dispute streak was about the superseded wording.
+        state.consecutive_disputes = 0
+        state.last_dispute_evidence = ""
+        self._save()
+        return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -1871,10 +2330,12 @@ class GoalManager:
              "output": f"exit {g.last_exit_code} (passed)\n{_tail((g.last_output_tail or '').strip(), _EVIDENCE_OUTPUT_CHARS)}".strip()}
             for g in state.gates
         ]
+        citations = resolve_cited_evidence(evidence_session_id or self.session_id, last_response,
+                                           since=state.created_at)
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-            evidence=evidence or None,
+            evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -1884,7 +2345,17 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
         disputed = verdict == "continue" and bool((wait_directive or {}).get("disputed"))
-        state.consecutive_disputes = state.consecutive_disputes + 1 if disputed else 0
+        # A dispute counts toward the stall breaker unless the reply cites a recorded result no
+        # earlier dispute in this streak cited: new proof means converging, rewording is not.
+        current = set(citations.get("evidence_ids") or [])
+        seen = {i for i in state.last_dispute_evidence.split(",") if i}
+        if not disputed:
+            state.consecutive_disputes = 0
+            state.last_dispute_evidence = ""
+        else:
+            fresh = current - seen
+            state.consecutive_disputes = 1 if (state.consecutive_disputes and fresh) else state.consecutive_disputes + 1
+            state.last_dispute_evidence = ",".join(sorted(seen | current, key=_evidence_id_order)[-_DISPUTE_SEEN_MAX:])
 
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
@@ -1929,8 +2400,9 @@ class GoalManager:
             return self._pause_decision(
                 f"{_DISPUTED_PAUSE_PREFIX}{reason}", "disputed", reason,
                 f"⏸ Goal paused — the agent reports the goal is complete, but the judge disagreed "
-                f"{state.consecutive_disputes} turns in a row: {reason} "
-                "Use /goal clear if it is done, or /goal resume to keep going.",
+                f"{state.consecutive_disputes} turns in a row without new evidence: {reason} "
+                "Use /goal clear if it is done, /goal resume to keep going, or tell the agent "
+                "which criterion no longer applies.",
             )
 
         if state.turns_used >= state.max_turns:
@@ -1946,6 +2418,13 @@ class GoalManager:
         s = self._state
         if not s or s.status != "active":
             return None
+        prompt = self._current_continuation_prompt(s)
+        if s.revisions:
+            prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=s.render_revisions_block())
+        return prompt
+
+    @staticmethod
+    def _current_continuation_prompt(s: "GoalState") -> str:
         # Contract first (it carries the verification surface); subgoals fold in as extra criteria.
         if s.has_contract():
             contract_block = s.contract.render_block()

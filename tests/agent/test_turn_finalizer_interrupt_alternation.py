@@ -14,6 +14,8 @@ an empty-content assistant turn.
 """
 
 
+import pytest
+
 from agent.turn_finalizer import finalize_turn
 
 
@@ -167,6 +169,20 @@ def test_interrupt_after_tool_closes_sequence_with_placeholder():
 
 
 
+def test_interrupted_tool_tail_does_not_persist_delivery_diagnostic():
+    agent = _StubAgent()
+    messages = _interrupted_tool_tail()
+    result = _finalize(
+        agent, messages, interrupted=True,
+        final_response="Operation interrupted: waiting for model response (1.3s elapsed).",
+    )
+    assert result["interrupted"] is True
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
+    assert agent.persisted_messages[-1]["content"] == messages[-1]["content"]
+    assert all("waiting for model response" not in str(m) for m in agent.persisted_messages)
+
+
 def test_interrupt_without_tool_tail_adds_nothing():
     # Interrupt while the tail is already an assistant/user message: no
     # synthetic close needed.
@@ -194,3 +210,19 @@ def test_interrupted_turn_with_diagnostic_text_is_not_completed():
     assert result["interrupted"] is True
     assert result["completed"] is False
     assert result["failed"] is False
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "Operation interrupted: handling API error (timeout).",
+    "Operation interrupted: retrying API call after error (retry 1/3).",
+    "Operation interrupted: waiting for the provider to recover (cycle 1/2).",
+    "Operation interrupted: retrying empty response from model (retry 1/3).",
+    "Operation interrupted during retry (timeout, attempt 1/3).",
+])
+def test_interrupted_tool_tail_never_persists_local_diagnostic(diagnostic):
+    agent = _StubAgent()
+    messages = _interrupted_tool_tail()
+    _finalize(agent, messages, interrupted=True, final_response=diagnostic)
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == "[No reply: this turn was interrupted before completion. Do not repeat this internal marker.]"
+    assert all(diagnostic not in str(row) for row in agent.persisted_messages)

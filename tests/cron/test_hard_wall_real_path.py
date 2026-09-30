@@ -27,6 +27,16 @@ from cron import scheduler, executions, delivery_queue
 from cron.scheduler_detached_worker import arm_hard_wall_timeout
 from hermes_constants import set_hermes_home_override
 home, job_file, mode, wall, marker = sys.argv[1:]
+if mode == 'timeout-script-terminated':
+    # Give the script runner time to observe the watchdog's SIGTERM before
+    # os._exit. This exposes the pre-commit diagnostic-output window.
+    from cron import scheduler_detached_worker
+    original_terminate = scheduler_detached_worker._terminate_owned_descendants
+    def terminate_then_yield(*args, **kwargs):
+        result = original_terminate(*args, **kwargs)
+        time.sleep(0.5)
+        return result
+    scheduler_detached_worker._terminate_owned_descendants = terminate_then_yield
 from agent.monitoring import emitter
 class RecordingEmitter:
     def emit(self, event):
@@ -104,7 +114,7 @@ def _run(tmp_path, mode, *, wall=3.0, deliver="telegram:123"):
     script = home / "scripts" / "job.py"
     script.parent.mkdir()
     marker = tmp_path / "worker.state"
-    if mode == "timeout":
+    if mode in ("timeout", "timeout-script-terminated"):
         script.write_text("import time\ntime.sleep(30)\nprint('late success')\n")
     elif mode == "suppressed":
         script.write_text("print('[SILENT]')\n")
@@ -156,7 +166,20 @@ def test_timeout_wins_before_run_job_completes_without_success_side_effects(tmp_
     assert code == 124, (code, row, stored, queued, out, err)
     assert row["status"] == "failed" and "hard wall-clock timeout" in row["error"]
     assert queued is None
-    assert outputs == []
+    assert outputs == [], [(str(p), p.read_text()) for p in outputs]
+    assert stored["last_status"] not in ("ok", "delivery_queued")
+    assert recovered == 0
+
+
+@pytest.mark.macos_only
+def test_timeout_script_termination_diagnostic_does_not_publish_success(tmp_path):
+    code, row, queued, stored, outputs, recovered, out, err, _ = _run(
+        tmp_path, "timeout-script-terminated")
+    assert code == 124, (code, row, stored, queued, out, err)
+    assert row is not None and stored is not None
+    assert row["status"] == "failed" and "hard wall-clock timeout" in row["error"]
+    assert queued is None
+    assert outputs == [], [(str(p), p.read_text()) for p in outputs]
     assert stored["last_status"] not in ("ok", "delivery_queued")
     assert recovered == 0
 
