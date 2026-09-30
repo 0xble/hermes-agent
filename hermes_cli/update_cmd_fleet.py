@@ -170,8 +170,19 @@ def _obligation_fields() -> dict[str, str] | None:
 
 
 def _current_checkout_sha() -> str | None:
-    """Current on-disk checkout HEAD, or None if it cannot be resolved."""
+    """The code the fleet should run: the active immutable release, else the checkout HEAD.
+
+    An immutable home's updater runs from the journal-bound source checkout, whose HEAD is
+    frozen by design. Comparing the fleet to it marks every current gateway stale, so an
+    already-up-to-date update restarted the gateway for nothing. Legacy homes keep HEAD.
+    """
     from hermes_cli.update_cmd import _capture_head_sha, _m
+    with suppress(Exception):
+        from hermes_cli.immutable_releases import resolved_release
+        from hermes_constants import get_hermes_home
+        release = resolved_release(get_hermes_home())
+        if release is not None:
+            return release.name
     try:
         from hermes_cli.build_info import get_code_identity
         sha = (get_code_identity(refresh=True) or {}).get("sha")
