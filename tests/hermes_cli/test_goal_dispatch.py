@@ -56,6 +56,41 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
     return execute
 
 
+@pytest.mark.parametrize("configured,expected", [(0, 0), (7, 7), (-1, 20), ("invalid", 20), (None, 20)])
+def test_cli_goal_manager_uses_profile_budget(tmp_path, monkeypatch, configured, expected):
+    import yaml
+    from hermes_cli.cli_loops_mixin import CLILoopsMixin
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"goals": {"max_turns": configured}}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cli = object.__new__(CLILoopsMixin)
+    cli.session_id = "cli-budget"
+    mgr = cli._get_goal_manager()
+    assert mgr.default_max_turns == expected
+    assert mgr.set("ship it").max_turns == expected
+
+
+@pytest.mark.parametrize("budget", [0, 7])
+@pytest.mark.parametrize("translated", [False, True])
+def test_goal_set_notice_renders_budget_in_existing_locale_template(budget, translated):
+    from hermes_cli.goal_command import dispatch_goal_command
+
+    mgr = goals.GoalManager("goal-notice", default_max_turns=budget)
+    seen = []
+
+    def render(key, fallback, **fields):
+        seen.append((key, fields))
+        template = "目標設定（{budget}ターン）: {goal}" if translated else fallback
+        return template.format(**fields)
+
+    result = dispatch_goal_command(mgr, "ship it", authorize_gate=lambda: None, render=render)
+    label = "∞" if budget == 0 else str(budget)
+    assert seen == [("gateway.goal.set", {"budget": label, "goal": "ship it"})]
+    assert label in result.output
+    assert "unlimited" not in result.output
+    assert goals.load_goal(mgr.session_id).max_turns == budget
+
+
 @pytest.mark.parametrize('surface', ['cli', 'gateway', 'tui'])
 @pytest.mark.parametrize('command', [
     'show', 'draft', 'draft build it', 'drafting docs', 'wait', 'wait nope',

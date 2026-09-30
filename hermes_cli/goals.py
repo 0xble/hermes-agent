@@ -31,6 +31,21 @@ logger = logging.getLogger(__name__)
 # ── Constants & defaults ──────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+
+
+def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> int:
+    """Normalize a goal budget; zero is the explicit unlimited sentinel."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return parsed if parsed >= 0 else int(default)
+
+
+def _goal_budget_label(turns_used: int, max_turns: int) -> str:
+    return f"{turns_used}/∞" if max_turns == 0 else f"{turns_used}/{max_turns}"
+
+
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. Reasoning models burn hidden-reasoning tokens before the visible one-line
 # JSON verdict; 200 (the original) reliably truncated it and tripped the auto-pause. 4096 covers
@@ -590,7 +605,7 @@ class GoalState:
             goal=data.get("goal", ""),
             mutation_id=str(data.get("mutation_id") or ""),
             status=data.get("status", "active"),
-            max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
+            max_turns=normalize_goal_max_turns(data.get("max_turns", DEFAULT_MAX_TURNS)),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
@@ -1765,7 +1780,7 @@ class GoalManager:
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
-        self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
+        self.default_max_turns = normalize_goal_max_turns(default_max_turns)
         self._state: Optional[GoalState] = load_goal(session_id)
 
     # --- introspection ------------------------------------------------
@@ -1787,7 +1802,7 @@ class GoalManager:
         s = self._state
         if s is None or s.status == "cleared":
             return "No active goal. Set one with /goal <text>."
-        turns = f"{s.turns_used}/{s.max_turns} turns"
+        turns = f"{_goal_budget_label(s.turns_used, s.max_turns)} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
         gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
@@ -1846,7 +1861,7 @@ class GoalManager:
             raise ValueError("goal text is empty")
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
-            max_turns=int(max_turns) if max_turns else self.default_max_turns,
+            max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
         )
         return self._save()
@@ -2105,7 +2120,7 @@ class GoalManager:
             return _decision(
                 "active", True, prompt, "gate_failed",
                 f"gate failed (exit {exit_code}): $ {gate.command}",
-                f"✗ Quality gate failed ({state.turns_used}/{state.max_turns} turns, "
+                f"✗ Quality gate failed ({_goal_budget_label(state.turns_used, state.max_turns)} turns, "
                 f"attempt {gate.attempts}/{gate.max_retries}): $ {gate.command}",
             )
 
@@ -2272,8 +2287,8 @@ class GoalManager:
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
         return self._pause_decision(
-            f"turn budget exhausted ({state.turns_used}/{state.max_turns})", verdict, reason,
-            f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used{note}. "
+            f"turn budget exhausted ({_goal_budget_label(state.turns_used, state.max_turns)})", verdict, reason,
+            f"⏸ Goal paused — {_goal_budget_label(state.turns_used, state.max_turns)} turns used{note}. "
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
@@ -2318,7 +2333,7 @@ class GoalManager:
         # so the judge is skipped and the gate's output drives the next turn (same turn budget).
         gate_decision = self._check_gates()
         if gate_decision is not None:
-            if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
+            if gate_decision.get("should_continue") and state.max_turns > 0 and state.turns_used >= state.max_turns:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
@@ -2405,13 +2420,13 @@ class GoalManager:
                 "which criterion no longer applies.",
             )
 
-        if state.turns_used >= state.max_turns:
+        if state.max_turns > 0 and state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
 
         self._save()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,
-            f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
+            f"↻ Continuing toward goal ({_goal_budget_label(state.turns_used, state.max_turns)}): {reason}",
         )
 
     def next_continuation_prompt(self) -> Optional[str]:
@@ -2601,5 +2616,5 @@ __all__ = [
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
     "DRAFT_CONTRACT_SYSTEM_PROMPT", "KANBAN_GOAL_CONTINUATION_TEMPLATE", "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS", "load_goal", "save_goal", "clear_goal", "migrate_goal_to_session", "judge_goal",
-    "run_kanban_goal_loop",
+    "run_kanban_goal_loop", "normalize_goal_max_turns",
 ]
