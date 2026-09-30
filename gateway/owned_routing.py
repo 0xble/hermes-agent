@@ -127,7 +127,7 @@ class OwnedRouting:
                                "transport_profile": identity.transport_profile,
                                "home": home}, ensure_ascii=False).encode()
         row, fresh = await asyncio.to_thread(
-            self.generation.coordinator.enqueue, home, "telegram", key,
+            self.generation.coordinator.enqueue_owned, home, "telegram", key,
             str(event.platform_update_id), "message", envelope, payload,
             self.generation.identity.id, self.generation.epoch)
         if row["owner_id"] == self.generation.identity.id:

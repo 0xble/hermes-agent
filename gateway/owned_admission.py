@@ -64,6 +64,18 @@ class OwnedAdmissionMixin:
 
     def enqueue(self, home: str, transport: str, key: str, event_id: str, kind: str,
                 source: bytes, payload: bytes | Callable[[], bytes], active_owner: str, active_epoch: int):
+        return self._enqueue(home, transport, key, event_id, kind, source, payload,
+                             active_owner, active_epoch, frozen_owner=False)
+
+    def enqueue_owned(self, home: str, transport: str, key: str, event_id: str, kind: str,
+                      source: bytes, payload: bytes | Callable[[], bytes], owner: str, epoch: int):
+        """Admit a late dispatch to its frozen owner, or forward it to the active owner."""
+        return self._enqueue(home, transport, key, event_id, kind, source, payload,
+                             owner, epoch, frozen_owner=True)
+
+    def _enqueue(self, home: str, transport: str, key: str, event_id: str, kind: str,
+                 source: bytes, payload: bytes | Callable[[], bytes], active_owner: str, active_epoch: int,
+                 *, frozen_owner: bool):
         """Commit source and payload before returning a durable-enqueue receipt.
 
         An existing platform event always wins, even if its later redelivery has a
@@ -107,8 +119,21 @@ class OwnedAdmissionMixin:
             lease = db.execute(
                 "SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'"
             ).fetchone()
-            if (lease is None or lease["generation_id"] != active_owner
-                    or lease["epoch"] != active_epoch or lease["state"] != "active"):
+            active_lease = (lease is not None and tuple(lease) == (active_owner, active_epoch, "active"))
+            if frozen_owner and not active_lease:
+                claim = db.execute(
+                    "SELECT generation_id,epoch,state FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
+                    (home, transport, key),
+                ).fetchone()
+                if claim is None or tuple(claim) != (active_owner, active_epoch, "owned"):
+                    if lease is None or lease["state"] != "active":
+                        raise RuntimeError("no active generation for late dispatch")
+                    # A cannot claim new work while draining. Forward the complete
+                    # payload under B's lease, atomically with the claim lookup.
+                    active_owner, active_epoch = lease["generation_id"], lease["epoch"]
+                    if callable(payload):
+                        payload = payload()
+            elif not active_lease:
                 raise RuntimeError("admission lease is not active for this generation")
             db.execute(
                 "INSERT OR IGNORE INTO sessions(profile_home,transport,session_key,generation_id,epoch,state) "
