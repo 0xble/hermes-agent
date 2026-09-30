@@ -29,6 +29,111 @@ class PollingAdapter:
 
 
 @pytest.mark.asyncio
+async def test_split_text_batch_buffered_at_handover_flushes_on_old_owner(tmp_path):
+    from gateway.config import Platform
+    from gateway.owned_routing import OwnedRouting
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    adapter.platform = Platform.TELEGRAM
+    key = "agent:default:telegram:chat-1"
+    event = MessageEvent(text="first chunk second chunk", source=SessionSource(platform=Platform.TELEGRAM, chat_id="1"))
+    adapter._pending_text_batches = {key: event}
+    adapter._pending_messages = {}
+    adapter._active_sessions = {}
+    adapter._pending_photo_batches = {}
+    adapter._media_group_events = {}
+    handled = []
+    async def flush(batch_key):
+        buffered = adapter._pending_text_batches.pop(batch_key, None)
+        if buffered:
+            handled.append((old.id, buffered.text))
+            adapter._active_sessions[batch_key] = buffered
+    adapter._flush_text_batch_now = flush
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False, _pending_approvals={})
+    active.runner = runner
+    active.owned_routing = OwnedRouting(active)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    try:
+        assert handled == [(old.id, "first chunk second chunk")]
+        assert adapter._pending_text_batches == {}
+        assert key in active.owned_routing._live_keys()
+        db.commit_transfer(old.id, new.id, epoch)
+        with db.connect() as conn:
+            assert conn.execute("SELECT generation_id FROM sessions WHERE session_key=?", (key,)).fetchone()[0] == old.id
+        # A delayed flush task seeing the emptied buffer cannot deliver twice.
+        await adapter._flush_text_batch_now(key)
+        assert handled == [(old.id, "first chunk second chunk")]
+    finally:
+        assert active._drain_task is not None
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("buffer_name, flush_name, text", [
+    ("_pending_photo_batches", "_flush_photo_batch_now", "photo"),
+    ("_media_group_events", "_flush_media_group_now", "album"),
+])
+@pytest.mark.asyncio
+async def test_media_buffered_at_handover_flushes_on_old_owner(tmp_path, buffer_name, flush_name, text):
+    from gateway.config import Platform
+    from gateway.owned_routing import OwnedRouting
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    adapter.platform = Platform.TELEGRAM
+    key = "agent:default:telegram:chat-1"
+    event = MessageEvent(text=text, source=SessionSource(platform=Platform.TELEGRAM, chat_id="1"))
+    setattr(adapter, buffer_name, {key: event})
+    adapter._pending_text_batches = {}
+    adapter._pending_messages = {}
+    adapter._active_sessions = {}
+    handled = []
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from types import MethodType
+    task_name = "_pending_photo_batch_tasks" if buffer_name == "_pending_photo_batches" else "_media_group_tasks"
+    setattr(adapter, task_name, {})
+    flush = getattr(TelegramAdapter, flush_name, None)
+    if flush is not None:
+        setattr(adapter, flush_name, MethodType(flush, adapter))
+    async def handle(buffered):
+        assert db.leases()[0]["generation_id"] == old.id
+        handled.append((old.id, buffered.text))
+        adapter._active_sessions[key] = buffered
+    adapter.handle_message = handle
+    runner = Mock(adapters={"telegram": adapter}, _overlap_draining=False, _pending_approvals={})
+    active.runner = runner
+    active.owned_routing = OwnedRouting(active)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id)
+    try:
+        assert handled == [(old.id, text)]
+        assert getattr(adapter, buffer_name) == {}
+        db.commit_transfer(old.id, new.id, epoch)
+        await getattr(adapter, flush_name)(key)
+        assert handled == [(old.id, text)]
+    finally:
+        assert active._drain_task is not None
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_old_runner_retains_work_after_polling_stops(tmp_path):
     db = GenerationCoordinator(tmp_path)
     fingerprint = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
@@ -271,6 +376,38 @@ async def test_session_keyed_process_without_claim_keeps_draining_owner_until_no
     assert process_registry.pending_watchers.pop() is notice
     assert await active.finish_draining_once()
     assert stopped == [True]
+
+
+@pytest.mark.asyncio
+async def test_registry_process_and_pending_notice_each_wait_until_deadline(tmp_path, monkeypatch):
+    import gateway.run_generation as generation_run
+    from tools.process_registry import process_registry
+    db = GenerationCoordinator(tmp_path)
+    old, new = GenerationIdentity.create(release_sha="a", label="a"), GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    db.commit_transfer(old.id, new.id, epoch)
+    now = [1000.0]
+    monkeypatch.setattr(generation_run.time, "time", lambda: now[0])
+    with db.connect() as conn:
+        conn.execute("UPDATE generations SET drain_deadline=? WHERE id=?", (now[0] + 5, old.id))
+    for held_by_process in (True, False):
+        active = ActiveGeneration(tmp_path, db, old, epoch)
+        stopped = []
+        async def stop():
+            stopped.append(True)
+        active.runner = Mock(_overlap_draining=True, _active_work_count=lambda: 0,
+                             _pending_approvals={}, stop=stop)
+        monkeypatch.setattr(process_registry, "has_any_active", lambda: held_by_process)
+        monkeypatch.setattr(process_registry, "pending_watchers", [] if held_by_process else [{"type": "complete"}])
+        now[0] = 1000.0
+        assert not await active.finish_draining_once()
+        assert stopped == []
+        now[0] = 1005.0
+        assert await active.finish_draining_once()
+        assert stopped == [True]
 
 
 @pytest.mark.asyncio
@@ -781,3 +918,52 @@ async def test_legacy_takeover_backs_off_and_warns_once(tmp_path, monkeypatch, c
     assert attempts <= 8, (attempts, intervals)
     assert intervals[0] >= 1 and max(intervals) >= 30, intervals
     assert len([r for r in caplog.records if "retrying slowly" in r.message]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True], ids=["before-pause", "materialized-during-flush"])
+async def test_invalid_live_key_retains_polling_and_cron_after_transfer_abort(tmp_path, late):
+    import threading
+    from types import SimpleNamespace
+    from gateway.config import Platform
+    from gateway.owned_routing import OwnedRouting
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="old", label="old")
+    new = GenerationIdentity.create(release_sha="new", label="new")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    adapter.platform = Platform.TELEGRAM
+    adapter._active_sessions = {} if late else {"unscoped": object()}
+    adapter._pending_messages = {}
+    adapter._pending_text_batches = {"agent:default:telegram:pending": object()} if late else {}
+    adapter._pending_photo_batches = {}
+    adapter._media_group_events = {}
+
+    async def flush(key):
+        adapter._pending_text_batches.pop(key)
+        adapter._active_sessions["unscoped"] = object()
+
+    adapter._flush_text_batch_now = flush
+    provider = Mock()
+    active.cron_provider = provider
+    active.cron_stop = threading.Event()
+    runner = SimpleNamespace(adapters={"telegram": adapter}, _pending_approvals={},
+                             _overlap_draining=False, _overlap_cron_start_kwargs={})
+    active.runner = runner
+    active.owned_routing = OwnedRouting(active)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    with pytest.raises(RuntimeError, match="unscoped session obligation"):
+        await active.transfer_requested(new.id)
+    assert adapter.stopped == late
+    assert adapter.resumed == late
+    assert runner._overlap_draining is False
+    assert not active.cron_stop.is_set()
+    provider.stop.assert_not_called()
+    provider.start.assert_not_called()
+    assert not active._external_cron_stopped
+    assert db.leases()[0]["generation_id"] == old.id
+    assert active._drain_task is None

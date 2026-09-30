@@ -3497,8 +3497,16 @@ class TelegramAdapter(BasePlatformAdapter):
             claim.failed = True
 
     async def handle_message(self, event: MessageEvent) -> None:
+        if getattr(self, "_owned_routing", None) is None:
+            # Without owned admission, native dispatch may hand work off before
+            # returning (including a task that outlives a cancelled callback).
+            self._accept_update()
+        try:
+            await super().handle_message(event)
+        except BaseException:
+            self._fail_update_preparation()
+            raise
         self._accept_update()
-        await super().handle_message(event)
 
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
@@ -7583,6 +7591,16 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key = self._event_session_key(event)
         media_group_id = getattr(msg, "media_group_id", None)
         return f"{session_key}:album:{media_group_id}" if media_group_id else f"{session_key}:photo-burst"
+
+    async def _flush_photo_batch_now(self, batch_key: str) -> None:
+        event = self._pending_photo_batches.pop(batch_key, None)
+        if event is not None:
+            await self.handle_message(event)
+
+    async def _flush_media_group_now(self, media_group_id: str) -> None:
+        event = self._media_group_events.pop(media_group_id, None)
+        if event is not None:
+            await self.handle_message(event)
 
     async def _flush_photo_batch(self, batch_key: str) -> None:
         """Send a buffered photo burst/album as a single MessageEvent."""

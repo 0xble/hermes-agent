@@ -6,6 +6,7 @@ and canonicalize before enqueueing, and the owner must re-authorize before use.
 from __future__ import annotations
 
 import json
+import time
 from contextlib import closing
 from typing import Callable
 
@@ -64,6 +65,18 @@ class OwnedAdmissionMixin:
 
     def enqueue(self, home: str, transport: str, key: str, event_id: str, kind: str,
                 source: bytes, payload: bytes | Callable[[], bytes], active_owner: str, active_epoch: int):
+        return self._enqueue(home, transport, key, event_id, kind, source, payload,
+                             active_owner, active_epoch, frozen_owner=False)
+
+    def enqueue_owned(self, home: str, transport: str, key: str, event_id: str, kind: str,
+                      source: bytes, payload: bytes | Callable[[], bytes], owner: str, epoch: int):
+        """Admit a late dispatch to its frozen owner, or forward it to the active owner."""
+        return self._enqueue(home, transport, key, event_id, kind, source, payload,
+                             owner, epoch, frozen_owner=True)
+
+    def _enqueue(self, home: str, transport: str, key: str, event_id: str, kind: str,
+                 source: bytes, payload: bytes | Callable[[], bytes], active_owner: str, active_epoch: int,
+                 *, frozen_owner: bool):
         """Commit source and payload before returning a durable-enqueue receipt.
 
         An existing platform event always wins, even if its later redelivery has a
@@ -82,8 +95,10 @@ class OwnedAdmissionMixin:
         except (ValueError, UnicodeDecodeError) as exc:
             raise ValueError("invalid source envelope") from exc
         if (not isinstance(envelope, dict) or envelope.get("version") != 1
-                or envelope.get("authorized") is not True or not envelope.get("sender")):
+                or envelope.get("authorized") is not True or "sender" not in envelope):
             raise ValueError("source is not an authorized version 1 envelope")
+        # Probe only the owner observed under the write fence. A pre-lock probe
+        # cannot authorize release and would duplicate the PID/start-time lookup.
         with self._transaction() as db, db:
             db.execute("BEGIN IMMEDIATE")
             duplicate = db.execute(
@@ -95,8 +110,22 @@ class OwnedAdmissionMixin:
             lease = db.execute(
                 "SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'"
             ).fetchone()
-            if (lease is None or lease["generation_id"] != active_owner
-                    or lease["epoch"] != active_epoch or lease["state"] != "active"):
+            active_lease = (lease is not None and tuple(lease) == (active_owner, active_epoch, "active"))
+            if frozen_owner and not active_lease:
+                claim = db.execute(
+                    "SELECT generation_id,epoch,state,outstanding_work FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
+                    (home, transport, key),
+                ).fetchone()
+                if (claim is None or tuple(claim)[:3] != (active_owner, active_epoch, "owned")
+                        or claim["outstanding_work"] <= 0):
+                    if lease is None or lease["state"] != "active":
+                        raise RuntimeError("no active generation for late dispatch")
+                    # A cannot claim new work while draining. Forward the complete
+                    # payload under B's lease, atomically with the claim lookup.
+                    active_owner, active_epoch = lease["generation_id"], lease["epoch"]
+                    if callable(payload):
+                        payload = payload()
+            elif not active_lease:
                 raise RuntimeError("admission lease is not active for this generation")
             db.execute(
                 "INSERT OR IGNORE INTO sessions(profile_home,transport,session_key,generation_id,epoch,state) "
@@ -156,11 +185,44 @@ class OwnedAdmissionMixin:
                        (seq, home, transport, key))
             cursor = db.execute(
                 "INSERT INTO inbox(profile_home,transport,session_key,source_event_id,kind,seq,owner_id,"
-                "owner_epoch,authorized_source,payload,state) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "owner_epoch,authorized_source,payload,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (home, transport, key, event_id, kind, seq, owner, epoch, source, payload,
-                 "accepted" if local_placeholder else "pending"),
+                 "accepted" if local_placeholder else "pending", time.time()),
             )
             return dict(db.execute("SELECT * FROM inbox WHERE id=?", (cursor.lastrowid,)).fetchone()), True
+
+    def prune_settled_inbox(self, owner: str, live_keys: set[str]) -> int:
+        """Retain seven days of settled evidence, never a transport replay obligation.
+
+        Seven days matches generation/transfer history and exceeds the wire
+        journal's 24-hour settled-evidence retention. The native poller's claim gate remains
+        authoritative after cleanup. Live buffers and received/processing wire
+        rows retain their receipts. Unattributed legacy rows stay put rather
+        than guessing which token owns them. A 1,000-row batch each minute
+        bounds write-lock work without putting database I/O on the event loop.
+        """
+        with self._transaction() as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('telegram_updates','polling_cursors')")}
+            if tables != {"telegram_updates", "polling_cursors"}:
+                return 0
+            return db.execute(
+                "DELETE FROM inbox WHERE id IN (SELECT i.id FROM inbox i "
+                "JOIN sessions s USING(profile_home,transport,session_key) "
+                "JOIN generations g ON g.id=i.owner_id "
+                "WHERE i.state IN ('accepted','refused','interrupted') AND i.created_at>0 AND i.created_at<? "
+                "AND (i.owner_id=? OR g.state IN ('exited','failed')) AND s.outstanding_work=0 "
+                "AND i.session_key NOT IN (SELECT value FROM json_each(?)) "
+                "AND i.transport='telegram' AND i.source_event_id!='' AND i.source_event_id NOT GLOB '*[^0-9]*' "
+                "AND EXISTS (SELECT 1 FROM polling_cursors c WHERE c.token_hash="
+                "json_extract(CAST(i.authorized_source AS TEXT),'$.token_hash')) "
+                "AND NOT EXISTS (SELECT 1 FROM telegram_updates u WHERE u.token_hash="
+                "json_extract(CAST(i.authorized_source AS TEXT),'$.token_hash') "
+                "AND u.update_id=CAST(i.source_event_id AS INTEGER) AND u.state IN ('received','processing')) "
+                "ORDER BY i.created_at,i.id LIMIT 1000)",
+                (time.time() - 7 * 86400, owner, json.dumps(sorted(live_keys))),
+            ).rowcount
 
     def pending(self, owner: str, home: str, transport: str, key: str) -> list[dict]:
         with self._transaction() as db:

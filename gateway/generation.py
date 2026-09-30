@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS inbox (
   session_key TEXT NOT NULL, source_event_id TEXT NOT NULL, kind TEXT NOT NULL,
   seq INTEGER NOT NULL, owner_id TEXT NOT NULL REFERENCES generations(id),
   owner_epoch INTEGER NOT NULL, authorized_source BLOB NOT NULL,
-  payload BLOB NOT NULL, state TEXT NOT NULL,
+  payload BLOB NOT NULL, state TEXT NOT NULL, created_at REAL NOT NULL DEFAULT 0,
   FOREIGN KEY(profile_home,transport,session_key) REFERENCES sessions(profile_home,transport,session_key),
   UNIQUE(profile_home,transport,source_event_id,kind),
   UNIQUE(profile_home,transport,session_key,seq)
@@ -166,6 +166,13 @@ class GenerationCoordinator(OwnedAdmissionMixin):
             if "attempt_nonce" not in transfer_columns:
                 conn.execute("ALTER TABLE generation_transfers ADD COLUMN attempt_nonce TEXT")
                 conn.execute("UPDATE generation_transfers SET attempt_nonce=? WHERE attempt_nonce IS NULL", (str(uuid.uuid4()),))
+            inbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(inbox)")}
+            if "created_at" not in inbox_columns:
+                conn.execute("ALTER TABLE inbox ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
+            # Old writers omit this additive column. Start their retention window
+            # only when a new coordinator sees them, never delete on migration.
+            conn.execute("UPDATE inbox SET created_at=? WHERE created_at=0", (time.time(),))
+            conn.execute("CREATE INDEX IF NOT EXISTS inbox_retention ON inbox(state,created_at)")
             version = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
             if version is None:
                 conn.execute("INSERT INTO schema_meta(key,value) VALUES('version', ?)",

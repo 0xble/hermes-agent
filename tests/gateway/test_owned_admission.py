@@ -144,6 +144,26 @@ def test_dead_owner_holds_pending_rows_without_replaying(tmp_path, monkeypatch):
 
 
 
+@pytest.mark.parametrize("dead", [False, True])
+def test_dead_owner_is_probed_once_against_locked_ownership(tmp_path, monkeypatch, dead):
+    store, old, new, epoch = _pair(tmp_path)
+    store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
+    probes = []
+    def probe(generation):
+        probes.append(generation["pid"])
+        # Ownership cannot change between the death proof and releasing claims.
+        with closing(store.connect()) as other:
+            other.execute("PRAGMA busy_timeout=1")
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                other.execute("BEGIN IMMEDIATE")
+        return dead
+    monkeypatch.setattr(store, "_owner_is_dead", probe)
+    row, fresh = store.enqueue("home-a", "telegram", "chat", "next", "message",
+                               _source(), b"next", new.id, epoch)
+    assert fresh and len(probes) == 1
+    assert row["owner_id"] == (new.id if dead else old.id)
+
+
 def test_first_message_after_owner_death_moves_to_successor(tmp_path, monkeypatch):
     store, old, new, epoch = _pair(tmp_path)
     store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)

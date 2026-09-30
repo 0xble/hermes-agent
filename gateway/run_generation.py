@@ -382,6 +382,11 @@ class ActiveGeneration:
             roster = self._telegram_adapters()
             if {row["token_hash"] for row in transfer} != set(roster):
                 raise RuntimeError("frozen token roster differs from live adapters")
+            # Invalid obligations must not pause a healthy polling/cron owner.
+            # claim_live validates again after flushing newly materialized work;
+            # that late failure uses the existing abort-and-rearm path.
+            if self.owned_routing is not None:
+                self.owned_routing.validate_live()
             stopped = []
             nonce = await asyncio.to_thread(self.coordinator.transfer_attempt_nonce,
                                             self.identity.id, self.epoch)
@@ -395,6 +400,15 @@ class ActiveGeneration:
                     await asyncio.to_thread(self.coordinator.record_poller_stopped,
                                             self.identity.id, self.epoch, token, receipt["safe_offset"],
                                             attempt_nonce=nonce)
+                # No more wire updates can extend a split text batch. Dispatch it
+                # while A still owns the lease, before the successor can receive it.
+                for adapter in roster.values():
+                    for key in tuple(getattr(adapter, "_pending_text_batches", {})):
+                        await adapter._flush_text_batch_now(key)
+                    for key in tuple(getattr(adapter, "_pending_photo_batches", {})):
+                        await adapter._flush_photo_batch_now(key)
+                    for key in tuple(getattr(adapter, "_media_group_events", {})):
+                        await adapter._flush_media_group_now(key)
                 # Freeze A's live session obligations before the lease can move.
                 if self.owned_routing is not None:
                     self.owned_routing.claim_live()
@@ -597,8 +611,6 @@ class ActiveGeneration:
         from tools.process_registry import process_registry
         # A claim covers only its session. A process from an ended cron turn can
         # have a key but no claim; stopping this owner would kill it before notice.
-        if process_registry.has_any_active() or process_registry.pending_watchers:
-            return False
         busy = (self.runner._active_work_count() or bool(self.runner._pending_approvals))
 
         def read_pending_work():
@@ -618,7 +630,8 @@ class ActiveGeneration:
             if not self._missing_deadline_warned:
                 logger.warning("generation missing drain deadline; using local drain cap")
                 self._missing_deadline_warned = True
-        if (busy or queued or claims) and time.time() < deadline:
+        if (busy or queued or claims or process_registry.has_any_active()
+                or process_registry.pending_watchers) and time.time() < deadline:
             return False
         if self._drain_stopping:
             return self._drain_stopped

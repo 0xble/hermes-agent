@@ -218,6 +218,28 @@ def test_successful_goal_turn_accepts_only_valid_completion_outcomes(
 # ── command.dispatch /goal ────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("configured,expected", [(0, 0), (7, 7), (-1, 20), ("invalid", 20), (None, 20)])
+def test_goal_budget_flows_through_command_and_prompt_manager(
+    server, session, hermes_home, configured, expected,
+):
+    import yaml
+    from hermes_cli import goals
+
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump({"goals": {"max_turns": configured}}))
+    sid, session_key, record = session
+    record["profile_home"] = str(hermes_home)
+    result = _call(server, "command.dispatch", name="goal", arg="ship it", session_id=sid)
+    assert result["result"]["type"] == "send"
+    with server._session_profile_runtime_scope(record):
+        assert goals.load_goal(session_key).max_turns == expected
+        mgr = server._active_goal_manager(record)
+        assert mgr.default_max_turns == expected
+        assert mgr.state.max_turns == expected
+    if expected == 0:
+        assert "∞" in result["result"]["notice"]
+
+
+
 
 
 def _exhaust_budget(session_key: str, goal_text: str = "finish the benchmark"):
