@@ -899,6 +899,26 @@ cron:
 
 Invalid, zero, and non-finite values fall back to 7200 seconds rather than disabling the cap. When the limit expires, the worker stops its identifiable descendant tree (including children in another process session), records one failed execution, and exits. If the process fingerprint cannot be verified or a descendant cannot be terminated, it leaves the result inspectable rather than declaring a successful kill.
 
+For a time-sensitive job, override only its detached-worker cap instead of shortening
+all cron runs in the profile:
+
+```bash
+hermes cron create "every 1h" "Produce a bounded status check" --hard-wall-timeout 1200
+hermes cron edit <job-id> --hard-wall-timeout 1200
+hermes cron edit <job-id> --hard-wall-timeout 0  # restore the profile cap
+```
+
+The CLI stores `hard_wall_timeout_seconds` on the job. Positive finite seconds
+override the profile cap; zero clears this **job** override, not the profile safety
+cap. Other jobs retain their existing limits. The timer starts when the detached
+worker adopts the execution and includes scripts, agent work, delegation and
+pre-completion persistence. Expiry records failure and uses the existing bounded
+descendant cleanup; it does not guarantee a partial report. Keep a shorter
+reporting deadline in the prompt if a useful partial answer is needed before the
+hard stop. This override applies only to restart-safe detached workers, not
+legacy in-process execution. It is operator-owned and absent from the agent
+cron tool schema.
+
 ## No-agent mode (script-only jobs)
 
 For recurring jobs that don't need LLM reasoning — classic watchdogs, disk/memory alerts, heartbeats, CI pings — pass `no_agent=True` at creation time. The scheduler runs your script on schedule and delivers its stdout directly, skipping the agent entirely:

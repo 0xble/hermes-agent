@@ -41,8 +41,11 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
     a, _ = stage_release(source, home, sha=revisions[0], uv=uv)
     b, _ = stage_release(source, home, sha=revisions[1], uv=uv)
     for name, release in (("A", a), ("B", b)):
-        shutil.copy2(repo / "cron" / "scheduler.py", release / "cron" / "scheduler.py")
-        shutil.copy2(repo / "hermes_cli" / "immutable_releases.py", release / "hermes_cli" / "immutable_releases.py")
+        # Exercise the candidate's scheduler and its job/deadline dependencies
+        # together; copying only the facade mixes it with the cloned base API.
+        for relative in ("cron/scheduler.py", "cron/scheduler_detached_worker.py", "cron/jobs.py",
+                         "hermes_cli/immutable_releases.py"):
+            shutil.copy2(repo / relative, release / relative)
         (release / "cron" / "s2_release_probe.py").write_text(f"IDENTITY = {name!r}\n", encoding="utf-8")
         # The worker's own startup hook waits for the script barrier. That keeps
         # a real detached process alive while current is changed under it.
