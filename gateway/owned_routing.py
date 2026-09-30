@@ -153,7 +153,7 @@ class OwnedRouting:
                                "home": home}, ensure_ascii=False).encode()
         payload = lambda: json.dumps({"callback": update.to_dict()}, ensure_ascii=False).encode()
         row, fresh = await asyncio.to_thread(
-            self.generation.coordinator.enqueue, home, "telegram", key,
+            self.generation.coordinator.enqueue_owned, home, "telegram", key,
             str(update.update_id), "callback", envelope, payload,
             self.generation.identity.id, self.generation.epoch)
         if row["owner_id"] == self.generation.identity.id:

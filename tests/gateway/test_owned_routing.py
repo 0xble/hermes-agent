@@ -559,6 +559,35 @@ async def test_late_dispatch_for_unowned_session_reaches_successor_once(tmp_path
     assert processed == [(new.id, "unowned")]
 
 
+@pytest.mark.parametrize("frozen", [True, False])
+@pytest.mark.asyncio
+async def test_late_callback_preserves_owned_session_or_forwards_to_successor(tmp_path, frozen):
+    store = GenerationCoordinator(tmp_path)
+    old, new = _identity("a", "old"), _identity("b", "new")
+    store.register(old, state="serving")
+    store.register(new, state="ready")
+    epoch = store.acquire_lease("active_generation", old.id)
+    key = "agent:default:telegram:chat-1"
+    if frozen:
+        store.freeze_session(str(tmp_path), "telegram", key, old.id, epoch)
+    store.request_transfer(old.id, new.id, epoch, set())
+    store.commit_transfer(old.id, new.id, epoch)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    route = OwnedRouting(SimpleNamespace(coordinator=store, identity=old, epoch=epoch,
+        runner=SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)))
+    update = SimpleNamespace(update_id=11, to_dict=lambda: {"update_id": 11})
+    assert await route.route_callback(SimpleNamespace(), update, source, key) is (not frozen)
+    assert await route.route_callback(SimpleNamespace(), update, source, key) is True
+    with store.connect() as db:
+        rows = db.execute("SELECT owner_id,state,payload FROM inbox").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["owner_id"] == (old.id if frozen else new.id)
+    assert rows[0]["state"] == ("accepted" if frozen else "pending")
+    if not frozen:
+        assert json.loads(rows[0]["payload"])["callback"] == {"update_id": 11}
+
+
 @pytest.mark.asyncio
 async def test_inbox_read_keeps_event_loop_responsive(tmp_path, monkeypatch):
     store = GenerationCoordinator(tmp_path)
