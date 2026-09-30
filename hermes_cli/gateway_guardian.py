@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import plistlib
+import sqlite3
 import subprocess
 import sys
 import time
@@ -246,7 +247,7 @@ def _run_overlap(home: Path, *, drain_seconds: float = 7200) -> str:
                 receipt(home, "rollback", "attempt", reason="successor process exited",
                         label=owner["label"])
                 try:
-                    _fence_failed_successor(owner["label"])
+                    _fence_failed_successor(home, owner, lease["epoch"])
                     proof = rollback_overlap(home, owner["id"], drainers[0]["id"], lease["epoch"],
                                              drain_seconds=drain_seconds)
                 except (RuntimeError, OSError) as failure:
@@ -387,17 +388,74 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     return "failed"
 
 
-def _fence_failed_successor(label: str) -> None:
-    """Boot out a dead successor before rollback inspects its launchd label.
+def _loaded_successor_identity(domain: str, home: Path, owner: dict) -> None:
+    """Require the loaded job's pinned environment, not the mutable plist on disk."""
+    result = subprocess.run(["launchctl", "print", f"{domain}/{owner['label']}"],
+                            capture_output=True, text=True, encoding="utf-8", timeout=5)
+    if result.returncode:
+        raise RuntimeError("successor loaded job identity is unavailable")
+    # launchctl prints an explicit environment block; inherited/default blocks
+    # cannot authorize a home-scoped destructive command.
+    environment = {}
+    in_environment = False
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if text == "environment = {":
+            if in_environment or environment:
+                raise RuntimeError("successor loaded job environment is ambiguous")
+            in_environment = True
+        elif in_environment and text == "}":
+            in_environment = False
+        elif in_environment:
+            key, separator, value = text.partition(" => ")
+            if separator:
+                if key in environment:
+                    raise RuntimeError("successor loaded job environment is ambiguous")
+                environment[key] = value
+    if (in_environment or environment.get("HERMES_HOME") != str(home.resolve()) or
+            environment.get("HERMES_RELEASE_SHA") != owner["release_sha"] or
+            environment.get("HERMES_LAUNCHD_LABEL") != owner["label"]):
+        raise RuntimeError("successor loaded job identity does not match home and release")
 
-    KeepAlive can have started a replacement between the PID death probe and
-    rollback_overlap's fence check. This helper fences by label only; it does
-    not verify that a replacement has not acquired a newer generation lease.
-    rollback_overlap checks generation identity only after this bootout.
+
+def _fence_failed_successor(home: Path, owner: dict, epoch: int) -> None:
+    """Serialize lease validation and bootout against registration/takeover.
+
+    Use the existing SQLite write fence, with no durable transient state. A
+    crashed guardian releases it automatically. No control-socket call runs
+    while holding this lock, and rollback acquires its own locks only after
+    this transaction closes. The one-shot CLI owns these bounded waits, never
+    the gateway event loop.
     """
+    from contextlib import closing
+    from gateway.generation import _boot_id
+    from gateway.status import _pid_exists
+
+    label = owner["label"]
     domain = _gateway_domain(label, None)
-    if _launch_state(domain, label) == "loaded":
+    loaded = _launch_state(domain, label) == "loaded"
+    if loaded:
+        _loaded_successor_identity(domain, home, owner)
+    # Do not initialize a missing/wrong coordinator while proving ownership.
+    path = home / "gateway-coordinator.db"
+    with closing(sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=1,
+                                isolation_level=None)) as db, db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN IMMEDIATE")
+        lease = db.execute("SELECT generation_id,epoch,state FROM leases "
+                           "WHERE resource='active_generation'").fetchone()
+        failed = db.execute("SELECT * FROM generations WHERE id=?", (owner["id"],)).fetchone()
+        if (lease is None or tuple(lease) != (owner["id"], epoch, "active") or failed is None or
+                any(failed[key] != owner[key] for key in
+                    ("label", "pid", "boot_id", "start_fingerprint", "release_sha")) or
+                failed["boot_id"] != _boot_id() or _pid_exists(failed["pid"]) or
+                failed["state"] not in {"serving", "ready"}):
+            raise RuntimeError("successor lease or process identity changed before fence")
+        if not loaded:
+            return
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=True, timeout=15)
+    # Nothing destructive remains. Release the writer before waiting for
+    # launchd so the healthy drainer can persist its ongoing work.
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if _launch_state(domain, label) == "unloaded":
@@ -456,7 +514,8 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                     "release_acknowledgement_timeout_seconds", 180.0)
             assert grace is not None
             return _run(home, Path(plist), label, grace=float(grace), domain=domain)
-        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, yaml.YAMLError) as exc:
+        except (OSError, ValueError, KeyError, RuntimeError, sqlite3.Error,
+                subprocess.SubprocessError, yaml.YAMLError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"
 

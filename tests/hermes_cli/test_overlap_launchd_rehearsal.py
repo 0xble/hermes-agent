@@ -409,7 +409,14 @@ def test_launchd_guardian_rolls_back_keepalive_successor_failure(request, tmp_pa
         assert time.monotonic() - failure_at < 60, "in-flight result exceeded the 60-second recovery bound"
         with api.lock:
             assert api.maximum == 1 and not api.errors
-            assert not any("Operation interrupted" in item["text"] for item in api.sent)
+            assert not any("⏳ Gateway" in item["text"] or "Operation interrupted" in item["text"]
+                           or "previous turn was interrupted" in item["text"].lower()
+                           or "session restored" in item["text"].lower() for item in api.sent)
+        # The deterministic fake can mask recovery guidance with a normal
+        # answer. Reject resume injection at the observed model boundary too.
+        assert not any("[System note: The previous turn was interrupted" in
+                       str(message.get("content", ""))
+                       for body in llm.main_requests() for message in body.get("messages", []))
         assert len(sent("restored-a-answer")) == len(sent("old-turn-complete")) == 1
         print(f"NATIVE_LAUNCHD guardian_failure={elapsed:.2f}s max_pollers={api.maximum} "
               f"lease_epoch={lease['epoch']}", flush=True)
