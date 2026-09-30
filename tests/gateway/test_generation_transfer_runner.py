@@ -889,3 +889,52 @@ async def test_legacy_takeover_backs_off_and_warns_once(tmp_path, monkeypatch, c
     assert attempts <= 8, (attempts, intervals)
     assert intervals[0] >= 1 and max(intervals) >= 30, intervals
     assert len([r for r in caplog.records if "retrying slowly" in r.message]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True], ids=["before-pause", "materialized-during-flush"])
+async def test_invalid_live_key_retains_polling_and_cron_after_transfer_abort(tmp_path, late):
+    import threading
+    from types import SimpleNamespace
+    from gateway.config import Platform
+    from gateway.owned_routing import OwnedRouting
+
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="old", label="old")
+    new = GenerationIdentity.create(release_sha="new", label="new")
+    db.register(old, state="serving")
+    db.register(new, state="ready")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    adapter = PollingAdapter("fake-token")
+    adapter.platform = Platform.TELEGRAM
+    adapter._active_sessions = {} if late else {"unscoped": object()}
+    adapter._pending_messages = {}
+    adapter._pending_text_batches = {"agent:default:telegram:pending": object()} if late else {}
+    adapter._pending_photo_batches = {}
+    adapter._media_group_events = {}
+
+    async def flush(key):
+        adapter._pending_text_batches.pop(key)
+        adapter._active_sessions["unscoped"] = object()
+
+    adapter._flush_text_batch_now = flush
+    provider = Mock()
+    active.cron_provider = provider
+    active.cron_stop = threading.Event()
+    runner = SimpleNamespace(adapters={"telegram": adapter}, _pending_approvals={},
+                             _overlap_draining=False, _overlap_cron_start_kwargs={})
+    active.runner = runner
+    active.owned_routing = OwnedRouting(active)
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    with pytest.raises(RuntimeError, match="unscoped session obligation"):
+        await active.transfer_requested(new.id)
+    assert adapter.stopped == late
+    assert adapter.resumed == late
+    assert runner._overlap_draining is False
+    assert not active.cron_stop.is_set()
+    provider.stop.assert_not_called()
+    provider.start.assert_not_called()
+    assert not active._external_cron_stopped
+    assert db.leases()[0]["generation_id"] == old.id
+    assert active._drain_task is None

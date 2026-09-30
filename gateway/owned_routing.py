@@ -95,12 +95,16 @@ class OwnedRouting:
             keys.update(approvals)
         return keys
 
+    def validate_live(self):
+        keys = self._live_keys()
+        if any(not key.startswith("agent:") for key in keys):
+            raise RuntimeError("unscoped session obligation during transfer")
+        return keys
+
     def claim_live(self):
         from gateway.session import profile_from_session_key_namespace
         from hermes_cli.profiles import get_profile_dir
-        for key in self._live_keys():
-            if not key.startswith("agent:"):
-                raise RuntimeError("unscoped session obligation during transfer")
+        for key in self.validate_live():
             profile = profile_from_session_key_namespace(key.split(":", 2)[1])
             home = str(self.generation.home if profile == "default" else get_profile_dir(profile))
             self.generation.coordinator.freeze_session(

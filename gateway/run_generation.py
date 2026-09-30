@@ -363,6 +363,11 @@ class ActiveGeneration:
             roster = self._telegram_adapters()
             if {row["token_hash"] for row in transfer} != set(roster):
                 raise RuntimeError("frozen token roster differs from live adapters")
+            # Invalid obligations must not pause a healthy polling/cron owner.
+            # claim_live validates again after flushing newly materialized work;
+            # that late failure uses the existing abort-and-rearm path.
+            if self.owned_routing is not None:
+                self.owned_routing.validate_live()
             stopped = []
             nonce = await asyncio.to_thread(self.coordinator.transfer_attempt_nonce,
                                             self.identity.id, self.epoch)

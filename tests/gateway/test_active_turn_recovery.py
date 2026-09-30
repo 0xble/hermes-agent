@@ -684,3 +684,166 @@ async def test_turn_marker_start_survives_a_timezone_change_across_the_crash(tmp
     assert _entry_for(store, source).resume_pending is True
     assert sweep_recoverable(deliverable_platforms={"discord"}) == []
     _close_store_db(store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["shutdown_timeout", "restart_timeout"])
+@pytest.mark.parametrize("successor", [False, True])
+async def test_cleanly_released_claim_does_not_block_later_recovery(tmp_path, monkeypatch, reason, successor):
+    from gateway.generation import GenerationCoordinator, GenerationIdentity
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, store = _db_runner(tmp_path)
+    runner.config = GatewayConfig(overlap_handover_enabled=True)
+    source = _turn(store, "released", marked=True, reply=None)
+    entry = _entry_for(store, source)
+    store.mark_resume_pending(entry.session_key, reason=reason)
+    coordinator = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="old", label="old", pid=456789)
+    coordinator.register(old, state="exited")
+    coordinator.claim_session(str(tmp_path), "discord", entry.session_key, old.id, 1)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid != old.pid)
+    if successor:
+        from gateway.status import _get_process_start_time
+        current = GenerationIdentity.create(release_sha="current", label="current",
+            start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
+        coordinator.register(current, state="serving")
+        coordinator.acquire_lease("active_generation", current.id)
+    coordinator.release_exited_owner(old.id)
+    marker = tmp_path / ".clean_shutdown"
+    marker.write_text("clean", encoding="utf-8")
+    try:
+        if successor:
+            # Reassignment is not release by the current living owner. Preserve
+            # it even at zero work: startup cannot prove that owner is finished.
+            assert await runner._consume_clean_shutdown_marker(marker) == 0
+            assert runner._resume_pending_candidates(record_boot=False) == []
+            assert entry.active_turn_token is not None
+            return
+        assert await runner._consume_clean_shutdown_marker(marker) == 1
+        assert runner._resume_pending_candidates(record_boot=False) == [entry]
+        # A later, unrelated crash in this same lane is not a historical owner's cut.
+        store.clear_resume_pending(entry.session_key)
+        store.mark_turn_active(entry.session_key)
+        assert await runner._recover_unclean_sessions() == (1, 0)
+        assert entry.resume_pending
+        assert entry.active_turn_token is None
+    finally:
+        _close_store_db(store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim", ["live", "dead-unfinished", "dead-interrupted", "dead-ambiguous", "dead-pending", "interrupted", "other-home", "other-transport"])
+async def test_recovery_fence_matches_current_claim_scope_and_cut_evidence(tmp_path, monkeypatch, claim):
+    from gateway.generation import GenerationCoordinator, GenerationIdentity
+    from gateway.status import _get_process_start_time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, store = _db_runner(tmp_path)
+    runner.config = GatewayConfig(overlap_handover_enabled=True)
+    source = _turn(store, "scoped", marked=True, reply=None)
+    entry = _entry_for(store, source)
+    token = entry.active_turn_token
+    coordinator = GenerationCoordinator(tmp_path)
+    owner = GenerationIdentity.create(release_sha="owner", label="owner",
+        start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
+    coordinator.register(owner, state="failed" if claim == "dead-unfinished" else "serving")
+    home = str(tmp_path / "other") if claim == "other-home" else str(tmp_path)
+    transport = "telegram" if claim == "other-transport" else "discord"
+    coordinator.claim_session(home, transport, entry.session_key, owner.id, 1, outstanding_work=1)
+    if claim.startswith("dead-"):
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    if claim in {"interrupted", "dead-interrupted"}:
+        # The cut tombstone survives even after a released claim moves to a live owner.
+        with coordinator.connect() as db:
+            db.execute("UPDATE sessions SET state='interrupted',outstanding_work=0")
+    if claim == "dead-ambiguous":
+        with coordinator.connect() as db:
+            db.execute("UPDATE sessions SET outstanding_work=0")
+            db.execute("UPDATE generations SET state='failed'")
+    if claim == "dead-pending":
+        epoch = coordinator.acquire_lease("active_generation", owner.id)
+        coordinator.enqueue(home, transport, entry.session_key, "pending", "message",
+                            b'{"version":1,"authorized":true,"sender":"user"}', b"work", owner.id, epoch)
+        with coordinator.connect() as db:
+            db.execute("UPDATE sessions SET outstanding_work=0")
+            db.execute("UPDATE generations SET state='exited'")
+    try:
+        expected = int(claim in {"other-home", "other-transport"})
+        assert await runner._recover_unclean_sessions() == (expected, 0)
+        assert entry.resume_pending == bool(expected)
+        assert entry.active_turn_token == (None if expected else token)
+        store.mark_resume_pending(entry.session_key, reason="shutdown_timeout")
+        assert runner._resume_pending_candidates(record_boot=False) == ([entry] if expected else [])
+    finally:
+        _close_store_db(store)
+
+
+def test_startup_owner_probe_uses_read_snapshot_without_blocking_coordinator_writes(tmp_path, monkeypatch):
+    from gateway.generation import GenerationCoordinator, GenerationIdentity
+    from gateway.owned_admission import OwnedAdmissionMixin
+    from gateway.run_startup_recovery import startup_recovery_fences
+    from gateway.status import _get_process_start_time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, store = _db_runner(tmp_path)
+    runner.config = GatewayConfig(overlap_handover_enabled=True)
+    source = _turn(store, "read-snapshot", marked=True, reply=None)
+    entry = _entry_for(store, source)
+    coordinator = GenerationCoordinator(tmp_path)
+    owner = GenerationIdentity.create(release_sha="owner", label="owner",
+        start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
+    coordinator.register(owner, state="serving")
+    coordinator.claim_session(str(tmp_path), "discord", entry.session_key, owner.id, 1, outstanding_work=1)
+    original = OwnedAdmissionMixin._owner_is_dead
+    probed = []
+
+    def probe(row):
+        # OS identity lookup must not monopolize the single coordinator writer.
+        with coordinator.connect() as db:
+            db.execute("PRAGMA busy_timeout=50")
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("UPDATE generations SET heartbeat_at=heartbeat_at WHERE id=?", (owner.id,))
+            db.rollback()
+        probed.append(row["id"])
+        return original(row)
+
+    monkeypatch.setattr(OwnedAdmissionMixin, "_owner_is_dead", staticmethod(probe))
+    try:
+        assert startup_recovery_fences(runner) == (frozenset({entry.session_key}), frozenset({entry.session_key}))
+        assert probed == [owner.id]
+    finally:
+        _close_store_db(store)
+
+
+def test_recovery_scope_follows_runtime_profile_home_a_b_a(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from gateway.generation import GenerationCoordinator, GenerationIdentity
+    from gateway.run_startup_recovery import startup_recovery_fences
+    from gateway.status import _get_process_start_time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    homes = {name: tmp_path / name for name in ("alpha", "beta")}
+    for home in homes.values():
+        home.mkdir()
+    monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: homes.get(name, tmp_path))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name in homes)
+    runner, store = _db_runner(tmp_path)
+    runner.config = store.config = GatewayConfig(overlap_handover_enabled=True, multiplex_profiles=True)
+    coordinator = GenerationCoordinator(tmp_path)
+    owner = GenerationIdentity.create(release_sha="owner", label="owner",
+        start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
+    coordinator.register(owner, state="serving")
+    try:
+        for name in ("alpha", "beta", "alpha"):
+            source = replace(_make_source("profile-lane"), profile=name)
+            entry = store.get_or_create_session(source)
+            # The same session key recorded for another home does not own this lane.
+            coordinator.claim_session(str(homes["beta"]), "discord", entry.session_key,
+                                      owner.id, 1, outstanding_work=1)
+            live, unsafe = startup_recovery_fences(runner)
+            assert (entry.session_key in live) == (name == "beta")
+            assert (entry.session_key in unsafe) == (name == "beta")
+            assert runner._resolve_profile_home_for_source(source) == homes[name]
+    finally:
+        _close_store_db(store)
