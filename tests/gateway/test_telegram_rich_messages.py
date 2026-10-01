@@ -148,6 +148,66 @@ def test_literal_hash_normalization_preserves_markdown_regions(content):
     assert escape_literal_hash_prefixes(escaped) == escaped
 
 
+# --- Adjacent footnote refs: Telegram merges [^2][^3] into one superscript run that reads "23" ---
+
+
+def test_adjacent_footnote_refs_get_a_superscript_separator():
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
+
+    content = (
+        "Two sources.[^2][^3] Three.[^1][^2][^note] One.[^4]\n\n"
+        "Spaced [^1] [^2] and inline `[^1][^2]` stay.\n\n"
+        "```\n[^1][^2]\n```\n\n"
+        "$$\nx[^1][^2]\n$$\n\n\\[x=[^1][^2]\\]\n\n"
+        "    [^1][^2] indented code\n\n"
+        "Multiline `code\n[^1][^2]` span.\n\n"
+        "A [link](https://example.com/[^1][^2]), <a title=\"[^1][^2]\">html</a>, "
+        "<https://example.com/[^1][^2]> and escaped \\[^1][^2] stay.\n\n"
+        "Nested [x](https://e.com/a(b(c[^1][^2]))) and <a title=\"x > [^1][^2]\">y</a> stay.\n\n"
+        "Math \\(x[^1][^2]\\) and $$y[^1][^2]$$ stay.\n\n"
+        "- item\n\n      [^1][^2] code inside a list item\n\nClosing prose.\n\n"
+        "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
+    )
+    result = normalize_footnotes(content)
+    assert result == content.replace("[^2][^3]", "[^2]<sup>,</sup>[^3]", 1).replace(
+        "[^1][^2][^note]", "[^1]<sup>,</sup>[^2]<sup>,</sup>[^note]", 1)
+    assert normalize_footnotes(result) == result
+
+
+def test_footnote_defs_after_a_list_get_a_spacer():
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
+
+    defs = "[^1]: [One](https://example.com/1)\n[^2]: [Two](https://example.com/2)"
+    for body in ("- a.[^1]\n- b.[^2]\n\n", "1. a.[^1]\n\n   more.[^2]\n\n", "- a\nlazy.[^1]\n"):
+        result = normalize_footnotes(body + defs)
+        assert result == body.rstrip("\n") + "\n\n<!-- -->\n" + defs
+        assert normalize_footnotes(result) == result
+    for unchanged in (
+        "Para.[^1]\n\n" + defs,
+        "- a\n\nTail.[^1]\n\n" + defs,
+        "    indented prose.[^1]\n\n" + defs,
+        "```\n- a\n[^1]: x\n```",
+    ):
+        assert normalize_footnotes(unchanged) == unchanged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit", "draft"])
+async def test_rich_delivery_separates_adjacent_footnote_refs(operation):
+    adapter = _make_adapter({"rich_messages": "always", "rich_drafts": True})
+    content = "Cited twice.[^2][^3]\n\n[^2]: <https://example.com/2>\n[^3]: <https://example.com/3>"
+    if operation == "send":
+        assert (await adapter.send("12345", content)).success
+    elif operation == "edit":
+        assert (await adapter.edit_message("12345", "123", content, finalize=True)).success
+    else:
+        assert await adapter.send_draft("12345", 123, content)
+    assert adapter._bot is not None
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    assert "[^2]<sup>,</sup>[^3]" in markdown
+    assert "[^2]: <https://example.com/2>" in markdown
+
+
 @pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()
