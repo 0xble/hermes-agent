@@ -825,6 +825,45 @@ def test_batch_rate_limit_does_not_fall_back_and_cools_down(monkeypatch, tmp_pat
     assert (op._cooldown_path(tmp_path).stat().st_mode & 0o777) == 0o600
 
 
+@pytest.mark.parametrize("reference", ["op://V/$NO_COLOR/a", "op://V/I #other/a", 'op://V/"I"/a', r"op://V/I\x/a", "op://V/I\nother/a", "op://V/I\rother/a"])
+def test_batch_dotenv_sensitive_references_use_exact_read(monkeypatch, tmp_path, reference):
+    calls = []
+    safe = "op://V/I/a"
+
+    def run_cli(command, **kwargs):
+        calls.append(command)
+        if command[1] == "read":
+            return _ok("exact:" + command[-1] + "\n")
+        mapping = dict(line.split("=", 1) for line in Path(command[command.index("--env-file") + 1]).read_text().splitlines())
+        # op run applies dotenv parsing before secret resolution. The documented
+        # $VAR expansion alone can select another existing item without an error.
+        expanded = {name: ref.replace("$NO_COLOR", kwargs["env"]["NO_COLOR"]) for name, ref in mapping.items()}
+        Path(command[command.index("--") + 4]).write_text(json.dumps({name: "exact:" + ref for name, ref in expanded.items()}))
+        return _ok("")
+
+    monkeypatch.setattr(op, "run_cli", run_cli)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"SAFE": safe, "SENSITIVE": reference, "COPY": reference}, binary=tmp_path / "op", use_cache=False)
+    assert secrets == {"SAFE": "exact:" + safe, "SENSITIVE": "exact:" + reference, "COPY": "exact:" + reference}
+    assert warnings == []
+    assert [call[1] for call in calls] == ["run", "read"]
+    assert all(call[-1] == reference for call in calls if call[1] == "read")
+
+
+def test_batch_rate_limit_also_stops_exact_sensitive_reads(monkeypatch, tmp_path):
+    calls = []
+    def rate_limited(command, **kwargs):
+        calls.append(command)
+        return _err(1, "Too many requests. Your client has been rate-limited")
+    monkeypatch.setattr(op, "run_cli", rate_limited)
+    refs = {"SAFE": "op://V/I/a", "SENSITIVE": "op://V/$NO_COLOR/a"}
+    for _ in range(2):
+        secrets, warnings = op.fetch_onepassword_secrets(references=refs, binary=tmp_path / "op", home_path=tmp_path)
+        assert secrets == {}
+        assert warnings
+    assert len(calls) == 1 and calls[0][1] == "run"
+
+
 def test_reason_survives_a_long_item_path(monkeypatch, tmp_path):
     """op names the vault and item before the reason; a long item name must not hide it."""
     fake_op = tmp_path / "op"

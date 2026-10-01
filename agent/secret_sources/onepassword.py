@@ -201,6 +201,12 @@ def _op_child_env(token_value: str) -> Dict[str, str]:
     return env
 
 
+def _batch_safe_reference(reference: str) -> bool:
+    # op run parses dotenv before resolving refs. Keep parser-sensitive paths on
+    # op read's exact argv contract instead of inventing another quoting parser.
+    return reference == reference.strip() and not any(c in reference for c in "\n\r$#\"'\\")
+
+
 def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
                   token_value: str = "") -> Dict[str, str]:
     """Resolve unique refs in one op invocation, never putting values on stdout.
@@ -208,8 +214,8 @@ def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
     The temporary directory is private; both files are 0600 and removed on every
     path. The child receives only synthetic env keys, not Hermes's other secrets.
     """
-    if any("\n" in ref or "\r" in ref for ref in references.values()):
-        raise RuntimeError("op run cannot encode a newline in a secret reference")
+    if any(not _batch_safe_reference(ref) for ref in references.values()):
+        raise RuntimeError("secret reference requires exact op read resolution")
     unique = list(dict.fromkeys(references.values()))
     names = [f"HERMES_OP_BATCH_{i}" for i in range(len(unique))]
     scratch = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
@@ -332,8 +338,10 @@ def fetch_onepassword_secrets(
     else:
         pending = {name: valid[name] for name in sorted(valid) if name not in secrets}
         if pending:
+            batch = {name: ref for name, ref in pending.items() if _batch_safe_reference(ref)}
             try:
-                secrets.update(_run_op_batch(op, pending, account=account, token_value=token_value))
+                if batch:
+                    secrets.update(_run_op_batch(op, batch, account=account, token_value=token_value))
             except (RuntimeError, OSError) as exc:
                 kind = _classify_op_error(str(exc))
                 if kind is ErrorKind.RATE_LIMITED:
@@ -342,20 +350,25 @@ def fetch_onepassword_secrets(
                     failure_kinds.append(kind)
                     if use_cache:
                         _record_rate_limit_cooldown(cooldown_key, home_path)
-                else:
-                    # One invalid ref makes op run fail wholesale; isolate the failure
-                    # with the existing per-ref path and preserve partial cache semantics.
-                    for name, ref in pending.items():
-                        try:
-                            secrets[name] = _run_op_read(op, ref, account=account, token_value=token_value)
-                        except RuntimeError as read_exc:
-                            warnings.append(str(read_exc))
-                            read_kind = _classify_op_error(str(read_exc))
-                            failure_kinds.append(read_kind)
-                            if read_kind is ErrorKind.RATE_LIMITED:
-                                if use_cache:
-                                    _record_rate_limit_cooldown(cooldown_key, home_path)
-                                break
+            if ErrorKind.RATE_LIMITED not in failure_kinds:
+                # Isolate failed batches and parser-sensitive refs through the
+                # existing exact read path, preserving successful partial results.
+                resolved_refs: Dict[str, str] = {}
+                for name, ref in pending.items():
+                    if name in secrets:
+                        continue
+                    try:
+                        if ref not in resolved_refs:
+                            resolved_refs[ref] = _run_op_read(op, ref, account=account, token_value=token_value)
+                        secrets[name] = resolved_refs[ref]
+                    except RuntimeError as read_exc:
+                        warnings.append(str(read_exc))
+                        read_kind = _classify_op_error(str(read_exc))
+                        failure_kinds.append(read_kind)
+                        if read_kind is ErrorKind.RATE_LIMITED:
+                            if use_cache:
+                                _record_rate_limit_cooldown(cooldown_key, home_path)
+                            break
 
     # An IDENTITY rejection fails every read it is asked to make; a single item the
     # identity may not read is a permission on that item, and `op` reports both as
