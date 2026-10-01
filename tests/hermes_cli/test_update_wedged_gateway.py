@@ -942,3 +942,49 @@ def test_review3_drifted_live_process_still_receives_guarded_signals(monkeypatch
     monkeypatch.setattr(gateway_cli, "_wait_for_pid_exit", lambda pid, timeout, **_: len(sent) > 1)
     assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000, term_grace=0, kill_wait=0) is True
     assert len(sent) == 2
+
+
+@_NEEDS_UNIX_SOCKETS
+def test_review5_successor_proof_survives_draining_writer_of_shared_heartbeat(tmp_path):
+    """A draining generation keeps the shared file; the successor's per-PID copy is the evidence."""
+    write_loop_heartbeat(pid=5001, home=tmp_path, extra={"loop_tick_socket": True})
+    write_loop_heartbeat(pid=4242, home=tmp_path, extra={"loop_tick_socket": True})
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path, get_pid_loop_heartbeat_path
+    own = get_pid_loop_heartbeat_path(tmp_path, 5001)
+    stamp = time.time() - 40
+    os.utime(own, (stamp, stamp))
+    _silent_socket_node(get_loop_tick_socket_path(tmp_path, 5001))
+    assert json.loads(get_loop_heartbeat_path(tmp_path).read_text(encoding="utf-8"))["pid"] == 4242
+    assert gateway_cli.probe_gateway_loop_liveness(
+        5001, home=tmp_path, stale_after=35, tick_timeout=0.2, tick_gap_s=0.05) == gateway_cli.GATEWAY_LOOP_WEDGED
+    # The default 90 s threshold stays unchanged for every other caller.
+    assert gateway_cli.probe_gateway_loop_liveness(
+        5001, home=tmp_path, tick_timeout=0.2, tick_gap_s=0.05) == gateway_cli.GATEWAY_LOOP_UNKNOWN
+
+
+@_NEEDS_UNIX_SOCKETS
+def test_review5_answering_successor_is_never_wedged_by_its_own_stale_copy(tmp_path):
+    write_loop_heartbeat(pid=5002, home=tmp_path, extra={"loop_tick_socket": True})
+    write_loop_heartbeat(pid=4242, home=tmp_path, extra={"loop_tick_socket": True})
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path, get_pid_loop_heartbeat_path
+    own = get_pid_loop_heartbeat_path(tmp_path, 5002)
+    stamp = time.time() - 600
+    os.utime(own, (stamp, stamp))
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    path = get_loop_tick_socket_path(tmp_path, 5002)
+    srv.bind(str(path)); srv.listen(4); srv.settimeout(0.1)
+    stop = threading.Event()
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            with conn:
+                conn.sendall(b"1")
+    thread = threading.Thread(target=serve, daemon=True); thread.start()
+    try:
+        assert gateway_cli.probe_gateway_loop_liveness(
+            5002, home=tmp_path, stale_after=35) == gateway_cli.GATEWAY_LOOP_ALIVE
+    finally:
+        stop.set(); srv.close(); thread.join(2)

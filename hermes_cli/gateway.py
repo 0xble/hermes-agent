@@ -511,14 +511,22 @@ def probe_gateway_loop_liveness(
         stale_budget = max(float(stale_after), 0.0)
     except (TypeError, ValueError):
         stale_budget = DEFAULT_LOOP_LIVENESS_STALE_AFTER_S
-    try:
-        from gateway.shutdown_watchdog import get_loop_heartbeat_path
-        path = get_loop_heartbeat_path(home)
-        mtime = path.stat().st_mtime
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        heartbeat_pid = int(payload.get("pid", 0))
-    except Exception:
+    def read(locate):
+        try:
+            path = locate()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return path.stat().st_mtime, payload, int(payload.get("pid", 0))
+        except Exception:
+            return None
+    from gateway import shutdown_watchdog
+    entry = read(lambda: shutdown_watchdog.get_loop_heartbeat_path(home))
+    if (entry is None or entry[2] != int(pid)) and int(pid) > 0:
+        # Overlapping generations share the home file; a draining generation keeps
+        # rewriting it. A successor's own per-PID copy is then the evidence.
+        entry = read(lambda: shutdown_watchdog.get_pid_loop_heartbeat_path(home, int(pid))) or entry
+    if entry is None:
         return GATEWAY_LOOP_UNKNOWN
+    mtime, payload, heartbeat_pid = entry
     if heartbeat_pid <= 0 or int(pid) <= 0 or heartbeat_pid != int(pid):
         # Heartbeat is not this process's (old version, starting up, stale file): not evidence.
         return GATEWAY_LOOP_UNKNOWN

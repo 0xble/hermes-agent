@@ -11,6 +11,7 @@ from hermes_cli import immutable_releases as releases
 from hermes_cli import gateway_forward_update as forward
 
 REAL_FRESH_REPLY = forward._fresh_reply
+from hermes_cli.gateway import probe_gateway_loop_liveness as REAL_PROBE  # noqa: E402
 
 
 def release(home, sha, capable=True):
@@ -1464,7 +1465,10 @@ def test_review3_poller_deadline_names_the_real_failure(rig, monkeypatch):
 
 
 def test_review4_silent_successor_post_commit_wait_keeps_rollback_budget(rig, monkeypatch):
-    """Realistic timings: a silent B plus a 13 s A-prime startup still rolls back inside 60 s."""
+    """Budget arithmetic: a 13 s A-prime startup plus the probe still fits 60 s.
+
+    The probe is stubbed here. TestReview5RealWedgeProof proves the real probe can fire.
+    """
     rig.supervisor.mode = 'wedged'
     fixture_handover = forward.handover_to_generation
     def handover(home, to_id, **kwargs):
@@ -1501,3 +1505,126 @@ def test_review4_late_recovery_replaces_a_proven_wedged_successor(rig, monkeypat
     assert any(event[0] == 'bounded-stop' for event in rig.events)
     lease = rig.db.leases()[0]
     assert forward._row(rig.db, lease['generation_id'])['release_sha'] == rig.a.name
+
+
+
+
+@pytest.mark.macos_only
+class TestReview5RealWedgeProof:
+    """Real probe and tick socket. B's heartbeat is fresh at commit; draining A keeps the shared file."""
+
+    @pytest.fixture()
+    def tmp_path(self):
+        import shutil
+        import tempfile
+        # macOS AF_UNIX paths stop near 104 bytes; the default temp root is too deep.
+        path = Path(tempfile.mkdtemp(prefix='hw5-', dir='/tmp')).resolve()  # windows-footgun: ok — macos_only
+        try:
+            yield path
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    @staticmethod
+    def _arm(rig, monkeypatch, *, answer):
+        """Give B a real witness. Elapsed fixture time ages only B's own heartbeat copy."""
+        import os
+        import socket
+        import threading
+        from gateway.shutdown_watchdog import (get_loop_heartbeat_path, get_loop_tick_socket_path,
+                                               get_pid_loop_heartbeat_path, write_loop_heartbeat)
+        monkeypatch.setattr('hermes_cli.gateway.probe_gateway_loop_liveness', REAL_PROBE)
+        armed, servers = [], []
+
+        def a_rewrites_shared_file():
+            write_loop_heartbeat(pid=rig.old.pid, home=rig.home, extra={'loop_tick_socket': True})
+
+        bootstrap = rig.supervisor.bootstrap
+        def bootstrap_and_arm(row, *args, **kwargs):
+            result = bootstrap(row, *args, **kwargs)
+            claimed = forward._row(rig.db, row['id'])
+            if claimed['release_sha'] == rig.b.name and claimed['pid']:
+                write_loop_heartbeat(pid=claimed['pid'], home=rig.home, extra={'loop_tick_socket': True})
+                node = get_loop_tick_socket_path(rig.home, claimed['pid'])
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(str(node))
+                srv.listen(8)
+                if answer:
+                    srv.settimeout(0.05)
+                    def serve():
+                        while True:
+                            try:
+                                conn, _ = srv.accept()
+                            except socket.timeout:
+                                continue
+                            except OSError:
+                                return
+                            with conn:
+                                conn.sendall(b'1')
+                    threading.Thread(target=serve, daemon=True).start()
+                    servers.append(srv)
+                else:
+                    srv.close()  # node stays: connect is refused, a silent witness
+                armed.append(claimed)
+                a_rewrites_shared_file()
+            return result
+        monkeypatch.setattr(rig.supervisor, 'bootstrap', bootstrap_and_arm)
+
+        def age(seconds):
+            for row in armed:
+                own = get_pid_loop_heartbeat_path(rig.home, row['pid'])
+                stamp = own.stat().st_mtime - seconds
+                os.utime(own, (stamp, stamp))
+            a_rewrites_shared_file()
+            assert json.loads(get_loop_heartbeat_path(rig.home).read_text(encoding='utf-8'))['pid'] == rig.old.pid
+
+        def sleep(seconds):
+            rig.clock.value += seconds
+            age(seconds)
+        monkeypatch.setattr(forward, '_sleep', sleep)
+
+        fixture_handover = forward.handover_to_generation
+        def handover(home, to_id, **kwargs):
+            if forward._row(rig.db, to_id)['release_sha'] == rig.a.name and armed:
+                sleep(kwargs['timeout'])  # a silent successor never acknowledges
+            return fixture_handover(home, to_id, **kwargs)
+        monkeypatch.setattr(forward, 'handover_to_generation', handover)
+        return armed, age, servers
+
+    def test_fresh_silent_successor_is_proved_wedged_and_rolled_back_inside_60s(self, rig, monkeypatch):
+        rig.supervisor.mode = 'wedged'
+        armed, _, _ = self._arm(rig, monkeypatch, answer=False)
+        result = promote(rig)
+        assert armed, result.get('failure')
+        assert result['outcome'] == 'rolled_back', result
+        assert any(event[0] == 'bounded-stop' and event[1] == armed[0]['pid'] for event in rig.events)
+        assert result['rollback']['commit_to_serving_upper_bound_seconds'] <= forward.ROLLBACK_SECONDS
+        lease = rig.db.leases()[0]
+        assert forward._row(rig.db, lease['generation_id'])['release_sha'] == rig.a.name
+
+    def test_answering_successor_stays_blocked_without_signals(self, rig, monkeypatch):
+        rig.supervisor.mode = 'blocked'
+        armed, _, servers = self._arm(rig, monkeypatch, answer=True)
+        try:
+            result = promote(rig)
+        finally:
+            for srv in servers:
+                srv.close()
+        assert result['outcome'] == 'blocked', result
+        assert 'neither handed over nor proved wedged' in result['failure']
+        assert not any(event[0] == 'bounded-stop' for event in rig.events)
+        assert rig.db.leases()[0]['generation_id'] == armed[0]['id']
+
+    def test_late_recovery_proves_a_later_wedge_while_a_owns_shared_file(self, rig, monkeypatch):
+        rig.supervisor.mode = 'blocked'
+        armed, age, servers = self._arm(rig, monkeypatch, answer=True)
+        blocked = promote(rig)
+        assert blocked['outcome'] == 'blocked', blocked
+        for srv in servers:
+            srv.close()  # B's loop stops answering; its node stays
+        rig.clock.value = blocked['commit_clock'] + forward.ROLLBACK_SECONDS + 300
+        age(300)
+        rig.events.clear()
+        recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+        assert recovered['outcome'] == 'rolled_back', recovered
+        assert recovered['late_rollback']['bound_missed'] is True and recovered['alert']
+        assert any(event[0] == 'bounded-stop' and event[1] == armed[0]['pid'] for event in rig.events)

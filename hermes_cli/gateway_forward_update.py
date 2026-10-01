@@ -25,6 +25,13 @@ from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _atomic_by
 
 STARTUP_SECONDS = 45
 ROLLBACK_SECONDS = 60
+# A successor's loop heartbeat is rewritten every 30 s. One missed beat plus margin,
+# confirmed by the sustained silent loop-tick witness, is the wedge proof here: the
+# default 90 s threshold cannot fire inside the 60 s rollback bound.
+WEDGE_STALE_SECONDS = 35
+# Bounded SIGTERM/SIGKILL, takeover and A-prime polling proof after a wedge proof.
+WEDGE_RESERVE_SECONDS = 15
+COOPERATIVE_ROLLBACK_SECONDS = 10
 POLL_SECONDS = 5
 # A committed successor must prove polling inside this share of the rollback
 # budget so A' keeps STARTUP_SECONDS to start, take over and poll.
@@ -668,7 +675,30 @@ def _observe_rollback_reply(home, db, row, proof, record):
 def _proven_wedged(home, row):
     """Existing liveness probe only. Unknown or alive never authorizes a late rollback."""
     from hermes_cli.gateway import probe_gateway_loop_liveness, GATEWAY_LOOP_WEDGED
-    return _live(row) and probe_gateway_loop_liveness(row['pid'], home=home) == GATEWAY_LOOP_WEDGED
+    return _live(row) and probe_gateway_loop_liveness(
+        row['pid'], home=home, stale_after=WEDGE_STALE_SECONDS) == GATEWAY_LOOP_WEDGED
+
+
+def _await_wedge_proof(home, db, row, deadline):
+    """Probe until the successor answers, proves wedged, or the stop reserve is reached.
+
+    A freshly wedged loop has a fresh heartbeat, so one probe at failure time is only
+    UNKNOWN. Repeating it lets the heartbeat age into proof while budget remains.
+    """
+    from hermes_cli.gateway import probe_gateway_loop_liveness, GATEWAY_LOOP_ALIVE, GATEWAY_LOOP_WEDGED
+    while True:
+        if db._owner_is_dead(_row(db, row['id'])):
+            return 'dead'
+        if not _live(row):
+            raise RuntimeError('successor identity became unknown during probe')
+        if deadline - _now() < WEDGE_RESERVE_SECONDS + 3.4:
+            return None
+        verdict = probe_gateway_loop_liveness(row['pid'], home=home, stale_after=WEDGE_STALE_SECONDS)
+        if verdict == GATEWAY_LOOP_WEDGED:
+            return 'wedged'
+        if verdict == GATEWAY_LOOP_ALIVE:
+            return None
+        _sleep(1)
 
 
 def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
@@ -717,20 +747,22 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
     if _lease(db)['generation_id'] != fresh['id']:
         if not db._owner_is_dead(_row(db, failed['id'])):
             try:
-                # Preserve time for the existing three-strike liveness proof,
-                # bounded stop and takeover. A silent loop cannot spend it all.
-                cooperative_budget = min(45, deadline - _now() - 20)
+                # A responsive successor hands over in seconds. A silent one cannot,
+                # so it must not spend the time its heartbeat needs to age into a
+                # wedge proof, plus the bounded stop, takeover and polling proof.
+                cooperative_budget = min(COOPERATIVE_ROLLBACK_SECONDS,
+                                         deadline - _now() - WEDGE_RESERVE_SECONDS - 3.4)
                 if cooperative_budget <= 0:
                     raise RuntimeError('cooperative handover has no reserved recovery budget')
                 handover_to_generation(home, fresh['id'], timeout=cooperative_budget, verify_after_commit=False)
             except Exception:
                 if _lease(db)['generation_id'] != fresh['id']:
-                    from hermes_cli.gateway import probe_gateway_loop_liveness, GATEWAY_LOOP_WEDGED, _escalate_wedged_gateway
+                    from hermes_cli.gateway import _escalate_wedged_gateway
                     current = _row(db, failed['id'])
                     if not db._owner_is_dead(current):
-                        if deadline - _now() < 3.4:
-                            raise RuntimeError('insufficient budget for existing liveness proof')
-                        if not _live(current) or probe_gateway_loop_liveness(current['pid'], home=home) != GATEWAY_LOOP_WEDGED:
+                        if not _live(current):
+                            raise RuntimeError('successor identity became unknown during probe')
+                        if _await_wedge_proof(home, db, current, deadline) is None:
                             raise RuntimeError('live successor neither handed over nor proved wedged')
                         # The probe can outlive this PID incarnation. A replacement
                         # proves B dead and must never receive either signal.
