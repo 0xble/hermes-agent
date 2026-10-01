@@ -450,8 +450,8 @@ def _build_candidate_web(staging: Path) -> None:
     from pm.build_operations import verified_tools
     from pm.store import current_target
     target = current_target()
-    store = prepare_tools(["npm"], out=staging.parent / ".build-tools", target=target)
-    tools = verified_tools(["npm"], source_store=store, target=target)
+    store = prepare_tools(["node", "npm"], out=staging.parent / ".build-tools", target=target)
+    tools = verified_tools(["node", "npm"], source_store=store, target=target)
     npm = str(tools.entries["npm"].binary)
     env = tools.environment(_release_subprocess_env())
     workspaces = ["--workspace", "web", "--include-workspace-root"]
