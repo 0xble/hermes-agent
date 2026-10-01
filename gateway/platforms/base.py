@@ -4200,14 +4200,14 @@ class BasePlatformAdapter(ABC):
         # otherwise turn a transport redelivery into another user turn.
         if (self.platform == Platform.TELEGRAM and not event.internal
                 and getattr(getattr(self.gateway_runner, "config", None), "durable_outbox_enabled", False)):
-            from gateway.outbox import store_for, event_kind, transport_id
+            from gateway.outbox import store_for, event_kind, transport_id, local_admission_turn
             event_id = transport_id(event)
             if event_id:
                 home = getattr(self.gateway_runner, "_resolve_profile_home_for_source")(event.source)
                 original = await asyncio.to_thread(
                     store_for(home).lookup, str(event.source.profile or "default"),
                     "telegram", event_id, event_kind(event))
-                if original:
+                if original and local_admission_turn(event, self.gateway_runner, home) is None:
                     event._gateway_accepted = True
                     return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
@@ -4237,15 +4237,11 @@ class BasePlatformAdapter(ABC):
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
-            if getattr(event, "_owned_local_pending", None) is not None:
-                event._owned_local_pending = None
             if getattr(event, "_owned_replay", False):
                 event._gateway_accepted = True
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
-        if getattr(event, "_owned_local_pending", None) is not None:
-            event._owned_local_pending = None
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
