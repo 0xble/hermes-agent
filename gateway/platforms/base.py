@@ -4220,6 +4220,9 @@ class BasePlatformAdapter(ABC):
             if getattr(event, "_owned_replay", False):
                 event._gateway_accepted = True
             return
+        if getattr(event.source, "_startup_gate_capability", None) is not None:
+            from gateway.startup_gate import note_gate_guard
+            note_gate_guard(event.source, "adapter_guard")
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
         if getattr(event, "_owned_local_pending", None) is not None:

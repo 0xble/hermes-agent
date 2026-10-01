@@ -1418,6 +1418,9 @@ class GatewayInboundMixin:
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
+        if getattr(source, "_startup_gate_capability", None) is not None:
+            from gateway.startup_gate import note_gate_guard
+            note_gate_guard(source, "runner_guard")
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
             return _result

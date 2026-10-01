@@ -27,9 +27,11 @@ async def test_cold_start_gate_then_takeover_or_block(tmp_path, monkeypatch, hol
     monkeypatch.setattr('gateway.status._pid_exists', lambda pid: holder in {'live', 'unknown'})
     monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: None if holder == 'unknown' else 1)
     calls = []
-    async def gate(config, identity):
+    async def gate(config):
         assert db.leases()[0]['generation_id'] == old.id
+        from gateway.startup_gate import StartupGateVerdict
         calls.append('gate')
+        return StartupGateVerdict('passed', {}, 0.1)
     async def start(self):
         calls.append('start')
     monkeypatch.setattr('gateway.startup_gate.run_startup_gate', gate)
@@ -73,11 +75,13 @@ async def test_production_start_claims_scope_before_cold_activation(tmp_path, mo
     monkeypatch.setattr('gateway.status._get_process_start_time',
         lambda pid: None if pid == 123 and holder == 'unknown' else 1)
     calls = []
-    async def gate(config, identity):
+    async def gate(config):
         assert db.leases()[0]['generation_id'] == old.id
-        row = next(row for row in db.generations() if row['id'] == identity.id)
+        row = next(row for row in db.generations() if row['release_sha'] == 'new-release')
         assert row['scope_nonce'] == 'fresh-bootstrap' and row['state'] == 'standby'
+        from gateway.startup_gate import StartupGateVerdict
         calls.append('gate')
+        return StartupGateVerdict('passed', {}, 0.1)
     async def promoted(config, *, promoted_generation):
         identity, epoch = promoted_generation
         assert identity.release_sha == 'new-release' and epoch == 2
