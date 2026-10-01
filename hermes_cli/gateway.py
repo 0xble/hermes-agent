@@ -2315,7 +2315,14 @@ def _native_service_homes() -> set[Path]:
     ``_profile_suffix`` for why sudo matters)."""
     from hermes_constants import _get_platform_default_hermes_home, sudo_invoker_default_home
 
-    homes = {_get_platform_default_hermes_home().resolve()}
+    native = _get_platform_default_hermes_home()
+    if is_macos():
+        # launchd plists live under the account home, even when a profile or
+        # sandbox pins HOME elsewhere. Use the same authority for bare labels.
+        import pwd
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — macOS launchd account identity
+        native = account_home / (".hermes" + os.environ.get("HERMES_DATA_DIR_SUFFIX", ""))
+    homes = {native.resolve()}
     sudo_home = sudo_invoker_default_home()
     if sudo_home is not None:
         homes.add(sudo_home.resolve())

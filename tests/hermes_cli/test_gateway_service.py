@@ -2843,3 +2843,17 @@ class TestUnitAnchoredServiceIdentity:
 
         assert os.environ["HERMES_HOME"] == str(alice_home)  # the sync really ran
         assert gateway_cli.get_service_name() == pre_sync_name
+
+
+@pytest.mark.platforms("macos")
+def test_launchd_account_identity_survives_profile_home_override(tmp_path, monkeypatch):
+    """A fake HOME cannot resolve a throwaway gateway to the real bare service."""
+    account = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — native macOS invariant
+    monkeypatch.delenv("HERMES_DATA_DIR_SUFFIX", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    isolated_label = gateway_cli.get_launchd_label()
+    assert isolated_label != "ai.hermes.gateway"
+    assert gateway_cli.get_launchd_plist_path() == account / "Library" / "LaunchAgents" / f"{isolated_label}.plist"
+    monkeypatch.setenv("HERMES_HOME", str(account / ".hermes"))
+    assert gateway_cli.get_launchd_label() == "ai.hermes.gateway"
