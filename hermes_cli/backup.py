@@ -2143,11 +2143,14 @@ def _prune_quick_snapshots(
     if not root.exists():
         return 0
 
+    verified: dict[tuple[Path, str], bool] = {}
+
     def usable(directory: Path, rel: str, size: Any, meta: dict) -> bool:
-        if not payload_matches(directory, rel, size, meta):
-            return False
-        path = directory / rel
-        return not rel.endswith(".db") or verify_sqlite_integrity(path)["valid"]
+        key = (directory, rel)
+        if key not in verified:
+            verified[key] = payload_matches(directory, rel, size, meta) and (
+                not rel.endswith(".db") or verify_sqlite_integrity(directory / rel)["valid"])
+        return verified[key]
 
     candidates = []
     for directory in _snapshot_dirs(root):
@@ -2168,6 +2171,7 @@ def _prune_quick_snapshots(
     if newest is not None:
         retained.add(newest)  # Never prune a snapshot in the same publication call.
     omissions: set[str] = set()
+    covered: set[str] = set()
     found_complete = False
     for directory, meta in candidates:
         files = meta["files"]
@@ -2176,11 +2180,23 @@ def _prune_quick_snapshots(
         if not isinstance(failed, list) or not isinstance(oversized, list):
             continue
         omissions.update(rel for rel in failed + oversized if isinstance(rel, str))
-        valid = {rel for rel, size in files.items() if isinstance(rel, str) and usable(directory, rel, size, meta)}
-        if not found_complete and not failed and not oversized and len(valid) == len(files):
+        # Prove one complete anchor, newest first. Once it exists, discarded
+        # generations need no payload reads. A retained database is checked
+        # only until its path has a verified anchor. Same-size corruption is
+        # an omission too, but restore validates every payload independently.
+        if not found_complete and not failed and not oversized and all(
+                isinstance(rel, str) and usable(directory, rel, size, meta)
+                for rel, size in files.items()):
             retained.add(directory)
             found_complete = True
-        omissions.update(rel for rel in files if isinstance(rel, str) and rel.endswith(".db") and rel not in valid)
+            covered.update(rel for rel in files if rel.endswith(".db"))
+        if directory in retained:
+            for rel, size in files.items():
+                if isinstance(rel, str) and rel.endswith(".db") and rel not in covered:
+                    if usable(directory, rel, size, meta):
+                        covered.add(rel)
+                    else:
+                        omissions.add(rel)
     for rel in omissions:
         for directory, meta in candidates:
             if rel in meta["files"] and usable(directory, rel, meta["files"][rel], meta):
