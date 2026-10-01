@@ -197,6 +197,7 @@ class TestRequireServiceInstalled:
         gateway_cli._require_service_installed("start")
 
 
+@pytest.mark.platforms("linux")
 class TestServiceIdentityForForeignHome:
     """A HERMES_HOME that is neither ``~/.hermes`` nor ``~/.hermes/profiles/<name>`` must never resolve to
     the default profile's ``hermes-gateway`` unit (a temp-home harness uninstalled the production gateway)."""
