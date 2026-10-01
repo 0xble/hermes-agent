@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from xml.sax.saxutils import escape
 
 from gateway.restart import LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
@@ -97,23 +98,72 @@ def _launchctl_domain_unsupported(returncode: int) -> bool:
 _LAUNCHCTL_BOOTSTRAP_EIO = 5
 
 
-def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 30) -> None:
+def _forward_only_home(home: Path) -> bool:
+    """Config errors retain the legacy launcher policy."""
+    from gateway.generation import forward_only_handover_enabled
+    from hermes_cli.config_effective import load_user_config_effective
+    try:
+        return forward_only_handover_enabled(
+            load_user_config_effective(Path(home) / 'config.yaml', fail_closed=True))
+    except Exception:
+        return False
+
+
+def _forward_only_plist(plist_path) -> bool:
+    """Resolve bootstrap policy from the definition's owning profile."""
+    import plistlib
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    try:
+        definition = plistlib.loads(Path(plist_path).read_bytes())
+    except Exception:
+        # plistlib does not normalize malformed bytes to one exception class.
+        # Without a readable definition there is no owning profile to opt in.
+        return False
+    try:
+        if isinstance(definition, dict):
+            environment = definition.get('EnvironmentVariables') or {}
+            if isinstance(environment, dict) and environment.get('HERMES_HOME'):
+                home = Path(environment['HERMES_HOME'])
+    except (TypeError, ValueError):
+        return False
+    return _forward_only_home(home)
+
+
+def _forward_service_plist(plist_path: Path) -> Path | None:
+    if not _forward_only_plist(plist_path):
+        return None
+    from gateway.generation import GenerationCoordinator
+    label = GenerationCoordinator(_gw().get_hermes_home()).service_label()
+    if label == _gw().get_launchd_label():
+        return plist_path
+    path = plist_path.with_name(f'{label}.plist')
+    if not path.is_file():
+        raise RuntimeError(f'forward-only service definition missing: {label}')
+    return path
+
+
+def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 30, runner=None) -> None:
     """Bootstrap a launchd job, recovering from a stale still-registered label (EIO 5). Without the
     bootout + retry that case is misread as an unmanageable domain and degrades to detached, silently
     losing auto-start and crash-restart."""
+    forward_only = _forward_only_plist(plist_path)
+    if forward_only:
+        from hermes_cli.gateway_launchd_generation import refresh_generation_scope
+        refresh_generation_scope(Path(plist_path))
     bootstrap = ["launchctl", "bootstrap", domain, str(plist_path)]
     try:
-        subprocess.run(bootstrap, check=True, timeout=timeout)
+        (runner or subprocess.run)(bootstrap, check=True, timeout=timeout)
     except subprocess.CalledProcessError as exc:
-        if exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
+        if forward_only or exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
             raise
         # Stale registration — bootout the leftover label and bootstrap once more.
         # Captured: the bootout is best-effort (a drained job may already be
         # unloaded), so its expected 3/113/125 stderr must not leak to the terminal.
-        subprocess.run(
+        (runner or subprocess.run)(
             ["launchctl", "bootout", f"{domain}/{label}"],
             check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
-        subprocess.run(bootstrap, check=True, timeout=timeout)
+        (runner or subprocess.run)(bootstrap, check=True, timeout=timeout)
 
 
 def _launchd_reload_log_path() -> Path:
@@ -140,13 +190,13 @@ def _launchd_reload_budget() -> float:
     return max(30.0, _gw()._get_restart_drain_timeout())
 
 
-def _launchctl_supervised_pid(label: str) -> int | None:
+def _launchctl_supervised_pid(label: str, *, runner=None) -> int | None:
     """PID launchd currently runs for ``label``, or None when it runs none. ``launchctl list`` exits 0 for
     a mere registered definition (``state = not running`` on macOS 26+), so a PID — not the exit code — is
     the answer. Domain-agnostic on purpose: ``launchctl print`` domain probes fail on macOS-26 per-user
     domains, which is why the invoking profile verifies through this and not ``_launchd_print_service_pid``."""
     try:
-        result = subprocess.run(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
+        result = (runner or subprocess.run)(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if result.returncode != 0:
@@ -336,6 +386,7 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
     The release updater must persist these exact bytes in its write-ahead record
     before changing pointers. Normal callers retain the existing service output.
     """
+    forward_only = _forward_only_home(_gw().get_hermes_home())
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
     working_dir = str(_gw().get_hermes_home() / "current") if release_target else _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
@@ -356,11 +407,27 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
     _gw()._append_node_dir_for_service(priority_dirs)
     sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
 
+    scope_block = ""
+    pinned_root = None
+    if forward_only:
+        from hermes_cli.immutable_releases import resolved_release
+        release = release_target or resolved_release(_gw().get_hermes_home())
+        if release is not None:
+            pinned_root = Path(release).resolve(strict=True)
+            working_dir, venv_dir = str(pinned_root), str(pinned_root / ".venv")
+        source_root = pinned_root or Path(_gw().PROJECT_ROOT).resolve()
+        scope_block = (f"<key>HERMES_GENERATION_SCOPE</key><string>{uuid.uuid4().hex}</string>"
+                       f"<key>HERMES_LAUNCHD_LABEL</key><string>{escape(label)}</string>"
+                       f"<key>HERMES_RELEASE_SHA</key><string>{escape(source_root.name)}</string>"
+                       f"<key>PYTHONPATH</key><string>{escape(str(source_root))}</string>")
+
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping
     # stderr; the osascript wrapper gives the job a Local Network identity (see launchd_program_arguments).
     stdout_log, stderr_log = log_dir / "gateway.log", log_dir / "gateway.error.log"
     interpreter = (str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python")
                    if release_target else None)
+    if pinned_root is not None:
+        interpreter = str(pinned_root / ".venv/bin/python")
     command = _timestamped_stderr_gateway_command(
         stderr_log, external_supervisor=True, interpreter=interpreter)
     prog_args_xml = "\n        ".join(
@@ -409,6 +476,7 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
         <string>{hermes_home}</string>
         <key>HERMES_SUPERVISED_CHILD</key>
         <string>1</string>
+        {scope_block}
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -466,6 +534,12 @@ def launchd_plist_is_current(release_target: Path | None = None) -> bool:
     norm = _gw()._normalize_launchd_plist_for_comparison
     expected = (_gw().generate_launchd_plist(release_target=release_target) if release_target
                 else _gw().generate_launchd_plist())
+    if _forward_only_home(_gw().get_hermes_home()):
+        import plistlib
+        left, right = [plistlib.loads(norm(value).encode()) for value in (installed, expected)]
+        for payload in (left, right):
+            payload.get("EnvironmentVariables", {}).pop("HERMES_GENERATION_SCOPE", None)
+        return left == right
     return norm(installed) == norm(expected)
 
 
@@ -482,6 +556,9 @@ def _spawn_deferred_launchd_reload(
     # Durable pre-bootout marker: distinguishes "helper never started" from "helper ran but failed".
     _gw()._append_launchd_reload_log(f"Launchd reload helper started for {target}")
 
+    if _forward_only_plist(plist_path):
+        from hermes_cli.gateway_launchd_generation import refresh_generation_scope
+        refresh_generation_scope(plist_path)
     _reload_budget = int(_launchd_reload_budget())
     q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
@@ -554,6 +631,9 @@ def refresh_launchd_plist_if_needed() -> bool | str:
 def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     """Re-register the installed bytes (including a saved source-checkout plist)."""
     label = _gw().get_launchd_label()
+    if _forward_only_plist(plist_path):
+        import plistlib
+        label = plistlib.loads(plist_path.read_bytes())['Label']
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
 
@@ -579,6 +659,9 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
         )
         return "deferred"
 
+    if _forward_only_plist(plist_path):
+        from hermes_cli.gateway_launchd_generation import refresh_generation_scope
+        refresh_generation_scope(plist_path)
     # Bootout/bootstrap so launchd reads the new definition; bootstrap can fail silently under load
     # during a drain, and KeepAlive can't revive an unregistered job.
     # Captured: best-effort (the job may already be unloaded), keep expected noise off the terminal.
@@ -656,6 +739,10 @@ def launchd_install(force: bool = False, *, start_now: bool = True):
         print("  hermes gateway status             # Check status")
         return
 
+    if _forward_only_plist(plist_path):
+        if _reload_installed_launchd_plist(plist_path):
+            _launchd_ok("✓ Service installed and loaded!")
+        return
     try:
         _gw()._launchctl_bootstrap(_gw()._launchd_domain(), plist_path, label, timeout=30)
     except subprocess.CalledProcessError as e:
@@ -704,6 +791,11 @@ def launchd_start():
             _launchd_ok("✓ Service started")
         return
 
+    forward_plist = _forward_service_plist(plist_path)
+    if forward_plist is not None:
+        if _reload_installed_launchd_plist(forward_plist):
+            _launchd_ok("✓ Service started")
+        return
     _gw().refresh_launchd_plist_if_needed()
     try:
         _launchctl_kickstart_current(label)
@@ -723,6 +815,8 @@ def _launchctl_kickstart_current(label: str) -> None:
 
 def _launchd_bootstrap_and_kickstart(plist_path: Path, label: str) -> bool:
     """Bootstrap then kickstart; False after degrading to detached (domain unsupported). Other errors propagate."""
+    if _forward_only_plist(plist_path):
+        return bool(_reload_installed_launchd_plist(plist_path))
     try:
         _gw()._launchctl_bootstrap(_gw()._launchd_domain(), plist_path, label, timeout=30)
         _launchctl_kickstart_current(label)
@@ -784,6 +878,12 @@ def launchd_restart():
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
+    plist_path = _gw().get_launchd_plist_path()
+    forward_plist = _forward_service_plist(plist_path)
+    if forward_plist is not None:
+        if _reload_installed_launchd_plist(forward_plist):
+            _launchd_ok("✓ Service restart requested")
+        return
     from gateway.status import get_running_pid
     try:
         pid = get_running_pid()

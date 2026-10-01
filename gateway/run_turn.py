@@ -2408,6 +2408,8 @@ class GatewayTurnMixin:
 
     def _resolve_turn_toolsets(self, user_config: dict, source: "SessionSource", platform_key: str):
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""
+        if getattr(self, "_startup_gate_source", None) is source:
+            return [], []
         from agent.skill_utils import parse_config_string_list
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None

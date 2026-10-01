@@ -16,17 +16,9 @@ def read_generation_status(home: Path) -> list[dict[str, Any]]:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0) as conn:
             conn.row_factory = sqlite3.Row
             recorded = conn.execute(
-                "SELECT id,release_sha,label,pid,start_fingerprint,state,heartbeat_at "
+                "SELECT * "
                 "FROM generations ORDER BY started_at DESC,id DESC").fetchall()
-            terminal_labels: set[str] = set()
-            rows = []
-            for record in recorded:
-                row = dict(record)
-                if row["state"] in {"exited", "failed"}:
-                    if row["label"] in terminal_labels:
-                        continue
-                    terminal_labels.add(row["label"])
-                rows.append(row)
+            rows = [dict(record) for record in recorded]
             rows.reverse()
             leases: dict[str, list[str]] = {}
             for row in conn.execute("SELECT resource,epoch,generation_id,state FROM leases WHERE state!='released'"):

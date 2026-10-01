@@ -354,3 +354,98 @@ async def test_stop_returns_failed_receipt_after_exhaustion(tmp_path):
     poller._task = asyncio.create_task(exhausted())
     await asyncio.sleep(0)
     assert await poller.stop() == {"stopped": False, "error": "OSError"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_lifecycle_write_cannot_delay_or_kill_polling(tmp_path, monkeypatch, caplog, write_fails):
+    import os
+    import sqlite3
+    from types import SimpleNamespace
+    from gateway.generation import GenerationIdentity
+
+    monkeypatch.setattr("gateway.generation._boot_id", lambda: "fixture")
+    coordinator = GenerationCoordinator(tmp_path)
+    monkeypatch.setattr("gateway.status._get_process_start_time", lambda pid: 123)
+    owner = GenerationIdentity.create(release_sha="r", label="r", boot_id="fixture",
+                                      start_fingerprint=f"{os.getpid()}:123")
+    coordinator.register(owner, state="serving")
+    coordinator.acquire_lease("active_generation", owner.id)
+    journal = PollingJournal(coordinator, "123456:LOCAL_ONLY")
+    entered = threading.Event()
+    release_write = threading.Event()
+    requested = asyncio.Event()
+    release_request = asyncio.Event()
+    original = coordinator.record_poller_event
+
+    def write(*args, **kwargs):
+        if args[3] == "poller_started":
+            entered.set()
+            assert release_write.wait(5)
+            if write_fails:
+                raise sqlite3.OperationalError("database is locked")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator, "record_poller_event", write)
+
+    async def get_updates(**kwargs):
+        requested.set()
+        await release_request.wait()
+        return []
+
+    poller = ControlledPoller(SimpleNamespace(
+        bot=SimpleNamespace(get_updates=get_updates), update_queue=asyncio.Queue()), journal)
+    start = asyncio.create_task(poller.start())
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        # The writer is held until cleanup, so this does not depend on scheduler speed.
+        await asyncio.wait_for(requested.wait(), 2)
+        await asyncio.wait_for(asyncio.shield(start), 2)
+        assert poller.running
+    finally:
+        release_write.set()
+        release_request.set()
+        await start
+        assert await poller.stop() == {"stopped": True}
+    events = [row["event"] for row in coordinator.poller_journal()]
+    assert events == (["poller_stopped"] if write_fails else ["poller_started", "poller_stopped"])
+    if write_fails:
+        assert "polling lifecycle evidence could not be recorded" in caplog.text
+        assert not coordinator.check_poller_journal()["ok"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease", ["missing", "foreign", "nonserving", "unknown_fingerprint"])
+async def test_registered_process_must_prove_identity_before_replay_or_poll(tmp_path, monkeypatch, lease):
+    import os
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from gateway.generation import GenerationIdentity
+
+    monkeypatch.setattr("gateway.generation._boot_id", lambda: "fixture")
+    coordinator = GenerationCoordinator(tmp_path)
+    monkeypatch.setattr("gateway.status._get_process_start_time",
+                        lambda pid: None if lease == "unknown_fingerprint" else 123)
+    owner = GenerationIdentity.create(release_sha="r", label="r", boot_id="fixture",
+                                      start_fingerprint=f"{os.getpid()}:123")
+    coordinator.register(owner, state="standby" if lease == "nonserving" else "serving")
+    if lease == "foreign":
+        foreign = GenerationIdentity.create(release_sha="f", label="f", boot_id="fixture", pid=os.getpid() + 1)
+        coordinator.register(foreign, state="serving")
+        coordinator.acquire_lease("active_generation", foreign.id)
+    elif lease != "missing":
+        coordinator.acquire_lease("active_generation", owner.id)
+    journal = PollingJournal(coordinator, "123456:LOCAL_ONLY")
+    journal.record_response(b'{"ok":true,"result":[{"update_id":4}]}')
+    app = SimpleNamespace(bot=SimpleNamespace(get_updates=AsyncMock()),
+                          update_queue=SimpleNamespace(put=AsyncMock(), join=AsyncMock()))
+    failures = []
+    poller = ControlledPoller(app, journal, on_error=failures.append)
+    try:
+        with pytest.raises(RuntimeError, match="polling generation identity is not serving"):
+            await poller.start()
+        assert len(failures) == 1
+        app.update_queue.put.assert_not_awaited()
+        app.bot.get_updates.assert_not_awaited()
+    finally:
+        await poller.stop()

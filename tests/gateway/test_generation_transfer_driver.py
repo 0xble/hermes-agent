@@ -37,7 +37,7 @@ async def test_driver_uses_old_control_socket_before_committing(tmp_path):
     adapter = _Adapter()
     active.bind_runner(type("Runner", (), {"adapters": {"telegram": adapter}})())
     await active.start()
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     successor = ActiveGeneration(tmp_path, db, new, epoch + 1)
     successor_adapter = _Adapter()
     successor_adapter._controlled_poller = type("Poller", (), {"running": True})()
@@ -61,7 +61,7 @@ async def test_driver_fails_closed_if_old_process_cannot_acknowledge(tmp_path):
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     with pytest.raises(RuntimeError, match="control"):
         await asyncio.to_thread(handover_to_generation, tmp_path, new.id, timeout=.2)
@@ -82,7 +82,7 @@ async def test_failed_commit_rearms_old_polling_and_dispatch(tmp_path, monkeypat
     runner = type("Runner", (), {"adapters": {"telegram": adapter}, "_overlap_draining": False})()
     active.bind_runner(runner)
     await active.start()
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     def fail_commit(*args, **kwargs):
         raise RuntimeError("injected commit failure")
     monkeypatch.setattr(GenerationCoordinator, "commit_transfer", fail_commit)
@@ -104,7 +104,7 @@ async def test_cleanup_failure_does_not_hide_original_transfer_failure(tmp_path,
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     db.acquire_lease("active_generation", old.id)
     monkeypatch.setattr(run_generation, "_generation_request", lambda *a, **kw: {"tokens": []}
                         if a[1] == "polling_roster" else (_ for _ in ()).throw(RuntimeError("original stop failure")))
@@ -126,7 +126,7 @@ async def test_committed_but_unverified_handover_has_typed_outcome(tmp_path):
     active = ActiveGeneration(tmp_path, db, old, epoch)
     active.bind_runner(type("Runner", (), {"adapters": {}})())
     await active.start()
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     try:
         with pytest.raises(run_generation.HandoverCommittedUnverified) as exc:
             await asyncio.to_thread(handover_to_generation, tmp_path, new.id, timeout=.3)
@@ -135,3 +135,10 @@ async def test_committed_but_unverified_handover_has_typed_outcome(tmp_path):
         assert db.leases()[0]["generation_id"] == new.id
     finally:
         await active.close()
+
+
+@pytest.fixture(autouse=True)
+def _coordinator_boot_identity(monkeypatch):
+    # Unit transactions use a stable supplied boot identity. Native process
+    # and launchd suites continue to probe the actual host.
+    monkeypatch.setattr("gateway.generation._boot_id", lambda: "unit-test-boot")

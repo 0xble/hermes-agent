@@ -3741,7 +3741,7 @@ class GatewayRunner(
         except Exception:
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
-    def _init_session_db(self) -> None:
+    def _init_session_db(self, *, maintenance: bool = True) -> None:
         """Open the session DB for the active scope and run opportunistic state.db / checkpoint maintenance."""
         # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
         # root home under multiplex); priming here keeps startup diagnostics at init.
@@ -3761,6 +3761,9 @@ class GatewayRunner(
             # WARNING (not DEBUG) so it lands in errors.log; else an NFS HERMES_HOME silently loses /resume etc.
             logger.warning("SQLite session store not available: %s", e)
             self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
+
+        if not maintenance:
+            return  # The standby canary must not prune unrelated user sessions.
 
         # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
         # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
@@ -5878,6 +5881,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                       if row["resource"] == "active_generation"), None)
         if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (promoted_id.id, promoted_epoch, "active"):
             raise RuntimeError("standby promotion has no matching admission lease")
+    from gateway.generation import overlap_handover_enabled, forward_only_handover_enabled
+    claimed_generation = None
+    if promoted_generation is None:
+        claim_config = config if config is not None else load_gateway_config()
+        if forward_only_handover_enabled(claim_config):
+            from gateway.run_generation import claim_active_generation
+            claimed_generation = claim_active_generation()
+            from gateway.run_generation import serve_standby_generation
+            return await serve_standby_generation(claim_config, claimed_generation=claimed_generation)
+
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
 
@@ -5981,10 +5994,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _active_generation = ActiveGeneration(Path(get_hermes_home()),
             GenerationCoordinator(Path(get_hermes_home())), promoted_id, promoted_epoch)
         await _active_generation.start()
-    elif getattr(runner.config, "overlap_handover_enabled", False):
+    elif overlap_handover_enabled(runner.config):
         from gateway.run_generation import start_active_generation
         try:
-            _active_generation = await start_active_generation(runner.config)
+            _active_generation = await start_active_generation(runner.config, claimed_generation=claimed_generation)
         except Exception:
             logger.exception("Could not register the active overlap generation")
             return False
