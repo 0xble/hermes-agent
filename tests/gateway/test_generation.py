@@ -329,14 +329,22 @@ async def test_promoted_exit_projects_stopped_status_without_stale_pid(tmp_path)
     assert state["pid"] is None
     assert retained_gateway_state(state) == "stopped"
     assert db.leases()[0]["state"] == "released"
-    command = [sys.executable, "-m", "hermes_cli.main", "gateway", "status"]
-    status = subprocess.run(command, env={**os.environ, "HERMES_HOME": str(tmp_path),
-                                           "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
-                                           "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+    # Exercise the real CLI path, but remove unrelated host gateway PIDs from
+    # this subprocess's process probe. The home still supplies its real records.
+    command = [sys.executable, "-c",
+               "import sys; from hermes_cli import gateway; "
+               "gateway.find_gateway_pids = lambda: []; "
+               "from hermes_cli.main import main; "
+               "sys.argv = ['hermes', 'gateway', 'status']; main()"]
+    status_env = {**os.environ, "HERMES_HOME": str(tmp_path),
+                  "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "locks"),
+                  "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                  "HERMES_LAUNCHD_LABEL": f"ai.hermes.test-{tmp_path.name}"}
+    status = subprocess.run(command, env=status_env,
                             capture_output=True, text=True, timeout=20)
     assert status.returncode == 0, status.stderr
-    assert "state=exited" in status.stdout, status.stdout
-    assert "lease=none" in status.stdout, status.stdout
+    assert "Gateway is not running" in status.stdout, status.stdout
+    assert "lease=none state=exited" in status.stdout, status.stdout
 
 
 def test_lease_cannot_be_stolen_and_release_is_fenced(tmp_path):
@@ -423,6 +431,9 @@ async def test_ready_and_close_database_work_does_not_block_loop(tmp_path, monke
     entered.clear()
     release.clear()
     monkeypatch.setattr(coordinator, "release_lease", blocked)
+    # The heartbeat stub does not mark this unregistered owner exited; keep this
+    # test scoped to the close path's nonblocking release-lease call.
+    monkeypatch.setattr(coordinator, "release_exited_owner", lambda owner: 0)
     task = asyncio.create_task(active.close())
     try:
         assert await asyncio.to_thread(entered.wait, 2)

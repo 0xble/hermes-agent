@@ -61,11 +61,25 @@ supported links, literal code/fenced-code/table regions, and explicitly
 bracketed numeric citation markers such as `[[3](https://example.com)]`.
 Ordinary numeric commit or PR links are not converted into citation markers.
 
+Telegram renders adjacent footnote references (`[^2][^3]`) as one superscript
+run with no separator, so two citations read as "23". Telegram's parser also
+drops the first `[^n]:` definition when the definitions directly follow a list,
+even across blank lines, leaving a literal `^n` in the list.
+`normalize_footnotes` (`rich_markdown.py`) inserts `<sup>,</sup>` between
+adjacent references, which joins the same run as "2,3" with each number still
+tappable, and puts an empty `<!-- -->` line before definitions that follow a
+list, which ends the list without rendering a block. `markdown-it-py` (already a
+dependency) finds both: block tokens locate code and lists, and a custom inline
+rule marks only references it reaches as prose, so code, TeX math, link
+destinations, autolinks, inline HTML and escapes stay literal. It runs on send, finalized edit,
+and draft, and is idempotent. Verified against live `sendRichMessage` output on
+2026-09-30.
+
 ## Provenance and adoption
 
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
   `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
-  `telegram-ordered-list-separation`.
+  `telegram-ordered-list-separation`, `telegram-footnote-refs`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -151,7 +165,12 @@ Retire the literal-hash part when PR 105487 merges and the candidate tag
 contains it: compare `rich_markdown.py` and the hash regression tests against
 that merge, then drop the fork copy. Retire ordered-list separation when a
 released upstream rich payload makes the `TestRichOrderedListAfterProse`
-regressions pass without `_rich_separate_ordered_lists`.
+regressions pass without `_rich_separate_ordered_lists`. Retire the footnote
+part when Telegram's own rich parser separates adjacent references and keeps
+the first definition after a list: resend the probes from the footnote
+regressions through raw `sendRichMessage` without `normalize_footnotes` and
+check the returned blocks. Rollback removes that function and its call in
+`_rich_message_payload`.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,

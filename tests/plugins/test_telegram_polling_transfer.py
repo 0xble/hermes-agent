@@ -94,6 +94,18 @@ def test_transfer_receipt_fences_epoch_and_bot_identity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_join_queue_returns_when_polling_is_stopped(tmp_path):
+    from types import SimpleNamespace
+    queue = asyncio.Queue()
+    await queue.put(object())
+    poller = ControlledPoller(SimpleNamespace(update_queue=queue),
+                              PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY"))
+    poller._stop.set()
+    await asyncio.wait_for(poller._join_queue("stopped batch"), timeout=1)
+    assert queue.qsize() == 1
+
+
+@pytest.mark.asyncio
 async def test_controlled_poller_replays_before_first_poll_and_drains_inflight(tmp_path):
     journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
     journal.record_response(b'{"ok":true,"result":[{"update_id":4}]}')
@@ -236,6 +248,30 @@ async def test_journal_io_runs_off_loop_and_queue_join_backpressures(tmp_path):
     assert worker_threads and all(ident != main_thread for ident in worker_threads)
     stop_request.set()
     assert (await asyncio.wait_for(poller.stop(), 1))["stopped"]
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_queued_dispatch_and_times_out_if_unfinished(tmp_path):
+    journal = PollingJournal(GenerationCoordinator(tmp_path), "123456:LOCAL_ONLY")
+    class Bot:
+        async def get_updates(self, **kwargs):
+            await asyncio.Event().wait()
+    class App:
+        bot = Bot()
+        update_queue = asyncio.Queue()
+    poller = ControlledPoller(App(), journal, timeout=.05)
+    # A completed wire request may coexist with an update already handed to PTB.
+    poller._task = asyncio.create_task(asyncio.sleep(0))
+    await poller._task
+    await App.update_queue.put(Update(update_id=4))
+    stop = asyncio.create_task(poller.stop())
+    await asyncio.sleep(.02)
+    assert not stop.done()
+    assert (await stop) == {"stopped": False, "error": "PollDrainTimeout"}
+    update = App.update_queue.get_nowait()
+    assert update.update_id == 4
+    App.update_queue.task_done()
+    assert await poller.stop() == {"stopped": True}
 
 
 @pytest.mark.asyncio

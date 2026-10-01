@@ -118,6 +118,68 @@ class TestGoalManager:
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
 
+    def test_zero_budget_is_persistent_unlimited_and_continues(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        mgr = GoalManager(session_id="unlimited-sid", default_max_turns=0)
+        state = mgr.set("keep going")
+        assert state.max_turns == 0
+        assert load_goal("unlimited-sid").max_turns == 0
+        assert "∞" in mgr.status_line()
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+            for i in range(101):
+                decision = mgr.evaluate_after_turn(f"step {i}")
+                assert decision["should_continue"] is True
+        assert mgr.state.status == "active"
+        assert mgr.state.turns_used == 101
+        assert load_goal("unlimited-sid").turns_used == 101
+
+    def test_finite_budget_still_pauses(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="finite-sid", default_max_turns=2)
+        mgr.set("stop at two")
+        with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+            assert mgr.evaluate_after_turn("step 1")["should_continue"] is True
+            decision = mgr.evaluate_after_turn("step 2")
+        assert decision["status"] == "paused"
+        assert mgr.state.paused_reason == "turn budget exhausted (2/2)"
+
+    def test_unlimited_budget_keeps_lifecycle_controls_functional(self, hermes_home):
+        """Zero is only a budget sentinel: terminal and user lifecycle controls still work."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager, load_goal
+
+        done = GoalManager(session_id="unlimited-done", default_max_turns=0)
+        done.set("finish without a budget")
+        done.mark_done("verified")
+        assert done.state.status == "done"
+        assert load_goal("unlimited-done").status == "done"
+
+        paused = GoalManager(session_id="unlimited-paused", default_max_turns=0)
+        paused.set("pause and resume")
+        paused.pause("user-paused")
+        assert paused.state.status == "paused"
+        paused.resume()
+        assert paused.state.status == "active"
+        assert paused.state.max_turns == 0
+
+        blocked = GoalManager(session_id="unlimited-blocked", default_max_turns=0)
+        blocked.set("needs input")
+        with patch.object(
+            goals, "judge_goal", return_value=("blocked", "needs user input", False, None, False)
+        ):
+            decision = blocked.evaluate_after_turn("blocked")
+        assert decision["status"] == "paused"
+        assert blocked.resume_for_user_input() is True
+        assert blocked.state.status == "active"
+        blocked.clear()
+        assert blocked.state is None
+        assert load_goal("unlimited-blocked").status == "cleared"
+
 
 
 

@@ -1704,14 +1704,14 @@ class TelegramAdapter(BasePlatformAdapter):
     def _content_fits_rich_limits(self, content: str) -> bool:
         """Check the normalized payload against the countable rich text limit.
 
-        Newline normalization can expand the source, so count the same Markdown
-        shape sent to Telegram. Other Bot API rich limits (500 blocks, 16
+        Normalization (newlines, currency, footnote separators) can expand the
+        source, so count the exact Markdown sent to Telegram. Other Bot API rich limits (500 blocks, 16
         nesting levels, 20 table columns, ...) are not pre-counted; if exceeded
         Telegram returns a BadRequest, which
         :meth:`_is_rich_fallback_error` classifies as permanent so the send
         degrades to the legacy chunking path.
         """
-        return len(_rich_normalize_linebreaks(_protect_rich_currency(content))) <= self.RICH_MESSAGE_MAX_CHARS
+        return len(self._rich_message_payload(content)["markdown"]) <= self.RICH_MESSAGE_MAX_CHARS
 
     def _bot_supports_rich(self) -> bool:
         """True when ``do_api_request`` is an *async* callable (real Bot or AsyncMock); plain MagicMock
@@ -1821,17 +1821,14 @@ class TelegramAdapter(BasePlatformAdapter):
         """``InputRichMessage`` from RAW markdown — never ``format_message(content)``, whose MarkdownV2
         escaping destroys table pipes. Block-start ``#89``-style references are escaped first because
         Telegram's rich parser accepts them as headings without the whitespace standard Markdown requires
-        (``escape_literal_hash_prefixes``); currency pairs are then backticked so they cannot pair into
-        inline LaTeX (``_protect_rich_currency``)."""
-        from .rich_markdown import escape_literal_hash_prefixes
+        (``escape_literal_hash_prefixes``); adjacent footnote references get a superscript comma so
+        ``[^2][^3]`` does not read as "23" and footnote definitions are split from a preceding list so the
+        first one is not dropped (``normalize_footnotes``); currency pairs are then backticked so they cannot
+        pair into inline LaTeX (``_protect_rich_currency``)."""
+        from .rich_markdown import escape_literal_hash_prefixes, normalize_footnotes
 
-        payload: Dict[str, Any] = {
-            "markdown": _rich_normalize_linebreaks(
-                _protect_rich_currency(
-                    escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content))
-                )
-            )
-        }
+        markdown = normalize_footnotes(escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content)))
+        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(_protect_rich_currency(markdown))}
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
         return payload
@@ -3497,8 +3494,16 @@ class TelegramAdapter(BasePlatformAdapter):
             claim.failed = True
 
     async def handle_message(self, event: MessageEvent) -> None:
+        if getattr(self, "_owned_routing", None) is None:
+            # Without owned admission, native dispatch may hand work off before
+            # returning (including a task that outlives a cancelled callback).
+            self._accept_update()
+        try:
+            await super().handle_message(event)
+        except BaseException:
+            self._fail_update_preparation()
+            raise
         self._accept_update()
-        await super().handle_message(event)
 
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
@@ -5421,9 +5426,23 @@ class TelegramAdapter(BasePlatformAdapter):
         query = update.callback_query
         if not query or not query.data:
             return
-        self._accept_update()
         data = query.data
         cb = self._callback_ctx(query)
+        owned = getattr(self, "_owned_routing", None)
+        from gateway.owned_routing import _owned_callback_replay
+        if owned is not None and not _owned_callback_replay.get() and cb["chat_id"] is not None:
+            if not await self._callback_authorized(query, cb, _UNAUTHORIZED):
+                return
+            source = self.build_source(
+                chat_id=str(cb["chat_id"]),
+                chat_type="dm" if str(cb["chat_type"]) == "private" else "group",
+                user_id=str(query.from_user.id),
+                thread_id=str(cb["thread_id"]) if cb["thread_id"] else None)
+            self._canonicalize(source)
+            if await owned.route_callback(self, update, source, self._source_session_key(source)):
+                self._accept_update()
+                return
+        self._accept_update()
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
@@ -7569,6 +7588,16 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key = self._event_session_key(event)
         media_group_id = getattr(msg, "media_group_id", None)
         return f"{session_key}:album:{media_group_id}" if media_group_id else f"{session_key}:photo-burst"
+
+    async def _flush_photo_batch_now(self, batch_key: str) -> None:
+        event = self._pending_photo_batches.pop(batch_key, None)
+        if event is not None:
+            await self.handle_message(event)
+
+    async def _flush_media_group_now(self, media_group_id: str) -> None:
+        event = self._media_group_events.pop(media_group_id, None)
+        if event is not None:
+            await self.handle_message(event)
 
     async def _flush_photo_batch(self, batch_key: str) -> None:
         """Send a buffered photo burst/album as a single MessageEvent."""

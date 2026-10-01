@@ -86,6 +86,31 @@ def _timestamp(value: str) -> float:
     return parsed.timestamp()
 
 
+def expected_revision(home: Path, receipt: dict) -> tuple[str | None, str | None]:
+    """``(sha, disagreement)`` naming the revision a finished update must leave running.
+
+    Immutable homes run the release ``current`` points at. The updater runs from the
+    journal-bound source checkout, whose HEAD is frozen by design, so the receipt's
+    ``post_update`` can name that checkout rather than the runtime. A recorded release
+    transition that contradicts the pointer is a real disagreement. Legacy homes keep
+    the receipt's post-update checkout identity.
+    """
+    post = (receipt.get("post_update") or {}).get("sha") or None
+    try:
+        from hermes_cli.immutable_releases import resolved_release
+        release = resolved_release(home)
+    except Exception:
+        release = None
+    if release is None:
+        return post, None
+    transition = receipt.get("release_transition") or {}
+    to_sha = transition.get("to_sha") if isinstance(transition, dict) else None
+    if to_sha and to_sha != release.name:
+        return None, (f"The update recorded release {str(to_sha)[:12]}, but the active release is "
+                      f"{release.name[:12]}. Runtime state is unverified.")
+    return release.name, None
+
+
 def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
     """None means still waiting; success needs process completion AND runtime proof.
 
@@ -122,9 +147,12 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
         if (home / "fleet_restart_pending").exists():
             return None
         fleet = receipt.get("fleet")
-        expected = (receipt.get("post_update") or {}).get("sha")
+        post = (receipt.get("post_update") or {}).get("sha")
         previous = (receipt.get("pre_update") or {}).get("sha")
-        if expected and previous == expected and not restart and not fleet:
+        expected, disagreement = expected_revision(home, receipt)
+        if disagreement:
+            return False, disagreement
+        if post and previous == post and expected and not restart and not fleet:
             # "Already up to date": no code changed and nothing was restarted, so there is no
             # runtime to verify. The caller labels this result "Already Latest".
             return True, f"Hermes is already at revision {expected[:12]}."

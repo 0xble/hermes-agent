@@ -115,6 +115,35 @@ async def connected(monkeypatch, *, extra=None, bot_id=111, is_reconnect=False):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("admission lease is not active for this generation"),
+                                     __import__("sqlite3").OperationalError("database locked"),
+                                     asyncio.CancelledError()])
+async def test_owned_admission_failure_reopens_journal_update(monkeypatch, tmp_path, failure):
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        journal = PollingJournal(GenerationCoordinator(tmp_path), adapter.config.token)
+        adapter._controlled_journal = journal
+        incoming = update(app.bot, uid=617, kind="command")
+        journal.record_response(json.dumps({"ok": True, "result": [incoming.to_dict()]}).encode())
+        calls = []
+        async def route(*args):
+            calls.append(incoming.update_id)
+            if len(calls) == 1:
+                raise failure
+            return False
+        adapter._owned_routing = SimpleNamespace(route_message=route)
+        try:
+            await app.process_update(incoming)
+        except asyncio.CancelledError:
+            pass
+        assert [row["update_id"] for row in journal.pending()] == [617]
+        await app.process_update(incoming)
+        await app.process_update(incoming)
+        assert calls == [617, 617]
+        assert len(delivered) == 1
+        assert journal.pending() == []
+
+
+@pytest.mark.asyncio
 async def test_journal_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path):
     async with connected(monkeypatch) as (adapter, app, delivered):
         journal = PollingJournal(GenerationCoordinator(tmp_path), adapter.config.token)

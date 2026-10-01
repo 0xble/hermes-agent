@@ -654,9 +654,17 @@ class GatewayNotificationsMixin:
         try:
             receipt_path = home / "logs" / "update_receipts" / "latest.json"
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            from gateway.update_notifications import expected_revision
             pre_sha = str((receipt.get("pre_update") or {}).get("sha") or "")
-            post_sha = str((receipt.get("post_update") or {}).get("sha") or "")
-            same_revision = bool(pre_sha and post_sha and pre_sha == post_sha)
+            raw_post_sha = str((receipt.get("post_update") or {}).get("sha") or "")
+            same_revision = bool(pre_sha and raw_post_sha and pre_sha == raw_post_sha)
+            # Name the revision that runs: an immutable home's source HEAD is frozen by design.
+            expected, disagreement = expected_revision(home, receipt)
+            if disagreement:
+                # The pointer can move between final_outcome and this heading; never label a
+                # receipt/pointer mismatch as success or "Already Latest".
+                return "❌ Update Failed", disagreement
+            post_sha = str(expected or "")
             # Same classification as ``final_outcome``: a same-SHA run that restarted the
             # gateway or verified a fleet (checkout repair, fleet catch-up) is not a no-op.
             if same_revision and not receipt.get("gateway_restart") and not receipt.get("fleet"):

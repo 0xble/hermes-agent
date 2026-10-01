@@ -79,6 +79,25 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_gateway_goal_preserves_zero_as_unlimited(tmp_path, monkeypatch):
+    """Gateway config propagation must not turn the unlimited sentinel into the default."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("goals:\n  max_turns: 0\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+    goals._get_session_db()
+    runner = _make_runner()
+    response = await GatewayRunner._handle_goal_command(runner, _make_goal_event())
+    try:
+        assert response
+        state = goals.GoalManager("sid-gateway-goal-config").state
+        assert state is not None and state.max_turns == 0
+    finally:
+        goals._DB_CACHE.clear()
+
+
+@pytest.mark.asyncio
 async def test_goal_command_slow_db_init_still_persists(tmp_path, monkeypatch):
     """A slow state.db init (cold cache, first /goal of the process) must
     not silently drop the goal write: the gateway warms the cache off-loop,
