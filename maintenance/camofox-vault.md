@@ -95,6 +95,14 @@ the browser vault fill tool, or the 1Password backends.
   an injected text template and preserves the existing cooldown and partial cache.
   Retire when a released upstream batches refs with equivalent failure isolation,
   last-good behavior, and safe handling of multiline values.
+  References containing dotenv expansion, comment, quote, escape, or line-break
+  syntax use exact `op read` arguments instead. Simple references keep batching.
+  Successful exact reads are reused for duplicate references. An identity-wide
+  rate limit stops both routes and preserves the existing cache cooldown.
+  Verify `test_batch_dotenv_sensitive_references_use_exact_read` and
+  `test_batch_rate_limit_also_stops_exact_sensitive_reads` in
+  `tests/agent/test_onepassword_secrets.py`. The parser contract is documented in
+  [1Password environment files](https://www.1password.dev/cli/secrets-environment-variables).
 - Fork patch identities: `slice-8-camofox-accounts` (local, no upstream submission),
   `slice-8-camofox-visible-handoff` (fork-only shared-window handoff; upstream does not
   expose these server endpoints); `slice-9-vault-camofox`, `slice-9-vault-shadow-dom`,

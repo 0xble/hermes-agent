@@ -6,6 +6,17 @@ or publisher service. `bin/ci setup` only installs dependencies. `bin/ci check`
 checks an existing setup. `bin/ci list` describes the seven default lanes.
 `bin/ci check --lane node` is explicitly partial evidence, never a full pass.
 
+The desktop E2E workflow installs the same Python 3.14.7 it selects for sync.
+Desktop typechecking includes test sources, so native filesystem test helpers
+must import the operations they call even when the test runs only on Linux.
+Update receipt tests bind ContextVars through their scope and isolate ownership
+lookup from the host's managed test-interpreter installation. Production ownership
+resolution has its separate invariant test. These corrections remain within
+`fork-ci-reliability`.
+The native Telegram cancel-before-entry test awaits its task callback rendezvous
+before asserting admission release. PTB stop and an already completed Task do not
+by themselves drain registered callbacks. The production admission code is unchanged.
+
 The full gate runs all selected lanes and returns nonzero if any fails. Within
 static checks and container lint, independent commands also aggregate failures.
 A setup failure stops the gate because dependencies are not qualified. The
