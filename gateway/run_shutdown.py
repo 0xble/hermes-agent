@@ -1081,15 +1081,25 @@ class GatewayShutdownMixin:
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):
-                restart_key = _notice_target_key(
-                    restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
-                )
+                restart_adapter = self._delivery_adapter_for(restart_source)
+                if restart_adapter is not None:
+                    _, restart_profile = self._owning_profile(restart_adapter, restart_source.platform)
+                    restart_key = _delivery_target_key(
+                        restart_source.platform.value, restart_source.chat_id, restart_source.thread_id,
+                        profile=restart_profile,
+                    )
         notified: set[tuple[str, str, Optional[str]]] = set()
         # A DM topic reaches its private parent, but a forum topic does not replace a group broadcast.
         private_topic_parents: set[tuple[int, str]] = set()
         if update_notified and update_record:
             data = update_record[1]
-            notified.add(_notice_target_key(str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id")))
+            update_target = self._resolve_update_target(self._update_paths())
+            if update_target is not None:
+                _, update_profile = self._owning_profile(update_target.adapter, update_target.platform)
+                notified.add(_delivery_target_key(
+                    str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id"),
+                    profile=update_profile,
+                ))
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1099,9 +1109,6 @@ class GatewayShutdownMixin:
                 profile = None
             else:
                 source, platform_str, chat_id, thread_id, profile = target
-            dedup_key = _notice_target_key(platform_str, chat_id, thread_id)
-            if dedup_key in notified:
-                continue
             try:
                 platform = Platform(platform_str)
                 # The session's OWN profile's bot (transport ref → profile map), never a bare
@@ -1111,6 +1118,10 @@ class GatewayShutdownMixin:
                 if adapter is None:
                     adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
+                    continue
+                _, delivery_profile = self._owning_profile(adapter, platform)
+                dedup_key = _delivery_target_key(platform_str, chat_id, thread_id, profile=delivery_profile)
+                if dedup_key in notified:
                     continue
                 if not self._notice_allowed(platform, "active session"):
                     continue
@@ -1169,7 +1180,8 @@ class GatewayShutdownMixin:
                 continue
             if not self._notice_allowed(platform, "home channel", platform_cfg):
                 continue
-            dedup_key = _notice_target_key(platform.value, home.chat_id, home.thread_id)
+            _, delivery_profile = self._owning_profile(adapter, platform)
+            dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=delivery_profile)
             if dedup_key in notified or (
                 platform == Platform.TELEGRAM and home.thread_id is None
                 and (id(adapter), str(home.chat_id)) in private_topic_parents

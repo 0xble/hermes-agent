@@ -2,6 +2,16 @@
 
 Patch identity: `seamless-restart`.
 
+## Shutdown Notice Routing
+
+Use upstream's `_delivery_target_key` for active chats, served home channels,
+restart requesters, and already delivered update notices. Derive its profile
+from the resolved adapter's native `_owning_profile`, including shared-bot
+satellites. Positive Telegram IDs remain separate conversations for separate
+bots. Shared groups receive one notice, and private-topic parent suppression
+remains bound to the actual adapter. Native routing invariants live in
+`tests/gateway/test_multiplex_notice_egress_profile_adapter.py`.
+
 ## Local Admission Replay
 
 An already admitted event may revisit the native adapter during startup, restore,
