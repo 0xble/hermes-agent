@@ -1,3 +1,5 @@
+# Frozen from 738c502c9ba76ce515ebc1abe89d6b925c8b53c9:gateway/outbox.py
+# Source git blob: 2756ddb96103628a366db3672e91569e1cf0a119
 """Per-profile admission and user-visible egress receipts for the opt-in gateway outbox.
 
 The store does not retry an interrupted model turn. A dispatch that crossed the
@@ -630,30 +632,6 @@ class Outbox:
                 db.rollback()
                 raise
 
-    def enqueue_synthetic(self, nonce: str, payload: dict[str, Any], owner_epoch: int = 0) -> OutboxRow:
-        """Insert a loopback terminal reply without ever creating sendable work.
-
-        N-1 shares this database and knows failed_unsent, not a new synthetic state.
-        The disposition is separate; the state CHECK and normal pruning stay intact.
-        Current status() hides these rows. N-1 status() still lists them as
-        failed_unsent during overlap, but neither version recovers or retries them.
-        """
-        key = "startup-gate:" + nonce
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            try:
-                db.execute(
-                    "INSERT OR IGNORE INTO outbox "
-                    "(turn_id,sequence,type,payload,idempotency_key,owner_epoch,state,send_status) "
-                    "VALUES (?,1,'send',?,?,?,'failed_unsent','synthetic')",
-                    (key, json.dumps(payload, default=str), key, owner_epoch))
-                row = db.execute("SELECT * FROM outbox WHERE idempotency_key=?", (key,)).fetchone()
-                db.commit()
-                return self._row(row)
-            except BaseException:
-                db.rollback()
-                raise
-
     @staticmethod
     def _row(row: sqlite3.Row) -> OutboxRow:
         return OutboxRow(row["turn_id"], row["sequence"], row["type"], json.loads(row["payload"]),
@@ -722,8 +700,7 @@ class Outbox:
             return [dict(r) for r in db.execute(
                 "SELECT turn_id, sequence, type, idempotency_key, state, created_at, "
                 "retry_at, attempts, send_status, edit_status FROM outbox "
-                "WHERE COALESCE(send_status, '') != 'synthetic' "
-                "AND state IN ('sending','ambiguous','expired_ambiguous','pending','failed_unsent') "
+                "WHERE state IN ('sending','ambiguous','expired_ambiguous','pending','failed_unsent') "
                 "ORDER BY created_at DESC")]
 
     def begin_send(self, row: OutboxRow) -> bool:

@@ -128,6 +128,25 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     raise HandoverCommittedUnverified(to_id, promoted)
 
 
+async def _run_generation_startup_gate(config, coordinator, identity) -> None:
+    """Retire a failed private probe before either startup path can take a lease."""
+    import json
+    from gateway.startup_gate import run_startup_gate
+    verdict = None
+    try:
+        verdict = await run_startup_gate(config)
+        if not verdict.ready:
+            raise RuntimeError("startup gate failed")
+    except BaseException as exc:
+        receipt = {"reason": "startup_gate_failed"}
+        if verdict is not None:
+            receipt["gate"] = json.loads(verdict.evidence_text)
+        else:
+            receipt["error"] = type(exc).__name__
+        coordinator._record_failure(identity.id, json.dumps(receipt, sort_keys=True))
+        raise
+
+
 async def start_active_generation(config, *, claimed_generation=None) -> "ActiveGeneration | None":
     """Register an already singleton-claimed active gateway; never claim from standby."""
     if not overlap_handover_enabled(config):
@@ -137,15 +156,12 @@ async def start_active_generation(config, *, claimed_generation=None) -> "Active
     else:
         coordinator, identity = claimed_generation
     home = Path(get_hermes_home())
+    if forward_only_handover_enabled(config):
+        await _run_generation_startup_gate(config, coordinator, identity)
     try:
-        if forward_only_handover_enabled(config):
-            from gateway.startup_gate import run_startup_gate
-            await run_startup_gate(config, identity)
-            epoch = _activate_cold_generation(coordinator, identity)
-        else:
-            # Fresh legacy starts reuse the existing clean-exit takeover path
-            # when shutdown retained a released lease and its epoch.
-            epoch = _activate_cold_generation(coordinator, identity)
+        # Fresh legacy starts reuse the existing clean-exit takeover path
+        # when shutdown retained a released lease and its epoch.
+        epoch = _activate_cold_generation(coordinator, identity)
     except Exception:
         coordinator._record_failure(identity.id, "startup_failed")
         raise
@@ -843,12 +859,7 @@ async def serve_standby_generation(config=None, *, claimed_generation=None) -> b
     else:
         coordinator, identity = claimed_generation
     if forward_only_handover_enabled(config):
-        from gateway.startup_gate import run_startup_gate
-        try:
-            await run_startup_gate(config, identity)
-        except BaseException:
-            coordinator._record_failure(identity.id, 'startup_gate_failed')
-            raise
+        await _run_generation_startup_gate(config, coordinator, identity)
         lease = next((row for row in coordinator.leases() if row['resource'] == 'active_generation'), None)
         holder = next((row for row in coordinator.generations() if lease and row['id'] == lease['generation_id']), None)
         if lease is None or (holder and (coordinator._owner_is_dead(holder) or
