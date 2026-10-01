@@ -12,6 +12,15 @@ bots. Shared groups receive one notice, and private-topic parent suppression
 remains bound to the actual adapter. Native routing invariants live in
 `tests/gateway/test_multiplex_notice_egress_profile_adapter.py`.
 
+## Resume Marker Freshness
+
+Startup resume admission and pending follow-up recovery use upstream's
+`_is_fresh_gateway_interruption` helper. Its epoch comparison handles local
+markers across DST and timezone-aware markers without changing the configured
+freshness window. Keep the existing DST invariants in
+`tests/gateway/test_restart_resume_pending.py` and queued-replay coverage in
+`tests/gateway/test_resume_queued_followup.py`.
+
 ## Local Admission Replay
 
 An already admitted event may revisit the native adapter during startup, restore,

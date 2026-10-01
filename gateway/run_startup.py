@@ -16,7 +16,6 @@ import signal
 import time
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
-from datetime import datetime
 from pathlib import Path
 from agent.i18n import t
 from gateway.config import Platform
@@ -599,9 +598,9 @@ class GatewayStartupMixin:
 
     def _auto_resume_ready(self, entry, *, require_adapter=True) -> tuple | None:
         """Shared admission for deferred follow-ups and synthetic resume turns."""
-        from gateway.run import _auto_continue_freshness_window
+        from gateway.run import _auto_continue_freshness_window, _is_fresh_gateway_interruption
         marker = entry.last_resume_marked_at or entry.updated_at
-        if marker is not None and (datetime.now() - marker).total_seconds() > _auto_continue_freshness_window():
+        if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
             return None
         if self._is_session_running(entry.session_key):
             return None
