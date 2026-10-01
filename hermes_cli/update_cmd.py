@@ -1457,6 +1457,17 @@ def _finalize_receipt(status: str, debug_message: str) -> None:
         finalize_update_receipt(status)
 
 
+def _forward_catchup_failed(proof=None, *, failure='forward-only catch-up failed') -> None:
+    from hermes_cli.update_receipt import current_forward_generation, record_forward_generation, forward_receipt_outcome
+    proof = proof or current_forward_generation() or {'outcome': 'partial', 'failure': failure}
+    record_forward_generation(proof)
+    detail = proof.get('failure') or f"forward-only recovery {proof['outcome']}"
+    print(f'✗ {detail}')
+    _record_update_step('immutable_release_catchup', False, detail)
+    _finalize_receipt(forward_receipt_outcome(proof['outcome']), 'Forward-only catch-up incomplete: %s')
+    raise SystemExit(1)
+
+
 @dataclass(frozen=True)
 class _ReleaseReconcileState:
     enabled: bool
@@ -1553,12 +1564,15 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
         if defer:
             _record_update_step('immutable_release_catchup', True, 'forward-only activation deferred')
             return
-        recovered = recover_forward(paths.home)
-        if recovered and recovered['outcome'] not in {'success', 'refused', 'aborted'}:
-            raise RuntimeError(f"forward-only recovery {recovered['outcome']}: {recovered.get('failure', '')}")
-        if read_pointer(paths.current) != paths.release(sha):
-            if not _activate_immutable_release(sha=sha, source=source):
-                raise RuntimeError('forward-only catch-up failed')
+        try:
+            recovered = recover_forward(paths.home)
+            if recovered and recovered['outcome'] not in {'success', 'refused', 'aborted'}:
+                _forward_catchup_failed(recovered)
+            if read_pointer(paths.current) != paths.release(sha):
+                if not _activate_immutable_release(sha=sha, source=source):
+                    _forward_catchup_failed()
+        except (RuntimeError, OSError) as exc:
+            _forward_catchup_failed({'outcome': 'partial', 'failure': str(exc)})
         return
     current = read_pointer(paths.current)
     source = source or _m().PROJECT_ROOT
@@ -1979,7 +1993,9 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 if proof is not None:
                     from hermes_cli.gateway_forward_update import verify_forward, require_forward_inventory
                     require_forward_inventory(paths.home)
-                    verify_forward(paths.home, proof)
+                    verified = verify_forward(paths.home, proof)
+                    from hermes_cli.update_receipt import record_forward_generation
+                    record_forward_generation(verified)
                     _record_update_step('forward_fleet', True, 'generation lease and polling verified; draining labels retained')
                     _write_gateway_update_exit_code(True)
                     _finalize_receipt('success', 'Forward-only release verified: %s')

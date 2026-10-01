@@ -22,8 +22,8 @@ def render_generation_launchd_plist(*, slot: str, release_sha: str, release_root
     label = generation_launchd_label(slot)
     from gateway.generation import forward_only_handover_enabled
     from hermes_cli.config_effective import load_user_config_effective
-    if (forward_only_handover_enabled(load_user_config_effective(Path(hermes_home) / 'config.yaml', fail_closed=True))
-            and not label.startswith('ai.hermes.gateway.g-')):
+    forward_only = forward_only_handover_enabled(load_user_config_effective(Path(hermes_home) / 'config.yaml', fail_closed=True))
+    if forward_only and not label.startswith('ai.hermes.gateway.g-'):
         raise ValueError('forward-only generations require a full UUID label')
     release = Path(release_root).resolve(strict=True)
     python = Path(interpreter).absolute()
@@ -43,8 +43,9 @@ def render_generation_launchd_plist(*, slot: str, release_sha: str, release_root
             "HERMES_LAUNCHD_LABEL": label,
             "HERMES_GENERATION_SCOPE": uuid.uuid4().hex,
         },
-        "RunAtLoad": True,
-        "KeepAlive": {"SuccessfulExit": False},
+        # SuccessfulExit implies RunAtLoad, even when RunAtLoad is false.
+        "RunAtLoad": not (forward_only and standby),
+        "KeepAlive": False if forward_only and standby else {"SuccessfulExit": False},
     }
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML).decode("utf-8")
 

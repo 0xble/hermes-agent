@@ -395,6 +395,8 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 proof = recover_forward(home, supervisor=GenerationSupervisor(home, runner=launchctl_runner,
                                         directory=Path(plist).parent, domain=domain))
                 if proof is not None:
+                    if proof['outcome'] == 'locked':
+                        return 'locked'
                     receipt(home, 'forward_observe', proof['outcome'], generation=proof.get('new_id'),
                             reason=proof.get('failure', ''))
                     return 'healthy' if proof['outcome'] == 'success' else 'waiting'

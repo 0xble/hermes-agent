@@ -817,10 +817,16 @@ def _apply_pending_fleet_restart_catchup(*, defer: bool = False, checkout_comple
     forward_current = read_pointer(ReleasePaths.for_home(forward_home).current)
     if forward_current is not None and forward_route(forward_home, forward_current):
         if not defer:
-            require_forward_inventory(forward_home)
-            proof = recover_forward(forward_home) or observe_current_forward(forward_home)
-            if proof['outcome'] != 'success':
-                raise RuntimeError('forward-only catch-up remains unverified; fleet restart is fenced')
+            from hermes_cli.update_cmd import _forward_catchup_failed
+            from hermes_cli.update_receipt import record_forward_generation
+            try:
+                proof = recover_forward(forward_home) or observe_current_forward(forward_home)
+                if proof['outcome'] != 'success':
+                    _forward_catchup_failed(proof)
+                require_forward_inventory(forward_home)
+                record_forward_generation(proof)
+            except (RuntimeError, OSError) as exc:
+                _forward_catchup_failed({'outcome': 'blocked', 'alert': True, 'failure': str(exc)})
         return
     if not _pending_fleet_restart_needed():
         return

@@ -1,6 +1,7 @@
 """Forward-only update contracts with real coordinator transactions, no live services."""
 import json
 import plistlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +59,8 @@ def rig(tmp_path, monkeypatch):
         mode = 'happy'
         abort = False
         polled = set()
+        def _domain(self, label):
+            return 'gui/fixture'
         def bootstrap(self, row, path, timeout, *, before_launch=None):
             reserved = next(item for item in db.generations() if item['id'] == row['id'])
             assert reserved['pid'] is None
@@ -92,8 +95,7 @@ def rig(tmp_path, monkeypatch):
         def bootout(self, row, timeout=15):
             assert next(item for item in db.generations() if item['id'] == row['id'])['state'] == 'exited'
             events.append(('bootout', row['id']))
-            loaded.discard(row['label'])
-            return True
+            return super().bootout(row, timeout)
         def request(self, row, verb, *, params=None, timeout=2):
             events.append((verb, row['id']))
             if verb == 'polling_status':
@@ -103,7 +105,10 @@ def rig(tmp_path, monkeypatch):
                 if row['release_sha'] == b.name and self.mode in ('dies', 'wedged', 'blocked', 'unhealthy'):
                     if self.mode == 'dies':
                         alive.pop(row['pid'], None)
-                    raise RuntimeError('unhealthy successor')
+                        raise RuntimeError('unhealthy successor')
+                    if self.mode == 'unhealthy':
+                        return {'healthy': False}
+                    raise TimeoutError('generation loop did not answer')
                 if row['id'] not in self.polled and row['id'] != old.id:
                     db.record_poller_event('token-hash', row['id'], lease['epoch'], 'lock_acquired')
                     db.record_poller_event('token-hash', row['id'], lease['epoch'], 'poller_started')
@@ -118,7 +123,16 @@ def rig(tmp_path, monkeypatch):
                         'armed': dict.fromkeys(('poller', 'cron', 'kanban', 'goal_wakeup'), True)}
             raise AssertionError(verb)
 
-    supervisor = Supervisor(home, directory=directory, domain='gui/fixture')
+    def launchctl(argv, **kwargs):
+        label = argv[-1].split('/')[-1]
+        if argv[1] == 'bootout':
+            loaded.discard(label)
+        else:
+            assert argv[1] == 'print'
+        present = label in loaded
+        return SimpleNamespace(returncode=0 if present else 1, stdout='',
+                               stderr='' if present else 'Could not find service')
+    supervisor = Supervisor(home, runner=launchctl, directory=directory, domain='gui/fixture')
     def handover(home_arg, to_id, **kwargs):
         lease = db.leases()[0]
         events.append(('handover', lease['generation_id'], to_id))
@@ -156,6 +170,212 @@ def rig(tmp_path, monkeypatch):
 
 def promote(rig):
     return forward.promote_forward(rig.home, rig.b, rig.b.name, supervisor=rig.supervisor)
+
+
+def promote_different_release(rig):
+    candidate = release(rig.home, 'c' * 40)
+    return forward.promote_forward(rig.home, candidate, candidate.name, supervisor=rig.supervisor)
+
+
+def test_review_m1_guardian_waits_quietly_for_active_updater(rig, monkeypatch):
+    from hermes_cli import gateway_guardian
+    forward._save(rig.home, {'outcome': 'running'})
+    monkeypatch.setattr(gateway_guardian, 'receipt', lambda *a, **k: pytest.fail('contention alert'))
+    with forward._update_lock(rig.home):
+        assert gateway_guardian.run_once(
+            rig.home, rig.supervisor.directory / f'{rig.old.label}.plist', rig.old.label,
+            grace=180, domain='gui/fixture',
+            launchctl_runner=lambda *a, **k: pytest.fail('launchd action during contention')) == 'locked'
+    assert json.loads((rig.home / 'forward-update.json').read_text(encoding='utf-8')) == {'outcome': 'running'}
+
+
+@pytest.mark.parametrize('caller', ['release', 'fleet'])
+def test_review_m1_update_catchup_refuses_contended_lock(rig, monkeypatch, capsys, caller):
+    from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+    monkeypatch.setattr(update_cmd, '_immutable_release_enabled', lambda paths: True)
+    monkeypatch.setattr(update_receipt, '_current', None)
+    update_receipt.begin_update_receipt()
+    forward._save(rig.home, {'outcome': 'running'})
+    with forward._update_lock(rig.home), pytest.raises(SystemExit):
+        if caller == 'release':
+            update_cmd._catch_up_immutable_release(defer=False, sha=rig.b.name, source=rig.a)
+        else:
+            update_cmd_fleet._apply_pending_fleet_restart_catchup()
+    receipt = update_receipt.read_latest_receipt()
+    assert receipt['outcome'] == 'refused'
+    assert 'another updater is running' in capsys.readouterr().out
+    assert rig.events == []
+
+
+def test_review_m2_only_holder_has_login_and_crash_respawn(rig):
+    standby_id = rig.db.reserve_generation(release_sha=rig.b.name, label='standby-fixture')
+    row = forward._row(rig.db, standby_id.id)
+    # Rendering uses a real UUID label, matching the reservation's identity.
+    row['label'] = forward.generation_launchd_label(row['id'])
+    rendered = plistlib.loads(forward.render_generation_launchd_plist(
+        slot=row['id'], release_sha=rig.b.name, release_root=rig.b,
+        interpreter=rig.b / '.venv/bin/python', hermes_home=rig.home).encode())
+    assert rendered['RunAtLoad'] is False and rendered['KeepAlive'] is False
+    path = rig.supervisor.install(row, rig.b)
+    standby = plistlib.loads(path.read_bytes())
+    assert standby['RunAtLoad'] is False and standby['KeepAlive'] is False
+    rig.supervisor.boot_active(row, True)
+    holder = plistlib.loads(path.read_bytes())
+    assert holder['RunAtLoad'] is True and holder['KeepAlive'] == {'SuccessfulExit': False}
+    assert '--standby' not in holder['ProgramArguments']
+    rig.supervisor.boot_active(row, False)
+    demoted = plistlib.loads(path.read_bytes())
+    assert demoted['RunAtLoad'] is False and demoted['KeepAlive'] is False
+
+
+@pytest.mark.parametrize('foreign,readback_failed', [(False, False), (True, False), (False, True)])
+def test_review_m2_cleanup_unlinks_only_owned_unloaded_definition(rig, monkeypatch, foreign, readback_failed):
+    assert promote_different_release(rig)['outcome'] == 'success'
+    path = rig.supervisor.directory / f'{rig.old.label}.plist'
+    original = path.read_bytes()
+    if foreign:
+        data = plistlib.loads(original)
+        data['EnvironmentVariables']['HERMES_HOME'] = str(rig.home / 'foreign')
+        path.write_bytes(plistlib.dumps(data))
+        original = path.read_bytes()
+    rig.db.heartbeat(rig.old.id, state='exited')
+    calls, synced = [], []
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == 'bootout' and not readback_failed:
+            rig.loaded.discard(rig.old.label)
+        loaded = rig.old.label in rig.loaded
+        return SimpleNamespace(returncode=0 if loaded else 1, stdout='', stderr='' if loaded else 'Could not find service')
+    rig.supervisor.runner = runner
+    monkeypatch.setattr(rig.supervisor, '_domain', lambda label: 'gui/fixture')
+    monkeypatch.setattr(rig.supervisor, 'bootout', lambda row: forward.GenerationSupervisor.bootout(rig.supervisor, row))
+    monkeypatch.setattr(forward, '_sync_dir', lambda directory: synced.append(directory))
+    if foreign or readback_failed:
+        with pytest.raises(RuntimeError):
+            forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+        assert path.exists()
+        if foreign:
+            assert path.read_bytes() == original and not calls
+    else:
+        forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+        assert not path.exists()
+        assert synced == [rig.supervisor.directory]
+        calls.clear()
+        forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+        assert not any(argv[1] == 'bootout' for argv in calls)
+
+
+def test_review_m2_bootstrap_keeps_runtime_respawn_outside_login_directory(rig, monkeypatch):
+    import uuid
+    from hermes_cli.gateway_launchd_generation import generation_launchd_label
+    generation_id = str(uuid.uuid4())
+    reserved = rig.db.reserve_generation(generation_id=generation_id, release_sha=rig.b.name,
+                                         label=generation_launchd_label(generation_id))
+    row = forward._row(rig.db, reserved.id)
+    path = rig.supervisor.install(row, rig.b)
+    scopes = []
+    def runner(argv, **kwargs):
+        if argv[1] == 'print':
+            return SimpleNamespace(returncode=1, stdout='', stderr='Could not find service')
+        assert argv[1] == 'bootstrap'
+        runtime_path = Path(argv[-1])
+        assert runtime_path.parent != rig.supervisor.directory
+        runtime = plistlib.loads(runtime_path.read_bytes())
+        login = plistlib.loads(path.read_bytes())
+        assert runtime['KeepAlive'] == {'SuccessfulExit': False} and runtime['RunAtLoad'] is True
+        assert login['KeepAlive'] is False and login['RunAtLoad'] is False
+        assert runtime['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] == login['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] == scopes[0]
+        return SimpleNamespace(returncode=0)
+    rig.supervisor.runner = runner
+    monkeypatch.setattr(rig.supervisor, '_domain', lambda label: 'gui/fixture')
+    forward.GenerationSupervisor.bootstrap(rig.supervisor, row, path, 30, before_launch=scopes.append)
+    assert scopes
+
+
+def test_review_l1_rolled_back_sha_stays_fenced_across_receipts(rig, monkeypatch):
+    rig.supervisor.mode = 'dies'
+    assert promote(rig)['outcome'] == 'rolled_back'
+    rig.supervisor.mode = 'happy'
+    rig.events.clear()
+    refused = promote(rig)
+    assert refused['outcome'] == 'refused'
+    assert refused['failure'] == 'release previously rolled back'
+    assert rig.events == []
+    assert promote(rig)['outcome'] == 'refused'  # A refusal must not erase the fence.
+    from hermes_cli import update_cmd, update_receipt
+    monkeypatch.setattr(update_cmd, '_immutable_release_enabled', lambda paths: True)
+    monkeypatch.setattr(forward, 'GenerationSupervisor', lambda home: rig.supervisor)
+    monkeypatch.setattr(update_cmd, '_require_immutable_launchd', lambda: None)
+    monkeypatch.setattr(releases, 'stage_release', lambda *a, **k: (rig.b, 'reused'))
+    monkeypatch.setattr(update_receipt, '_current', None)
+    update_receipt.begin_update_receipt()
+    with pytest.raises(SystemExit):
+        update_cmd._catch_up_immutable_release(defer=False, sha=rig.b.name, source=rig.a)
+    assert update_receipt.read_latest_receipt()['outcome'] == 'refused'
+    candidate = release(rig.home, 'c' * 40)
+    assert forward.promote_forward(rig.home, candidate, candidate.name, supervisor=rig.supervisor)['outcome'] == 'success'
+
+
+def test_review_l1_catchup_failure_finalizes_partial_without_traceback(rig, monkeypatch):
+    from hermes_cli import update_cmd, update_receipt
+    monkeypatch.setattr(update_cmd, '_immutable_release_enabled', lambda paths: True)
+    monkeypatch.setattr(forward, 'recover_forward', lambda home: (_ for _ in ()).throw(RuntimeError('recovery failed')))
+    monkeypatch.setattr(update_receipt, '_current', None)
+    update_receipt.begin_update_receipt()
+    with pytest.raises(SystemExit) as exc:
+        update_cmd._catch_up_immutable_release(defer=False, sha=rig.b.name, source=rig.a)
+    assert exc.value.code == 1
+    assert update_receipt.read_latest_receipt()['outcome'] == 'partial'
+
+
+@pytest.mark.parametrize('phase', ['promote', 'rollback', 'recover_success', 'recover_rollback', 'verify'])
+def test_review_n1_slow_first_poll_uses_original_commit_budget(rig, monkeypatch, phase):
+    original = rig.supervisor.request
+    waiting = {}
+    def slow(row, verb, **kwargs):
+        if verb == 'polling_status' and row['id'] != rig.old.id:
+            start = waiting.setdefault(row['id'], rig.clock.value)
+            if rig.clock.value - start < 13:
+                raise RuntimeError('first poll pending')
+        return original(row, verb, **kwargs)
+    if phase in {'rollback', 'recover_rollback'}:
+        rig.supervisor.mode = 'dies'
+        def slow_rollback(row, verb, **kwargs):
+            return slow(row, verb, **kwargs) if row['release_sha'] == rig.a.name else original(row, verb, **kwargs)
+        delayed = slow_rollback
+    else:
+        delayed = slow
+    if phase.startswith('recover'):
+        flip = forward._flip
+        def crash(*args, **kwargs):
+            if phase == 'recover_success' or kwargs.get('operation') == 'rollback':
+                raise KeyboardInterrupt('committed owner before pointer flip')
+            return flip(*args, **kwargs)
+        monkeypatch.setattr(forward, '_flip', crash)
+        with pytest.raises(KeyboardInterrupt):
+            promote(rig)
+        monkeypatch.setattr(forward, '_flip', flip)
+        monkeypatch.setattr(rig.supervisor, 'request', delayed)
+        result = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    elif phase == 'verify':
+        result = promote(rig)
+        monkeypatch.setattr(rig.supervisor, 'request', delayed)
+        result = forward.verify_forward(rig.home, result, supervisor=rig.supervisor)
+    else:
+        monkeypatch.setattr(rig.supervisor, 'request', delayed)
+        result = promote(rig)
+    assert result['outcome'] == ('rolled_back' if 'rollback' in phase else 'success'), result
+    assert rig.clock.value <= result['commit_clock'] + forward.ROLLBACK_SECONDS
+
+
+def test_review_n1_current_observation_timeout_is_recheckable(rig, monkeypatch):
+    request = rig.supervisor.request
+    monkeypatch.setattr(rig.supervisor, 'request', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('first poll pending')))
+    result = forward.observe_current_forward(rig.home, supervisor=rig.supervisor)
+    assert result['outcome'] == 'blocked' and result['alert']
+    assert rig.clock.value == pytest.approx(forward.POLL_SECONDS)
+    monkeypatch.setattr(rig.supervisor, 'request', request)
+    assert forward.observe_current_forward(rig.home, supervisor=rig.supervisor)['outcome'] == 'success'
 
 
 def test_happy_ordering_and_exit_cleanup(rig):
@@ -324,17 +544,18 @@ def test_rollback_never_claims_reply_success_past_60_second_budget(rig, monkeypa
     assert not (rig.home / 'forward-update.json').exists()
 
 
-def test_quiet_rollback_does_not_permanently_block_the_next_promotion(rig, monkeypatch):
+def test_quiet_rollback_allows_a_different_release_after_fencing_failed_sha(rig, monkeypatch):
     rig.supervisor.mode = 'dies'
     monkeypatch.setattr(forward, '_fresh_reply', lambda *args: None)
     first = promote(rig)
     rig.supervisor.mode = 'happy'
-    second = promote(rig)
+    assert promote(rig)['outcome'] == 'refused'
+    second = promote_different_release(rig)
     assert first['outcome'] == 'rolled_back'
     assert first['rollback']['reply_observed'] is False
     assert second['outcome'] == 'success'
     assert second['old_id'] == first['rollback']['new_id']
-    assert releases.read_pointer(rig.home / 'current') == rig.b
+    assert releases.read_pointer(rig.home / 'current').name == 'c' * 40
 
 
 def test_abandoned_precommit_reservation_is_retired_by_observer(rig, monkeypatch):
@@ -453,7 +674,7 @@ def test_recovered_rollback_still_requires_fresh_reply_with_original_deadline(ri
     assert rig.clock.value == pytest.approx(max(60, resume_at))
     assert not (rig.home / 'forward-update.json').exists()
     rig.supervisor.mode = 'happy'
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 def test_positive_owned_final_reply_proof_rejects_interim_synthetic_and_other_owner(rig):
@@ -744,7 +965,7 @@ def test_successful_reply_read_cannot_cross_original_rollback_deadline(rig, monk
     assert 'reply_seconds' not in result['rollback']
     assert not (rig.home / 'forward-update.json').exists()
     rig.supervisor.mode = 'happy'
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 @pytest.mark.parametrize('recovered', [False, True])
@@ -796,7 +1017,7 @@ def test_unanswered_fresh_input_alerts_but_archives_completed_rollback(rig, monk
     assert rig.clock.value == pytest.approx(60)
     assert not (rig.home / 'forward-update.json').exists()
     rig.supervisor.mode = 'happy'
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 @pytest.mark.parametrize('recovered', [False, True])
@@ -830,7 +1051,7 @@ def test_late_rollback_polling_proof_alerts_but_does_not_block_next_promotion(ri
     assert 'reply_seconds' not in result['rollback']
     assert not (rig.home / 'forward-update.json').exists()
     rig.supervisor.mode = 'happy'
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 def cold_claimant(rig, sha):
@@ -876,7 +1097,7 @@ def test_reboot_cold_claimant_supersedes_intent_and_retires_unclaimed_standby(ri
     assert not any(event[0] in ('bootstrap', 'handover', 'transfer_aborted') for event in rig.events)
     verified = forward.verify_forward(rig.home, result, supervisor=rig.supervisor)
     assert verified['poller']['generation_id'] == fresh.id
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 def test_rollback_holder_after_boot_change_archives_with_unprovable_timing(rig, monkeypatch):
@@ -907,7 +1128,7 @@ def test_rollback_holder_after_boot_change_archives_with_unprovable_timing(rig, 
     assert rig.db.leases()[0]['generation_id'] == rollback_id
     assert releases.read_pointer(rig.home / 'current') == rig.a
     rig.supervisor.mode = 'happy'
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 @pytest.mark.parametrize('reservation', [False, True])
@@ -937,7 +1158,7 @@ def test_superseded_pointer_inconsistency_is_rechecked_without_flipping(rig, mon
     assert recovered['superseded_by']['id'] == fresh.id
     assert recovered['superseded_by']['epoch'] == epoch
     assert not (rig.home / 'forward-update.json').exists()
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 @pytest.mark.parametrize('resolution', ['healthy', 'handover', 'death'])
@@ -957,7 +1178,7 @@ def test_live_successor_safety_block_clears_from_durable_state(rig, resolution):
     assert recovered['rollback_deadline_clock'] == original_deadline
     assert not (rig.home / 'forward-update.json').exists()
     assert not any(event[0] in ('bounded-stop', 'transfer_aborted') for event in rig.events)
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 def test_failed_rollback_reservation_can_retry_inside_original_budget(rig, monkeypatch):
@@ -984,7 +1205,7 @@ def test_failed_rollback_reservation_can_retry_inside_original_budget(rig, monke
     assert recovered['rollback_deadline_clock'] == blocked['rollback_deadline_clock']
     assert recovered['rollback']['commit_to_reply_upper_bound_seconds'] <= 60
     assert not (rig.home / 'forward-update.json').exists()
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 def test_cross_boot_dead_successor_does_not_reuse_monotonic_budget(rig, monkeypatch):
@@ -1046,7 +1267,7 @@ def test_superseded_safety_failure_is_rechecked_before_archival(rig, monkeypatch
     assert result['outcome'] == 'rolled_back' and result['superseded_by']['id'] == fresh.id, result
     assert not (rig.home / 'forward-update.json').exists()
     assert standby['label'] not in rig.loaded
-    assert promote(rig)['outcome'] == 'success'
+    assert promote_different_release(rig)['outcome'] == 'success'
 
 
 def test_launch_free_recovery_probe_failure_alerts_and_rechecks(rig, monkeypatch):

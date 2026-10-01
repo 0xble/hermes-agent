@@ -55,7 +55,10 @@ def test_generation_plist_has_fresh_scope_for_each_bootstrap_definition(tmp_path
     first, second = [plistlib.loads(render_generation_launchd_plist(**args).encode()) for _ in range(2)]
     scope = first['EnvironmentVariables']['HERMES_GENERATION_SCOPE']
     assert scope and scope != second['EnvironmentVariables']['HERMES_GENERATION_SCOPE']
-    assert first['KeepAlive'] == {'SuccessfulExit': False}
+    # A stored standby definition must not start at login (SuccessfulExit implies RunAtLoad).
+    assert (first['RunAtLoad'], first['KeepAlive']) == (False, False)
+    holder = plistlib.loads(render_generation_launchd_plist(**args, standby=False).encode())
+    assert (holder['RunAtLoad'], holder['KeepAlive']) == (True, {'SuccessfulExit': False})
     assert first['Label'] == f'ai.hermes.gateway.g-{generation.hex}'
     with pytest.raises(ValueError, match='UUID'):
         render_generation_launchd_plist(**{**args, 'slot': 'a'})

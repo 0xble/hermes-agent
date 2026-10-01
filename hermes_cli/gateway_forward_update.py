@@ -14,6 +14,7 @@ import plistlib
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -25,6 +26,9 @@ from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _atomic_by
 STARTUP_SECONDS = 45
 ROLLBACK_SECONDS = 60
 POLL_SECONDS = 5
+# A committed successor must prove polling inside this share of the rollback
+# budget so A' keeps STARTUP_SECONDS to start, take over and poll.
+POLL_PROOF_SECONDS = ROLLBACK_SECONDS - STARTUP_SECONDS
 
 
 def _now():
@@ -126,14 +130,28 @@ def observe_current_forward(home, *, supervisor=None):
              'old_sha': row['release_sha'], 'new_sha': row['release_sha'],
              'current': str(paths.release(row['release_sha'])),
              'previous': str(read_pointer(paths.previous)) if read_pointer(paths.previous) else None}
-    return verify_forward(home, proof, supervisor=supervisor)
+    try:
+        return verify_forward(home, proof, supervisor=supervisor)
+    except (RuntimeError, OSError) as exc:
+        return {**proof, 'outcome': 'blocked', 'alert': True, 'failure': str(exc)}
+
+
+def _proof_deadline(record, row):
+    """Use a durable commit budget only in the boot that recorded its clock."""
+    from gateway.generation import _boot_id
+    if record.get('commit_clock') is not None and record.get('commit_boot_id') == row['boot_id'] == _boot_id():
+        rollback = row['id'] == (record.get('rollback_generation') or {}).get('id')
+        deadline = record['commit_clock'] + (ROLLBACK_SECONDS if rollback else POLL_PROOF_SECONDS)
+        if deadline > _now():
+            return deadline
+    return _now() + POLL_SECONDS
 
 
 def verify_forward(home, record, *, supervisor=None):
     db = GenerationCoordinator(home)
     supervisor = supervisor or GenerationSupervisor(home)
     row = _row(db, (record.get('superseded_by') or {}).get('id') or record['new_id'])
-    proof = _poller(db, row, supervisor, _now() + POLL_SECONDS)
+    proof = _poller(db, row, supervisor, _proof_deadline(record, row))
     paths = ReleasePaths.for_home(home)
     if read_pointer(paths.current) != paths.release(row['release_sha']):
         raise RuntimeError('forward pointer does not name the serving generation')
@@ -167,8 +185,16 @@ def _live(row):
 def _update_lock(home):
     import fcntl  # macOS updater, no launchd work on other hosts.
     with (Path(home) / 'forward-update.lock').open('a+') as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def _locked():
+    return {'outcome': 'locked', 'failure': 'another updater is running'}
 
 
 class GenerationSupervisor:
@@ -202,6 +228,7 @@ class GenerationSupervisor:
         data = plistlib.loads(body.encode())
         # bootstrap is explicit. A standby must never be eligible at next login.
         data['RunAtLoad'] = False
+        data['KeepAlive'] = False
         _atomic_bytes(path, plistlib.dumps(data))
         return path
 
@@ -211,9 +238,23 @@ class GenerationSupervisor:
         from hermes_cli.gateway_guardian import _launch_state
         if _launch_state(domain, row['label'], runner=self.runner) != 'unloaded':
             raise RuntimeError('generation label was already loaded before bootstrap')
-        bootstrap_generation_plist(domain=domain, plist_path=path,
-                                   label=row['label'], runner=self.runner, timeout=min(30, timeout),
-                                   before_launch=before_launch)
+        # launchd retains the loaded definition. It needs crash respawn when this
+        # standby becomes holder, but SuccessfulExit implies RunAtLoad at login
+        # (launchd.plist(5)). Bootstrap that definition outside LaunchAgents.
+        with tempfile.TemporaryDirectory(prefix='.generation-bootstrap-', dir=self.home) as scratch:
+            runtime_path = Path(scratch) / path.name
+            _, data = self._definition(row['label'])
+            data.update(RunAtLoad=True, KeepAlive={'SuccessfulExit': False})
+            _atomic_bytes(runtime_path, plistlib.dumps(data))
+            def bind_scope(scope):
+                _, login = self._definition(row['label'])
+                login['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] = scope
+                _atomic_bytes(path, plistlib.dumps(login))
+                if before_launch is not None:
+                    before_launch(scope)
+            bootstrap_generation_plist(domain=domain, plist_path=runtime_path,
+                                       label=row['label'], runner=self.runner, timeout=min(30, timeout),
+                                       before_launch=bind_scope)
 
     def owns_bootstrap(self, row, scope):
         """Prove an unclaimed loaded job belongs to our interrupted bootstrap."""
@@ -244,17 +285,22 @@ class GenerationSupervisor:
         from hermes_cli.gateway_guardian import _launch_state
         if _launch_state(domain, row['label'], runner=self.runner) != 'unloaded':
             raise RuntimeError('generation bootout readback failed')
+        if path.exists():
+            self._definition(row['label'])
+            path.unlink()
+            _sync_dir(self.directory)
         return True
 
     def boot_active(self, row, active):
         path, data = self._definition(row['label'])
         data['RunAtLoad'] = active
+        data['KeepAlive'] = {'SuccessfulExit': False} if active else False
         if active:
             data['ProgramArguments'] = [arg for arg in data['ProgramArguments'] if arg != '--standby']
         _atomic_bytes(path, plistlib.dumps(data))
         _, readback = self._definition(row['label'])
-        if readback['RunAtLoad'] is not active:
-            raise RuntimeError('RunAtLoad readback failed')
+        if readback['RunAtLoad'] is not active or readback['KeepAlive'] != data['KeepAlive']:
+            raise RuntimeError('generation login policy readback failed')
 
     def ready(self, row):
         if row['pid'] is None or not _live(row) or row['verdict'] is not None:
@@ -314,9 +360,12 @@ def _poller(db, row, supervisor, deadline):
                 if not starts:
                     raise RuntimeError('successor lacks a durable poller start')
                 proof['poller_started_at'] = max(starts)
+                proof.update(pid=current['pid'], label=current['label'])
                 return proof
         except RuntimeError:
-            pass
+            proof = {}
+        if proof.get('healthy') is False:
+            raise RuntimeError('successor reports unhealthy runtime')
         _sleep(min(.2, _remaining(deadline, .2)))
 
 
@@ -330,6 +379,10 @@ def _finish(home, record, outcome, **fields):
     record.update(fields, outcome=outcome, finished_at=time.time())
     if outcome == 'blocked':
         record['alert'] = True
+    if outcome == 'rolled_back':
+        # Separate from the last receipt: refusals and unrelated observations
+        # must not erase the exact revision that failed after commitment.
+        _atomic_json(Path(home) / 'forward-update-bad.json', {'failed_sha': record['new_sha']})
     _save(home, record)
     if outcome in {'success', 'rolled_back', 'refused', 'aborted'}:
         _archive(home, record)
@@ -373,6 +426,7 @@ def _refuse(db, row, supervisor, evidence, *, bootstrapped=True, bootstrap_scope
         if installed and path.exists():
             supervisor._definition(row['label'])
             path.unlink()
+            _sync_dir(supervisor.directory)
 
 
 def _discard_reservation(db, info, supervisor, evidence, *, never_claimed_only=False):
@@ -398,16 +452,21 @@ def cleanup_exited(home, *, supervisor=None):
     db = GenerationCoordinator(home)
     lease = next((item for item in db.leases() if item['resource'] == 'active_generation'), None)
     holder = lease['generation_id'] if lease else None
-    for row in db.generations():
+    rows = db.generations()
+    live_labels = {row['label'] for row in rows if row['state'] != 'exited'}
+    for row in rows:
         if row['state'] == 'exited' and row['id'] != holder:
             if row['pid'] is None:
                 continue  # Unclaimed bootstrap cleanup belongs to its durable intent.
             path = supervisor.directory / f"{row['label']}.plist"
             # A cold start may have reused a historical label. Address its live row.
-            if path.exists() and not any(other['label'] == row['label'] and other['state'] != 'exited'
-                                         for other in db.generations()):
+            if row['label'] in live_labels:
+                continue
+            if path.exists():
                 supervisor.boot_active(row, False)
                 supervisor.bootout(row)
+            # Successful bootout removes our definition. Later ticks need no
+            # launchd query. A custom plist belongs to its exact-path guardian.
 
 
 def _boot_entries(db, supervisor):
@@ -656,7 +715,7 @@ def _rollback(home, db, failed, previous, supervisor, record):
             # The standby itself can cold-takeover. CAS protects either participant.
             db.takeover_dead_generation('active_generation', failed['id'], fresh['id'],
                 bootout=lambda label: supervisor.bootout(_row(db, failed['id']), _remaining(deadline, 15)))
-    proof = _poller(db, fresh, supervisor, min(deadline, _now() + POLL_SECONDS))
+    proof = _poller(db, fresh, supervisor, deadline)
     serving_clock = _now()
     result = _flip(home, db, fresh, proof, supervisor, operation='rollback')
     rollback = {'old_id': failed['id'], 'new_id': fresh['id'], 'old_label': failed['label'],
@@ -676,7 +735,7 @@ def _rollback(home, db, failed, previous, supervisor, record):
 def _superseded(home, db, record, lease, supervisor):
     """A proven independent claimant makes this intent an audit record only."""
     row = _row(db, lease['generation_id'])
-    proof = _poller(db, row, supervisor, _now() + POLL_SECONDS)
+    proof = _poller(db, row, supervisor, _proof_deadline(record, row))
     release = ReleasePaths.for_home(home).release(row['release_sha'])
     if read_pointer(Path(home) / 'current') != release:
         raise RuntimeError('superseding holder release differs from current pointer')
@@ -706,7 +765,11 @@ def recover_forward(home, *, supervisor=None):
     if not path.exists():
         return None
     supervisor = supervisor or GenerationSupervisor(home)
-    with _update_lock(home):
+    with _update_lock(home) as acquired:
+        if not acquired:
+            return _locked()
+        if not path.exists():
+            return None  # The updater may have archived just before lock acquisition.
         record = json.loads(path.read_text(encoding='utf-8'))
         db = GenerationCoordinator(home)
         try:
@@ -741,7 +804,7 @@ def recover_forward(home, *, supervisor=None):
         if lease['generation_id'] == new['id']:
             try:
                 row = _row(db, new['id'])
-                proof = _poller(db, row, supervisor, _now() + POLL_SECONDS)
+                proof = _poller(db, row, supervisor, _proof_deadline(record, row))
                 serving_clock = _now()
                 rollback_owner = new == record.get('rollback_generation')
                 if not rollback_owner and record.get('rollback_generation'):
@@ -813,7 +876,21 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
     if not forward_route(home, candidate) or candidate.name != sha or not _release_is_ready(candidate, sha):
         raise RuntimeError('forward-only release pair is not capable and ready')
     supervisor = supervisor or GenerationSupervisor(home)
-    with _update_lock(home):
+    with _update_lock(home) as acquired:
+        if not acquired:
+            return _locked()
+        bad = home / 'forward-update-bad.json'
+        last = home / 'forward-update-last.json'
+        previous_failure = json.loads(bad.read_text(encoding='utf-8')) if bad.exists() else {}
+        # Also recognize rollback records written before the durable fence existed.
+        archived = json.loads(last.read_text(encoding='utf-8')) if last.exists() else {}
+        if (previous_failure.get('failed_sha') == sha or
+                archived.get('outcome') == 'rolled_back' and archived.get('new_sha') == sha):
+            _atomic_json(bad, {'failed_sha': sha})
+            refusal = {'outcome': 'refused', 'new_sha': sha, 'failure': 'release previously rolled back'}
+            from hermes_cli.update_receipt import record_forward_generation
+            record_forward_generation(refusal)
+            return refusal
         db = GenerationCoordinator(home)
         lease = _lease(db)
         old = _row(db, lease['generation_id'])
@@ -851,7 +928,11 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
                 record.update(commit_clock=_now(), commit_at=time.time(), commit_boot_id=old['boot_id'])
                 _save(home, record)
             handover_to_generation(home, successor['id'], timeout=45, before_commit=record_commit_window)
-            proof = _poller(db, successor, supervisor, _now() + POLL_SECONDS)
+            # The rollback budget also starts at commit. The successor's proof
+            # window leaves A' STARTUP_SECONDS to start, take over and poll.
+            commit = record['commit_clock']
+            proof = _poller(db, successor, supervisor, min(
+                commit + ROLLBACK_SECONDS, max(commit + POLL_PROOF_SECONDS, _now() + POLL_SECONDS)))
             result = _flip(home, db, successor, proof, supervisor)
             return _finish(home, record, 'success', poller=proof, epoch=proof['epoch'],
                            promotion_seconds=_now() - started, **result)
