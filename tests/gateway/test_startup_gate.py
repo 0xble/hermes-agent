@@ -141,10 +141,12 @@ def isolated_runner(tmp_path, monkeypatch):
 
 def make_turn(tmp_path):
     from gateway.startup_gate import _LoopbackTurn
-    return _LoopbackTurn("gate-nonce", "gate-fixture", {
+    turn = _LoopbackTurn("gate-nonce", "gate-fixture", {
         "provider": "custom", "requested_provider": "custom", "api_key": "fixture-only",
         "base_url": "http://127.0.0.1:9/v1", "api_mode": "chat_completions",
     }, tmp_path / "profile")
+    turn.evidence["session_key"] = "startup-gate:" + turn.nonce
+    return turn
 
 
 @pytest.mark.parametrize("reply,completed,accepted", [
@@ -332,7 +334,15 @@ async def test_verdict_uses_real_worker_turn_and_is_private(worker_provider, mod
         assert len(rows) == 1 and rows[0].state == "failed_unsent"
         assert rows[0].payload["session_key"].startswith("startup-gate:")
     else:
-        assert rows == []
+        if mode in {"wrong-nonce", "missing-nonce"}:
+            assert len(rows) == 1
+            assert rows[0].state == "failed_unsent" and rows[0].message_id is None
+            assert rows[0].payload["session_key"] == "startup-gate:" + verdict.evidence["nonce"]
+            with sqlite3.connect(Outbox(owner_home).path) as conn:
+                assert conn.execute("SELECT send_status,attempts FROM outbox").fetchall() == [("synthetic", 0)]
+            assert Outbox(owner_home).pending() == []
+        else:
+            assert rows == []
         assert verdict.evidence["error"]
         if mode == "schema-override":
             assert not runner.provider_entered

@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
+from contextlib import closing
 from contextvars import ContextVar
 from dataclasses import fields
 from datetime import datetime
+from pathlib import Path
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
@@ -96,9 +99,30 @@ class OwnedRouting:
         return keys
 
     def validate_live(self):
-        keys = self._live_keys()
+        keys = self._live_keys() | self._delegation_keys()
         if any(not key.startswith("agent:") for key in keys):
             raise RuntimeError("unscoped session obligation during transfer")
+        return keys
+
+    def _delegation_keys(self):
+        # A child finishing is not its result being admitted. Keep the spawning
+        # session on A through durable completion delivery, including that gap.
+        from gateway.status import get_process_start_time
+        pid = self.generation.identity.pid
+        started = get_process_start_time(pid)
+        served = getattr(self.generation.runner, '_served_profile_homes', None)
+        homes = {self.generation.coordinator.home,
+                 *(served.values() if isinstance(served, dict) else ())}
+        keys = set()
+        for home in homes:
+            path = Path(home) / 'state.db'
+            if not path.exists():
+                continue
+            with closing(sqlite3.connect(f'file:{path}?mode=ro', uri=True)) as conn:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone():
+                    keys.update(row[0] for row in conn.execute(
+                        "SELECT origin_session FROM async_delegations WHERE owner_pid=? "
+                        "AND owner_started_at=? AND delivery_state='pending'", (pid, started)) if row[0])
         return keys
 
     def claim_live(self):
@@ -267,7 +291,7 @@ class OwnedRouting:
                         "SELECT * FROM sessions WHERE generation_id=?", (owner,))]
 
             claims = await asyncio.to_thread(read_claims)
-            live = self._live_keys()
+            live = self._live_keys() | await asyncio.to_thread(self._delegation_keys)
             from tools.process_registry import process_registry
             # A claim is retained only for work belonging to its own session.
             lease_rows = await asyncio.to_thread(store.leases)

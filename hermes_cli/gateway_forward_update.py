@@ -309,11 +309,14 @@ class GenerationSupervisor:
         if path.exists():
             self._definition(row['label'])
         domain = self._domain(row['label'])
+        deadline = _now() + min(15, timeout)
         self.runner(['launchctl', 'bootout', f"{domain}/{row['label']}"],
                     capture_output=True, timeout=min(15, timeout))
         from hermes_cli.gateway_guardian import _launch_state
-        if _launch_state(domain, row['label'], runner=self.runner) != 'unloaded':
-            raise RuntimeError('generation bootout readback failed')
+        while _launch_state(domain, row['label'], runner=self.runner) != 'unloaded':
+            if _now() >= deadline:
+                raise RuntimeError('generation bootout readback failed')
+            _sleep(min(.05, deadline - _now()))
         if path.exists():
             self._definition(row['label'])
             path.unlink()
@@ -340,8 +343,18 @@ class GenerationSupervisor:
             record = json.loads(path.read_text(encoding='utf-8'))
         except FileNotFoundError:
             return False
-        return (all(record.get(key) == row[key] for key in GenerationIdentity.__dataclass_fields__)
-                and record.get('state') in {'standby', 'serving'} and bool(record.get('socket_path')))
+        if not (all(record.get(key) == row[key] for key in GenerationIdentity.__dataclass_fields__)
+                and record.get('state') in {'standby', 'serving'} and bool(record.get('socket_path'))):
+            return False
+        if record['state'] == 'serving':
+            # Cold takeover publishes the socket before adapters start. Finish
+            # startup inside its existing budget before the short poller proof.
+            try:
+                status = self.request(row, 'polling_status')
+            except RuntimeError:
+                return False
+            return status.get('polling') is True and status.get('healthy') is True and bool(status.get('tokens'))
+        return True
 
     def request(self, row, verb, *, params=None, timeout=2):
         return _generation_request(generation_paths(self.home, _identity(row))['socket'],
