@@ -13,16 +13,18 @@ from gateway.generation import GenerationCoordinator, GenerationIdentity
 from gateway.status import _get_process_start_time
 
 
-def _pair(tmp_path):
+def _pair(tmp_path, *, old_pid=None):
     store = GenerationCoordinator(tmp_path)
     fingerprint = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
-    old = GenerationIdentity.create(release_sha="a", label="slot-a", start_fingerprint=fingerprint)
+    old_pid = os.getpid() if old_pid is None else old_pid
+    old = GenerationIdentity.create(release_sha="a", label="slot-a", pid=old_pid,
+                                    start_fingerprint=f"{old_pid}:{_get_process_start_time(old_pid)}")
     new = GenerationIdentity.create(release_sha="b", label="slot-b", start_fingerprint=fingerprint)
-    store.register(old, state="draining")
-    store.register(new, state="serving")
+    store.register(old, state="serving")
+    store.register(new, state="standby")
     previous = store.acquire_lease("active_generation", old.id)
-    assert store.release_lease("active_generation", old.id, previous)
-    current = store.acquire_lease("active_generation", new.id)
+    store.request_transfer(old.id, new.id, previous, set())
+    current = store.commit_transfer(old.id, new.id, previous)
     assert current == previous + 1
     return store, old, new, current
 
@@ -132,6 +134,10 @@ def test_dead_owner_holds_pending_rows_without_replaying(tmp_path, monkeypatch):
     with closing(store.connect()) as conn:
         held = conn.execute("SELECT state,owner_id FROM inbox WHERE id=?", (row["id"],)).fetchone()
         assert tuple(held) == ("interrupted", old.id)
+        retired = conn.execute("SELECT state,verdict,verdict_at,verdict_evidence FROM generations WHERE id=?",
+                               (old.id,)).fetchone()
+        assert tuple(retired)[:2] == ("exited", "failed")
+        assert retired["verdict_at"] is not None and retired["verdict_evidence"]
     again, fresh = store.enqueue("home-a", "telegram", "chat", "one", "message",
                                  _source(), b"work", new.id, epoch)
     assert not fresh and again["state"] == "interrupted"
@@ -162,6 +168,9 @@ def test_dead_owner_is_probed_once_against_locked_ownership(tmp_path, monkeypatc
                                _source(), b"next", new.id, epoch)
     assert fresh and len(probes) == 1
     assert row["owner_id"] == (new.id if dead else old.id)
+    with closing(store.connect()) as db:
+        retired = db.execute("SELECT state,verdict FROM generations WHERE id=?", (old.id,)).fetchone()
+        assert tuple(retired) == (("exited", "failed") if dead else ("draining", None))
 
 
 def test_first_message_after_owner_death_moves_to_successor(tmp_path, monkeypatch):
@@ -189,6 +198,7 @@ def test_exited_owner_outstanding_claim_moves_without_replaying_cut_work(tmp_pat
 
 
 
+@pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize("failure", ["cap", "sigkill"])
 def test_cut_claim_recovers_only_on_next_new_message(tmp_path, failure):
     import signal
@@ -196,16 +206,11 @@ def test_cut_claim_recovers_only_on_next_new_message(tmp_path, failure):
     import sys
     import time
 
-    store, old, new, epoch = _pair(tmp_path)
     process = None
     try:
         if failure == "sigkill":
             process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-            from gateway.status import _get_process_start_time
-            start = _get_process_start_time(process.pid)
-            with closing(store.connect()) as db, db:
-                db.execute("UPDATE generations SET pid=?,start_fingerprint=? WHERE id=?",
-                           (process.pid, f"{process.pid}:{start}", old.id))
+        store, old, new, epoch = _pair(tmp_path, old_pid=process.pid if process else None)
         store.claim_session("home-a", "telegram", "chat", old.id, epoch - 1, outstanding_work=1)
         cut, _ = store.enqueue("home-a", "telegram", "chat", "cut", "message",
                                _source(), b"cut-work", new.id, epoch)

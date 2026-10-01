@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -33,7 +34,7 @@ def _domain(label: str) -> str:
     return _probe_launchd_domain_for_label(label)
 
 
-def _gateway_domain(label: str, preferred: str | None) -> str:
+def _gateway_domain(label: str, preferred: str | None, *, runner=None) -> str:
     """Observe both domains before trusting a saved domain or starting an unloaded job."""
     domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")  # windows-footgun: ok (macOS launchd only)
     if preferred is not None and preferred not in domains:
@@ -41,10 +42,10 @@ def _gateway_domain(label: str, preferred: str | None) -> str:
     states = {}
     for candidate in domains:
         try:
-            states[candidate] = _launch_state(candidate, label)
+            states[candidate] = _launch_state(candidate, label, runner=runner)
         except RuntimeError:
             states[candidate] = "unknown"
-    loaded = [candidate for candidate, state in states.items() if state == "loaded"]
+    loaded = [candidate for candidate, state in states.items() if state in {"loaded", "parked"}]
     if len(loaded) > 1:
         raise RuntimeError("gateway label is loaded in both launchd domains")
     if loaded:
@@ -116,7 +117,7 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
     return "none", None
 
 
-def healthy(home: Path, label: str, expected: Path) -> bool:
+def healthy(home: Path, label: str, expected: Path, runner=None) -> bool:
     from gateway.status import read_runtime_status, runtime_status_is_stale
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
     import psutil
@@ -126,7 +127,8 @@ def healthy(home: Path, label: str, expected: Path) -> bool:
         return False
     if state.get("code_sha") != expected.name or runtime_status_is_stale(state):
         return False
-    supervised = _launchctl_supervised_pid(label)
+    supervised = (_launchctl_supervised_pid(label) if runner is None else
+                  _launchctl_supervised_pid(label, runner=runner))
     if supervised is None:
         return False
     try:
@@ -138,17 +140,22 @@ def healthy(home: Path, label: str, expected: Path) -> bool:
         return False
 
 
-def _launch_state(domain: str, label: str) -> str:
-    result = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
+def _launch_state(domain: str, label: str, *, runner=None) -> str:
+    result = (runner or subprocess.run)(["launchctl", "print", f"{domain}/{label}"],
                             capture_output=True, text=True, encoding="utf-8", timeout=5)
     if result.returncode == 0:
+        pid = re.search(r"^\s*pid\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+        last_exit = re.search(r"^\s*last exit (?:code|status)\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+        if (not pid or int(pid[1]) == 0) and last_exit and int(last_exit[1]) == 0:
+            return "parked"
         return "loaded"
     if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
         return "unloaded"
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
-def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None) -> bool:
+def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
+                    launchctl_runner=None) -> bool:
     """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
     from hermes_cli import gateway
     from hermes_cli.immutable_releases import wait_for_release_acknowledgement
@@ -165,18 +172,23 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
-    domain = domain or _domain(label)
+    domain = domain or (_domain(label) if launchctl_runner is None else
+                        _gateway_domain(label, None, runner=launchctl_runner))
     def reload_target():
         import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
-        old_pid = _launchctl_supervised_pid(label)
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
+        old_pid = (_launchctl_supervised_pid(label) if launchctl_runner is None else
+                   _launchctl_supervised_pid(label, runner=launchctl_runner))
+        (launchctl_runner or subprocess.run)(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
         if old_pid is not None:
             try:
                 psutil.Process(old_pid).wait(timeout=30)
             except psutil.NoSuchProcess:
                 pass
-        _launchctl_bootstrap(domain, plist, label, timeout=30)
+        if launchctl_runner is None:
+            _launchctl_bootstrap(domain, plist, label, timeout=30)
+        else:
+            _launchctl_bootstrap(domain, plist, label, timeout=30, runner=launchctl_runner)
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
     if result.get("reload_pending"):
@@ -185,13 +197,14 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         wait_for_release_acknowledgement(home, timeout_seconds=5)
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
-        if healthy(home, label, old):
+        if healthy(home, label, old, launchctl_runner):
             return True
         time.sleep(.25)
     return False
 
 
-def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None) -> str:
+def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
+         forward_only: bool = False, launchctl_runner=None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
     if intent_path(home).exists():
         return "stopped"
@@ -203,6 +216,15 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve() != home.resolve()):
         receipt(home, "inspect", "alert", reason="gateway plist identity mismatch")
         return "alert"
+    if forward_only:
+        from gateway.generation import GenerationCoordinator
+        coordinator = GenerationCoordinator(home)
+        if coordinator.service_label() != label:
+            cleanup_domain = _gateway_domain(label, domain, runner=launchctl_runner)
+            if _launch_state(cleanup_domain, label, runner=launchctl_runner) == "parked":
+                return _repair_parked(home, plist, label, cleanup_domain,
+                                      Path(definition.get("WorkingDirectory", "")), launchctl_runner or subprocess.run)
+            return "waiting"
     paths = ReleasePaths.for_home(home)
     current = paths.current.resolve()
     if (not paths.current.is_symlink() or current.parent != paths.releases.resolve() or
@@ -215,9 +237,10 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     switch_state, switch = _switch(home, grace=grace)
     if switch_state == "waiting":
         return "waiting"
-    domain = _gateway_domain(label, domain)
-    state = _launch_state(domain, label)
-    if state == "loaded" and healthy(home, label, current):
+    domain = _gateway_domain(label, domain, runner=launchctl_runner)
+    state = _launch_state(domain, label, runner=launchctl_runner)
+    launchctl = launchctl_runner or subprocess.run
+    if state == "loaded" and healthy(home, label, current, launchctl_runner):
         pending = home / "release-txn.json"
         if pending.exists():
             record = json.loads(pending.read_text(encoding="utf-8-sig"))
@@ -225,6 +248,19 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
                 from hermes_cli.immutable_releases import acknowledge_running_release
                 acknowledge_running_release(home)
         return "healthy"
+    if forward_only:
+        if switch:
+            # Parked repair is cold recovery. A pending update owns fresh A-prime.
+            return "waiting"
+        if state == "parked":
+            return _repair_parked(home, plist, label, domain, current, launchctl)
+        # A loaded process is never forced out. An unloaded service uses the
+        # same coordinator fence and repair budget as a parked one.
+        if state == "loaded":
+            return "waiting"
+        from gateway.generation import GenerationCoordinator
+        if GenerationCoordinator(home).prepare_parked_repair(label, retire=False) != "repair":
+            return "waiting"
     if switch:
         old = Path(switch["previous_intended"])
         if (old != paths.previous.resolve() or old == current or old.parent != paths.releases.resolve() or
@@ -237,19 +273,58 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             receipt(home, "rollback", "capped", candidate=str(current))
             return "capped"
         receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
-        ok = rollback_switch(home, plist, label, old, domain=domain)
+        ok = rollback_switch(home, plist, label, old, domain=domain, launchctl_runner=launchctl_runner)
         receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
         return "rolled_back" if ok else "failed"
-    if state == "loaded":
+    if state in {"loaded", "parked"}:
         return "waiting"  # KeepAlive may be bringing up a registered job.
     if _repair_count(home) >= MAX_REPAIRS:
         receipt(home, "bootstrap", "capped", label=label)
         return "capped"
     receipt(home, "bootstrap", "attempt", label=label)
-    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
+    if forward_only:
+        from gateway.generation import GenerationCoordinator
+        if GenerationCoordinator(home).prepare_parked_repair(label) != "repair":
+            return "waiting"
+        from hermes_cli.gateway_launchd_generation import refresh_generation_scope
+        refresh_generation_scope(plist)
+    launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
-        if _launch_state(domain, label) == "loaded" and healthy(home, label, current):
+        if _launch_state(domain, label, runner=launchctl_runner) in {"loaded", "parked"} and healthy(home, label, current, launchctl_runner):
+            receipt(home, "bootstrap", "repaired", label=label, release=str(current))
+            return "repaired"
+        time.sleep(.25)
+    receipt(home, "bootstrap", "failed", label=label, reason="gateway not healthy after bootstrap")
+    return "failed"
+
+
+def _repair_parked(home, plist, label, domain, current, launchctl):
+    from gateway.generation import GenerationCoordinator
+    from hermes_cli.gateway_launchd_generation import refresh_generation_scope
+    coordinator = GenerationCoordinator(home)
+    action = coordinator.prepare_parked_repair(label, retire=False)
+    if action == "waiting":
+        receipt(home, "inspect", "waiting", label=label, reason="serving generation or unproven claimant")
+        return "waiting"
+    if action == "repair" and _repair_count(home) >= MAX_REPAIRS:
+        receipt(home, "bootstrap", "capped", label=label)
+        return "capped"
+    if action == "repair":
+        if coordinator.prepare_parked_repair(label) != "repair":
+            return "waiting"
+        receipt(home, "bootstrap", "attempt", label=label)
+    launchctl(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=10)
+    if _launch_state(domain, label, runner=launchctl) != "unloaded":
+        raise RuntimeError("parked label bootout did not read back unloaded")
+    if action == "cleanup":
+        receipt(home, "bootout", "cleaned", label=label)
+        return "cleaned"
+    refresh_generation_scope(plist)
+    launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if _launch_state(domain, label, runner=launchctl) == "loaded" and healthy(home, label, current, launchctl):
             receipt(home, "bootstrap", "repaired", label=label, release=str(current))
             return "repaired"
         time.sleep(.25)
@@ -271,7 +346,7 @@ def _repair_count(home: Path) -> int:
 
 
 def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
-             domain: str | None = None) -> str:
+             domain: str | None = None, launchctl_runner=None) -> str:
     import fcntl
     home = Path(home)
     directory = home / "logs/guardian"
@@ -296,7 +371,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                     flag_text = config_path.read_text(encoding="utf-8-sig") if config_path.is_file() else ""
                 except (OSError, UnicodeError):
                     return "waiting"  # Unreadable flag cannot authorize legacy repair.
-                if "overlap_handover" in flag_text:
+                if "overlap_handover" in flag_text or "forward_only_handover" in flag_text:
                     try:
                         flag_config = yaml.safe_load(flag_text) or {}
                     except yaml.YAMLError as exc:
@@ -311,6 +386,8 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                                                 overlap.get("enabled") is not False):
                         return "waiting"
                     config["gateway"] = raw_gateway
+            from gateway.generation import forward_only_handover_enabled
+            forward_only = forward_only_handover_enabled(config)
             # The legacy guardian only knows one launchd label. Until overlap repair has
             # its own fenced protocol, it must not bootstrap or roll back either generation.
             gateway_config = config.get("gateway") or {}
@@ -333,7 +410,8 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 grace = (config.get("updates") or {}).get(
                     "release_acknowledgement_timeout_seconds", 180.0)
             assert grace is not None
-            return _run(home, Path(plist), label, grace=float(grace), domain=domain)
+            return _run(home, Path(plist), label, grace=float(grace), domain=domain,
+                        forward_only=forward_only, launchctl_runner=launchctl_runner)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, yaml.YAMLError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"
@@ -385,7 +463,7 @@ def cli(argv: list[str] | None = None) -> int:
     if args.action == "run":
         outcome = run_once(home, target, label, domain=args.domain)
         print(outcome)
-        return 0 if outcome in {"healthy", "stopped", "repaired", "rolled_back", "waiting", "locked"} else 1
+        return 0 if outcome in {"healthy", "stopped", "repaired", "rolled_back", "waiting", "locked", "cleaned"} else 1
     paths = ReleasePaths.for_home(home)
     if not paths.current.is_symlink() or not _release_is_ready(paths.current.resolve(), paths.current.resolve().name):
         parser.error("a valid immutable current release is required")

@@ -23,6 +23,7 @@ from gateway.generation import (
     GenerationIdentity,
     generation_paths,
     overlap_handover_enabled,
+    forward_only_handover_enabled,
     remove_generation_files,
     write_generation_record,
 )
@@ -86,7 +87,7 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     old_id, epoch = lease["generation_id"], lease["epoch"]
     identities = {row["id"]: row for row in coordinator.generations()}
     old, successor = identities.get(old_id), identities.get(to_id)
-    if old is None or successor is None or successor["state"] != "ready":
+    if old is None or successor is None or successor["state"] != "standby":
         raise RuntimeError("successor is not ready or old generation is missing")
     old_identity = GenerationIdentity(**{key: old[key] for key in GenerationIdentity.__dataclass_fields__})
     path = generation_paths(home, old_identity)["socket"]
@@ -127,26 +128,42 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     raise HandoverCommittedUnverified(to_id, promoted)
 
 
-async def start_active_generation(config) -> "ActiveGeneration | None":
+async def _run_generation_startup_gate(config, coordinator, identity) -> None:
+    """Retire a failed private probe before either startup path can take a lease."""
+    import json
+    from gateway.startup_gate import run_startup_gate
+    verdict = None
+    try:
+        verdict = await run_startup_gate(config)
+        if not verdict.ready:
+            raise RuntimeError("startup gate failed")
+    except BaseException as exc:
+        receipt = {"reason": "startup_gate_failed"}
+        if verdict is not None:
+            receipt["gate"] = json.loads(verdict.evidence_text)
+        else:
+            receipt["error"] = type(exc).__name__
+        coordinator._record_failure(identity.id, json.dumps(receipt, sort_keys=True))
+        raise
+
+
+async def start_active_generation(config, *, claimed_generation=None) -> "ActiveGeneration | None":
     """Register an already singleton-claimed active gateway; never claim from standby."""
     if not overlap_handover_enabled(config):
         return None
-    from gateway.status import _get_process_start_time
+    if claimed_generation is None:
+        coordinator, identity = claim_active_generation(forward_only=forward_only_handover_enabled(config))
+    else:
+        coordinator, identity = claimed_generation
     home = Path(get_hermes_home())
-    coordinator = GenerationCoordinator(home)
-    started = _get_process_start_time(os.getpid())
-    if started is None:
-        raise RuntimeError("cannot determine process start time for generation identity")
-    identity = GenerationIdentity.create(
-        release_sha=os.environ.get("HERMES_RELEASE_SHA", "unknown"),
-        label=os.environ.get("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway"),
-        start_fingerprint=f"{os.getpid()}:{started}",
-    )
-    coordinator.register(identity, state="serving")
+    if forward_only_handover_enabled(config):
+        await _run_generation_startup_gate(config, coordinator, identity)
     try:
-        epoch = coordinator.acquire_lease("active_generation", identity.id)
+        # Fresh legacy starts reuse the existing clean-exit takeover path
+        # when shutdown retained a released lease and its epoch.
+        epoch = _activate_cold_generation(coordinator, identity)
     except Exception:
-        coordinator.heartbeat(identity.id, state="failed")
+        coordinator._record_failure(identity.id, "startup_failed")
         raise
     active = ActiveGeneration(home, coordinator, identity, epoch)
     try:
@@ -154,10 +171,108 @@ async def start_active_generation(config) -> "ActiveGeneration | None":
         from gateway.status import set_generation_runtime_status
         set_generation_runtime_status(identity.id)
     except BaseException:
+        coordinator._record_failure(identity.id, "startup_failed")
         await active.close()
-        coordinator.heartbeat(identity.id, state="failed")
         raise
     return active
+
+
+def _bootout_retired_generation(label: str) -> bool:
+    from hermes_cli.gateway_guardian import _gateway_domain, _launch_state
+    import subprocess
+    domain = _gateway_domain(label, None)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=10)
+    return _launch_state(domain, label) == "unloaded"
+
+
+def _activate_cold_generation(coordinator, identity):
+    lease = next((row for row in coordinator.leases() if row['resource'] == 'active_generation'), None)
+    if lease is None:
+        epoch = coordinator.acquire_lease('active_generation', identity.id)
+        coordinator.transition_state(identity.id, 'standby', 'serving')
+        return epoch
+    return coordinator.takeover_dead_generation('active_generation', lease['generation_id'], identity.id,
+        bootout=lambda label: True if label == identity.label else _bootout_retired_generation(label))
+
+
+def claim_active_generation(*, forward_only: bool = True) -> tuple[GenerationCoordinator, GenerationIdentity]:
+    """Claim process identity before the singleton startup can acquire resources."""
+    from gateway.status import _get_process_start_time
+    home = Path(get_hermes_home())
+    coordinator = GenerationCoordinator(home)
+    started = _get_process_start_time(os.getpid())
+    if started is None:
+        raise RuntimeError("cannot determine process start time for generation identity")
+    label = os.environ.get("HERMES_LAUNCHD_LABEL")
+    if forward_only:
+        service = coordinator.service_label()
+        if label != service and not any(row['label'] == label for row in coordinator.generations()):
+            label = service
+    identity = GenerationIdentity.create(
+        release_sha=os.environ.get("HERMES_RELEASE_SHA", "unknown"),
+        label=label or "ai.hermes.gateway",
+        start_fingerprint=f"{os.getpid()}:{started}",
+    )
+    claim = _claim_process_generation if forward_only else _claim_legacy_process_generation
+    return coordinator, claim(coordinator, identity)
+
+
+def defer_forward_launchd_restart(config) -> bool:
+    """A planned launchd exit must reload the service with a new single-use scope."""
+    import sys
+    if (sys.platform != 'darwin' or not forward_only_handover_enabled(config)
+            or not os.environ.get('HERMES_GENERATION_SCOPE')
+            or not os.environ.get('HERMES_LAUNCHD_LABEL')):
+        return False
+    from hermes_cli.gateway_launchd import _spawn_deferred_launchd_reload
+    from hermes_cli.gateway import get_launchd_plist_path, get_launchd_label, _launchd_domain
+    label = GenerationCoordinator(Path(get_hermes_home())).service_label()
+    plist_path = get_launchd_plist_path()
+    if label != get_launchd_label():
+        plist_path = plist_path.with_name(f'{label}.plist')
+    domain = _launchd_domain()
+    if not _spawn_deferred_launchd_reload(domain=domain, label=label,
+            target=f'{domain}/{label}', plist_path=plist_path, gateway_pid=os.getpid()):
+        raise RuntimeError('forward-only planned restart could not submit launchd reload')
+    return True
+
+
+def _claim_process_generation(coordinator: GenerationCoordinator,
+                              process: GenerationIdentity) -> GenerationIdentity:
+    """Bind the reserved label once, before any generation resource is acquired.
+
+    The legacy first A and direct CLI launches reserve at this boundary. Managed
+    launchers reserve before bootstrap and the child finds that exact row.
+    """
+    import uuid
+    scope_nonce = os.environ.get("HERMES_GENERATION_SCOPE") or uuid.uuid4().hex
+    identity = coordinator.claim_process(process, scope_nonce)
+    if identity is None:
+        raise SystemExit(0)  # KeepAlive SuccessfulExit=false parks consumed scopes.
+    return identity
+
+
+def _claim_legacy_process_generation(coordinator, process):
+    """Replace only proven-dead legacy claimants, before the same-label insert."""
+    from gateway.generation import _is_unclaimed
+
+    with contextlib.closing(coordinator.connect()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute("SELECT * FROM generations WHERE label=? AND state<>'exited'",
+                            (process.label,)).fetchall()
+        for row in rows:
+            if (_is_unclaimed(row) or not row['start_fingerprint']
+                    or not coordinator._owner_is_dead(row)):
+                raise RuntimeError(f"cannot start same-label legacy generation {process.label}: "
+                                   "holder is alive or identity unknown")
+            if not coordinator._retire_in_transaction(conn, row['id'], expected_pid=row['pid'],
+                    expected_start_fingerprint=row['start_fingerprint'],
+                    evidence='boot_changed' if row['boot_id'] != process.boot_id else 'dead'):
+                raise RuntimeError("same-label legacy generation retirement failed")
+        # Retain the lease and its epoch for the existing legacy takeover.
+        coordinator._register_in_transaction(conn, process)
+        conn.commit()
+    return process
 
 
 def _generation_socket_owner_path(socket_path: Path) -> Path:
@@ -434,6 +549,10 @@ class ActiveGeneration:
                 raise
 
     async def _rearm_stopped_pollers(self) -> list[str]:
+        row = next((row for row in await asyncio.to_thread(self.coordinator.generations)
+                    if row["id"] == self.identity.id), None)
+        if row is None or row["state"] != "serving" or row["verdict"] is not None:
+            raise RuntimeError("only a still-serving generation can resume")
         errors: list[str] = []
         remaining = []
         for adapter, receipt in self._stopped_receipts:
@@ -598,6 +717,7 @@ class ActiveGeneration:
             await asyncio.sleep(1)
 
     async def start(self) -> None:
+        await asyncio.to_thread(self.coordinator.prune_history)
         for name in ("pid", "host"):
             write_generation_record(self.paths[name], self.identity, state="serving")
         socket_path = self.paths["socket"]
@@ -653,7 +773,9 @@ class ActiveGeneration:
         now = time.monotonic()
         if runtime == self._last_runtime and now - self._last_status_write < 30:
             return
-        write_generation_record(self.paths["state"], self.identity, state="serving",
+        row = next((row for row in self.coordinator.generations() if row["id"] == self.identity.id), None)
+        state = row["state"] if row else "serving"
+        write_generation_record(self.paths["state"], self.identity, state=state,
                                 socket_path=self.paths["socket"], runtime=runtime)
         self.coordinator.project_active_summary(self.identity, self.epoch, runtime)
         self._last_runtime = runtime.copy()
@@ -701,51 +823,75 @@ class ActiveGeneration:
         runtime_path = self.home / f"gateway_runtime.{self.identity.id}.json"
         from gateway.status import read_runtime_status
         runtime = read_runtime_status(runtime_path) or {}
-        if runtime.get("pid") == self.identity.pid:
+        row = next((row for row in await asyncio.to_thread(self.coordinator.generations)
+                    if row["id"] == self.identity.id), None)
+        if runtime.get("pid") == self.identity.pid and row is not None and row["verdict"] is None:
             runtime_path.unlink(missing_ok=True)
 
 
-async def serve_standby_generation(config=None) -> bool:
-    """Report readiness without constructing a runner or connecting any adapter.
+async def serve_standby_generation(config=None, *, claimed_generation=None) -> bool:
+    """Pass the forward-only loopback gate before readiness or cold takeover.
 
-    No singleton status/PID/socket or token-scoped lock is touched. The next slice owns
-    poller transfer, so this process is strictly passive throughout its lifetime.
+    A waiting standby connects no external adapter and holds no polling lock.
+    Legacy flag-off startup retains its passive readiness path.
     """
     if config is None:
         from gateway.config import load_gateway_config
         config = load_gateway_config()
     if not overlap_handover_enabled(config):
-        raise RuntimeError("gateway run --standby requires gateway.overlap_handover.enabled")
+        raise RuntimeError("gateway run --standby requires gateway.overlap_handover.enabled or gateway.forward_only_handover.enabled")
 
     home = Path(get_hermes_home())
-    coordinator = GenerationCoordinator(home)
-    label = os.environ.get("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway-b")
-    release_sha = os.environ.get("HERMES_RELEASE_SHA", "unknown")
-    from gateway.status import _get_process_start_time
-    started = _get_process_start_time(os.getpid())
-    if started is None:
-        raise RuntimeError("cannot determine process start time for generation identity")
-    identity = GenerationIdentity.create(
-        release_sha=release_sha, label=label,
-        start_fingerprint=f"{os.getpid()}:{started}",
-    )
+    if claimed_generation is None:
+        coordinator = GenerationCoordinator(home)
+        label = os.environ.get("HERMES_LAUNCHD_LABEL", "ai.hermes.gateway-b")
+        release_sha = os.environ.get("HERMES_RELEASE_SHA", "unknown")
+        from gateway.status import _get_process_start_time
+        started = _get_process_start_time(os.getpid())
+        if started is None:
+            raise RuntimeError("cannot determine process start time for generation identity")
+        identity = GenerationIdentity.create(
+            release_sha=release_sha, label=label,
+            start_fingerprint=f"{os.getpid()}:{started}",
+        )
+        claim = _claim_process_generation if forward_only_handover_enabled(config) else _claim_legacy_process_generation
+        identity = claim(coordinator, identity)
+    else:
+        coordinator, identity = claimed_generation
+    if forward_only_handover_enabled(config):
+        await _run_generation_startup_gate(config, coordinator, identity)
+        lease = next((row for row in coordinator.leases() if row['resource'] == 'active_generation'), None)
+        holder = next((row for row in coordinator.generations() if lease and row['id'] == lease['generation_id']), None)
+        if lease is None or (holder and (coordinator._owner_is_dead(holder) or
+                (lease['state'] == 'released' and holder['state'] == 'exited' and holder['verdict'] is None))):
+            epoch = _activate_cold_generation(coordinator, identity)
+            from gateway.run import start_gateway
+            return await start_gateway(config, promoted_generation=(identity, epoch))
+        logger.info('Standby waiting for cooperative handover: holder is live or identity unknown')
     paths = generation_paths(home, identity)
 
     async def report_ready(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         import json
-        writer.write((json.dumps({"generation_id": identity.id, "state": "ready",
+        writer.write((json.dumps({"generation_id": identity.id, "state": "standby",
                                  "release_sha": identity.release_sha}) + "\n").encode())
         await writer.drain()
         writer.close()
         await writer.wait_closed()
 
     socket_path = paths["socket"]
-    _ensure_generation_socket_parent(socket_path)
-    if len(os.fsencode(socket_path)) >= 100:
-        raise RuntimeError("generation control socket path exceeds UNIX socket limit")
+    try:
+        _ensure_generation_socket_parent(socket_path)
+        if len(os.fsencode(socket_path)) >= 100:
+            raise RuntimeError("generation control socket path exceeds UNIX socket limit")
+    except BaseException:
+        coordinator._record_failure(identity.id, "socket_setup_failed")
+        raise
     old_umask = os.umask(0o177)
     try:
         server = await asyncio.start_unix_server(report_ready, path=str(socket_path))
+    except BaseException:
+        coordinator._record_failure(identity.id, "socket_bind_failed")
+        raise
     finally:
         os.umask(old_umask)
     try:
@@ -755,13 +901,16 @@ async def serve_standby_generation(config=None) -> bool:
         server.close()
         await server.wait_closed()
         socket_path.unlink(missing_ok=True)
+        coordinator._record_failure(identity.id, "socket_setup_failed")
         raise
     try:
-        coordinator.register(identity)
         write_generation_record(paths["pid"], identity, state="standby")
         write_generation_record(paths["host"], identity, state="standby")
-        write_generation_record(paths["state"], identity, state="ready", socket_path=socket_path)
-        coordinator.heartbeat(identity.id, state="ready")
+        write_generation_record(paths["state"], identity, state="standby", socket_path=socket_path)
+        # These files advertise the socket, not database runtime authority.
+        # The claim supplied the initial liveness timestamp. A later refresh
+        # belongs in the retry loop: a busy DB must not close this ready socket,
+        # and publication must not reset a concurrently promoted generation.
     except BaseException:
         server.close()
         await server.wait_closed()
@@ -770,7 +919,7 @@ async def serve_standby_generation(config=None) -> bool:
             if (current.st_dev, current.st_ino) == (socket_stat.st_dev, socket_stat.st_ino):
                 socket_path.unlink()
         if any(row["id"] == identity.id for row in coordinator.generations()):
-            coordinator.heartbeat(identity.id, state="failed")
+            coordinator._record_failure(identity.id, "startup_failed")
         remove_generation_files(home, identity)
         raise
     stop = asyncio.Event()

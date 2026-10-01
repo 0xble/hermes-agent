@@ -142,7 +142,10 @@ class OwnedAdmissionMixin:
                 if generation is not None and (generation["state"] in ("exited", "failed") or
                                                self._owner_is_dead(generation)):
                     if generation["state"] != "exited":
-                        db.execute("UPDATE generations SET state='failed' WHERE id=?", (owner,))
+                        self._retire_in_transaction(
+                            db, owner, evidence="admission_owner_dead",
+                            expected_pid=generation["pid"],
+                            expected_start_fingerprint=generation["start_fingerprint"])
                     self._release_abandoned(db, owner)
                     owner, epoch = active_owner, active_epoch
                     session = db.execute("SELECT * FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
@@ -173,7 +176,7 @@ class OwnedAdmissionMixin:
                 owner, epoch = active_owner, active_epoch
             elif owner != active_owner:
                 generation = db.execute("SELECT state FROM generations WHERE id=?", (owner,)).fetchone()
-                if generation is None or generation["state"] not in ("draining", "quiescing", "serving", "ready"):
+                if generation is None or generation["state"] not in ("draining", "serving"):
                     raise RuntimeError("session owner is unavailable; event remains unacknowledged")
             local_placeholder = callable(payload) and owner == active_owner and pending is None
             if callable(payload):
@@ -284,7 +287,9 @@ class OwnedAdmissionMixin:
                 raise RuntimeError("unknown owner; cannot prove death")
             if not self._owner_is_dead(record):
                 return 0
-            db.execute("UPDATE generations SET state='failed' WHERE id=?", (owner,))
+            self._retire_in_transaction(
+                db, owner, evidence="admission_owner_dead", expected_pid=record["pid"],
+                expected_start_fingerprint=record["start_fingerprint"])
             return self._release_abandoned(db, owner)
 
     @staticmethod
