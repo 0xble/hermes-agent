@@ -669,6 +669,24 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
     assert spawned[0][1]["cwd"] == str(repo_root)
 
 
+def test_external_worker_keeps_loaded_tree_after_current_moves(tmp_path, monkeypatch):
+    import cron.scheduler as scheduler
+    from tools.process_registry import GatewayChildDispatch
+    loaded = scheduler._LOADED_CODE_ROOT
+    moved = tmp_path / "new-release" / "cron" / "scheduler.py"
+    moved.parent.mkdir(parents=True)
+    moved.touch()
+    monkeypatch.setattr(scheduler, "__file__", str(moved))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
+                        lambda command, **_: GatewayChildDispatch("degraded", command))
+    spawned, *_ = _stub_external_worker_launch(scheduler, monkeypatch)
+    assert scheduler._launch_external_cron_worker({"id": "job-pin", "execution_id": "exec-pin"})
+    _, kwargs = spawned[0]
+    assert kwargs["cwd"] == str(loaded)
+    assert kwargs["env"]["PYTHONPATH"].split(os.pathsep)[0] == str(loaded)
+
+
 def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     tmp_path, monkeypatch,
 ):

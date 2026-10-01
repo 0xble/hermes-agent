@@ -552,6 +552,54 @@ def test_gateway_interpreter_honors_managed_immutable_opt_in(tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="Invalid immutable release current pointer"):
         gateway.get_python_path()
 
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("damage", [None, "source_changed", "dangling_current", "dangling_previous", "unfinished"])
+def test_gateway_source_interpreter_after_migration_rollback(tmp_path, monkeypatch, damage):
+    from hermes_cli import gateway
+
+    source, home = tmp_path / "source", tmp_path / "profile"
+    (source / "hermes_cli").mkdir(parents=True)
+    (source / "hermes_cli/__init__.py").write_text("")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    commit = ["git", "-C", str(source), "-c", "user.email=test@example.com",
+              "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "source"]
+    subprocess.run(commit, check=True)
+    sha = releases.release_sha(source)
+    release = home / "releases" / sha
+    _fake_release(release, sha)
+    (home / "current").symlink_to(release)
+    (home / "previous").symlink_to(source)
+    journal = home / "release-layout.json"
+    record = {"source": str(source), "source_sha": sha, "source_python": sys.executable,
+              "state": "done", "plist": None}
+    journal.write_text(json.dumps(record))
+    releases.restore_source_layout(home)
+    assert not (home / "current").is_symlink() and not (home / "previous").is_symlink()
+    assert json.loads(journal.read_text())["state"] == "rolled-back"
+    (home / "config.yaml").write_text("updates:\n  immutable_releases: true\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    if damage == "source_changed":
+        (source / "version.txt").write_text("changed")
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+        subprocess.run(commit, check=True)
+    elif damage in {"dangling_current", "dangling_previous"}:
+        (home / damage.removeprefix("dangling_")).symlink_to(home / "absent")
+    elif damage == "unfinished":
+        record["state"] = "in-progress"
+        journal.write_text(json.dumps(record))
+    if damage:
+        with pytest.raises(RuntimeError, match="Invalid immutable release current pointer"):
+            gateway.get_python_path()
+    else:
+        assert gateway.get_python_path() == sys.executable
+        plist = __import__("plistlib").loads(gateway.generate_launchd_plist().encode())
+        # Plist rendering may wrap Python in macOS's Local Network identity.
+        assert sys.executable in str(plist["ProgramArguments"])
+
 @pytest.mark.platforms("macos")
 def test_gateway_interpreter_existing_current_does_not_read_config(tmp_path, monkeypatch):
     from hermes_cli import gateway, config_effective

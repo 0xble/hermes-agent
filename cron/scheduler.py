@@ -39,6 +39,7 @@ _LOADED_CODE_ROOT = Path(__file__).resolve().parent.parent
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(_LOADED_CODE_ROOT))
 
+from hermes_cli import immutable_releases
 from cron.worker_bootstrap import WORKER_MARKER
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
@@ -3639,10 +3640,9 @@ def _launch_external_cron_worker(job: dict) -> bool:
     ack_path = handoff_dir / f"{execution_id}.ready"
     # Captured so a worker that dies before its acknowledgement can name the cause (#112729).
     stderr_path = handoff_dir / f"{execution_id}.stderr"
-    from hermes_cli.immutable_releases import LOADED_RELEASE_ROOT, worker_launch_spec
     # The only launch-spec owner resolves the loaded installation, not the
     # profile whose job happens to be running in this gateway.
-    executable, _, _ = worker_launch_spec(LOADED_RELEASE_ROOT, {})
+    executable, _, _ = immutable_releases.worker_launch_spec(immutable_releases.LOADED_RELEASE_ROOT, {})
     command = [
         executable,
         "-m",
@@ -3734,10 +3734,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
     ):
         worker_env.pop(_presence_var, None)
     # Preserve immutable worker identity after profile sanitization, then bind PM generation.
-    _, worker_cwd, worker_env = worker_launch_spec(LOADED_RELEASE_ROOT, worker_env)
+    _, worker_cwd, worker_env = immutable_releases.worker_launch_spec(
+        immutable_releases.LOADED_RELEASE_ROOT, worker_env)
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    repo_root = Path(__file__).resolve().parent.parent
-    worker_env = pin_hermes_tree_on_pythonpath(worker_env, repo_root)
+    worker_env = pin_hermes_tree_on_pythonpath(worker_env, _LOADED_CODE_ROOT)
     worker_env[WORKER_MARKER] = "1"
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

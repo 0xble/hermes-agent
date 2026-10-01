@@ -3128,6 +3128,19 @@ def get_python_path() -> str:
             return str(candidate)
         except (OSError, ValueError, TypeError) as exc:
             if current.is_symlink() or (home / "release-layout.json").exists():
+                # First-migration rollback deliberately removes both pointers.
+                # Keep the immutable opt-in, but render the journal-bound source
+                # interpreter only after proving the rollback's source identity.
+                try:
+                    if (not current.exists() and not current.is_symlink()
+                            and not paths.previous.exists() and not paths.previous.is_symlink()):
+                        from hermes_cli.immutable_releases import release_sha, source_checkout_python
+                        record = json.loads((home / "release-layout.json").read_text(encoding="utf-8-sig"))
+                        source = Path(record["source"]).resolve(strict=True)
+                        if record.get("state") == "rolled-back" and release_sha(source) == record["source_sha"]:
+                            return str(source_checkout_python(home, source))
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
+                    pass  # An unverified journal never authorizes a source fallback.
                 raise RuntimeError(
                     f"Invalid immutable release current pointer {current}: {exc}. "
                     "Inspect release-txn.json and the release; repair the pointer or "
