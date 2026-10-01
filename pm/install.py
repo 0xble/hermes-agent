@@ -9,6 +9,7 @@ import os
 import shutil
 import threading
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,9 +23,19 @@ from pm.registry import get_package, walk
 from pm.store import Store, current_target, merge_tree, tree_digest
 
 LOG = logging.getLogger(__name__)
+_active_install_store: ContextVar[Store | None] = ContextVar("pm_active_install_store", default=None)
 
 # ``progress(stage, done, total, label)`` reports download/unpack/verify;
 # multi-archive labels follow lockfile order.
+
+
+@contextmanager
+def _using_install_store(store: Store):
+    token = _active_install_store.set(store)
+    try:
+        yield
+    finally:
+        _active_install_store.reset(token)
 
 
 def _prepare_artifacts(package, store, scratch, artifacts, version, target, *,
@@ -84,7 +95,10 @@ def _installed_location(package: Package, lockfile: Lockfile, target: str, *,
                         verify: bool = False, allow_outdated: bool = False,
                         roots: tuple[Path, ...] | None = None):
     """Prefer the current pin. An explicit read may retain a prior PM install."""
-    search_roots = dict.fromkeys(roots if roots is not None else (paths.store_root(), paths.writable_store_root()))
+    if roots is None:
+        active = _active_install_store.get()
+        roots = ((active.root,) if active is not None else ()) + (paths.store_root(), paths.writable_store_root())
+    search_roots = dict.fromkeys(roots)
     fallback = None
     for root in search_roots:
         store = Store(root)
@@ -373,7 +387,7 @@ def _install(
     artifacts = lockfile.artifacts(package.name, target)
     pin = json.dumps({"target": target, "sha256": [a["sha256"] for a in artifacts]})
 
-    with nullcontext() if _lock_held else store.install_lock():
+    with _using_install_store(store), (nullcontext() if _lock_held else store.install_lock()):
         if pause_event is not None and pause_event.is_set():
             raise DownloadPaused("install paused")
         if facts is not None:
