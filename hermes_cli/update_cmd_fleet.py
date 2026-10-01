@@ -810,6 +810,18 @@ def _apply_pending_fleet_restart_catchup(*, defer: bool = False, checkout_comple
     cgroup would kill the caller.
     """
     from hermes_cli.update_cmd import _run_pending_fleet_restart
+    from hermes_cli.gateway_forward_update import forward_route, recover_forward, observe_current_forward, require_forward_inventory
+    from hermes_cli.immutable_releases import ReleasePaths, read_pointer
+    from hermes_cli.update_cmd import get_hermes_home
+    forward_home = get_hermes_home()
+    forward_current = read_pointer(ReleasePaths.for_home(forward_home).current)
+    if forward_current is not None and forward_route(forward_home, forward_current):
+        if not defer:
+            require_forward_inventory(forward_home)
+            proof = recover_forward(forward_home) or observe_current_forward(forward_home)
+            if proof['outcome'] != 'success':
+                raise RuntimeError('forward-only catch-up remains unverified; fleet restart is fenced')
+        return
     if not _pending_fleet_restart_needed():
         return
     if defer:

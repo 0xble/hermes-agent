@@ -76,11 +76,18 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
 
 
 def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
-                           drain_seconds: float = DEFAULT_DRAIN_SECONDS) -> int:
+                           drain_seconds: float = DEFAULT_DRAIN_SECONDS,
+                           before_commit=None) -> int:
     """Internal updater entry point; never ask the lease holder to relinquish by force."""
     if not 1 <= drain_seconds <= 86400:
         raise ValueError("drain_seconds must be between 1 and 86400")
     coordinator = GenerationCoordinator(home)
+    deadline = time.monotonic() + timeout
+    def remaining():
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise RuntimeError('handover deadline exceeded')
+        return budget
     lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
     if not lease or lease["state"] != "active":
         raise RuntimeError("no active generation lease to transfer")
@@ -91,16 +98,18 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         raise RuntimeError("successor is not ready or old generation is missing")
     old_identity = GenerationIdentity(**{key: old[key] for key in GenerationIdentity.__dataclass_fields__})
     path = generation_paths(home, old_identity)["socket"]
-    roster = _generation_request(path, "polling_roster", timeout=timeout)
+    roster = _generation_request(path, "polling_roster", timeout=remaining())
     tokens = roster.get("tokens")
     if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
         raise RuntimeError("invalid old generation polling roster")
     coordinator.request_transfer(old_id, to_id, epoch, set(tokens))
     nonce = coordinator.transfer_attempt_nonce(old_id, epoch)
     try:
-        ack = _generation_request(path, "transfer_requested", params={"to": to_id}, timeout=timeout)
+        ack = _generation_request(path, "transfer_requested", params={"to": to_id}, timeout=remaining())
         if (ack.get("generation_id"), ack.get("epoch"), ack.get("poller_stopped")) != (old_id, epoch, True):
             raise RuntimeError("old generation did not prove poller stopped")
+        if before_commit is not None:
+            before_commit()
         promoted = coordinator.commit_transfer(old_id, to_id, epoch, drain_seconds=drain_seconds)
     except Exception:
         # Never hide the transfer failure with a second failure during recovery.
@@ -110,14 +119,16 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         except Exception:
             logger.exception("transfer abort failed after pre-commit failure")
         try:
-            _generation_request(path, "transfer_aborted", params={"to": to_id, "nonce": nonce}, timeout=timeout)
+            _generation_request(path, "transfer_aborted", params={"to": to_id, "nonce": nonce}, timeout=remaining())
         except Exception:
             logger.exception("poller re-arm failed after pre-commit failure")
         raise
     successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})
     successor_socket = generation_paths(home, successor_identity)["socket"]
-    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        claimed = next(row for row in coordinator.generations() if row['id'] == to_id)
+        if coordinator._owner_is_dead(claimed):
+            raise HandoverCommittedUnverified(to_id, promoted)
         try:
             status = _generation_request(successor_socket, "polling_status", timeout=min(2, max(.1, deadline-time.monotonic())))
             if status.get("generation_id") == to_id and status.get("polling") is True and set(status.get("tokens", [])) == set(tokens):
@@ -463,6 +474,11 @@ class ActiveGeneration:
     def polling_status(self) -> dict:
         roster = self._telegram_adapters()
         return {"generation_id": self.identity.id,
+                "release_sha": self.identity.release_sha, "epoch": self.epoch,
+                "release_root": str(Path(__file__).resolve().parent.parent),
+                "healthy": not self._rearm_errors and not (self._last_runtime or {}).get('needs_attention', False)
+                           and (self._last_runtime or {}).get('gateway_state') not in {'startup_failed', 'degraded', 'stopped'},
+                "armed": self.rearm_status()['armed'],
                 "tokens": sorted(roster),
                 "polling": self.runner is not None and all(
                     getattr(getattr(adapter, "_controlled_poller", None), "running", False)
@@ -583,6 +599,20 @@ class ActiveGeneration:
             self.runner._overlap_draining = False
         return errors
 
+    def rearm_status(self) -> dict:
+        """Read the actual dispatch fences shared by cron, kanban and wakeup loops."""
+        gate = not getattr(self.runner, '_overlap_draining', False)
+        cron_gate = (getattr(self.runner, '_overlap_cron_start_kwargs', None) or {}).get('can_dispatch')
+        pollers = self._telegram_adapters()
+        poller_armed = all(
+            getattr(getattr(adapter, '_controlled_poller', None), 'running', False)
+            for adapter in pollers.values())
+        return {'generation_id': self.identity.id, 'epoch': self.epoch,
+                'rearmed': gate and not self._rearm_errors,
+                'armed': {'poller': poller_armed, 'cron': gate and not self._external_cron_stopped
+                          and (cron_gate() if callable(cron_gate) else True),
+                          'kanban': gate, 'goal_wakeup': gate}}
+
     async def transfer_aborted(self, new_id: str, attempt_nonce: str | None = None) -> dict:
         """Re-arm only for the same aborted attempt under the old lease."""
         async with self._transfer_lock:
@@ -592,7 +622,7 @@ class ActiveGeneration:
                     self.identity.id, self.epoch, "active"):
                 raise RuntimeError("old generation no longer owns admission")
             if not getattr(self.runner, "_overlap_draining", False):
-                return {"rearmed": True}
+                return self.rearm_status()
             def read_transfer():
                 with contextlib.closing(self.coordinator.connect()) as conn:
                     return conn.execute(
@@ -606,7 +636,7 @@ class ActiveGeneration:
             errors = await self._rearm_stopped_pollers()
             if errors:
                 raise RuntimeError(f"re-arm failed for {', '.join(errors)}")
-            return {"rearmed": True}
+            return self.rearm_status()
 
     async def finish_draining_once(self) -> bool:
         """Stop A only after B owns the lease and all locally owned work has settled."""

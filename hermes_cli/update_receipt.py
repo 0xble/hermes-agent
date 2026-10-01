@@ -188,6 +188,23 @@ def record_release_transition(*, from_sha: str | None, to_sha: str, from_path: s
         logger.debug("Could not record release transition: %s", exc)
 
 
+def record_forward_generation(proof: dict[str, Any]) -> None:
+    """Retain generation identities, epochs, timing and poller/rollback proof."""
+    if _current is not None:
+        _current.data['forward_generation'] = dict(proof)
+
+
+def record_forward_inventory(other_runtimes: list[dict[str, Any]]) -> None:
+    """Record non-gateway observers without qualifying them as polling owners."""
+    if _current is not None:
+        _current.data['forward_inventory'] = {'other_runtimes': other_runtimes}
+
+
+def current_forward_generation() -> Optional[dict[str, Any]]:
+    proof = _current.data.get('forward_generation') if _current is not None else None
+    return dict(proof) if isinstance(proof, dict) else None
+
+
 def record_skip(name: str, reason: str) -> None:
     """Record a skipped step WITH the reason it was skipped."""
     _record("skip", f"update skip {name}", name, reason)

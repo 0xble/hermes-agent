@@ -570,7 +570,8 @@ def probe_gateway_loop_liveness(
     return GATEWAY_LOOP_UNKNOWN  # Armed but unreachable socket: ambiguity — never kill on it.
 
 
-def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: float = 5.0) -> bool:
+def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: float = 5.0,
+                            deadline: float | None = None, expected_start_time: float | None = None) -> bool:
     """Bounded stop (SIGTERM, ``term_grace``, SIGKILL, ``kill_wait``) for a provably dead loop; True once gone.
     Callers MUST have classified ``GATEWAY_LOOP_WEDGED`` first: escalating a merely busy gateway
     bypasses the cron drain floor and SIGKILLs live work.
@@ -578,19 +579,32 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
     See #86684.
     """
     from gateway.status import get_process_start_time
-    expected_start_time = get_process_start_time(pid)
+    def remaining(cap):
+        return max(0., min(float(cap), deadline - time.monotonic())) if deadline is not None else max(float(cap), 0.)
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
+    if expected_start_time is None:
+        expected_start_time = get_process_start_time(pid)
+    elif get_process_start_time(pid) != expected_start_time:
+        return True  # The recorded process is gone. Its replacement is unrelated.
     try:
-        terminate_pid(pid, force=False)
+        terminate_pid(pid, force=False, expected_start_time=expected_start_time)
     except (ProcessLookupError, PermissionError, OSError):
-        return _wait_for_pid_exit(pid, 1.0)
-    if _wait_for_pid_exit(pid, max(float(term_grace), 0.0)):
+        gone = _wait_for_pid_exit(pid, remaining(1.0))
+        return gone or (expected_start_time is not None and get_process_start_time(pid) != expected_start_time)
+    if _wait_for_pid_exit(pid, remaining(term_grace)):
         return True
+    if expected_start_time is not None and get_process_start_time(pid) != expected_start_time:
+        return True
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
     try:
         terminate_pid(pid, force=True, expected_start_time=expected_start_time)
         print(f"⚠ Gateway PID {pid} unresponsive to SIGTERM; sent SIGKILL")
     except (ProcessLookupError, PermissionError, OSError):
         pass
-    return _wait_for_pid_exit(pid, max(float(kill_wait), 0.0))
+    gone = _wait_for_pid_exit(pid, remaining(kill_wait))
+    return gone or (expected_start_time is not None and get_process_start_time(pid) != expected_start_time)
 
 
 def _get_ancestor_pids() -> set[int]:

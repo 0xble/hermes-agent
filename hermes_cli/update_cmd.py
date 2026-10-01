@@ -242,6 +242,14 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
         if defer:
             _record_update_step("immutable_release", True, f"staged: {candidate}; activation deferred")
             return True
+        from hermes_cli.gateway_forward_update import activate_if_forward
+        forward = activate_if_forward(Path(home), candidate, sha)
+        if forward is not None:
+            from hermes_cli.update_receipt import record_forward_generation
+            record_forward_generation(forward)
+            ok = forward['outcome'] == 'success' and forward['new_sha'] == sha
+            _record_update_step('immutable_release', ok, f"forward-only: {forward['outcome']}")
+            return ok
         # A pending record owns its target, even if its pointers already moved.
         # Complete it before evaluating a new candidate. The release manager
         # persists the exact intended plist before touching any mutable state.
@@ -1536,6 +1544,22 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
         raise SystemExit(message)
     if not _immutable_release_enabled(paths):
         return
+    from hermes_cli.gateway_forward_update import forward_route, recover_forward
+    # Generation promotion owns its service entries. S2 repair would bootout A
+    # while its turns drain or reload the legacy label after B acquired the lease.
+    source = source or _m().PROJECT_ROOT
+    sha = sha or release_sha(source)
+    if forward_route(paths.home, paths.release(sha)):
+        if defer:
+            _record_update_step('immutable_release_catchup', True, 'forward-only activation deferred')
+            return
+        recovered = recover_forward(paths.home)
+        if recovered and recovered['outcome'] not in {'success', 'refused', 'aborted'}:
+            raise RuntimeError(f"forward-only recovery {recovered['outcome']}: {recovered.get('failure', '')}")
+        if read_pointer(paths.current) != paths.release(sha):
+            if not _activate_immutable_release(sha=sha, source=source):
+                raise RuntimeError('forward-only catch-up failed')
+        return
     current = read_pointer(paths.current)
     source = source or _m().PROJECT_ROOT
     sha = sha or release_sha(source)
@@ -1924,13 +1948,25 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                     _write_gateway_update_exit_code(False)
                 _finalize_receipt("partial", "Immutable release maintenance incomplete: %s")
                 raise SystemExit(1)
+            from hermes_cli.gateway_forward_update import forward_route, require_forward_inventory
+            if not opts.no_gateway_restart and forward_route(paths.home, release):
+                try:
+                    require_forward_inventory(paths.home, _pre_update_plan)
+                except RuntimeError as exc:
+                    from hermes_cli.update_receipt import record_forward_generation
+                    record_forward_generation({'outcome': 'blocked', 'alert': True, 'failure': str(exc), 'new_sha': release.name})
+                    _record_update_step('forward_inventory', False, str(exc))
+                    _finalize_receipt('blocked', 'Forward-only fleet qualification refused: %s')
+                    raise SystemExit(1)
             if not _activate_immutable_release(defer=opts.no_gateway_restart,
                                                 sha=release.name, source=Path(payload["source"]),
                                                 source_python=Path(payload["source_python"]) if payload.get("source_python") else None):
                 detail = _immutable_phase_error("immutable_activation", release, paths.home)
                 _record_update_step("immutable_activation", False, detail)
                 print(f"✗ {detail}")
-                _finalize_receipt("partial", "Immutable release activation failed: %s")
+                from hermes_cli.update_receipt import current_forward_generation
+                failure_proof = current_forward_generation() or {}
+                _finalize_receipt(failure_proof.get('outcome', 'partial'), "Immutable release activation failed: %s")
                 raise SystemExit(1)
             if opts.no_gateway_restart:
                 _record_update_skip("immutable_activation", "staged; activation deferred")
@@ -1938,6 +1974,16 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _record_update_step("immutable_activation", True,
                                     f"activated release {release.name} ({release})")
             if not opts.no_gateway_restart:
+                from hermes_cli.update_receipt import current_forward_generation
+                proof = current_forward_generation()
+                if proof is not None:
+                    from hermes_cli.gateway_forward_update import verify_forward, require_forward_inventory
+                    require_forward_inventory(paths.home)
+                    verify_forward(paths.home, proof)
+                    _record_update_step('forward_fleet', True, 'generation lease and polling verified; draining labels retained')
+                    _write_gateway_update_exit_code(True)
+                    _finalize_receipt('success', 'Forward-only release verified: %s')
+                    return
                 restart = _restart_gateway_fleet_after_update(
                     _pre_update_plan, gateway_mode, acknowledged_release_root=release)
                 _resume_windows_gateways_and_merge_outcome(restart, _windows_gateway_resume, gateway_mode)

@@ -1,7 +1,4 @@
-"""Pinned launchd definitions for an opt-in overlapping gateway generation.
-
-Rendering and bootstrap are exposed here but wired into the update flow in a later slice.
-"""
+"""Pinned launchd definitions for opt-in gateway generations."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,7 +7,6 @@ import subprocess
 import uuid
 
 
-# Pure definitions only; updater wiring and lifecycle orchestration ship later.
 def generation_launchd_label(slot: str) -> str:
     """Render a UUID label, retaining legacy slot names for the flag-off route."""
     normalized = str(slot).strip().lower()
@@ -53,7 +49,8 @@ def render_generation_launchd_plist(*, slot: str, release_sha: str, release_root
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML).decode("utf-8")
 
 
-def bootstrap_generation_plist(*, domain: str, plist_path: Path, label: str) -> None:
+def bootstrap_generation_plist(*, domain: str, plist_path: Path, label: str,
+                               runner=None, timeout: float = 30, before_launch=None) -> None:
     """Bootstrap once; never bootout an existing generation on an EIO collision."""
     payload = plistlib.loads(Path(plist_path).read_bytes())
     from gateway.generation import forward_only_handover_enabled
@@ -76,8 +73,10 @@ def bootstrap_generation_plist(*, domain: str, plist_path: Path, label: str) -> 
     elif label not in {"ai.hermes.gateway-a", "ai.hermes.gateway-b"}:
         raise ValueError("only reserved generation labels may be bootstrapped")
     refresh_generation_scope(plist_path)
-    subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)],
-                   check=True, timeout=30)
+    if before_launch is not None:
+        before_launch(plistlib.loads(Path(plist_path).read_bytes())['EnvironmentVariables']['HERMES_GENERATION_SCOPE'])
+    (runner or subprocess.run)(["launchctl", "bootstrap", domain, str(plist_path)],
+                               check=True, timeout=min(30, timeout))
 
 
 def refresh_generation_scope(plist_path: Path) -> None:
