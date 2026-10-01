@@ -363,7 +363,7 @@ def _retention_days(home: Path) -> int:
     """Read only this setting using the gateway loader's layer precedence."""
     from gateway import config_loader
     from gateway.config import GatewayConfig, validate_outbox_retention_days
-    import yaml
+    import hermes_yaml as yaml
 
     default = GatewayConfig.durable_outbox_retention_days
     legacy = config_loader.load_legacy_gateway_json(home)

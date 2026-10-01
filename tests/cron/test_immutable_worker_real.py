@@ -12,7 +12,7 @@ import pytest
 from hermes_cli.immutable_releases import promote, stage_release
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path, monkeypatch):
     from cron import executions

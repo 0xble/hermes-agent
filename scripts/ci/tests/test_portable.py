@@ -41,12 +41,12 @@ class PortableGateTests(unittest.TestCase):
             ci.shard_files(ci.ROOT, 0)
 
     def test_container_jobs_install_git_and_configure_safe_directory_before_checkout(self):
-        import yaml
+        import hermes_yaml as yaml
 
         workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
         for workflow_name in ('gate.yml', 'nightly.yml'):
             with self.subTest(workflow=workflow_name):
-                document = yaml.safe_load((workflows / workflow_name).read_text(encoding='utf-8'))
+                document = yaml.safe_load((workflows / workflow_name).read_text(encoding='utf-8-sig'))
                 for job_name, job in document['jobs'].items():
                     if 'container' not in job:
                         continue
@@ -74,10 +74,10 @@ class PortableGateTests(unittest.TestCase):
                     )
 
     def test_nightly_reaps_orphans_and_runs_python_suite_as_nonroot(self):
-        import yaml
+        import hermes_yaml as yaml
 
         workflow = Path(__file__).resolve().parents[3] / '.github/workflows/nightly.yml'
-        linux = yaml.safe_load(workflow.read_text(encoding='utf-8'))['jobs']['linux']
+        linux = yaml.safe_load(workflow.read_text(encoding='utf-8-sig'))['jobs']['linux']
         self.assertIn('--init', linux['container']['options'].split())
         install = next(step for step in linux['steps'] if step.get('name') == 'Install pinned Linux toolchain and platform libraries')
         self.assertIn(' ffmpeg ', install['run'])
@@ -167,7 +167,7 @@ class PortableGateTests(unittest.TestCase):
             self.assertEqual(env['UV_PROJECT_ENVIRONMENT'], str(ci.ROOT / '.venv'))
             config = Path(env['GIT_CONFIG_GLOBAL'])
             self.assertEqual(config, (state / 'isolated' / 'gitconfig').resolve())
-            self.assertEqual(config.read_text(encoding='utf-8'),
+            self.assertEqual(config.read_text(encoding='utf-8-sig'),
                              f'[safe]\n\tdirectory = {ci.ROOT.resolve().as_posix()}\n')
             self.assertEqual(env['GIT_CONFIG_NOSYSTEM'], '1')
             directories = subprocess.check_output(
@@ -315,24 +315,24 @@ try {
 
     def test_workflows_install_the_pinned_python(self):
         for name in ('gate.yml', 'nightly.yml'):
-            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8-sig')
             self.assertIn(f"uv python install {ci.PINS['python']}", text, name)
         self.assertNotEqual(ci.PINS['python'], '3.11.14', '3.11.14 links WAL-reset-vulnerable SQLite 3.50.4')
 
     def test_uv_pin_is_consistent_across_installers(self):
         # uv's bundled download manifest decides which CPython patches install; a stale uv cannot
         # provision a newer pinned interpreter on a fresh runner.
-        artifacts = (ci.ROOT / 'ci/linux-artifacts.json').read_text(encoding='utf-8')
+        artifacts = (ci.ROOT / 'ci/linux-artifacts.json').read_text(encoding='utf-8-sig')
         self.assertIn(f"/uv/releases/download/{ci.PINS['uv']}/", artifacts)
         self.assertNotRegex(artifacts, r'/uv/releases/download/(?!' + re.escape(ci.PINS['uv']) + r'/)')
         for name in ('e2e-desktop-core.yml', 'live-providers.yml'):
-            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8-sig')
             self.assertRegex(text, r"version: ['\"]" + re.escape(ci.PINS['uv']) + r"['\"]", name)
 
     def test_every_reusable_only_workflow_has_a_caller(self):
-        import yaml
+        import hermes_yaml as yaml
         workflows = ci.ROOT / '.github/workflows'
-        texts = {path.name: path.read_text(encoding='utf-8') for path in workflows.glob('*.y*ml')}
+        texts = {path.name: path.read_text(encoding='utf-8-sig') for path in workflows.glob('*.y*ml')}
         for name, text in texts.items():
             triggers = yaml.safe_load(text).get(True) or yaml.safe_load(text).get('on') or {}
             if isinstance(triggers, dict) and set(triggers) <= {'workflow_call', 'workflow_dispatch'} and 'workflow_call' in triggers:
@@ -344,7 +344,7 @@ try {
         import re
         missing = []
         for path in sorted((ci.ROOT / '.github/workflows').glob('*.y*ml')):
-            for ref in re.findall(r'uses:\s*(\./[^\s#]+)', path.read_text(encoding='utf-8')):
+            for ref in re.findall(r'uses:\s*(\./[^\s#]+)', path.read_text(encoding='utf-8-sig')):
                 target = ci.ROOT / ref
                 if not (target.is_file() or any((target / name).is_file() for name in ('action.yml', 'action.yaml', 'Dockerfile'))):
                     missing.append(f'{path.name}: {ref}')
@@ -362,7 +362,7 @@ try {
                 with self.assertRaisesRegex(RuntimeError, 'source.txt'):
                     with ci.source_unchanged():
                         source.write_text('unexpected generated output', encoding='utf-8')
-            self.assertEqual(source.read_text(encoding='utf-8'), 'unexpected generated output')
+            self.assertEqual(source.read_text(encoding='utf-8-sig'), 'unexpected generated output')
 
     def test_source_guard_detects_source_created_during_ci(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -495,7 +495,7 @@ try {
                 'from pathlib import Path\n'
                 'def test_fail_once():\n'
                 f'    attempts = Path({str(attempts)!r})\n'
-                '    count = int(attempts.read_text(encoding="utf-8")) + 1 if attempts.exists() else 1\n'
+                '    count = int(attempts.read_text(encoding="utf-8-sig")) + 1 if attempts.exists() else 1\n'
                 '    attempts.write_text(str(count), encoding="utf-8")\n'
                 '    assert count > 1, "first attempt fails"\n', encoding='utf-8')
             stack.enter_context(patch.object(ci, 'STATE', root / 'state'))
@@ -509,7 +509,7 @@ try {
             stack.enter_context(patch.object(ci, 'python_tests', side_effect=
                 lambda env, roots, workers: python_tests(env, [str(test_file)], workers)))
             self.assertEqual(ci.main(), 1)
-            self.assertEqual(attempts.read_text(encoding='utf-8'), '1')
+            self.assertEqual(attempts.read_text(encoding='utf-8-sig'), '1')
 
             attempts.unlink()
             interactive_env = ci.environment(root / 'interactive')
@@ -521,7 +521,7 @@ try {
                                     cwd=ci.ROOT, env=interactive_env,
                                     capture_output=True, text=True, encoding='utf-8', errors='replace')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(attempts.read_text(encoding='utf-8'), '2')
+            self.assertEqual(attempts.read_text(encoding='utf-8-sig'), '2')
 
     def test_checkout_lock_releases_when_owner_is_killed(self):
         with tempfile.TemporaryDirectory() as directory:

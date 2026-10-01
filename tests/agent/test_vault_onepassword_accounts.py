@@ -54,8 +54,8 @@ _BUSINESS = {"alias": "business", "account": "business.example.com",
 
 
 @pytest.fixture(params=[
-    pytest.param(None, marks=pytest.mark.linux_only, id="linux"),
-    pytest.param(None, marks=pytest.mark.macos_only, id="macos"),
+    pytest.param(None, marks=pytest.mark.platforms("linux"), id="linux"),
+    pytest.param(None, marks=pytest.mark.platforms("macos"), id="macos"),
 ])
 def env(request, tmp_path, monkeypatch):
     for key in list(os.environ):

@@ -48,7 +48,7 @@ The public fork runs ten hosted Linux Python/E2E shards on both PR and nightly. 
 ## Tools and Linux image
 
 Exact CLI versions are declared in `scripts/ci/toolchain.json`. Python uses the
-repository's 3.11 line with a fixed CI patch. Root Python and Node dependencies
+repository's Python 3.14 line with a fixed CI patch. Root Python and Node dependencies
 use their existing locks. Docs Python tools are ascii-guard 2.3.0 and PyYAML
 6.0.3. The bootstrap application now tracks Cargo.lock and runs `cargo test
 --locked --lib`. The first lock captures the existing manifest's 553-package
@@ -139,8 +139,8 @@ required fork statuses. Linux success does not qualify macOS or Windows.
 `nightly.yml` runs `bin/ci nightly-native <sha>` at the exact scheduled or
 dispatched SHA on hosted `macos-26` (arm64) and `windows-2025-vs2026`; both matrix jobs
 must pass for nightly `qualification`. The PR gate remains Linux-only. The
-native profile performs setup and selects files with `macos_only` or
-`windows_only` through `scripts/ci/list_os_marked_tests.py`, then runs the
+native profile performs setup and selects files covering `macos` or
+`windows` through `scripts/ci/list_os_marked_tests.py`, then runs the
 canonical Python harness with that marker and `not integration`. Empty selection
 is a failure. Windows also runs the existing long-path, Node-compatibility and
 uv-shim installer scripts under both `powershell` 5.1 and `pwsh` 7. Linux cannot
@@ -191,3 +191,10 @@ full Python roots. Historical outcomes in `fork-ci.md` remain historical, not
 current qualification. No installed Hermes runtime is checked or promoted here.
 
 The documentation environment bootstrap preserves its existing checkout-local venv with `uv venv --allow-existing`, so running setup before gate or repeating gate does not fail merely because `.ci/docs-venv` exists. Pinned documentation packages are installed on every setup.
+
+
+## Pre-Tip Checkpoint Adaptation (2026-09-30)
+
+The explicit checkpoint exception imports upstream Python 3.14 and the native PM tool owner. Native OS selection lists files covering the actual host, then selects `platforms` tests. Optional memory SDK integration is the `hindsight` extra. The separate `hindsight-embedded` extra opts into the embedded server and is not inferred from incidental shared transitive distributions. Immutable staging preserves declared extras and all active plugin entry points, and validates enabled plugin imports before activation.
+
+Release, signing, store publishing and channel promotion workflows remain removed under the fork workflow policy. Tests whose entire owner disappeared are retired with that owner. Generic archive/link, SHA admission, ancestry and receipt security tests remain. Workflow policy coverage remains in `scripts/ci/tests/test_portable.py` and `tests/ci/test_workflow_job_graph.py`. The resumable reconciliation evidence records each removed test owner and partial retirement separately.

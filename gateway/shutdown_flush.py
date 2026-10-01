@@ -159,7 +159,7 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     entries = []
     for path in candidates:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
             continue
         # A parseable non-object file (scalar/list) cannot be attributed to any session: skip it
@@ -248,7 +248,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
     entries = []
     for path in _get_flush_dir().glob("*.json"):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
             if not isinstance(payload, dict):
                 raise ValueError("payload must be an object")
             order = (payload.get("ts", 0), payload.get("session_key", ""),

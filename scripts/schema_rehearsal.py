@@ -58,7 +58,7 @@ def declared_tables() -> set[str]:
         if {"tests", ".venv", "venv", ".worktrees"}.intersection(path.relative_to(REPO).parts[:-1]):
             continue
         try:
-            names.update(pattern.findall(path.read_text(encoding="utf-8", errors="ignore")))
+            names.update(pattern.findall(path.read_text(encoding="utf-8-sig", errors="ignore")))
         except OSError:
             continue
     return names

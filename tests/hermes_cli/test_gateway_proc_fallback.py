@@ -53,7 +53,7 @@ def _fake_proc_dir(entries: dict):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 class TestProcFallback:
     """_scan_gateway_pids reads /proc when available, skips ps.
 
@@ -114,7 +114,7 @@ class TestProcFallback:
         mock_ps.assert_not_called()  # /proc dir existed, so ps not called
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 class TestPsFallbackBsdCompat:
     """The ps fallback must use flags BSD/macOS ps accepts (#73626, #74075).
 
@@ -158,7 +158,7 @@ def test_scan_ignores_only_gateway_run_standby_flag(monkeypatch):
 class TestGetServicePidsAllProfiles:
     """_get_service_pids(all_profiles=...) discovery across profiles."""
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_default_scope_uses_current_profile_label(self):
         """Without all_profiles, only the current profile's launchd agent is
         located (per-label domain-explicit probe, #73627)."""
@@ -193,7 +193,7 @@ class TestGetServicePidsAllProfiles:
         ]
         assert launchctl_calls == []
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_all_profiles_enumerates_all_gateway_labels(self):
         """With all_profiles=True, every install-derived gateway label is
         located (#73627), and the bare ``launchctl list`` prefix scan still
@@ -250,11 +250,11 @@ class TestGetServicePidsAllProfiles:
         ]
         assert launchctl_calls == [["launchctl", "list"]]
 
+    @pytest.mark.platforms("linux")
     def test_all_profiles_preserves_systemd_behavior(self):
         """systemd scope is unaffected by the all_profiles switch — it already
         lists every hermes-gateway* unit unconditionally."""
         with (
-            patch("hermes_cli.gateway.is_macos", return_value=False),
             patch("hermes_cli.gateway.supports_systemd_services", return_value=True),
             patch("subprocess.run") as mock_run,
         ):

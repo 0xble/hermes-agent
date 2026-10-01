@@ -45,7 +45,7 @@ def fake_launchctl(monkeypatch, label, *, loaded=False):
     monkeypatch.setattr(guardian.subprocess, "run", run)
     return calls
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_explicit_grace_does_not_load_flag_off_config(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: false\n")
@@ -55,7 +55,7 @@ def test_explicit_grace_does_not_load_flag_off_config(tmp_path, monkeypatch):
     assert guardian.run_once(home, plist, label, grace=12) == "healthy"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_explicit_grace_ignores_unrelated_invalid_config(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("updates: [unclosed\n")
@@ -63,7 +63,7 @@ def test_explicit_grace_ignores_unrelated_invalid_config(tmp_path, monkeypatch):
     assert guardian.run_once(home, plist, label, grace=12) == "healthy"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("value", ["text", 0, -1, ".nan", ".inf"])
 def test_invalid_grace_writes_alert_receipt(tmp_path, value, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
@@ -73,7 +73,7 @@ def test_invalid_grace_writes_alert_receipt(tmp_path, value, monkeypatch):
     assert any(json.loads(path.read_text())["outcome"] == "alert"
                for path in (home / "logs/guardian").glob("*.json"))
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_invalid_overlap_config_writes_alert_receipt(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
     monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")
@@ -83,7 +83,7 @@ def test_invalid_overlap_config_writes_alert_receipt(tmp_path, monkeypatch):
                for path in (home / "logs/guardian").glob("*.json"))
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_invalid_yaml_writes_alert_receipt(tmp_path):
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("updates: [unclosed\n")
@@ -92,7 +92,7 @@ def test_invalid_yaml_writes_alert_receipt(tmp_path):
                for path in (home / "logs/guardian").glob("*.json"))
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("grace", [0, -1, float("nan"), float("inf"), "invalid"])
 def test_explicit_invalid_grace_writes_alert_receipt(tmp_path, monkeypatch, grace):
     home, plist, label, *_ = layout(tmp_path)
@@ -102,7 +102,7 @@ def test_explicit_invalid_grace_writes_alert_receipt(tmp_path, monkeypatch, grac
                for path in (home / "logs/guardian").glob("*.json"))
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_unrelated_invalid_update_key_does_not_block_repair(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("updates:\n  immutable_releases: not-a-boolean\n")
@@ -112,7 +112,7 @@ def test_unrelated_invalid_update_key_does_not_block_repair(tmp_path, monkeypatc
     assert [row[1] for row in calls].count("bootstrap") == 1
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_overlap_generation_guardian_is_observe_only(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
@@ -121,7 +121,7 @@ def test_overlap_generation_guardian_is_observe_only(tmp_path, monkeypatch):
     assert guardian.run_once(home, plist, label, grace=1) == "waiting"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
@@ -133,7 +133,7 @@ def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypa
                for path in (home / "logs/guardian").glob("*.json"))
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_stop_marker_never_fights_unloaded_service(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
@@ -142,7 +142,7 @@ def test_stop_marker_never_fights_unloaded_service(tmp_path, monkeypatch):
     assert not calls
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)
@@ -151,7 +151,7 @@ def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
     assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_attempt_cap_and_lock_prevent_repair(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
@@ -165,7 +165,7 @@ def test_attempt_cap_and_lock_prevent_repair(tmp_path, monkeypatch):
         assert guardian.run_once(home, plist, label) == "locked"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_corrupt_current_pointer_reports_without_source_fallback(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     (home / "current").unlink()
@@ -175,7 +175,7 @@ def test_corrupt_current_pointer_reports_without_source_fallback(tmp_path, monke
     assert not calls
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_source_checkout_plist_is_never_bootstrapped(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     definition = plistlib.loads(plist.read_bytes())
@@ -186,7 +186,7 @@ def test_source_checkout_plist_is_never_bootstrapped(tmp_path, monkeypatch):
     assert not calls
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_pending_failed_switch_archived_before_rollback(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     txn = {"version": 1, "operation": "promote", "candidate": str(b),
@@ -202,7 +202,7 @@ def test_pending_failed_switch_archived_before_rollback(tmp_path, monkeypatch):
                for path in home.glob("release-abandoned-*.json"))
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_acknowledged_or_mismatched_switch_is_not_abandoned(tmp_path):
     home, plist, label, a, b = layout(tmp_path)
     from hermes_cli.immutable_releases import abandon_failed_switch
@@ -217,7 +217,7 @@ def test_acknowledged_or_mismatched_switch_is_not_abandoned(tmp_path):
     assert pending.exists()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)
@@ -234,7 +234,7 @@ def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch
     assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_configured_release_ack_grace_delays_guardian_rollback(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     (home / "config.yaml").write_text(
@@ -250,7 +250,7 @@ def test_configured_release_ack_grace_delays_guardian_rollback(tmp_path, monkeyp
     assert calls == []
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
     from hermes_cli import gateway_launchd
     import psutil
@@ -264,7 +264,7 @@ def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
     assert not guardian.healthy(home, label, b)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("operation", ["promote", "first-migration"])
 def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch, operation):
     home, plist, label, a, b = layout(tmp_path)
@@ -280,7 +280,7 @@ def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch
     assert not any(row[1] == "bootstrap" for row in calls)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_gateway_restart_command_clears_stopped_intent(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway
@@ -299,7 +299,7 @@ def test_gateway_restart_command_clears_stopped_intent(tmp_path, monkeypatch):
     assert not guardian.intent_path(home).exists()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_launchd_restart_clears_stopped_intent(tmp_path, monkeypatch):
     from hermes_cli import gateway, gateway_launchd
     from gateway import status
@@ -314,7 +314,7 @@ def test_launchd_restart_clears_stopped_intent(tmp_path, monkeypatch):
     assert not guardian.intent_path(home).exists()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = []
@@ -341,7 +341,7 @@ def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeyp
     assert calls[-1] == "bootstrap"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_repeated_alerts_are_deduplicated_and_old_receipts_pruned(tmp_path):
     home, *_ = layout(tmp_path)
     old = guardian.receipt(home, "inspect", "alert", reason="old")
@@ -353,7 +353,7 @@ def test_repeated_alerts_are_deduplicated_and_old_receipts_pruned(tmp_path):
     assert guardian._repair_count(home) == 0
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_healthy_rollback_is_acknowledged_on_subsequent_run(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     fake_launchctl(monkeypatch, label, loaded=True)
@@ -370,7 +370,7 @@ def test_healthy_rollback_is_acknowledged_on_subsequent_run(tmp_path, monkeypatc
     assert not pending.exists()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("domain", ["gui", "user"])
 def test_guardian_resolves_existing_gateway_domain(tmp_path, monkeypatch, domain):
     home, plist, label, a, b = layout(tmp_path)
@@ -393,7 +393,7 @@ def test_guardian_resolves_existing_gateway_domain(tmp_path, monkeypatch, domain
     assert [row[2] for row in calls if row[1] == "print"][-1] == f"{selected}/{label}"
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_user_domain_stays_healthy_when_gui_probe_errors(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = []
@@ -408,7 +408,7 @@ def test_user_domain_stays_healthy_when_gui_probe_errors(tmp_path, monkeypatch):
     assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_unknown_launchctl_failure_is_alert_not_bootstrap(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = []
@@ -420,7 +420,7 @@ def test_unknown_launchctl_failure_is_alert_not_bootstrap(tmp_path, monkeypatch)
     assert len(calls) == 2 and all(row[1] == "print" for row in calls)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_failed_switch_rolls_back_only_verified_previous(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     txn = {"version": 1, "operation": "promote", "candidate": str(b), "previous_intended": str(a),

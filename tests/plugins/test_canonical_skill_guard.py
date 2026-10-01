@@ -51,7 +51,7 @@ def test_non_skill_tools_are_ignored(monkeypatch):
 
 
 def test_manifest_declares_every_registered_hook():
-    import yaml
+    import hermes_yaml as yaml
 
     plugin = _load_plugin()
     registered: list[str] = []

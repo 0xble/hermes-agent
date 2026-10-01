@@ -91,3 +91,8 @@ keeps that allowlist entry, mirroring the range in its `plugin.yaml`. Without it
 client build raises `FeatureUnavailable` and retain and recall stop.
 `tests/plugins/memory/test_memory_lazy_install.py` guards the entry. Drop this patch
 only together with the bundled provider.
+
+
+## Native Notification Footer
+
+Upstream appends `INTERNAL_NOTIFICATION_FOOTER` after a framed process result's end marker. Retention removes that exact defining formatter footer before retaining any real human suffix. The async batch delivery invariant exercises both notification-only and notification-plus-human-request turns in `tests/gateway/test_completion_delivery.py`.

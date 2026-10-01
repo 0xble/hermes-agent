@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / '.ci'
 # Checkout-owned npm and ripgrep at the exact pins; host tools only bootstrap them.
 TOOLCHAIN = STATE / 'toolchain'
-PINS = json.loads((ROOT / 'scripts/ci/toolchain.json').read_text(encoding='utf-8'))
-EXTRAS = ('all', 'dev', 'messaging', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'parallel-web')
+PINS = json.loads((ROOT / 'scripts/ci/toolchain.json').read_text(encoding='utf-8-sig'))
+EXTRAS = ('all', 'messaging', 'anthropic', 'bedrock', 'mistral', 'fal', 'modal', 'daytona', 'parallel-web', 'hindsight')
 LANES = {
     'static': 'Blocking lint, source policies, attribution, history and lock consistency',
     'python': 'Canonical full tests (excludes integration/e2e/docker)',
@@ -60,7 +60,7 @@ def shard_files(root: Path, count: int) -> list[list[str]]:
                            or path == root / NIGHTLY_ONLY_E2E[1]))]
     # Most files live in tests/; candidate-extensions is an additional ordinary root.
     files.extend((root / 'candidate-extensions').rglob('test_*.py') if (root / 'candidate-extensions').is_dir() else ())
-    timings = json.loads((ROOT / 'scripts/ci/python_shard_timings.json').read_text(encoding='utf-8'))
+    timings = json.loads((ROOT / 'scripts/ci/python_shard_timings.json').read_text(encoding='utf-8-sig'))
     def weight(path: Path) -> float:
         relative = path.relative_to(root).as_posix()
         # The 3 KB/s estimate matches the aggregate of measured sub-5s files;
@@ -298,7 +298,7 @@ def aggregate(actions: list[tuple[str, Callable[[], None]]]) -> bool:
 
 def provision_npm(env: dict[str, str]) -> None:
     npm = TOOLCHAIN / 'node_modules' / 'npm' / 'package.json'
-    if npm.is_file() and json.loads(npm.read_text(encoding='utf-8')).get('version') == PINS['npm']:
+    if npm.is_file() and json.loads(npm.read_text(encoding='utf-8-sig')).get('version') == PINS['npm']:
         return
     TOOLCHAIN.mkdir(parents=True, exist_ok=True)
     run(['npm', 'install', '--prefix', str(TOOLCHAIN), '--no-save', '--no-audit', '--no-fund',
@@ -320,7 +320,7 @@ def setup(env: dict[str, str]) -> None:
     provision_npm(env)
     provision_rg(env)
     require_tools(('npm', 'rg'), env)
-    run(['uv', 'sync', '--locked', '--python', PINS['python'], *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
+    run(['uv', 'sync', '--locked', '--python', PINS['python'], '--group', 'dev', '--group', 'test', *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=ROOT / 'website', env=env)
     run(['uv', 'venv', '--allow-existing', '--python', PINS['python'], str(STATE / 'docs-venv')], env=env)
@@ -348,7 +348,7 @@ def history_policy() -> None:
     release = accepted_release_baseline(ROOT)
     emails = git('log', f'{base}..HEAD', *([f'^{release}'] if release else []),
                  '--format=%ae', '--no-merges').splitlines()
-    legacy = (ROOT / 'scripts/release.py').read_text(encoding='utf-8')
+    legacy = (ROOT / 'scripts/release.py').read_text(encoding='utf-8-sig')
     missing = []
     for email in sorted(set(emails)):
         if any(token in email for token in ('teknium', 'noreply@github.com', 'dependabot', 'github-actions', 'anthropic.com', 'cursor.com')):
@@ -373,7 +373,6 @@ def static(env: dict[str, str]) -> None:
         [py, '-m', 'unittest', 'discover', '-s', 'scripts/ci/tests', '-p', 'test_*.py'],
         [py, '-m', 'ruff', 'check', '.'],
         [py, 'scripts/check-windows-footguns.py', '--all'],
-        [py, 'scripts/check_compat_pointers.py'],
         [py, 'scripts/check_no_tmp_literals.py'],
         [py, 'scripts/ci/check_os_marker_fakes.py'],
         [py, 'scripts/check-case-collisions.py'],
@@ -452,7 +451,7 @@ def e2e_tests(env: dict[str, str], workers: int) -> None:
 
 
 def native_os(env: dict[str, str], workers: int) -> None:
-    marker = {'darwin': 'macos_only', 'win32': 'windows_only'}.get(sys.platform)
+    marker = {'darwin': 'macos', 'win32': 'windows'}.get(sys.platform)
     if marker is None:
         raise RuntimeError('native-os requires an actual macOS or Windows host.')
     selected = subprocess.check_output(
@@ -462,7 +461,7 @@ def native_os(env: dict[str, str], workers: int) -> None:
     files = [line.strip() for line in selected.splitlines() if line.strip()]
     if not files:
         raise RuntimeError(f'No files selected for {marker}. Refusing an empty native OS lane.')
-    actions = [(marker, lambda: python_tests(env, files, workers, pytest_args=['-m', f'{marker} and not integration']))]
+    actions = [(marker, lambda: python_tests(env, files, workers, pytest_args=['-m', 'platforms and not integration']))]
     if sys.platform == 'win32':
         for shell in ('powershell', 'pwsh'):
             for case in ('longpath', 'node-compatibility', 'uv-shim-validation'):

@@ -36,7 +36,7 @@ def read_generation_status(home: Path) -> list[dict[str, Any]]:
                 row["leases"] = leases.get(row["id"], [])
                 state_file = Path(home) / f"gateway_state.{row['id']}.json"
                 try:
-                    health = json.loads(state_file.read_text(encoding="utf-8"))
+                    health = json.loads(state_file.read_text(encoding="utf-8-sig"))
                     if health.get("id") == row["id"] and health.get("start_fingerprint") == row["start_fingerprint"]:
                         row["needs_attention"] = health.get("needs_attention", False)
                         row["polling"] = health.get("polling")

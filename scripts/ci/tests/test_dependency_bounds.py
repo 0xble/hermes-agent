@@ -34,7 +34,7 @@ class DependencyBoundsTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(CHECKER), '--repo', str(repo or self.repo), *arguments], capture_output=True, text=True, encoding='utf-8', errors='replace')
 
     def add_spec(self, spec):
-        content = self.manifest.read_text(encoding='utf-8')
+        content = self.manifest.read_text(encoding='utf-8-sig')
         self.manifest.write_text(content.replace('\n]\n', f'\n  "{spec}",\n]\n'), encoding='utf-8')
         self.commit()
 
@@ -47,7 +47,7 @@ class DependencyBoundsTests(unittest.TestCase):
 
     def test_dirty_dependency_fails_but_explicit_head_checks_committed_snapshot(self):
         old_head = self.git('rev-parse', 'HEAD')
-        content = self.manifest.read_text(encoding='utf-8')
+        content = self.manifest.read_text(encoding='utf-8-sig')
         self.manifest.write_text(content.replace('\n]\n', '\n  "dirty_sdk>=4.2",\n]\n'), encoding='utf-8')
         for staged in (False, True):
             if staged:
@@ -61,7 +61,7 @@ class DependencyBoundsTests(unittest.TestCase):
 
     def test_working_tree_compares_merge_base_not_advanced_base_tip(self):
         self.git('checkout', '-b', 'base-advanced')
-        content = self.manifest.read_text(encoding='utf-8')
+        content = self.manifest.read_text(encoding='utf-8-sig')
         self.manifest.write_text(content.replace('existing>=1.0', 'existing>=1.0,<2'), encoding='utf-8')
         self.commit()
         self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')

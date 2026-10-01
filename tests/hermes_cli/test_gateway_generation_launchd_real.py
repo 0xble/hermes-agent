@@ -24,7 +24,7 @@ def _sweep(request):
     sweep_prior_sessions(request)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 def test_active_and_passive_generations_use_distinct_records(request):
     """Boot a real active gateway beside a strictly passive standby."""

@@ -163,7 +163,7 @@ def _source_install_python(source: Path, home: Path | None = None) -> Path:
     if home is not None:
         journal = ReleasePaths.for_home(home).home / "release-layout.json"
         if journal.exists():
-            record = json.loads(journal.read_text(encoding="utf-8"))
+            record = json.loads(journal.read_text(encoding="utf-8-sig"))
             if Path(record["source"]).resolve() != source.resolve():
                 raise RuntimeError("migration journal refers to a different checkout")
             if record.get("source_python"):
@@ -189,10 +189,8 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
     from packaging.utils import canonicalize_name
     from packaging.markers import default_environment
 
-    project_data = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+    project_data = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8-sig"))
     groups = project_data["project"].get("optional-dependencies", {})
-    lock = tomllib.loads((project / "uv.lock").read_text(encoding="utf-8"))
-    packages = {canonicalize_name(p["name"]): p for p in lock["package"]}
     installed = set(_active_distributions(source_python))
     declared: dict[str, set[str]] = {}
     for extra, requirements in groups.items():
@@ -224,56 +222,18 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
                                      capture_output=True, text=True, env=_release_subprocess_env())
     selected.update(extra for extra in json.loads(metadata_result.stdout) if extra in declared)
 
-    def closure(extra: str) -> set[str]:
-        pending = list(declared[extra])
-        seen: set[str] = set()
-        while pending:
-            name = pending.pop()
-            if name in seen:
-                continue
-            seen.add(name)
-            for dep in packages.get(name, {}).get("dependencies", []):
-                pending.append(canonicalize_name(dep["name"]))
-        return seen
-
-    closure_by_extra = {extra: closure(extra) for extra in declared}
-    covered = set().union(*(closure_by_extra[e] for e in selected)) if selected else set()
-    # A source may retain a locked transitive dependency after its parent was
-    # removed. Bring it in through its lockfile extra, never an unpinned pip restore.
-    remaining = (installed & packages.keys()) - covered - {"hermes-agent"}
-    base = set()
-    for req in project_data["project"].get("dependencies", []):
-        dep = Requirement(req)
-        if dep.marker is None or dep.marker.evaluate():
-            base.add(canonicalize_name(dep.name))
-    pending = list(base)
-    while pending:
-        name = pending.pop()
-        if name in base and name not in packages:
-            continue
-        for dep in packages.get(name, {}).get("dependencies", []):
-            child = canonicalize_name(dep["name"])
-            if child not in base:
-                base.add(child)
-                pending.append(child)
-    remaining -= base
-    while remaining:
-        options = [(len(remaining & names), extra) for extra, names in closure_by_extra.items()
-                   if extra not in selected]
-        count, extra = max(options, default=(0, ""))
-        if not count:
-            break  # subsequent parity check names every uncovered distribution
-        selected.add(extra)
-        remaining -= closure_by_extra[extra]
+    # Old transitive packages are not evidence of an enabled feature. In particular,
+    # legacy PyYAML/importlib-metadata must not enable an unused embedded server.
     return sorted(selected)
 
 
 def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = (),
                 python: Path | None = None) -> None:
-    cmd = [uv, "sync", "--frozen", "--python", str(python or sys.executable)]
-    for extra in extras:
-        cmd.extend(("--extra", extra))
-    subprocess.run(cmd, cwd=release, env=_release_subprocess_env(release), check=True)
+    # PM supplies its pinned Python ABI and locked build engine. The migration-bound
+    # source interpreter can remain 3.11 and is never a candidate build target.
+    from pm import build_environment
+    build_environment(source=release, out=release / ".venv", extras=extras,
+                      env=_release_subprocess_env(release), frozen=True, explicit=True)
 
 
 def _active_distributions(python: Path) -> dict[str, str]:
@@ -314,7 +274,7 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
     if not lock.is_file():
         raise RuntimeError(f"candidate lockfile missing: {lock}")
     locked = {re.sub(r"[-_.]+", "-", p["name"]).lower()
-              for p in tomllib.loads(lock.read_text(encoding="utf-8"))["package"]}
+              for p in tomllib.loads(lock.read_text(encoding="utf-8-sig"))["package"]}
     locked_versions = {name: target[name] for name in locked if name in target}
     extras = {name: version for name, version in installed.items()
               if name not in locked and name not in {"hermes-agent", "hermes-agent-cli"}}
@@ -324,15 +284,25 @@ def restore_active_distributions(source: Path, candidate: Path, *, uv: str = "uv
         subprocess.run([uv, "pip", "install", "--no-deps", "--python", str(candidate_python), *missing],
                        env=_release_subprocess_env(candidate), check=True)
     target = _active_distributions(candidate_python)
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    project_file = candidate / "pyproject.toml"
+    declared = (tomllib.loads(project_file.read_text(encoding="utf-8-sig"))
+                .get("project", {}).get("optional-dependencies", {}) if project_file.is_file() else {})
+    selected = _active_locked_extras(source_python, candidate) if declared else []
+    required = {canonicalize_name(Requirement(raw).name)
+                for extra in selected for raw in declared[extra]
+                if Requirement(raw).marker is None or Requirement(raw).marker.evaluate({"extra": extra})}
     unmatched = [name for name in installed if name not in {"hermes-agent", "hermes-agent-cli"}
-                 and (name not in target or (name not in locked and target[name] != installed[name]))]
+                 and ((name not in target and (name not in locked or name in required))
+                      or (name not in locked and target.get(name) != installed[name]))]
     if unmatched:
         raise RuntimeError(f"candidate distribution parity failed: {', '.join(sorted(unmatched))}")
     changed = [name for name in locked if name in target and name in locked_versions
                and target[name] != locked_versions[name]]
     if changed:
         raise RuntimeError(f"candidate lock distributions changed: {', '.join(sorted(changed))}")
-    absent = _active_plugin_entrypoints(source_python, set(extras)) - _active_plugin_entrypoints(candidate_python, set(extras))
+    absent = _active_plugin_entrypoints(source_python) - _active_plugin_entrypoints(candidate_python)
     if absent:
         raise RuntimeError(f"candidate lost installed plugin entry points: {sorted(absent)}")
 
@@ -467,7 +437,7 @@ def _relocate_venv(staging: Path, target: Path) -> None:
 
 def _release_is_ready(path: Path, sha: str) -> bool:
     return (path.is_dir() and all((path / name).is_file()
-            and (path / name).read_text(encoding="utf-8").strip() == sha
+            and (path / name).read_text(encoding="utf-8-sig").strip() == sha
             for name in (".release-ready", ".hermes_build_sha")))
 
 
@@ -476,16 +446,20 @@ def _build_candidate_web(staging: Path) -> None:
     web = staging / "web"
     if not (web / "package.json").is_file():
         return
-    from hermes_constants import find_node_executable
-    npm = find_node_executable("npm")
-    if not npm:
-        raise RuntimeError("npm is required to build an immutable release's web assets")
+    from pm import prepare_tools
+    from pm.build_operations import verified_tools
+    from pm.store import current_target
+    target = current_target()
+    store = prepare_tools(["npm"], out=staging.parent / ".build-tools", target=target)
+    tools = verified_tools(["npm"], source_store=store, target=target)
+    npm = str(tools.entries["npm"].binary)
+    env = tools.environment(_release_subprocess_env())
     workspaces = ["--workspace", "web", "--include-workspace-root"]
     if (staging / "ui-tui" / "package.json").is_file():
         workspaces[:0] = ["--workspace", "ui-tui"]
     subprocess.run([npm, "ci", "--no-audit", "--no-fund", *workspaces],
-                   cwd=staging, check=True)
-    subprocess.run([npm, "run", "build", "--workspace", "web"], cwd=staging, check=True)
+                   cwd=staging, env=env, check=True)
+    subprocess.run([npm, "run", "build", "--workspace", "web"], cwd=staging, env=env, check=True)
     if not (staging / "hermes_cli" / "web_dist" / "index.html").is_file():
         raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
 
@@ -519,6 +493,19 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
                      source=source if (source / ".git").exists() else None,
                      source_python=source_python or (_source_install_python(source, paths.home)
                                                     if (source / ".git").exists() else None))
+        from scripts.write_install_stamp import build_stamp
+        from hermes_cli.version_info import _git_version_info
+        identity = _git_version_info(source, revision=sha) if (source / ".git").exists() else None
+        stamp = build_stamp(commit=sha, branch="", dirty=False, source="local",
+                            update_mechanism="self",
+                            base_version=identity.base_version if identity and identity.base_version != "unknown" else None,
+                            display_version=identity.display_version if identity else None,
+                            distance=identity.distance if identity else None)
+        stamp["branch"] = None
+        stamp["commitDate"] = None
+        if identity:
+            stamp["commitDate"] = identity.commit_date
+        (staging / "install-stamp.json").write_text(json.dumps(stamp) + "\n", encoding="utf-8")
         (staging / ".hermes_build_sha").write_text(sha + "\n", encoding="utf-8")
         smoke_plugins(staging, paths.home, plugin_dir=plugin_dir)
         _relocate_venv(staging, target)
@@ -569,7 +556,7 @@ def _read_txn(paths: ReleasePaths) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
         if record["version"] != 1 or record["operation"] not in {
             "promote", "rollback", "first-migration", "first-migration-rollback"
         }:
@@ -663,7 +650,7 @@ def _verify_transaction(paths: ReleasePaths, record: dict[str, Any]) -> None:
     if (_pointer_value(paths.current), _pointer_value(paths.previous)) != (expected_current, expected_previous):
         raise RuntimeError("release pointers differ from transaction intent")
     journal = record.get("journal_intended")
-    if journal is not None and json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8")) != journal:
+    if journal is not None and json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8-sig")) != journal:
         raise RuntimeError("release layout differs from transaction intent")
     plist = record.get("plist")
     if plist and "intended_body" in plist:
@@ -962,7 +949,7 @@ def _receipt_pins(home: Path) -> set[Path]:
     pins: set[Path] = set()
     for path in (home / "logs" / "update_receipts").glob("*.json"):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"cannot safely prune releases: unreadable update receipt {path}: {exc}") from exc
         # Successful historical transitions are audit records, not permanent
@@ -1069,7 +1056,7 @@ def source_checkout_python(home: Path, source: Path) -> Path:
     """Resolve the migration-bound source interpreter for CLI and gateway re-entry."""
     journal = ReleasePaths.for_home(home).home / "release-layout.json"
     try:
-        record = json.loads(journal.read_text(encoding="utf-8"))
+        record = json.loads(journal.read_text(encoding="utf-8-sig"))
         if Path(record["source"]).resolve() != source.resolve():
             raise RuntimeError(f"migration journal points to another checkout: {journal}")
         recorded = record.get("source_python")
@@ -1095,7 +1082,7 @@ def _migration_record(paths: ReleasePaths, source: Path, plist_path: Path | None
     journal = paths.home / "release-layout.json"
     if not _source_python_valid(source_python, source):
         raise RuntimeError(f"migration requires a source interpreter importing hermes_cli from {source}: {source_python}")
-    original = json.loads(journal.read_text(encoding="utf-8")) if journal.exists() else None
+    original = json.loads(journal.read_text(encoding="utf-8-sig")) if journal.exists() else None
     if original is not None:
         if Path(original["source"]).resolve() != source:
             raise RuntimeError("release migration journal refers to a different checkout")
@@ -1134,7 +1121,7 @@ def restore_source_layout(home: Path, *, plist_path: Path | None = None,
             return _run_transaction(paths, pending, reload_callback)
         recover_pending_transaction(paths.home, reload_callback)
     journal = paths.home / "release-layout.json"
-    data = json.loads(journal.read_text(encoding="utf-8"))
+    data = json.loads(journal.read_text(encoding="utf-8-sig"))
     source = Path(data["source"]).resolve(strict=True)
     if read_pointer(paths.previous) != source:
         raise RuntimeError("previous is not the recorded source checkout")
@@ -1167,7 +1154,7 @@ def restore_source_layout(home: Path, *, plist_path: Path | None = None,
 def migration_plist(home: Path) -> tuple[Path, bytes] | None:
     """Read back the exact original plist, rather than regenerating a lookalike."""
     import base64
-    data = json.loads((ReleasePaths.for_home(home).home / "release-layout.json").read_text(encoding="utf-8"))
+    data = json.loads((ReleasePaths.for_home(home).home / "release-layout.json").read_text(encoding="utf-8-sig"))
     if data["plist"] is None:
         return None
     return Path(data["plist"]["path"]), base64.b64decode(data["plist"]["body"], validate=True)
@@ -1194,7 +1181,7 @@ def abandon_failed_switch(home: Path, *, candidate: Path, previous: Path) -> Non
     archive = paths.home / f"release-abandoned-{uuid.uuid4().hex}.json"
     _atomic_bytes(archive, pending.read_bytes())
     # If the transaction changed while the archive was written, do not delete it.
-    if json.loads(pending.read_text(encoding="utf-8")) != record:
+    if json.loads(pending.read_text(encoding="utf-8-sig")) != record:
         raise RuntimeError("release transaction changed during guardian archive")
     pending.unlink()
     _sync_dir(paths.home)
@@ -1215,7 +1202,7 @@ def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | 
     # rollback merely because previous now identifies the old current.
     last_path = paths.home / "release-last-txn.json"
     if last_path.is_file():
-        last = json.loads(last_path.read_text(encoding="utf-8"))
+        last = json.loads(last_path.read_text(encoding="utf-8-sig"))
         if last.get("operation") in {"rollback", "first-migration-rollback"}:
             try:
                 _verify_transaction(paths, last)
@@ -1257,7 +1244,7 @@ def update_source_checkout(home: Path, running_root: Path) -> Path | None:
     if resolved_release(paths.home) != running_root:
         return None
     try:
-        record = json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8"))
+        record = json.loads((paths.home / "release-layout.json").read_text(encoding="utf-8-sig"))
         source = Path(record["source"]).resolve(strict=True)
         if source == running_root or not (source / ".git").exists():
             return None

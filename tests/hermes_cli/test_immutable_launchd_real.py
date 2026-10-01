@@ -64,7 +64,7 @@ def _ack_observed_probe(releases, home, plist_path, output, *, gateway_pid=None)
     return False
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch, request):
     home = tmp_path / "profile"
     label = f"ai.hermes.s2spike.{uuid.uuid4().hex}"
@@ -238,7 +238,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_path, monkeypatch, request):
     """Updater promotion and reversal reload one throwaway job, never the live label."""
     from hermes_cli import gateway_launchd, immutable_releases as releases, update_cmd, update_receipt

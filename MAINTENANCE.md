@@ -6,11 +6,15 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.24 + qualified checkpoint`, `ca6782850432927f33df4775cb6dd45bb51460d2`.
-Brian explicitly selected this exact upstream checkpoint on 2026-09-25 for
-one sync and personal-runtime promotion. It contains released baseline
-`v2026.9.24` (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) plus 256 upstream
-commits, with successful upstream CI run `36022678358` and over 24 hours of age.
+`v2026.9.24 + qualified checkpoint`, `eb8d21f482142c236550762ebdb5df4004c39696`.
+Brian authorized a newer stable pre-tip checkpoint on 2026-09-30 for one
+sync and personal-runtime promotion. This selected checkpoint retains prior
+`ca6782850432927f33df4775cb6dd45bb51460d2` and released baseline
+`v2026.9.24` (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) as ancestors.
+Upstream CI run `36801643187` succeeded in every substantive lane, with no
+cancelled lanes. The selected revision was 86 commits before frozen upstream
+tip `484ebdf16a5127894f16ba883e9630968f945c5e`. Fork qualification and
+independent exact-head review remain required before promotion.
 This one-run non-release exception does not change recurring release selection
 or waive fork tests, independent review, protected landing, or backup safeguards.
 

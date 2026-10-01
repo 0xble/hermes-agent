@@ -39,7 +39,6 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
 
     return side_effect
 
-
 def _make_head_pinned_side_effect(sha="abc123"):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
 
@@ -58,7 +57,6 @@ def _make_head_pinned_side_effect(sha="abc123"):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect
-
 
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Patch the hermes_cli.main helpers ``_cmd_update_impl`` touches.
@@ -133,4 +131,3 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     handoff.assert_not_called()
     out = capsys.readouterr().out
     assert "✓ Code updated!" not in out
-

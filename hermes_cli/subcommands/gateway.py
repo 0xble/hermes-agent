@@ -53,14 +53,18 @@ def build_gateway_parser(
             "already supervises this profile. Without --force, the command "
             "refuses because a second dispatcher escapes the service and can "
             "corrupt shared gateway state.")
-    _flag(gateway_run, "--no-supervise",
-        help="Inside the s6-overlay Docker image, normally `gateway run` is "
+    gateway_run.add_argument(
+        "--no-supervise",
+        action="store_true",
+        help=(
+            "Inside the s6-overlay Docker image, normally `gateway run` is "
             "automatically redirected to the supervised s6 service (so the "
             "gateway gets auto-restart on crash, plus a supervised dashboard "
             "if HERMES_DASHBOARD is set). Pass --no-supervise to opt out and "
             "get the historical pre-s6 foreground behavior: the gateway is "
             "the container's main process and the container exits with the "
-            "gateway's exit code. No effect outside an s6 container.")
+            "gateway's exit code. No effect outside an s6 container."),
+    )
     _flag(gateway_run, "--external-supervisor",
         help="Declare that an external process manager owns this foreground "
             "gateway. In-chat restarts and updates exit back to that manager "
@@ -102,6 +106,7 @@ def build_gateway_parser(
     _add_system_flag(gateway_status)
     _add_compat_platform_flag(gateway_status)
 
+    # gateway install
     gateway_install = gateway_subparsers.add_parser(
         "install", help="Install gateway as a systemd/launchd background service")
     _flag(gateway_install, "--force",
@@ -118,6 +123,8 @@ def build_gateway_parser(
         help="Enable the service to start automatically on login/boot")
     gateway_install.add_argument("--no-start-on-login", dest="start_on_login", action="store_false",
         help="Do not enable the service to start on login/boot")
+    _flag(gateway_install, "--if-missing", dest="if_missing",
+        help="Do nothing when a gateway service is already installed")
     _flag(gateway_install, "--elevated-handoff", dest="elevated_handoff", help=argparse.SUPPRESS)
 
     gateway_uninstall = gateway_subparsers.add_parser("uninstall", help="Uninstall gateway service")

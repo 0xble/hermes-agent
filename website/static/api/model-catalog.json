@@ -41,6 +41,10 @@
           "description": "2x price, higher output speed"
         },
         {
+          "id": "anthropic/claude-sonnet-5.5",
+          "description": ""
+        },
+        {
           "id": "anthropic/claude-sonnet-5",
           "description": ""
         },
@@ -272,6 +276,10 @@
         {
           "id": "stealth/union-alpha",
           "description": "free, stealth model"
+        },
+        {
+          "id": "stealth/space-bunny-alpha",
+          "description": "free, stealth model"
         }
       ]
     },
@@ -295,6 +303,9 @@
         },
         {
           "id": "anthropic/claude-opus-4.8"
+        },
+        {
+          "id": "anthropic/claude-sonnet-5.5"
         },
         {
           "id": "anthropic/claude-sonnet-5"
@@ -425,6 +436,9 @@
         },
         {
           "id": "sakana/fugu-ultra"
+        },
+        {
+          "id": "stealth/space-bunny-alpha"
         }
       ]
     }
