@@ -584,6 +584,13 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
         current = get_process_start_time(pid)
         return (expected_start_time is not None and current is not None
                 and not start_time_fingerprints_match(expected_start_time, current))
+    def guard():
+        # terminate_pid compares strictly. Hand it a reading that just matched within drift.
+        current = get_process_start_time(pid)
+        if expected_start_time is not None and current is not None and \
+                start_time_fingerprints_match(expected_start_time, current):
+            return current
+        return expected_start_time
     def remaining(cap):
         return max(0., min(float(cap), deadline - time.monotonic())) if deadline is not None else max(float(cap), 0.)
     if deadline is not None and time.monotonic() >= deadline:
@@ -593,7 +600,7 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
     elif replaced():
         return True  # The recorded process is gone. Its replacement is unrelated.
     try:
-        terminate_pid(pid, force=False, expected_start_time=expected_start_time)
+        terminate_pid(pid, force=False, expected_start_time=guard())
     except (ProcessLookupError, PermissionError, OSError):
         gone = _wait_for_pid_exit(pid, remaining(1.0))
         return gone or replaced()
@@ -604,7 +611,7 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
     if deadline is not None and time.monotonic() >= deadline:
         return False
     try:
-        terminate_pid(pid, force=True, expected_start_time=expected_start_time)
+        terminate_pid(pid, force=True, expected_start_time=guard())
         print(f"⚠ Gateway PID {pid} unresponsive to SIGTERM; sent SIGKILL")
     except (ProcessLookupError, PermissionError, OSError):
         pass

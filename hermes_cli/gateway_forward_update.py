@@ -72,7 +72,7 @@ def forward_route(home: Path, candidate: Path) -> bool:
     return capable(paths.release(serving['release_sha']))
 
 
-def activate_if_forward(home, candidate, sha):
+def activate_if_forward(home, candidate, sha, *, supervisor=None):
     """Return None to preserve the existing S2 call sequence exactly."""
     if not forward_route(home, candidate):
         return None
@@ -80,8 +80,20 @@ def activate_if_forward(home, candidate, sha):
     if intent.exists():
         record = json.loads(intent.read_text(encoding='utf-8'))
         if record.get('outcome') in {'running', 'blocked'}:
-            # None means another updater archived the intent first. Re-observe; never fall back to S2.
-            return recover_forward(home) or observe_current_forward(home)
+            # None means another updater archived the intent first: continue to the candidate.
+            recovered = recover_forward(home, supervisor=supervisor)
+            if recovered is not None and recovered.get('new_sha') == sha:
+                return recovered  # The interrupted attempt was this candidate: its outcome answers it.
+            if recovered is not None and (intent.exists() or recovered.get('outcome') not in
+                                          {'success', 'rolled_back', 'refused', 'aborted'}):
+                # An earlier update is still unresolved. Report it against this candidate.
+                proof = {'outcome': recovered.get('outcome', 'blocked'), 'alert': True, 'new_sha': sha,
+                         'failure': 'earlier forward update unresolved: ' + str(
+                             recovered.get('failure') or recovered.get('outcome')),
+                         'unresolved_new_sha': recovered.get('new_sha')}
+                from hermes_cli.update_receipt import record_forward_generation
+                record_forward_generation(proof)
+                return proof
     try:
         require_forward_inventory(home)
     except RuntimeError as exc:
@@ -92,7 +104,7 @@ def activate_if_forward(home, candidate, sha):
         return proof
     if read_pointer(ReleasePaths.for_home(home).current) == candidate:
         return observe_current_forward(home)
-    result = promote_forward(home, candidate, sha)
+    result = promote_forward(home, candidate, sha, supervisor=supervisor)
     from hermes_cli.update_receipt import record_release_transition
     if result['outcome'] == 'success':
         record_release_transition(from_sha=result['old_sha'], to_sha=sha,
@@ -340,6 +352,7 @@ def _wait_ready(db, generation_id, supervisor, deadline):
 
 
 def _poller(db, row, supervisor, deadline):
+    last_failure = ''
     while True:
         current = _row(db, row['id'])
         lease = _lease(db)
@@ -347,8 +360,16 @@ def _poller(db, row, supervisor, deadline):
             raise RuntimeError('poller proof owner changed')
         if db._owner_is_dead(current):
             raise RuntimeError('successor died')
+        def budget(cap):
+            try:
+                return _remaining(deadline, cap)
+            except RuntimeError as exc:
+                if last_failure:  # Name the real cause, not only the clock.
+                    raise RuntimeError(f'{exc}; last poller failure: {last_failure}') from exc
+                raise
+        wait = budget(2)
         try:
-            proof = supervisor.request(current, 'polling_status', timeout=_remaining(deadline, 2))
+            proof = supervisor.request(current, 'polling_status', timeout=wait)
             if (proof.get('generation_id'), proof.get('release_sha'), proof.get('epoch'),
                     proof.get('polling'), proof.get('healthy')) == (
                     current['id'], current['release_sha'], lease['epoch'], True, True) and proof.get('tokens'):
@@ -365,11 +386,11 @@ def _poller(db, row, supervisor, deadline):
                 proof['poller_started_at'] = max(starts)
                 proof.update(pid=current['pid'], label=current['label'])
                 return proof
-        except RuntimeError:
-            proof = {}
+        except RuntimeError as exc:
+            proof, last_failure = {}, str(exc)
         if proof.get('healthy') is False:
             raise RuntimeError('successor reports unhealthy runtime')
-        _sleep(min(.2, _remaining(deadline, .2)))
+        _sleep(min(.2, budget(.2)))
 
 
 def _save(home, record):
@@ -644,11 +665,16 @@ def _observe_rollback_reply(home, db, row, proof, record):
     record['alert'] = not rollback['rollback_bound_met']
 
 
-def _rollback(home, db, failed, previous, supervisor, record):
+def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
     started = record.get('rollback_clock', _now())
     # Before-commit is the earliest possible death of serving B. This durable
     # upper bound includes time spent noticing failure, not a fresh recovery budget.
-    deadline = record.get('commit_clock', started) + ROLLBACK_SECONDS
+    bound = record.get('commit_clock', started) + ROLLBACK_SECONDS
+    # A late recovery of a proven-dead successor gets a fresh operating budget. The
+    # recorded bound stays the original one, so the miss is reported, never hidden.
+    deadline = _now() + ROLLBACK_SECONDS if late else bound
+    if late:
+        record['late_rollback'] = {'started_at': time.time(), 'bound_missed': True}
     if not capable(previous) or not _release_is_ready(previous, previous.name):
         raise RuntimeError('previous release cannot run a fresh forward-only generation')
     if not record.get('rollback_generation'):
@@ -659,7 +685,7 @@ def _rollback(home, db, failed, previous, supervisor, record):
         record['failure_observed_at'] = time.time()
         record['death_observed_at'] = time.time() if dead else None
         record.update(rollback_started_at=time.time(), rollback_clock=started,
-                      rollback_deadline_clock=deadline, rollback_boot_id=failed['boot_id'])
+                      rollback_deadline_clock=bound, rollback_boot_id=failed['boot_id'])
         record['death_observed_clock'] = death_clock
     # An A-prime startup gate has the same 45s limit, inside the total 60s budget.
     try:
@@ -674,7 +700,7 @@ def _rollback(home, db, failed, previous, supervisor, record):
                 info = None
         if info:
             fresh = _resume_launch(db, previous, supervisor, record, 'rollback_generation',
-                                   min(deadline, info['startup_deadline_clock']))
+                                   deadline if late else min(deadline, info['startup_deadline_clock']))
         else:
             fresh = _launch(db, previous, supervisor, record, 'rollback_generation',
                             min(deadline, _now() + STARTUP_SECONDS))
@@ -846,8 +872,13 @@ def recover_forward(home, *, supervisor=None):
                         record.get('commit_boot_id') == _boot_id() and
                         _row(db, new['id'])['boot_id'] == record.get('commit_boot_id')):
                     try:
-                        _remaining(record['commit_clock'] + ROLLBACK_SECONDS, ROLLBACK_SECONDS)
-                        return _rollback(home, db, _row(db, new['id']), Path(record['previous']), supervisor, record)
+                        if record['commit_clock'] + ROLLBACK_SECONDS > _now():
+                            return _rollback(home, db, _row(db, new['id']), Path(record['previous']), supervisor, record)
+                        if db._owner_is_dead(_row(db, new['id'])):
+                            # The 60 s bound is already missed. It bounds how fast A-prime starts,
+                            # never whether it starts: a dead successor must not leave zero pollers.
+                            return _rollback(home, db, _row(db, new['id']), Path(record['previous']),
+                                             supervisor, record, late=True)
                     except Exception as rollback_error:
                         exc = rollback_error
                 return _finish(home, record, 'blocked', failure=str(exc), recovered=True)

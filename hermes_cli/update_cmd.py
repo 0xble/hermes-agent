@@ -1468,7 +1468,7 @@ def _forward_catchup_failed(proof=None, *, failure='forward-only catch-up failed
     raise SystemExit(1)
 
 
-def _complete_forward_update(home, proof) -> None:
+def _complete_forward_update(home, proof, *, gateway_mode: bool = True) -> None:
     """Verify a forward-only activation after the pointer flip, then finish the update exactly once.
 
     The handover is the restart this update armed before handoff, so success discharges the
@@ -1484,13 +1484,15 @@ def _complete_forward_update(home, proof) -> None:
         record_forward_generation({**proof, 'outcome': 'blocked', 'alert': True, 'failure': str(exc)})
         print(f"✗ Forward-only verification failed: {exc}")
         _record_update_step('forward_fleet', False, str(exc))
-        _write_gateway_update_exit_code(False)
+        if gateway_mode:
+            _write_gateway_update_exit_code(False)
         _finalize_receipt(forward_receipt_outcome('blocked'), 'Forward-only verification failed: %s')
         raise SystemExit(1)
     record_forward_generation(verified)
     _record_update_step('forward_fleet', True, 'generation lease and polling verified; draining labels retained')
     _clear_fleet_restart_pending_marker()
-    _write_gateway_update_exit_code(True)
+    if gateway_mode:
+        _write_gateway_update_exit_code(True)
     _finalize_receipt('success', 'Forward-only release verified: %s')
 
 
@@ -1996,7 +1998,9 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                     from hermes_cli.update_receipt import record_forward_generation
                     record_forward_generation({'outcome': 'blocked', 'alert': True, 'failure': str(exc), 'new_sha': release.name})
                     _record_update_step('forward_inventory', False, str(exc))
-                    _finalize_receipt('blocked', 'Forward-only fleet qualification refused: %s')
+                    if gateway_mode:
+                        _write_gateway_update_exit_code(False)
+                    _finalize_receipt('refused', 'Forward-only fleet qualification refused: %s')
                     raise SystemExit(1)
             if not _activate_immutable_release(defer=opts.no_gateway_restart,
                                                 sha=release.name, source=Path(payload["source"]),
@@ -2005,8 +2009,13 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _record_update_step("immutable_activation", False, detail)
                 print(f"✗ {detail}")
                 from hermes_cli.update_receipt import current_forward_generation
+                from hermes_cli.update_receipt import forward_receipt_outcome
                 failure_proof = current_forward_generation() or {}
-                _finalize_receipt(failure_proof.get('outcome', 'partial'), "Immutable release activation failed: %s")
+                # A proof about another release never finalizes this update as anything but partial.
+                failed_outcome = (forward_receipt_outcome(failure_proof['outcome'])
+                                  if failure_proof.get('outcome') and failure_proof.get('new_sha') == release.name
+                                  and failure_proof['outcome'] != 'success' else 'partial')
+                _finalize_receipt(failed_outcome, "Immutable release activation failed: %s")
                 raise SystemExit(1)
             if opts.no_gateway_restart:
                 _record_update_skip("immutable_activation", "staged; activation deferred")
@@ -2017,7 +2026,7 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 from hermes_cli.update_receipt import current_forward_generation
                 proof = current_forward_generation()
                 if proof is not None:
-                    _complete_forward_update(paths.home, proof)
+                    _complete_forward_update(paths.home, proof, gateway_mode=bool(gateway_mode))
                     return
                 restart = _restart_gateway_fleet_after_update(
                     _pre_update_plan, gateway_mode, acknowledged_release_root=release)

@@ -1385,11 +1385,14 @@ def test_review2_route_probe_never_creates_coordinator_db(rig):
 
 
 def test_review2_archived_intent_race_reobserves_instead_of_s2(rig, monkeypatch):
-    (rig.home / 'forward-update.json').write_text(json.dumps({'outcome': 'running'}), encoding='utf-8')
-    monkeypatch.setattr(forward, 'recover_forward', lambda home: None)
-    observed = {'outcome': 'success', 'observed': True}
-    monkeypatch.setattr(forward, 'observe_current_forward', lambda home: observed)
-    assert forward.activate_if_forward(rig.home, rig.b, rig.b.name) is observed
+    intent = rig.home / 'forward-update.json'
+    intent.write_text(json.dumps({'outcome': 'running'}), encoding='utf-8')
+    def archived_by_other_updater(home, **kwargs):
+        intent.unlink()
+        return None
+    monkeypatch.setattr(forward, 'recover_forward', archived_by_other_updater)
+    result = forward.activate_if_forward(rig.home, rig.b, rig.b.name, supervisor=rig.supervisor)
+    assert result is not None and result['outcome'] == 'success' and result['new_sha'] == rig.b.name
 
 
 def test_review2_fleet_catchup_success_clears_restart_obligation(rig, monkeypatch):
@@ -1401,3 +1404,60 @@ def test_review2_fleet_catchup_success_clears_restart_obligation(rig, monkeypatc
     monkeypatch.setattr(update_cmd_fleet, '_clear_fleet_restart_pending_marker', lambda: cleared.append(True))
     update_cmd_fleet._apply_pending_fleet_restart_catchup()
     assert cleared == [True]
+
+
+def test_review3_successor_death_after_budget_still_starts_previous_release(rig):
+    """A blocked intent must never become a permanent zero-poller outage."""
+    rig.supervisor.mode = 'blocked'
+    blocked = promote(rig)
+    assert blocked['outcome'] == 'blocked' and blocked['alert']
+    rig.supervisor.mode = 'happy'
+    rig.clock.value = blocked['commit_clock'] + forward.ROLLBACK_SECONDS + 300
+    failed = forward._row(rig.db, blocked['new_id'])
+    rig.alive.pop(failed['pid'])
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    assert recovered['late_rollback']['bound_missed'] is True
+    assert recovered['rollback']['rollback_bound_met'] is False and recovered['alert']
+    lease = rig.db.leases()[0]
+    assert forward._row(rig.db, lease['generation_id'])['release_sha'] == rig.a.name
+    assert not (rig.home / 'forward-update.json').exists()
+
+
+def test_review3_live_successor_after_budget_stays_blocked_without_signals(rig):
+    rig.supervisor.mode = 'blocked'
+    blocked = promote(rig)
+    rig.clock.value = blocked['commit_clock'] + forward.ROLLBACK_SECONDS + 300
+    rig.events.clear()
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'blocked' and recovered['alert']
+    assert not any(event[0] in ('bootstrap', 'bounded-stop', 'takeover') for event in rig.events)
+    assert (rig.home / 'forward-update.json').exists()
+
+
+def test_review3_unresolved_earlier_intent_never_reports_candidate_success(rig):
+    rig.supervisor.mode = 'blocked'
+    assert promote(rig)['outcome'] == 'blocked'
+    candidate = release(rig.home, 'c' * 40)
+    result = forward.activate_if_forward(rig.home, candidate, candidate.name, supervisor=rig.supervisor)
+    assert result['outcome'] == 'blocked' and result['new_sha'] == candidate.name
+    assert result['unresolved_new_sha'] == rig.b.name
+    assert forward.read_pointer(rig.home / 'current') != candidate
+
+
+def test_review3_recovered_earlier_intent_continues_to_candidate(rig):
+    rig.supervisor.mode = 'blocked'
+    assert promote(rig)['outcome'] == 'blocked'
+    rig.supervisor.mode = 'happy'
+    candidate = release(rig.home, 'c' * 40)
+    result = forward.activate_if_forward(rig.home, candidate, candidate.name, supervisor=rig.supervisor)
+    assert result['outcome'] == 'success' and result['new_sha'] == candidate.name, result
+    assert forward.read_pointer(rig.home / 'current') == candidate
+
+
+def test_review3_poller_deadline_names_the_real_failure(rig, monkeypatch):
+    row = forward._row(rig.db, rig.db.leases()[0]['generation_id'])
+    monkeypatch.setattr(rig.supervisor, 'request', lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError('successor lacks a durable poller start')))
+    with pytest.raises(RuntimeError, match='last poller failure: successor lacks a durable poller start'):
+        forward._poller(rig.db, row, rig.supervisor, forward._now() + 1)
