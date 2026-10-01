@@ -1461,3 +1461,43 @@ def test_review3_poller_deadline_names_the_real_failure(rig, monkeypatch):
         RuntimeError('successor lacks a durable poller start')))
     with pytest.raises(RuntimeError, match='last poller failure: successor lacks a durable poller start'):
         forward._poller(rig.db, row, rig.supervisor, forward._now() + 1)
+
+
+def test_review4_silent_successor_post_commit_wait_keeps_rollback_budget(rig, monkeypatch):
+    """Realistic timings: a silent B plus a 13 s A-prime startup still rolls back inside 60 s."""
+    rig.supervisor.mode = 'wedged'
+    fixture_handover = forward.handover_to_generation
+    def handover(home, to_id, **kwargs):
+        assert kwargs.get('verify_after_commit') is False, 'post-commit wait must stay in _poller'
+        return fixture_handover(home, to_id, **kwargs)
+    monkeypatch.setattr(forward, 'handover_to_generation', handover)
+    bootstrap = rig.supervisor.bootstrap
+    def slow_previous(row, *args, **kwargs):
+        if row['release_sha'] == rig.a.name:
+            rig.clock.value += 13
+        return bootstrap(row, *args, **kwargs)
+    monkeypatch.setattr(rig.supervisor, 'bootstrap', slow_previous)
+    def probe(*args, **kwargs):
+        rig.clock.value += 3.4
+        return 'wedged'
+    monkeypatch.setattr('hermes_cli.gateway.probe_gateway_loop_liveness', probe)
+    result = promote(rig)
+    assert result['outcome'] == 'rolled_back', result
+    assert result['rollback']['commit_to_serving_upper_bound_seconds'] <= forward.ROLLBACK_SECONDS
+    lease = rig.db.leases()[0]
+    assert forward._row(rig.db, lease['generation_id'])['release_sha'] == rig.a.name
+
+
+def test_review4_late_recovery_replaces_a_proven_wedged_successor(rig, monkeypatch):
+    rig.supervisor.mode = 'blocked'
+    blocked = promote(rig)
+    assert blocked['outcome'] == 'blocked'
+    rig.clock.value = blocked['commit_clock'] + forward.ROLLBACK_SECONDS + 300
+    rig.supervisor.mode = 'wedged'
+    rig.events.clear()
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    assert recovered['late_rollback']['bound_missed'] is True and recovered['alert']
+    assert any(event[0] == 'bounded-stop' for event in rig.events)
+    lease = rig.db.leases()[0]
+    assert forward._row(rig.db, lease['generation_id'])['release_sha'] == rig.a.name

@@ -120,8 +120,8 @@ def require_forward_inventory(home, plan=None):
     runtimes = plan.get('runtimes') if isinstance(plan, dict) else getattr(plan, 'runtimes', None)
     if runtimes is None:
         raise RuntimeError('forward-only fleet inventory is unavailable')
-    rows = GenerationCoordinator(home).generations()
     db = GenerationCoordinator(home)
+    rows = db.generations()
     owned = {row['pid'] for row in rows if row['state'] != 'exited' and _live(row) and not db._owner_is_dead(row)}
     others = []
     for runtime in runtimes:
@@ -665,6 +665,12 @@ def _observe_rollback_reply(home, db, row, proof, record):
     record['alert'] = not rollback['rollback_bound_met']
 
 
+def _proven_wedged(home, row):
+    """Existing liveness probe only. Unknown or alive never authorizes a late rollback."""
+    from hermes_cli.gateway import probe_gateway_loop_liveness, GATEWAY_LOOP_WEDGED
+    return _live(row) and probe_gateway_loop_liveness(row['pid'], home=home) == GATEWAY_LOOP_WEDGED
+
+
 def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
     started = record.get('rollback_clock', _now())
     # Before-commit is the earliest possible death of serving B. This durable
@@ -716,7 +722,7 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
                 cooperative_budget = min(45, deadline - _now() - 20)
                 if cooperative_budget <= 0:
                     raise RuntimeError('cooperative handover has no reserved recovery budget')
-                handover_to_generation(home, fresh['id'], timeout=cooperative_budget)
+                handover_to_generation(home, fresh['id'], timeout=cooperative_budget, verify_after_commit=False)
             except Exception:
                 if _lease(db)['generation_id'] != fresh['id']:
                     from hermes_cli.gateway import probe_gateway_loop_liveness, GATEWAY_LOOP_WEDGED, _escalate_wedged_gateway
@@ -874,9 +880,10 @@ def recover_forward(home, *, supervisor=None):
                     try:
                         if record['commit_clock'] + ROLLBACK_SECONDS > _now():
                             return _rollback(home, db, _row(db, new['id']), Path(record['previous']), supervisor, record)
-                        if db._owner_is_dead(_row(db, new['id'])):
+                        if db._owner_is_dead(_row(db, new['id'])) or _proven_wedged(home, _row(db, new['id'])):
                             # The 60 s bound is already missed. It bounds how fast A-prime starts,
-                            # never whether it starts: a dead successor must not leave zero pollers.
+                            # never whether it starts: a dead or provably wedged successor must not
+                            # leave zero pollers. A live, unproven successor stays blocked untouched.
                             return _rollback(home, db, _row(db, new['id']), Path(record['previous']),
                                              supervisor, record, late=True)
                     except Exception as rollback_error:
@@ -961,7 +968,10 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
             def record_commit_window():
                 record.update(commit_clock=_now(), commit_at=time.time(), commit_boot_id=old['boot_id'])
                 _save(home, record)
-            handover_to_generation(home, successor['id'], timeout=45, before_commit=record_commit_window)
+            # The commit-clocked _poller below is the only post-commit wait, so the
+            # 60 s rollback budget is never spent inside the cooperative call.
+            handover_to_generation(home, successor['id'], timeout=45, before_commit=record_commit_window,
+                                   verify_after_commit=False)
             # The rollback budget also starts at commit. The successor's proof
             # window leaves A' STARTUP_SECONDS to start, take over and poll.
             commit = record['commit_clock']

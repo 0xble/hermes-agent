@@ -154,3 +154,33 @@ def test_identity_change_at_term_guard_is_already_a_death_proof(monkeypatch):
     monkeypatch.setattr(gateway, 'terminate_pid', refuse)
     monkeypatch.setattr(gateway, '_wait_for_pid_exit', lambda *args: False)
     assert gateway._escalate_wedged_gateway(123, expected_start_time=1.)
+
+
+def test_review4_unverified_commit_returns_without_spending_post_commit_budget(tmp_path, monkeypatch):
+    """The updater's commit-clocked proof is the only post-commit wait."""
+    from gateway import run_generation
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'fixture-boot')
+    monkeypatch.setattr('gateway.status._pid_exists', lambda pid: True)
+    monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: 1.)
+    clock = SimpleNamespace(value=0.)
+    monkeypatch.setattr(run_generation, 'time', SimpleNamespace(monotonic=lambda: clock.value,
+                        sleep=lambda seconds: setattr(clock, 'value', clock.value + seconds)))
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha='a', label='old', pid=100, start_fingerprint='100:1.0')
+    new = GenerationIdentity.create(release_sha='b', label='new', pid=200, start_fingerprint='200:1.0')
+    db.register(old, state='serving')
+    db.register(new)
+    epoch = db.acquire_lease('active_generation', old.id)
+    verbs = []
+    def request(path, verb, **kwargs):
+        verbs.append(verb)
+        if verb == 'polling_roster':
+            return {'tokens': []}
+        if verb == 'transfer_requested':
+            return {'generation_id': old.id, 'epoch': epoch, 'poller_stopped': True}
+        clock.value += 2  # a live but silent successor
+        raise RuntimeError('successor loop silent')
+    monkeypatch.setattr(run_generation, '_generation_request', request)
+    promoted = run_generation.handover_to_generation(tmp_path, new.id, timeout=45, verify_after_commit=False)
+    assert promoted == db.leases()[0]['epoch'] and db.leases()[0]['generation_id'] == new.id
+    assert 'polling_status' not in verbs and clock.value == 0

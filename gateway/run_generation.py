@@ -77,8 +77,13 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
 
 def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
                            drain_seconds: float = DEFAULT_DRAIN_SECONDS,
-                           before_commit=None) -> int:
-    """Internal updater entry point; never ask the lease holder to relinquish by force."""
+                           before_commit=None, verify_after_commit: bool = True) -> int:
+    """Internal updater entry point; never ask the lease holder to relinquish by force.
+
+    ``verify_after_commit=False`` returns the committed epoch at once. A caller
+    that runs its own commit-clocked polling proof uses it so that this wait
+    can never spend the post-commit rollback budget.
+    """
     if not 1 <= drain_seconds <= 86400:
         raise ValueError("drain_seconds must be between 1 and 86400")
     coordinator = GenerationCoordinator(home)
@@ -123,6 +128,8 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         except Exception:
             logger.exception("poller re-arm failed after pre-commit failure")
         raise
+    if not verify_after_commit:
+        return promoted
     successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})
     successor_socket = generation_paths(home, successor_identity)["socket"]
     while time.monotonic() < deadline:
