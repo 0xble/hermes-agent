@@ -184,3 +184,147 @@ def test_review4_unverified_commit_returns_without_spending_post_commit_budget(t
     promoted = run_generation.handover_to_generation(tmp_path, new.id, timeout=45, verify_after_commit=False)
     assert promoted == db.leases()[0]['epoch'] and db.leases()[0]['generation_id'] == new.id
     assert 'polling_status' not in verbs and clock.value == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('budget,stop_delay', [(10, 11), (45, 46)])
+async def test_socket_timeout_self_rearms_after_slow_stop(tmp_path, monkeypatch, budget, stop_delay):
+    """The real driver/socket may time out while the owner is still stopping its wire."""
+    import asyncio
+    import contextlib
+    import tempfile
+    import time
+    from pathlib import Path
+    from gateway import run_generation
+    from plugins.platforms.telegram.polling_transfer import ControlledPoller
+
+    # Keep every socket under the selected scratch root, below AF_UNIX's path limit.
+    with tempfile.TemporaryDirectory(dir=Path(tempfile.gettempdir()), prefix='r7') as short:
+        original_paths = run_generation.generation_paths
+        def paths(home, identity):
+            return {**original_paths(home, identity), 'socket': Path(short) / (identity.id[:8] + '.sock')}
+        monkeypatch.setattr(run_generation, 'generation_paths', paths)
+        db = GenerationCoordinator(tmp_path)
+        old = GenerationIdentity.create(release_sha='b', label='old')
+        new = GenerationIdentity.create(release_sha='a', label='fresh-previous')
+        db.register(old, state='serving')
+        db.register(new)
+        epoch = db.acquire_lease('active_generation', old.id)
+        entered, wire_release, rearmed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        async def get_updates(**kwargs):
+            entered.set()
+            await wire_release.wait()
+            return []
+        journal = SimpleNamespace(token_hash=old.id, lifecycle_owner=lambda: None,
+                                  pending=lambda: [], safe_offset=lambda: 42)
+        app = SimpleNamespace(bot=SimpleNamespace(get_updates=get_updates), update_queue=asyncio.Queue())
+        poller = ControlledPoller(app, journal)  # real timeout+1 long-poll stop
+        await poller.start()
+        await entered.wait()
+        adapter = SimpleNamespace(_controlled_poller=poller, _controlled_journal=journal)
+        async def stop():
+            started = time.monotonic()
+            stopped = await poller.stop()
+            assert stopped['stopped']
+            # A promotion can exhaust 45s across multiple stops/queue flushes.
+            await asyncio.sleep(max(0, stop_delay - (time.monotonic() - started)))
+            return {'token_hash': old.id, 'safe_offset': 42}
+        async def start(receipt):
+            assert receipt['safe_offset'] == 42
+            await poller.start()
+            rearmed.set()
+        adapter.stop_polling_for_transfer, adapter.start_polling_from_transfer = stop, start
+        runner = SimpleNamespace(adapters={'telegram': adapter}, _overlap_draining=False)
+        runner._overlap_cron_start_kwargs = {'can_dispatch': lambda: not runner._overlap_draining}
+        active = ActiveGeneration(tmp_path, db, old, epoch)
+        active.runner = runner
+        await active.start()
+        verbs = []
+        request = run_generation._generation_request
+        def observed(path, verb, **kwargs):
+            verbs.append((verb, kwargs['timeout']))
+            return request(path, verb, **kwargs)
+        monkeypatch.setattr(run_generation, '_generation_request', observed)
+        async def release_wire():
+            await asyncio.sleep(11)  # responsive owner, ordinary outstanding Telegram poll
+            wire_release.set()
+        release = asyncio.create_task(release_wire())
+        started = time.monotonic()
+        try:
+            with pytest.raises(RuntimeError, match='generation control unavailable'):
+                await asyncio.to_thread(run_generation.handover_to_generation, tmp_path, new.id,
+                                        timeout=budget, verify_after_commit=False)
+            assert time.monotonic() - started < budget + 2
+            assert any(verb == 'transfer_aborted' and 0 < seconds <= 2 for verb, seconds in verbs)
+            await asyncio.wait_for(rearmed.wait(), timeout=stop_delay - budget + 5)
+            # Re-arm starts the wire before reopening the shared dispatch gate.
+            # Observe completion across the same real control-socket boundary.
+            nonce = db.transfer_attempt_nonce(old.id, epoch)
+            reply = await asyncio.to_thread(request, active.paths['socket'], 'transfer_aborted',
+                                            params={'to': new.id, 'nonce': nonce}, timeout=5)
+            assert reply['rearmed']
+            assert active.rearm_status()['armed'] == dict.fromkeys(('poller', 'cron', 'kanban', 'goal_wakeup'), True)
+            assert not active._rearm_errors
+            assert db.leases()[0]['generation_id'] == old.id
+            assert {row['id']: row['state'] for row in db.generations()} == {old.id: 'serving', new.id: 'standby'}
+            with contextlib.closing(db.connect()) as conn:
+                assert conn.execute('SELECT state FROM generation_transfers').fetchone()[0] == 'aborted'
+                assert conn.execute('SELECT count(*) FROM lease_moves').fetchone()[0] == 0
+        finally:
+            wire_release.set()
+            await release
+            await poller.stop()
+            await active.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('changed', ['committed', 'identity', 'epoch', 'nonce'])
+async def test_delayed_stop_never_rearms_changed_owner_or_attempt(tmp_path, monkeypatch, changed):
+    import asyncio
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha='b', label='old')
+    new = GenerationIdentity.create(release_sha='a', label='fresh-previous')
+    db.register(old, state='serving')
+    db.register(new)
+    epoch = db.acquire_lease('active_generation', old.id)
+    entered, release = asyncio.Event(), asyncio.Event()
+    starts = []
+    poller = SimpleNamespace(running=True)
+    async def stop():
+        entered.set()
+        await release.wait()
+        poller.running = False
+        return {'token_hash': 'hash', 'safe_offset': 42}
+    async def start(receipt):
+        starts.append(receipt)
+        poller.running = True
+    adapter = SimpleNamespace(_controlled_poller=poller,
+        _controlled_journal=SimpleNamespace(token_hash='hash'),
+        stop_polling_for_transfer=stop, start_polling_from_transfer=start)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.runner = SimpleNamespace(adapters={'telegram': adapter}, _overlap_draining=False)
+    db.request_transfer(old.id, new.id, epoch, {'hash'})
+    nonce = db.transfer_attempt_nonce(old.id, epoch)
+    task = asyncio.create_task(active.transfer_requested(new.id))
+    await entered.wait()
+    assert db.abort_transfer(old.id, new.id, epoch, attempt_nonce=nonce)
+    if changed in {'committed', 'nonce'}:
+        db.request_transfer(old.id, new.id, epoch, {'hash'})
+        if changed == 'committed':
+            db.record_poller_stopped(old.id, epoch, 'hash', 42)
+            db.commit_transfer(old.id, new.id, epoch)
+    else:
+        # A delayed callback can carry an obsolete process incarnation or epoch;
+        # the durable identity/lease cannot itself be mutated outside lease moves.
+        if changed == 'identity':
+            from dataclasses import replace
+            active.identity = replace(old, start_fingerprint='replaced:1')
+        else:
+            active.epoch += 1
+    release.set()
+    with pytest.raises(RuntimeError):
+        await task
+    with pytest.raises(RuntimeError):
+        await active.transfer_aborted(new.id, nonce)
+    assert not starts
+    assert active.runner._overlap_draining and not poller.running

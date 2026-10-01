@@ -4054,6 +4054,23 @@ def _attach_to_host_gateway_or_guard(force: bool = False, replace: bool = False)
     _guard_named_profile_under_multiplexer(force=force)
 
 
+def _forward_generation_launch() -> bool:
+    """A forward-only launchd generation answers to the coordinator, not the host record.
+
+    Its claim exits 0 on a consumed scope, which parks a KeepAlive respawn of a dead label. The
+    host-attach guard would instead see the live successor serving this profile and exit 75, so
+    launchd would respawn the dead label forever and never park it.
+    """
+    if not os.environ.get("HERMES_GENERATION_SCOPE"):
+        return False
+    try:
+        from gateway.generation import forward_only_handover_enabled
+        return forward_only_handover_enabled(load_gateway_config())
+    except Exception:
+        logger.debug("forward-only generation launch probe failed", exc_info=True)
+        return False
+
+
 def _guard_supervised_gateway_conflict(force: bool = False) -> None:
     """Refuse a foreground gateway when a service manager already supervises one: a shell-launched run
     becomes a second dispatcher that escapes the cgroup, survives ``systemctl restart``, and writes the
@@ -4286,7 +4303,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
     _guard_official_docker_root_gateway()
     if not standby:
-        _attach_to_host_gateway_or_guard(force=force, replace=replace)
+        if not _forward_generation_launch():
+            _attach_to_host_gateway_or_guard(force=force, replace=replace)
         _guard_supervised_gateway_conflict(force=force)
         _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))

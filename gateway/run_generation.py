@@ -30,6 +30,7 @@ from gateway.generation import (
 
 logger = logging.getLogger(__name__)
 HANDOVER_REQUEST_TIMEOUT = 45  # Same bound as generation control acknowledgements.
+HANDOVER_ABORT_RESERVE = 2  # Reserved inside the caller's budget, never added to it.
 DEFAULT_DRAIN_SECONDS = 7200  # Match the commit cap when the durable deadline is missing.
 
 
@@ -88,8 +89,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         raise ValueError("drain_seconds must be between 1 and 86400")
     coordinator = GenerationCoordinator(home)
     deadline = time.monotonic() + timeout
-    def remaining():
-        budget = deadline - time.monotonic()
+    request_deadline = deadline - min(HANDOVER_ABORT_RESERVE, timeout / 5)
+    def remaining(*, recovery=False):
+        budget = (deadline if recovery else request_deadline) - time.monotonic()
         if budget <= 0:
             raise RuntimeError('handover deadline exceeded')
         return budget
@@ -124,7 +126,8 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         except Exception:
             logger.exception("transfer abort failed after pre-commit failure")
         try:
-            _generation_request(path, "transfer_aborted", params={"to": to_id, "nonce": nonce}, timeout=remaining())
+            _generation_request(path, "transfer_aborted", params={"to": to_id, "nonce": nonce},
+                                timeout=min(HANDOVER_ABORT_RESERVE, remaining(recovery=True)))
         except Exception:
             logger.exception("poller re-arm failed after pre-commit failure")
         raise
@@ -550,32 +553,54 @@ class ActiveGeneration:
                 # recovery is incomplete, and do not mask the stop failure.
                 self._stopped_receipts = stopped
                 try:
-                    aborted = await asyncio.to_thread(self.coordinator.abort_transfer,
-                                                      self.identity.id, new_id, self.epoch,
-                                                      attempt_nonce=nonce)
+                    await asyncio.to_thread(self.coordinator.abort_transfer,
+                                            self.identity.id, new_id, self.epoch,
+                                            attempt_nonce=nonce)
                 except Exception:
                     message = "poller stop failed and transfer abort could not be proved"
                     self._rearm_errors = [message]
                     logger.exception("transfer abort failed after poller stop failure")
                     await asyncio.to_thread(self._sync_runtime_status)
                     raise RuntimeError(message) from original
-                if not aborted:
+                try:
+                    # The driver may already have aborted this nonce while the
+                    # long poll was stopping. False is not a changed attempt until
+                    # the fresh lease/identity/nonce read below proves it is.
+                    errors = await self._rearm_stopped_pollers(new_id, nonce)
+                except RuntimeError:
                     message = "poller stop failed and transfer attempt changed"
                     self._rearm_errors = [message]
                     await asyncio.to_thread(self._sync_runtime_status)
                     raise RuntimeError(message) from original
-                errors = await self._rearm_stopped_pollers()
                 if errors:
                     logger.error("poller stop failed: %s; re-arm failed for %s",
                                  original, ", ".join(errors))
                     raise RuntimeError(f"poller stop failed; re-arm failed for {', '.join(errors)}") from original
                 raise
 
-    async def _rearm_stopped_pollers(self) -> list[str]:
-        row = next((row for row in await asyncio.to_thread(self.coordinator.generations)
-                    if row["id"] == self.identity.id), None)
-        if row is None or row["state"] != "serving" or row["verdict"] is not None:
+    async def _check_rearm_owner(self, new_id=None, attempt_nonce=None) -> None:
+        def read_owner():
+            with contextlib.closing(self.coordinator.connect()) as conn:
+                return conn.execute(
+                    "SELECT g.*,l.generation_id AS holder,l.epoch AS lease_epoch,l.state AS lease_state,"
+                    "t.new_id,t.state AS transfer_state,t.attempt_nonce FROM generations g "
+                    "LEFT JOIN leases l ON l.resource='active_generation' "
+                    "LEFT JOIN generation_transfers t ON t.old_id=g.id AND t.epoch=? WHERE g.id=?",
+                    (self.epoch, self.identity.id)).fetchone()
+        row = await asyncio.to_thread(read_owner)
+        if row is None or row['state'] != 'serving' or row['verdict'] is not None:
             raise RuntimeError("only a still-serving generation can resume")
+        if ((row['holder'], row['lease_epoch'], row['lease_state']) !=
+                (self.identity.id, self.epoch, 'active') or
+                any(row[key] != getattr(self.identity, key)
+                    for key in ('pid', 'start_fingerprint', 'boot_id'))):
+            raise RuntimeError("old generation no longer owns admission")
+        if new_id is not None and (row['new_id'], row['transfer_state'], row['attempt_nonce']) != (
+                new_id, 'aborted', attempt_nonce):
+            raise RuntimeError("transfer has not been aborted for this attempt")
+
+    async def _rearm_stopped_pollers(self, new_id=None, attempt_nonce=None) -> list[str]:
+        await self._check_rearm_owner(new_id, attempt_nonce)
         errors: list[str] = []
         remaining = []
         for adapter, receipt in self._stopped_receipts:
@@ -602,6 +627,7 @@ class ActiveGeneration:
             logger.error("generation %s remains draining: re-arm failed for %s",
                          self.identity.id, ", ".join(errors))
         else:
+            await self._check_rearm_owner(new_id, attempt_nonce)
             self._pending_transfer = None
             self.runner._overlap_draining = False
         return errors
@@ -640,7 +666,7 @@ class ActiveGeneration:
             if transfer is None or transfer["state"] != "aborted" or (
                     attempt_nonce is not None and transfer["attempt_nonce"] != attempt_nonce):
                 raise RuntimeError("transfer has not been aborted for this attempt")
-            errors = await self._rearm_stopped_pollers()
+            errors = await self._rearm_stopped_pollers(new_id, transfer['attempt_nonce'])
             if errors:
                 raise RuntimeError(f"re-arm failed for {', '.join(errors)}")
             return self.rearm_status()
@@ -743,7 +769,7 @@ class ActiveGeneration:
                         if aborted:
                             logger.warning("transfer deadline expired; re-arming old gateway %s", self.identity.id)
                             try:
-                                await self._rearm_stopped_pollers()
+                                await self._rearm_stopped_pollers(new_id, nonce)
                             except Exception:
                                 logger.exception("transfer deadline recovery failed; old gateway remains fenced")
             try:

@@ -747,9 +747,11 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
     if _lease(db)['generation_id'] != fresh['id']:
         if not db._owner_is_dead(_row(db, failed['id'])):
             try:
-                # A responsive successor hands over in seconds. A silent one cannot,
-                # so it must not spend the time its heartbeat needs to age into a
-                # wedge proof, plus the bounded stop, takeover and polling proof.
+                # A responsive successor's long poll can outlive this cap. The
+                # driver reserves abort notification inside it; a delayed stop
+                # self-rearms only under the same still-serving lease and nonce.
+                # A silent loop still needs heartbeat aging, bounded termination,
+                # takeover and polling proof inside the original rollback bound.
                 cooperative_budget = min(COOPERATIVE_ROLLBACK_SECONDS,
                                          deadline - _now() - WEDGE_RESERVE_SECONDS - 3.4)
                 if cooperative_budget <= 0:
