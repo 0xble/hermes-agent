@@ -1374,3 +1374,30 @@ def test_superseding_other_release_archives_refused_without_pointer_writes(rig, 
     assert not (rig.home / 'forward-update.json').exists()
     assert releases.read_pointer(rig.home / 'current') == third
     assert not (rig.home / 'previous').exists()
+
+
+def test_review2_route_probe_never_creates_coordinator_db(rig):
+    (rig.home / 'gateway-coordinator.db').unlink()
+    for suffix in ('-wal', '-shm'):
+        (rig.home / f'gateway-coordinator.db{suffix}').unlink(missing_ok=True)
+    assert not forward.forward_route(rig.home, rig.b)
+    assert not (rig.home / 'gateway-coordinator.db').exists()
+
+
+def test_review2_archived_intent_race_reobserves_instead_of_s2(rig, monkeypatch):
+    (rig.home / 'forward-update.json').write_text(json.dumps({'outcome': 'running'}), encoding='utf-8')
+    monkeypatch.setattr(forward, 'recover_forward', lambda home: None)
+    observed = {'outcome': 'success', 'observed': True}
+    monkeypatch.setattr(forward, 'observe_current_forward', lambda home: observed)
+    assert forward.activate_if_forward(rig.home, rig.b, rig.b.name) is observed
+
+
+def test_review2_fleet_catchup_success_clears_restart_obligation(rig, monkeypatch):
+    from hermes_cli import update_cmd_fleet
+    result = promote(rig)
+    cleared = []
+    monkeypatch.setattr(forward, 'recover_forward', lambda home: result)
+    monkeypatch.setattr(forward, 'require_forward_inventory', lambda home: None)
+    monkeypatch.setattr(update_cmd_fleet, '_clear_fleet_restart_pending_marker', lambda: cleared.append(True))
+    update_cmd_fleet._apply_pending_fleet_restart_catchup()
+    assert cleared == [True]

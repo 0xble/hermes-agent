@@ -578,23 +578,28 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
 
     See #86684.
     """
-    from gateway.status import get_process_start_time
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
+    def replaced():
+        # Only a readable, different incarnation proves the recorded process is gone; drift is not.
+        current = get_process_start_time(pid)
+        return (expected_start_time is not None and current is not None
+                and not start_time_fingerprints_match(expected_start_time, current))
     def remaining(cap):
         return max(0., min(float(cap), deadline - time.monotonic())) if deadline is not None else max(float(cap), 0.)
     if deadline is not None and time.monotonic() >= deadline:
         return False
     if expected_start_time is None:
         expected_start_time = get_process_start_time(pid)
-    elif get_process_start_time(pid) != expected_start_time:
+    elif replaced():
         return True  # The recorded process is gone. Its replacement is unrelated.
     try:
         terminate_pid(pid, force=False, expected_start_time=expected_start_time)
     except (ProcessLookupError, PermissionError, OSError):
         gone = _wait_for_pid_exit(pid, remaining(1.0))
-        return gone or (expected_start_time is not None and get_process_start_time(pid) != expected_start_time)
+        return gone or replaced()
     if _wait_for_pid_exit(pid, remaining(term_grace)):
         return True
-    if expected_start_time is not None and get_process_start_time(pid) != expected_start_time:
+    if replaced():
         return True
     if deadline is not None and time.monotonic() >= deadline:
         return False
@@ -604,7 +609,7 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
     except (ProcessLookupError, PermissionError, OSError):
         pass
     gone = _wait_for_pid_exit(pid, remaining(kill_wait))
-    return gone or (expected_start_time is not None and get_process_start_time(pid) != expected_start_time)
+    return gone or replaced()
 
 
 def _get_ancestor_pids() -> set[int]:

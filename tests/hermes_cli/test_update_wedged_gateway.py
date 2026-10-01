@@ -910,3 +910,23 @@ class TestLoopTickTcpWitness:
         )
 
 
+
+
+def test_review2_start_time_drift_is_not_proof_the_wedged_process_is_gone(monkeypatch):
+    """macOS start-time readings drift ~1 s; drift must still escalate to SIGKILL, not report 'gone'."""
+    signals, waits = [], []
+    monkeypatch.setattr(gateway_cli, "terminate_pid",
+                        lambda pid, force=False, **kwargs: signals.append("kill" if force else "term"))
+    monkeypatch.setattr(gateway_cli, "_wait_for_pid_exit", lambda pid, timeout, **_: waits.append(timeout) or len(waits) > 1)
+    readings = iter([1000, 1050, 1080, 1090, 1100])  # same incarnation, drifting within tolerance
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: next(readings))
+    assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000) is True
+    assert signals == ["term", "kill"]
+
+
+def test_review2_replaced_incarnation_is_gone_without_signals(monkeypatch):
+    signals = []
+    monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False, **kwargs: signals.append(force))
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 99999)
+    assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000) is True
+    assert signals == []

@@ -74,3 +74,28 @@ def test_review_l2_forward_outcomes_use_existing_consumer_vocabulary(
     if mapped != 'success':
         result = final_outcome(receipt_home, pending)
         assert result is not None and result[0] is False
+
+
+@pytest.mark.parametrize('fails', [False, True])
+def test_review2_post_swap_forward_finishes_once_and_discharges_restart(monkeypatch, fails):
+    from hermes_cli import update_cmd, gateway_forward_update as forward
+    calls = []
+    proof = {'outcome': 'success', 'new_sha': 'b' * 40}
+    monkeypatch.setattr(forward, 'require_forward_inventory', lambda home: None)
+    def verify(home, record):
+        if fails:
+            raise RuntimeError('poller proof owner changed')
+        return {**record, 'verified': True}
+    monkeypatch.setattr(forward, 'verify_forward', verify)
+    monkeypatch.setattr(update_receipt, 'record_forward_generation', lambda record: calls.append(('record', record['outcome'])))
+    monkeypatch.setattr(update_cmd, '_record_update_step', lambda name, ok, detail: calls.append(('step', ok)))
+    monkeypatch.setattr(update_cmd, '_clear_fleet_restart_pending_marker', lambda: calls.append(('clear',)))
+    monkeypatch.setattr(update_cmd, '_write_gateway_update_exit_code', lambda ok: calls.append(('exit_code', ok)))
+    monkeypatch.setattr(update_cmd, '_finalize_receipt', lambda status, msg: calls.append(('final', status)))
+    if fails:
+        with pytest.raises(SystemExit):
+            update_cmd._complete_forward_update(Path('/nonexistent'), proof)
+        assert calls == [('record', 'blocked'), ('step', False), ('exit_code', False), ('final', 'failed')]
+    else:
+        update_cmd._complete_forward_update(Path('/nonexistent'), proof)
+        assert calls == [('record', 'success'), ('step', True), ('clear',), ('exit_code', True), ('final', 'success')]

@@ -137,7 +137,7 @@ def test_replaced_pid_after_term_proves_old_owner_dead_without_kill(monkeypatch)
     monkeypatch.setattr('gateway.status.get_process_start_time', lambda pid: start.value)
     monkeypatch.setattr(gateway, 'terminate_pid', lambda pid, **kw: signals.append(kw))
     def wait(*args):
-        start.value = 2.
+        start.value = 100_000.  # a new incarnation, far outside start-time drift tolerance
         return False
     monkeypatch.setattr(gateway, '_wait_for_pid_exit', wait)
     assert gateway._escalate_wedged_gateway(123, expected_start_time=1.)
@@ -149,7 +149,7 @@ def test_identity_change_at_term_guard_is_already_a_death_proof(monkeypatch):
     start = SimpleNamespace(value=1.)
     monkeypatch.setattr('gateway.status.get_process_start_time', lambda pid: start.value)
     def refuse(*args, **kwargs):
-        start.value = 2.
+        start.value = 100_000.  # a new incarnation, far outside start-time drift tolerance
         raise OSError('identity changed at signal guard')
     monkeypatch.setattr(gateway, 'terminate_pid', refuse)
     monkeypatch.setattr(gateway, '_wait_for_pid_exit', lambda *args: False)

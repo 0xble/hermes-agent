@@ -825,6 +825,8 @@ def _apply_pending_fleet_restart_catchup(*, defer: bool = False, checkout_comple
                     _forward_catchup_failed(proof)
                 require_forward_inventory(forward_home)
                 record_forward_generation(proof)
+                # A verified serving generation discharges any restart obligation armed earlier.
+                _clear_fleet_restart_pending_marker()
             except (RuntimeError, OSError) as exc:
                 _forward_catchup_failed({'outcome': 'blocked', 'alert': True, 'failure': str(exc)})
         return

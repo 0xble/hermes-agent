@@ -1468,6 +1468,32 @@ def _forward_catchup_failed(proof=None, *, failure='forward-only catch-up failed
     raise SystemExit(1)
 
 
+def _complete_forward_update(home, proof) -> None:
+    """Verify a forward-only activation after the pointer flip, then finish the update exactly once.
+
+    The handover is the restart this update armed before handoff, so success discharges the
+    host fleet-restart obligation. Any verification failure still writes the gateway exit-code
+    marker and a finalized receipt instead of escaping the post-swap phase.
+    """
+    from hermes_cli.gateway_forward_update import verify_forward, require_forward_inventory
+    from hermes_cli.update_receipt import record_forward_generation, forward_receipt_outcome
+    try:
+        require_forward_inventory(home)
+        verified = verify_forward(home, proof)
+    except (RuntimeError, OSError) as exc:
+        record_forward_generation({**proof, 'outcome': 'blocked', 'alert': True, 'failure': str(exc)})
+        print(f"✗ Forward-only verification failed: {exc}")
+        _record_update_step('forward_fleet', False, str(exc))
+        _write_gateway_update_exit_code(False)
+        _finalize_receipt(forward_receipt_outcome('blocked'), 'Forward-only verification failed: %s')
+        raise SystemExit(1)
+    record_forward_generation(verified)
+    _record_update_step('forward_fleet', True, 'generation lease and polling verified; draining labels retained')
+    _clear_fleet_restart_pending_marker()
+    _write_gateway_update_exit_code(True)
+    _finalize_receipt('success', 'Forward-only release verified: %s')
+
+
 @dataclass(frozen=True)
 class _ReleaseReconcileState:
     enabled: bool
@@ -1991,14 +2017,7 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 from hermes_cli.update_receipt import current_forward_generation
                 proof = current_forward_generation()
                 if proof is not None:
-                    from hermes_cli.gateway_forward_update import verify_forward, require_forward_inventory
-                    require_forward_inventory(paths.home)
-                    verified = verify_forward(paths.home, proof)
-                    from hermes_cli.update_receipt import record_forward_generation
-                    record_forward_generation(verified)
-                    _record_update_step('forward_fleet', True, 'generation lease and polling verified; draining labels retained')
-                    _write_gateway_update_exit_code(True)
-                    _finalize_receipt('success', 'Forward-only release verified: %s')
+                    _complete_forward_update(paths.home, proof)
                     return
                 restart = _restart_gateway_fleet_after_update(
                     _pre_update_plan, gateway_mode, acknowledged_release_root=release)

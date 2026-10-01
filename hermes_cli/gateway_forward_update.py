@@ -62,6 +62,8 @@ def forward_route(home: Path, candidate: Path) -> bool:
     paths = ReleasePaths.for_home(home)
     if not capable(read_pointer(paths.current)):
         return False
+    if not (Path(home) / 'gateway-coordinator.db').exists():
+        return False  # A route probe never creates coordinator state.
     db = GenerationCoordinator(home)
     lease = next((row for row in db.leases() if row['resource'] == 'active_generation'), None)
     if lease is None:
@@ -78,7 +80,8 @@ def activate_if_forward(home, candidate, sha):
     if intent.exists():
         record = json.loads(intent.read_text(encoding='utf-8'))
         if record.get('outcome') in {'running', 'blocked'}:
-            return recover_forward(home)
+            # None means another updater archived the intent first. Re-observe; never fall back to S2.
+            return recover_forward(home) or observe_current_forward(home)
     try:
         require_forward_inventory(home)
     except RuntimeError as exc:
