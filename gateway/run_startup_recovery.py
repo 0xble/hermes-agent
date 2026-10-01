@@ -15,7 +15,8 @@ def startup_recovery_fences(runner) -> tuple[frozenset[str], frozenset[str]]:
     reassigned to a living successor remains protected; zero work alone cannot
     prove that the successor released it. Failed/unknown claims are ambiguous.
     """
-    if not getattr(getattr(runner, "config", None), "overlap_handover_enabled", False):
+    from gateway.generation import overlap_handover_enabled
+    if not overlap_handover_enabled(getattr(runner, "config", None)):
         return frozenset(), frozenset()
     from gateway.owned_admission import OwnedAdmissionMixin
     from hermes_constants import get_process_hermes_home
@@ -34,8 +35,12 @@ def startup_recovery_fences(runner) -> tuple[frozenset[str], frozenset[str]]:
     # the coordinator or hold its writer lock while probing OS process identity.
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
+        # N-1 stores failure in state. Migrated writers preserve it in verdict.
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(generations)")}
+        verdict = "g.verdict" if "verdict" in columns else "NULL"
         rows = db.execute(
             "SELECT s.*,g.id,g.pid,g.boot_id,g.start_fingerprint,g.state AS owner_state,"
+            f"{verdict} AS owner_verdict,"
             "EXISTS (SELECT 1 FROM inbox i WHERE i.profile_home=s.profile_home "
             "AND i.transport=s.transport AND i.session_key=s.session_key "
             "AND i.owner_id=s.generation_id AND i.state='pending') AS pending "
@@ -52,7 +57,7 @@ def startup_recovery_fences(runner) -> tuple[frozenset[str], frozenset[str]]:
         if not dead[owner]:
             live.add(key)
             unsafe.add(key)
-        elif cut or row["owner_state"] != "exited":
+        elif cut or row["owner_state"] != "exited" or row["owner_verdict"] == "failed":
             unsafe.add(key)
     # Startup intake has not begun; an excluded live claim may release after the
     # snapshot (conservatively deferred). A proven-dead identity cannot revive.

@@ -1129,12 +1129,15 @@ class TurnRunner:
         ctx = self._ctx
         runner = self._runner
         src = ctx.source
+        startup_gate = getattr(runner, "_startup_gate_source", None) is src
+        checkpoint_kwargs = {"checkpoints_enabled": False} if startup_gate else _checkpoint_agent_kwargs(ctx.user_config)
+        gate_kwargs = {"skip_memory": True, "skip_background_review": True, "side_agent": True} if startup_gate else {}
         agent = ctx.AIAgent(
-            model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
-            max_iterations=max_iterations, quiet_mode=True, verbose_logging=False,
+            model=turn_route["model"], **turn_route["runtime"], **checkpoint_kwargs, **gate_kwargs,
+            max_iterations=1 if startup_gate else max_iterations, quiet_mode=True, verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
-            prefill_messages=runner._prefill_messages or None,
+            prefill_messages=None if startup_gate else (runner._prefill_messages or None),
             reasoning_config=reasoning_config, service_tier=runner._service_tier,
             request_overrides=turn_route.get("request_overrides"),
             providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"), providers_order=pr.get("order"),
@@ -1147,11 +1150,13 @@ class TurnRunner:
             session_db=getattr(runner._session_db, "_db", runner._session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
-            fallback_model=self._runner._refresh_fallback_model(),
-            skip_context_files=skip_context_files,
+            fallback_model=None if startup_gate else self._runner._refresh_fallback_model(),
+            skip_context_files=skip_context_files or startup_gate,
             # Keep the persona even with minimal context: soul identity is one small file.
-            load_soul_identity=True,
+            load_soul_identity=not startup_gate,
         )
+        if startup_gate and agent.tools:
+            raise RuntimeError("startup gate must have an empty toolset")
         base_overrides = turn_route.get("base_request_overrides")
         if base_overrides is not None:
             agent._gateway_base_request_overrides = dict(base_overrides)

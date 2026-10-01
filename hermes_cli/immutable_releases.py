@@ -490,9 +490,16 @@ def _build_candidate_web(staging: Path) -> None:
         raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
 
 
+def _validate_handover_config(home: Path) -> None:
+    from gateway.generation import forward_only_handover_enabled
+    from hermes_cli.config_effective import load_user_config_effective
+    forward_only_handover_enabled(load_user_config_effective(Path(home) / "config.yaml", fail_closed=True))
+
+
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
                   uv: str = "uv", plugin_dir: Path | None = None,
                   source_python: Path | None = None) -> tuple[Path, str]:
+    _validate_handover_config(home)
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
@@ -905,6 +912,7 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
     bytes atomically; reload_callback only reloads launchd and returns False on
     failure. It must tolerate retry after a crash before reload_done is durable.
     """
+    _validate_handover_config(home)
     paths = ReleasePaths.for_home(home)
     candidate = Path(candidate).resolve()
     if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():

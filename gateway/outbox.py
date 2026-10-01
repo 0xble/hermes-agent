@@ -630,6 +630,19 @@ class Outbox:
                 db.rollback()
                 raise
 
+    def enqueue_synthetic(self, turn_id: str, payload: dict[str, Any]) -> OutboxRow:
+        """A loopback result is born terminal, so N-1 recovery cannot dispatch it."""
+        key = f"synthetic:{turn_id}"
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR IGNORE INTO outbox "
+                "(turn_id,sequence,type,payload,idempotency_key,owner_epoch,state,send_status) "
+                "VALUES (?,1,'message',?,?,0,'delivered','synthetic')",
+                (turn_id, json.dumps(payload), key))
+            row = db.execute("SELECT * FROM outbox WHERE idempotency_key=?", (key,)).fetchone()
+            db.commit()
+            return self._row(row)
+
     @staticmethod
     def _row(row: sqlite3.Row) -> OutboxRow:
         return OutboxRow(row["turn_id"], row["sequence"], row["type"], json.loads(row["payload"]),

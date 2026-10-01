@@ -46,6 +46,11 @@ def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bo
     """Resolve the process verdict after either startup abort or normal shutdown."""
     if _exit_with_failure_verdict(runner):
         return False
+    if getattr(runner, '_restart_requested', False) and (runner.exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+                                      or runner._restart_via_service):
+        from gateway.run_generation import defer_forward_launchd_restart
+        if defer_forward_launchd_restart(getattr(runner, 'config', None)):
+            return True  # Clean exit parks KeepAlive until the fresh bootstrap.
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
     if signal_initiated_shutdown and not runner._restart_requested:
