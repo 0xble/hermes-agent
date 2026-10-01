@@ -293,7 +293,7 @@ class TestPreUpdateBackupIsHonest:
         monkeypatch.setattr(maint, "_run_quick_snapshots", snapshot)
         ur.begin_update_receipt()
         result = maint._run_pre_update_backup(object())
-        return result, ur._current.data
+        return result, ur._current.get().data
 
     def test_failed_snapshot_records_the_real_reason(self, receipt_home, monkeypatch):
         from hermes_cli.backup import BackupInProgressError
@@ -317,7 +317,7 @@ class TestPreUpdateBackupIsHonest:
         ur.begin_update_receipt()
 
         assert maint._run_pre_update_backup(object()) is None
-        data = ur._current.data
+        data = ur._current.get().data
         assert not any(s["name"] == "pre_update_backup" for s in data["steps"])
         skip = next(s for s in data["skips"] if s["name"] == "pre_update_backup")
         assert "disabled by" in skip["reason"]
@@ -350,7 +350,7 @@ def test_full_mode_still_takes_the_zip_when_the_snapshot_fails(monkeypatch, rece
 
     assert maint._run_pre_update_backup(object()) is None
     assert ran["zip"] is True, "a failed snapshot must not cancel the full backup"
-    step = next(s for s in ur._current.data["steps"] if s["name"] == "pre_update_backup")
+    step = next(s for s in ur._current.get().data["steps"] if s["name"] == "pre_update_backup")
     assert step["ok"] is False and "OSError" in step["detail"]
 
 
@@ -378,7 +378,7 @@ def test_no_sibling_profiles_is_not_a_sibling_failure(
 
     maint._run_quick_snapshots()
 
-    recorded = [s for s in ur._current.data["steps"] if s["name"] == "sibling_profile_snapshots"]
+    recorded = [s for s in ur._current.get().data["steps"] if s["name"] == "sibling_profile_snapshots"]
     assert bool(recorded) is expect_failure_recorded
 
 

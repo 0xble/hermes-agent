@@ -28,6 +28,8 @@ def receipt_home(tmp_path, monkeypatch):
     # ``_receipt_dir`` resolves through ``hermes_constants.get_hermes_home`` (env var), not
     # ``hermes_cli.config`` — patch where production reads.
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # These tests own receipt boundaries, not retargeting another installation.
+    monkeypatch.setattr("hermes_cli.update_owning_install.owning_install_root", lambda *_: None)
     # The open receipt is per-context; the scope isolates it from any enclosing receipt.
     with ur.update_receipt_scope():
         yield home
