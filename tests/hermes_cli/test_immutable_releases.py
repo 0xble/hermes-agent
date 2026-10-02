@@ -94,7 +94,7 @@ def test_release_plist_executes_selected_release_with_managed_source_launcher(tm
         subprocess.run(release["ProgramArguments"], cwd=release["WorkingDirectory"],
                        env={**os.environ, **release["EnvironmentVariables"]}, check=True, timeout=30)
         observed = json.loads(output.read_text(encoding="utf-8"))
-        assert observed == {"root": str(candidate), "python": str(home / "current/.venv/bin/python"),
+        assert observed == {"root": str(candidate), "python": str(candidate / ".venv/bin/python"),
                             "argv": ["gateway", "run", "--external-supervisor"]}
         assert (home / "bootstrap-root").read_text(encoding="utf-8") == str(candidate)
         assert release["EnvironmentVariables"]["PATH"].split(":")[0] == str(home / "current/.venv/bin")

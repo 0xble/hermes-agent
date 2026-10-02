@@ -27,6 +27,28 @@ def release(home, sha, capable=True):
     return path
 
 
+def test_forward_receipts_accept_utf8_bom(tmp_path, monkeypatch):
+    """Windows-written capability and in-progress intent receipts still parse."""
+    home = tmp_path / 'profile'
+    home.mkdir()
+    candidate = release(home, 'a' * 40)
+    stale = release(home, 'b' * 40)
+    (candidate / 'hermes_cli/release-capabilities.json').write_bytes(
+        b'\xef\xbb\xbf{"forward_only_handover":1}'
+    )
+    (home / 'current').symlink_to(candidate)
+    (home / 'forward-update.json').write_bytes(
+        b'\xef\xbb\xbf' + json.dumps({
+            'outcome': 'running', 'previous': str(candidate), 'current': str(candidate),
+        }).encode()
+    )
+    monkeypatch.setattr(releases, '_live_process_pins', lambda _home: set())
+    monkeypatch.setattr(releases, '_receipt_pins', lambda _home: set())
+
+    assert forward.capable(candidate)
+    assert releases.retain(home, rollback_count=0) == [stale]
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     monkeypatch.setattr('gateway.generation._boot_id', lambda: 'fixture-boot')
