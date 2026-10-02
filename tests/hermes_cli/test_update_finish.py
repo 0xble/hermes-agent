@@ -55,12 +55,12 @@ def completion(tmp_path, monkeypatch):
                "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
     for command in (["init", "-q"], ["add", "--all"], ["-c", "commit.gpgsign=false", "commit", "-qm", "selected"]):
         subprocess.run(["git", *command], cwd=source, env=git_env, check=True, capture_output=True)
-    # The selected interpreter is dependency-free, not the pytest environment. A symlink, not a
-    # copy: a relocatable build (python-build-standalone) locates its stdlib beside the resolved
-    # executable, so a lone copied binary cannot even import ``encodings``.
+    # A real empty venv prevents a framework Python's global site packages from
+    # leaking into the stdlib-only completion parent. Its base executable still
+    # resolves its own stdlib, including relocatable standalone distributions.
     python = tmp_path / "store/python/bin/python3"
-    python.parent.mkdir(parents=True)
-    python.symlink_to(Path(sys._base_executable).resolve())
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(python.parent.parent)],
+                   check=True, capture_output=True)
     _put(tmp_path / "store", "facts.json", json.dumps({"packages": {"python": {"entry": "python"}}}))
     # A real venv: isolated build children (icon generation, npm lifecycle scripts) run on the
     # selected generation's own interpreter, not on the store Python that hosts the completion.

@@ -129,7 +129,7 @@ async def test_legacy_overlap_start_registers_fresh_identity(tmp_path, monkeypat
         await active.close()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.asyncio
 async def test_legacy_overlap_sigkill_respawn_takes_same_label_lease(tmp_path, monkeypatch):

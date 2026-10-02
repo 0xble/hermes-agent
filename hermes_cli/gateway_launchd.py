@@ -297,7 +297,8 @@ def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: 
 
 
 def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor: bool = False,
-                                        interpreter: str | None = None) -> list[str]:
+                                        interpreter: str | None = None,
+                                        release_root: Path | None = None) -> list[str]:
     """Wrap gateway run so raw stderr lines are timestamped before file write. ``external_supervisor``
     (launchd ProgramArguments only) adds ``--external-supervisor`` so ``hermes update`` hands back to
     launchd, and drops ``--replace``: KeepAlive respawns would re-arm takeover, so two profiles sharing
@@ -315,16 +316,20 @@ def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor:
     ``generate_systemd_unit``, whose ExecStart also runs ``gateway run`` without ``--replace``.
     """
     from hermes_cli._launchers import installation_command, runtime_command
-    inner = (_gw()._gateway_run_command() if interpreter is None else
-             _gateway_run_command(interpreter=interpreter))
+    root = release_root if release_root is not None else _gw().PROJECT_ROOT
+    # A source launcher follows PM's current interpreter. An immutable release
+    # must instead bind both entry points to its selected tree and interpreter.
+    command = installation_command if external_supervisor and release_root is None else runtime_command
     if external_supervisor:
-        inner = installation_command(_gw().PROJECT_ROOT, [*shlex.split(_gw()._profile_arg()), "gateway", "run"],
-                                     python=interpreter or _gw().get_python_path())
+        inner = command(root, [*shlex.split(_gw()._profile_arg()), "gateway", "run"],
+                        python=interpreter or _gw().get_python_path())
         inner = [part for part in inner if part != "--replace"]
         if "--external-supervisor" not in inner:
             inner.append("--external-supervisor")
-    command = installation_command if external_supervisor else runtime_command
-    return command(_gw().PROJECT_ROOT, ["--error-log", str(error_log), "--", *inner],
+    else:
+        inner = (_gw()._gateway_run_command() if interpreter is None else
+                 _gateway_run_command(interpreter=interpreter))
+    return command(root, ["--error-log", str(error_log), "--", *inner],
                    module="hermes_cli.stderr_timestamp", python=interpreter or _gw().get_python_path())
 
 
@@ -449,7 +454,8 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
     if pinned_root is not None:
         interpreter = str(pinned_root / ".venv/bin/python")
     command = _timestamped_stderr_gateway_command(
-        stderr_log, external_supervisor=True, interpreter=interpreter)
+        stderr_log, external_supervisor=True, interpreter=interpreter,
+        release_root=pinned_root or release_target)
     prog_args_xml = "\n        ".join(
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
     )

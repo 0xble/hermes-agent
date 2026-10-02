@@ -54,7 +54,6 @@ _KEY_URL = "https://www.perplexity.ai/account/api"
 _HEADERS = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
     "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{get_version_info().base_version}",
     "X-Pplx-Integration": "hermes-agent",
 }
 
@@ -90,10 +89,11 @@ def _perplexity_request(endpoint: str, payload: Dict[str, Any], gateway=None) ->
     from agent.web_search_provider import get_provider_env
 
     api_key = get_provider_env("PERPLEXITY_API_KEY")
-    headers = _HEADERS
+    user_agent = f"HermesAgent/{get_version_info().base_version}"
+    headers = {**_HEADERS, "User-Agent": user_agent}
     if gateway is not None:
         # Nous-owned key behind the gateway: identify the harness only, not a per-user integration.
-        base_url, api_key, headers = gateway.gateway_origin.rstrip("/"), gateway.nous_user_token, {"User-Agent": _HEADERS["User-Agent"]}
+        base_url, api_key, headers = gateway.gateway_origin.rstrip("/"), gateway.nous_user_token, {"User-Agent": user_agent}
     elif api_key:
         base_url = (get_provider_env("PERPLEXITY_BASE_URL") or _DEFAULT_BASE_URL).rstrip("/")
     else:

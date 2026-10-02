@@ -2031,6 +2031,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
     on the OLD checkout in an exit-2 loop); it runs right before the dependency sync."""
     _hermes_current_updater_frame = True
+    # A user's active Git operation owns the checkout, including its index.
+    # Refuse before release recovery, snapshots or branch switching can mutate it.
+    git_operation = (None if getattr(args, "rollback", False)
+                     else git_operation_in_progress(_m().PROJECT_ROOT))
+    if git_operation:
+        root = _m().PROJECT_ROOT
+        print(f"✗ Cannot update while a Git {git_operation} is in progress in {root}.")
+        print(f"  Finish it or run `git {git_operation} --abort`, then re-run `hermes update`.")
+        raise SystemExit(1)
     # Rollback does not fetch, prompt, inspect dependency options or mutate the checkout.
 
     if getattr(args, "rollback", False) and getattr(args, "no_gateway_restart", False):

@@ -56,6 +56,8 @@ def update_tree(tmp_path, monkeypatch):
     newer = git(origin, 'rev-parse', 'HEAD')
 
     monkeypatch.setattr(cli_main, 'PROJECT_ROOT', clone)
+
+    monkeypatch.setenv("PYTHONPATH", str(clone))
     monkeypatch.setattr(update_receipt, '_code_identity', lambda **_: {'commit': base})
     monkeypatch.setattr(cli_main, '_run_pre_update_backup', lambda *_: 'release-snapshot')
     monkeypatch.setattr(cli_main, '_pause_windows_gateways_for_update', lambda: None)

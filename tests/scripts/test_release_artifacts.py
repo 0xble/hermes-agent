@@ -273,21 +273,28 @@ def test_promote_refuses_when_one_macos_arch_is_missing(tmp_path, monkeypatch, r
 
 
 @pytest.fixture
-def candidate_workflow_step(tmp_path, r2_server, staged_candidate):
-    """Run real workflow shell/CLIs; replace only service endpoints and tool setup."""
+def candidate_cli_steps(tmp_path, r2_server, staged_candidate):
+    """Run real release shell/CLIs; replace only service endpoints and tool setup."""
     manifest, fetched, base = staged_candidate
-    jobs = hermes_yaml.safe_load((ROOT / '.github/workflows/desktop-bundled-release.yml').read_text(encoding='utf-8-sig'))['jobs']
-    stable_jobs = hermes_yaml.safe_load(
-        (ROOT / '.github/workflows/stable-release.yml').read_text(encoding='utf-8-sig'))['jobs']
-    render = next(step for step in stable_jobs['complete']['steps']
-                  if step.get('name', '').startswith('Render the admitted'))
-    jobs['controller-promote'] = {
-        'env': jobs['stable-publish']['env'],
+    # The fork's local gate calls the release CLIs directly. Admission belongs
+    # to these native owners and does not depend on a hosted workflow existing.
+    jobs = {'controller-promote': {
+        'env': {
+            'RELEASE_TAG': '${{ inputs.tag }}',
+            'HERMES_ARCHIVE_TAG': '${{ inputs.claim-tag }}',
+            'CANDIDATE_MANIFEST_SHA256': '${{ inputs.manifest-sha256 }}',
+            'CLOUDFLARE_R2_PUBLIC_URL': '${{ vars.CLOUDFLARE_R2_PUBLIC_URL }}',
+            'GH_TOKEN': '${{ github.token }}',
+            'RELEASE_COMMIT': '${{ needs.admit.outputs.commit }}',
+        },
         'steps': [
             {'run': 'python -m scripts.bundles.release_artifacts promote --root verified'},
-            render,
+            {'run': 'python scripts/render-builds-table.py --tag "$RELEASE_TAG" '
+                    '--repo "$GITHUB_REPOSITORY" --archive "$RELEASE_CLAIM_TAG" '
+                    '--candidate-manifest-sha256 "$CANDIDATE_MANIFEST_SHA256" '
+                    '--candidate-commit "$RELEASE_COMMIT"'},
         ],
-    }
+    }}
     shutil.copytree(fetched, tmp_path / 'candidates')
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
@@ -359,9 +366,9 @@ def candidate_workflow_step(tmp_path, r2_server, staged_candidate):
 @pytest.mark.parametrize('ambient_needs', [None, {job: {'result': 'skipped'} for job in SMOKE_RESULTS}])
 @pytest.mark.platforms('posix')
 def test_candidate_smoke_survives_real_promotion_and_renderer(tmp_path, r2_server, staged_candidate,
-                                                           candidate_workflow_step, ambient_needs, https_origin):
+                                                           candidate_cli_steps, ambient_needs, https_origin):
     manifest, _, base = staged_candidate
-    jobs, run, body_file = candidate_workflow_step
+    jobs, run, body_file = candidate_cli_steps
     stored = json.loads(r2_server.store[f"releases/tag/{manifest['archive']}/release-candidates.json"][0])
     assert stored['smoke_results'] == SMOKE_RESULTS
     # An unrelated orphan object must not acquire the candidate's Passed label.
@@ -384,9 +391,9 @@ def test_candidate_smoke_survives_real_promotion_and_renderer(tmp_path, r2_serve
 
 
 @pytest.mark.platforms('posix')
-def test_candidate_smoke_admission_fails_before_publication(tmp_path, r2_server, staged_candidate, candidate_workflow_step):
+def test_candidate_smoke_admission_fails_before_publication(tmp_path, r2_server, staged_candidate, candidate_cli_steps):
     manifest, _, _ = staged_candidate
-    jobs, run, body_file = candidate_workflow_step
+    jobs, run, body_file = candidate_cli_steps
     key = f"releases/tag/{manifest['archive']}/release-candidates.json"
     raw = r2_server.store[key][0]
     for fault, message in [('legacy', 'Candidate manifest'), ('missing', 'Candidate smoke results'),

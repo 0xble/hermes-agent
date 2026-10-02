@@ -5,14 +5,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent.reasoning_effort import KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, thinking_toggle_extras
-from hermes_cli.version_info import get_version_info
 from providers import register_provider
-from providers.base import OMIT_TEMPERATURE, ProviderProfile
+from providers.base import OMIT_TEMPERATURE, ProviderProfile, _versioned_user_agent
 
 _HEADERS = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
     "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{get_version_info().base_version}",
     # Exclude brotli: httpx's brotlicffi backend has a streaming decode bug on
     # Moonshot's content-encoding: br SSE responses (#28043, #48428, #59556).
     # gzip sidesteps it while still compressing the transfer.
@@ -64,6 +62,7 @@ def _kimi(name: str, aliases: tuple, env_vars: tuple, base_url: str) -> KimiProf
         name=name, aliases=aliases, env_vars=env_vars, base_url=base_url,
         fixed_temperature=OMIT_TEMPERATURE, default_max_tokens=32000,
         default_headers=dict(_HEADERS), default_aux_model="kimi-k2-turbo-preview",
+        default_headers_factory=lambda: {"User-Agent": _versioned_user_agent("HermesAgent")},
     )
 
 

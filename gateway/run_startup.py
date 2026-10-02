@@ -126,7 +126,12 @@ class GatewayStartupMixin:
                 # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
                 with suppress(Exception):
                     setattr(event, "_hermes_startup_restore_replay", True)
+                # A normal return can be an admission refusal. Retire the only
+                # durable copy only after this replay acquires an explicit receipt.
+                event._gateway_accepted = False
                 await adapter.handle_message(event)
+                if getattr(event, "_gateway_accepted", False) is not True:
+                    continue
                 spool = getattr(event, "_hermes_recovery_spool", None)
                 if spool is not None:
                     spool.unlink(missing_ok=True)

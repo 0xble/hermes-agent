@@ -833,8 +833,8 @@ test.skipIf(process.platform === 'win32')(
   }
 )
 
-test.skipIf(process.platform !== 'linux')(
-  'terminateOwnedDashboardForUpdate SIGTERMs a serve pinned to a "serve"-named profile',
+test.skipIf(process.platform === 'win32')(
+  'terminateOwnedDashboardForUpdate proves native ownership for a serve pinned to a "serve"-named profile',
   async () => {
     const temp = await mkdtemp(path.join(os.tmpdir(), 'hermes wrapper ownership '))
     const installDir = path.join(temp, 'install dir')
@@ -842,11 +842,9 @@ test.skipIf(process.platform !== 'linux')(
     const pythonLink = path.join(venvBin, 'python')
     const entrypoint = path.join(installDir, 'hermes')
     const launcher = path.join(temp, 'hermes launcher')
-    const python = (await exec('command -v python3')).stdout.trim()
     const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
 
-    await mkdir(venvBin, { recursive: true })
-    await symlink(python, pythonLink)
+    await promisify(execFileCallback)('python3', ['-m', 'venv', '--without-pip', path.join(installDir, 'venv')])
     await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
     await writeFile(launcher, `#!/usr/bin/env bash\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
     await chmod(launcher, 0o755)
@@ -887,14 +885,13 @@ test.skipIf(process.platform !== 'linux')(
 
       assert.equal(execed, true, 'wrapper must exec into the fake installer entrypoint')
 
-      const raw = await readFile(`/proc/${child.pid}/stat`, 'utf8')
-
-      const creationTime = `linux:${
-        raw
-          .slice(raw.lastIndexOf(')') + 2)
-          .trim()
-          .split(/\s+/)[19]
-      }`
+      let creationTime: string
+      if (process.platform === 'darwin') {
+        creationTime = `darwin:${(await exec(`ps -o lstart= -p ${child.pid}`)).stdout.trim()}`
+      } else {
+        const raw = await readFile(`/proc/${child.pid}/stat`, 'utf8')
+        creationTime = `linux:${raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/)[19]}`
+      }
 
       const lock = ownedLock({
         pid: child.pid,
@@ -914,11 +911,18 @@ test.skipIf(process.platform !== 'linux')(
         }
       }
 
-      const result = await terminateOwnedDashboardForUpdate(ssh, lock)
-
-      assert.equal(result.terminated, true)
-      await exited
-      assert.equal(child.signalCode, 'SIGTERM')
+      if (process.platform === 'darwin') {
+        // Native argv proves ownership even with spaces, then the intentional
+        // no-pidfd policy refuses unbound signalling with its specific remedy.
+        await assert.rejects(terminateOwnedDashboardForUpdate(ssh, lock), /cannot atomically bind a signal/)
+        assert.equal(child.exitCode, null)
+        assert.equal(child.signalCode, null)
+      } else {
+        const result = await terminateOwnedDashboardForUpdate(ssh, lock)
+        assert.equal(result.terminated, true)
+        await exited
+        assert.equal(child.signalCode, 'SIGTERM')
+      }
     } finally {
       child.kill('SIGKILL')
       await rm(temp, { force: true, recursive: true })

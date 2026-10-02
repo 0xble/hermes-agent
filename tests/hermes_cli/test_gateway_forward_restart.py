@@ -59,7 +59,7 @@ def service(tmp_path, monkeypatch, request):
     return plist, calls, successors, command
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize('action', ['start', 'restart'])
 def test_loaded_service_launch_opens_fresh_scope(service, action):
     plist, calls, successors, _ = service
@@ -69,7 +69,7 @@ def test_loaded_service_launch_opens_fresh_scope(service, action):
     assert len(successors) == 1
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize('explicit_exit', [75, None])
 def test_planned_exit_hands_off_reload_before_parking(service, monkeypatch, explicit_exit):
     from gateway.run_shutdown import _resolve_gateway_exit_verdict

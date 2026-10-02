@@ -123,6 +123,9 @@ def test_bundle_stages_git_tree_and_runs_native_children_before_manifest(tmp_pat
     subprocess.run([uv, "lock", "--python", sys.executable], cwd=repo, env=env, check=True, capture_output=True)
     subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
     subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    # The wheel is a tracked build input even on hosts that globally ignore
+    # generated wheels. Git archive must include the declared find-links source.
+    subprocess.run(["git", "add", "--force", "wheels"], cwd=repo, check=True)
     subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "fixture"], cwd=repo, check=True, capture_output=True)
     monkeypatch.setattr("pm.paths.repo_root", lambda: repo)
     (repo / "untracked").write_text("must not ship", encoding="utf-8")

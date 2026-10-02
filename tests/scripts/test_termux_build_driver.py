@@ -9,7 +9,6 @@ import subprocess
 import sys
 
 import pytest
-from ruamel.yaml import YAML
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -157,7 +156,7 @@ def test_child_failure_stops_sequence_even_with_stale_product(build_fixture, sta
 
 
 @pytest.mark.parametrize("identity", [("--tag", "v1.2.3"), ("--commit", "a" * 40)])
-def test_release_workflow_runs_the_shared_sequence(build_fixture, identity):
+def test_release_identity_runs_the_shared_sequence(build_fixture, identity):
     repo, payload, _, log, env = build_fixture
     (repo / "scripts/termux/build.py").symlink_to(DRIVER)
     (repo / "termux-build").mkdir()
@@ -166,13 +165,10 @@ def test_release_workflow_runs_the_shared_sequence(build_fixture, identity):
     (tools / "python3").symlink_to(sys.executable)
     env.update(HERMES_BUILD_COMMIT=identity[1] if identity[0] == "--commit" else "",
                HERMES_PAYLOAD_TAG=identity[1] if identity[0] == "--tag" else "")
-    workflow = YAML(typ="safe").load((ROOT / ".github/workflows/desktop-bundled-release.yml").read_text())
-    step = next(step for step in workflow["jobs"]["termux-deb"]["steps"]
-                if step.get("name") == "Assemble the .deb")
-    bash = shutil.which("bash")
-    assert bash is not None
-    result = subprocess.run([bash, "-euo", "pipefail", "-c", step["run"]],
-                            cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(
+        [sys.executable, str(DRIVER), '--repo', str(repo), '--payload', str(payload),
+         '--out', str(repo / 'termux-build/deb'), *identity],
+        cwd=repo, env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = recorded_calls(log)
     assert [Path(call["args"][0]).name for call in calls] == [

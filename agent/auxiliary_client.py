@@ -932,13 +932,14 @@ def build_nvidia_nim_headers(base_url: str | None) -> dict:
 
 
 # Vercel AI Gateway attribution (HTTP-Referer → referrerUrl, X-Title → appName).
-from hermes_cli.version_info import get_version_info
+def build_ai_gateway_headers() -> dict:
+    from providers.base import _versioned_user_agent
 
-_AI_GATEWAY_HEADERS = {
-    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{get_version_info().base_version}",
-}
+    return {
+        "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+        "X-Title": "Hermes Agent",
+        "User-Agent": _versioned_user_agent("HermesAgent"),
+    }
 
 # Nous Portal attribution extra_body. Tags come from agent.portal_tags so the client= marker
 # tracks the canonical base version — never inline a literal here.
@@ -2209,7 +2210,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         if provider_id == "gemini":
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
             if is_native_gemini_base_url(base_url):
-                return GeminiNativeClient(api_key=api_key, base_url=base_url), model
+                return GeminiNativeClient(api_key=api_key, base_url=base_url,
+                                          **_openai_http_client_kwargs(base_url)), model
         if base_url_host_matches(base_url, "api.kimi.com"):
             headers = {"User-Agent": "claude-code/0.1.0"}
         elif base_url_host_matches(base_url, "githubcopilot.com"):
@@ -2259,8 +2261,8 @@ def _profile_default_headers(provider: str) -> Optional[dict]:
     with contextlib.suppress(Exception):
         from providers import get_provider_profile
         profile = get_provider_profile(provider)
-        if profile and profile.default_headers:
-            return dict(profile.default_headers)
+        if profile and (headers := profile.get_default_headers()):
+            return headers
     return None
 
 
@@ -5308,7 +5310,8 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
     if provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
         if is_native_gemini_base_url(base_url):
-            client = GeminiNativeClient(api_key=api_key, base_url=base_url)
+            client = GeminiNativeClient(api_key=api_key, base_url=base_url,
+                                        **_openai_http_client_kwargs(base_url))
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return _route_client(req, client, final_model)
     headers = _endpoint_default_headers(base_url, provider, is_vision=req.is_vision, xai=True)

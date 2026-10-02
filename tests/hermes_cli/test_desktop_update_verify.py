@@ -35,6 +35,7 @@ def bundle(tmp_path, monkeypatch):
     return tmp_path, archive, dist
 
 
+@pytest.mark.platforms("windows")
 def test_readable_packaged_entry_passes(bundle):
     root, _, _ = bundle
     verify.verify_windows_desktop_update(root)
@@ -79,6 +80,7 @@ def _app_only_under(root):
     return lookup
 
 
+@pytest.mark.platforms("windows")
 def test_caller_root_without_a_packaged_app_falls_back_to_the_checkout(bundle, tmp_path, monkeypatch):
     # A hand-off script read before the pull still passes HERMES_HOME, which never
     # holds a packaged app. The healthy checkout it just wrote must be verified instead.

@@ -1,11 +1,63 @@
 """Behavioral tests for the state-holder and repair-admission authority."""
 
 import os
+import select
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 import hermes_state_holders
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("generation", ["current", "hardlink", "retired"])
+def test_darwin_holder_scan_uses_native_descriptor_identity(tmp_path, monkeypatch, generation):
+    """A foreign descriptor remains authoritative without stat-ing unrelated files."""
+    db = tmp_path / "state.db"
+    db.write_bytes(b"held generation")
+    opened = db
+    if generation == "hardlink":
+        opened = tmp_path / "alias.db"
+        os.link(db, opened)
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys; held=open(sys.argv[1], 'rb'); print('ready', flush=True); sys.stdin.read()",
+         str(opened)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert select.select([child.stdout], [], [], 10)[0], "holder did not open its descriptor"
+        assert child.stdout.readline().strip() == "ready"
+        if generation == "retired":
+            db.unlink()
+            db.write_bytes(b"replacement generation")
+        monkeypatch.setattr(hermes_state_holders.psutil, "process_iter",
+                            lambda *args, **kwargs: pytest.fail("ambient psutil path scan"))
+        holders = hermes_state_holders.foreign_state_db_holders(db)
+        assert any(pid == child.pid for pid, _ in holders), holders
+        assert not any(pid < 0 for pid, _ in holders), holders
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("partial", [False, True])
+def test_darwin_holder_scan_retains_uncertainty_on_enumeration_failure(tmp_path, monkeypatch, partial):
+    import hermes_state_dbfile
+
+    db = tmp_path / "state.db"
+    db.touch()
+    info = db.stat()
+    def interrupted():
+        if partial:
+            yield 4242, 7, str(db), (info.st_dev, info.st_ino)
+        raise RuntimeError("descriptor enumeration interrupted")
+    monkeypatch.setattr(hermes_state_dbfile, "_iter_darwin_fd_targets", interrupted)
+    holders = hermes_state_holders.foreign_state_db_holders(db)
+    assert any(pid < 0 and "descriptor enumeration interrupted" in detail for pid, detail in holders)
+    assert ((4242, str(db)) in holders) == partial
 
 
 @pytest.mark.platforms("linux")

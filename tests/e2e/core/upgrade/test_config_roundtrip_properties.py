@@ -939,7 +939,9 @@ def test_p3_a_transient_error_on_any_single_read_never_clobbers(op_name, web_app
 
 def _truncate_mid_scalar(text: str) -> str:
     idx = text.index('"', text.index("\n", 10))  # first double-quoted scalar after the header
-    return text[: idx + 5]
+    # Keep only the opening quote: even a short generated scalar must remain
+    # unterminated, rather than accidentally retaining its closing quote.
+    return text[: idx + 1]
 
 
 _PERSISTENT_FAULTS = {

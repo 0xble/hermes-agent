@@ -60,8 +60,8 @@ The public fork runs ten hosted Linux Python/E2E shards on both PR and nightly. 
 
 Exact CLI versions are declared in `scripts/ci/toolchain.json`. Python uses the
 repository's Python 3.14 line with a fixed CI patch. Root Python and Node dependencies
-use their existing locks. Docs Python tools are ascii-guard 2.3.0 and PyYAML
-6.0.3. The bootstrap application now tracks Cargo.lock and runs `cargo test
+use their existing locks. Docs Python tools are ascii-guard 2.3.0 and ruamel.yaml
+0.18.16, matching the repository YAML reader. The bootstrap application now tracks Cargo.lock and runs `cargo test
 --locked --lib`. The first lock captures the existing manifest's 553-package
 resolution, without changing manifest dependency bounds. Linux arm64
 qualification compiled the locked graph and passed all 68 library tests.
@@ -209,3 +209,11 @@ The documentation environment bootstrap preserves its existing checkout-local ve
 The explicit checkpoint exception imports upstream Python 3.14 and the native PM tool owner. Native OS selection lists files covering the actual host, then selects `platforms` tests. Optional memory SDK integration is the `hindsight` extra. The separate `hindsight-embedded` extra opts into the embedded server and is not inferred from incidental shared transitive distributions. Immutable staging preserves declared extras and all active plugin entry points, and validates enabled plugin imports before activation.
 
 Release, signing, store publishing and channel promotion workflows remain removed under the fork workflow policy. Tests whose entire owner disappeared are retired with that owner. Generic archive/link, SHA admission, ancestry and receipt security tests remain. Workflow policy coverage remains in `scripts/ci/tests/test_portable.py` and `tests/ci/test_workflow_job_graph.py`. The resumable reconciliation evidence records each removed test owner and partial retirement separately.
+
+## Native Checkpoint Fixture Boundaries
+
+Release-publication corruption tests call the actual `scripts.bundles.release_artifacts promote` and builds-table CLI owners. Termux build tests call the native build driver directly. Neither depends on a deleted Actions workflow. Archive fixtures force-add their declared local wheel directory, so a contributor's global Git ignore cannot silently remove the fixture dependency from the archived source. Python payload signing requires both a Darwin host and a Darwin target.
+
+Host-specific cases use one native `platforms` marker. Real profile and adapter constructors, explicit selected-payload ownership, an empty completion-parent venv, interpreter-reported base prefixes, and event-controlled probes replace obsolete environment assumptions. Concurrent local transfer fixtures use a threaded HTTP server, preserving the production resolver's IPv4/IPv6 connection behavior. Memory tests exercise actual provider SDK admission and the Hindsight no-install hot-path contract instead of removed dependency bookkeeping. These are fixture adaptations, not waivers of the portable gate or native qualification.
+
+The startup-gate config read uses the repository-required `utf-8-sig` decoding policy. Its safe YAML parser already accepts a BOM, so this correction is a source-policy alignment, not a reproduced runtime decoding failure. The existing public A→B→A startup invariant exercises BOM and BOM-less configurations. Mutable startup-gate fixtures use upstream's `hermes_yaml` owner rather than the removed PyYAML dependency. The historical frozen outbox fixture remains unchanged and its child receives the actual `pyyaml==6.0.3` dependency from that release in a disposable local dependency directory. It does not restore PyYAML to the current runtime or substitute a fake module.

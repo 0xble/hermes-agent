@@ -30,9 +30,17 @@ class PythonScratchTests(unittest.TestCase):
             for writable in (False, True):
                 original_env = {'PATH': os.defpath, 'HOME': str(original_home / 'isolated-home')}
                 observed = []
+                runner_calls = []
 
                 def observe(command, *, env):
+                    if command[:2] != ['bash', 'scripts/run_tests.sh']:
+                        # Browser admission uses the same isolated environment
+                        # before invoking the file runner, but owns no scratch.
+                        self.assertEqual(env['PLAYWRIGHT_BROWSERS_PATH'], '0')
+                        self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', env)
+                        return
                     self.assertEqual(command, ['bash', 'scripts/run_tests.sh', '-j', '4', '--file-retries', '0', 'tests'])
+                    runner_calls.append(command)
                     if writable:
                         self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', env)
                     else:
@@ -45,6 +53,7 @@ class PythonScratchTests(unittest.TestCase):
 
                 with self.subTest(writable=writable), patch.object(ci, 'python'), patch.object(ci, 'require_wal_capable_sqlite'), patch.object(ci, 'require_tools'), patch.object(ci.sys, 'platform', 'linux'), patch.object(ci.os, 'access', return_value=writable), patch.object(ci.Path, 'home', return_value=original_home), patch.object(ci, 'run', side_effect=observe):
                     ci.python_tests(original_env, ['tests'], 4)
+                    self.assertEqual(len(runner_calls), 1)
                     self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', original_env)
                 for scratch in observed:
                     self.assertFalse(scratch.exists())

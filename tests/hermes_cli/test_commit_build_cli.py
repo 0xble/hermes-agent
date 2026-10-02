@@ -36,7 +36,8 @@ def test_sealed_cli_never_checks_or_spawns_updater(payload, tmp_path, args):
     root, source = payload
     home = tmp_path / "home"
     home.mkdir()
-    env = {**os.environ, "HERMES_HOME": str(home), "HERMES_INSTALL_ROOT": str(root)}
+    env = {**os.environ, "HERMES_HOME": str(home), "HERMES_INSTALL_ROOT": str(root),
+           "PYTHONPATH": os.pathsep.join((str(root), str(source)))}
     # Real imports and parser, no admission mocks. Audit attempts even if a caller swallows the error.
     script = f"""
 import json, sys

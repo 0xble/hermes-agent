@@ -103,7 +103,7 @@ def test_generation_socket_root_cleanup_preserves_live_siblings(tmp_path):
         server.close()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
     from gateway import generation
     import platform

@@ -10,6 +10,7 @@ the Desktop Model Settings page, which awaits this endpoint inside one
 from __future__ import annotations
 
 import time
+import threading
 
 
 def _config(model: str, provider: str, base_url: str) -> dict:
@@ -27,22 +28,28 @@ def test_model_info_degrades_when_the_context_probe_exceeds_its_budget(monkeypat
 
     import agent.model_metadata as metadata
 
-    def _hanging_probe(model, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None):
-        time.sleep(1.0)
+    entered, release = threading.Event(), threading.Event()
+    def _hanging_probe(model, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None, api_mode=""):
+        entered.set()
+        release.wait(5)
         raise AssertionError("the abandoned probe should never be awaited")
 
     monkeypatch.setattr(metadata, "get_model_context_length", _hanging_probe)
 
     started = time.monotonic()
-    info = router.get_model_info()
+    try:
+        info = router.get_model_info()
+        assert entered.is_set()
+    finally:
+        release.set()
     elapsed = time.monotonic() - started
 
     # The response degrades to "auto context unknown" instead of hanging…
     assert info["model"] == "some-model"
     assert info["provider"] == "custom-proxy"
     assert info["auto_context_length"] == 0
-    # …and it returns within the (shrunk) budget, not the probe's 1s sleep.
-    assert elapsed < 0.9
+    # …and it returns within the (shrunk) budget, while the probe is still waiting for release.
+    assert elapsed < 2.0
 
 
 def test_model_info_surfaces_the_context_value_when_the_probe_is_fast(monkeypatch):
@@ -55,7 +62,7 @@ def test_model_info_surfaces_the_context_value_when_the_probe_is_fast(monkeypatc
 
     import agent.model_metadata as metadata
 
-    def _fast_probe(model, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None):
+    def _fast_probe(model, base_url="", api_key="", config_context_length=None, provider="", custom_providers=None, api_mode=""):
         return 131072
 
     monkeypatch.setattr(metadata, "get_model_context_length", _fast_probe)

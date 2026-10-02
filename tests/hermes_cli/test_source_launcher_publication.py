@@ -533,7 +533,7 @@ def test_sync_migrates_old_store_wrapper_before_python_collection(tmp_path, monk
                             capture_output=True, text=True, timeout=30, encoding="utf-8")
     assert result.returncode == 7, result.stderr
     assert json.loads(result.stdout)["value"] == "ready"
-    assert Path(json.loads(result.stdout)["exe"]) == store / "python-B/bin/python3"
+    assert Path(json.loads(result.stdout)["exe"]).resolve() == (store / "python-B/bin/python3").resolve()
 
 
 def test_update_import_probe_uses_selected_dependencies(tmp_path, monkeypatch):

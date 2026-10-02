@@ -5530,14 +5530,11 @@ def _cmd_start(args):
     system = getattr(args, "system", False)
     start_all = getattr(args, "all", False)
     force = getattr(args, "force", False)
-    _guard_named_profile_under_multiplexer(force=force)
     if sys.platform == "darwin" and not start_all:
         # Record operator intent first: even a failed dispatch must not make the guardian
         # mistake this start request for an intentional stop.
         from hermes_cli.gateway_guardian import set_intent
         set_intent(get_hermes_home(), stopped=False)
-    if not start_all and _dispatch_via_service_manager_if_s6("start"):
-        return
     if start_all:
         owner = None if force else _host_multiplexer_for_all_verb()
         if owner is not None:

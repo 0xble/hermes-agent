@@ -1155,7 +1155,8 @@ def _build_curated_lists(current_provider: str, current_base_url: str, current_m
         if _pp.fallback_models and not curated.get(_pp.name):
             curated[_pp.name] = list(_pp.fallback_models)
     # Remote manifest so new Portal models surface without a release; in-repo snapshot fallback.
-    curated["nous"] = get_curated_nous_model_ids()
+    curated["nous"] = (get_curated_nous_model_ids(cache_only=True) if non_blocking
+                       else get_curated_nous_model_ids())
     if "ollama-cloud" not in curated:
         from hermes_cli.models import fetch_ollama_cloud_models
         # Read path: cache only; the row's own SWR refresh (cached_provider_model_ids) warms it.

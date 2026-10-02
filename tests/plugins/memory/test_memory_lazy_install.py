@@ -52,16 +52,25 @@ def test_provider_sdk_admission(monkeypatch, tmp_path, extra, state):
     assert calls == ([] if state == "present" else [[extra]])
 
 
-class TestBundledHindsightAllowlisted:
-    def test_bundled_provider_feature_is_allowlisted_and_matches_its_manifest(self):
-        """The fork keeps plugins/memory/hindsight, whose client calls ensure("memory.hindsight").
-        Upstream dropped the entry with its bundled copy; without it the provider cannot build."""
-        import hermes_yaml as yaml
-        from pathlib import Path
-        manifest = Path(__file__).resolve().parents[3] / "plugins/memory/hindsight/plugin.yaml"
-        declared = yaml.safe_load(manifest.read_text(encoding="utf-8"))["pip_dependencies"]
-        spec = ld.LAZY_DEPS["memory.hindsight"]
-        assert len(spec) == 1 and spec[0].startswith(declared[0])
+@pytest.mark.parametrize("installed", [None, "0.1.0", "0.6.1"])
+def test_hindsight_client_admission_never_installs_on_the_hot_path(monkeypatch, installed):
+    from importlib import metadata
+    from plugins.memory.hindsight import _ensure_client_dependency
+    import pm
+
+    def version(name):
+        assert name == "hindsight-client"
+        if installed is None:
+            raise metadata.PackageNotFoundError(name)
+        return installed
+
+    monkeypatch.setattr(metadata, "version", version)
+    monkeypatch.setattr(pm, "sync_venv", lambda *args, **kwargs: pytest.fail("hot-path install"))
+    if installed == "0.6.1":
+        _ensure_client_dependency()
+    else:
+        with pytest.raises(ImportError, match="hermes pm install"):
+            _ensure_client_dependency()
 
 
 class TestSupermemoryIsAvailable:

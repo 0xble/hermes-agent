@@ -83,13 +83,6 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
     if not files:
         raise RuntimeError(f'Empty Python shard {index}/{count}')
     print(f'Python shard {index}/{count}: {len(files)} files', flush=True)
-    if 'tests/tools/test_vault_shadow_dom_live.py' in files:
-        # This test must execute on the hosted gate, not silently skip because
-        # the runner lacks Playwright's separately downloaded Chromium.
-        env = dict(env, PLAYWRIGHT_BROWSERS_PATH='0')
-        run([python(env), '-m', 'playwright', 'install', 'chromium'], env=env)
-        run([python(env), '-c', 'from pathlib import Path; from playwright.sync_api import sync_playwright; '
-             'p = sync_playwright().start(); assert Path(p.chromium.executable_path).is_file(); p.stop()'], env=env)
     python_tests(env, files, workers)
 
 
@@ -324,7 +317,7 @@ def setup(env: dict[str, str]) -> None:
     run(['npm', 'ci', '--no-audit', '--no-fund'], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=ROOT / 'website', env=env)
     run(['uv', 'venv', '--allow-existing', '--python', PINS['python'], str(STATE / 'docs-venv')], env=env)
-    run(['uv', 'pip', 'install', '--python', str(docs_python()), 'ascii-guard==2.3.0', 'pyyaml==6.0.3'], env=env)
+    run(['uv', 'pip', 'install', '--python', str(docs_python()), 'ascii-guard==2.3.0', 'ruamel.yaml==0.18.16'], env=env)
 
 
 def docs_python() -> Path:
@@ -410,6 +403,14 @@ def python_tests(env: dict[str, str], roots: list[str], workers: int,
     require_tools(('rg',), env)
     env = dict(env)
     env['HERMES_PYTHON'] = py
+    browser_test = ROOT / 'tests/tools/test_vault_shadow_dom_live.py'
+    if any(browser_test == ROOT / path or browser_test.is_relative_to(ROOT / path) for path in roots):
+        # Every lane that owns the real-browser tests must supply Chromium,
+        # including the complete contributor suite as well as a shard.
+        env['PLAYWRIGHT_BROWSERS_PATH'] = '0'
+        run([py, '-m', 'playwright', 'install', 'chromium'], env=env)
+        run([py, '-c', 'from pathlib import Path; from playwright.sync_api import sync_playwright; '
+             'p = sync_playwright().start(); assert Path(p.chromium.executable_path).is_file(); p.stop()'], env=env)
     if file_timeout is not None:
         env['HERMES_TEST_FILE_TIMEOUT'] = str(file_timeout)
     command = ['bash', 'scripts/run_tests.sh', '-j', str(workers), '--file-retries', '0',
@@ -475,7 +476,7 @@ def native_os(env: dict[str, str], workers: int) -> None:
 def node_gate(env: dict[str, str], workers: int) -> None:
     # Admit fast cross-workspace checks on every PR; the full nine-unit Node
     # profile, including desktop UI and TUI suites, runs in nightly.
-    python(env)
+    env = dict(env, HERMES_PYTHON=python(env))
     require_tools(('node', 'npm'), env)
     run(['node', '--test', 'scripts/ci/tests/workspace-checks.test.mjs'], env=env)
     command = ['node', 'scripts/run-workspace-checks.mjs', '--concurrency', str(workers),
@@ -487,7 +488,7 @@ def node_gate(env: dict[str, str], workers: int) -> None:
 
 
 def node(env: dict[str, str], workers: int) -> None:
-    python(env)  # JavaScript tests spawn Python subprocesses from PATH.
+    env = dict(env, HERMES_PYTHON=python(env))
     require_tools(('node', 'npm'), env)
     run(['node', '--test', 'scripts/ci/tests/workspace-checks.test.mjs'], env=env)
     command = ['node', 'scripts/run-workspace-checks.mjs', '--concurrency', str(workers), '--skip', 'check:test:desktop:all']

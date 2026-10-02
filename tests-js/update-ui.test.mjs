@@ -123,7 +123,7 @@ test('test-only source probe pins staged main without changing other Python invo
   expect(sourceBranchProbe.branchProbeArgs(cmd, root, '/real&git')).toBe(cmd)
 })
 
-test.skipIf(process.platform === 'win32')('probe Git reaches the staged main even with global Git config isolated', () => {
+function withStagedSourceProbe(check) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-staged-git-'))
   const git = process.env.HERMES_E2E_REAL_GIT || process.env.PATH.split(path.delimiter)
     .map(dir => path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git')).find(file => fs.existsSync(file))
@@ -155,21 +155,29 @@ test.skipIf(process.platform === 'win32')('probe Git reaches the staged main eve
       PYTHONPATH: source, GIT_ALLOW_PROTOCOL: 'file' }
     const home = path.join(root, 'profile')
     fs.mkdirSync(home)
-    const status = JSON.parse(execFileSync(launcher, ['--run-module', 'hermes_cli.source_check',
-      '--install-root', checkout, '--home', home, '--git', git, '--force'],
+    const readStatus = installRoot => JSON.parse(execFileSync(launcher, ['--run-module', 'hermes_cli.source_check',
+      '--install-root', installRoot, '--home', home, '--git', git, '--force'],
     { cwd: checkout, encoding: 'utf8', env }))
-    expect(status).toMatchObject({ supported: true, currentSha: base, branch: 'main', targetSha: sha, updateAvailable: true })
-    expect(execFileSync(launcher, ['--version'], { cwd: checkout, env, encoding: 'utf8' }).trim()).toBe('--version')
-    const other = path.join(root, 'other-checkout')
-    fs.mkdirSync(other)
-    const foreign = JSON.parse(execFileSync(launcher, ['--run-module', 'hermes_cli.source_check',
-      '--install-root', other, '--home', home, '--git', git, '--force'],
-    { cwd: checkout, encoding: 'utf8', env }))
-    expect(foreign).toMatchObject({ supported: false, reason: 'not-a-git-checkout' })
-    expect(() => sourceBranchProbe.prepareSourceBranchEnvironment(checkout, '0'.repeat(40), git, capturedEnv, launchEnv)).toThrow(/does not match expected/)
+    check({ root, checkout, base, sha, git, capturedEnv, launchEnv, launcher, env, readStatus })
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+}
+
+test.skipIf(process.platform === 'win32')('probe Git reaches the staged main even with global Git config isolated', () => {
+  withStagedSourceProbe(({ checkout, base, sha, git, capturedEnv, launchEnv, readStatus }) => {
+    expect(readStatus(checkout)).toMatchObject({ supported: true, currentSha: base, branch: 'main', targetSha: sha, updateAvailable: true })
+    expect(() => sourceBranchProbe.prepareSourceBranchEnvironment(checkout, '0'.repeat(40), git, capturedEnv, launchEnv)).toThrow(/does not match expected/)
+  })
+})
+
+test.skipIf(process.platform === 'win32')('staged source probe leaves foreign roots and ordinary launcher invocations alone', () => {
+  withStagedSourceProbe(({ root, checkout, launcher, env, readStatus }) => {
+    expect(execFileSync(launcher, ['--version'], { cwd: checkout, env, encoding: 'utf8' }).trim()).toBe('--version')
+    const other = path.join(root, 'other-checkout')
+    fs.mkdirSync(other)
+    expect(readStatus(other)).toMatchObject({ supported: false, reason: 'not-a-git-checkout' })
+  })
 })
 
 test.skipIf(process.platform === 'win32')('historical venv install without a PM launcher still checks staged Git main', () => {

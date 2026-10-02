@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import gateway, gateway_launchd, immutable_releases as releases, update_cmd, update_cmd_fleet, update_receipt
-from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions
+from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions, install_probe_process_dependency
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -43,6 +43,7 @@ def release_job(tmp_path, monkeypatch, request):
     for root in (a, b):
         root.mkdir(parents=True)
         venv.EnvBuilder(with_pip=False).create(root / ".venv")
+        install_probe_process_dependency(root / ".venv")
         (root / ".release-ready").write_text(root.name + "\n")
         (root / ".hermes_build_sha").write_text(root.name + "\n")
         (root / "probe.py").write_text(

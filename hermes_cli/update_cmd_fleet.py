@@ -15,6 +15,7 @@ import sys
 import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NoReturn
 
 from hermes_cli.update_cmd_common import _best_effort
 from hermes_cli.update_inventory import _gateway_service_matches_profile
@@ -788,30 +789,8 @@ def _apply_pending_fleet_restart_catchup(*, defer: bool = False, checkout_comple
             outcome, _pre_update_plan=None, _windows_gateway_resume=None,
             node_failures=[], update_complete=checkout_complete, expected_sha=current.name, expected_root=current)
         return
-    print()
-    _warn_pending_fleet_restart()
-    print("→ Running the pending fleet restart...")
-    if not _run_pending_fleet_restart():
-        print("  ⚠ Fleet restart incomplete. Recover with: hermes gateway restart")
-        sys.exit(1)
-    if not _pending_fleet_restart_needed():
-        return
-    # The restart itself succeeded, but the receipt still owes gateways it cannot match to a
-    # live row (unknown identity, pre-pull plan SHAs). When every live gateway serves the
-    # checkout code, that matrix is the recovery evidence: settle the receipt with it instead of
-    # failing this run — an exit 1 here writes another failed receipt and the warning never
-    # clears, even after a successful manual `hermes gateway restart` (#117051).
-    fleet = _live_fleet_current_rows()
-    if fleet is not None:
-        from hermes_cli.update_receipt import settle_latest_receipt_fleet
-        settled = settle_latest_receipt_fleet(
-            fleet, discharges=lambda receipt: not _pending_fleet_restart_needed(receipt=receipt)
-        )
-        if settled:
-            print(f"  ✓ Update receipt settled: {len(fleet)} gateway(s) serve the checkout code.")
-            return
-    print("  ⚠ Fleet restart ran, but gateways are still off the checkout code. Recover with: hermes gateway restart")
-    sys.exit(1)
+    # Legacy source updates finish in update_completion's selected interpreter.
+    _run_pending_fleet_restart()
 
 
 def _systemctl(cmd: list, *, timeout: float):
@@ -2353,98 +2332,6 @@ def _service_restart_sec(scope_cmd_: list, svc_name_: str, default: float = 0.0)
     return total if matched else default
 
 
-def _run_pending_fleet_restart() -> bool:
-    """Catch-up restart for gateways left on pre-update code. Never raises.
-
-    True when all discovered targets recovered (or none exist); False if incomplete.
-
-    Idempotent per HOST: one process multiplexes every profile, so the second profile's
-    ``hermes update`` must attach to the first one's restart instead of killing the shared
-    gateway again (the obligation record carries the proof).
-
-    See #95294.
-    """
-    from hermes_cli.update_cmd import _m
-    from hermes_cli.update_host_obligation import host_restart_already_completed, mark_host_restart_completed
-    checkout_sha = _restart_identity_sha()
-    if host_restart_already_completed(checkout_sha):
-        print("  ✓ This host's gateway was already restarted for this update — not restarting it again.")
-        return True
-    print("→ Restarting gateways left on pre-update code...")
-    # Warn if legacy Hermes gateway unit files are still installed. When both hermes.service (from a
-    # pre-rename install) and the current hermes-gateway.service are enabled, they SIGTERM-fight for the
-    # same bot token (see PR #11909). Flagging here means every `hermes update` surfaces the issue until the
-    # user migrates.
-    try:
-        from hermes_cli.gateway import (
-            find_gateway_pids, is_macos, is_windows, kill_gateway_processes, supports_systemd_services,
-            _wait_for_gateway_exit,
-        )
-    except Exception as exc:
-        _warn_gateway_restart_phase_aborted(exc, None)
-        return False
-
-    try:
-        pids = list(find_gateway_pids(all_profiles=True))
-    except Exception as exc:
-        logger.debug("Pending fleet restart: gateway probe failed: %s", exc)
-        pids = None
-
-    # A gateway this very update cold-started (or a manual `hermes gateway restart` seconds
-    # ago) already serves the checkout code; stopping it here re-kills the fleet, and on
-    # Windows the stop/start pair then reports "No gateway was running" plus a second spawn
-    # (#117051). Skip when EVERY live gateway is current on the checkout SHA.
-    if pids and _live_fleet_current_rows() is not None:
-        print("  ✓ Every running gateway already serves the checkout code — nothing to restart.")
-        return True
-
-    failed: list = []
-    try:
-        # Snapshot before stopping: Restart=no units can disappear from list-units on a clean exit.
-        systemd_listings = list(_systemd_gateway_unit_listings()) if supports_systemd_services() else None
-        # Stop old processes before supervisor recovery, never its freshly verified workers.
-        if pids != []:
-            try:
-                leftover = list(find_gateway_pids(all_profiles=True))
-            except Exception:
-                leftover = list(pids or [])
-            if leftover:
-                with _best_effort('Pending fleet restart: PID stop failed: %s'):
-                    kill_gateway_processes(all_profiles=True)
-                    _wait_for_gateway_exit(timeout=5.0, force_after=None)
-        # --- Systemd services (Linux) --- Discover all hermes-gateway* units (default + profiles) plus
-        # hermes-serve* units (the Desktop app's backend, #83438).
-        if systemd_listings is not None:
-            _restart_systemd_gateway_units_best_effort(failed, systemd_listings)
-        # --- Launchd services (macOS) --- Restart EVERY ai.hermes.gateway* LaunchAgent, not only the
-        # invoking profile's — parity with the systemd branch above (#41403). Per-label TimeoutExpired
-        # isolation happens inside.
-        if is_macos():
-            try:
-                _restart_macos_launchd_gateways([], failed, 45.0, require_supervision=True)
-            except Exception as exc:
-                logger.debug("Pending fleet restart: launchd failed: %s", exc)
-                failed.append("launchd")
-        if is_windows():
-            try:
-                from hermes_cli import gateway_windows
-                if gateway_windows.is_installed():
-                    gateway_windows.restart()
-            except Exception as exc:
-                logger.debug("Pending fleet restart: Windows failed: %s", exc)
-                failed.append("windows-gateway")
-        if failed:
-            _warn_incomplete_gateway_fleet_restart(failed)
-            return False
-        # Stamp the HOST obligation so every other profile's CLI knows this update's restart
-        # already happened; without it each profile re-kills the one shared multiplexer.
-        mark_host_restart_completed(checkout_sha or "")
-        print("  ✓ Pending fleet restart completed.")
-        return True
-    except Exception as exc:
-        try:
-            surviving = list(find_gateway_pids(all_profiles=True))
-        except Exception:
-            surviving = pids
-        _warn_gateway_restart_phase_aborted(exc, surviving)
-        return False
+def _run_pending_fleet_restart() -> NoReturn:
+    from hermes_cli._old_updater import stop_for_relaunch
+    stop_for_relaunch(incomplete=True)

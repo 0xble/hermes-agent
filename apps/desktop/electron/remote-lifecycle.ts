@@ -675,6 +675,35 @@ async function remoteProcessCreationTime(ssh, pid) {
   }
 }
 
+// Read exact argv boundaries on hosts where ps renders unquoted spaces. Both
+// reuse and update termination must prove ownership from the same native source.
+const remoteProcessArgvScript = String.raw`
+def argv():
+ import struct
+ try:
+  raw=open(f"/proc/{pid}/cmdline","rb").read()
+  return [part.decode("utf-8","surrogateescape") for part in raw.split(b"\0") if part]
+ except OSError:
+  try:
+   if sys.platform!="darwin":
+    return shlex.split(subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip())
+   import ctypes
+   libc=ctypes.CDLL(None,use_errno=True)
+   mib=(ctypes.c_int*3)(1,49,pid)
+   size=ctypes.c_size_t()
+   if libc.sysctl(mib,3,None,ctypes.byref(size),None,0)!=0: return []
+   buf=ctypes.create_string_buffer(size.value)
+   if libc.sysctl(mib,3,buf,ctypes.byref(size),None,0)!=0: return []
+   raw=buf.raw[:size.value]
+   argc=struct.unpack_from("i",raw)[0]
+   pos=raw.index(b"\0",4)+1
+   while raw[pos:pos+1]==b"\0": pos+=1
+   parts=raw[pos:].split(b"\0")
+   if argc<=0 or len(parts)<argc:return []
+   return [part.decode("utf-8","surrogateescape") for part in parts[:argc]]
+  except (OSError,subprocess.CalledProcessError,ValueError,struct.error):return []
+`
+
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
 async function pidIsOurDashboard(
@@ -705,16 +734,8 @@ async function pidIsOurDashboard(
     `expected_token=os.path.expanduser(${shq(ownershipId ? spawnTokenPath(ownershipId, spawnNonce) : '')})\n` +
     `expected_profile=${shq(profile)}\n` +
     `nonce=${shq(spawnNonce)}\n` +
-    'try:\n' +
-    ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
-    ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
-    'except OSError:\n' +
-    ' try:\n' +
-    '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
-    ' except subprocess.CalledProcessError:\n' +
-    '  # pid already gone — a dead process is FOREIGN, not a transport error\n' +
-    '  print("FOREIGN");sys.exit(0)\n' +
-    ' args=shlex.split(line)\n' +
+    remoteProcessArgvScript +
+    'args=argv()\n' +
     'ok=False\n' +
     'try:\n' +
     // A profile literally named "serve" puts the value token before the
@@ -920,27 +941,15 @@ def creation():
   except (OSError,subprocess.CalledProcessError):return ""
  return ""
 
-def argv():
- try:
-  raw=open(f"/proc/{pid}/cmdline","rb").read()
-  return [part.decode("utf-8","surrogateescape") for part in raw.split(b"\\0") if part]
- except OSError:
-  try:return shlex.split(subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip())
-  except (OSError,subprocess.CalledProcessError,ValueError):return []
-
+${remoteProcessArgvScript}
 def identity_before_signal():
- # Darwin's lstart has one-second resolution. Read the start time and the
- # complete argv in one ps call immediately before signalling; the random
- # ownership nonce is the discriminator for a same-second PID reuse. A
- # same-second reuse with a forged/repeated nonce remains a residual limitation.
- if sys.platform=="darwin":
-  try:
-   line=subprocess.check_output(["ps","-ww","-p",str(pid),"-o","lstart=","-o","command="],text=True).strip()
-   prefix=expected_creation.removeprefix("darwin:")
-   if not prefix or not line.startswith(prefix):return "",[]
-   return "darwin:"+prefix,shlex.split(line[len(prefix):].strip())
-  except (OSError,subprocess.CalledProcessError,ValueError):return "",[]
- return creation(),argv()
+ # Darwin has second-resolution creation time. Bracket the exact native argv
+ # read with creation checks so a changed PID cannot inherit an ownership proof.
+ # The later DARWIN_UNAVAILABLE refusal still prevents unbound signalling.
+ before=creation()
+ args=argv()
+ after=creation()
+ return (before,args) if before and before==after else ("",[])
 
 def owned(args):
  try:

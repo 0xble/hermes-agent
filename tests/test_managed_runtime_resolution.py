@@ -313,7 +313,7 @@ def test_resolution_allowlist_has_no_stale_rows():
 @pytest.fixture
 def _fresh_scan_caches():
     """The scans are cached per process; a test that swaps REPO_ROOT must not leak its tree."""
-    caches = (_findings, _resolution_sites, _is_packaging_copy)
+    caches = (_is_packaging_copy,)
     for cached in caches:
         cached.cache_clear()
     yield
@@ -330,7 +330,7 @@ def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, mo
         path.parent.mkdir(parents=True)
         path.write_text('import shutil\nshutil.which("uv")\n', encoding="utf-8")
 
-    assert _findings() == (("hermes_cli/new_command.py", "uv", 2),)
+    assert list(_findings()) == [("hermes_cli/new_command.py", "uv", 2)]
 
 
 def test_no_unreviewed_bare_managed_runtime_lookups():

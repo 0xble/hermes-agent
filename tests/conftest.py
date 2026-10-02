@@ -242,6 +242,7 @@ from tests._fixtures.live_system_guard import (  # noqa: F401 — _live_system_g
     _live_system_guard,
 )
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
+from tests._fixtures.repair_capacity import adequate_repair_capacity  # noqa: F401 — registers fixture
 
 
 @pytest.fixture(autouse=True)
@@ -462,8 +463,18 @@ def _neutralize_git_safe_directory_read(request, monkeypatch):
     monkeypatch.setattr(_subprocess_compat, "_user_safe_directories", lambda base_env: [], raising=False)
 
 
+@pytest.fixture
+def monkeypatch(_close_leaked_session_dbs, monkeypatch):
+    """Restore native patches before retiring the resources they may replace.
+
+    Pytest resolves the same-name dependency to its original fixture. Its
+    undo runs before this dependency, preserving the native MonkeyPatch API.
+    """
+    return monkeypatch
+
+
 @pytest.fixture(autouse=True)
-def _close_leaked_session_dbs():
+def _close_leaked_session_dbs(tmp_path):
     """Close every SessionDB a test constructed but forgot to close.
 
     Root cause of OOM incident 20260816: ~40 files under tests/hermes_cli/
@@ -507,12 +518,7 @@ def _close_leaked_session_dbs():
     wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
     if wait is not None:
         wait()
-    try:
-        from hermes_state_guard import _test_instance_registry as registry
-    except Exception:
-        return
-    if not registry:
-        return
+    registry = getattr(sys.modules.get("hermes_state_guard"), "_test_instance_registry", ())
     for db in list(registry):
         if getattr(db, "_shared_registry_owned", False):
             continue
@@ -523,6 +529,26 @@ def _close_leaked_session_dbs():
             # (cross-thread ProgrammingError, already-closed) leaves at most
             # the one connection for the next sweep / process exit.
             pass
+
+    # A per-test home is a finished resource owner. Force-close only shared
+    # generations below this test's tmp_path, preserving module/session fixture
+    # handles outside it. Skipping all registry-owned DBs left one generation
+    # per test alive until the worker hit its file-descriptor limit.
+    close_shared = getattr(sys.modules.get("hermes_state_registry"), "close_all_under", None)
+    if close_shared is not None:
+        close_shared(tmp_path)
+
+    # Agent construction routes logging to each isolated home. Those routed
+    # handlers outlive the agent, so retiring the home must release them too.
+    logs = sys.modules.get("hermes_logging")
+    release_logs = getattr(logs, "release_profile_log_handlers", None)
+    if callable(release_logs):
+        with logs._queue_state_lock:
+            homes = logs._known_log_homes()
+        root = tmp_path.resolve()
+        for home in homes:
+            if home.is_relative_to(root):
+                release_logs(home)
 
 
 @pytest.fixture(autouse=True)

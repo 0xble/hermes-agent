@@ -53,7 +53,7 @@ def test_active_and_passive_generations_use_distinct_records(request):
         plist.write_bytes(plistlib.dumps({
             "Label": label, "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False},
             "ExitTimeOut": 60,
-            "ProgramArguments": [str(python), "-m", "hermes_cli.main", "gateway", "run"] +
+            "ProgramArguments": [str(python), "-u", "-m", "hermes_cli.main", "gateway", "run"] +
                                 (["--standby"] if label != labels[0] else []),
             "WorkingDirectory": str(repository),
             "EnvironmentVariables": {"HERMES_HOME": str(home), "PYTHONPATH": str(repository),
@@ -85,7 +85,9 @@ def test_active_and_passive_generations_use_distinct_records(request):
     try:
         for plist in plists:
             subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=15)
-        deadline = time.monotonic() + 18
+        # Both fresh interpreters import the real CLI and gateway. Allow cold
+        # bytecode repair and shared-host load before requiring runtime readiness.
+        deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not ready():
             time.sleep(.2)
         if not ready():

@@ -51,6 +51,10 @@ def test_validator_accepts_real_cli_refusal_for_installed_identity(artifact, mon
 
     root, source = artifact
     monkeypatch.setattr(main, "PROJECT_ROOT", root)
+    # This fixture deliberately runs the sealed artifact on the test venv.
+    # Select it explicitly so owning-install recovery does not retarget the
+    # test to the interpreter's real checkout before the package guard runs.
+    monkeypatch.setenv("PYTHONPATH", str(root))
     monkeypatch.setattr("hermes_cli.image_provenance.IMAGE_PROVENANCE_PATH", tmp_path / "absent")
     monkeypatch.delenv("HERMES_MANAGED", raising=False)
 

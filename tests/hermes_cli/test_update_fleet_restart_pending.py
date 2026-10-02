@@ -85,6 +85,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Isolate machine maintenance while exercising interrupted fleet updates."""
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     monkeypatch.setattr(update_cmd, "_prepare_updated_checkout", lambda *a, **k: None)
     (tmp_path / ".git").mkdir()
     monkeypatch.setattr(hermes_main, "_resolve_update_branch", lambda args: "main")
@@ -564,7 +565,7 @@ def test_startup_warn_prints_when_marker_present(capsys):
     update_cmd._write_fleet_restart_pending_marker()
     update_cmd._warn_pending_fleet_restart_on_startup()
     err = capsys.readouterr().err
-    assert "did not restart running gateways" in err
+    assert "recorded a pending gateway-restart obligation" in err
     assert "hermes gateway restart" in err
 
 
@@ -709,7 +710,7 @@ def test_startup_warn_kept_when_inventory_holds_unclassified_serve(monkeypatch, 
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "recorded a pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -732,7 +733,7 @@ def test_startup_warn_kept_without_positive_evidence(monkeypatch, capsys, disk_s
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "recorded a pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -765,6 +766,7 @@ def _checkout_with_carried_commit(monkeypatch, tmp_path):
     git("commit", "-qm", "carried hotfix")
     head = git("rev-parse", "HEAD")
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo)
+    monkeypatch.setenv("PYTHONPATH", str(repo))
     _patch_marker_sha(monkeypatch, head)
     return expected, head
 
@@ -793,7 +795,7 @@ def test_obligation_kept_when_gateway_serves_stale_code_on_carried_checkout(monk
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "recorded a pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -827,7 +829,7 @@ def test_startup_warn_kept_when_receipt_owed_gateway_is_down(monkeypatch, capsys
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "recorded a pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 
@@ -946,7 +948,7 @@ def test_startup_warn_kept_when_inventory_less_marker_fleet_stale(monkeypatch, c
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "recorded a pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 # ── Empty-inventory marker: a pull that recorded no gateway owes nothing (#115311) ──
@@ -1118,7 +1120,7 @@ def test_startup_warn_kept_when_sha_less_marker_fleet_is_all_external(monkeypatc
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "recorded a pending gateway-restart obligation" in capsys.readouterr().err
     assert update_cmd_fleet._fleet_restart_obligation_armed()
 
 

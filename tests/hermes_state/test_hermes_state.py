@@ -332,7 +332,7 @@ class TestConnectionLifecycle:
         ]
 
     def test_failed_read_only_open_does_not_leak_tracked_connection(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         """A malformed store makes the RO FTS probe raise DatabaseError.
         The connection must be closed on that failure path: a leaked tracked
@@ -340,6 +340,13 @@ class TestConnectionLifecycle:
         lifetime, so the writable heal that follows would repair WITHOUT its
         forensic backup."""
         import sqlite3
+        from types import SimpleNamespace
+
+        # This contract exercises leaked connection tracking and a real forensic
+        # backup. Model an adequately provisioned disk so unrelated host fullness
+        # does not refuse that backup before the connection check can be proved.
+        monkeypatch.setattr("hermes_state_repair.shutil.disk_usage",
+                            lambda path: SimpleNamespace(total=1024 ** 4, used=0, free=1024 ** 4))
 
         from hermes_cli.sqlite_safe_read import has_live_connection
 

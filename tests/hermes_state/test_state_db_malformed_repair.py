@@ -29,6 +29,9 @@ from hermes_state import SessionDB, is_malformed_db_error
 from hermes_state_repair import repair_state_db_schema
 
 
+pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
+
+
 def _build_healthy_db(db_path: Path) -> str:
     db = SessionDB(db_path=db_path)
     sid = db.create_session(session_id=str(uuid.uuid4()), source="cli")
@@ -502,7 +505,9 @@ _REPAIR_SCRIPT = """
 import sys, json
 sys.path.insert(0, {root!r})
 from hermes_state_repair import repair_state_db_schema
-print(json.dumps(repair_state_db_schema({db!r})), flush=True)
+from tests._fixtures.repair_capacity import ample_repair_capacity
+with ample_repair_capacity():
+    print(json.dumps(repair_state_db_schema({db!r})), flush=True)
 """
 
 

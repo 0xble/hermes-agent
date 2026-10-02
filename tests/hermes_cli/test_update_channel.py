@@ -353,6 +353,8 @@ class TestSetChannelCLI:
         from hermes_cli import main, update_cmd
 
         monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
         def unexpected_update(*args, **kwargs):
             pytest.fail("metadata command entered the real updater")
         monkeypatch.setattr(update_cmd, "_cmd_update_impl", unexpected_update)

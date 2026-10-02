@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_cli import immutable_releases as releases
-from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions
+from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions, install_probe_process_dependency
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -130,6 +130,7 @@ def _release(path: Path, *, real: bool = False) -> None:
     python = path / ".venv/bin/python"
     if real:
         venv.EnvBuilder(with_pip=False).create(path / ".venv")
+        install_probe_process_dependency(path / ".venv")
         package = path / "hermes_cli"
         package.mkdir()
         (package / "__init__.py").write_text("")
@@ -207,6 +208,7 @@ def _fixture(tmp_path: Path, scenario: str, *, real: bool = False):
     source_sha = _source(source, real=real)
     if real:
         venv.EnvBuilder(with_pip=False).create(source / ".venv")
+        install_probe_process_dependency(source / ".venv")
     label = f"ai.hermes.s2crash.{uuid.uuid4().hex}" if real else "ai.hermes.disposable"
     plist = tmp_path / f"{label}.plist"
     first = scenario.startswith("migration")
@@ -590,10 +592,10 @@ def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
     assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
                                      reload_callback=lambda: calls.append(1) or "deferred")["reload_pending"]
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {
+        "immutable_releases": True, "release_acknowledgement_timeout_seconds": 0})
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
-    monkeypatch.setattr(update_cmd.sys, "platform", "darwin")
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda **kw: True)
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _: calls.append(1) or "deferred")

@@ -139,7 +139,6 @@ def test_timeout_diagnostics_kill_pipe_holding_process_tree(tmp_path: Path) -> N
     assert process.poll() is not None
 
 
-@pytest.mark.platforms("windows")
 def test_handoff_children_run_from_install_root(tmp_path: Path) -> None:
     install_root = tmp_path / "checkout"
     launch_cwd = tmp_path / "profile-home"
@@ -186,7 +185,6 @@ def test_handoff_children_cannot_read_the_handoff_console(tmp_path: Path) -> Non
     assert "WORKING-DIRECTORY SELF-TEST: PASS" in report
 
 
-@pytest.mark.platforms("windows")
 def test_handoff_fails_closed_when_install_root_cannot_be_entered(tmp_path: Path) -> None:
     install_root = tmp_path / "missing" / "checkout"
     launch_cwd = tmp_path / "profile-home"

@@ -21,6 +21,7 @@ import re
 import shlex
 import tomllib
 import plistlib
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,7 +58,7 @@ def release_sha(source: Path) -> str:
     """Return the exact git revision represented by *source*."""
     result = subprocess.run(
         ["git", "-C", str(source), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     return result.stdout.strip()
 
@@ -73,13 +74,34 @@ def _content_digest(release: Path) -> str:
 
 def _python_version(python: Path) -> str:
     result = subprocess.run([str(python), "-c", "import platform; print(platform.python_version())"],
-                            check=True, capture_output=True, text=True,
+                            check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
                             env=_release_subprocess_env())
     return result.stdout.strip()
 
 
 def _release_python(release: Path) -> Path:
     return release / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def _interpreter_process_executable(python: Path) -> Path:
+    """Observe the kernel image of the intended interpreter, including framework launchers."""
+    python = python.absolute()
+    identity = python.stat()
+    return _probe_interpreter_process_executable(
+        str(python), identity.st_dev, identity.st_ino, identity.st_size, identity.st_mtime_ns)
+
+
+@lru_cache(maxsize=32)
+def _probe_interpreter_process_executable(python: str, *identity: int) -> Path:
+    result = subprocess.run(
+        [python, "-I", "-c", "import psutil; print(psutil.Process().exe())"],
+        env=_release_subprocess_env(), check=True, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=10,
+    )
+    executable = Path(result.stdout.strip())
+    if not executable.is_absolute() or not executable.is_file():
+        raise ValueError("intended interpreter did not report an executable image")
+    return executable.resolve()
 
 
 def _copy_tree(source: Path, target: Path, *, home: Path | None = None) -> None:
@@ -219,7 +241,7 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
                        "for group in re.findall(r'hermes-agent\\[([^]]+)\\]', text) "
                        "for x in group.split(',')))))")
     metadata_result = subprocess.run([str(source_python), "-c", metadata_script], check=True,
-                                     capture_output=True, text=True, env=_release_subprocess_env())
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env())
     selected.update(extra for extra in json.loads(metadata_result.stdout) if extra in declared)
 
     # Old transitive packages are not evidence of an enabled feature. In particular,
@@ -241,7 +263,7 @@ def _active_distributions(python: Path) -> dict[str, str]:
               "import re; print(json.dumps({re.sub(r'[-_.]+','-',d.metadata['Name']).lower(): d.version "
               "for d in m.distributions() if d.metadata.get('Name')}))")
     result = subprocess.run([str(python), "-c", script], check=True,
-                            capture_output=True, text=True, env=_release_subprocess_env())
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env())
     return json.loads(result.stdout)
 
 
@@ -252,7 +274,7 @@ def _active_plugin_entrypoints(python: Path, names: set[str] | None = None) -> s
               "for d in m.distributions() if d.metadata.get('Name') "
               "for e in d.entry_points if e.group in groups)))")
     result = subprocess.run([str(python), "-c", script], check=True,
-                            capture_output=True, text=True, env=_release_subprocess_env())
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env())
     return {(group, name, value) for dist, group, name, value in json.loads(result.stdout)
             if names is None or dist in names}
 
@@ -342,7 +364,7 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
         result = subprocess.run(
             [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
-            cwd=release, env=env, capture_output=True, text=True, timeout=90,
+            cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
         )
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
@@ -725,7 +747,7 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
             expected_python = (intended_root / ".venv" / "bin" / "python" if
                                intended_root.parent == paths.releases.resolve() else
                                Path(record["journal_original"]["source_python"]))
-            if (executable == expected_python.resolve() and
+            if (executable == _interpreter_process_executable(expected_python) and
                     (gateway_pid is None or _LOADED_CODE_ROOT == intended_root) and
                     Path(process.cwd()).resolve() == intended_root and
                     not process.environ().get("PYTHONPATH")):
@@ -739,7 +761,7 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
                 _write_txn(paths, record)
                 _finish_txn(paths, record)
                 return True
-    except (OSError, ValueError, KeyError, psutil.Error, subprocess.CalledProcessError):
+    except (OSError, ValueError, KeyError, psutil.Error, subprocess.SubprocessError):
         return False
     return False
 

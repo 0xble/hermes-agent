@@ -831,8 +831,8 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> Dict
         with suppress(Exception):
             from providers import get_provider_profile as _gpf
             _ph = _gpf(agent.provider)
-            if _ph and _ph.default_headers:
-                client_kwargs["default_headers"] = dict(_ph.default_headers)
+            if _ph and (_headers := _ph.get_default_headers()):
+                client_kwargs["default_headers"] = _headers
     return client_kwargs
 
 

@@ -142,8 +142,10 @@ def test_project_environment_replaces_generation_when_pinned_python_moves(instal
         selected = operations.ensure_project_environment(
             "test-environment", project, root=selection_root, explicit=True)
         chosen.append(selected)
-        assert Path(_run([str(selected), "-I", "-c",
-                          "import sys, side_dep; print(sys.base_prefix)"], cwd=project, env=env)) == interpreter.parent.parent
+        expected_prefix = _run([str(interpreter), "-I", "-c", "import sys; print(sys.base_prefix)"],
+                               cwd=project, env=env)
+        assert _run([str(selected), "-I", "-c",
+                     "import sys, side_dep; print(sys.base_prefix)"], cwd=project, env=env) == expected_prefix
         assert (project / "uv.lock").read_bytes() == locked
     assert chosen[0] != chosen[1] != chosen[2]
 

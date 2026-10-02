@@ -36,7 +36,6 @@ DEFAULT_TTL_HOURS = DEFAULT_TTL_MINUTES / 60.0
 DEFAULT_FETCH_TIMEOUT = 8.0
 SUPPORTED_SCHEMA_VERSION = 1
 
-_HERMES_USER_AGENT = f"hermes-cli/{get_version_info().base_version}"
 
 # In-process cache, invalidated against the disk file's path + mtime and TTL. The path matters:
 # under a multiplexed gateway each profile has its own ``<home>/cache/model_catalog.json``, and
@@ -88,7 +87,7 @@ def _cache_path() -> Path:
 def _fetch_manifest(url: str, timeout: float) -> dict[str, Any] | None:
     """HTTP GET the manifest URL and return a validated dict, or None on failure."""
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": _HERMES_USER_AGENT})
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": f"hermes-cli/{get_version_info().base_version}"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
@@ -169,11 +168,12 @@ def _write_disk_cache(data: dict[str, Any]) -> None:
 # lands on disk; the NEXT get_catalog() call picks it up via the mtime check.
 _catalog_swr_lock = threading.Lock()
 _catalog_swr_inflight: set[str] = set()
+_provider_override_cache: dict[str, dict[str, Any]] = {}
 
 
-def _spawn_catalog_swr_refresh(url: str) -> None:
+def _spawn_catalog_swr_refresh(url: str, *, provider: str | None = None) -> None:
     """Refresh the catalog manifest off-thread (fire-and-forget, deduped per cache path)."""
-    inflight_key = str(_cache_path())
+    inflight_key = _override_cache_key(provider, url) if provider else str(_cache_path())
     with _catalog_swr_lock:
         if inflight_key in _catalog_swr_inflight:
             return
@@ -181,9 +181,14 @@ def _spawn_catalog_swr_refresh(url: str) -> None:
 
     def _refresh() -> None:
         try:
-            fetched = _fetch_manifest_with_fallback(url, DEFAULT_FETCH_TIMEOUT)
+            fetched = (_fetch_manifest(url, DEFAULT_FETCH_TIMEOUT) if provider
+                       else _fetch_manifest_with_fallback(url, DEFAULT_FETCH_TIMEOUT))
             if fetched is not None:
-                _write_disk_cache(fetched)
+                if provider:
+                    with _catalog_swr_lock:
+                        _provider_override_cache[inflight_key] = fetched
+                else:
+                    _write_disk_cache(fetched)
         except Exception:
             logger.debug("catalog SWR refresh failed", exc_info=True)
         finally:
@@ -210,7 +215,7 @@ def _in_process_catalog() -> dict[str, Any] | None:
     return None
 
 
-def get_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
+def get_catalog(*, force_refresh: bool = False, cache_only: bool = False) -> dict[str, Any]:
     """Parsed model catalog manifest, or ``{}`` on failure — never raises, so the CLI works offline
     (callers treat a missing provider/model as "use the in-repo fallback")."""
     cfg = _load_catalog_config()
@@ -228,9 +233,13 @@ def get_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
         if not disk_fresh:
             # Stale-while-revalidate: serve the expired disk copy now and refresh off-thread so the
             # /model picker (which calls this on every open) never blocks on the manifest fetch.
-            # Only a cold cache (no disk copy at all) still blocks.
+            # A cold cache blocks only for callers that permit live reads.
             _spawn_catalog_swr_refresh(cfg["url"])
         return _remember(disk_data, disk_mtime)
+
+    if cache_only and not force_refresh:
+        _spawn_catalog_swr_refresh(cfg["url"])
+        return _in_process_catalog() or {}
 
     fetched = _fetch_manifest_with_fallback(cfg["url"], DEFAULT_FETCH_TIMEOUT)
     if fetched is not None:
@@ -266,7 +275,11 @@ def refresh_catalogs() -> bool:
     return bool(catalog)
 
 
-def _fetch_provider_override(provider: str) -> dict[str, Any] | None:
+def _override_cache_key(provider: str, url: str) -> str:
+    return f"{_cache_path()}:{provider}:{url}"
+
+
+def _fetch_provider_override(provider: str, *, cache_only: bool = False) -> dict[str, Any] | None:
     """If ``model_catalog.providers.<name>.url`` is set, fetch that instead."""
     cfg = _load_catalog_config()
     if not cfg["enabled"]:
@@ -277,8 +290,20 @@ def _fetch_provider_override(provider: str) -> dict[str, Any] | None:
     override_url = provider_cfg.get("url")
     if not isinstance(override_url, str) or not override_url.strip():
         return None
-    # Overrides are usually third-party self-hosted: skip the disk cache, re-request every call.
-    return _fetch_manifest(override_url.strip(), DEFAULT_FETCH_TIMEOUT)
+    url = override_url.strip()
+    key = _override_cache_key(provider, url)
+    if cache_only:
+        with _catalog_swr_lock:
+            cached = _provider_override_cache.get(key)
+        _spawn_catalog_swr_refresh(url, provider=provider)
+        return cached
+    # Explicit/live reads still re-request self-hosted overrides. Remember the
+    # result for later non-blocking reads without mixing profiles or URLs.
+    fetched = _fetch_manifest(url, DEFAULT_FETCH_TIMEOUT)
+    if fetched is not None:
+        with _catalog_swr_lock:
+            _provider_override_cache[key] = fetched
+    return fetched
 
 
 def _block_of(manifest: dict[str, Any] | None, provider: str) -> dict[str, Any] | None:
@@ -286,9 +311,10 @@ def _block_of(manifest: dict[str, Any] | None, provider: str) -> dict[str, Any] 
     return block if isinstance(block, dict) else None
 
 
-def _get_provider_block(provider: str) -> dict[str, Any] | None:
+def _get_provider_block(provider: str, *, cache_only: bool = False) -> dict[str, Any] | None:
     """Return the provider's manifest block, respecting per-provider overrides."""
-    return _block_of(_fetch_provider_override(provider), provider) or _block_of(get_catalog(), provider)
+    return (_block_of(_fetch_provider_override(provider, cache_only=cache_only), provider)
+            or _block_of(get_catalog(cache_only=cache_only), provider))
 
 
 def _block_ids(block: dict[str, Any] | None) -> list[tuple[str, dict[str, Any]]]:
@@ -297,15 +323,15 @@ def _block_ids(block: dict[str, Any] | None) -> list[tuple[str, dict[str, Any]]]
     return [(mid, m) for m in models if isinstance(m, dict) and (mid := str(m.get("id") or "").strip())]
 
 
-def get_curated_openrouter_models() -> list[tuple[str, str]] | None:
+def get_curated_openrouter_models(*, cache_only: bool = False) -> list[tuple[str, str]] | None:
     """OpenRouter's curated ``[(id, description), ...]`` from the manifest."""
-    rows = _block_ids(_get_provider_block("openrouter"))
+    rows = _block_ids(_get_provider_block("openrouter", cache_only=cache_only))
     return [(mid, str(m.get("description") or "")) for mid, m in rows] or None
 
 
-def get_curated_nous_models() -> list[str] | None:
+def get_curated_nous_models(*, cache_only: bool = False) -> list[str] | None:
     """Nous Portal's curated model ids from the manifest."""
-    return [mid for mid, _ in _block_ids(_get_provider_block("nous"))] or None
+    return [mid for mid, _ in _block_ids(_get_provider_block("nous", cache_only=cache_only))] or None
 
 
 def _default_model_from_block(block: dict[str, Any] | None) -> str | None:
@@ -349,3 +375,5 @@ def reset_cache() -> None:
     _catalog_cache = None
     _catalog_cache_source_mtime = 0.0
     _catalog_cache_source_path = ""
+    with _catalog_swr_lock:
+        _provider_override_cache.clear()

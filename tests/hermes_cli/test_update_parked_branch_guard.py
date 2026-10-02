@@ -193,6 +193,7 @@ def test_print_update_completion_carries_branch_and_sha(
     repo_pair, monkeypatch, capsys
 ):
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo_pair)
+    monkeypatch.setenv("PYTHONPATH", str(repo_pair))
     update_cmd._print_update_completion("✓ Update complete!")
     out = capsys.readouterr().out
     short = _git(repo_pair, "rev-parse", "--short", "HEAD").stdout.strip()
@@ -212,6 +213,7 @@ def _patch_update_flow(monkeypatch, repo, run_real_git=True):
     repo (the whole point of these regressions).
     """
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo)
+    monkeypatch.setenv("PYTHONPATH", str(repo))
     monkeypatch.setattr(hermes_main, "_resolve_update_branch", lambda args: "main")
     monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
     monkeypatch.setattr(main_install_repair, "_is_windows", lambda: False)
