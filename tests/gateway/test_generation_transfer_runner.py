@@ -175,7 +175,8 @@ async def test_abandoned_transfer_rearms_old_generation_and_allows_retry(tmp_pat
     await active.transfer_requested(new.id)
     try:
         deadline = asyncio.get_running_loop().time() + 3
-        while not adapter.resumed and asyncio.get_running_loop().time() < deadline:
+        # The wire resumes before the final asynchronous owner check reopens dispatch.
+        while (not adapter.resumed or runner._overlap_draining) and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(.05)
         assert adapter.resumed
         assert runner._overlap_draining is False

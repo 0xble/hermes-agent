@@ -55,7 +55,10 @@ def test_generation_plist_has_fresh_scope_for_each_bootstrap_definition(tmp_path
     first, second = [plistlib.loads(render_generation_launchd_plist(**args).encode()) for _ in range(2)]
     scope = first['EnvironmentVariables']['HERMES_GENERATION_SCOPE']
     assert scope and scope != second['EnvironmentVariables']['HERMES_GENERATION_SCOPE']
-    assert first['KeepAlive'] == {'SuccessfulExit': False}
+    # A stored standby definition must not start at login (SuccessfulExit implies RunAtLoad).
+    assert (first['RunAtLoad'], first['KeepAlive']) == (False, False)
+    holder = plistlib.loads(render_generation_launchd_plist(**args, standby=False).encode())
+    assert (holder['RunAtLoad'], holder['KeepAlive']) == (True, {'SuccessfulExit': False})
     assert first['Label'] == f'ai.hermes.gateway.g-{generation.hex}'
     with pytest.raises(ValueError, match='UUID'):
         render_generation_launchd_plist(**{**args, 'slot': 'a'})
@@ -115,3 +118,33 @@ def test_service_plist_pins_release_and_ignores_nonce_for_staleness(tmp_path, mo
     config.write_text('gateway:\n  forward_only_handover:\n    enabled: false\n', encoding="utf-8")
     legacy = plistlib.loads(gateway.generate_launchd_plist(release_target=release).encode())
     assert 'HERMES_GENERATION_SCOPE' not in legacy['EnvironmentVariables']
+
+
+def test_forward_generation_launch_skips_host_attach(monkeypatch, tmp_path):
+    """A KeepAlive respawn of a dead generation label must reach its coordinator claim.
+
+    The host-attach guard would see the live successor serving this profile and exit 75,
+    so launchd would respawn the label forever instead of parking it on exit 0.
+    """
+    from hermes_cli import gateway as gateway_cli
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    attached = []
+    monkeypatch.setattr(gateway_cli, '_guard_official_docker_root_gateway', lambda: None)
+    monkeypatch.setattr(gateway_cli, '_attach_to_host_gateway_or_guard',
+                        lambda **kwargs: attached.append(kwargs))
+    class ReachedCoordinatorRoute(Exception):
+        pass
+    def next_guard(**kwargs):
+        raise ReachedCoordinatorRoute
+    monkeypatch.setattr(gateway_cli, '_guard_supervised_gateway_conflict', next_guard)
+    for enabled, scoped in ((True, True), (True, False), (False, True)):
+        (tmp_path / 'config.yaml').write_text(
+            f'gateway:\n  forward_only_handover:\n    enabled: {str(enabled).lower()}\n', encoding='utf-8')
+        if scoped:
+            monkeypatch.setenv('HERMES_GENERATION_SCOPE', 'scope')
+        else:
+            monkeypatch.delenv('HERMES_GENERATION_SCOPE', raising=False)
+        attached.clear()
+        with pytest.raises(ReachedCoordinatorRoute):
+            gateway_cli.run_gateway()
+        assert bool(attached) is not (enabled and scoped)

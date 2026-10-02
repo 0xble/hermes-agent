@@ -357,6 +357,8 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         except BlockingIOError:
             return "locked"
         try:
+            if intent_path(home).exists():
+                return 'stopped'
             from hermes_cli.config import _validate_updates
             from hermes_cli.config_effective import load_user_config_effective
             config: dict[str, Any]
@@ -388,6 +390,27 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                     config["gateway"] = raw_gateway
             from gateway.generation import forward_only_handover_enabled
             forward_only = forward_only_handover_enabled(config)
+            if forward_only and (home / 'forward-update.json').exists():
+                from hermes_cli.gateway_forward_update import recover_forward, GenerationSupervisor
+                proof = recover_forward(home, supervisor=GenerationSupervisor(home, runner=launchctl_runner,
+                                        directory=Path(plist).parent, domain=domain))
+                if proof is not None:
+                    if proof['outcome'] == 'locked':
+                        return 'locked'
+                    receipt(home, 'forward_observe', proof['outcome'], generation=proof.get('new_id'),
+                            reason=proof.get('failure', ''))
+                    return 'healthy' if proof['outcome'] in {'success', 'rolled_back'} else 'waiting'
+            if forward_only and (home / 'gateway-coordinator.db').exists():
+                from hermes_cli.gateway_forward_update import cleanup_exited, GenerationSupervisor
+                from gateway.generation import GenerationCoordinator
+                supervisor = GenerationSupervisor(home, runner=launchctl_runner, directory=Path(plist).parent, domain=domain)
+                cleanup_exited(home, supervisor=supervisor)
+                service_label = GenerationCoordinator(home).service_label()
+                # Canonical guardian installations follow the promoted service.
+                # An explicit custom plist still addresses its requested label.
+                if service_label != label and Path(plist).name == f'{label}.plist':
+                    label = service_label
+                    plist = Path(plist).with_name(f'{label}.plist')
             # The legacy guardian only knows one launchd label. Until overlap repair has
             # its own fenced protocol, it must not bootstrap or roll back either generation.
             gateway_config = config.get("gateway") or {}
