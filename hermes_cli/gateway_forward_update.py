@@ -76,6 +76,11 @@ def forward_route(home: Path, candidate: Path) -> bool:
     if lease is None:
         return False  # A flag-off serving process has no forward coordinator claim.
     serving = _row(db, lease['generation_id'])
+    intent = Path(home) / 'forward-update.json'
+    pending = json.loads(intent.read_text(encoding='utf-8')) if intent.exists() else {}
+    unresolved = pending.get('outcome') in {'running', 'blocked'} or pending.get('bookkeeping_pending')
+    if lease['state'] == 'released' and serving['state'] == 'exited' and not unresolved:
+        return False  # Clean stop retained as history, not a serving handover pair.
     return capable(paths.release(serving['release_sha']))
 
 
@@ -86,7 +91,7 @@ def activate_if_forward(home, candidate, sha, *, supervisor=None):
     intent = Path(home) / 'forward-update.json'
     if intent.exists():
         record = json.loads(intent.read_text(encoding='utf-8'))
-        if record.get('outcome') in {'running', 'blocked'}:
+        if record.get('outcome') in {'running', 'blocked'} or record.get('bookkeeping_pending'):
             # None means another updater archived the intent first: continue to the candidate.
             recovered = recover_forward(home, supervisor=supervisor)
             if recovered is not None and recovered.get('new_sha') == sha:
@@ -200,7 +205,8 @@ def _live(row):
     from gateway.status import _get_process_start_time, _pid_exists
     pid = row['pid']
     start = _get_process_start_time(pid) if pid and _pid_exists(pid) else None
-    return start is not None and row['start_fingerprint'] == f'{pid}:{start}'
+    from gateway.generation import _boot_id, generation_start_fingerprint_matches
+    return row['boot_id'] == _boot_id() and generation_start_fingerprint_matches(row, start) is True
 
 
 @contextmanager
@@ -415,7 +421,7 @@ def _finish(home, record, outcome, **fields):
         # must not erase the exact revision that failed after commitment.
         _atomic_json(Path(home) / 'forward-update-bad.json', {'failed_sha': record['new_sha']})
     _save(home, record)
-    if outcome in {'success', 'rolled_back', 'refused', 'aborted'}:
+    if outcome in {'success', 'rolled_back', 'refused', 'aborted'} and not record.get('bookkeeping_pending'):
         _archive(home, record)
     else:
         _atomic_json(Path(home) / 'forward-update-last.json', record)
@@ -564,16 +570,39 @@ def _resume_launch(db, release, supervisor, record, key, deadline):
     return _wait_ready(db, generation_id, supervisor, deadline)
 
 
-def _flip(home, db, row, proof, supervisor, *, operation='promote'):
+def _flip(home, db, row, proof, supervisor, *, operation='promote', record=None):
     paths = ReleasePaths.for_home(home)
     lease = _lease(db)
     if (lease['generation_id'], lease['epoch'], lease['state']) != (row['id'], proof['epoch'], 'active'):
         raise RuntimeError('generation changed before pointer flip')
     if not _live(_row(db, row['id'])):
         raise RuntimeError('generation died before pointer flip')
-    result = activate_release(home, paths.release(row['release_sha']), operation=operation)
-    _boot_entries(db, supervisor)
-    cleanup_exited(home, supervisor=supervisor)
+    release = paths.release(row['release_sha'])
+    result: dict = activate_release(home, release, operation=operation)
+    # Lease + polling proof + pointer activation is the success commit. Login
+    # policy and retired-file cleanup are repairable bookkeeping, not a B fault.
+    if record is not None:
+        record['pointer_commit'] = {'generation_id': row['id'], 'epoch': proof['epoch'],
+                                    'release_sha': row['release_sha']}
+        record['bookkeeping_pending'] = True
+        _save(home, record)
+    if read_pointer(paths.current) != release:
+        raise RuntimeError('committed pointer differs from serving release')
+    try:
+        _boot_entries(db, supervisor)
+        cleanup_exited(home, supervisor=supervisor)
+    except Exception as exc:
+        result.update(bookkeeping_pending=True, alert=True, bookkeeping_failure=str(exc))
+    else:
+        result['bookkeeping_pending'] = False
+        if record is not None:
+            record.pop('bookkeeping_failure', None)
+    lease = _lease(db)
+    if ((lease['generation_id'], lease['epoch'], lease['state']) != (row['id'], proof['epoch'], 'active')
+            or not _live(_row(db, row['id']))):
+        raise RuntimeError('committed owner changed during bookkeeping')
+    if read_pointer(paths.current) != release:
+        raise RuntimeError('committed pointer differs from serving release')
     return result
 
 
@@ -702,21 +731,23 @@ def _await_wedge_proof(home, db, row, deadline):
 
 
 def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
+    from gateway.generation import _boot_id
+    same_boot = record.get('commit_boot_id') == _boot_id()
     started = record.get('rollback_clock', _now())
     # Before-commit is the earliest possible death of serving B. This durable
     # upper bound includes time spent noticing failure, not a fresh recovery budget.
     bound = record.get('commit_clock', started) + ROLLBACK_SECONDS
     # A late recovery of a proven-dead successor gets a fresh operating budget. The
     # recorded bound stays the original one, so the miss is reported, never hidden.
-    deadline = _now() + ROLLBACK_SECONDS if late else bound
-    if late:
+    deadline = _now() + ROLLBACK_SECONDS if late or not same_boot else bound
+    if late and same_boot:
         record['late_rollback'] = {'started_at': time.time(), 'bound_missed': True}
     if not capable(previous) or not _release_is_ready(previous, previous.name):
         raise RuntimeError('previous release cannot run a fresh forward-only generation')
     if not record.get('rollback_generation'):
         require_forward_inventory(home)
     dead = db._owner_is_dead(_row(db, failed['id']))
-    death_clock = record.get('death_observed_clock', _now() if dead else None)
+    death_clock = record.get('death_observed_clock', _now() if dead else None) if same_boot else None
     if not record.get('rollback_generation'):
         record['failure_observed_at'] = time.time()
         record['death_observed_at'] = time.time() if dead else None
@@ -728,15 +759,26 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
         info = record.get('rollback_generation')
         if info:
             reserved = next((row for row in db.generations() if row['id'] == info['id']), None)
-            if reserved and reserved['state'] == 'exited':
-                # A failed claim is terminal, not a launch that can be resumed.
-                # Retry only within the original commit's remaining budget.
+            if reserved and reserved['id'] == failed['id'] and dead:
+                # This reservation already served and died. Preserve its identity in
+                # the intent across another updater crash; takeover retires/boots it
+                # out in the required order, after the fresh standby is ready.
+                history = record.setdefault('rollback_history', [])
+                if info not in history:
+                    history.append(info)
+                if record.get('rollback'):
+                    # A previous serving/reply observation remains audit evidence,
+                    # never polling or timing proof for the replacement process.
+                    record.setdefault('rollback_attempts', []).append(record.pop('rollback'))
+                info = None
+            elif reserved and (reserved['state'] == 'exited' or
+                               reserved['pid'] is not None and db._owner_is_dead(reserved)):
                 _remaining(deadline, STARTUP_SECONDS)
                 _discard_reservation(db, info, supervisor, 'rollback_startup_not_ready')
                 info = None
         if info:
             fresh = _resume_launch(db, previous, supervisor, record, 'rollback_generation',
-                                   deadline if late else min(deadline, info['startup_deadline_clock']))
+                                   deadline if late or not same_boot else min(deadline, info['startup_deadline_clock']))
         else:
             fresh = _launch(db, previous, supervisor, record, 'rollback_generation',
                             min(deadline, _now() + STARTUP_SECONDS))
@@ -756,7 +798,7 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
                                          deadline - _now() - WEDGE_RESERVE_SECONDS - 3.4)
                 if cooperative_budget <= 0:
                     raise RuntimeError('cooperative handover has no reserved recovery budget')
-                handover_to_generation(home, fresh['id'], timeout=cooperative_budget, verify_after_commit=False)
+                handover_to_generation(home, fresh['id'], timeout=cooperative_budget, verify_after_commit=False, require_pollers=True)
             except Exception:
                 if _lease(db)['generation_id'] != fresh['id']:
                     from hermes_cli.gateway import _escalate_wedged_gateway
@@ -786,19 +828,24 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
                 bootout=lambda label: supervisor.bootout(_row(db, failed['id']), _remaining(deadline, 15)))
     proof = _poller(db, fresh, supervisor, deadline)
     serving_clock = _now()
-    result = _flip(home, db, fresh, proof, supervisor, operation='rollback')
+    result = _flip(home, db, fresh, proof, supervisor, operation='rollback', record=record)
     rollback = {'old_id': failed['id'], 'new_id': fresh['id'], 'old_label': failed['label'],
                 'new_label': fresh['label'], 'old_sha': failed['release_sha'], 'new_sha': fresh['release_sha'],
                 'epoch': proof['epoch'], 'poller': proof,
-                'serving_seconds': serving_clock - (death_clock if death_clock is not None else record['commit_clock']),
                 'death_observed_at': record['death_observed_at'], **result}
-    rollback['commit_to_serving_upper_bound_seconds'] = serving_clock - record['commit_clock']
-    if death_clock is not None:
-        rollback['death_to_serving_seconds'] = serving_clock - death_clock
+    if same_boot:
+        rollback['serving_seconds'] = serving_clock - (death_clock if death_clock is not None else record['commit_clock'])
+        rollback['commit_to_serving_upper_bound_seconds'] = serving_clock - record['commit_clock']
+        if death_clock is not None:
+            rollback['death_to_serving_seconds'] = serving_clock - death_clock
+    else:
+        rollback.update(rollback_bound_met=None, timing_unprovable='boot changed', reply_observed=False)
+        record['alert'] = True
     record['rollback'] = rollback
     _save(home, record)
-    _observe_rollback_reply(home, db, fresh, proof, record)
-    return _finish(home, record, 'rolled_back')
+    if same_boot:
+        _observe_rollback_reply(home, db, fresh, proof, record)
+    return _finish(home, record, 'rolled_back', **result)
 
 
 def _superseded(home, db, record, lease, supervisor):
@@ -846,10 +893,11 @@ def recover_forward(home, *, supervisor=None):
             lease = _lease(db)
         except Exception as exc:
             return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
-        if record.get('outcome') in {'success', 'rolled_back', 'refused', 'aborted'}:
+        if (record.get('outcome') in {'success', 'rolled_back', 'refused', 'aborted'}
+                and not record.get('bookkeeping_pending')):
             _archive(home, record)
             return record
-        intended = [record.get('rollback_generation'), record.get('successor')]
+        intended = [record.get('rollback_generation'), record.get('successor'), *record.get('rollback_history', [])]
         intent_ids = {record.get('old_id'), *(info['id'] for info in intended if info)}
         if lease['generation_id'] not in intent_ids:
             try:
@@ -873,9 +921,14 @@ def recover_forward(home, *, supervisor=None):
         if lease['generation_id'] == new['id']:
             try:
                 row = _row(db, new['id'])
+                committed = (record.get('pointer_commit') or {}).get('generation_id') == row['id']
+                if committed and not db._owner_is_dead(row):
+                    if read_pointer(Path(home) / 'current') != ReleasePaths.for_home(home).release(row['release_sha']):
+                        return _finish(home, record, 'blocked', failure='committed pointer differs from serving release', recovered=True)
+                    record['alert'] = False  # A repeated bookkeeping failure sets it again.
                 proof = _poller(db, row, supervisor, _proof_deadline(record, row))
                 serving_clock = _now()
-                rollback_owner = new == record.get('rollback_generation')
+                rollback_owner = new != record.get('successor')
                 if not rollback_owner and record.get('rollback_generation'):
                     _discard_reservation(db, record['rollback_generation'], supervisor, 'rollback_abandoned')
                 try:
@@ -883,7 +936,7 @@ def recover_forward(home, *, supervisor=None):
                 except Exception as exc:
                     return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
                 result = _flip(home, db, row, proof, supervisor,
-                               operation='rollback' if rollback_owner else 'promote')
+                               operation='rollback' if rollback_owner else 'promote', record=record)
                 if rollback_owner:
                     from gateway.generation import _boot_id
                     rollback = record.setdefault('rollback', {
@@ -908,18 +961,17 @@ def recover_forward(home, *, supervisor=None):
                                poller=proof, epoch=proof['epoch'], recovered=True, **result)
             except Exception as exc:
                 from gateway.generation import _boot_id
-                if (new == record.get('successor') and
-                        record.get('commit_boot_id') == _boot_id() and
-                        _row(db, new['id'])['boot_id'] == record.get('commit_boot_id')):
+                holder = _row(db, new['id'])
+                same_boot = record.get('commit_boot_id') == holder['boot_id'] == _boot_id()
+                # Death authorizes a fresh takeover for any intended holder, including
+                # a rollback owner or a holder from an earlier boot. Never compare a
+                # prior boot's monotonic deadline with the current clock.
+                in_budget = same_boot and record['commit_clock'] + ROLLBACK_SECONDS > _now()
+                pointer_committed = (record.get('pointer_commit') or {}).get('generation_id') == holder['id']
+                if db._owner_is_dead(holder) or not pointer_committed and same_boot and (in_budget or _proven_wedged(home, holder)):
                     try:
-                        if record['commit_clock'] + ROLLBACK_SECONDS > _now():
-                            return _rollback(home, db, _row(db, new['id']), Path(record['previous']), supervisor, record)
-                        if db._owner_is_dead(_row(db, new['id'])) or _proven_wedged(home, _row(db, new['id'])):
-                            # The 60 s bound is already missed. It bounds how fast A-prime starts,
-                            # never whether it starts: a dead or provably wedged successor must not
-                            # leave zero pollers. A live, unproven successor stays blocked untouched.
-                            return _rollback(home, db, _row(db, new['id']), Path(record['previous']),
-                                             supervisor, record, late=True)
+                        return _rollback(home, db, holder, Path(record['previous']), supervisor,
+                                         record, late=not in_budget)
                     except Exception as rollback_error:
                         exc = rollback_error
                 return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
@@ -975,7 +1027,8 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
         if (home / 'release-txn.json').exists():
             raise RuntimeError('single-gateway transaction must finish before forward-only promotion')
         intent = home / 'forward-update.json'
-        if intent.exists() and json.loads(intent.read_text(encoding='utf-8')).get('outcome') in {'running', 'blocked'}:
+        pending = json.loads(intent.read_text(encoding='utf-8')) if intent.exists() else {}
+        if pending.get('outcome') in {'running', 'blocked'} or pending.get('bookkeeping_pending'):
             raise RuntimeError('unresolved forward-only intent must be observed before another promotion')
         cleanup_exited(home, supervisor=supervisor)
         record = {'version': 1, 'outcome': 'running', 'started_at': time.time(),
@@ -999,19 +1052,26 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
         record.update(new_id=successor['id'], new_label=successor['label'], startup_seconds=_now() - started)
         _save(home, record)
         try:
+            # Refuse an empty roster before transfer_requested can pause A or
+            # move its lease. Standby startup by itself is side-effect isolated.
+            roster = supervisor.request(old, 'polling_roster', timeout=2).get('tokens')
+            if not isinstance(roster, list) or any(not isinstance(token, str) for token in roster):
+                raise RuntimeError('invalid old generation polling roster')
+            if not roster:
+                raise RuntimeError('empty polling roster cannot qualify forward-only promotion')
             def record_commit_window():
                 record.update(commit_clock=_now(), commit_at=time.time(), commit_boot_id=old['boot_id'])
                 _save(home, record)
             # The commit-clocked _poller below is the only post-commit wait, so the
             # 60 s rollback budget is never spent inside the cooperative call.
             handover_to_generation(home, successor['id'], timeout=45, before_commit=record_commit_window,
-                                   verify_after_commit=False)
+                                   verify_after_commit=False, require_pollers=True)
             # The rollback budget also starts at commit. The successor's proof
             # window leaves A' STARTUP_SECONDS to start, take over and poll.
             commit = record['commit_clock']
             proof = _poller(db, successor, supervisor, min(
                 commit + ROLLBACK_SECONDS, max(commit + POLL_PROOF_SECONDS, _now() + POLL_SECONDS)))
-            result = _flip(home, db, successor, proof, supervisor)
+            result = _flip(home, db, successor, proof, supervisor, record=record)
             return _finish(home, record, 'success', poller=proof, epoch=proof['epoch'],
                            promotion_seconds=_now() - started, **result)
         except Exception as exc:
@@ -1039,6 +1099,9 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
                     return _finish(home, record, 'blocked', failure=str(recovery_error))
             if current['generation_id'] != successor['id']:
                 return _finish(home, record, 'blocked', failure='committed owner changed')
+            if ((record.get('pointer_commit') or {}).get('generation_id') == successor['id']
+                    and not db._owner_is_dead(_row(db, successor['id']))):
+                return _finish(home, record, 'blocked', alert=True)
             try:
                 return _rollback(home, db, _row(db, successor['id']), previous, supervisor, record)
             except Exception as recovery_error:

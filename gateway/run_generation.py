@@ -78,7 +78,8 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
 
 def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
                            drain_seconds: float = DEFAULT_DRAIN_SECONDS,
-                           before_commit=None, verify_after_commit: bool = True) -> int:
+                           before_commit=None, verify_after_commit: bool = True,
+                           require_pollers: bool = False) -> int:
     """Internal updater entry point; never ask the lease holder to relinquish by force.
 
     ``verify_after_commit=False`` returns the committed epoch at once. A caller
@@ -109,6 +110,8 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     tokens = roster.get("tokens")
     if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
         raise RuntimeError("invalid old generation polling roster")
+    if require_pollers and not tokens:
+        raise RuntimeError('empty polling roster cannot qualify forward-only promotion')
     coordinator.request_transfer(old_id, to_id, epoch, set(tokens))
     nonce = coordinator.transfer_attempt_nonce(old_id, epoch)
     try:

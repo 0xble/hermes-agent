@@ -399,7 +399,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                         return 'locked'
                     receipt(home, 'forward_observe', proof['outcome'], generation=proof.get('new_id'),
                             reason=proof.get('failure', ''))
-                    return 'healthy' if proof['outcome'] == 'success' else 'waiting'
+                    return 'healthy' if proof['outcome'] in {'success', 'rolled_back'} else 'waiting'
             if forward_only and (home / 'gateway-coordinator.db').exists():
                 from hermes_cli.gateway_forward_update import cleanup_exited, GenerationSupervisor
                 from gateway.generation import GenerationCoordinator

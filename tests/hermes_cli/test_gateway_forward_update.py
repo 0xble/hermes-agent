@@ -1,4 +1,5 @@
 """Forward-only update contracts with real coordinator transactions, no live services."""
+from contextlib import closing
 import json
 import plistlib
 from pathlib import Path
@@ -99,6 +100,8 @@ def rig(tmp_path, monkeypatch):
             return super().bootout(row, timeout)
         def request(self, row, verb, *, params=None, timeout=2):
             events.append((verb, row['id']))
+            if verb == 'polling_roster':
+                return {'tokens': ['token-hash']}
             if verb == 'polling_status':
                 lease = db.leases()[0]
                 if lease['generation_id'] != row['id']:
@@ -176,6 +179,303 @@ def promote(rig):
 def promote_different_release(rig):
     candidate = release(rig.home, 'c' * 40)
     return forward.promote_forward(rig.home, candidate, candidate.name, supervisor=rig.supervisor)
+
+
+def test_review9_empty_roster_refused_without_lease_move(rig, monkeypatch):
+    request = rig.supervisor.request
+    def empty(row, verb, **kwargs):
+        proof = request(row, verb, **kwargs)
+        if verb in {'polling_status', 'polling_roster'}:
+            proof['tokens'] = []
+        return proof
+    monkeypatch.setattr(rig.supervisor, 'request', empty)
+    monkeypatch.setattr(forward, '_fresh_reply', lambda *a: None)
+    result = promote(rig)
+    assert result['outcome'] == 'aborted', result
+    assert 'empty' in result['failure']
+    assert rig.db.leases()[0]['generation_id'] == rig.old.id
+    assert rig.db.leases()[0]['epoch'] == 1
+    assert releases.read_pointer(rig.home / 'current') == rig.a
+    assert not any(event[0] == 'handover' for event in rig.events)
+    assert len(rig.db.generations()) == 2
+    assert rig.db.generations()[1]['state'] == 'exited'
+    assert not (rig.home / 'forward-update-bad.json').exists()
+    assert not (rig.home / 'forward-update.json').exists()
+
+
+def test_review9_empty_roster_recheck_cannot_commit_transfer(rig, monkeypatch):
+    from gateway import run_generation
+    fresh = rig.db.reserve_generation(release_sha=rig.b.name, label='empty-standby')
+    requests = []
+    def empty(path, verb, **kwargs):
+        requests.append(verb)
+        assert verb == 'polling_roster'
+        return {'tokens': []}
+    monkeypatch.setattr(run_generation, '_generation_request', empty)
+    with pytest.raises(RuntimeError, match='empty polling roster'):
+        run_generation.handover_to_generation(rig.home, fresh.id, require_pollers=True)
+    assert requests == ['polling_roster']
+    assert rig.db.leases()[0]['generation_id'] == rig.old.id
+    assert rig.db.leases()[0]['epoch'] == 1
+    with closing(rig.db.connect()) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM generation_transfers').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('fault', ['login', 'cleanup'])
+@pytest.mark.parametrize('caller', ['updater', 'guardian'])
+def test_review9_post_flip_bookkeeping_keeps_healthy_successor(rig, monkeypatch, fault, caller):
+    boot, cleanup = rig.supervisor.boot_active, forward.cleanup_exited
+    def broken_boot(row, active):
+        if active and row['release_sha'] == rig.b.name:
+            raise RuntimeError('generation login policy readback failed')
+        return boot(row, active)
+    def broken_cleanup(*args, **kwargs):
+        if releases.read_pointer(rig.home / 'current') == rig.b:
+            raise RuntimeError('post-flip cleanup readback failed')
+        return cleanup(*args, **kwargs)
+    if fault == 'login':
+        monkeypatch.setattr(rig.supervisor, 'boot_active', broken_boot)
+    else:
+        monkeypatch.setattr(forward, 'cleanup_exited', broken_cleanup)
+    result = promote(rig)
+    assert result['outcome'] == 'success', result
+    assert result['alert'] and result['bookkeeping_pending']
+    assert result['pointer_commit']['generation_id'] == result['new_id']
+    holder = forward._row(rig.db, rig.db.leases()[0]['generation_id'])
+    assert holder['release_sha'] == rig.b.name and forward._live(holder)
+    assert releases.read_pointer(rig.home / 'current') == rig.b
+    assert not (rig.home / 'forward-update-bad.json').exists()
+    assert (rig.home / 'forward-update.json').exists()
+    rig.clock.value += 100  # Repair is not a fresh rollback-budget claim.
+    failed_repair = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert failed_repair['alert'] and failed_repair['bookkeeping_pending']
+    assert rig.db.leases()[0]['generation_id'] == holder['id']
+    monkeypatch.setattr(rig.supervisor, 'boot_active', boot)
+    monkeypatch.setattr(forward, 'cleanup_exited', cleanup)
+    if caller == 'guardian':
+        from hermes_cli import gateway_guardian
+        monkeypatch.setattr(forward, 'GenerationSupervisor', lambda *a, **k: rig.supervisor)
+        assert gateway_guardian.run_once(rig.home, rig.supervisor.directory / 'ai.hermes.gateway.plist',
+                                    'ai.hermes.gateway', grace=1) == 'healthy'
+        repaired = json.loads((rig.home / 'forward-update-last.json').read_text())
+    else:
+        repaired = forward.activate_if_forward(rig.home, rig.b, rig.b.name, supervisor=rig.supervisor)
+    assert repaired['outcome'] == 'success', repaired
+    assert not repaired['bookkeeping_pending']
+    assert rig.db.leases()[0]['generation_id'] == holder['id']
+    enabled = [p.stem for p in rig.supervisor.directory.glob('*.plist')
+               if plistlib.loads(p.read_bytes()).get('RunAtLoad')]
+    assert enabled == [holder['label']]
+    assert not (rig.home / 'forward-update.json').exists()
+    assert not (rig.home / 'forward-update-bad.json').exists()
+
+
+def test_review9_post_flip_inconsistent_pointer_blocks_without_rollback(rig, monkeypatch):
+    boot = rig.supervisor.boot_active
+    def broken(row, active):
+        if active and row['release_sha'] == rig.b.name:
+            raise RuntimeError('login readback failed')
+        return boot(row, active)
+    monkeypatch.setattr(rig.supervisor, 'boot_active', broken)
+    result = promote(rig)
+    assert result['outcome'] == 'success', result
+    (rig.home / 'current').unlink()
+    (rig.home / 'current').symlink_to(rig.a)
+    monkeypatch.setattr(rig.supervisor, 'boot_active', boot)
+    repaired = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert repaired['outcome'] == 'blocked' and repaired['alert'], repaired
+    assert 'pointer' in repaired['failure']
+    assert rig.db.leases()[0]['generation_id'] == result['new_id']
+    assert not (rig.home / 'forward-update-bad.json').exists()
+
+
+@pytest.mark.parametrize('phase', ['before_flip', 'after_flip'])
+@pytest.mark.parametrize('reboot', [False, True])
+def test_review9_dead_rollback_holder_starts_fresh_previous_owner(rig, monkeypatch, reboot, phase):
+    rig.supervisor.mode = 'dies'
+    flip, observe = forward._flip, forward._observe_rollback_reply
+    def interrupt(*args, **kwargs):
+        if phase == 'before_flip' and kwargs.get('operation') == 'rollback':
+            raise KeyboardInterrupt('rollback lease acquired before pointer flip')
+        return flip(*args, **kwargs)
+    def interrupt_observation(*args, **kwargs):
+        raise KeyboardInterrupt('rollback pointer flipped before finalization')
+    monkeypatch.setattr(forward, '_flip', interrupt)
+    if phase == 'after_flip':
+        monkeypatch.setattr(forward, '_observe_rollback_reply', interrupt_observation)
+    with pytest.raises(KeyboardInterrupt):
+        promote(rig)
+    monkeypatch.setattr(forward, '_flip', flip)
+    monkeypatch.setattr(forward, '_observe_rollback_reply', observe)
+    intent = json.loads((rig.home / 'forward-update.json').read_text())
+    holder = forward._row(rig.db, rig.db.leases()[0]['generation_id'])
+    assert holder['id'] == intent['rollback_generation']['id']
+    rig.alive.pop(holder['pid'])
+    if reboot:
+        rig.alive.clear()
+        monkeypatch.setattr('gateway.generation._boot_id', lambda: 'reboot')
+        rig.clock.value = 0
+    rig.supervisor.mode = 'happy'
+    if phase == 'after_flip':
+        def interrupt_replacement(*args, **kwargs):
+            raise KeyboardInterrupt('replacement lease acquired before pointer flip')
+        monkeypatch.setattr(forward, '_flip', interrupt_replacement)
+        with pytest.raises(KeyboardInterrupt):
+            forward.recover_forward(rig.home, supervisor=rig.supervisor)
+        monkeypatch.setattr(forward, '_flip', flip)
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    fresh = forward._row(rig.db, rig.db.leases()[0]['generation_id'])
+    assert fresh['id'] != holder['id'] and fresh['release_sha'] == rig.a.name
+    assert forward._row(rig.db, holder['id'])['verdict'] == 'failed'
+    assert len([row for row in rig.db.generations() if row['state'] == 'serving' and forward._live(row)]) == 1
+    assert recovered['rollback_deadline_clock'] == intent['rollback_deadline_clock']
+    assert recovered['rollback']['new_id'] == fresh['id']
+    if phase == 'after_flip':
+        assert recovered['rollback_attempts'] == [intent['rollback']]
+    assert releases.read_pointer(rig.home / 'current') == rig.a
+    assert not (rig.home / 'forward-update.json').exists()
+    assert forward.recover_forward(rig.home, supervisor=rig.supervisor) is None
+    if reboot:
+        assert recovered['rollback']['timing_unprovable'] == 'boot changed'
+        assert recovered['rollback']['rollback_bound_met'] is None and recovered['alert']
+    else:
+        assert recovered['rollback']['commit_to_reply_upper_bound_seconds'] <= 60
+
+
+def test_review9_rollback_replacement_survives_another_updater_crash(rig, monkeypatch):
+    rig.supervisor.mode = 'dies'
+    flip = forward._flip
+    def interrupt_flip(*args, **kwargs):
+        if kwargs.get('operation') == 'rollback':
+            raise KeyboardInterrupt('first rollback has lease')
+        return flip(*args, **kwargs)
+    monkeypatch.setattr(forward, '_flip', interrupt_flip)
+    with pytest.raises(KeyboardInterrupt):
+        promote(rig)
+    monkeypatch.setattr(forward, '_flip', flip)
+    failed = forward._row(rig.db, rig.db.leases()[0]['generation_id'])
+    rig.alive.pop(failed['pid'])
+    rig.supervisor.mode = 'happy'
+    launch = forward._launch
+    def interrupt_ready(*args, **kwargs):
+        launch(*args, **kwargs)
+        raise KeyboardInterrupt('replacement ready before takeover')
+    monkeypatch.setattr(forward, '_launch', interrupt_ready)
+    with pytest.raises(KeyboardInterrupt):
+        forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    monkeypatch.setattr(forward, '_launch', launch)
+    intent = json.loads((rig.home / 'forward-update.json').read_text())
+    assert failed['id'] in [info['id'] for info in intent['rollback_history']]
+    replacement = intent['rollback_generation']['id']
+    launches = len([event for event in rig.events if event[0] == 'bootstrap'])
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    assert rig.db.leases()[0]['generation_id'] == replacement
+    assert len([event for event in rig.events if event[0] == 'bootstrap']) == launches
+    assert forward._row(rig.db, failed['id'])['verdict'] == 'failed'
+    assert len([row for row in rig.db.generations() if row['state'] == 'serving' and forward._live(row)]) == 1
+    assert recovered['rollback_deadline_clock'] == intent['rollback_deadline_clock']
+    assert not (rig.home / 'forward-update.json').exists()
+
+
+@pytest.mark.parametrize('caller', ['updater', 'guardian'])
+def test_review9_reboot_before_pointer_flip_recovers_dead_holder(rig, monkeypatch, caller):
+    handover = forward.handover_to_generation
+    def interrupt(*args, **kwargs):
+        handover(*args, **kwargs)
+        raise KeyboardInterrupt('after commit before pointer flip')
+    monkeypatch.setattr(forward, 'handover_to_generation', interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        promote(rig)
+    monkeypatch.setattr(forward, 'handover_to_generation', handover)
+    intent = json.loads((rig.home / 'forward-update.json').read_text())
+    definitions = [plistlib.loads(path.read_bytes()) for path in rig.supervisor.directory.glob('*.plist')]
+    assert [data['Label'] for data in definitions if data['RunAtLoad']] == [rig.old.label]
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'reboot')
+    rig.alive.clear()
+    rig.clock.value = 0
+    old_login = GenerationIdentity.create(release_sha=rig.a.name, label=rig.old.label, pid=800,
+                                         start_fingerprint='800:1.0')
+    assert rig.db.claim_process(old_login, 'reboot-scope') is None
+    if caller == 'guardian':
+        from hermes_cli import gateway_guardian
+        monkeypatch.setattr(forward, 'GenerationSupervisor', lambda *a, **k: rig.supervisor)
+        outcome = gateway_guardian.run_once(rig.home, rig.supervisor.directory / f'{rig.old.label}.plist',
+            rig.old.label, grace=180, domain='gui/fixture', launchctl_runner=rig.supervisor.runner)
+        assert outcome == 'healthy'
+        recovered = json.loads((rig.home / 'forward-update-last.json').read_text())
+    else:
+        recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    fresh = forward._row(rig.db, rig.db.leases()[0]['generation_id'])
+    assert fresh['release_sha'] == rig.a.name and fresh['id'] != rig.old.id
+    assert len([row for row in rig.db.generations() if row['state'] == 'serving' and forward._live(row)]) == 1
+    assert releases.read_pointer(rig.home / 'current') == rig.a
+    assert recovered['commit_clock'] == intent['commit_clock']
+    assert recovered['rollback']['timing_unprovable'] == 'boot changed'
+    assert recovered['rollback']['rollback_bound_met'] is None and recovered['alert']
+    definitions = [plistlib.loads(path.read_bytes()) for path in rig.supervisor.directory.glob('*.plist')]
+    assert [data['Label'] for data in definitions if data['RunAtLoad']] == [fresh['label']]
+    assert not (rig.home / 'forward-update.json').exists()
+
+
+def test_review9_clean_stop_routes_activation_and_fleet_to_ordinary_path(rig, monkeypatch):
+    from hermes_cli import update_cmd_fleet
+    assert rig.db.release_lease('active_generation', rig.old.id, 1)
+    rig.db.heartbeat(rig.old.id, state='exited')
+    rig.alive.pop(rig.old.pid)
+    assert not forward.forward_route(rig.home, rig.b)
+    assert forward.activate_if_forward(rig.home, rig.b, rig.b.name, supervisor=rig.supervisor) is None
+    monkeypatch.setattr(forward, 'observe_current_forward', lambda *a, **k: pytest.fail('exited owner observed'))
+    from hermes_cli import update_cmd
+    ordinary = []
+    monkeypatch.setattr(update_cmd_fleet, '_pending_fleet_restart_needed', lambda: True)
+    monkeypatch.setattr(update_cmd_fleet, '_acknowledged_release_launchd_label', lambda *a: None)
+    monkeypatch.setattr(update_cmd, '_restart_gateway_fleet_after_update',
+                        lambda *a, **k: ordinary.append(k) or {})
+    monkeypatch.setattr(update_cmd, '_verify_fleet_after_update', lambda *a, **k: None)
+    update_cmd_fleet._apply_pending_fleet_restart_catchup()
+    assert len(ordinary) == 1 and ordinary[0]['acknowledged_release_label'] is None
+    assert not rig.events
+    forward._save(rig.home, {'outcome': 'blocked'})
+    assert forward.forward_route(rig.home, rig.b), 'an unresolved intent must not fall through to S2'
+
+
+@pytest.mark.parametrize('observed', [1050, 1250, None])
+def test_review9_drift_liveness_and_death_proofs_agree(rig, monkeypatch, observed):
+    home = rig.home / 'drift'
+    home.mkdir()
+    db = GenerationCoordinator(home)
+    owner = GenerationIdentity.create(release_sha=rig.a.name, label='drift-owner', pid=100,
+                                      start_fingerprint='100:1000')
+    db.register(owner, state='serving')
+    db.acquire_lease('active_generation', owner.id)
+    rig = SimpleNamespace(**{**vars(rig), 'home': home, 'db': db, 'old': owner})
+    rig.alive[rig.old.pid] = observed
+    row = forward._row(rig.db, rig.old.id)
+    live, dead = observed == 1050, observed == 1250
+    assert forward._live(row) is live
+    assert rig.db._owner_is_dead(row) is dead
+    if live:
+        forward.require_forward_inventory(rig.home, {'runtimes': [{'kind': 'gateway', 'pid': rig.old.pid}]})
+        assert rig.db.prepare_parked_repair(row['label']) == 'waiting'
+        claimant = GenerationIdentity.create(release_sha=rig.a.name, label=row['label'], pid=800,
+                                            start_fingerprint='800:2000')
+        assert rig.db.claim_process(claimant, 'fresh-scope') is None
+    standby = rig.db.reserve_generation(release_sha=rig.b.name, label='drift-standby')
+    rig.alive[700] = 2000
+    rig.db.claim_generation(standby.id, 700, '700:2000', scope_nonce='drift-scope')
+    booted = []
+    if dead:
+        assert rig.db.takeover_dead_generation('active_generation', rig.old.id, standby.id,
+            bootout=lambda label: booted.append(label) or True) == 2
+    else:
+        with pytest.raises(RuntimeError, match='takeover death proof failed'):
+            rig.db.takeover_dead_generation('active_generation', rig.old.id, standby.id,
+                bootout=lambda label: booted.append(label) or True)
+        assert not booted
+        assert forward._row(rig.db, rig.old.id)['verdict'] is None
 
 
 def test_review_m1_guardian_waits_quietly_for_active_updater(rig, monkeypatch):
@@ -871,7 +1171,7 @@ def test_wedged_handover_timeout_preserves_termination_and_reply_budget(rig, mon
 def test_pid_replaced_during_probe_is_taken_over_without_any_signal(rig, monkeypatch):
     rig.supervisor.mode = 'wedged'
     def probe(pid, **kwargs):
-        rig.alive[pid] = 2.
+        rig.alive[pid] = 1000.  # Beyond the canonical same-host drift tolerance.
         return 'wedged'
     monkeypatch.setattr('hermes_cli.gateway.probe_gateway_loop_liveness', probe)
     result = promote(rig)
@@ -880,7 +1180,7 @@ def test_pid_replaced_during_probe_is_taken_over_without_any_signal(rig, monkeyp
 
 
 def test_inventory_rejects_recycled_generation_pid_and_accepts_prompt_old_exit(rig):
-    rig.alive[rig.old.pid] = 2.
+    rig.alive[rig.old.pid] = 1000.  # A recycled PID, not a tolerated clock reading.
     with pytest.raises(RuntimeError, match='additional fleet runtime'):
         forward.require_forward_inventory(rig.home, {'runtimes': [{'kind': 'gateway', 'pid': rig.old.pid}]})
     rig.alive[rig.old.pid] = 1.
@@ -1223,11 +1523,13 @@ def test_cross_boot_dead_successor_does_not_reuse_monotonic_budget(rig, monkeypa
     rig.clock.value = 0
     rig.events.clear()
     result = forward.recover_forward(rig.home, supervisor=rig.supervisor)
-    assert result['outcome'] == 'blocked' and result['alert'], result
-    assert not any(event[0] in ('bootstrap', 'handover', 'bounded-stop') for event in rig.events)
-    fresh, _ = cold_claimant(rig, rig.a.name)
-    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
-    assert recovered['outcome'] == 'rolled_back' and recovered['superseded_by']['id'] == fresh.id
+    assert result['outcome'] == 'rolled_back' and result['alert'], result
+    assert not any(event[0] in ('handover', 'bounded-stop') for event in rig.events)
+    launches = [event for event in rig.events if event[0] == 'bootstrap']
+    assert len(launches) == 1 and launches[0][2] == rig.a.name
+    assert result['rollback']['timing_unprovable'] == 'boot changed'
+    assert result['rollback']['rollback_bound_met'] is None
+    assert 'commit_to_serving_upper_bound_seconds' not in result['rollback']
     assert not (rig.home / 'forward-update.json').exists()
 
 

@@ -370,7 +370,7 @@ def test_lease_cannot_be_stolen_and_release_is_fenced(tmp_path):
 @pytest.mark.parametrize("death", ["missing_pid", "reused_pid", "different_boot"])
 def test_dead_lease_holder_fails_and_new_generation_takes_higher_epoch(tmp_path, monkeypatch, death):
     from gateway import generation
-    from gateway.status import _get_process_start_time
+    from gateway.status import _get_process_start_time, START_TIME_DRIFT_TOLERANCE
     coordinator = GenerationCoordinator(tmp_path)
     current_start = _get_process_start_time(os.getpid())
     assert current_start is not None
@@ -384,7 +384,10 @@ def test_dead_lease_holder_fails_and_new_generation_takes_higher_epoch(tmp_path,
     if death == "missing_pid":
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
     elif death == "reused_pid":
-        monkeypatch.setattr("gateway.status._get_process_start_time", lambda pid: current_start + 1)
+        # Fingerprints are centiseconds, not seconds: +1 is tolerated drift,
+        # not proof of a reused PID. Exercise the canonical mismatch boundary.
+        monkeypatch.setattr("gateway.status._get_process_start_time",
+                            lambda pid: current_start + START_TIME_DRIFT_TOLERANCE + 1)
     else:
         monkeypatch.setattr(generation, "_boot_id", lambda: "new-boot")
     assert coordinator.takeover_dead_generation("active_generation", first.id, second.id,
