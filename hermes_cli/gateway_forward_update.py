@@ -919,14 +919,19 @@ def recover_forward(home, *, supervisor=None):
             except Exception as exc:
                 return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
         if lease['generation_id'] == new['id']:
+            rollback_allowed = True
             try:
                 row = _row(db, new['id'])
                 committed = (record.get('pointer_commit') or {}).get('generation_id') == row['id']
                 if committed and not db._owner_is_dead(row):
+                    rollback_allowed = False  # Pointer inspection cannot condemn a healthy B.
                     if read_pointer(Path(home) / 'current') != ReleasePaths.for_home(home).release(row['release_sha']):
                         return _finish(home, record, 'blocked', failure='committed pointer differs from serving release', recovered=True)
                     record['alert'] = False  # A repeated bookkeeping failure sets it again.
+                    rollback_allowed = True  # A new actual health failure still follows the design.
                 proof = _poller(db, row, supervisor, _proof_deadline(record, row))
+                if committed:
+                    rollback_allowed = False  # From here failures are post-proof bookkeeping.
                 serving_clock = _now()
                 rollback_owner = new != record.get('successor')
                 if not rollback_owner and record.get('rollback_generation'):
@@ -967,8 +972,7 @@ def recover_forward(home, *, supervisor=None):
                 # a rollback owner or a holder from an earlier boot. Never compare a
                 # prior boot's monotonic deadline with the current clock.
                 in_budget = same_boot and record['commit_clock'] + ROLLBACK_SECONDS > _now()
-                pointer_committed = (record.get('pointer_commit') or {}).get('generation_id') == holder['id']
-                if db._owner_is_dead(holder) or not pointer_committed and same_boot and (in_budget or _proven_wedged(home, holder)):
+                if db._owner_is_dead(holder) or rollback_allowed and same_boot and (in_budget or _proven_wedged(home, holder)):
                     try:
                         return _rollback(home, db, holder, Path(record['previous']), supervisor,
                                          record, late=not in_budget)

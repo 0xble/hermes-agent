@@ -270,6 +270,24 @@ def test_review9_post_flip_bookkeeping_keeps_healthy_successor(rig, monkeypatch,
     assert not (rig.home / 'forward-update-bad.json').exists()
 
 
+def test_review9_post_flip_pending_repair_does_not_hide_new_unhealthy_holder(rig, monkeypatch):
+    boot = rig.supervisor.boot_active
+    def broken(row, active):
+        if active and row['release_sha'] == rig.b.name:
+            raise RuntimeError('login readback failed')
+        return boot(row, active)
+    monkeypatch.setattr(rig.supervisor, 'boot_active', broken)
+    result = promote(rig)
+    assert result['outcome'] == 'success' and result['bookkeeping_pending'], result
+    monkeypatch.setattr(rig.supervisor, 'boot_active', boot)
+    rig.supervisor.mode = 'unhealthy'  # Different from the prior bookkeeping error.
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    assert releases.read_pointer(rig.home / 'current') == rig.a
+    assert len([row for row in rig.db.generations() if row['state'] == 'serving' and forward._live(row)]) == 1
+    assert rig.db.leases()[0]['generation_id'] != result['new_id']
+
+
 def test_review9_post_flip_inconsistent_pointer_blocks_without_rollback(rig, monkeypatch):
     boot = rig.supervisor.boot_active
     def broken(row, active):
