@@ -20,6 +20,11 @@ transcript echo, or queued follow-up drain.
   on every FIFO enqueue, including `/queue`. The shielded inner STT task is
   tracked for shutdown, and completion or cancellation clears its handle while a
   finished result stays reusable after the outer awaiter is cancelled.
+- Preserve queue admission receipts when integrating the shared FIFO prefetch:
+  `_queue_or_replace_pending_event` returns true only for an admitted event and
+  false for a missing adapter or a full queue. Refused voice events start no STT;
+  admitted events retain their FIFO slot and start prefetch from `_enqueue_fifo`.
+  Do not restore the redundant prefetch call in the admission wrapper.
 
 ## Provenance and patches
 

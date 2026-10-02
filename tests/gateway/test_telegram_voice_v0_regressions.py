@@ -242,9 +242,16 @@ async def test_queued_voice_transcribes_immediately_and_drain_reuses_it():
         assert release_stt.wait(timeout=3)
         return {"success": True, "transcript": "queued hello", "provider": "mock"}
 
-    with patch("tools.transcription_tools.transcribe_audio", side_effect=_transcribe) as mock_transcribe:
-        runner._queue_or_replace_pending_event(session_key, event)
+    with (
+        patch("tools.transcription_tools.transcribe_audio", side_effect=_transcribe) as mock_transcribe,
+        patch.object(runner, "_BUSY_QUEUE_MAX_PENDING", 1),
+    ):
+        assert runner._queue_or_replace_pending_event(session_key, event) is True
         assert adapter._pending_messages[session_key] is event  # still queued, FIFO unchanged
+        refused = _voice_event(source, event.media_urls)
+        assert runner._queue_or_replace_pending_event(session_key, refused) is False
+        assert not getattr(refused, "_gateway_accepted", False)
+        assert not hasattr(refused, "_gateway_pending_stt_prefetch")
         assert await asyncio.to_thread(stt_started.wait, 3)  # STT began before any drain
 
         # Current task finishes while STT is still running: the drain joins the in-flight call.
