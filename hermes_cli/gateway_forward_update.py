@@ -36,6 +36,7 @@ POLL_SECONDS = 5
 # A committed successor must prove polling inside this share of the rollback
 # budget so A' keeps STARTUP_SECONDS to start, take over and poll.
 POLL_PROOF_SECONDS = ROLLBACK_SECONDS - STARTUP_SECONDS
+_REARM_FENCES = ('poller', 'cron', 'kanban', 'goal_wakeup')
 
 
 def _now():
@@ -364,6 +365,23 @@ def _wait_ready(db, generation_id, supervisor, deadline):
         _sleep(min(.2, _remaining(deadline, .2)))
 
 
+def _all_fences_armed(proof):
+    return all((proof.get('armed') or {}).get(key) is True for key in _REARM_FENCES)
+
+
+def _frozen_transfer_tokens(db, row, lease):
+    """Return the durable roster for this committed transfer, if this is one."""
+    with closing(db.connect()) as conn:
+        transfer = conn.execute(
+            "SELECT old_id,epoch FROM generation_transfers "
+            "WHERE new_id=? AND epoch=? AND state='committed'",
+            (row['id'], lease['epoch'] - 1)).fetchone()
+    if transfer is None:
+        return None
+    return {receipt['token_hash'] for receipt in db.transfer_receipts(
+        transfer['old_id'], transfer['epoch'])}
+
+
 def _poller(db, row, supervisor, deadline):
     last_failure = ''
     while True:
@@ -385,18 +403,33 @@ def _poller(db, row, supervisor, deadline):
             proof = supervisor.request(current, 'polling_status', timeout=wait)
             if (proof.get('generation_id'), proof.get('release_sha'), proof.get('epoch'),
                     proof.get('polling'), proof.get('healthy')) == (
-                    current['id'], current['release_sha'], lease['epoch'], True, True) and proof.get('tokens'):
+                    current['id'], current['release_sha'], lease['epoch'], True, True):
+                if not _all_fences_armed(proof):
+                    raise RuntimeError('successor has an unarmed rearm fence')
+                tokens = proof.get('tokens')
+                if (not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens)
+                        or len(set(tokens)) != len(tokens) or not tokens):
+                    raise RuntimeError('successor reported an invalid polling roster')
+                actual_tokens = set(tokens)
+                expected_tokens = _frozen_transfer_tokens(db, current, lease)
+                if expected_tokens is None:
+                    expected_tokens = actual_tokens
+                if not expected_tokens:
+                    raise RuntimeError('successor transfer has an empty frozen polling roster')
+                if actual_tokens != expected_tokens:
+                    raise RuntimeError('successor polling roster differs from frozen transfer roster')
                 if proof.get('release_root') != str(ReleasePaths.for_home(db.home).release(current['release_sha'])):
                     raise RuntimeError('successor did not acknowledge its loaded release tree')
                 # Socket answers alone never authorize a pointer flip under a stale lease.
                 if _lease(db) != lease or not _live(current):
                     raise RuntimeError('poller identity changed during observation')
-                starts = [event['wall_at'] for event in db.poller_journal()
+                starts = {event['token_hash']: event['wall_at'] for event in db.poller_journal()
                           if event['generation_id'] == row['id'] and event['epoch'] == lease['epoch']
-                          and event['event'] == 'poller_started' and event['token_hash'] in proof['tokens']]
-                if not starts:
-                    raise RuntimeError('successor lacks a durable poller start')
-                proof['poller_started_at'] = max(starts)
+                          and event['event'] == 'poller_started' and event['token_hash'] in expected_tokens}
+                missing = expected_tokens - starts.keys()
+                if missing:
+                    raise RuntimeError('successor lacks durable poller starts for: ' + ', '.join(sorted(missing)))
+                proof['poller_started_at'] = max(starts.values())
                 proof.update(pid=current['pid'], label=current['label'])
                 return proof
         except RuntimeError as exc:
@@ -936,8 +969,7 @@ def recover_forward(home, *, supervisor=None):
                 if (lease['generation_id'], lease['epoch'], lease['state']) == (
                         record['old_id'], record['old_epoch'], 'active'):
                     status = supervisor.request(_row(db, record['old_id']), 'polling_status', timeout=2)
-                    if status.get('polling') is True and all((status.get('armed') or {}).get(key) is True
-                            for key in ('poller', 'cron', 'kanban', 'goal_wakeup')):
+                    if status.get('polling') is True and _all_fences_armed(status):
                         return _finish(home, record, 'refused', failure='updater exited before reservation', recovered=True)
                 raise RuntimeError('reservation intent incomplete')
             except Exception as exc:
@@ -1032,8 +1064,7 @@ def recover_forward(home, *, supervisor=None):
                 with closing(db.connect()) as conn:
                     transfer = conn.execute('SELECT state FROM generation_transfers WHERE old_id=? AND epoch=?',
                                             (old['id'], lease['epoch'])).fetchone()
-                if (status.get('polling') is not True or not all((status.get('armed') or {}).get(key) is True
-                        for key in ('poller', 'cron', 'kanban', 'goal_wakeup')) or
+                if (status.get('polling') is not True or not _all_fences_armed(status) or
                         transfer and transfer['state'] != 'aborted'):
                     raise RuntimeError('old owner deadline has not re-armed all fences')
                 _discard_reservation(db, new, supervisor, 'updater_abandoned')
@@ -1137,8 +1168,7 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
                             db.abort_transfer(old['id'], successor['id'], lease['epoch'], attempt_nonce=transfer['attempt_nonce'])
                         resume = supervisor.request(old, 'transfer_aborted',
                             params={'to': successor['id'], 'nonce': transfer['attempt_nonce']}, timeout=45)
-                        if (resume.get('rearmed') is not True or not all(
-                            (resume.get('armed') or {}).get(key) is True for key in ('poller', 'cron', 'kanban', 'goal_wakeup'))):
+                        if (resume.get('rearmed') is not True or not _all_fences_armed(resume)):
                             raise RuntimeError('precommit fences did not read back as armed')
                     _refuse(db, successor, supervisor, 'precommit_aborted')
                     return _finish(home, record, 'aborted', resume=resume)

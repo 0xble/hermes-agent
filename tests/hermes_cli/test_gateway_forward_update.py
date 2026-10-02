@@ -38,6 +38,9 @@ def rig(tmp_path, monkeypatch):
     (home / 'current').symlink_to(a)
     db = GenerationCoordinator(home)
     alive = {100: 1.0}
+    transfer_tokens = {'token-hash'}
+    proof_tokens = {'token-hash'}
+    armed_fences = dict.fromkeys(('poller', 'cron', 'kanban', 'goal_wakeup'), True)
     monkeypatch.setattr('gateway.status._pid_exists', lambda pid: pid in alive)
     monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: alive.get(pid))
     old = GenerationIdentity.create(release_sha=a.name, label='ai.hermes.gateway', pid=100,
@@ -101,7 +104,7 @@ def rig(tmp_path, monkeypatch):
         def request(self, row, verb, *, params=None, timeout=2):
             events.append((verb, row['id']))
             if verb == 'polling_roster':
-                return {'tokens': ['token-hash']}
+                return {'tokens': sorted(transfer_tokens)}
             if verb == 'polling_status':
                 lease = db.leases()[0]
                 if lease['generation_id'] != row['id']:
@@ -114,13 +117,14 @@ def rig(tmp_path, monkeypatch):
                         return {'healthy': False}
                     raise TimeoutError('generation loop did not answer')
                 if row['id'] not in self.polled and row['id'] != old.id:
-                    db.record_poller_event('token-hash', row['id'], lease['epoch'], 'lock_acquired')
-                    db.record_poller_event('token-hash', row['id'], lease['epoch'], 'poller_started')
+                    for token in proof_tokens:
+                        db.record_poller_event(token, row['id'], lease['epoch'], 'lock_acquired')
+                        db.record_poller_event(token, row['id'], lease['epoch'], 'poller_started')
                 self.polled.add(row['id'])
                 return {'generation_id': row['id'], 'release_sha': row['release_sha'],
                         'release_root': str(home / 'releases' / row['release_sha']),
-                        'epoch': lease['epoch'], 'tokens': ['token-hash'], 'polling': True,
-                        'healthy': True, 'armed': dict.fromkeys(('poller', 'cron', 'kanban', 'goal_wakeup'), True)}
+                        'epoch': lease['epoch'], 'tokens': sorted(proof_tokens), 'polling': True,
+                        'healthy': True, 'armed': dict(armed_fences)}
             if verb == 'transfer_aborted':
                 assert row['id'] == old.id, 'Never re-arm draining A after commit'
                 return {'generation_id': row['id'], 'epoch': 1, 'rearmed': True,
@@ -142,10 +146,11 @@ def rig(tmp_path, monkeypatch):
         events.append(('handover', lease['generation_id'], to_id))
         if supervisor.mode in ('blocked', 'wedged') and lease['generation_id'] != old.id:
             raise RuntimeError('no acknowledgement')
-        db.request_transfer(lease['generation_id'], to_id, lease['epoch'], {'token-hash'})
-        db.record_poller_stopped(lease['generation_id'], lease['epoch'], 'token-hash', 42)
-        db.record_poller_event('token-hash', lease['generation_id'], lease['epoch'], 'poller_stopped')
-        db.record_poller_event('token-hash', lease['generation_id'], lease['epoch'], 'lock_released')
+        db.request_transfer(lease['generation_id'], to_id, lease['epoch'], set(transfer_tokens))
+        for token in sorted(transfer_tokens):
+            db.record_poller_stopped(lease['generation_id'], lease['epoch'], token, 42)
+            db.record_poller_event(token, lease['generation_id'], lease['epoch'], 'poller_stopped')
+            db.record_poller_event(token, lease['generation_id'], lease['epoch'], 'lock_released')
         if supervisor.abort:
             db.abort_transfer(lease['generation_id'], to_id, lease['epoch'])
             db.record_poller_event('token-hash', lease['generation_id'], lease['epoch'], 'lock_acquired')
@@ -169,7 +174,9 @@ def rig(tmp_path, monkeypatch):
         SimpleNamespace(runtimes=[{'kind': 'gateway', 'pid': row['pid']} for row in db.generations()
                                   if row['state'] != 'exited' and row['pid'] in alive]))
     return SimpleNamespace(home=home, a=a, b=b, db=db, old=old, supervisor=supervisor,
-                           events=events, clock=clock, loaded=loaded, alive=alive)
+                           events=events, clock=clock, loaded=loaded, alive=alive,
+                           transfer_tokens=transfer_tokens, proof_tokens=proof_tokens,
+                           armed_fences=armed_fences)
 
 
 def promote(rig):
@@ -710,6 +717,43 @@ def test_happy_ordering_and_exit_cleanup(rig):
     forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
     assert rig.old.label not in rig.loaded
     assert result['poller']['epoch'] == result['epoch']
+
+
+def _shorten_poller_proof(monkeypatch):
+    monkeypatch.setattr(forward, 'ROLLBACK_SECONDS', 1.0)
+    monkeypatch.setattr(forward, 'POLL_PROOF_SECONDS', 0.8)
+
+
+@pytest.mark.parametrize('proof_tokens', [
+    {'token-hash'},
+    {'different-token'},
+    {'token-hash', 'extra-token'},
+])
+def test_review11_successor_roster_must_match_frozen_transfer(rig, monkeypatch, proof_tokens):
+    _shorten_poller_proof(monkeypatch)
+    rig.transfer_tokens.update({'second-token'})
+    rig.proof_tokens.clear()
+    rig.proof_tokens.update(proof_tokens)
+    result = promote(rig)
+    assert result['outcome'] != 'success', result
+    assert releases.read_pointer(rig.home / 'current') != rig.b
+
+
+@pytest.mark.parametrize('fence', ['cron', 'kanban', 'goal_wakeup'])
+def test_review11_successor_requires_all_rearm_fences(rig, monkeypatch, fence):
+    _shorten_poller_proof(monkeypatch)
+    rig.armed_fences[fence] = False
+    result = promote(rig)
+    assert result['outcome'] != 'success', result
+    assert releases.read_pointer(rig.home / 'current') != rig.b
+
+
+def test_review11_successor_exact_roster_and_all_fences_succeeds(rig, monkeypatch):
+    rig.transfer_tokens.update({'second-token'})
+    rig.proof_tokens.update({'second-token'})
+    result = promote(rig)
+    assert result['outcome'] == 'success', result
+    assert releases.read_pointer(rig.home / 'current') == rig.b
 
 
 @pytest.mark.parametrize('mode,evidence', [('gate_failed', 'startup_gate_failed'), ('unclaimed', 'unclaimed')])
@@ -1294,6 +1338,8 @@ def test_unanswered_fresh_input_alerts_but_archives_completed_rollback(rig, monk
     from plugins.platforms.telegram.polling_transfer import PollingJournal
     rig.supervisor.mode = 'dies'
     journal = PollingJournal(rig.db, 'fake-token')
+    rig.transfer_tokens.clear()
+    rig.transfer_tokens.add(journal.token_hash)
     request = rig.supervisor.request
     def polling(*args, **kwargs):
         proof = request(*args, **kwargs)
