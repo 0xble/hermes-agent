@@ -511,14 +511,22 @@ def probe_gateway_loop_liveness(
         stale_budget = max(float(stale_after), 0.0)
     except (TypeError, ValueError):
         stale_budget = DEFAULT_LOOP_LIVENESS_STALE_AFTER_S
-    try:
-        from gateway.shutdown_watchdog import get_loop_heartbeat_path
-        path = get_loop_heartbeat_path(home)
-        mtime = path.stat().st_mtime
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        heartbeat_pid = int(payload.get("pid", 0))
-    except Exception:
+    def read(locate):
+        try:
+            path = locate()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return path.stat().st_mtime, payload, int(payload.get("pid", 0))
+        except Exception:
+            return None
+    from gateway import shutdown_watchdog
+    entry = read(lambda: shutdown_watchdog.get_loop_heartbeat_path(home))
+    if (entry is None or entry[2] != int(pid)) and int(pid) > 0:
+        # Overlapping generations share the home file; a draining generation keeps
+        # rewriting it. A successor's own per-PID copy is then the evidence.
+        entry = read(lambda: shutdown_watchdog.get_pid_loop_heartbeat_path(home, int(pid))) or entry
+    if entry is None:
         return GATEWAY_LOOP_UNKNOWN
+    mtime, payload, heartbeat_pid = entry
     if heartbeat_pid <= 0 or int(pid) <= 0 or heartbeat_pid != int(pid):
         # Heartbeat is not this process's (old version, starting up, stale file): not evidence.
         return GATEWAY_LOOP_UNKNOWN
@@ -570,27 +578,53 @@ def probe_gateway_loop_liveness(
     return GATEWAY_LOOP_UNKNOWN  # Armed but unreachable socket: ambiguity — never kill on it.
 
 
-def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: float = 5.0) -> bool:
+def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: float = 5.0,
+                            deadline: float | None = None, expected_start_time: float | None = None) -> bool:
     """Bounded stop (SIGTERM, ``term_grace``, SIGKILL, ``kill_wait``) for a provably dead loop; True once gone.
     Callers MUST have classified ``GATEWAY_LOOP_WEDGED`` first: escalating a merely busy gateway
     bypasses the cron drain floor and SIGKILLs live work.
 
     See #86684.
     """
-    from gateway.status import get_process_start_time
-    expected_start_time = get_process_start_time(pid)
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
+    def replaced():
+        # Only a readable, different incarnation proves the recorded process is gone; drift is not.
+        current = get_process_start_time(pid)
+        return (expected_start_time is not None and current is not None
+                and not start_time_fingerprints_match(expected_start_time, current))
+    def guard():
+        # terminate_pid compares strictly. Hand it a reading that just matched within drift.
+        current = get_process_start_time(pid)
+        if expected_start_time is not None and current is not None and \
+                start_time_fingerprints_match(expected_start_time, current):
+            return current
+        return expected_start_time
+    def remaining(cap):
+        return max(0., min(float(cap), deadline - time.monotonic())) if deadline is not None else max(float(cap), 0.)
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
+    if expected_start_time is None:
+        expected_start_time = get_process_start_time(pid)
+    elif replaced():
+        return True  # The recorded process is gone. Its replacement is unrelated.
     try:
-        terminate_pid(pid, force=False)
+        terminate_pid(pid, force=False, expected_start_time=guard())
     except (ProcessLookupError, PermissionError, OSError):
-        return _wait_for_pid_exit(pid, 1.0)
-    if _wait_for_pid_exit(pid, max(float(term_grace), 0.0)):
+        gone = _wait_for_pid_exit(pid, remaining(1.0))
+        return gone or replaced()
+    if _wait_for_pid_exit(pid, remaining(term_grace)):
         return True
+    if replaced():
+        return True
+    if deadline is not None and time.monotonic() >= deadline:
+        return False
     try:
-        terminate_pid(pid, force=True, expected_start_time=expected_start_time)
+        terminate_pid(pid, force=True, expected_start_time=guard())
         print(f"⚠ Gateway PID {pid} unresponsive to SIGTERM; sent SIGKILL")
     except (ProcessLookupError, PermissionError, OSError):
         pass
-    return _wait_for_pid_exit(pid, max(float(kill_wait), 0.0))
+    gone = _wait_for_pid_exit(pid, remaining(kill_wait))
+    return gone or replaced()
 
 
 def _get_ancestor_pids() -> set[int]:
@@ -4020,6 +4054,23 @@ def _attach_to_host_gateway_or_guard(force: bool = False, replace: bool = False)
     _guard_named_profile_under_multiplexer(force=force)
 
 
+def _forward_generation_launch() -> bool:
+    """A forward-only launchd generation answers to the coordinator, not the host record.
+
+    Its claim exits 0 on a consumed scope, which parks a KeepAlive respawn of a dead label. The
+    host-attach guard would instead see the live successor serving this profile and exit 75, so
+    launchd would respawn the dead label forever and never park it.
+    """
+    if not os.environ.get("HERMES_GENERATION_SCOPE"):
+        return False
+    try:
+        from gateway.generation import forward_only_handover_enabled
+        return forward_only_handover_enabled(load_gateway_config())
+    except Exception:
+        logger.debug("forward-only generation launch probe failed", exc_info=True)
+        return False
+
+
 def _guard_supervised_gateway_conflict(force: bool = False) -> None:
     """Refuse a foreground gateway when a service manager already supervises one: a shell-launched run
     becomes a second dispatcher that escapes the cgroup, survives ``systemctl restart``, and writes the
@@ -4252,7 +4303,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard."""
     _guard_official_docker_root_gateway()
     if not standby:
-        _attach_to_host_gateway_or_guard(force=force, replace=replace)
+        if not _forward_generation_launch():
+            _attach_to_host_gateway_or_guard(force=force, replace=replace)
         _guard_supervised_gateway_conflict(force=force)
         _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))

@@ -162,6 +162,18 @@ _POLL_JOURNAL_EVENTS = frozenset({
 })
 
 
+def generation_start_fingerprint_matches(row, observed) -> bool | None:
+    """Reconcile a same-host reading; an unavailable reading never proves death."""
+    from gateway.status import start_time_fingerprints_match
+    if observed is None or not row['start_fingerprint']:
+        return None
+    try:
+        pid, recorded = row['start_fingerprint'].split(':', 1)
+        return int(pid) == int(row['pid']) and start_time_fingerprints_match(float(recorded), observed)
+    except (TypeError, ValueError, OverflowError):
+        return False  # A nonnumeric legacy fingerprint cannot match this reading.
+
+
 def _is_unclaimed(row: sqlite3.Row | dict[str, Any]) -> bool:
     return bool(row.get("claim_pending", 0) if isinstance(row, dict) else row["claim_pending"]) \
         or ((row.get("pid") if isinstance(row, dict) else row["pid"]) is None) \
@@ -648,7 +660,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             alive = _pid_exists(pid)
             actual_start = _get_process_start_time(pid) if alive else None
             dead = (holder["boot_id"] != _boot_id() or not alive or
-                    (actual_start is not None and holder["start_fingerprint"] != f"{pid}:{actual_start}"))
+                    generation_start_fingerprint_matches(holder, actual_start) is False)
             evidence = json.dumps({"reason": evidence, "pid": pid,
                                    "start_fingerprint": holder["start_fingerprint"],
                                    "recorded_boot": holder["boot_id"], "observed_boot": _boot_id(),

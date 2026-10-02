@@ -270,12 +270,12 @@ class OwnedAdmissionMixin:
     @staticmethod
     def _owner_is_dead(record) -> bool:
         from gateway.status import _get_process_start_time, _pid_exists
-        from gateway.generation import _boot_id
+        from gateway.generation import _boot_id, generation_start_fingerprint_matches
         pid = int(record["pid"])
         alive = _pid_exists(pid)
         start = _get_process_start_time(pid) if alive else None
         return (record["boot_id"] != _boot_id() or not alive or
-                (start is not None and record["start_fingerprint"] != f"{pid}:{start}"))
+                generation_start_fingerprint_matches(record, start) is False)
 
     def hold_dead_owner(self, owner: str) -> int:
         """Interrupt pending rows only with PID/start-fingerprint death proof."""
