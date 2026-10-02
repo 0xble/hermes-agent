@@ -489,6 +489,9 @@ class GatewayAgentCacheMixin:
         from gateway.run import _INTERRUPT_REASON_STOP
         stop_marker = None
         if interrupt_reason == _INTERRUPT_REASON_STOP:
+            # Latch before interrupting: the interrupted background delegations below report back
+            # within a second and must not start the turn the user just stopped.
+            self._latch_user_stop(session_key)
             try:
                 # Capture before the first await. The immutable marker includes the
                 # session identity, so a delayed stop cannot clear a newer recovery.
@@ -569,6 +572,25 @@ class GatewayAgentCacheMixin:
                 await self.async_session_store.clear_resume_pending(session_key, expected_marker=stop_marker)
             except Exception:
                 logger.warning("Could not persist restart marker clear after /stop for %s", session_key, exc_info=True)
+        if interrupt_reason == _INTERRUPT_REASON_STOP:
+            await self._pause_goal_for_stop(session_key, source)
+
+    def _latch_user_stop(self, session_key: str) -> None:
+        """Hold background wakes for ``session_key`` until the next non-internal turn."""
+        if session_key:
+            self._session_state(session_key).conversation.stop_latched = True
+
+    def _clear_user_stop_latch(self, session_key: str) -> None:
+        state = self._peek_session_state(session_key) if session_key else None
+        if state is not None:
+            state.conversation.stop_latched = False
+
+    def _user_stop_latched(self, *session_keys: str) -> bool:
+        for key in session_keys:
+            state = self._peek_session_state(key) if key else None
+            if state is not None and state.conversation.stop_latched:
+                return True
+        return False
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard
