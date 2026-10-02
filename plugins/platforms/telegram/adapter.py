@@ -4201,14 +4201,28 @@ class TelegramAdapter(BasePlatformAdapter):
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
+    def _text_send_refusal(self) -> Optional[SendResult]:
+        """Recheck after lock/pacing/retry awaits, before starting another text request."""
+        if getattr(self, "_send_path_degraded", False):
+            return SendResult(success=False, error="send_path_degraded", retryable=True, pre_send=True)
+        if not self._bot:
+            return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal(), pre_send=True)
+        return None
+
     async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any]):
         """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
+        refusal = self._text_send_refusal()
+        if refusal is not None:
+            return refusal
         try:
             return await _await_with_thread_deadline(
                 self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         except Exception as md_error:
             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                refusal = self._text_send_refusal()
+                if refusal is not None:
+                    return refusal
                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                 return await _await_with_thread_deadline(
                     self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
@@ -4236,7 +4250,11 @@ class TelegramAdapter(BasePlatformAdapter):
         cooldown = self._send_flood_cooldown_remaining(chat_id)
         if cooldown is not None:
             return _flood_cap_result(cooldown)
+        prior_transport_error = None
         for _send_attempt in range(3):
+            refusal = self._text_send_refusal()
+            if refusal is not None and prior_transport_error is not None:
+                raise prior_transport_error
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return _flood_cap_result(cooldown)
@@ -4244,7 +4262,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                message = await self._send_chunk_markdown_or_plain(chunk, send_kwargs)
+                if isinstance(message, SendResult):
+                    return message
+                return message, used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -4287,6 +4308,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     raise
                 if is_pool_timeout:
                     await self._drain_general_connections_after_pool_timeout()
+                if not self._looks_like_connect_timeout(send_err) and not is_pool_timeout:
+                    prior_transport_error = send_err
                 if _send_attempt >= 2:
                     raise
                 wait = 2 ** _send_attempt
@@ -4398,6 +4421,9 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _send_text_locked(
         self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]]) -> SendResult:
         """``send()`` body under the per-chat lock: rich fast-path, else MarkdownV2 chunks."""
+        refusal = self._text_send_refusal()
+        if refusal is not None:
+            return refusal
         # Re-checked under the lock: a burst queued behind a refused send must not each fire once.
         cooldown = self._send_flood_cooldown_remaining(chat_id)
         if cooldown is not None:
@@ -4417,6 +4443,9 @@ class TelegramAdapter(BasePlatformAdapter):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return _flood_cap_result(cooldown)
+            refusal = self._text_send_refusal()
+            if refusal is not None:
+                return refusal
         self._hold_chat_outbound_slot(chat_id)
         error_types = self._telegram_error_types()
         chunks: List[str] = []

@@ -109,7 +109,25 @@ budget in #107612 remains necessary to prevent the first rate-limit event.
 - Emphasis is an own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906),
   open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19.
 
-## Verification
+## Reconnect Teardown During Text Sends
+
+**Patch identity:** `telegram-send-teardown`. A text send can pass admission,
+then wait for its chat lock, pacing slot, or retry while disconnect fences the
+adapter and clears its bot. Recheck before starting each Markdown/plain request
+and after lock/pacing waits. Return the existing retryable, pre-send refusal so
+the delivery owner keeps the reply. Preserve delivered split chunks and their
+certain remainder. If a previous transport request had an uncertain outcome,
+preserve its error instead of converting it into a certain pre-send refusal.
+
+Source: `plugins/platforms/telegram/adapter.py`. Proof:
+`tests/gateway/test_telegram_send_teardown.py`, plus reconnect, split-send and
+send-path health tests. No new calls, retries, shorter pacing, or longer turns
+are introduced. The inherited shared-rate limitations in Rate Boundary remain
+unresolved. Retire after an accepted upstream release passes these behavioral
+tests without this patch. Roll back this patch's adapter and tests together.
+There are no configuration or persistent-state changes.
+
+## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,
 `tests/gateway/test_telegram_split_send_flood.py`,
