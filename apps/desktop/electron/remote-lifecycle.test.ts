@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
