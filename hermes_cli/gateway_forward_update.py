@@ -570,6 +570,28 @@ def _resume_launch(db, release, supervisor, record, key, deadline):
     return _wait_ready(db, generation_id, supervisor, deadline)
 
 
+class _PointerActivationUncertain(RuntimeError):
+    """An activation error with unreadable pointers never authorizes rollback."""
+
+
+def _commit_pointer(home, record, row, proof):
+    if record is not None:
+        record['pointer_commit'] = {'generation_id': row['id'], 'epoch': proof['epoch'],
+                                    'release_sha': row['release_sha']}
+        record['bookkeeping_pending'] = True
+        _save(home, record)
+
+
+def _observe_pointer_commit(home, record, row, proof):
+    try:
+        release = ReleasePaths.for_home(home).release(row['release_sha'])
+        activated = read_pointer(Path(home) / 'current') == release
+    except Exception as exc:
+        raise _PointerActivationUncertain(f'pointer commit readback failed: {exc}') from exc
+    if activated:
+        _commit_pointer(home, record, row, proof)
+
+
 def _flip(home, db, row, proof, supervisor, *, operation='promote', record=None):
     paths = ReleasePaths.for_home(home)
     lease = _lease(db)
@@ -578,14 +600,16 @@ def _flip(home, db, row, proof, supervisor, *, operation='promote', record=None)
     if not _live(_row(db, row['id'])):
         raise RuntimeError('generation died before pointer flip')
     release = paths.release(row['release_sha'])
-    result: dict = activate_release(home, release, operation=operation)
+    try:
+        result: dict = activate_release(home, release, operation=operation)
+    except Exception:
+        # Activation can fail in fsync/readback/archive after replacing current.
+        # Reconcile that durable effect before either caller decides on rollback.
+        _observe_pointer_commit(home, record, row, proof)
+        raise
     # Lease + polling proof + pointer activation is the success commit. Login
     # policy and retired-file cleanup are repairable bookkeeping, not a B fault.
-    if record is not None:
-        record['pointer_commit'] = {'generation_id': row['id'], 'epoch': proof['epoch'],
-                                    'release_sha': row['release_sha']}
-        record['bookkeeping_pending'] = True
-        _save(home, record)
+    _commit_pointer(home, record, row, proof)
     if read_pointer(paths.current) != release:
         raise RuntimeError('committed pointer differs from serving release')
     try:
@@ -919,19 +943,29 @@ def recover_forward(home, *, supervisor=None):
             except Exception as exc:
                 return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
         if lease['generation_id'] == new['id']:
-            rollback_allowed = True
+            # Keep pointer inspection (including its failure receipt) outside the
+            # health-failure rollback path. An unreadable pointer is not a B fault.
             try:
                 row = _row(db, new['id'])
-                committed = (record.get('pointer_commit') or {}).get('generation_id') == row['id']
-                if committed and not db._owner_is_dead(row):
-                    rollback_allowed = False  # Pointer inspection cannot condemn a healthy B.
+                if ((record.get('pointer_commit') or {}).get('generation_id') == row['id']
+                        and not db._owner_is_dead(row)):
                     if read_pointer(Path(home) / 'current') != ReleasePaths.for_home(home).release(row['release_sha']):
-                        return _finish(home, record, 'blocked', failure='committed pointer differs from serving release', recovered=True)
+                        raise RuntimeError('committed pointer differs from serving release')
                     record['alert'] = False  # A repeated bookkeeping failure sets it again.
-                    rollback_allowed = True  # A new actual health failure still follows the design.
-                proof = _poller(db, row, supervisor, _proof_deadline(record, row))
-                if committed:
-                    rollback_allowed = False  # From here failures are post-proof bookkeeping.
+            except Exception as exc:
+                return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
+            polling_error = None
+            try:
+                deadline = _proof_deadline(record, row)
+                try:
+                    proof = _poller(db, row, supervisor, deadline)
+                except (RuntimeError, TimeoutError) as health_error:
+                    polling_error = health_error
+                    raise
+                # A prior updater can die after current moved but before the
+                # forward marker was saved. Reconcile that commit before any
+                # clock, reservation cleanup, inventory or receipt can fail.
+                _observe_pointer_commit(home, record, row, proof)
                 serving_clock = _now()
                 rollback_owner = new != record.get('successor')
                 if not rollback_owner and record.get('rollback_generation'):
@@ -972,7 +1006,16 @@ def recover_forward(home, *, supervisor=None):
                 # a rollback owner or a holder from an earlier boot. Never compare a
                 # prior boot's monotonic deadline with the current clock.
                 in_budget = same_boot and record['commit_clock'] + ROLLBACK_SECONDS > _now()
-                if db._owner_is_dead(holder) or rollback_allowed and same_boot and (in_budget or _proven_wedged(home, holder)):
+                committed = (record.get('pointer_commit') or {}).get('generation_id') == holder['id']
+                dead = db._owner_is_dead(holder)
+                # Re-read the commit after _flip: recovery may have activated it
+                # in this attempt. Only a new failed polling proof, death or a
+                # proven wedge can condemn a pointer-committed holder.
+                wedged = same_boot and not dead and _proven_wedged(home, holder)
+                if not dead and not wedged and (isinstance(exc, _PointerActivationUncertain)
+                        or committed and polling_error is not exc):
+                    return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
+                if dead or same_boot and (in_budget or wedged):
                     try:
                         return _rollback(home, db, holder, Path(record['previous']), supervisor,
                                          record, late=not in_budget)
@@ -1103,8 +1146,10 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
                     return _finish(home, record, 'blocked', failure=str(recovery_error))
             if current['generation_id'] != successor['id']:
                 return _finish(home, record, 'blocked', failure='committed owner changed')
-            if ((record.get('pointer_commit') or {}).get('generation_id') == successor['id']
-                    and not db._owner_is_dead(_row(db, successor['id']))):
+            holder = _row(db, successor['id'])
+            if ((isinstance(exc, _PointerActivationUncertain) or
+                    (record.get('pointer_commit') or {}).get('generation_id') == holder['id'])
+                    and not db._owner_is_dead(holder) and not _proven_wedged(home, holder)):
                 return _finish(home, record, 'blocked', alert=True)
             try:
                 return _rollback(home, db, _row(db, successor['id']), previous, supervisor, record)
