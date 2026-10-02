@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -133,6 +134,9 @@ def _toggle_on(host, key: str) -> list[dict[str, Any]]:
 
 def test_plugin_sandbox_selects_real_pm_tools_offline(tmp_path: Path) -> None:
     """The same isolated home used by activation can resolve PM's pinned toolchain without downloads."""
+    uv = shutil.which("uv")
+    if uv is None or not Path(uv).resolve().with_name("uvx").is_file():
+        pytest.skip("real uv and uvx are required for PM toolchain selection")
     eh = build_home(tmp_path, "http://127.0.0.1:1")
     child = subprocess.run([sys.executable, "-c",
                             "from pm._uv import _toolchain; assert _toolchain(realize=False) is not None"],

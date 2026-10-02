@@ -107,7 +107,7 @@ export function buildHudModifierMonitor({
       }
     }
     if (platform !== 'linux') throw error
-    console.warn('[hud-modifier] unavailable: native build needs a C compiler, libx11-dev and libxi-dev; desktop packaging continues')
+    console.warn(`[hud-modifier] ${platform}-${arch} unavailable: native build needs a C compiler, libx11-dev and libxi-dev; desktop packaging continues`)
     console.warn(String(error.stderr || error.message))
     return null
   } finally {

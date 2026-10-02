@@ -50,6 +50,10 @@ def test_release_plist_executes_selected_release_with_managed_source_launcher(tm
 
     home = tmp_path / "profile"
     source = tmp_path / "source"
+    (home / "config.yaml").parent.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "gateway:\n  forward_only_handover:\n    enabled: true\n", encoding="utf-8"
+    )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
@@ -664,7 +668,6 @@ def test_gateway_interpreter_ignores_unsupported_dangling_pointer(tmp_path, monk
     home.mkdir()
     (home / "current").symlink_to(home / "missing")
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(gateway, "_detect_venv_dir", lambda: None)
     assert gateway.get_python_path() == gateway.sys.executable
 
 

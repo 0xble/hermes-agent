@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, served, fault):
     uv = shutil.which("uv")
     assert uv, "fresh-install acceptance requires real uv"
+    if not Path(uv).resolve().with_name("uvx").is_file():
+        pytest.skip("fresh-install acceptance requires the uvx companion binary")
     python = Path(sys._base_executable).resolve()
     version = ".".join(map(str, sys.version_info[:3]))
     minor = ".".join(map(str, sys.version_info[:2]))

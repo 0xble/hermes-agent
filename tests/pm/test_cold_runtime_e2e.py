@@ -83,7 +83,8 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
         pytest.skip("real uv and uvx must be on PATH")
     uv = Path(uv).resolve()
     uvx = uv.with_name("uvx")
-    assert uvx.is_file(), "the real uv distribution must include uvx"
+    if not uvx.is_file():
+        pytest.skip("the real uv distribution does not provide uvx on this runner")
     python = Path(sys._base_executable).resolve()
     if sys.version_info[:2] != (3, 14):
         pytest.skip("the checked-in PM runtime currently requires Python 3.14")

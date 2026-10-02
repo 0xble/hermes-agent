@@ -123,7 +123,7 @@ class TestPulseSocketReachable:
     def test_stale_socket_file_not_reachable(self, monkeypatch, pulse_dir):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        runtime_dir = tmp_path.parent / "pulse-stale"
+        runtime_dir = pulse_dir.parent / "pulse-stale"
         sock_path = runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
@@ -139,7 +139,7 @@ class TestPulseSocketReachable:
     def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, pulse_dir):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        runtime_dir = tmp_path.parent / "pulse-live"
+        runtime_dir = pulse_dir.parent / "pulse-live"
         sock_path = runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)

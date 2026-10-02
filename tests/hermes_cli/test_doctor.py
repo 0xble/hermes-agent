@@ -1101,9 +1101,7 @@ class TestGitHubTokenCheck:
         from hermes_cli import doctor_state
 
         def gh_2_98(cmd, **kwargs):
-            assert cmd[:3] == ["gh", "auth", "status"], cmd
-            if "--json" in cmd and "authenticated" in cmd:
-                return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"unknown JSON field")
+            assert cmd == ["gh", "auth", "status"], cmd
             return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"Logged in to github.com")
 
         monkeypatch.setattr(subprocess, "run", gh_2_98)
