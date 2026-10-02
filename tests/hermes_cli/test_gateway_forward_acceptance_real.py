@@ -42,7 +42,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'plugins'))
 from telegram_polling_stub import BotAPI
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-EVIDENCE = Path('/Users/brianle/.hermes/cache/scratch/p3-coordinator-recovery-20260930/w23')
+
+
+def evidence_root(rig_root):
+    """Retained native evidence: under the runner's scratch root, else beside the rig."""
+    scratch = os.environ.get('HERMES_TEST_SCRATCH_ROOT')
+    return Path(scratch or Path(rig_root).parent) / 'p3a-evidence'
+
+
 # The driver allows 45s for handover, including stopped->successor polling proof
 # (gateway/run_generation.py:78,114-145). This is the same bound, not a new timeout.
 MAX_HANDOVER_GAP_SECONDS = 45
@@ -402,9 +409,23 @@ class Rig:
         assert not self.api.errors
 
     def close(self):
-        self.supervisor.labels.update(row['label'] for row in self.db.generations())
-        target = EVIDENCE / (self.name + '-' + self.root.name)
-        target.mkdir(parents=True, exist_ok=True)
+        target = evidence_root(self.root) / (self.name + '-' + self.root.name)
+        try:
+            self.supervisor.labels.update(row['label'] for row in self.db.generations())
+            target.mkdir(parents=True, exist_ok=True)
+            self.preserve_evidence(target)
+        finally:
+            try:
+                self.unload_owned_jobs(target)
+            finally:
+                self.api.close()
+                self.llm.stop()
+                if target.is_dir():
+                    shutil.copytree(self.home, target / 'home', symlinks=True, dirs_exist_ok=True,
+                                    ignore=lambda _p, names: [n for n in names
+                                                              if n in {'releases'} or n.endswith('.sock')])
+
+    def preserve_evidence(self, target):
         # Preserve every native log/DB/plist before bootout, plus readbacks.
         jobs = {}
         for label in self.supervisor.labels:
@@ -421,28 +442,27 @@ class Rig:
         (target / 'llm-requests.json').write_text(json.dumps([
             {key: request[key] for key in ('kind', 'body', 'response') if key in request}
             for request in self.llm.requests], indent=2), encoding='utf-8')
-        try:
-            cleanup_deadline = time.monotonic() + 15
-            for label in sorted(self.supervisor.labels):
-                self.supervisor.command(['launchctl', 'bootout', f'{self.supervisor.domain}/{label}'],
-                                        capture_output=True, timeout=max(.1, cleanup_deadline - time.monotonic()))
-                wait(lambda label=label: self.supervisor.job({'label': label}).returncode != 0,
-                     max(.1, cleanup_deadline - time.monotonic()), 'owned label bootout')
-            # List output stays private. Only the requested aggregate is exposed.
-            counts = []
-            def unloaded_inventory():
-                listed = subprocess.run(['launchctl', 'list'], capture_output=True, text=True, encoding='utf-8', check=True).stdout
-                counts.append(sum('p3test' in line for line in listed.splitlines()))
-                (target / 'cleanup-count.txt').write_text(str(counts[-1]) + '\n', encoding='utf-8')
+
+    def unload_owned_jobs(self, target):
+        # Only this rig's labels are inspected: concurrent native runs own
+        # other p3test jobs, and a global count would fail or race them.
+        cleanup_deadline = time.monotonic() + 15
+        for label in sorted(self.supervisor.labels):
+            self.supervisor.command(['launchctl', 'bootout', f'{self.supervisor.domain}/{label}'],
+                                    capture_output=True, timeout=max(.1, cleanup_deadline - time.monotonic()))
+            wait(lambda label=label: self.supervisor.job({'label': label}).returncode != 0,
+                 max(.1, cleanup_deadline - time.monotonic()), 'owned label bootout')
+        counts = []
+        def unloaded_inventory():
+            listed = subprocess.run(['launchctl', 'list'], capture_output=True, text=True,
+                                    encoding='utf-8', check=True).stdout
+            loaded = {line.rsplit(None, 1)[-1] for line in listed.splitlines() if line.strip()}
+            counts.append(len(self.supervisor.labels & loaded))
+            if target.is_dir():
                 (target / 'cleanup-counts.json').write_text(json.dumps(counts), encoding='utf-8')
-                return counts[-1] == 0
-            wait(unloaded_inventory, max(.1, cleanup_deadline - time.monotonic()), 'p3test inventory unloaded')
-            assert counts[-1] == 0
-        finally:
-            self.api.close()
-            self.llm.stop()
-            shutil.copytree(self.home, target / 'home', symlinks=True, dirs_exist_ok=True,
-                            ignore=lambda _p, names: [n for n in names if n in {'releases'} or n.endswith('.sock')])
+            return counts[-1] == 0
+        wait(unloaded_inventory, max(.1, cleanup_deadline - time.monotonic()), 'owned p3test jobs unloaded')
+        assert counts[-1] == 0
 
 
 @pytest.fixture(scope='session', autouse=True)
