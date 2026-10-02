@@ -221,7 +221,9 @@ class OwnedRouting:
                 rows = [dict(row) for row in db.execute(
                     "SELECT * FROM inbox WHERE owner_id=? AND state='pending' ORDER BY id", (owner,))]
                 foreign = [row[0] for row in db.execute(
-                    "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending'", (owner,))]
+                    "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending' "
+                    "UNION SELECT generation_id FROM sessions WHERE generation_id!=? AND outstanding_work>0",
+                    (owner, owner))]
             return rows, foreign
 
         rows, foreign = await asyncio.to_thread(read_inbox)

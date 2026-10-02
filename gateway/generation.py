@@ -696,6 +696,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             if (not retired or retired["state"] != "exited" or retired["verdict"] != (None if clean_exit else "failed")
                     or any(retired[key] != holder[key] for key in ("pid", "start_fingerprint", "boot_id", "label"))):
                 raise RuntimeError("takeover identity changed after bootout")
+            self._close_dead_poller_journal(conn, old_id)
             new_epoch = int(current["epoch"]) + 1
             conn.execute("INSERT INTO lease_moves VALUES(?,?,?,?,?,'takeover')",
                          (resource, old_id, new_id, current["epoch"], new_epoch))
@@ -713,6 +714,30 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 raise RuntimeError("takeover successor state compare-and-swap failed")
             conn.commit()
             return new_epoch
+
+    @staticmethod
+    def _close_dead_poller_journal(conn, generation_id: str) -> None:
+        """After death proof and bootout, bound crash intervals before a new poller starts.
+
+        These timestamps are conservative stop/release upper bounds, not the
+        unknown crash instant. SIGKILL cannot publish its own closing receipts.
+        """
+        opened = {}
+        for row in conn.execute("SELECT epoch,token_hash,event FROM poller_journal "
+                                "WHERE generation_id=? ORDER BY id", (generation_id,)):
+            key = (row['epoch'], row['token_hash'])
+            opened.setdefault(key, set())
+            if row['event'] in {'poller_started', 'lock_acquired'}:
+                opened[key].add(row['event'])
+            else:
+                opened[key].discard({'poller_stopped': 'poller_started',
+                                     'lock_released': 'lock_acquired'}[row['event']])
+        for (epoch, token), events in opened.items():
+            for start, stop in (('poller_started', 'poller_stopped'), ('lock_acquired', 'lock_released')):
+                if start in events:
+                    conn.execute("INSERT INTO poller_journal(generation_id,epoch,token_hash,event,"
+                                 "monotonic_at,wall_at,boot_id) VALUES(?,?,?,?,?,?,?)",
+                                 (generation_id, epoch, token, stop, time.monotonic(), time.time(), _boot_id()))
 
     def record_poller_event(self, token_hash: str, generation_id: str, epoch: int,
                             event: str, *, monotonic_at: float | None = None,

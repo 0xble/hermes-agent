@@ -1,7 +1,7 @@
 """Forward-only acceptance against real release-pinned macOS launchd gateways.
 
 No production launch agent or profile is eligible for this harness. Fault hooks
-are in the updater process, never replacements for a gateway or its coordinator.
+are in the updater or isolated release, never replacements for a gateway or its coordinator.
 Reboot is deliberately excluded: changing this host's boot is outside the fixture.
 """
 from __future__ import annotations
@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'plugins'))
 from telegram_polling_stub import BotAPI
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-EVIDENCE = Path('/Users/brianle/.hermes/cache/scratch/p3-coordinator-recovery-20260930/w21')
+EVIDENCE = Path('/Users/brianle/.hermes/cache/scratch/p3-coordinator-recovery-20260930/w23')
 # The driver allows 45s for handover, including stopped->successor polling proof
 # (gateway/run_generation.py:78,114-145). This is the same bound, not a new timeout.
 MAX_HANDOVER_GAP_SECONDS = 45
@@ -264,6 +264,10 @@ class Rig:
         if match:
             assert not record['body'].get('tools'), 'gate was given a tool schema'
             return Text('WRONG' if self.bad_gate else 'HERMES_READY ' + match[1])
+        if 'fresh recovery of interrupted session' in content:
+            # A restored interrupted user turn can be coalesced into this
+            # message. The explicit new input, not that context, owns the reply.
+            return Text('fresh-final')
         if '[Continuing toward your standing goal]' in content and 'native wake proof' in content:
             return Text('goal-wakeup-final')
         card = re.search(r'work kanban task ([a-zA-Z0-9_-]+)', content)
@@ -414,6 +418,9 @@ class Rig:
                                                    'poll_requests': self.api.poll_requests,
                                                    'send_receipts': self.api.send_receipts,
                                                    'delivered_ids': sorted(self.api.delivered_ids)}, indent=2), encoding='utf-8')
+        (target / 'llm-requests.json').write_text(json.dumps([
+            {key: request[key] for key in ('kind', 'body', 'response') if key in request}
+            for request in self.llm.requests], indent=2), encoding='utf-8')
         try:
             cleanup_deadline = time.monotonic() + 15
             for label in sorted(self.supervisor.labels):
@@ -845,3 +852,267 @@ def test_old_sigkill_before_stop_receipt_never_promotes_standby(rig, monkeypatch
     with closing(r.db.connect()) as conn:
         assert conn.execute('SELECT COUNT(*) FROM lease_moves').fetchone()[0] == 0
     assert r.api.maximum == 1
+
+
+def successor_fault(r, monkeypatch, fault):
+    """Prove native B polling and a reply before faulting its postcommit proof."""
+    real = forward._poller
+    injected = []
+    def poller(db, row, supervisor, deadline):
+        proof = real(db, row, supervisor, deadline)
+        if row['release_sha'] == r.b.name and not injected:
+            injected.append(row['id'])
+            r.send(8001, 'fresh B before fault', 3)
+            wait(lambda: r.seen('fresh-final'), 15, 'B replied before fault')
+            assert r.admitted(8001)[0]['owner_id'] == row['id']
+            fault(r.row(row['id']))
+            # Observe the actual fault through the existing poller proof path.
+            return real(db, row, supervisor, deadline)
+        return proof
+    monkeypatch.setattr(forward, '_poller', poller)
+
+
+def test_live_successor_wedge_is_terminated_and_replaced(rig, monkeypatch):
+    r = rig
+    old = r.start()
+    from hermes_cli import gateway as gateway_cli
+    from gateway.shutdown_watchdog import get_loop_heartbeat_path, get_pid_loop_heartbeat_path
+    stopped = []
+    real_probe = gateway_cli.probe_gateway_loop_liveness
+    probes = []
+    def probe(pid, **kwargs):
+        verdict = real_probe(pid, **kwargs)
+        probes.append({'pid': pid, 'verdict': verdict, 'at': time.monotonic(),
+                       'stale_after': kwargs.get('stale_after')})
+        return verdict
+    monkeypatch.setattr(gateway_cli, 'probe_gateway_loop_liveness', probe)
+    def wedge(row):
+        own = get_pid_loop_heartbeat_path(r.home, row['pid'])
+        def witness():
+            payload = json.loads(own.read_text(encoding='utf-8')) if own.exists() else {}
+            return payload if payload.get('pid') == row['pid'] and payload.get('loop_tick_socket') is True else None
+        wait(witness, 15, 'B owns armed per-PID heartbeat')
+        assert real_probe(row['pid'], home=r.home) == gateway_cli.GATEWAY_LOOP_ALIVE
+        started = time.monotonic()
+        # SIGSTOP freezes the actual loop and all off-loop heartbeat writers.
+        # No witness contents, mtimes, thresholds or strike counts are forged.
+        os.kill(row['pid'], signal.SIGSTOP)
+        stopped.append(row)
+        shared = json.loads(get_loop_heartbeat_path(r.home).read_text(encoding='utf-8'))
+        r.metrics['wedge'] = {'pid': row['pid'], 'started_clock': started,
+                             'heartbeat_age_at_stop_seconds': time.time() - own.stat().st_mtime,
+                             'shared_heartbeat_pid_at_stop': shared.get('pid')}
+        assert real_probe(row['pid'], home=r.home) == gateway_cli.GATEWAY_LOOP_UNKNOWN
+        raise RuntimeError('native SIGSTOP after B served and replied')
+    successor_fault(r, monkeypatch, wedge)
+    try:
+        result = r.promote()
+        b = r.row(result['new_id'])
+        path = 'in_budget'
+        if result['outcome'] == 'blocked':
+            # A wedge that starts too late to age into proof inside the 60 s bound is the
+            # designed blocked case. The guardian's recovery must still replace it.
+            path = 'guardian_late'
+            assert 'neither handed over nor proved wedged' in result['failure'] and result['alert'], result
+            assert r.holder()['id'] == b['id'] and forward._live(b)
+            r.metrics['wedge']['blocked_seconds'] = time.monotonic() - r.metrics['wedge']['started_clock']
+            wait(lambda: real_probe(b['pid'], home=r.home, stale_after=forward.WEDGE_STALE_SECONDS)
+                 == gateway_cli.GATEWAY_LOOP_WEDGED, 60, 'wedge provable from B heartbeat')
+            result = forward.recover_forward(r.home, supervisor=r.supervisor)
+            assert result['late_rollback']['bound_missed'] is True and result['alert'], result
+        assert result['outcome'] == 'rolled_back', result
+        fresh = r.holder()
+        assert fresh['release_sha'] == r.a.name and fresh['id'] != old['id']
+        r.send(8004, 'fresh after wedge', 3)
+        wait(lambda: len(r.seen('fresh-final')) == 2, 30, 'A-prime reply after wedge')
+        replied = time.monotonic() - r.metrics['wedge']['started_clock']
+        assert r.db._owner_is_dead(b) and r.row(b['id'])['verdict'] == 'failed'
+        assert any(p['pid'] == b['pid'] and p['verdict'] == gateway_cli.GATEWAY_LOOP_WEDGED for p in probes), probes
+        assert r.admitted(8004)[0]['owner_id'] == fresh['id']
+        assert (r.home / 'current').resolve() == r.a
+        if path == 'in_budget':
+            assert result['rollback']['commit_to_serving_upper_bound_seconds'] <= 60, result['rollback']
+        assert r.api.maximum == 1
+        wait(lambda: r.api.confirmed >= 8004, 10, 'wedge cursor')
+        r.poller_proof([8001, 8004])
+        with closing(r.db.connect()) as conn:
+            assert conn.execute('SELECT COUNT(*) FROM lease_moves').fetchone()[0] == 2
+        r.metrics['wedge'].update(
+            path=path, probes=probes, wedge_to_A_prime_reply_seconds=replied,
+            commit_to_serving_seconds=result['rollback'].get('commit_to_serving_upper_bound_seconds'),
+            rollback_bound_met=result['rollback'].get('rollback_bound_met'))
+    finally:
+        # Resume only our injected stop if B somehow survived, so cleanup can boot it out.
+        for row in stopped:
+            if forward._live(row):
+                os.kill(row['pid'], signal.SIGCONT)
+
+
+def test_live_successor_refuses_handover_then_late_death_recovers(rig, monkeypatch):
+    r = rig
+    r.start()
+    marker = r.home / 'refuse-handover'
+    receipt = r.home / 'handover-refused'
+    # A minimal release-local fault: native loop, socket, transport and handler
+    # remain real. Only health reporting and cooperative handover are faulted.
+    (r.b / 'sitecustomize.py').write_text(LOCAL_NETWORK_POLICY +
+        'from pathlib import Path\n'
+        'from gateway.run_generation import ActiveGeneration\n'
+        f'marker=Path({str(marker)!r})\nreceipt=Path({str(receipt)!r})\n'
+        'original_status=ActiveGeneration.polling_status\n'
+        'original_transfer=ActiveGeneration.transfer_requested\n'
+        'def status(self):\n'
+        '    result=original_status(self)\n'
+        '    if marker.exists(): result["healthy"]=False\n'
+        '    return result\n'
+        'async def transfer(self,new_id):\n'
+        '    if marker.exists():\n'
+        '        receipt.write_text(self.identity.id)\n'
+        '        raise RuntimeError("native live loop refuses handover")\n'
+        '    return await original_transfer(self,new_id)\n'
+        'ActiveGeneration.polling_status=status\n'
+        'ActiveGeneration.transfer_requested=transfer\n', encoding='utf-8')
+    signals = []
+    real_kill = os.kill
+    def traced_kill(pid, sig):
+        if sig:
+            signals.append((pid, int(sig)))
+        return real_kill(pid, sig)
+    monkeypatch.setattr(os, 'kill', traced_kill)
+    from hermes_cli import gateway as gateway_cli
+    def no_escalation(*args, **kwargs):
+        raise AssertionError('alive refusing successor must never be signalled')
+    monkeypatch.setattr(gateway_cli, '_escalate_wedged_gateway', no_escalation)
+    successor_fault(r, monkeypatch, lambda row: marker.touch())
+    result = r.promote()
+    b = r.row(result['new_id'])
+    assert result['outcome'] == 'blocked' and result['alert'], result
+    assert 'neither handed over nor proved wedged' in result['failure']
+    assert receipt.read_text(encoding='utf-8') == b['id']
+    assert r.holder()['id'] == b['id'] and forward._live(b)
+    assert gateway_cli.probe_gateway_loop_liveness(b['pid'], home=r.home) == gateway_cli.GATEWAY_LOOP_ALIVE
+    assert not [s for s in signals if s[0] == b['pid']]
+    r.send(8002, 'fresh while blocked', 4)
+    wait(lambda: len(r.seen('fresh-final')) == 2, 20, 'blocked B still replies')
+    assert r.admitted(8002)[0]['owner_id'] == b['id']
+    wait(lambda: r.api.confirmed >= 8002, 10, 'blocked cursor confirmed')
+    r.poller_proof([8001, 8002])
+    with closing(r.db.connect()) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM lease_moves').fetchone()[0] == 1
+    # Crossing the original deadline is observed from the real clock, not a
+    # mocked clock or a sleep standing in for liveness/death/polling evidence.
+    wait(lambda: time.monotonic() > result['commit_clock'] + 60, 60, 'original rollback budget expired')
+    assert not [s for s in signals if s[0] == b['pid']]
+    died = time.monotonic()
+    os.kill(b['pid'], SIGKILL)
+    wait(lambda: parked(r.supervisor, b) and r.db._owner_is_dead(b), 15, 'late B death and parked respawn')
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        task = pool.submit(forward.recover_forward, r.home, supervisor=r.supervisor)
+        fresh = wait(lambda: next((row for row in r.db.generations()
+            if row['release_sha'] == r.a.name and row['state'] == 'serving'
+            and row['id'] != result['old_id'] and r.supervisor.ready(row)
+            and any(e['generation_id'] == row['id'] and e['event'] == 'poller_started'
+                    for e in r.db.poller_journal())), None), 45, 'late A-prime serving')
+        started = [e['monotonic_at'] for e in r.db.poller_journal()
+                   if e['generation_id'] == fresh['id'] and e['event'] == 'poller_started']
+        death_to_poller = max(started) - died
+        assert 0 <= death_to_poller <= MAX_HANDOVER_GAP_SECONDS
+        r.send(8003, 'fresh after late death', 3)
+        wait(lambda: len(r.seen('fresh-final')) == 3, max(.1, 60 - (time.monotonic() - died)), 'late A-prime reply')
+        replied = time.monotonic() - died
+        recovery = task.result(timeout=max(.1, 60 - (time.monotonic() - died)))
+    assert recovery['outcome'] == 'rolled_back', recovery
+    assert recovery['late_rollback']['bound_missed'] is True
+    assert recovery['rollback']['rollback_bound_met'] is False
+    assert recovery['alert'] is True
+    assert r.admitted(8003)[0]['owner_id'] == fresh['id']
+    assert (r.home / 'current').resolve() == r.a
+    assert r.row(b['id'])['verdict'] == 'failed'
+    assert replied <= 60
+    wait(lambda: r.api.confirmed >= 8003, 10, 'late recovery cursor')
+    r.poller_proof([8001, 8002, 8003])
+    ended = [e for e in r.db.poller_journal() if e['generation_id'] == b['id']
+             and e['event'] in {'poller_stopped', 'lock_released'}]
+    assert [e['event'] for e in ended] == ['poller_stopped', 'lock_released']
+    assert all(e['monotonic_at'] >= died for e in ended)
+    with closing(r.db.connect()) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM lease_moves').fetchone()[0] == 2
+    r.metrics.update(late_recovery=recovery, late_death_to_reply_seconds=replied,
+                     late_death_to_poller_seconds=death_to_poller,
+                     successor_signals_before_death=[], signals=signals)
+
+
+def test_old_draining_sigkill_interrupts_once_without_replay(rig):
+    r = rig
+    old = r.start()
+    r.send(9001, 'inflight-old', 1)
+    wait(lambda: (r.home / 'inflight.start').exists(), 30, 'old in-process tool executing')
+    result = r.promote()
+    assert result['outcome'] == 'success', result
+    b = r.row(result['new_id'])
+    assert r.row(old['id'])['state'] == 'draining' and forward._live(old)
+    assert not (r.home / 'inflight.done').exists()
+    r.send(9002, '/queue followup-old', 1)
+    wait(lambda: r.admitted(9002) and r.admitted(9002)[0]['state'] == 'accepted',
+         15, 'queued command accepted by draining A')
+    assert r.admitted(9002)[0]['owner_id'] == old['id']
+    assert r.admitted(9002)[0]['state'] == 'accepted'
+    with closing(r.db.connect()) as conn, conn:
+        session = dict(conn.execute('SELECT * FROM sessions WHERE generation_id=?', (old['id'],)).fetchone())
+        assert session['state'] == 'owned' and session['outstanding_work'] > 0
+        conn.executescript('''
+            CREATE TABLE interruption_audit(kind TEXT, item TEXT, owner TEXT, at REAL);
+            CREATE TRIGGER audit_session_interruption AFTER UPDATE OF state ON sessions
+            WHEN NEW.state='interrupted' AND OLD.state!='interrupted'
+            BEGIN INSERT INTO interruption_audit VALUES('session',OLD.session_key,OLD.generation_id,
+                julianday('now')); END;
+            CREATE TRIGGER audit_inbox_interruption AFTER UPDATE OF state ON inbox
+            WHEN NEW.state='interrupted' AND OLD.state!='interrupted'
+            BEGIN INSERT INTO interruption_audit VALUES('inbox',OLD.source_event_id,OLD.owner_id,
+                julianday('now')); END;
+        ''')
+    assert not r.seen('inflight-final') and not r.seen('followup-final')
+    died = time.monotonic()
+    os.kill(old['pid'], SIGKILL)
+    wait(lambda: parked(r.supervisor, old) and r.db._owner_is_dead(old), 15, 'draining A death proof')
+    def interrupted():
+        with closing(r.db.connect()) as conn:
+            return conn.execute('SELECT state FROM sessions WHERE session_key=?',
+                                (session['session_key'],)).fetchone()[0] == 'interrupted'
+    wait(interrupted, 15, 'native B fences dead A in-process work')
+    retired = r.row(old['id'])
+    assert (retired['state'], retired['verdict'], retired['verdict_evidence']) == ('exited', 'failed', 'admission_owner_dead')
+    def audit():
+        with closing(r.db.connect()) as conn:
+            return [tuple(row) for row in conn.execute(
+                'SELECT kind,item,owner FROM interruption_audit ORDER BY kind')]
+    expected = [('session', session['session_key'], old['id'])]
+    assert audit() == expected
+    assert r.db.hold_dead_owner(old['id']) == 0
+    assert r.db.hold_dead_owner(old['id']) == 0
+    assert audit() == expected
+    assert r.row(old['id'])['verdict_at'] == retired['verdict_at']
+    r.send(9003, 'fresh B after old death', 3)
+    wait(lambda: r.seen('fresh-final'), 20, 'B unaffected by draining death')
+    replied = time.monotonic() - died
+    assert r.admitted(9003)[0]['owner_id'] == b['id']
+    assert r.holder()['id'] == b['id'] and forward._live(b)
+    r.send(9004, 'fresh recovery of interrupted session', 1)
+    wait(lambda: len(r.seen('fresh-final')) == 2, 20, 'fresh input recovers interrupted session on B')
+    assert r.admitted(9004)[0]['owner_id'] == b['id']
+    assert not r.seen('inflight-final') and not r.seen('followup-final')
+    # Both admissions stay pinned to A. B never invokes the interrupted tool.
+    assert r.admitted(9001)[0]['owner_id'] == old['id']
+    assert r.admitted(9002)[0]['state'] == 'accepted'
+    tool_requests = [request for request in r.llm.requests
+                     if request['kind'] == 'main' and request.get('response') == 'ToolCall'
+                     and 'inflight-old' in str(next((message.get('content')
+                         for message in reversed(request['body']['messages'])
+                         if message.get('role') == 'user'), ''))]
+    assert len(tool_requests) == 1
+    assert audit() == expected
+    wait(lambda: r.api.confirmed >= 9004, 10, 'draining death cursor')
+    r.poller_proof([9001, 9002, 9003, 9004])
+    forward.cleanup_exited(r.home, supervisor=r.supervisor)
+    assert r.supervisor.job(old).returncode != 0
+    r.metrics.update(old_death_to_B_reply_seconds=replied, interruption_audit=expected)
