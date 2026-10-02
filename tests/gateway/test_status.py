@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1371,7 +1372,12 @@ class TestReadProcessCmdlinePsFallback:
         import psutil
 
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
-        monkeypatch.setattr(psutil, "Process", lambda pid: (_ for _ in ()).throw(psutil.AccessDenied(pid)))
+        def _no_such_process(pid):
+            raise ProcessLookupError(pid)
+
+        # A real PID may exist on the test host. Force the psutil layer to miss
+        # so this invariant exercises the intended ps fallback deterministically.
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=_no_such_process))
         monkeypatch.setattr(
             status.subprocess, "run",
             lambda args, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/libexec/bluetoothuserd\n"),

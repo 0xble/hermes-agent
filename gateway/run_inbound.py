@@ -2274,8 +2274,33 @@ class GatewayInboundMixin:
             if not audio_paths:
                 return user_text if user_text is not None else (getattr(event, "text", None) or None), []
             text = user_text if user_text is not None else (getattr(event, "text", "") or "")
-            task = asyncio.ensure_future(self._enrich_message_with_transcription(text, audio_paths))
+            semaphore = getattr(self, "_pending_stt_semaphore", None)
+            if semaphore is None:
+                semaphore = self._pending_stt_semaphore = asyncio.Semaphore(2)
+
+            async def _transcribe():
+                # Limit provider calls (including local fallback) across pending messages, not
+                # just clips within one message. Queued events can fill the FIFO at once.
+                async with semaphore:
+                    return await self._enrich_message_with_transcription(text, audio_paths)
+
+            task = self._retain_background_task(asyncio.create_task(_transcribe()))
             event._gateway_pending_stt_task = task
+
+            def _settle(completed):
+                if getattr(event, "_gateway_pending_stt_task", None) is not completed:
+                    return  # the event was merged and its STT cache invalidated
+                del event._gateway_pending_stt_task
+                if completed.cancelled():
+                    return
+                try:
+                    enriched, transcripts = completed.result()
+                except Exception:
+                    return  # a later drain may retry a failed task
+                event._gateway_pending_stt_text = enriched
+                event._gateway_pending_stt_transcripts = list(transcripts)
+
+            task.add_done_callback(_settle)
         try:
             enriched_text, successful_transcripts = await asyncio.shield(task)
         except asyncio.CancelledError:
