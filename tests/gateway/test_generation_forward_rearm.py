@@ -187,6 +187,66 @@ def test_review4_unverified_commit_returns_without_spending_post_commit_budget(t
 
 
 @pytest.mark.asyncio
+async def test_retry_waits_for_complete_rearm_before_freezing_new_attempt(tmp_path, monkeypatch):
+    """Wire progress is not permission to replace an abort still reopening dispatch."""
+    import asyncio
+    from gateway import run_generation
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'fixture-boot')
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha='a', label='old')
+    new = GenerationIdentity.create(release_sha='b', label='new')
+    db.register(old, state='serving')
+    db.register(new)
+    epoch = db.acquire_lease('active_generation', old.id)
+    wire_started, finish_start, roster_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    poller = SimpleNamespace(running=False)
+    async def start(receipt):
+        poller.running = True
+        wire_started.set()
+        await finish_start.wait()
+    async def stop():
+        poller.running = False
+        return {'token_hash': 'hash', 'safe_offset': 42}
+    adapter = SimpleNamespace(_controlled_poller=poller,
+        _controlled_journal=SimpleNamespace(token_hash='hash'), start_polling_from_transfer=start,
+        stop_polling_for_transfer=stop)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.runner = SimpleNamespace(adapters={'telegram': adapter}, _overlap_draining=True)
+    active._stopped_receipts = [(adapter, {'token_hash': 'hash', 'safe_offset': 42})]
+    db.request_transfer(old.id, new.id, epoch, {'hash'})
+    nonce = db.transfer_attempt_nonce(old.id, epoch)
+    assert db.abort_transfer(old.id, new.id, epoch, attempt_nonce=nonce)
+    await active.start()
+    rearm = asyncio.create_task(active.transfer_aborted(new.id, nonce))
+    request = run_generation._generation_request
+    loop = asyncio.get_running_loop()
+    def observed(path, verb, **kwargs):
+        if verb == 'polling_roster':
+            loop.call_soon_threadsafe(roster_entered.set)
+        return request(path, verb, **kwargs)
+    monkeypatch.setattr(run_generation, '_generation_request', observed)
+    retry = None
+    try:
+        await asyncio.wait_for(wire_started.wait(), 2)
+        retry = asyncio.create_task(asyncio.to_thread(run_generation.handover_to_generation,
+            tmp_path, new.id, timeout=4, verify_after_commit=False))
+        await asyncio.wait_for(roster_entered.wait(), 2)
+        # A driver already at the socket must not freeze another nonce while
+        # the adapter's start is unfinished, even though getUpdates can progress.
+        await asyncio.sleep(.1)
+        assert db.transfer_attempt_nonce(old.id, epoch) == nonce
+        assert not retry.done()
+        finish_start.set()
+        assert (await rearm)['rearmed']
+        assert await retry == epoch + 1
+        assert db.leases()[0]['generation_id'] == new.id
+    finally:
+        finish_start.set()
+        await asyncio.gather(rearm, *([retry] if retry else []), return_exceptions=True)
+        await active.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('budget,stop_delay', [(10, 11), (45, 46)])
 async def test_socket_timeout_self_rearms_after_slow_stop(tmp_path, monkeypatch, budget, stop_delay):
     """The real driver/socket may time out while the owner is still stopping its wire."""

@@ -495,6 +495,12 @@ class ActiveGeneration:
                     and getattr(getattr(adapter, "_polling_progress_event", None), "is_set", lambda: False)()
                     for adapter in roster.values())}
 
+    async def polling_roster(self) -> dict:
+        # Wire progress precedes completed re-arm. A retry must not replace the
+        # aborted nonce until recovery's final owner check has reopened dispatch.
+        async with self._transfer_lock:
+            return {"tokens": sorted(self._telegram_adapters())}
+
     async def transfer_requested(self, new_id: str) -> dict:
         """Old owner alone can stop its wire and persist receipts; never stop a live turn."""
         async with self._transfer_lock:
@@ -728,9 +734,8 @@ class ActiveGeneration:
             if pending and time.monotonic() >= pending[2]:
                 new_id, nonce, _ = pending
                 async with self._transfer_lock:
-                    # Hold the local stop/re-arm lock through recovery: a retry
-                    # may write a fresh attempt immediately after the CAS, but
-                    # cannot collect a new stop receipt before A is polling.
+                    # Roster requests share this lock, so a retry cannot replace
+                    # the aborted nonce before recovery has reopened dispatch.
                     try:
                         aborted = await asyncio.to_thread(
                             self.coordinator.abort_transfer, self.identity.id, new_id,
@@ -805,11 +810,15 @@ class ActiveGeneration:
             future = asyncio.run_coroutine_threadsafe(self.transfer_aborted(new_id, params.get("nonce")), loop)
             return future.result(timeout=45)
 
+        def _roster_handler() -> dict:
+            future = asyncio.run_coroutine_threadsafe(self.polling_roster(), loop)
+            return future.result(timeout=45)
+
         self.server = GenerationControlServer(
             self.home, self.paths["socket"],
             verb_handlers={"transfer_requested": _transfer_handler,
                            "transfer_aborted": _abort_handler,
-                           "polling_roster": lambda: {"tokens": sorted(self._telegram_adapters())},
+                           "polling_roster": _roster_handler,
                            "polling_status": self.polling_status})
         if not await self.server.start():
             raise RuntimeError("generation control socket unavailable")
