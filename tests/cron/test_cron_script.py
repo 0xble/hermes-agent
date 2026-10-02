@@ -346,7 +346,10 @@ class TestRunJobScript:
 
         venv = tmp_path / "selected-venv"
         (venv / "bin").mkdir(parents=True)
-        (venv / "bin" / "python").symlink_to(sys.executable)
+        # Point at the real base interpreter. Symlinking the active venv launcher
+        # makes CPython treat that launcher as its own base executable and loses
+        # the stdlib when the synthetic venv is invoked on Python 3.14.
+        (venv / "bin" / "python").symlink_to(sys._base_executable)
         (venv / "pyvenv.cfg").write_text(
             f"home = {Path(sys.base_prefix) / 'bin'}\ninclude-system-site-packages = false\n",
             encoding="utf-8",

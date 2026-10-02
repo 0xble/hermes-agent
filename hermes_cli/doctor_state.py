@@ -550,15 +550,10 @@ def _gh_authenticated() -> bool:
     """Check if gh CLI is authenticated via token file or device flow.
 
     Plain ``gh auth status`` (exit code only): gh 2.98+ dropped the ``authenticated`` JSON
-    field, so ``--json authenticated`` exits 1 even when logged in. Availability is resolved
-    through shutil.which (the same probe every other doctor tool check uses); an OS-level
-    launch failure (a Store/MSIX shim, a deleted binary) reads as "not authenticated" rather
-    than crashing the Skills Hub check.
+    field, so ``--json authenticated`` exits 1 even when logged in. An OS-level
+    launch failure (a Store/MSIX shim, a deleted binary) reads as "not authenticated"
+    rather than crashing the Skills Hub check.
     """
-    from hermes_cli.doctor_tools import _safe_which
-
-    if not _safe_which("gh"):
-        return False
     try:
         result = subprocess.run(["gh", "auth", "status"], capture_output=True, timeout=10)
         return result.returncode == 0
