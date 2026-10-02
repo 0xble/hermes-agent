@@ -858,6 +858,39 @@ def test_wedged_successor_coordinator_lock_is_released_before_rollback_retry(rig
     assert result['rollback']['new_sha'] == rig.a.name
 
 
+def test_dead_wedge_proof_never_signals_if_process_looks_live_again(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+    dead_checks = iter((False, False))
+    escalated = []
+    monkeypatch.setattr(rig.db, '_owner_is_dead', lambda current: next(dead_checks))
+    monkeypatch.setattr(forward, '_await_wedge_proof', lambda *args: 'dead')
+    monkeypatch.setattr('hermes_cli.gateway._escalate_wedged_gateway',
+                        lambda pid, **kwargs: escalated.append(pid) or True)
+
+    death_clock = forward._terminate_proven_wedged(
+        rig.home, rig.db, row, deadline=60, record={})
+
+    assert death_clock == 0
+    assert escalated == []
+
+
+def test_lease_change_during_wedge_probe_never_signals(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+    expected = rig.db.leases()[0]
+    changed = {**expected, 'generation_id': 'other-generation', 'epoch': expected['epoch'] + 1}
+    leases = iter((expected, changed))
+    escalated = []
+    monkeypatch.setattr(forward, '_lease', lambda db: next(leases))
+    monkeypatch.setattr(forward, '_await_wedge_proof', lambda *args: 'wedged')
+    monkeypatch.setattr('hermes_cli.gateway._escalate_wedged_gateway',
+                        lambda pid, **kwargs: escalated.append(pid) or True)
+
+    with pytest.raises(RuntimeError, match='rollback owner changed during wedge probe'):
+        forward._terminate_proven_wedged(rig.home, rig.db, row, deadline=60, record={})
+
+    assert escalated == []
+
+
 def test_crash_after_commit_recovery_observes_instead_of_handover(rig, monkeypatch):
     original = forward.handover_to_generation
     def crash(*args, **kwargs):

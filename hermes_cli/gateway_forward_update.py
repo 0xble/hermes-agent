@@ -804,9 +804,13 @@ def _sqlite_locked(exc):
     return isinstance(exc, sqlite3.OperationalError) and 'database is locked' in str(exc).lower()
 
 
-def _terminate_proven_wedged(home, db, row, deadline, record):
+def _terminate_proven_wedged(home, db, row, deadline, record, *, expected_lease=None):
     """Release a wedged successor's SQLite transaction before coordinator retry."""
     from hermes_cli.gateway import _escalate_wedged_gateway
+    expected_lease = expected_lease or _lease(db)
+    expected = (expected_lease['generation_id'], expected_lease['epoch'], expected_lease['state'])
+    if expected != (row['id'], expected_lease['epoch'], 'active'):
+        raise RuntimeError('rollback owner changed before wedge recovery')
     current = _row(db, row['id'])
     if not db._owner_is_dead(current):
         if not _live(current):
@@ -815,10 +819,13 @@ def _terminate_proven_wedged(home, db, row, deadline, record):
         if proof is None:
             raise RuntimeError('live successor neither handed over nor proved wedged')
         current = _row(db, row['id'])
-        if not db._owner_is_dead(current):
+        if proof == 'wedged' and not db._owner_is_dead(current):
             if not _live(current):
                 raise RuntimeError('successor identity became unknown during probe')
             grace = _remaining(deadline, 5)
+            lease = _lease(db)
+            if (lease['generation_id'], lease['epoch'], lease['state']) != expected:
+                raise RuntimeError('rollback owner changed during wedge probe')
             if not _escalate_wedged_gateway(current['pid'], term_grace=grace,
                     kill_wait=5, deadline=deadline,
                     expected_start_time=float(current['start_fingerprint'].split(':', 1)[1])):
@@ -893,7 +900,15 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
             _discard_reservation(db, record.get('rollback_generation'), supervisor, 'rollback_startup_not_ready')
             raise
         try:
-            death_clock = _terminate_proven_wedged(home, db, current, deadline, record)
+            expected_lease = _lease(db)
+            expected = (expected_lease['generation_id'], expected_lease['epoch'], expected_lease['state'])
+            if expected != (failed['id'], expected_lease['epoch'], 'active'):
+                raise RuntimeError('rollback owner changed before wedge recovery')
+            death_clock = _terminate_proven_wedged(
+                home, db, current, deadline, record, expected_lease=expected_lease)
+            lease = _lease(db)
+            if (lease['generation_id'], lease['epoch'], lease['state']) != expected:
+                raise RuntimeError('rollback owner changed before retry')
             fresh = _resume_launch(db, previous, supervisor, record, 'rollback_generation',
                                    deadline if late or not same_boot else min(deadline, _now() + STARTUP_SECONDS))
         except Exception:
