@@ -107,9 +107,12 @@ class OwnedRouting:
     def _delegation_keys(self):
         # A child finishing is not its result being admitted. Keep the spawning
         # session on A through durable completion delivery, including that gap.
-        from gateway.status import get_process_start_time
+        from gateway.status import get_process_start_time, start_time_fingerprints_match
         pid = self.generation.identity.pid
-        started = get_process_start_time(pid)
+        try:
+            started = get_process_start_time(pid)
+        except Exception:
+            started = None
         served = getattr(self.generation.runner, '_served_profile_homes', None)
         homes = {self.generation.coordinator.home,
                  *(served.values() if isinstance(served, dict) else ())}
@@ -120,9 +123,23 @@ class OwnedRouting:
                 continue
             with closing(sqlite3.connect(f'file:{path}?mode=ro', uri=True)) as conn:
                 if conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone():
-                    keys.update(row[0] for row in conn.execute(
-                        "SELECT origin_session FROM async_delegations WHERE owner_pid=? "
-                        "AND owner_started_at=? AND delivery_state='pending'", (pid, started)) if row[0])
+                    rows = conn.execute(
+                        "SELECT origin_session, owner_started_at FROM async_delegations "
+                        "WHERE owner_pid=? AND delivery_state='pending'", (pid,))
+                    for origin, recorded in rows:
+                        if not origin:
+                            continue
+                        # Unknown ownership metadata must stay with this process. Only a
+                        # clearly mismatched fingerprint proves PID reuse.
+                        if recorded is None or started is None:
+                            keys.add(origin)
+                            continue
+                        try:
+                            matches = start_time_fingerprints_match(recorded, started)
+                        except Exception:
+                            matches = True
+                        if matches:
+                            keys.add(origin)
         return keys
 
     def claim_live(self):
