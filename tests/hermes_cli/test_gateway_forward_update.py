@@ -93,7 +93,7 @@ def rig(tmp_path, monkeypatch):
                                     socket_path=generation_paths(home, identity)['socket'])
         def owns_bootstrap(self, row, scope):
             return self.bootstrap_state(row, scope) == 'owned'
-        def bootstrap_state(self, row, scope):
+        def bootstrap_state(self, row, scope, *, timeout=5):
             if row['label'] not in loaded:
                 return 'unloaded'
             payload = plistlib.loads((self.directory / f"{row['label']}.plist").read_bytes())
@@ -178,6 +178,44 @@ def rig(tmp_path, monkeypatch):
                            events=events, clock=clock, loaded=loaded, alive=alive,
                            transfer_tokens=transfer_tokens, proof_tokens=proof_tokens,
                            armed_fences=armed_fences)
+
+
+def test_ready_bounds_polling_request_and_rejects_late_success(rig, monkeypatch):
+    row = rig.db.generations()[0]
+    identity = forward._identity(row)
+    write_generation_record(generation_paths(rig.home, identity)['state'], identity,
+                            state='serving', socket_path=rig.home / 'gateway.sock')
+    captured = []
+
+    def late_request(request_row, verb, *, timeout=2, params=None):
+        captured.append((request_row['id'], verb, timeout))
+        rig.clock.value += timeout + .1
+        return {'polling': True, 'healthy': True, 'tokens': ['token-hash']}
+
+    monkeypatch.setattr(rig.supervisor, 'request', late_request)
+    assert rig.supervisor.ready(row, deadline=1.0) is False
+    assert captured == [(row['id'], 'polling_status', 1.0)]
+
+
+def test_bootout_bounds_readback_and_rejects_late_unloaded_success(rig, monkeypatch):
+    rig.db._record_failure(rig.old.id, 'test_bootout')
+    row = rig.db.generations()[0]
+    calls = []
+
+    def late_readback(argv, **kwargs):
+        calls.append((argv[1], kwargs['timeout']))
+        if argv[1] == 'print':
+            rig.clock.value += kwargs['timeout'] + .1
+            return SimpleNamespace(returncode=1, stdout='', stderr='Could not find service')
+        assert argv[1] == 'bootout'
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(rig.supervisor, 'runner', late_readback)
+    with pytest.raises(RuntimeError, match='bootout readback failed'):
+        rig.supervisor.bootout(row, timeout=1)
+    assert calls[0] == ('bootout', 1)
+    assert calls[1][0] == 'print'
+    assert calls[1][1] <= 1
 
 
 def promote(rig):

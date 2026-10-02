@@ -141,9 +141,9 @@ def healthy(home: Path, label: str, expected: Path, runner=None) -> bool:
         return False
 
 
-def _launch_state(domain: str, label: str, *, runner=None) -> str:
+def _launch_state(domain: str, label: str, *, runner=None, timeout: float = 5) -> str:
     result = (runner or subprocess.run)(["launchctl", "print", f"{domain}/{label}"],
-                            capture_output=True, text=True, encoding="utf-8", timeout=5)
+                            capture_output=True, text=True, encoding="utf-8", timeout=timeout)
     if result.returncode == 0:
         pid = re.search(r"^\s*pid\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
         last_exit = re.search(r"^\s*last exit (?:code|status)\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)

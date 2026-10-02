@@ -264,8 +264,10 @@ class GenerationSupervisor:
     def bootstrap(self, row, path, timeout, *, before_launch=None):
         self._definition(row['label'])
         domain = self._domain(row['label'])
+        deadline = _now() + min(30, timeout)
         from hermes_cli.gateway_guardian import _launch_state
-        if _launch_state(domain, row['label'], runner=self.runner) != 'unloaded':
+        if _launch_state(domain, row['label'], runner=self.runner,
+                         timeout=_remaining(deadline, 5)) != 'unloaded':
             raise RuntimeError('generation label was already loaded before bootstrap')
         # launchd retains the loaded definition. It needs crash respawn when this
         # standby becomes holder, but SuccessfulExit implies RunAtLoad at login
@@ -282,19 +284,25 @@ class GenerationSupervisor:
                 if before_launch is not None:
                     before_launch(scope)
             bootstrap_generation_plist(domain=domain, plist_path=runtime_path,
-                                       label=row['label'], runner=self.runner, timeout=min(30, timeout),
+                                       label=row['label'], runner=self.runner,
+                                       timeout=_remaining(deadline, 30),
                                        before_launch=bind_scope)
+            if _now() >= deadline:
+                raise RuntimeError('forward update deadline exceeded')
 
     def owns_bootstrap(self, row, scope):
         """Prove an unclaimed loaded job belongs to our interrupted bootstrap."""
         return self.bootstrap_state(row, scope) == 'owned'
 
-    def bootstrap_state(self, row, scope):
+    def bootstrap_state(self, row, scope, *, timeout=5):
+        deadline = _now() + timeout
         result = self.runner(['launchctl', 'print', f"{self._domain(row['label'])}/{row['label']}"],
-                             capture_output=True, text=True, encoding='utf-8', timeout=5)
+                             capture_output=True, text=True, encoding='utf-8',
+                             timeout=_remaining(deadline, 5))
         if result.returncode != 0:
             from hermes_cli.gateway_guardian import _launch_state
-            if _launch_state(self._domain(row['label']), row['label'], runner=self.runner) == 'unloaded':
+            if _launch_state(self._domain(row['label']), row['label'], runner=self.runner,
+                             timeout=_remaining(deadline, 5)) == 'unloaded':
                 return 'unloaded'
             raise RuntimeError('cannot establish interrupted bootstrap ownership')
         def value(name):
@@ -311,12 +319,17 @@ class GenerationSupervisor:
         domain = self._domain(row['label'])
         deadline = _now() + min(15, timeout)
         self.runner(['launchctl', 'bootout', f"{domain}/{row['label']}"],
-                    capture_output=True, timeout=min(15, timeout))
+                    capture_output=True, timeout=_remaining(deadline, 15))
         from hermes_cli.gateway_guardian import _launch_state
-        while _launch_state(domain, row['label'], runner=self.runner) != 'unloaded':
+        while True:
             if _now() >= deadline:
                 raise RuntimeError('generation bootout readback failed')
-            _sleep(min(.05, deadline - _now()))
+            if _launch_state(domain, row['label'], runner=self.runner,
+                             timeout=_remaining(deadline, 5)) == 'unloaded':
+                if _now() >= deadline:
+                    raise RuntimeError('generation bootout readback failed')
+                break
+            _sleep(min(.05, _remaining(deadline, .05)))
         if path.exists():
             self._definition(row['label'])
             path.unlink()
@@ -334,7 +347,7 @@ class GenerationSupervisor:
         if readback['RunAtLoad'] is not active or readback['KeepAlive'] != data['KeepAlive']:
             raise RuntimeError('generation login policy readback failed')
 
-    def ready(self, row):
+    def ready(self, row, *, deadline=None):
         if row['pid'] is None or not _live(row) or row['verdict'] is not None:
             return False
         # This generation-scoped record is published only AFTER the startup gate.
@@ -350,8 +363,11 @@ class GenerationSupervisor:
             # Cold takeover publishes the socket before adapters start. Finish
             # startup inside its existing budget before the short poller proof.
             try:
-                status = self.request(row, 'polling_status')
+                request_timeout = _remaining(deadline, 2) if deadline is not None else 2
+                status = self.request(row, 'polling_status', timeout=request_timeout)
             except RuntimeError:
+                return False
+            if deadline is not None and _now() >= deadline:
                 return False
             return status.get('polling') is True and status.get('healthy') is True and bool(status.get('tokens'))
         return True
@@ -373,7 +389,7 @@ def _wait_ready(db, generation_id, supervisor, deadline):
         row = _row(db, generation_id)
         if row['verdict'] is not None or row['state'] == 'exited':
             raise RuntimeError('standby failed its startup gate')
-        if supervisor.ready(row):
+        if supervisor.ready(row, deadline=deadline):
             return row
         _sleep(min(.2, _remaining(deadline, .2)))
 
@@ -590,7 +606,8 @@ def _resume_launch(db, release, supervisor, record, key, deadline):
     row = _row(db, generation_id)
     launch_needed = not info.get('bootstrap_scope')
     if row['pid'] is None and row['state'] == 'standby' and not launch_needed:
-        state = supervisor.bootstrap_state(row, info['bootstrap_scope'])
+        state = supervisor.bootstrap_state(row, info['bootstrap_scope'],
+                                           timeout=_remaining(deadline, 5))
         if state == 'foreign':
             raise RuntimeError('interrupted bootstrap label belongs to another scope')
         launch_needed = state == 'unloaded'
