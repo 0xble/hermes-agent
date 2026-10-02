@@ -23,6 +23,9 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
+_GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
+
 
 class GatewayGoalsMixin:
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
@@ -270,12 +273,62 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db(label)
         return factory(sid)
 
+    async def _pause_goal_for_stop(self, session_key: str, source: Any) -> bool:
+        """``/stop`` pauses the standing goal and drops its queued continuations (CLI Ctrl+C parity).
+
+        A judge BLOCKED pause is overwritten too: an explicit stop must not be revived by the next
+        user message, only by ``/goal resume``. Best-effort; a failure never breaks the stop.
+        Returns True when a goal was paused by this call.
+        """
+        try:
+            session_id = await asyncio.to_thread(
+                self._lookup_session_id_under_store_lock, self.session_store, session_key)
+        except Exception as exc:
+            logger.debug("goal stop: session lookup failed for %s: %s", session_key, exc)
+            session_id = None
+        adapter = self._delivery_adapter_for(source)
+        with suppress(Exception):
+            self._clear_goal_pending_continuations(session_key, adapter)
+        if not session_id:
+            return False
+        from hermes_cli.goals import GoalManager
+
+        def _pause() -> Optional[str]:
+            mgr = GoalManager(session_id=str(session_id), default_max_turns=self._goal_max_turns_from_config())
+            if not mgr.has_goal():
+                return None
+            if mgr.state.status == "paused" and mgr.state.paused_reason == _GOAL_STOP_PAUSE_REASON:
+                return None
+            mgr.pause(reason=_GOAL_STOP_PAUSE_REASON)
+            return mgr.state.goal
+
+        with self._profile_scope_for_source(source):
+            await self._warm_goals_session_db("goal stop")
+            try:
+                goal = await self._run_in_executor_with_context(_pause)
+            except Exception as exc:
+                logger.warning("goal stop: pause failed for session %s: %s", session_id, exc)
+                return False
+            if not goal:
+                return False
+            logger.info("goal stop: paused standing goal for session %s", session_id)
+            try:
+                await self._send_goal_status_notice(
+                    source, f"⏸ Goal paused: {goal}\nUse /goal resume to continue, or /goal clear to end it.")
+            except Exception as exc:
+                logger.debug("goal stop: notice failed: %s", exc)
+            return True
+
+    def _is_user_turn_event(self, event) -> bool:
+        """An admitted turn the user sent, not a wake, continuation, heartbeat or relayed message."""
+        return not (getattr(event, "internal", False)
+                    or not getattr(event, "allow_gateway_control", True)
+                    or getattr(event, "_heartbeat_session_id", None)
+                    or self._is_goal_continuation_event(event))
+
     async def _revive_blocked_goal_for_user_turn(self, session_entry, source, event) -> None:
         """Resume only after turn admission, independently of model success or delivery."""
-        if (getattr(event, "internal", False)
-                or not getattr(event, "allow_gateway_control", True)
-                or getattr(event, "_heartbeat_session_id", None)
-                or self._is_goal_continuation_event(event)):
+        if not self._is_user_turn_event(event):
             return
         from hermes_cli.goals import GoalManager
 

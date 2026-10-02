@@ -2192,6 +2192,10 @@ class GatewayTurnMixin:
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
+            if self._is_user_turn_event(event):
+                # The user is back: release completions held since their /stop.
+                self._clear_user_stop_latch(session_key)
+                self._clear_user_stop_latch(_quick_key)
             await self._revive_blocked_goal_for_user_turn(session_entry, source, event)
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()

@@ -1411,6 +1411,11 @@ class GatewayNotificationsMixin:
         gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
+        if self._completion_held_by_stop(evt):
+            # Retryable, not refused: the event stays queued until the user's next turn.
+            if raise_not_accepted:
+                raise WakeNotAccepted("session stopped by the user; holding the wake")
+            return False
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
@@ -1492,6 +1497,13 @@ class GatewayNotificationsMixin:
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
+
+    def _completion_held_by_stop(self, evt: dict) -> bool:
+        """True while the event's session is stopped (``/stop``) and the user has not sent a turn."""
+        metadata_key = ""
+        with suppress(Exception):
+            metadata_key = str((evt.get("metadata") or {}).get("gateway_session_key") or "")
+        return self._user_stop_latched(str(evt.get("session_key") or "").strip(), metadata_key.strip())
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
@@ -1733,6 +1745,9 @@ class GatewayNotificationsMixin:
         self, synth_text: str, evt: dict, *, sibling_claims=(),
     ) -> Optional[bool]:
         from gateway.wake import WakeNotAccepted
+        if self._completion_held_by_stop(evt):
+            # Before any durable claim, so holding spends no delivery attempt.
+            return False
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
@@ -1929,6 +1944,8 @@ class GatewayNotificationsMixin:
     async def _deliver_async_delegation_group_scoped(self, group: list[dict]) -> Optional[bool]:
         from gateway.run import _format_gateway_process_notification
         from tools.process_registry import process_registry as _pr
+        if any(self._completion_held_by_stop(evt) for evt in group):
+            return False  # requeued whole; no sibling claim is taken while the session is stopped
         # API delivery does not start a model turn, so there is nothing to coalesce.
         # Keep each unit's stable identity with its row across partial delivery/retry.
         if group and group[0].get("origin_session_id"):
