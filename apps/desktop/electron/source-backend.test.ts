@@ -118,7 +118,11 @@ test.skipIf(process.platform === 'win32')(
         })
       )
 
-      assert.equal(origin.python, fixture.python)
+      // CPython may canonicalize a symlinked launcher before exposing
+      // sys.executable. Compare the interpreter identity after resolving both
+      // spellings, while retaining the exact fixture path in the publication
+      // record above.
+      assert.equal(fs.realpathSync(origin.python), fs.realpathSync(fixture.python))
       assert.ok(origin.module.startsWith(`${fixture.selected}${path.sep}`))
       assert.equal(origin.value, 'selected by PM')
 
