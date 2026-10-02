@@ -2,6 +2,7 @@
 from contextlib import closing
 import json
 import plistlib
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -808,6 +809,53 @@ def test_live_unknown_loop_blocks_without_second_poller_or_forced_move(rig):
     assert rig.db.leases()[0]['generation_id'] == result['new_id']
     assert not any(event[0] == 'bounded-stop' for event in rig.events)
     assert not any(row['state'] == 'serving' and row['id'] != result['new_id'] for row in rig.db.generations())
+
+
+def test_wedged_successor_coordinator_lock_is_released_before_rollback_retry(rig, monkeypatch):
+    """A frozen successor may stop between BEGIN IMMEDIATE and COMMIT on the coordinator."""
+    rig.supervisor.mode = 'wedged'
+    blocker = sqlite3.connect(rig.db.path, timeout=0, isolation_level=None,
+                              check_same_thread=False)
+    armed = False
+    escalated = []
+    wedged_pid = None
+    original_handover = forward.handover_to_generation
+
+    def handover(*args, **kwargs):
+        nonlocal armed, wedged_pid
+        result = original_handover(*args, **kwargs)
+        if not armed:
+            wedged_pid = next(row['pid'] for row in rig.db.generations()
+                              if row['id'] == rig.db.leases()[0]['generation_id'])
+            blocker.execute('BEGIN IMMEDIATE')
+            armed = True
+        return result
+
+    def escalate(pid, **kwargs):
+        escalated.append(pid)
+        blocker.rollback()
+        blocker.close()
+        rig.alive.pop(pid, None)
+        return True
+
+    monkeypatch.setattr(forward, 'handover_to_generation', handover)
+    monkeypatch.setattr('hermes_cli.gateway._escalate_wedged_gateway', escalate)
+    try:
+        result = promote(rig)
+    finally:
+        if armed:
+            try:
+                blocker.rollback()
+            except sqlite3.ProgrammingError:
+                pass
+            try:
+                blocker.close()
+            except sqlite3.ProgrammingError:
+                pass
+    assert result['outcome'] == 'rolled_back', result
+    assert result['failure'] != 'database is locked'
+    assert escalated == [wedged_pid]
+    assert result['rollback']['new_sha'] == rig.a.name
 
 
 def test_crash_after_commit_recovery_observes_instead_of_handover(rig, monkeypatch):
