@@ -21,6 +21,7 @@ from typing import Any
 
 from hermes_constants import get_hermes_home
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
+from hermes_cli.gateway_forward_update import STARTUP_SECONDS
 
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
 INTERVAL = 30
@@ -289,7 +290,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         from hermes_cli.gateway_launchd_generation import refresh_generation_scope
         refresh_generation_scope(plist)
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
-    deadline = time.monotonic() + 12
+    deadline = time.monotonic() + STARTUP_SECONDS
     while time.monotonic() < deadline:
         if _launch_state(domain, label, runner=launchctl_runner) in {"loaded", "parked"} and healthy(home, label, current, launchctl_runner):
             receipt(home, "bootstrap", "repaired", label=label, release=str(current))
@@ -322,7 +323,7 @@ def _repair_parked(home, plist, label, domain, current, launchctl):
         return "cleaned"
     refresh_generation_scope(plist)
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
-    deadline = time.monotonic() + 12
+    deadline = time.monotonic() + STARTUP_SECONDS
     while time.monotonic() < deadline:
         if _launch_state(domain, label, runner=launchctl) == "loaded" and healthy(home, label, current, launchctl):
             receipt(home, "bootstrap", "repaired", label=label, release=str(current))

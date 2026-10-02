@@ -115,3 +115,28 @@ def test_health_probe_uses_injected_launchctl(tmp_path, monkeypatch):
         parents=lambda: [], cwd=lambda: str(release)))
     assert guardian.healthy(home, 'ai.hermes.gateway', release, launchctl)
     assert calls == [['launchctl', 'list', 'ai.hermes.gateway']]
+
+
+@pytest.mark.macos_only
+def test_parked_repair_waits_for_documented_startup_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'boot')
+    home, release = layout(tmp_path)
+    label = 'ai.hermes.gateway'
+    db = GenerationCoordinator(home)
+    old = GenerationIdentity.create(release_sha=release.name, label=label, pid=123,
+        start_fingerprint='123:1', boot_id='boot')
+    db.register(old, state='serving')
+    db.acquire_lease('active_generation', old.id)
+    monkeypatch.setattr('gateway.status._pid_exists', lambda pid: False)
+    monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: 1)
+    plist = tmp_path / 'service.plist'
+    plist.write_bytes(plistlib.dumps({'Label': label, 'WorkingDirectory': str(release),
+        'EnvironmentVariables': {'HERMES_HOME': str(home), 'HERMES_GENERATION_SCOPE': 'old'}}))
+    runner, _calls, _state = fake_launchctl(label, plist, home)
+    clock = [0.0]
+    monkeypatch.setattr(guardian.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(guardian.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(guardian, 'healthy', lambda *args: clock[0] >= 13.0)
+
+    assert guardian.run_once(home, plist, label, grace=12,
+                            domain=f'gui/{os.getuid()}', launchctl_runner=runner) == 'repaired'
