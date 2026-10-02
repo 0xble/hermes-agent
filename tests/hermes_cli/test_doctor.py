@@ -1099,12 +1099,14 @@ class TestGitHubTokenCheck:
         so that invocation exits 1 even for a logged-in user. A logged-in user on
         such a gh must still be reported as authenticated."""
         from hermes_cli import doctor_state
+        from hermes_cli import doctor_tools
 
         def gh_2_98(cmd, **kwargs):
             assert cmd == ["gh", "auth", "status"], cmd
             return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"Logged in to github.com")
 
         monkeypatch.setattr(subprocess, "run", gh_2_98)
+        monkeypatch.setattr(doctor_tools, "_safe_which", lambda cmd: "/usr/bin/gh" if cmd == "gh" else None)
         assert doctor_state._gh_authenticated() is True
 
 
