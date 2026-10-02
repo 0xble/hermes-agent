@@ -30,9 +30,17 @@ class PythonScratchTests(unittest.TestCase):
             for writable in (False, True):
                 original_env = {'PATH': os.defpath, 'HOME': str(original_home / 'isolated-home')}
                 observed = []
+                runner_calls = []
 
                 def observe(command, *, env):
+                    if command[:2] != ['bash', 'scripts/run_tests.sh']:
+                        # Browser admission uses the same isolated environment
+                        # before invoking the file runner, but owns no scratch.
+                        self.assertEqual(env['PLAYWRIGHT_BROWSERS_PATH'], '0')
+                        self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', env)
+                        return
                     self.assertEqual(command, ['bash', 'scripts/run_tests.sh', '-j', '4', '--file-retries', '0', 'tests'])
+                    runner_calls.append(command)
                     if writable:
                         self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', env)
                     else:
@@ -45,10 +53,11 @@ class PythonScratchTests(unittest.TestCase):
 
                 with self.subTest(writable=writable), patch.object(ci, 'python'), patch.object(ci, 'require_wal_capable_sqlite'), patch.object(ci, 'require_tools'), patch.object(ci.sys, 'platform', 'linux'), patch.object(ci.os, 'access', return_value=writable), patch.object(ci.Path, 'home', return_value=original_home), patch.object(ci, 'run', side_effect=observe):
                     ci.python_tests(original_env, ['tests'], 4)
+                    self.assertEqual(len(runner_calls), 1)
                     self.assertNotIn('HERMES_TEST_SCRATCH_ROOT', original_env)
                 for scratch in observed:
                     self.assertFalse(scratch.exists())
-                self.assertEqual(sentinel.read_text(encoding='utf-8'), 'unrelated')
+                self.assertEqual(sentinel.read_text(encoding='utf-8-sig'), 'unrelated')
 
     def test_main_rejects_invalid_scratch_once_before_dispatch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -95,8 +104,10 @@ class PythonScratchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'scripts').mkdir()
-            for name in ('run_tests.sh', 'run_tests_parallel.py'):
+            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
                 shutil.copy2(ROOT / 'scripts' / name, root / 'scripts' / name)
+            (root / 'scripts/ci').mkdir()
+            shutil.copy2(ROOT / 'scripts/ci/list_os_marked_tests.py', root / 'scripts/ci/list_os_marked_tests.py')
             # A bare executable symlink loses relocatable Python's stdlib path
             # on macOS. Use a real, dependency-free venv for the shell boundary.
             subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(root / '.venv')], check=True)
@@ -119,21 +130,23 @@ if __name__ == '__main__':
     print('1 passed in 0.01s')
 ''', encoding='utf-8')
             subprocess.run(['git', 'init', '-q', str(root)], check=True)
-            env = dict(os.environ, HOME=str(root / 'home'), HERMES_TEST_SCRATCH_ROOT=str(scratch), OPENAI_API_KEY='must-not-forward')
+            env = dict(os.environ, HOME=str(root / 'home'), HERMES_TEST_SCRATCH_ROOT=str(scratch), OPENAI_API_KEY='must-not-forward', HERMES_PYTHON=str(root / '.venv/bin/python'))
             result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=root, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('1 tests passed', result.stdout)
             self.assertTrue(scratch.is_dir())
             self.assertEqual(list(scratch.iterdir()), [])
 
-    def test_linked_worktree_uses_the_primary_checkout_venv(self):
+    def test_linked_worktree_honors_explicit_primary_test_interpreter(self):
         # Worktrees under .worktrees/<name> have no venv of their own. Before this probe the
         # runner exited "no virtualenv with pytest found", so reviewers could not run tests.
         with tempfile.TemporaryDirectory() as directory:
             primary = Path(directory) / 'primary'
             (primary / 'scripts').mkdir(parents=True)
-            for name in ('run_tests.sh', 'run_tests_parallel.py'):
+            for name in ('run_tests.sh', 'run_tests_parallel.py', '_activation.sh'):
                 shutil.copy2(ROOT / 'scripts' / name, primary / 'scripts' / name)
+            (primary / 'scripts/ci').mkdir()
+            shutil.copy2(ROOT / 'scripts/ci/list_os_marked_tests.py', primary / 'scripts/ci/list_os_marked_tests.py')
             (primary / 'tests').mkdir()
             (primary / 'tests/test_probe.py').write_text('def test_probe(): pass\n', encoding='utf-8')
             git = ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-C', str(primary)]
@@ -149,6 +162,7 @@ if __name__ == '__main__':
                                             encoding='utf-8')
             env = {key: value for key, value in os.environ.items() if key != 'HERMES_PYTHON'}
             env['HOME'] = str(Path(directory) / 'home')
+            env['HERMES_PYTHON'] = str(primary / '.venv/bin/python')
             result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', 'tests'], cwd=worktree, env=env,
                                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -86,6 +86,7 @@ def _run(root: Path, name: str, case: Case) -> Outcome:
     home = nh.make_home(root / name, hermes_model(), env_file=HERMES_ENV,
                         extra_config={"agent": {"api_max_retries": case.max_retries}})
     with GeminiFake(root / name / "fake", case.script, route=case.route) as fake:
+        fake.configure_home(home.hermes_home)
         result = nh.run_chat(home, f"Say hello ({name}).", env=fake.child_env())
         calls = fake.generate_calls()
     return Outcome(result, calls, nh.messages(home))

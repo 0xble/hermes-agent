@@ -363,6 +363,30 @@ async def test_shutdown_notifications_have_one_aggregate_deadline(monkeypatch):
     await runner._stop_begin_teardown(ctx)
     assert entered.is_set()
     assert time.monotonic() - started < 5.0
+@pytest.mark.asyncio
+async def test_shutdown_home_channel_broadcast_carries_interim_marker():
+    """Active-chat and home-channel shutdown sends are interim sends (#98432): a
+    stream-is-the-message adapter must not seal an in-flight answer with the advisory,
+    including when the home channel has no thread routing metadata."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="active-42", chat_type="dm")
+    session_key = build_session_key(source)
+
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    targets = [c.args[0] for c in adapter.send.await_args_list]
+    assert targets == ["active-42", "home-42"]
+    for call in adapter.send.await_args_list:
+        assert call.kwargs["metadata"]["_interim_send"] is True
 
 
 @pytest.mark.asyncio

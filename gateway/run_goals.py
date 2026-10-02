@@ -595,7 +595,7 @@ class GatewayGoalsMixin:
         store — a ``/loop`` set from a secondary profile's chat would never fire. Every served
         profile's store is scanned under its own runtime scope (same shape as ``_handoff_watcher``),
         and each hit is fired against that profile's adapters."""
-        from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes
+        from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
         from gateway.run_idle_gates import profile_has_active_loop, profile_has_parked_goal
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
@@ -638,7 +638,9 @@ class GatewayGoalsMixin:
                 await asyncio.sleep(interval)
                 continue
             try:
-                for profile_name, profile_home in _handoff_watch_scopes(self):
+                # Multiplex resolution walks the filesystem off-loop; a stalled walk on the loop
+                # trips the loop-liveness watchdog (exit 75).
+                for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
                     if getattr(self, "_overlap_draining", False):
                         break
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds

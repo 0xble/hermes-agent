@@ -315,7 +315,7 @@ def _socket_accepts_connections(socket_path: Path) -> bool:
 
 def _generation_owner_is_dead(socket_path: Path) -> bool:
     try:
-        owner = json.loads(_generation_socket_owner_path(socket_path).read_text(encoding="utf-8"))
+        owner = json.loads(_generation_socket_owner_path(socket_path).read_text(encoding="utf-8-sig"))
         pid = int(owner["pid"])
         expected_start = owner.get("start_time")
         from gateway.status import _get_process_start_time, _pid_exists

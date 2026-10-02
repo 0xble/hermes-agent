@@ -101,7 +101,7 @@ def _maintenance_texts(revision: str = "HEAD") -> list[str]:
     if revision == "HEAD":
         root = REPO / MAINTENANCE_ROOT
         units = sorted((REPO / MAINTENANCE_DIR).glob("*.md")) if (REPO / MAINTENANCE_DIR).is_dir() else []
-        return [p.read_text(encoding="utf-8") for p in [root, *units] if p.is_file()]
+        return [p.read_text(encoding="utf-8-sig") for p in [root, *units] if p.is_file()]
     names = _git("ls-tree", "--name-only", revision, "--", MAINTENANCE_ROOT, f"{MAINTENANCE_DIR}/").split("\n")
     paths = [n for n in names if n == MAINTENANCE_ROOT or (n.startswith(f"{MAINTENANCE_DIR}/") and n.endswith(".md"))]
     return [_git("show", f"{revision}:{n}") for n in sorted(paths)]
@@ -275,7 +275,7 @@ def check_receipt(home: Path) -> list[str]:
     if not latest.is_file():
         return []  # no promotion has happened through hermes update yet; nothing to compare
     try:
-        receipt = json.loads(latest.read_text(encoding="utf-8"))
+        receipt = json.loads(latest.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         return [f"update receipt unreadable: {exc}"]
     if not isinstance(receipt, dict) or not {"outcome", "post_update"} <= set(receipt):

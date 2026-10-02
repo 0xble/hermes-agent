@@ -6,11 +6,15 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.24 + qualified checkpoint`, `ca6782850432927f33df4775cb6dd45bb51460d2`.
-Brian explicitly selected this exact upstream checkpoint on 2026-09-25 for
-one sync and personal-runtime promotion. It contains released baseline
-`v2026.9.24` (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) plus 256 upstream
-commits, with successful upstream CI run `36022678358` and over 24 hours of age.
+`v2026.9.24 + qualified checkpoint`, `eb8d21f482142c236550762ebdb5df4004c39696`.
+Brian authorized a newer stable pre-tip checkpoint on 2026-09-30 for one
+sync and personal-runtime promotion. This selected checkpoint retains prior
+`ca6782850432927f33df4775cb6dd45bb51460d2` and released baseline
+`v2026.9.24` (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) as ancestors.
+Upstream CI run `36801643187` succeeded in every substantive lane, with no
+cancelled lanes. The selected revision was 86 commits before frozen upstream
+tip `484ebdf16a5127894f16ba883e9630968f945c5e`. Fork qualification and
+independent exact-head review remain required before promotion.
 This one-run non-release exception does not change recurring release selection
 or waive fork tests, independent review, protected landing, or backup safeguards.
 
@@ -50,6 +54,8 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |
+| Launchd account home | Keep service labels and plist placement on the same real account identity even when process HOME changes | Service naming, sandbox gateway startup or launchd profile ownership | [Launchd account home](maintenance/launchd-account-home.md) |
+| Build store dependencies | Resolve package hook dependencies from the caller-owned build store, with scoped cleanup and ordinary sealed-store fallback | PM install lifecycle, dependency lookup, archived web builds, or ARM64 Windows ripgrep staging | [Build store dependencies](maintenance/build-store-dependencies.md) |
 | TTS discovery without installation | Defer optional SDK installation until TTS use instead of blocking unrelated turns | TTS capability registration, lazy SDK imports, or tool-schema discovery changes | [TTS discovery](maintenance/tts-discovery-no-install.md) |
 | Goal lifecycle | Complete judge criteria, conversational recovery of blocker pauses, and durable command authority during judging | Goal judging, admission, continuation, or concurrent goal-command changes | [Goal lifecycle](maintenance/goal-lifecycle.md) |
 | Parked goal idle wake | A parked goal resumes when its wait ends, even when no completion turn arrives (restart-killed process, no notify, elapsed timer) | Goal wait barriers, the gateway loop wakeup watcher, TUI notification poller, or restart process cleanup changes | [Parked goal idle wake](maintenance/goal-parked-idle-wake.md) |

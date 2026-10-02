@@ -122,7 +122,7 @@ async def test_claimed_spool_survives_until_replay_acceptance(tmp_path, monkeypa
     elif outcome == "raise":
         adapter.handle_message = AsyncMock(side_effect=RuntimeError("dispatch failed"))
     else:
-        adapter.handle_message = AsyncMock()
+        adapter.handle_message = AsyncMock(side_effect=lambda event: setattr(event, "_gateway_accepted", True))
     assert await runner._drain_startup_restore_queue() == (1 if outcome == "accepted" else 0)
     assert path.exists() == (outcome != "accepted")
     if outcome != "accepted":
@@ -282,7 +282,7 @@ async def test_offline_followup_retried_on_primary_reconnect(tmp_path, monkeypat
     runner._redeliver_failed_obligations_for_platform = AsyncMock()
     runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
     runner._await_startup_warmup = AsyncMock()
-    adapter.handle_message = AsyncMock()
+    adapter.handle_message = AsyncMock(side_effect=lambda event: setattr(event, "_gateway_accepted", True))
     await runner._install_reconnected_adapter(source.platform, adapter)
     await runner._reconnect_spool_tasks[source.platform]
     assert not list((tmp_path / "pending_messages").glob("*.json"))
@@ -420,6 +420,7 @@ async def test_reconnect_during_boot_drain_replays_owned_followup_first(tmp_path
             started.set()
             await release.wait()
         seen.append(event.text)
+        event._gateway_accepted = True
 
     adapter.handle_message = handle
     reconnect = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))

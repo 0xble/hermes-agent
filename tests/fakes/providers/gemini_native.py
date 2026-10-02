@@ -4,8 +4,8 @@ TLS boundary.
 Hermes routes to its native Gemini adapter only for the real Google host
 (``generativelanguage.googleapis.com``), so the fake is reached the way any corporate egress
 proxy would be: an HTTPS ``CONNECT`` proxy on loopback that terminates TLS for the Google host
-with a leaf certificate signed by a throwaway CA. The child trusts that CA through the standard
-``SSL_CERT_FILE`` / ``REQUESTS_CA_BUNDLE`` channel and reaches the proxy through
+with a leaf certificate signed by a throwaway CA. The child trusts that CA through explicit
+provider ``ssl_ca_cert`` configuration and reaches the proxy through
 ``HTTPS_PROXY`` (see :meth:`GeminiFake.child_env`). Every other host is refused and recorded,
 so a test also proves the turn made no other egress.
 
@@ -478,6 +478,17 @@ class GeminiFake:
                 "HTTP_PROXY": self.proxy_url, "http_proxy": self.proxy_url,
                 "NO_PROXY": "", "no_proxy": "",
                 "SSL_CERT_FILE": ca, "REQUESTS_CA_BUNDLE": ca, "CURL_CA_BUNDLE": ca}
+
+    def configure_home(self, home: Path) -> None:
+        """Declare this test endpoint's CA through Hermes' provider TLS contract."""
+        import hermes_yaml as yaml
+        path = home / "config.yaml"
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+        base_url = cfg["model"].get("base_url") or "https://generativelanguage.googleapis.com/v1beta"
+        cfg.setdefault("providers", {})["gemini-test-tls"] = {
+            "base_url": base_url, "ssl_ca_cert": str(self.ca_pem),
+        }
+        path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
 
     # views ------------------------------------------------------------------------------------
     def generate_calls(self) -> list[Recorded]:

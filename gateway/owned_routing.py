@@ -138,12 +138,17 @@ class OwnedRouting:
             str(event.platform_update_id), "message", envelope, payload,
             self.generation.identity.id, self.generation.epoch)
         if row["owner_id"] == self.generation.identity.id:
+            scope = (self.generation.identity.id, home, identity.runtime_profile,
+                     identity.transport_profile, key, event.platform_update_id,
+                     event.source.user_id, event.source.chat_id, event.source.thread_id)
             if not fresh:
                 return not (row["payload"] == b"{}" and
+                            getattr(event, "_owned_local_scope", None) == scope and
                             getattr(event, "_owned_local_pending", None) == row["id"])
             if row["payload"] != b"{}":
                 return True  # An earlier replay row owns this lane; drain in sequence.
             event._owned_local_pending = row["id"]
+            event._owned_local_scope = scope
             return False
         return True
 

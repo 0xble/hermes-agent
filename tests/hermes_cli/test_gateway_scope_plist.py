@@ -89,7 +89,7 @@ def test_refresh_scope_changes_only_bootstrap_nonce(tmp_path, monkeypatch):
     assert not gateway_launchd._forward_only_plist(path)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_service_plist_pins_release_and_ignores_nonce_for_staleness(tmp_path, monkeypatch):
     from hermes_cli import gateway
     home = tmp_path / 'profile'

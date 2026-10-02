@@ -87,6 +87,7 @@ def run(tmp_path_factory: pytest.TempPathFactory) -> Run:
         Text(ANSWER_2, prompt_tokens=3_000),
     ]
     with GeminiFake(root / "fake", script, route=_summary_route) as fake:
+        fake.configure_home(home.hermes_home)
         # Outcomes are asserted by the tests (a rejected request must name the broken contract).
         first = nh.run_chat(home, "Read big1.txt and big2.txt.", env=fake.child_env())
         second = nh.run_chat(home, "Now read big3.txt, then echo the marker.", env=fake.child_env(),

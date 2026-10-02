@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 OMIT_TEMPERATURE = object()
 
 
+def _versioned_user_agent(prefix: str) -> str:
+    """Resolve canonical identity only when a client or request needs its UA."""
+    from hermes_cli.version_info import get_version_info
+
+    return f"{prefix}/{get_version_info().base_version}"
+
+
 def _profile_user_agent() -> str:
     """Return a ``hermes-cli/<version>`` UA string, with a stable fallback.
 
@@ -32,8 +39,7 @@ def _profile_user_agent() -> str:
     (OpenCode Zen, etc.) sit behind a WAF that returns 403 for that.
     """
     try:
-        from hermes_cli import __version__ as _ver  # lazy: avoid layer cycle at import time
-        return f"hermes-cli/{_ver}"
+        return _versioned_user_agent("hermes-cli")
     except Exception:
         return "hermes-cli"
 
@@ -127,6 +133,8 @@ class ProviderProfile:
 
     # ── Client-level quirks (set once at client construction) ─
     default_headers: dict[str, str] = field(default_factory=dict)
+    # Dynamic identity belongs at header use, never in metadata discovery.
+    default_headers_factory: Callable[[], dict[str, str]] | None = None
 
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send
@@ -144,6 +152,13 @@ class ProviderProfile:
     model_capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # ── Hooks (override in subclass for complex providers) ───
+
+    def get_default_headers(self) -> dict[str, str]:
+        """Return fresh client/catalog headers, resolving optional dynamic values."""
+        headers = dict(self.default_headers)
+        if self.default_headers_factory is not None:
+            headers.update(self.default_headers_factory())
+        return headers
 
     def fetch_account_usage(
         self, *, base_url: str | None = None, api_key: str | None = None
@@ -367,7 +382,7 @@ class ProviderProfile:
           3. self.base_url + "/models"  (standard OpenAI-compat fallback)
 
         The default implementation sends Bearer auth when api_key is given
-        and forwards self.default_headers. Override to customise auth, path,
+        and forwards self.get_default_headers(). Override to customise auth, path,
         response shape, or to return None for providers with no REST catalog.
 
         Callers must always fall back to the static _PROVIDER_MODELS list
@@ -402,14 +417,16 @@ class ProviderProfile:
         # the default ``Python-urllib/<ver>`` User-Agent.  Set a generic
         # hermes-cli UA so the catalog endpoint is reachable.
         req.add_header("User-Agent", _profile_user_agent())
-        for k, v in self.default_headers.items():
+        for k, v in self.get_default_headers().items():
             req.add_header(k, v)
 
         try:
             with open_credentialed_url(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
             items = data if isinstance(data, list) else data.get("data", [])
-            return [m["id"] for m in items if isinstance(m, dict) and "id" in m]
+            from hermes_cli.chat_catalog import chat_catalog_ids
+
+            return chat_catalog_ids(items)
         except Exception as exc:
             logger.debug("fetch_models(%s): %s", self.name, exc)
             return None

@@ -6,6 +6,17 @@ or publisher service. `bin/ci setup` only installs dependencies. `bin/ci check`
 checks an existing setup. `bin/ci list` describes the seven default lanes.
 `bin/ci check --lane node` is explicitly partial evidence, never a full pass.
 
+The desktop E2E workflow installs the same Python 3.14.7 it selects for sync.
+Desktop typechecking includes test sources, so native filesystem test helpers
+must import the operations they call even when the test runs only on Linux.
+Update receipt tests bind ContextVars through their scope and isolate ownership
+lookup from the host's managed test-interpreter installation. Production ownership
+resolution has its separate invariant test. These corrections remain within
+`fork-ci-reliability`.
+The native Telegram cancel-before-entry test awaits its task callback rendezvous
+before asserting admission release. PTB stop and an already completed Task do not
+by themselves drain registered callbacks. The production admission code is unchanged.
+
 The full gate runs all selected lanes and returns nonzero if any fails. Within
 static checks and container lint, independent commands also aggregate failures.
 A setup failure stops the gate because dependencies are not qualified. The
@@ -48,9 +59,9 @@ The public fork runs ten hosted Linux Python/E2E shards on both PR and nightly. 
 ## Tools and Linux image
 
 Exact CLI versions are declared in `scripts/ci/toolchain.json`. Python uses the
-repository's 3.11 line with a fixed CI patch. Root Python and Node dependencies
-use their existing locks. Docs Python tools are ascii-guard 2.3.0 and PyYAML
-6.0.3. The bootstrap application now tracks Cargo.lock and runs `cargo test
+repository's Python 3.14 line with a fixed CI patch. Root Python and Node dependencies
+use their existing locks. Docs Python tools are ascii-guard 2.3.0 and ruamel.yaml
+0.18.16, matching the repository YAML reader. The bootstrap application now tracks Cargo.lock and runs `cargo test
 --locked --lib`. The first lock captures the existing manifest's 553-package
 resolution, without changing manifest dependency bounds. Linux arm64
 qualification compiled the locked graph and passed all 68 library tests.
@@ -139,8 +150,8 @@ required fork statuses. Linux success does not qualify macOS or Windows.
 `nightly.yml` runs `bin/ci nightly-native <sha>` at the exact scheduled or
 dispatched SHA on hosted `macos-26` (arm64) and `windows-2025-vs2026`; both matrix jobs
 must pass for nightly `qualification`. The PR gate remains Linux-only. The
-native profile performs setup and selects files with `macos_only` or
-`windows_only` through `scripts/ci/list_os_marked_tests.py`, then runs the
+native profile performs setup and selects files covering `macos` or
+`windows` through `scripts/ci/list_os_marked_tests.py`, then runs the
 canonical Python harness with that marker and `not integration`. Empty selection
 is a failure. Windows also runs the existing long-path, Node-compatibility and
 uv-shim installer scripts under both `powershell` 5.1 and `pwsh` 7. Linux cannot
@@ -191,3 +202,18 @@ full Python roots. Historical outcomes in `fork-ci.md` remain historical, not
 current qualification. No installed Hermes runtime is checked or promoted here.
 
 The documentation environment bootstrap preserves its existing checkout-local venv with `uv venv --allow-existing`, so running setup before gate or repeating gate does not fail merely because `.ci/docs-venv` exists. Pinned documentation packages are installed on every setup.
+
+
+## Pre-Tip Checkpoint Adaptation (2026-09-30)
+
+The explicit checkpoint exception imports upstream Python 3.14 and the native PM tool owner. Native OS selection lists files covering the actual host, then selects `platforms` tests. Optional memory SDK integration is the `hindsight` extra. The separate `hindsight-embedded` extra opts into the embedded server and is not inferred from incidental shared transitive distributions. Immutable staging preserves declared extras and all active plugin entry points, and validates enabled plugin imports before activation.
+
+Release, signing, store publishing and channel promotion workflows remain removed under the fork workflow policy. Tests whose entire owner disappeared are retired with that owner. Generic archive/link, SHA admission, ancestry and receipt security tests remain. Workflow policy coverage remains in `scripts/ci/tests/test_portable.py` and `tests/ci/test_workflow_job_graph.py`. The resumable reconciliation evidence records each removed test owner and partial retirement separately.
+
+## Native Checkpoint Fixture Boundaries
+
+Release-publication corruption tests call the actual `scripts.bundles.release_artifacts promote` and builds-table CLI owners. Termux build tests call the native build driver directly. Neither depends on a deleted Actions workflow. Archive fixtures force-add their declared local wheel directory, so a contributor's global Git ignore cannot silently remove the fixture dependency from the archived source. Python payload signing requires both a Darwin host and a Darwin target.
+
+Host-specific cases use one native `platforms` marker. Real profile and adapter constructors, explicit selected-payload ownership, an empty completion-parent venv, interpreter-reported base prefixes, and event-controlled probes replace obsolete environment assumptions. Concurrent local transfer fixtures use a threaded HTTP server, preserving the production resolver's IPv4/IPv6 connection behavior. Memory tests exercise actual provider SDK admission and the Hindsight no-install hot-path contract instead of removed dependency bookkeeping. These are fixture adaptations, not waivers of the portable gate or native qualification.
+
+The startup-gate config read uses the repository-required `utf-8-sig` decoding policy. Its safe YAML parser already accepts a BOM, so this correction is a source-policy alignment, not a reproduced runtime decoding failure. The existing public A→B→A startup invariant exercises BOM and BOM-less configurations. Mutable startup-gate fixtures use upstream's `hermes_yaml` owner rather than the removed PyYAML dependency. The historical frozen outbox fixture remains unchanged and its child receives the actual `pyyaml==6.0.3` dependency from that release in a disposable local dependency directory. It does not restore PyYAML to the current runtime or substitute a fake module.

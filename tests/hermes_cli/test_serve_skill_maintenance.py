@@ -2,6 +2,7 @@
 import asyncio
 import json
 from contextlib import suppress
+from queue import Queue
 
 import pytest
 
@@ -10,8 +11,10 @@ import pytest
 async def test_removed_sessions_keep_profile_idle_watermark(tmp_path, monkeypatch):
     import time
     from pathlib import Path
+    from types import SimpleNamespace
 
     import tui_gateway.server as gateway
+    import hermes_cli.web_server_sessions as web_server_sessions
     from agent.curator import load_state, save_state
     from hermes_cli.web_server_sessions import _auto_archive_ticker_loop, _skill_maintenance_idle_for
 
@@ -22,17 +25,25 @@ async def test_removed_sessions_keep_profile_idle_watermark(tmp_path, monkeypatc
         "curator:\n  enabled: true\n  interval_hours: 168\n"
         "  min_idle_hours: 0.002\n  prune_builtins: false\n", encoding="utf-8")
     save_state({"last_run_at": "2020-01-01T00:00:00+00:00", "run_count": 0})
-    # Let the actual timer age past its idle threshold before recent activity.
+    # Advance the maintenance clock by phase. Slow session finalization must
+    # not change the activity watermark or implicitly advance this scenario.
+    clock = {"now": time.time()}
+    monkeypatch.setattr(web_server_sessions, "time", SimpleNamespace(
+        time=lambda: clock["now"], monotonic=time.monotonic))
+    # Keep the real timer close to its first sweep before recent activity.
     task = asyncio.create_task(_auto_archive_ticker_loop(interval_s=.05, initial_delay_s=8))
     try:
         await asyncio.sleep(7.5)
         for reason in ("tui_close", "ws_orphan_reap"):
-            recent = time.time()
+            recent = clock["now"]
             with gateway._sessions_lock:
                 gateway._sessions["watermark"] = {
                     "last_active": recent, "running": False, "profile_home": str(tmp_path)}
             assert gateway._close_session_by_id("watermark", end_reason=reason)
-            assert _skill_maintenance_idle_for(recent - 3600) < 2
+            with gateway._sessions_lock:
+                assert gateway._closed_session_activity[str(tmp_path.resolve())] == recent
+            clock["now"] = recent + 1
+            assert _skill_maintenance_idle_for(recent - 3600) == 1
         # An active sibling profile must not hold this profile's idle clock.
         with gateway._sessions_lock:
             gateway._sessions["other-profile"] = {
@@ -40,6 +51,7 @@ async def test_removed_sessions_keep_profile_idle_watermark(tmp_path, monkeypatc
         assert _skill_maintenance_idle_for(recent - 3600) is not None
         await asyncio.sleep(2)
         assert load_state()["run_count"] == 0
+        clock["now"] = recent + 0.002 * 3600 + 1
         async with asyncio.timeout(12):
             while "consolidation off" not in (load_state().get("last_run_summary") or ""):
                 await asyncio.sleep(.05)
@@ -61,20 +73,32 @@ async def test_serve_timer_runs_due_curator_once_and_honors_pause(tmp_path, monk
         "curator:\n  enabled: true\n  consolidate: false\n  interval_hours: 168\n"
         "  min_idle_hours: 0\n  prune_builtins: false\n", encoding="utf-8")
     from agent.curator import load_state, save_state, set_paused
-    from hermes_cli.web_server_sessions import _auto_archive_ticker_loop
+    import hermes_cli.web_server_sessions as web_server_sessions
+
+    ticks = Queue()
+    original_maintenance = web_server_sessions._maybe_run_skill_maintenance
+
+    def observed_maintenance(started_at):
+        try:
+            return original_maintenance(started_at)
+        finally:
+            ticks.put(None)
+
+    monkeypatch.setattr(web_server_sessions, "_maybe_run_skill_maintenance", observed_maintenance)
 
     save_state({"last_run_at": "2020-01-01T00:00:00+00:00", "run_count": 0, "paused": True})
-    task = asyncio.create_task(_auto_archive_ticker_loop(interval_s=.02, initial_delay_s=0))
+    task = asyncio.create_task(web_server_sessions._auto_archive_ticker_loop(
+        interval_s=.02, initial_delay_s=0))
     try:
-        await asyncio.sleep(.15)
+        await asyncio.to_thread(ticks.get, True, 8)
         assert load_state()["run_count"] == 0
-        set_paused(False)
         # Active turns must suppress maintenance even with a zero idle threshold.
         import tui_gateway.server as gateway
         with gateway._sessions_lock:
             gateway._sessions['maintenance-test'] = {"running": True}
+        set_paused(False)
         try:
-            await asyncio.sleep(.15)
+            await asyncio.to_thread(ticks.get, True, 8)
             assert load_state()["run_count"] == 0
         finally:
             with gateway._sessions_lock:

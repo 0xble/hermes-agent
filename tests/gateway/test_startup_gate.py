@@ -275,7 +275,7 @@ def worker_provider(tmp_path, monkeypatch):
         sessions_dir=home / "sessions", overlap_handover_enabled=True)
 
     def write_config(deadline=45):
-        import yaml
+        import hermes_yaml as yaml
         if deadline is None:
             config["gateway"]["overlap_handover"].pop("startup_gate_timeout_seconds", None)
         else:
@@ -435,6 +435,12 @@ def test_previous_release_outbox_reads_writes_and_never_recovers_synthetic(tmp_p
     frozen = module.read_bytes().split(b"\n", 2)[2]
     blob = b"blob " + str(len(frozen)).encode("ascii") + b"\0" + frozen
     assert hashlib.sha1(blob).hexdigest() == "2756ddb96103628a366db3672e91569e1cf0a119"
+    # Frozen 738c502c code requires its actual PyYAML pin, which current Hermes
+    # replaced with hermes_yaml. Keep that dependency local to this old-code probe.
+    legacy_site = tmp_path / "legacy-site"
+    subprocess.run(["uv", "pip", "install", "--python", sys.executable,
+                    "--target", str(legacy_site), "--no-deps", "pyyaml==6.0.3"],
+                   check=True, capture_output=True, text=True, timeout=60)
     store = Outbox(tmp_path / "shared")
     store.enqueue_synthetic("compat", {"content": "compat", "chat_id": "loopback:compat"})
     with store._connect() as db:
@@ -444,6 +450,7 @@ def test_previous_release_outbox_reads_writes_and_never_recovers_synthetic(tmp_p
 import asyncio, importlib.util, json, sys
 from pathlib import Path
 from unittest.mock import AsyncMock
+sys.path.insert(0, sys.argv[4])
 spec = importlib.util.spec_from_file_location('old_release_outbox', sys.argv[1])
 old = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = old
@@ -461,9 +468,10 @@ store.receipt(row, message_id='old-receipt', success=True)
 assert store.all_rows()[1].state == 'delivered'
 print(json.dumps({'release': sys.argv[3], 'synthetic_recovered': False, 'old_write': 'delivered'}))
 """
-    completed = subprocess.run([sys.executable, "-c", code, str(module), str(store.path.parent), release],
-                               check=True, capture_output=True, text=True,
+    completed = subprocess.run([sys.executable, "-c", code, str(module), str(store.path.parent), release, str(legacy_site)],
+                               capture_output=True, text=True,
                                cwd=Path(__file__).resolve().parents[2])
+    assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["old_write"] == "delivered"
     with store._connect() as db:
         assert db.execute("SELECT sql FROM sqlite_master WHERE name='outbox'").fetchone()[0] == schema
@@ -487,19 +495,23 @@ async def test_custom_session_storage_does_not_change_gate_profile_owner(worker_
 
 @pytest.mark.asyncio
 @pytest.mark.live_system_guard_bypass  # All three disposable groups are created by this fixture.
-async def test_profile_owner_is_bound_for_each_probe_a_b_a(worker_provider):
+@pytest.mark.parametrize("bom", [False, True])
+async def test_profile_owner_is_bound_for_each_probe_a_b_a(worker_provider, bom):
     from gateway.startup_gate import run_startup_gate
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import is_multiplex_active, set_multiplex_active
-    import yaml
+    import hermes_yaml as yaml
 
     runner, _, homes, _, _ = worker_provider
     home_a = runner.config.sessions_dir.parent
+    if bom:
+        config_a_path = home_a / "config.yaml"
+        config_a_path.write_text("\ufeff" + config_a_path.read_text(encoding="utf-8-sig"), encoding="utf-8")
     home_b = home_a.parent / "profile-b"
     home_b.mkdir()
     config_b = dict(runner.user_config)
     config_b["model"] = {**config_b["model"], "default": "gate-fixture-b", "api_key": "fixture-b"}
-    (home_b / "config.yaml").write_text(yaml.safe_dump(config_b), encoding="utf-8")
+    (home_b / "config.yaml").write_text(("\ufeff" if bom else "") + yaml.safe_dump(config_b), encoding="utf-8")
     was_multiplex = is_multiplex_active()
     set_multiplex_active(True)
     try:
@@ -575,7 +587,7 @@ def test_worker_never_refreshes_near_expiry_rotating_owner_oauth(tmp_path, monke
     import subprocess
     import sys
     import time
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli import auth
 
     owner = tmp_path / "owner"
