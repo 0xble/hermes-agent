@@ -93,8 +93,9 @@ def test_sibling_does_not_cross_profiles():
 
 
 class _StoreEntry:
-    def __init__(self, session_key):
+    def __init__(self, session_key, origin=None):
         self.session_key = session_key
+        self.origin = origin
 
 
 class _FakeStore:
@@ -103,6 +104,15 @@ class _FakeStore:
 
     def get_or_create_session(self, source):
         return _StoreEntry(self._key)
+
+
+class _OriginStore(_FakeStore):
+    def __init__(self, session_key, entries):
+        super().__init__(session_key)
+        self._entries = entries
+
+    def lookup_by_session_key(self, session_key):
+        return self._entries.get(session_key)
 
 
 @pytest.mark.asyncio
@@ -128,6 +138,33 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 
     assert interrupted == []
     assert "no active" in str(getattr(result, "text", result)).lower()
+
+
+@pytest.mark.asyncio
+async def test_stop_pauses_sibling_goal_through_its_own_source():
+    caller = _thread_source("userA")
+    sibling = _thread_source("userB")
+    key_a = _per_user_key("userA")
+    key_b = _per_user_key("userB")
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {key_b: _FakeAgent()}
+    runner.session_store = _OriginStore(
+        key_a, {key_b: _StoreEntry(key_b, origin=sibling)}
+    )
+    runner._is_user_authorized_for_source = lambda source, **kw: True
+    runner.adapters = {}
+    interrupted = []
+
+    async def _fake_interrupt(session_key, source, *, interrupt_reason, invalidation_reason):
+        interrupted.append((session_key, source.user_id))
+
+    runner._interrupt_and_clear_session = _fake_interrupt
+    result = await runner._handle_stop_command(
+        MessageEvent(text="/stop", message_type=MessageType.TEXT, source=caller)
+    )
+
+    assert interrupted == [(key_b, "userB")]
+    assert "Stopped" in str(getattr(result, "text", result))
 
 
 # ---------------------------------------------------------------------------

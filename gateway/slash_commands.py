@@ -23,7 +23,7 @@ from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent
-from gateway.session import AsyncSessionStore
+from gateway.session import AsyncSessionStore, SessionSource
 from gateway.session_transcript import TranscriptReadError
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 from gateway.slash_commands_model import GatewayModelCommandsMixin
@@ -458,9 +458,29 @@ class GatewaySlashCommandsMixin(
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
+        async def _source_for_key(key: str) -> SessionSource:
+            """Recover the delivery source that owns a sibling run.
+
+            Chat-scoped stops can interrupt a run whose key carries another participant or
+            thread.  Reusing the caller's source would send that run's goal-pause notice to the
+            wrong thread.  Active turns cache their source, while the routing entry is the durable
+            fallback for runs that predate the cache.
+            """
+            if key == session_key:
+                return source
+            cached = self._get_cached_session_source(key)
+            if cached is not None:
+                return cached
+            try:
+                entry = await self.async_session_store.lookup_by_session_key(key)
+            except Exception:
+                entry = None
+            return getattr(entry, "origin", None) or source
+
         async def _stop(key: str, invalidation_reason: str) -> None:
+            stop_source = await _source_for_key(key)
             await self._interrupt_and_clear_session(
-                key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+                key, stop_source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
