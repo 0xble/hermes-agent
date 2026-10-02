@@ -1711,6 +1711,21 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_hard_wall_timeout(value: Any) -> Optional[float]:
+    """Positive finite seconds; None/zero/empty clears a per-job override."""
+    import math
+
+    if value is None or value == "":
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.") from None
+    if isinstance(value, bool) or not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.")
+    return seconds or None
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1725,6 +1740,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "hard_wall_timeout_seconds": _normalize_hard_wall_timeout,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "timezone": normalize_job_timezone,
@@ -1732,6 +1748,7 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "hard_wall_timeout_seconds": _normalize_hard_wall_timeout,
 }
 
 
@@ -1804,6 +1821,7 @@ def create_job(
     paused_reason: Optional[str] = None,
     job_timezone: Optional[str] = None,
     pinned: bool = False,
+    hard_wall_timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1900,6 +1918,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
+        ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
     ):
         if value is not None:
             job[key] = value

@@ -203,13 +203,14 @@ def test_external_worker_hard_wall_survives_abandoned_inactivity_future(tmp_path
         reset_hermes_home_override(token)
     payload = tmp_path / "payload.json"
     ack = tmp_path / "ack.json"
-    payload.write_text(json.dumps({"job": {"id": "wedged", "execution_id": run["id"]},
+    payload.write_text(json.dumps({"job": {"id": "wedged", "execution_id": run["id"],
+                                          "hard_wall_timeout_seconds": 3},
                                    "profile_home": str(home)}), encoding="utf-8")
-    code = """import concurrent.futures,sys,time
+    returned = tmp_path / "abandoned.json"
+    code = """import concurrent.futures,json,sys,threading,time
 from pathlib import Path
 from types import SimpleNamespace
 from cron import scheduler
-import cron.scheduler_detached_worker as detached
 import run_agent
 
 # Keep the real run_one_job -> run_job -> executor/inactivity-watchdog path;
@@ -235,17 +236,25 @@ scheduler._inactivity_watchdog_loop = lambda **kw: original_idle_loop(**{**kw, '
 original_wait = concurrent.futures.wait
 concurrent.futures.wait = lambda fs, timeout=None, **kw: original_wait(fs, timeout=.02, **kw)
 scheduler._save_compose_deliver = lambda *args, **kwargs: None
-detached.hard_wall_timeout_seconds = lambda: 1.2
-sys.exit(0 if scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys.argv[2])) else 1)
+result = scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys.argv[2]))
+# Returning from the payload is not proof of process exit: the real executor's
+# non-daemon thread is still running, and interpreter shutdown waits for it.
+Path(sys.argv[3]).write_text(json.dumps({'result': result, 'worker_alive': any(
+    t.is_alive() and not t.daemon and t is not threading.current_thread()
+    for t in threading.enumerate())}), encoding='utf-8')
+sys.exit(0 if result else 1)
 """
     env = {**os.environ, "HERMES_HOME": str(home)}
-    process = subprocess.Popen([sys.executable, "-c", code, str(payload), str(ack)],
+    process = subprocess.Popen([sys.executable, "-c", code, str(payload), str(ack), str(returned)],
                                env=env, cwd=Path(__file__).resolve().parents[2],
                                start_new_session=True, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True)
     try:
         stdout, stderr = process.communicate(timeout=12)
         assert process.returncode == 1, (stdout, stderr)
+        assert ack.exists(), (stdout, stderr)
+        assert json.loads(returned.read_text(encoding="utf-8")) == {
+            "result": True, "worker_alive": True}
         token = _home(home)
         try:
             row = executions.get_execution(run["id"])

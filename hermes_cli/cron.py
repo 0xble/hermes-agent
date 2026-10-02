@@ -682,7 +682,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("job_timezone", "job_timezone"))
+                   ("job_timezone", "job_timezone"),
+                   ("hard_wall_timeout_seconds", "hard_wall_timeout_seconds"))
 
 
 def _job_api_kwargs(args) -> Dict[str, Any]:
