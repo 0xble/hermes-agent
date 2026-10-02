@@ -1078,7 +1078,7 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
                     for row in GenerationCoordinator(paths.home).generations() if row['state'] != 'exited')
     intent = paths.home / 'forward-update.json'
     if intent.exists():
-        record = json.loads(intent.read_text(encoding='utf-8'))
+        record = json.loads(intent.read_text(encoding='utf-8-sig'))
         if record.get('outcome') in {'running', 'blocked'}:
             keep.update(Path(record[key]).resolve() for key in ('previous', 'current') if record.get(key))
     current_previous = {p.resolve() for p in (read_pointer(paths.current), read_pointer(paths.previous)) if p}
