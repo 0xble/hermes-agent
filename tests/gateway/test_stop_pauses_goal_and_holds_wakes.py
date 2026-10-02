@@ -11,8 +11,6 @@ Real ``GatewayRunner`` + real ``BasePlatformAdapter`` subclass, real goal SQLite
 from __future__ import annotations
 
 import time
-import uuid
-from datetime import datetime
 from unittest.mock import patch
 
 import pytest
@@ -22,7 +20,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.session import SessionEntry, SessionSource
+from gateway.session import SessionSource
 
 
 class _Adapter(BasePlatformAdapter):
@@ -60,19 +58,18 @@ def _isolated(monkeypatch):
     goals._DB_CACHE.clear()
 
 
-def _runner(monkeypatch):
+async def _runner(monkeypatch):
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "u1")
     adapter = _Adapter()
     runner = GatewayRunner(config=GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="x")}))
     runner.adapters = {Platform.TELEGRAM: adapter}
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm", user_id="u1", user_name="tester")
     key = adapter._event_session_key(MessageEvent(text="", message_type=MessageType.TEXT, source=source))
-    session_id = f"stop-goal-{uuid.uuid4().hex[:8]}"
-    entry = SessionEntry(session_key=key, session_id=session_id, created_at=datetime.now(),
-                         updated_at=datetime.now(), platform=Platform.TELEGRAM, chat_type="dm")
-    with runner.session_store._lock:
-        runner.session_store._loaded = True
-        runner.session_store._entries[key] = entry
+    # Route through the real store so the in-memory index and state.db contain the same
+    # session.  A hand-inserted SessionEntry leaves the durable row absent, and the
+    # production stale-route guard then self-heals it to a different session during /stop.
+    entry = await runner.async_session_store.get_or_create_session(source)
+    session_id = entry.session_id
     return runner, adapter, source, key, session_id
 
 
@@ -107,7 +104,7 @@ def _interrupted_completion(key: str, delegation_id: str) -> dict:
 async def test_stop_pauses_goal_so_user_input_does_not_revive_it(monkeypatch, session_state, goal_state):
     from hermes_cli.goals import GoalManager
 
-    runner, adapter, source, key, session_id = _runner(monkeypatch)
+    runner, adapter, source, key, session_id = await _runner(monkeypatch)
     (_active_goal if goal_state == "active" else _blocked_goal)(session_id)
     continuation = runner._synthetic_prompt_event(source, "[Continuing toward your standing goal]\nGoal: x")
     adapter._pending_messages[key] = continuation
@@ -131,7 +128,7 @@ async def test_stop_pauses_goal_so_user_input_does_not_revive_it(monkeypatch, se
 
 @pytest.mark.asyncio
 async def test_completions_from_a_stop_are_held_until_the_user_sends_a_turn(monkeypatch):
-    runner, adapter, source, key, _session_id = _runner(monkeypatch)
+    runner, adapter, source, key, _session_id = await _runner(monkeypatch)
     received: list[MessageEvent] = []
 
     async def handler(event):
