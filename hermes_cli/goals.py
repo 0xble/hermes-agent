@@ -139,7 +139,10 @@ CONTINUATION_PROMPT_TEMPLATE = (
 CONTINUATION_REVISIONS_TEMPLATE = (
     "\n\nThis goal has been revised. Each earlier requirement listed below still "
     "binds you unless the user message cited for that revision plainly instructs "
-    "that specific change. When in doubt, honor the earlier requirement.\n"
+    "that specific change, or the revision records concrete evidence that the "
+    "requirement is obsolete or impossible. Evidence-backed changes remain "
+    "superseded unless later recorded tool results contradict that evidence. "
+    "When in doubt, honor the earlier requirement.\n"
     "{revision_lines}"
 )
 
@@ -312,8 +315,11 @@ JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "A revision may clarify or restructure, but only the user can lower the "
     "bar. For each earlier requirement a revision dropped or weakened: it is "
     "superseded only when the cited user message plainly instructs that "
-    "specific change; otherwise, including every revision with no user "
-    "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
+    "specific change, or when the revision includes concrete evidence that the "
+    "requirement became impossible or irrelevant. An evidence-backed drop is "
+    "superseded unless later recorded tool results contradict that evidence; "
+    "otherwise, including every revision with no user authority or evidence, "
+    "hold the agent to the earlier requirement.\n{revision_lines}\n\n"
 )
 
 JUDGE_USER_PROMPT_TEMPLATE = (
@@ -605,8 +611,8 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # Every durable mutation gets a new token, including pause/resume with equal values.
     mutation_id: str = ""
-    # Versioned revisions of the goal/contract/subgoals: {at, actor, reason, user_quote, before, after}.
-    # Shown to the judge and continuation so superseded wording stops binding. Old rows load as [].
+    # Versioned revisions of the goal/contract/subgoals. Records also carry ``authority`` (user_quote,
+    # evidence, or empty), optional ``evidence`` and ``kind=replace`` for audit/read-back.
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     # Comma-joined ids of recorded results cited during the current dispute streak; a dispute that
     # cites none beyond these counts toward the stall breaker.
@@ -657,13 +663,16 @@ class GoalState:
         """Every revision with every requirement it replaced, in full; empty without revisions.
 
         Nothing is windowed or truncated: a replaced requirement stays binding unless a user message
-        instructs the change, so dropping it from the prompt would silently lower the bar."""
+        instructs the change or the revision records concrete evidence that the requirement is obsolete
+        or impossible; evidence-backed changes remain superseded unless later tool results contradict it."""
         lines = []
         for i, rev in enumerate(self.revisions, start=1):
             quote = str(rev.get("user_quote") or "").strip()
             source = str(rev.get("user_message") or "").strip()
             if quote:
                 authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
+            elif str(rev.get("evidence") or "").strip():
+                authority = f'agent, evidence: {_truncate(str(rev.get("evidence")), 300)}'
             else:
                 authority = "agent, no user authority"
             before, after = rev.get("before") or {}, rev.get("after") or {}
@@ -1954,15 +1963,69 @@ class GoalManager:
     # still holds an unauthorized revision to any earlier requirement it weakened.
     _AUTHORITY_FIELDS = ("goal", "constraints")
 
+    def _quote_source(self, quote: str, state: GoalState, user_messages: Optional[List[str]] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Validate a user quote using the same normalized, post-enrollment source as revisions."""
+        quote = " ".join((quote or "").split())
+        if len(quote) < _REVISION_QUOTE_MIN_CHARS:
+            return "", {"error_code": "user_quote_too_short",
+                         "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
+        pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
+        sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
+        if not sources:
+            return "", {"error_code": "user_quote_not_found",
+                         "error": "user_quote does not match any user message sent since the goal was set"}
+        source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
+        if not source:
+            return "", {"error_code": "user_message_too_long",
+                         "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
+                                  "long to judge whether it authorizes this change; ask the user to state the "
+                                  "change in a short message and quote that"}
+        return quote, None
+
+    def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
+                contract: Optional[GoalContract] = None, user_quote: str = "",
+                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Replace an active or paused goal after verifying fresh user direction."""
+        state = self._require_goal()
+        if state.status not in {"active", "paused"}:
+            return {"ok": False, "error_code": "no_active_goal", "error": "no active or paused goal"}
+        reason = (reason or "").strip()
+        goal = (goal or "").strip()
+        if not reason:
+            return {"ok": False, "error_code": "reason_required", "error": "a replacement needs a reason"}
+        if not goal:
+            return {"ok": False, "error_code": "invalid_goal", "error": "goal text is empty"}
+        quote, quote_error = self._quote_source(user_quote, state, user_messages)
+        if quote_error:
+            return {"ok": False, **quote_error}
+        source_pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
+        source = next((m for m in source_pool if quote in " ".join(m.split()) and len(" ".join(m.split())) <= _REVISION_SOURCE_MAX_CHARS), "")
+        previous = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals)}
+        new_state = GoalState(
+            goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
+            contract=contract or GoalContract(),
+        )
+        revision = {"at": time.time(), "actor": "user", "kind": "replace", "reason": reason,
+                    "user_quote": quote, "user_message": source, "authority": "user_quote",
+                    "before": previous, "after": {"goal": goal, **new_state.contract.to_dict(), "subgoals": []}}
+        new_state.revisions.append(revision)
+        self._state = new_state
+        self._save()
+        return {"ok": True, "state": new_state, "previous_goal": state.goal, "revision": revision,
+                "version": 1}
+
     def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
                contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
-               user_quote: str = "", user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+               user_quote: str = "", user_messages: Optional[List[str]] = None,
+               evidence: str = "") -> Dict[str, Any]:
         """Record a versioned revision of the goal, contract fields and/or subgoal list.
 
         ``contract`` updates only the named fields (``""`` clears one); ``subgoals`` replaces the list.
         A change to the objective or constraints, or a dropped subgoal, needs ``user_quote``: a verbatim
         excerpt (12+ chars) of a real user message in ``user_messages`` (defaults to this session's
-        user messages since the goal was set). Returns ``{"ok", "error_code", "error", "revision"}``."""
+        user messages since the goal was set). A verification change or dropped subgoal may instead carry
+        non-empty ``evidence`` when it is obsolete or impossible. Returns ``{"ok", "error_code", "error", "revision"}``."""
         state = self._require_goal()
         reason = (reason or "").strip()
         if not reason:
@@ -1981,32 +2044,32 @@ class GoalManager:
         if not changed:
             return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
         dropped = [s for s in before["subgoals"] if s not in after["subgoals"]]
+        evidence = " ".join((evidence or "").split())
         needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
+        evidence_changes = [k for k in changed if k == "verification"] + (["subgoals"] if dropped else [])
         quote = " ".join((user_quote or "").split())
-        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS:
+        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS and not (evidence and not set(needs_authority) - {"subgoals"}):
+            return {"ok": False, "error_code": "user_authority_required",
+                    "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
+                             f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session, "
+                             "or concrete evidence only when the dropped criterion is obsolete or impossible"}
+        source = ""
+        authority = ""
+        if quote:
+            quote, quote_error = self._quote_source(quote, state, user_messages)
+            if quote_error:
+                return {"ok": False, **quote_error}
+            source = next((m for m in (user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at))
+                           if quote in " ".join(m.split()) and len(" ".join(m.split())) <= _REVISION_SOURCE_MAX_CHARS), "")
+            authority = "user_quote"
+        elif evidence and evidence_changes and not set(needs_authority) - {"subgoals"}:
+            authority = "evidence"
+        elif needs_authority:
             return {"ok": False, "error_code": "user_authority_required",
                     "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
                              f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session"}
-        source = ""
-        if quote:
-            # Deterministic part: the quote must come from a real user message. Whether that message
-            # authorizes this specific change is judged against the full message, shown with the revision.
-            if len(quote) < _REVISION_QUOTE_MIN_CHARS:
-                return {"ok": False, "error_code": "user_quote_too_short",
-                        "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
-            pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-            sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
-            if not sources:
-                return {"ok": False, "error_code": "user_quote_not_found",
-                        "error": "user_quote does not match any user message sent since the goal was set"}
-            source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
-            if not source:
-                return {"ok": False, "error_code": "user_message_too_long",
-                        "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
-                                 "long to judge whether it authorizes this change; ask the user to state the "
-                                 "change in a short message and quote that"}
         revision = {"at": time.time(), "actor": actor, "reason": reason, "user_quote": quote,
-                    "user_message": source,
+                    "user_message": source, "authority": authority, "evidence": evidence,
                     "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}}
         state.goal = after["goal"]
         state.contract = GoalContract.from_dict({k: after[k] for k in _CONTRACT_FIELDS})

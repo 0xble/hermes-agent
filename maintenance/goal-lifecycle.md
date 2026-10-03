@@ -89,18 +89,21 @@ Failed or interrupted model turns do not run completion judging.
     instead of 2, unless the reply cites a recorded result that no earlier dispute
     in the streak cited. Rewording or dropping citations is not progress.
   - **Revisions.** `GoalManager.revise()` records a versioned revision (actor,
-    reason, user quote with its source message, before, after). The judge prompt
-    shows every revision and every requirement it replaced, in full. The
-    continuation prompt shows the current version and the same history, with each
-    replaced requirement still binding unless its cited user message plainly
-    instructs the change, so the working agent cannot act on an unauthorized
-    weakening before the judge sees it. Changing the objective or
-    constraints, or dropping a subgoal, needs a verbatim quote of 12+ characters
-    from a real user message sent since the goal was set. The runtime proves only
-    that the user said it. The judge sees the complete source message, which may
-    be at most 4,000 characters (longer ones are refused, never excerpted), and
-    decides whether it plainly instructs the specific change. Otherwise it holds
-    the agent to the earlier requirement.
+    reason, user quote with its source message, before, after, authority and
+    optional evidence). The judge prompt shows every revision and every
+    requirement it replaced, in full. The continuation prompt shows the current
+    version and the same history, with each replaced requirement still binding
+    unless its cited user message plainly instructs the change, or recorded
+    evidence shows the requirement is obsolete/impossible. Evidence-backed
+    changes remain superseded unless later recorded tool results contradict the
+    evidence. Changing the objective or constraints, or dropping a subgoal,
+    still needs a verbatim quote of 12+ characters from a real user message sent
+    since the goal was set; evidence cannot authorize those changes. A
+    verification criterion may be reworded or dropped with non-empty evidence.
+    `GoalManager.replace()` replaces an active or paused goal only after the same
+    fresh quote check, resets the new goal active with the configured budget,
+    and records the complete replaced goal in the audit entry. The plugin
+    degrades with `unsupported_core` until these primitives are promoted.
   The judge prompt judges the end state, not the route. A remedied state
   invariant stops blocking `done`, while a breached irreversible prohibition
   returns BLOCKED.

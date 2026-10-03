@@ -478,6 +478,60 @@ def test_revision_refuses_a_source_message_too_long_to_judge(hermes_home):
     assert mgr.state.contract.verification == "security audit passes"
 
 
+def test_evidence_can_supersede_an_obsolete_verification_without_user_quote(hermes_home, monkeypatch):
+    mgr = GoalManager(session_id="rev-evidence")
+    mgr.set("Ship X", contract=GoalContract(verification="Check the removed component"))
+    result = mgr.revise(
+        reason="the approved plan removed the component",
+        contract={"verification": "X is live"},
+        evidence="The approved plan removed the component, so that check is impossible.",
+    )
+    assert result["ok"] and result["version"] == 2
+    revision = load_goal("rev-evidence").revisions[-1]
+    assert revision["actor"] == "agent"
+    assert revision["authority"] == "evidence"
+    assert "removed the component" in revision["evidence"]
+    history = load_goal("rev-evidence").render_revisions_block()
+    assert "agent, evidence:" in history
+    assert "earlier verification: Check the removed component" in history
+
+
+def test_evidence_does_not_authorize_objective_or_constraint_changes(hermes_home):
+    mgr = GoalManager(session_id="rev-evidence-boundary")
+    mgr.set("Ship X", contract=GoalContract(constraints="Never publish secrets"))
+    assert mgr.revise(reason="descoped", goal="Ship Y", evidence="The old path was removed")["error_code"] == "user_authority_required"
+    assert mgr.revise(reason="loosened", contract={"constraints": ""}, evidence="The old path was removed")["error_code"] == "user_authority_required"
+
+
+def test_replace_uses_current_user_quote_and_records_the_replaced_goal(hermes_home):
+    mgr = GoalManager(session_id="replace-goal")
+    old = mgr.set("Ship the original outcome", contract=GoalContract(verification="old proof"))
+    mgr.pause("user-paused")
+    result = mgr.replace(
+        reason="the user asked for a better goal",
+        goal="Ship the better outcome",
+        contract=GoalContract(verification="new proof"),
+        user_quote="set a better goal",
+        user_messages=["Please set a better goal for this work."],
+    )
+    assert result["ok"]
+    assert result["previous_goal"] == old.goal
+    assert result["state"].status == "active"
+    assert result["state"].goal == "Ship the better outcome"
+    record = load_goal("replace-goal").revisions[-1]
+    assert record["kind"] == "replace"
+    assert record["authority"] == "user_quote"
+    assert record["before"]["goal"] == "Ship the original outcome"
+
+
+def test_replace_requires_a_real_current_user_quote(hermes_home):
+    mgr = GoalManager(session_id="replace-authority")
+    mgr.set("Ship X")
+    result = mgr.replace(reason="better wording", goal="Ship Y", user_quote="set a better goal",
+                         user_messages=["keep the current goal"])
+    assert result["error_code"] == "user_quote_not_found"
+
+
 def test_cited_command_with_quotes_resolves_to_its_result(hermes_home):
     sid = "cite-quoted"
     db = _db(sid)
