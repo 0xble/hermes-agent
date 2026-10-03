@@ -178,6 +178,26 @@ when the standalone lane can send Rich Messages, or upstream retries short live
 floods equivalently. Roll back by reverting the commit. There are no
 configuration or persistent-state changes.
 
+## Replacement Adapter Egress
+
+**Patch identity:** `telegram-replacement-adapter-egress`. When polling recovery
+rebuilds the adapter, a turn already in flight keeps the retired instance, whose
+`_bot` is gone. `send()` already forwards to the live adapter in `runner.adapters`.
+`edit_message()`, `delete_message()` and `send_typing()` did not. Their refusal was
+not retryable, so the progress loop stopped editing and sent every later tool line
+as its own reply. Observed 2026-10-03 in the Booking Analytics topic after the
+12:33 PDT adapter rebuild. These three calls now forward to the live adapter. With
+no live adapter, an edit returns a retryable `Not connected` unless the failure is
+permanently fatal.
+
+Source: `plugins/platforms/telegram/adapter.py`. Proof:
+`tests/gateway/test_telegram_replacement_adapter_egress.py`, red on the base. No new
+request types: a forwarded call replaces one that would otherwise have been a
+fresh send. Media sends (`send_image`, `send_voice`, `send_multiple_images`, local
+files) still refuse on a retired instance and remain a follow-up. Upstream has the
+same gap at `343500b354`. Retire when an upstream release forwards these calls.
+Roll back by reverting this patch's adapter and test changes. No state changes.
+
 ## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,

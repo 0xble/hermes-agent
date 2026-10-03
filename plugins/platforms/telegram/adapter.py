@@ -4671,6 +4671,13 @@ class TelegramAdapter(BasePlatformAdapter):
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
        ) -> SendResult:
+        if not self._bot:
+            # A turn that outlived a reconnect still holds this retired instance. Its message ids are
+            # valid on the live adapter, so edit there instead of failing the progress bubble.
+            live = self._replacement_telegram_adapter()
+            if live is not None:
+                return await live.edit_message(chat_id, message_id, content, finalize=finalize, metadata=metadata)
+            return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
         async with self._chat_send_lock(chat_id):
             return await self._edit_message_locked(chat_id, message_id, content, finalize=finalize, metadata=metadata)
 
@@ -4943,7 +4950,8 @@ class TelegramAdapter(BasePlatformAdapter):
         — the caller leaves the preview in place and logs at debug level.
         """
         if not self._bot:
-            return False
+            live = self._replacement_telegram_adapter()
+            return await live.delete_message(chat_id, message_id) if live is not None else False
         try:
             await call_with_flood_guard(self, chat_id, lambda: self._bot.delete_message(
                 chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id)))
@@ -6615,6 +6623,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
+        if not self._bot:
+            live = self._replacement_telegram_adapter()
+            if live is not None:
+                await live.send_typing(chat_id, metadata)
+            return
         key = str(normalize_telegram_chat_id(chat_id))
         lock = self.__dict__.get("_telegram_chat_send_locks", {}).get(key)
         owner = self.__dict__.get("_telegram_chat_send_lock_owners", {}).get(key)
