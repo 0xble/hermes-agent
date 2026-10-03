@@ -1,5 +1,7 @@
 # Fork CI reliability
 
+Fork patch identity: `plugin-admission-subdir-paths`.
+
 ## Required behavior
 
 The current CI interface is owned by [repository-ci-contract.md](repository-ci-contract.md);
@@ -77,6 +79,12 @@ Historical: before the gate/nightly split, a standalone runner published a requi
 checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
+
+The `plugin-admission-subdir-paths` fork patch keeps valid pinned plugin
+subdirectories usable when a repository directory contains spaces. Admission
+still rejects absolute paths, Windows drives, backslashes, empty segments, and
+dot segments in `check_plugin_admission.py`, so the validator's character
+allowlist is redundant and breaks the existing path-confinement test.
 
 Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
 

@@ -172,12 +172,9 @@ def validate_entry(data: object) -> tuple[list[str], list[str]]:
     if subdir is not None:
         if not isinstance(subdir, str):
             errors.append("subdir must be a string")
-        elif subdir and (
-            not re.fullmatch(r"[A-Za-z0-9._/-]+", subdir)
-            or any(seg in ("", ".", "..") for seg in subdir.split("/"))
-        ):
+        elif subdir and any(seg in ("", ".", "..") for seg in subdir.split("/")):
             errors.append(
-                f"subdir {subdir!r} must be a relative path without '.' or '..' segments"
+                f"subdir {subdir!r} must be a relative path inside the repository without '.' or '..' segments"
             )
 
     sha = data.get("sha")
