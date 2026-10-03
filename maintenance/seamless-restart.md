@@ -2,6 +2,36 @@
 
 Patch identity: `seamless-restart`.
 
+## Shutdown Notice Routing
+
+Use upstream's `_delivery_target_key` for active chats, served home channels,
+restart requesters, and already delivered update notices. Derive its profile
+from the resolved adapter's native `_owning_profile`, including shared-bot
+satellites. Positive Telegram IDs remain separate conversations for separate
+bots. Shared groups receive one notice, and private-topic parent suppression
+remains bound to the actual adapter. Native routing invariants live in
+`tests/gateway/test_multiplex_notice_egress_profile_adapter.py`.
+
+## Resume Marker Freshness
+
+Startup resume admission and pending follow-up recovery use upstream's
+`_is_fresh_gateway_interruption` helper. Its epoch comparison handles local
+markers across DST and timezone-aware markers without changing the configured
+freshness window. Keep the existing DST invariants in
+`tests/gateway/test_restart_resume_pending.py` and queued-replay coverage in
+`tests/gateway/test_resume_queued_followup.py`.
+
+## Local Admission Replay
+
+An already admitted event may revisit the native adapter during startup, restore,
+or deferred execution. Its local admission is reusable only for the same event
+object, runner, owning home/profile, transport identity, and routed session. A new
+transport event remains a durable duplicate. Startup and restore gates retain
+the local owned-admission marker until actual dispatch. Verify the native adapter
+and runner path with `tests/gateway/test_durable_outbox.py` and
+`tests/gateway/test_owned_routing.py`, including profile A to B to A.
+
+
 > **Status (2026-09-28):** S1–S3, H1, S4.1 durable outbox and G1 guardian shipped on fork `main`; the live gateway still restarts drain-first. The S4.2 router/executor split stopped after two failed spikes and was not built. [Overlap Handover](#overlap-handover) is a replacement **design**, not implemented or enabled. Later changes follow repository policy, verification, review and separate runtime-activation authority.
 
 **Goal:** Promote a new Hermes gateway release without interrupting active cron executions or in-flight conversations, while making failure and rollback observable.

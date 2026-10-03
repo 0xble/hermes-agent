@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
-import yaml
+import hermes_yaml as yaml
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -79,7 +79,7 @@ def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
             if prior.stat().st_mtime < cutoff:
                 prior.unlink()
             elif outcome in {"alert", "capped"}:
-                old = json.loads(prior.read_text(encoding="utf-8"))
+                old = json.loads(prior.read_text(encoding="utf-8-sig"))
                 if {k: v for k, v in old.items() if k != "at"} == {k: v for k, v in payload.items() if k != "at"}:
                     return prior
         except (OSError, ValueError):
@@ -103,7 +103,7 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
         path = home / name
         if not path.exists():
             continue
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(record, dict) or record.get("version") != 1:
             raise ValueError(f"invalid release receipt: {path}")
         if record.get("operation") not in {"promote", "first-migration"} or record.get("reload_ack"):
@@ -284,7 +284,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     if state == "loaded" and healthy(home, label, current, launchctl_runner):
         pending = home / "release-txn.json"
         if pending.exists():
-            record = json.loads(pending.read_text(encoding="utf-8"))
+            record = json.loads(pending.read_text(encoding="utf-8-sig"))
             if record.get("operation") in {"rollback", "first-migration-rollback"}:
                 from hermes_cli.immutable_releases import acknowledge_running_release
                 acknowledge_running_release(home)
@@ -394,7 +394,7 @@ def _repair_count(home: Path) -> int:
     count = 0
     for path in (home / "logs/guardian").glob("*.json"):
         try:
-            row = json.loads(path.read_text(encoding="utf-8"))
+            row = json.loads(path.read_text(encoding="utf-8-sig"))
             if row.get("action") in {"bootstrap", "rollback"} and row.get("outcome") == "attempt" and datetime.fromisoformat(row["at"]).timestamp() > cutoff:
                 count += 1
         except (OSError, ValueError, KeyError):
@@ -427,7 +427,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 # opt-in marker when present; a malformed unrelated config cannot alert.
                 config_path = home / "config.yaml"
                 try:
-                    flag_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+                    flag_text = config_path.read_text(encoding="utf-8-sig") if config_path.is_file() else ""
                 except (OSError, UnicodeError):
                     return "waiting"  # Unreadable flag cannot authorize legacy repair.
                 if "overlap_handover" in flag_text or "forward_only_handover" in flag_text:

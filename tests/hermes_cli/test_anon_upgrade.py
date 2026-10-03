@@ -185,6 +185,7 @@ def free_account(monkeypatch):
     free list are the only network egress the default pick has, stubbed at their seams."""
     from hermes_cli import models as m
     from hermes_cli import models_pricing as mp
+    monkeypatch.setattr(m, "get_curated_nous_model_ids", lambda **kw: list(m._PROVIDER_MODELS["nous"]))
     monkeypatch.setattr(m, "check_nous_free_tier", lambda **kw: True)
     monkeypatch.setattr(m, "fetch_nous_recommended_models", lambda *a, **kw: {
         "freeRecommendedModels": [{"modelName": FREE_PICK}]})

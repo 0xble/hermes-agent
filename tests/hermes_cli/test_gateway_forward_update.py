@@ -28,6 +28,28 @@ def release(home, sha, capable=True):
     return path
 
 
+def test_forward_receipts_accept_utf8_bom(tmp_path, monkeypatch):
+    """Windows-written capability and in-progress intent receipts still parse."""
+    home = tmp_path / 'profile'
+    home.mkdir()
+    candidate = release(home, 'a' * 40)
+    stale = release(home, 'b' * 40)
+    (candidate / 'hermes_cli/release-capabilities.json').write_bytes(
+        b'\xef\xbb\xbf{"forward_only_handover":1}'
+    )
+    (home / 'current').symlink_to(candidate)
+    (home / 'forward-update.json').write_bytes(
+        b'\xef\xbb\xbf' + json.dumps({
+            'outcome': 'running', 'previous': str(candidate), 'current': str(candidate),
+        }).encode()
+    )
+    monkeypatch.setattr(releases, '_live_process_pins', lambda _home: set())
+    monkeypatch.setattr(releases, '_receipt_pins', lambda _home: set())
+
+    assert forward.capable(candidate)
+    assert releases.retain(home, rollback_count=0) == [stale]
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     monkeypatch.setattr('gateway.generation._boot_id', lambda: 'fixture-boot')
@@ -592,7 +614,7 @@ def test_review_m1_guardian_waits_quietly_for_active_updater(rig, monkeypatch):
 def test_review_m1_update_catchup_refuses_contended_lock(rig, monkeypatch, capsys, caller):
     from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
     monkeypatch.setattr(update_cmd, '_immutable_release_enabled', lambda paths: True)
-    monkeypatch.setattr(update_receipt, '_current', None)
+    update_receipt._current.set(None)
     update_receipt.begin_update_receipt()
     forward._save(rig.home, {'outcome': 'running'})
     with forward._update_lock(rig.home), pytest.raises(SystemExit):
@@ -706,7 +728,7 @@ def test_review_l1_rolled_back_sha_stays_fenced_across_receipts(rig, monkeypatch
     monkeypatch.setattr(forward, 'GenerationSupervisor', lambda home: rig.supervisor)
     monkeypatch.setattr(update_cmd, '_require_immutable_launchd', lambda: None)
     monkeypatch.setattr(releases, 'stage_release', lambda *a, **k: (rig.b, 'reused'))
-    monkeypatch.setattr(update_receipt, '_current', None)
+    update_receipt._current.set(None)
     update_receipt.begin_update_receipt()
     with pytest.raises(SystemExit):
         update_cmd._catch_up_immutable_release(defer=False, sha=rig.b.name, source=rig.a)
@@ -719,7 +741,7 @@ def test_review_l1_catchup_failure_finalizes_partial_without_traceback(rig, monk
     from hermes_cli import update_cmd, update_receipt
     monkeypatch.setattr(update_cmd, '_immutable_release_enabled', lambda paths: True)
     monkeypatch.setattr(forward, 'recover_forward', lambda home: (_ for _ in ()).throw(RuntimeError('recovery failed')))
-    monkeypatch.setattr(update_receipt, '_current', None)
+    update_receipt._current.set(None)
     update_receipt.begin_update_receipt()
     with pytest.raises(SystemExit) as exc:
         update_cmd._catch_up_immutable_release(defer=False, sha=rig.b.name, source=rig.a)
@@ -1105,7 +1127,7 @@ def test_extra_fleet_runtime_is_refused_before_any_launch(rig):
     assert rig.events == []
 
 
-def test_backend_inventory_does_not_block_forward_activation_and_is_recorded(rig, monkeypatch):
+def test_backend_inventory_does_not_block_forward_activation_and_is_recorded(rig, monkeypatch, request):
     from hermes_cli import update_inventory, update_receipt
     others = [update_inventory.RuntimeRecord(kind=kind, profile='default', pid=200 + index)
               for index, kind in enumerate(('serve', 'dashboard'))]
@@ -1113,7 +1135,8 @@ def test_backend_inventory_does_not_block_forward_activation_and_is_recorded(rig
         update_inventory.RuntimeRecord(kind='gateway', profile='default', pid=rig.old.pid), *others])
     monkeypatch.setattr(update_inventory, 'collect_runtime_inventory', lambda **kwargs: plan)
     receipt = SimpleNamespace(data={})
-    monkeypatch.setattr(update_receipt, '_current', receipt)
+    token = update_receipt._current.set(receipt)
+    request.addfinalizer(lambda: update_receipt._current.reset(token))
     monkeypatch.setattr(forward, 'GenerationSupervisor', lambda home: rig.supervisor)
     result = forward.activate_if_forward(rig.home, rig.b, rig.b.name)
     assert result['outcome'] == 'success'
@@ -2028,7 +2051,7 @@ def test_review4_late_recovery_replaces_a_proven_wedged_successor(rig, monkeypat
 
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 class TestReview5RealWedgeProof:
     """Real probe and tick socket. B's heartbeat is fresh at commit; draining A keeps the shared file."""
 

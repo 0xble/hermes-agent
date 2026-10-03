@@ -114,6 +114,22 @@ def event_kind(event) -> str:
     return getattr(getattr(event, "message_type", None), "value", None) or "message"
 
 
+def event_admission_scope(event, runner, home: Path) -> tuple:
+    """Bind local replay to its native runner, routing identity and ingress payload."""
+    source = event.source
+    return (id(event), runner, Path(home).resolve(), str(source.profile or "default"),
+            source.platform, source.chat_id, source.thread_id, source.user_id,
+            transport_id(event), event_kind(event))
+
+
+def local_admission_turn(event, runner, home: Path) -> str | None:
+    """Only the same event's unchanged local admission can bypass transport dedup."""
+    if (not getattr(event, "_outbox_duplicate", False)
+            and getattr(event, "_outbox_admission_scope", None) == event_admission_scope(event, runner, home)):
+        return getattr(event, "_outbox_turn_id", None)
+    return None
+
+
 def durable_control(method):
     """Control cards return a raw Telegram message so callback state can bind its ID."""
     @functools.wraps(method)
@@ -363,7 +379,7 @@ def _retention_days(home: Path) -> int:
     """Read only this setting using the gateway loader's layer precedence."""
     from gateway import config_loader
     from gateway.config import GatewayConfig, validate_outbox_retention_days
-    import yaml
+    import hermes_yaml as yaml
 
     default = GatewayConfig.durable_outbox_retention_days
     legacy = config_loader.load_legacy_gateway_json(home)

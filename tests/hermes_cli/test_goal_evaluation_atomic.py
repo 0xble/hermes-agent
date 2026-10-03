@@ -31,7 +31,7 @@ def test_command_mutation_wins_over_stale_evaluation(tmp_path, monkeypatch, timi
             command.resume(reset_budget=False)
         expected.append(db.get_meta("goal:session"))
 
-    def gate(_gate):
+    def gate(_gate, *, cwd):
         if timing == "gate":
             mutate()
         return True, 0, "ok"

@@ -14,10 +14,10 @@ from hermes_cli.web_routers.actions import _completed_exit_code
 def receipt_home(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
-    monkeypatch.setattr(update_receipt, '_current', None)
+    token = update_receipt._current.set(None)
     monkeypatch.setattr(update_receipt, '_code_identity', lambda **kwargs: {'sha': 'source-sha'})
     yield tmp_path
-    update_receipt._current = None
+    update_receipt._current.reset(token)
 
 
 @pytest.mark.parametrize('outcome', ['success', 'rolled_back'])
@@ -36,7 +36,7 @@ def test_review_m3_forward_receipt_carries_verified_fleet(receipt_home, outcome)
     if outcome == 'rolled_back':
         forward['rollback'] = {'poller': proof, 'new_id': proof['generation_id'], 'new_sha': sha}
     update_receipt.begin_update_receipt()
-    pending = {'notification_version': 2, 'timestamp': update_receipt._current.data['started_at']}
+    pending = {'notification_version': 2, 'timestamp': update_receipt._current.get().data['started_at']}
     update_receipt.record_forward_generation(forward)
     update_receipt.finalize_update_receipt('success' if outcome == 'success' else 'partial')
     (home / '.update_process_exit_code').write_text('0', encoding='utf-8')
@@ -61,7 +61,7 @@ def test_review_m3_forward_receipt_carries_verified_fleet(receipt_home, outcome)
 def test_review_l2_forward_outcomes_use_existing_consumer_vocabulary(
         receipt_home, forward_outcome, mapped, exit_code, unfinished):
     update_receipt.begin_update_receipt()
-    pending = {'notification_version': 2, 'timestamp': update_receipt._current.data['started_at']}
+    pending = {'notification_version': 2, 'timestamp': update_receipt._current.get().data['started_at']}
     update_receipt.record_forward_generation({'outcome': forward_outcome, 'failure': 'fixture reason',
                                              'alert': forward_outcome == 'blocked'})
     update_receipt.finalize_update_receipt(forward_outcome)

@@ -231,7 +231,7 @@ async def run_startup_gate(config: GatewayConfig) -> StartupGateVerdict:
     from utils import fast_safe_load
     try:
         config_path = home / "config.yaml"
-        config = fast_safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        config = fast_safe_load(config_path.read_text(encoding="utf-8-sig")) if config_path.exists() else {}
         value = ((config.get("gateway") or {}).get("overlap_handover") or {}).get(
             "startup_gate_timeout_seconds", DEADLINE_SECONDS)
         timeout_seconds = float(value)

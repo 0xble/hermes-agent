@@ -31,7 +31,7 @@ def _latest_receipt(home, fleet_sha):
 
 
 def _frozen_source_head(monkeypatch):
-    monkeypatch.setattr("hermes_cli.build_info.get_code_identity",
+    monkeypatch.setattr("hermes_cli.version_info.get_code_identity",
                         lambda refresh=False: {"sha": SOURCE, "source": "git"})
 
 

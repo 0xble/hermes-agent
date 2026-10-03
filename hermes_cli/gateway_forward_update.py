@@ -54,7 +54,7 @@ def capable(release: Path | None) -> bool:
     path = release / 'hermes_cli/release-capabilities.json'
     if not path.exists():
         return False
-    data = json.loads(path.read_text(encoding='utf-8'))
+    data = json.loads(path.read_text(encoding='utf-8-sig'))
     return type(data.get('forward_only_handover')) is int and data['forward_only_handover'] == 1
 
 
@@ -78,7 +78,7 @@ def forward_route(home: Path, candidate: Path) -> bool:
         return False  # A flag-off serving process has no forward coordinator claim.
     serving = _row(db, lease['generation_id'])
     intent = Path(home) / 'forward-update.json'
-    pending = json.loads(intent.read_text(encoding='utf-8')) if intent.exists() else {}
+    pending = json.loads(intent.read_text(encoding='utf-8-sig')) if intent.exists() else {}
     unresolved = pending.get('outcome') in {'running', 'blocked'} or pending.get('bookkeeping_pending')
     if lease['state'] == 'released' and serving['state'] == 'exited' and not unresolved:
         return False  # Clean stop retained as history, not a serving handover pair.
@@ -91,7 +91,7 @@ def activate_if_forward(home, candidate, sha, *, supervisor=None):
         return None
     intent = Path(home) / 'forward-update.json'
     if intent.exists():
-        record = json.loads(intent.read_text(encoding='utf-8'))
+        record = json.loads(intent.read_text(encoding='utf-8-sig'))
         if record.get('outcome') in {'running', 'blocked'} or record.get('bookkeeping_pending'):
             # None means another updater archived the intent first: continue to the candidate.
             recovered = recover_forward(home, supervisor=supervisor)
@@ -359,7 +359,7 @@ class GenerationSupervisor:
         # This generation-scoped record is published only AFTER the startup gate.
         path = generation_paths(self.home, _identity(row))['state']
         try:
-            record = json.loads(path.read_text(encoding='utf-8'))
+            record = json.loads(path.read_text(encoding='utf-8-sig'))
         except FileNotFoundError:
             return False
         if not (all(record.get(key) == row[key] for key in GenerationIdentity.__dataclass_fields__)
@@ -1074,7 +1074,7 @@ def recover_forward(home, *, supervisor=None):
             return _locked()
         if not path.exists():
             return None  # The updater may have archived just before lock acquisition.
-        record = json.loads(path.read_text(encoding='utf-8'))
+        record = json.loads(path.read_text(encoding='utf-8-sig'))
         db = GenerationCoordinator(home)
         try:
             cleanup_exited(home, supervisor=supervisor)
@@ -1220,9 +1220,9 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
             return _locked()
         bad = home / 'forward-update-bad.json'
         last = home / 'forward-update-last.json'
-        previous_failure = json.loads(bad.read_text(encoding='utf-8')) if bad.exists() else {}
+        previous_failure = json.loads(bad.read_text(encoding='utf-8-sig')) if bad.exists() else {}
         # Also recognize rollback records written before the durable fence existed.
-        archived = json.loads(last.read_text(encoding='utf-8')) if last.exists() else {}
+        archived = json.loads(last.read_text(encoding='utf-8-sig')) if last.exists() else {}
         if (previous_failure.get('failed_sha') == sha or
                 archived.get('outcome') == 'rolled_back' and archived.get('new_sha') == sha):
             _atomic_json(bad, {'failed_sha': sha})
@@ -1239,7 +1239,7 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
         if (home / 'release-txn.json').exists():
             raise RuntimeError('single-gateway transaction must finish before forward-only promotion')
         intent = home / 'forward-update.json'
-        pending = json.loads(intent.read_text(encoding='utf-8')) if intent.exists() else {}
+        pending = json.loads(intent.read_text(encoding='utf-8-sig')) if intent.exists() else {}
         if pending.get('outcome') in {'running', 'blocked'} or pending.get('bookkeeping_pending'):
             raise RuntimeError('unresolved forward-only intent must be observed before another promotion')
         cleanup_exited(home, supervisor=supervisor)

@@ -45,7 +45,7 @@ def fake_launchctl(label, plist, home, *, pid=None, bootout_succeeds=True):
     return run, calls, state
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize('case', ['dead', 'reboot', 'live', 'unknown', 'other-serving', 'drainer', 'running', 'bootout-fails', 'capped'])
 def test_parked_repair_is_service_only_and_death_fenced(tmp_path, monkeypatch, case):
     monkeypatch.setattr('gateway.generation._boot_id', lambda: 'boot')
@@ -68,7 +68,7 @@ def test_parked_repair_is_service_only_and_death_fenced(tmp_path, monkeypatch, c
     monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: None if case == 'unknown' else 1)
     if case == 'drainer':
         release = home / 'releases' / ('b' * 40)  # Completed labels may pin a previous release.
-    plist = tmp_path / 'service.plist' 
+    plist = tmp_path / 'service.plist'
     plist.write_bytes(plistlib.dumps({'Label': label, 'WorkingDirectory': str(release),
         'EnvironmentVariables': {'HERMES_HOME': str(home), 'HERMES_GENERATION_SCOPE': 'old'}}))
     runner, calls, state = fake_launchctl(label, plist, home, pid=123 if case == 'running' else None,
@@ -97,7 +97,7 @@ def test_parked_repair_is_service_only_and_death_fenced(tmp_path, monkeypatch, c
         assert outcome == 'waiting' and mutations == []
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_health_probe_uses_injected_launchctl(tmp_path, monkeypatch):
     from types import SimpleNamespace
     import json

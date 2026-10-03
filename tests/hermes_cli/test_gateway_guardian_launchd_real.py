@@ -19,7 +19,7 @@ def _sweep(request):
     sweep_prior_sessions(request)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_path, request, monkeypatch):
     home = tmp_path / "profile"
     home.mkdir()

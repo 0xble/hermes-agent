@@ -1011,7 +1011,7 @@ def remove_generation_files(home: Path, identity: GenerationIdentity) -> None:
         if name == "socket":
             continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             continue
         if payload.get("id") != identity.id or payload.get("start_fingerprint") != identity.start_fingerprint:

@@ -88,6 +88,39 @@ def test_delegation_with_reused_pid_is_excluded(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_native_restore_replays_local_event_but_deduplicates_new_transport_object(tmp_path):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "owner")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    runner = SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
+    adapter = object.__new__(TelegramAdapter)
+    BasePlatformAdapter.__init__(adapter, PlatformConfig(enabled=True), Platform.TELEGRAM)
+    adapter.gateway_runner = runner
+    adapter._owned_routing = routing
+    adapter._is_sender_authorized = lambda *a, **kw: True
+    adapter.set_message_handler(lambda event: None)
+    dispatched = []
+    adapter._start_session_processing = lambda event, key: dispatched.append((event, key)) or True
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    event = MessageEvent(text="during restore", source=source, platform_update_id=1)
+    await adapter.handle_message(event)
+    event._hermes_startup_restore_replay = True
+    await adapter.handle_message(event)
+    assert [item[0] for item in dispatched] == [event, event]
+    await adapter.handle_message(MessageEvent(text=event.text, source=source, platform_update_id=1))
+    assert len(dispatched) == 2
+    with store.connect() as db:
+        rows = db.execute("SELECT owner_id,state,payload FROM inbox").fetchall()
+    assert [(row["owner_id"], row["state"], row["payload"]) for row in rows] == [(owner.id, "accepted", b"{}")]
+
+
+@pytest.mark.asyncio
 async def test_session_claim_releases_only_after_dependent_work_drains(tmp_path, monkeypatch):
     store = GenerationCoordinator(tmp_path)
     old = _identity("a", "slot-a")

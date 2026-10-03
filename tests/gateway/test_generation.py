@@ -103,7 +103,7 @@ def test_generation_socket_root_cleanup_preserves_live_siblings(tmp_path):
         server.close()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
     from gateway import generation
     import platform
@@ -125,7 +125,7 @@ def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
         generation._boot_id.cache_clear()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_macos_boot_id_fallback_is_host_independent(monkeypatch):
     import platform
     import psutil
@@ -165,7 +165,7 @@ def test_two_hundred_heartbeats_do_not_leak_descriptors(tmp_path):
     assert psutil.Process().num_fds() <= before + 2
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_live_lease_is_not_stolen_after_hostname_change(tmp_path, monkeypatch):
     import platform
     from gateway import generation
@@ -489,7 +489,7 @@ async def test_active_heartbeat_io_does_not_block_event_loop(tmp_path, monkeypat
         await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_overlap_flag_rejected_on_windows():
     from gateway.config import GatewayConfig
     with pytest.raises(ValueError, match="overlap_handover.*Windows"):

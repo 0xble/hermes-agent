@@ -358,15 +358,16 @@ def resolve_systemd_timeout_stop_sec(
     drain = _seconds(drain_timeout)
     cron = _seconds(cron_drain_timeout)
     cron_budget = (cron + _seconds(cleanup_reserve_s)) if cron > 0.0 else 0.0
-    return int(max(_seconds(floor_s), max(drain, cron_budget) + _seconds(headroom_s)))
+    budget = max(_seconds(floor_s), max(drain, cron_budget) + _seconds(headroom_s))
+    return int(budget) if math.isfinite(budget) else math.inf
 
 
 def resolve_restart_exit_wait_budget(
     drain_timeout: float,
     after_turn_timeout: float,
+    cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     *,
     delegation_timeout: float = 0.0,
-    cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     headroom: float = 15.0,
 ) -> float:
     """Bound the observer's wait for an outgoing gateway to exit after SIGUSR1.
@@ -375,7 +376,7 @@ def resolve_restart_exit_wait_budget(
     cron drain plus cleanup reserve, even when the chat drain is short. Reuse the
     service stop envelope (including its floor and cleanup headroom), so the
     observer cannot expire before a healthy supervised shutdown completes.
-    """
+"""
     if not all(math.isfinite(_seconds(value)) for value in (drain_timeout, cron_drain_timeout)):
         return math.inf
     return (

@@ -261,7 +261,7 @@ sys.exit(0 if scheduler._run_external_worker_payload(Path(sys.argv[1]), Path(sys
             process.wait()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_hard_wall_watchdog_kills_setsid_grandchild_once(tmp_path):
     home = tmp_path / "profile"
     home.mkdir()

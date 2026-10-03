@@ -58,7 +58,7 @@ def _surface(surface, mgr, monkeypatch, prompts=None):
 
 @pytest.mark.parametrize("configured,expected", [(0, 0), (7, 7), (-1, 20), ("invalid", 20), (None, 20)])
 def test_cli_goal_manager_uses_profile_budget(tmp_path, monkeypatch, configured, expected):
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli.cli_loops_mixin import CLILoopsMixin
 
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"goals": {"max_turns": configured}}))

@@ -75,6 +75,11 @@ def _user_after_machine_notice(content: str) -> str | None:
     if not boundary:
         return None
     suffix = suffix.strip()
+    # Upstream appends machine provenance after the process payload boundary.
+    # Strip only the formatter's exact footer, preserving a later human suffix.
+    from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
+    if suffix.startswith(INTERNAL_NOTIFICATION_FOOTER):
+        suffix = suffix[len(INTERNAL_NOTIFICATION_FOOTER):].strip()
     if suffix.startswith(STEER_MARKER_OPEN + "\n") and suffix.endswith("\n" + STEER_MARKER_CLOSE):
         suffix = suffix[len(STEER_MARKER_OPEN): -len(STEER_MARKER_CLOSE)].strip()
     return suffix or None

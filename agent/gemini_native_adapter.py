@@ -25,13 +25,8 @@ from agent.gemini_schema import prepare_gemini_tool_parameters, sanitize_gemini_
 
 logger = logging.getLogger(__name__)
 
-try:
-    import hermes_cli as _hermes_cli
+from hermes_cli.version_info import get_version_info
 
-    _HERMES_VERSION = str(_hermes_cli.__version__)
-except Exception:
-    _HERMES_VERSION = "0.0.0"
-_API_CLIENT = f"hermes-agent/{_HERMES_VERSION}"  # client context per Gemini's partner-integration guidance
 
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # A Vertex AI express-mode base, when the user configures one explicitly: aiplatform serves the
@@ -181,7 +176,7 @@ def probe_gemini_tier(
         return "unknown"
     base = normalize_gemini_base_url(base_url)
     payload = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
-    headers = {"Content-Type": "application/json", "X-Goog-Api-Client": _API_CLIENT}
+    headers = {"Content-Type": "application/json", "X-Goog-Api-Client": f"hermes-agent/{get_version_info().base_version}"}
     try:
         with httpx.Client(timeout=timeout) as client:
             resp = client.post(f"{base}/models/{model}:generateContent", params={"key": key}, json=payload, headers=headers)
@@ -841,8 +836,9 @@ class GeminiNativeClient:
         self.close()
 
     def _headers(self) -> Dict[str, str]:
+        api_client = f"hermes-agent/{get_version_info().base_version}"
         return {"Content-Type": "application/json", "Accept": "application/json", "x-goog-api-key": self.api_key,
-                "User-Agent": f"{_API_CLIENT} (gemini-native)", "X-Goog-Api-Client": _API_CLIENT, **self._default_headers}
+                "User-Agent": f"{api_client} (gemini-native)", "X-Goog-Api-Client": api_client, **self._default_headers}
 
     @staticmethod
     def _advance_stream_iterator(iterator: Iterator[_GeminiStreamChunk]) -> tuple[bool, Optional[_GeminiStreamChunk]]:

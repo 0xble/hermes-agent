@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
@@ -292,6 +292,22 @@ for _slug, _inp, _out, _read, _write, _inp_above, _out_above, _read_above, _writ
     )
 del _slug, _inp, _out, _read, _write, _inp_above, _out_above, _read_above, _write_above
 
+# OpenAI Ultrafast (``service_tier: "ultrafast"``): 6x Standard on every bucket, same 272K
+# whole-request tier. Selected by the tier the response reports it was SERVED at (a request asking
+# for Ultrafast can be served at ``default``, and is then billed at Standard).
+_OPENAI_ULTRAFAST_PRICING: Dict[str, PricingEntry] = {
+    "gpt-6-astra": _snap(
+        "60.00", "300.00", "6.00", "75.00",
+        url="https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast",
+        version="openai-ultrafast-2026-09",
+        tier_threshold_tokens=272_000,
+        input_cost_per_million_above=Decimal("120.00"),
+        output_cost_per_million_above=Decimal("450.00"),
+        cache_read_cost_per_million_above=Decimal("12.00"),
+        cache_write_cost_per_million_above=Decimal("150.00"),
+    ),
+}
+
 # Context-tiered Gemini Pro: above 200k prompt tokens the *_above rates apply to
 # the whole request (see PricingEntry).
 _OFFICIAL_DOCS_PRICING[("google", "gemini-3.1-pro")] = _snap(
@@ -450,6 +466,19 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     normalize = _MODEL_NORMALIZERS.get(route.provider)
     normalized = normalize(model) if normalize else model
     return _OFFICIAL_DOCS_PRICING.get((route.provider, normalized)) if normalized != model else None
+
+
+def with_served_service_tier(usage: CanonicalUsage, response: Any) -> CanonicalUsage:
+    """``usage`` with the response's served ``service_tier`` folded into ``raw_usage``. OpenAI reports
+    the tier on the response, not inside ``usage``, and pricing reads it from ``raw_usage``."""
+    tier = getattr(response, "service_tier", None)
+    if not isinstance(tier, str) or not tier.strip():
+        return usage
+    return replace(usage, raw_usage={**(usage.raw_usage or {}), "service_tier": tier.strip().lower()})
+
+
+def _served_openai_tier(usage: CanonicalUsage) -> Optional[str]:
+    return usage.raw_usage.get("service_tier") if isinstance(usage.raw_usage, dict) else None
 
 
 def _served_fast(usage: CanonicalUsage) -> bool:
@@ -656,6 +685,10 @@ def estimate_usage_cost(
         entry = _anthropic_fast_mode_entry(route.model)
         if not entry:
             return _unknown_cost("official_docs_snapshot", "fast-mode pricing unavailable for model")
+    if route.provider == "openai" and _served_openai_tier(usage) == "ultrafast":
+        entry = _OPENAI_ULTRAFAST_PRICING.get(route.model)
+        if not entry:
+            return _unknown_cost("official_docs_snapshot", "ultrafast pricing unavailable for model")
     if not entry:
         return _unknown_cost("none")
 
@@ -731,12 +764,3 @@ def format_token_count_compact(value: int) -> str:
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return f"{sign}{text}{suffix}"
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-
-DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
-# ---- END PLUGIN-COMPAT ----
