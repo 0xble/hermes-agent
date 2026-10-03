@@ -395,3 +395,90 @@ class TestStandaloneSendIsBounded:
 
         assert error is None
         assert f"delivered to telegram:{CHAT_ID}" in caplog.text
+
+
+class TestShortFloodWaitStaysOnTheLiveLane:
+    """A short flood refusal is sat out on the live lane instead of degrading to standalone.
+
+    The standalone sender cannot send Telegram Rich Messages, so a cron that falls back because
+    the chat was briefly rate-limited arrives with raw ``[^1]`` footnotes and flattened tables.
+    """
+
+    @staticmethod
+    def _run_sequence(results):
+        """Drive the live lane with a router whose sends fail or succeed in ``results`` order."""
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            try:
+                future.set_result(asyncio.run(coro))
+            except BaseException as e:  # noqa: BLE001
+                future.set_exception(e)
+            return future
+
+        router_calls, standalone_calls, sleeps = [], [], []
+        pending = list(results)
+        router = MagicMock()
+
+        async def _deliver_to_platform(target, text, metadata, transport=None):
+            router_calls.append(text)
+            outcome = pending.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        router._deliver_to_platform = _deliver_to_platform
+
+        async def _fake_send_to_platform(platform, pconfig, chat_id, text, **kwargs):
+            standalone_calls.append(text)
+            return {"success": True, "message_id": 9}
+
+        with patch("gateway.config.load_gateway_config", return_value=_gateway_config()), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler_delivery._record_delivery_verification"), \
+             patch("gateway.delivery.DeliveryRouter", return_value=router), \
+             patch("tools.send_message_tool._send_to_platform", _fake_send_to_platform), \
+             patch("cron.scheduler_delivery.time.sleep", side_effect=sleeps.append), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            error = _deliver_result(_job(), "Alert with a footnote.[^1]", adapters=_adapters(), loop=loop)
+        return error, router_calls, standalone_calls, sleeps
+
+    def test_short_flood_is_retried_on_the_live_lane(self, caplog):
+        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+            error, router_calls, standalone_calls, sleeps = self._run_sequence([
+                RuntimeError("flood_control:3.5878933201602194"), _SendResult(message_id=1234)])
+
+        assert error is None
+        assert len(router_calls) == 2
+        assert standalone_calls == []
+        assert len(sleeps) == 1 and 3.5 < sleeps[0] < 5
+        assert "via live adapter" in caplog.text
+        assert "falling back to standalone" not in caplog.text
+
+    def test_long_flood_still_falls_back(self, caplog):
+        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+            error, router_calls, standalone_calls, sleeps = self._run_sequence([
+                RuntimeError("flood_control:120.0")])
+
+        assert len(router_calls) == 1
+        assert sleeps == []
+        assert len(standalone_calls) == 1
+        assert "falling back to standalone" in caplog.text
+
+    def test_repeated_floods_stop_at_the_budget(self):
+        floods = [RuntimeError("flood_control:6.0") for _ in range(5)]
+        _, router_calls, standalone_calls, sleeps = self._run_sequence(floods)
+
+        assert sum(sleeps) <= sched_delivery._LIVE_FLOOD_WAIT_BUDGET_SECS
+        assert len(router_calls) == len(sleeps) + 1
+        assert len(standalone_calls) == 1
+
+    def test_other_errors_fall_back_without_waiting(self):
+        _, router_calls, standalone_calls, sleeps = self._run_sequence([
+            RuntimeError("send_path_degraded")])
+
+        assert len(router_calls) == 1
+        assert sleeps == []
+        assert len(standalone_calls) == 1
