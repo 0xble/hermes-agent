@@ -168,14 +168,24 @@ def observe_current_forward(home, *, supervisor=None):
 
 
 def _proof_deadline(record, row):
-    """Use a durable commit budget only in the boot that recorded its clock."""
+    """Use a durable commit budget only in the boot that recorded its clock.
+
+    When that window is gone (expired, other boot, or never recorded) this is a
+    re-observation of an already-committed holder, not a new handover window:
+    it gets the named POLL_SECONDS observation reserve, min-ed with any
+    enclosing scope, and the record is marked so the result is never reported
+    as proof inside the original bound.
+    """
     from gateway.generation import _boot_id
     if record.get('commit_clock') is not None and record.get('commit_boot_id') == row['boot_id'] == _boot_id():
         rollback = row['id'] == (record.get('rollback_generation') or {}).get('id')
         deadline = record['commit_clock'] + (ROLLBACK_SECONDS if rollback else POLL_PROOF_SECONDS)
         if deadline > _now():
             return deadline
-    return _now() + POLL_SECONDS
+    record['proof_window'] = 'reobservation'
+    deadline = _now() + POLL_SECONDS
+    enclosing = gateway_deadline.current()
+    return deadline if enclosing is None else min(deadline, enclosing)
 
 
 def verify_forward(home, record, *, supervisor=None):
@@ -1350,7 +1360,8 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
         try:
             # Refuse an empty roster before transfer_requested can pause A or
             # move its lease. Standby startup by itself is side-effect isolated.
-            roster = supervisor.request(old, 'polling_roster', timeout=2).get('tokens')
+            roster = supervisor.request(old, 'polling_roster', params={'deadline': _now() + 2},
+                                        timeout=2).get('tokens')
             if not isinstance(roster, list) or any(not isinstance(token, str) for token in roster):
                 raise RuntimeError('invalid old generation polling roster')
             if not roster:

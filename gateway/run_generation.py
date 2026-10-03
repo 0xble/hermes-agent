@@ -141,7 +141,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         raise RuntimeError("successor is not ready or old generation is missing")
     old_identity = GenerationIdentity(**{key: old[key] for key in GenerationIdentity.__dataclass_fields__})
     path = generation_paths(home, old_identity)["socket"]
-    roster = _generation_request(path, "polling_roster", timeout=remaining())
+    roster_budget = remaining()
+    roster = _generation_request(path, "polling_roster", params={"deadline": _now() + roster_budget},
+                                 timeout=roster_budget)
     check_deadline()
     tokens = roster.get("tokens")
     if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
@@ -634,7 +636,12 @@ class ActiveGeneration:
                         _stop_cron_provider(self.cron_provider)
                         self._external_cron_stopped = True
                 self._stopped_receipts = stopped
-                self._pending_transfer = (new_id, nonce, _now() + HANDOVER_REQUEST_TIMEOUT)
+                # The watchdog inherits the driver's window: it fires when that
+                # window ends, never a fresh full HANDOVER_REQUEST_TIMEOUT later.
+                watchdog_at = _now() + HANDOVER_REQUEST_TIMEOUT
+                if deadline is not None:
+                    watchdog_at = min(watchdog_at, float(deadline))
+                self._pending_transfer = (new_id, nonce, watchdog_at)
                 self._drain_task = asyncio.create_task(self._drain_after_transfer(), context=detached_context())
                 return {"poller_stopped": True, "generation_id": self.identity.id,
                         "epoch": self.epoch, "tokens": len(stopped)}
@@ -920,9 +927,21 @@ class ActiveGeneration:
                 wait_timeout = min(wait_timeout, max(0.0, float(deadline) - _now()))
             return future.result(timeout=wait_timeout)
 
-        def _roster_handler() -> dict:
+        def _roster_handler(params: dict) -> dict:
+            deadline = params.get("deadline")
+            if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float))):
+                raise RuntimeError("roster deadline must be a number")
             future = asyncio.run_coroutine_threadsafe(self.polling_roster(), loop)
-            return future.result(timeout=45)
+            wait_timeout = HANDOVER_REQUEST_TIMEOUT
+            if deadline is not None:
+                wait_timeout = min(wait_timeout, max(0.0, float(deadline) - _now()))
+            try:
+                return future.result(timeout=wait_timeout)
+            except BaseException:
+                # The caller's bound is over: never leave the roster waiter queued
+                # on _transfer_lock behind abort/re-arm.
+                future.cancel()
+                raise
 
         self.server = GenerationControlServer(
             self.home, self.paths["socket"],

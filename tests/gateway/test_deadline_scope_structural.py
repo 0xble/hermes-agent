@@ -430,3 +430,34 @@ def test_guardian_creates_one_startup_bound_per_entry_point():
     run_bounded = source[source.index("def _run_bounded("):]
     run_bounded = run_bounded[:run_bounded.index("\ndef ")]
     assert "STARTUP_SECONDS" not in run_bounded
+
+
+def test_transfer_watchdog_inherits_the_driver_window():
+    source = (ROOT / "gateway" / "run_generation.py").read_text(encoding="utf-8")
+    assert "self._pending_transfer = (new_id, nonce, _now() + HANDOVER_REQUEST_TIMEOUT)" not in source
+    block = source[source.index("watchdog_at = _now() + HANDOVER_REQUEST_TIMEOUT"):]
+    block = block[:block.index("self._pending_transfer = (new_id, nonce, watchdog_at)")]
+    assert "min(watchdog_at, float(deadline))" in block
+
+
+def test_control_handlers_never_wait_a_fixed_window():
+    """Every generation control handler bounds its future wait by the caller deadline."""
+    source = (ROOT / "gateway" / "run_generation.py").read_text(encoding="utf-8")
+    assert "future.result(timeout=45)" not in source
+    tree = ast.parse(source)
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef) and fn.name in {"_transfer_handler", "_abort_handler", "_roster_handler"}:
+            body = ast.get_source_segment(source, fn)
+            assert 'params.get("deadline")' in body, fn.name
+            assert "wait_timeout = min(" in body, fn.name
+
+
+def test_proof_deadline_fallback_is_marked_and_min_ed():
+    from gateway import deadline as gd
+    from hermes_cli import gateway_forward_update as fu
+    record = {}
+    row = {"id": "g", "boot_id": "other"}
+    with gd.deadline_scope(gd.now() + 1):
+        bound = fu._proof_deadline(record, row)
+        assert bound <= gd.current()
+    assert record["proof_window"] == "reobservation"
