@@ -149,6 +149,7 @@ def extra_supported(extra: str, *, environment: dict[str, str] | None = None,
             "sys_platform": sys.platform,
             "platform_system": platform.system(),
             "platform_machine": platform.machine(),
+            "platform_release": platform.release(),
             "os_name": os.name,
         }
     try:
