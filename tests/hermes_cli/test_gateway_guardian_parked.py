@@ -216,3 +216,31 @@ def test_parked_repair_passes_remaining_timeout_and_rejects_late_health(tmp_path
     assert outcome == 'failed'
     assert timeouts and all(0 < timeout <= guardian.STARTUP_SECONDS for timeout in timeouts)
     assert any(argv[0] == 'print' for argv in calls)
+
+
+def test_late_service_label_repair_inherits_the_original_startup_bound(tmp_path, monkeypatch):
+    """The forward-only label-mismatch branch must reuse _run's STARTUP_SECONDS
+    bound, not open a fresh one when entered late."""
+    from gateway import deadline as gd
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'boot')
+    home, release = layout(tmp_path)
+    label = 'ai.hermes.gateway.g-other'
+    plist = tmp_path / 'service.plist'
+    plist.write_bytes(plistlib.dumps({'Label': label, 'WorkingDirectory': str(release),
+        'EnvironmentVariables': {'HERMES_HOME': str(home), 'HERMES_GENERATION_SCOPE': 'old'}}))
+    clock = [100.0]
+    monkeypatch.setattr(gd, 'now', lambda: clock[0])
+    seen = {}
+    from gateway.generation import GenerationCoordinator
+    def late_service_label(self):
+        clock[0] += 40  # the label-mismatch branch is entered late
+        return 'ai.hermes.gateway'
+    monkeypatch.setattr(GenerationCoordinator, 'service_label', late_service_label)
+    monkeypatch.setattr(guardian, '_gateway_domain', lambda *a, **k: f'gui/{os.getuid()}')
+    monkeypatch.setattr(guardian, '_launch_state', lambda *a, **k: 'parked')
+    def repair(*args, deadline=None, **kwargs):
+        seen['deadline'] = deadline
+        return 'repaired'
+    monkeypatch.setattr(guardian, '_repair_parked', repair)
+    assert guardian._run(home, plist, label, grace=0, domain=None, forward_only=True) == 'repaired'
+    assert seen['deadline'] == 100.0 + guardian.STARTUP_SECONDS

@@ -300,7 +300,8 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
         from gateway.generation import GenerationCoordinator
         coordinator = GenerationCoordinator(home)
         if coordinator.service_label() != label:
-            repair_deadline = gateway_deadline.now() + STARTUP_SECONDS
+            # One startup bound per guardian run: the repair inherits it, never a fresh one.
+            repair_deadline = deadline
             cleanup_domain = _gateway_domain(label, domain, runner=launchctl_runner,
                                              timeout=_remaining(repair_deadline, 10))
             if _launch_state(cleanup_domain, label, runner=launchctl_runner,
@@ -409,7 +410,11 @@ def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=N
         if coordinator.prepare_parked_repair(label) != "repair":
             return "waiting"
         receipt(home, "bootstrap", "attempt", label=label)
-    deadline = gateway_deadline.now() + STARTUP_SECONDS if deadline is None else deadline
+    own = gateway_deadline.now() + STARTUP_SECONDS
+    enclosing = gateway_deadline.current()
+    deadline = own if deadline is None else deadline
+    if enclosing is not None:
+        deadline = min(deadline, enclosing)
     launchctl(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
               timeout=_remaining(deadline, 10))
     if _launch_state(domain, label, runner=launchctl, timeout=_remaining(deadline, 5)) != "unloaded":

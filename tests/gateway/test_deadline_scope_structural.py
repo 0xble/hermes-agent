@@ -409,3 +409,24 @@ def test_recovery_pointer_reconciliation_is_scoped():
             if not ok:
                 bad.append(node.lineno)
     assert not bad, f"_observe_pointer_commit outside a deadline scope at lines {bad}"
+
+
+def test_guardian_creates_one_startup_bound_per_entry_point():
+    """Only the public entry points may start a STARTUP_SECONDS window; nested
+    repair paths inherit it (min with any enclosing scope)."""
+    tree = ast.parse((ROOT / "hermes_cli" / "gateway_guardian.py").read_text(encoding="utf-8"))
+    allowed = {"_run", "rollback_switch", "_repair_parked"}
+    bad = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add)
+                    and isinstance(node.right, ast.Name) and node.right.id == "STARTUP_SECONDS"
+                    and fn.name not in allowed):
+                bad.append(f"{fn.name}:{node.lineno}")
+    assert not bad, "fresh STARTUP_SECONDS window inside a nested guardian path: " + ", ".join(bad)
+    source = (ROOT / "hermes_cli" / "gateway_guardian.py").read_text(encoding="utf-8")
+    run_bounded = source[source.index("def _run_bounded("):]
+    run_bounded = run_bounded[:run_bounded.index("\ndef ")]
+    assert "STARTUP_SECONDS" not in run_bounded
