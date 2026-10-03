@@ -2,12 +2,15 @@
 from contextlib import closing
 import json
 import plistlib
+import sqlite3
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths, write_generation_record
+from gateway import deadline as gateway_deadline
 from hermes_cli import immutable_releases as releases
 from hermes_cli import gateway_forward_update as forward
 
@@ -72,6 +75,7 @@ def rig(tmp_path, monkeypatch):
     db.record_poller_event('token-hash', old.id, 1, 'lock_acquired')
     db.record_poller_event('token-hash', old.id, 1, 'poller_started')
     clock = SimpleNamespace(value=0.)
+    monkeypatch.setattr(gateway_deadline, 'now', lambda: clock.value)
     monkeypatch.setattr(forward, '_now', lambda: clock.value)
     monkeypatch.setattr(forward, '_sleep', lambda seconds: setattr(clock, 'value', clock.value + seconds))
     events, loaded = [], {old.label}
@@ -86,7 +90,7 @@ def rig(tmp_path, monkeypatch):
         mode = 'happy'
         abort = False
         polled = set()
-        def _domain(self, label):
+        def _domain(self, label, **kwargs):
             return 'gui/fixture'
         def bootstrap(self, row, path, timeout, *, before_launch=None):
             reserved = next(item for item in db.generations() if item['id'] == row['id'])
@@ -114,7 +118,7 @@ def rig(tmp_path, monkeypatch):
                                     socket_path=generation_paths(home, identity)['socket'])
         def owns_bootstrap(self, row, scope):
             return self.bootstrap_state(row, scope) == 'owned'
-        def bootstrap_state(self, row, scope):
+        def bootstrap_state(self, row, scope, *, timeout=5):
             if row['label'] not in loaded:
                 return 'unloaded'
             payload = plistlib.loads((self.directory / f"{row['label']}.plist").read_bytes())
@@ -199,6 +203,125 @@ def rig(tmp_path, monkeypatch):
                            events=events, clock=clock, loaded=loaded, alive=alive,
                            transfer_tokens=transfer_tokens, proof_tokens=proof_tokens,
                            armed_fences=armed_fences)
+
+
+def test_generation_bootstrap_passes_remaining_deadline_to_domain_probes(tmp_path, monkeypatch):
+    home = tmp_path / 'profile'
+    directory = tmp_path / 'LaunchAgents'
+    home.mkdir()
+    directory.mkdir()
+    label = 'ai.hermes.gateway.g-test'
+    path = directory / f'{label}.plist'
+    path.write_bytes(plistlib.dumps({
+        'Label': label,
+        'EnvironmentVariables': {'HERMES_HOME': str(home)},
+        'RunAtLoad': False,
+        'KeepAlive': False,
+    }))
+    timeouts = []
+
+    def runner(argv, **kwargs):
+        timeouts.append(kwargs['timeout'])
+        if argv[1] == 'managername':
+            return subprocess.CompletedProcess(argv, 0, stdout='Aqua', stderr='')
+        assert argv[1] == 'print'
+        return subprocess.CompletedProcess(argv, 113, stdout='', stderr='Could not find service')
+
+    monkeypatch.setattr(forward, 'bootstrap_generation_plist', lambda **kwargs: None)
+    supervisor = forward.GenerationSupervisor(
+        home, runner=runner, directory=directory, domain=f'gui/{forward.os.getuid()}'
+    )
+    supervisor.bootstrap({'label': label}, path, timeout=.2)
+    assert len(timeouts) == 3
+    assert all(0 < value <= .2 for value in timeouts)
+
+
+def test_precommit_abort_uses_named_reserve_not_fresh_handover_timeout(rig, monkeypatch):
+    seen = []
+    request = rig.supervisor.request
+
+    def bounded_request(row, verb, *, params=None, timeout=2):
+        if verb == 'transfer_aborted':
+            seen.append(timeout)
+        return request(row, verb, params=params, timeout=timeout)
+
+    monkeypatch.setattr(rig.supervisor, 'request', bounded_request)
+    rig.supervisor.abort = True
+    result = promote(rig)
+    assert result['outcome'] == 'aborted', result
+    assert seen and 0 < seen[0] <= forward.HANDOVER_ABORT_RESERVE
+
+
+def test_ready_bounds_polling_request_and_rejects_late_success(rig, monkeypatch):
+    row = rig.db.generations()[0]
+    identity = forward._identity(row)
+    write_generation_record(generation_paths(rig.home, identity)['state'], identity,
+                            state='serving', socket_path=rig.home / 'gateway.sock')
+    captured = []
+
+    def late_request(request_row, verb, *, timeout=2, params=None):
+        captured.append((request_row['id'], verb, timeout))
+        rig.clock.value += timeout + .1
+        return {'polling': True, 'healthy': True, 'tokens': ['token-hash']}
+
+    monkeypatch.setattr(rig.supervisor, 'request', late_request)
+    assert rig.supervisor.ready(row, deadline=1.0) is False
+    assert captured == [(row['id'], 'polling_status', 1.0)]
+
+
+def test_bootout_bounds_readback_and_rejects_late_unloaded_success(rig, monkeypatch):
+    rig.db._record_failure(rig.old.id, 'test_bootout')
+    row = rig.db.generations()[0]
+    calls = []
+
+    def late_readback(argv, **kwargs):
+        calls.append((argv[1], kwargs['timeout']))
+        if argv[1] == 'print':
+            rig.clock.value += kwargs['timeout'] + .1
+            return SimpleNamespace(returncode=1, stdout='', stderr='Could not find service')
+        assert argv[1] == 'bootout'
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr(rig.supervisor, 'runner', late_readback)
+    with pytest.raises(RuntimeError, match='bootout readback failed'):
+        rig.supervisor.bootout(row, timeout=1)
+    assert calls[0] == ('bootout', 1)
+    assert calls[1][0] == 'print'
+    assert calls[1][1] <= 1
+
+
+def test_poller_rejects_late_successful_status(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+
+    def late_status(request_row, verb, *, timeout=2, params=None):
+        assert verb == 'polling_status'
+        rig.clock.value += timeout + .1
+        return {
+            'generation_id': row['id'], 'release_sha': row['release_sha'], 'epoch': 1,
+            'release_root': str(rig.home / 'releases' / row['release_sha']),
+            'tokens': ['token-hash'], 'polling': True, 'healthy': True,
+            'armed': dict.fromkeys(('poller', 'cron', 'kanban', 'goal_wakeup'), True),
+        }
+
+    monkeypatch.setattr(rig.supervisor, 'request', late_status)
+    with pytest.raises(RuntimeError, match='deadline'):
+        forward._poller(rig.db, row, rig.supervisor, deadline=1.0)
+
+
+def test_poller_rejects_late_proof_query(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+    request = rig.supervisor.request
+    monkeypatch.setattr(rig.supervisor, 'request', request)
+    original = forward._frozen_transfer_tokens
+
+    def late_roster(*args, **kwargs):
+        result = original(*args, **kwargs)
+        rig.clock.value = 1.1
+        return result
+
+    monkeypatch.setattr(forward, '_frozen_transfer_tokens', late_roster)
+    with pytest.raises(RuntimeError, match='deadline'):
+        forward._poller(rig.db, row, rig.supervisor, deadline=1.0)
 
 
 def promote(rig):
@@ -595,7 +718,7 @@ def test_review_m2_cleanup_unlinks_only_owned_unloaded_definition(rig, monkeypat
         loaded = rig.old.label in rig.loaded
         return SimpleNamespace(returncode=0 if loaded else 1, stdout='', stderr='' if loaded else 'Could not find service')
     rig.supervisor.runner = runner
-    monkeypatch.setattr(rig.supervisor, '_domain', lambda label: 'gui/fixture')
+    monkeypatch.setattr(rig.supervisor, '_domain', lambda label, **kwargs: 'gui/fixture')
     monkeypatch.setattr(rig.supervisor, 'bootout', lambda row: forward.GenerationSupervisor.bootout(rig.supervisor, row))
     monkeypatch.setattr(forward, '_sync_dir', lambda directory: synced.append(directory))
     if foreign or readback_failed:
@@ -635,7 +758,7 @@ def test_review_m2_bootstrap_keeps_runtime_respawn_outside_login_directory(rig, 
         assert runtime['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] == login['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] == scopes[0]
         return SimpleNamespace(returncode=0)
     rig.supervisor.runner = runner
-    monkeypatch.setattr(rig.supervisor, '_domain', lambda label: 'gui/fixture')
+    monkeypatch.setattr(rig.supervisor, '_domain', lambda label, **kwargs: 'gui/fixture')
     forward.GenerationSupervisor.bootstrap(rig.supervisor, row, path, 30, before_launch=scopes.append)
     assert scopes
 
@@ -830,6 +953,86 @@ def test_live_unknown_loop_blocks_without_second_poller_or_forced_move(rig):
     assert rig.db.leases()[0]['generation_id'] == result['new_id']
     assert not any(event[0] == 'bounded-stop' for event in rig.events)
     assert not any(row['state'] == 'serving' and row['id'] != result['new_id'] for row in rig.db.generations())
+
+
+def test_wedged_successor_coordinator_lock_is_released_before_rollback_retry(rig, monkeypatch):
+    """A frozen successor may stop between BEGIN IMMEDIATE and COMMIT on the coordinator."""
+    rig.supervisor.mode = 'wedged'
+    blocker = sqlite3.connect(rig.db.path, timeout=0, isolation_level=None,
+                              check_same_thread=False)
+    armed = False
+    escalated = []
+    wedged_pid = None
+    original_handover = forward.handover_to_generation
+
+    def handover(*args, **kwargs):
+        nonlocal armed, wedged_pid
+        result = original_handover(*args, **kwargs)
+        if not armed:
+            wedged_pid = next(row['pid'] for row in rig.db.generations()
+                              if row['id'] == rig.db.leases()[0]['generation_id'])
+            blocker.execute('BEGIN IMMEDIATE')
+            armed = True
+        return result
+
+    def escalate(pid, **kwargs):
+        escalated.append(pid)
+        blocker.rollback()
+        blocker.close()
+        rig.alive.pop(pid, None)
+        return True
+
+    monkeypatch.setattr(forward, 'handover_to_generation', handover)
+    monkeypatch.setattr('hermes_cli.gateway._escalate_wedged_gateway', escalate)
+    try:
+        result = promote(rig)
+    finally:
+        if armed:
+            try:
+                blocker.rollback()
+            except sqlite3.ProgrammingError:
+                pass
+            try:
+                blocker.close()
+            except sqlite3.ProgrammingError:
+                pass
+    assert result['outcome'] == 'rolled_back', result
+    assert result['failure'] != 'database is locked'
+    assert escalated == [wedged_pid]
+    assert result['rollback']['new_sha'] == rig.a.name
+
+
+def test_dead_wedge_proof_never_signals_if_process_looks_live_again(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+    dead_checks = iter((False, False))
+    escalated = []
+    monkeypatch.setattr(rig.db, '_owner_is_dead', lambda current: next(dead_checks))
+    monkeypatch.setattr(forward, '_await_wedge_proof', lambda *args: 'dead')
+    monkeypatch.setattr('hermes_cli.gateway._escalate_wedged_gateway',
+                        lambda pid, **kwargs: escalated.append(pid) or True)
+
+    death_clock = forward._terminate_proven_wedged(
+        rig.home, rig.db, row, deadline=60, record={})
+
+    assert death_clock == 0
+    assert escalated == []
+
+
+def test_lease_change_during_wedge_probe_never_signals(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+    expected = rig.db.leases()[0]
+    changed = {**expected, 'generation_id': 'other-generation', 'epoch': expected['epoch'] + 1}
+    leases = iter((expected, changed))
+    escalated = []
+    monkeypatch.setattr(forward, '_lease', lambda db: next(leases))
+    monkeypatch.setattr(forward, '_await_wedge_proof', lambda *args: 'wedged')
+    monkeypatch.setattr('hermes_cli.gateway._escalate_wedged_gateway',
+                        lambda pid, **kwargs: escalated.append(pid) or True)
+
+    with pytest.raises(RuntimeError, match='rollback owner changed during wedge probe'):
+        forward._terminate_proven_wedged(rig.home, rig.db, row, deadline=60, record={})
+
+    assert escalated == []
 
 
 def test_crash_after_commit_recovery_observes_instead_of_handover(rig, monkeypatch):
@@ -1437,6 +1640,9 @@ def test_late_rollback_polling_proof_alerts_but_does_not_block_next_promotion(ri
     assert result['rollback']['rollback_bound_met'] is False
     assert result['rollback']['reply_observed'] is False
     assert 'reply_seconds' not in result['rollback']
+    # The irreversible flip ran after the bound: classified late before it ran.
+    assert result['late_rollback']['bound_missed'] is True
+    assert result['late_rollback']['flip_after_bound'] is True
     assert not (rig.home / 'forward-update.json').exists()
     rig.supervisor.mode = 'happy'
     assert promote_different_release(rig)['outcome'] == 'success'
@@ -1881,6 +2087,21 @@ def test_review4_silent_successor_post_commit_wait_keeps_rollback_budget(rig, mo
     assert forward._row(rig.db, lease['generation_id'])['release_sha'] == rig.a.name
 
 
+def test_late_recovery_uses_fresh_budget_when_wedge_reserve_wont_fit(rig, monkeypatch):
+    rig.supervisor.mode = 'blocked'
+    blocked = promote(rig)
+    assert blocked['outcome'] == 'blocked'
+    # Five seconds remain in the original bound: the holder is already proven
+    # wedged, but there is no room left for termination/takeover reserve.
+    rig.clock.value = blocked['commit_clock'] + 55
+    rig.supervisor.mode = 'wedged'
+    rig.events.clear()
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    assert recovered['late_rollback']['bound_missed'] is True
+    assert any(event[0] == 'bounded-stop' for event in rig.events)
+
+
 def test_review4_late_recovery_replaces_a_proven_wedged_successor(rig, monkeypatch):
     rig.supervisor.mode = 'blocked'
     blocked = promote(rig)
@@ -2017,3 +2238,20 @@ class TestReview5RealWedgeProof:
         assert recovered['outcome'] == 'rolled_back', recovered
         assert recovered['late_rollback']['bound_missed'] is True and recovered['alert']
         assert any(event[0] == 'bounded-stop' and event[1] == armed[0]['pid'] for event in rig.events)
+
+
+def test_rollback_serving_clock_is_taken_after_the_pointer_flip(rig, monkeypatch):
+    """serving_seconds must include the irreversible flip; a slow flip that crosses
+    the bound may not be recorded as within it."""
+    rig.supervisor.mode = 'dies'
+    flip = forward._flip
+    def slow(*args, **kwargs):
+        result = flip(*args, **kwargs)
+        if kwargs.get('operation') == 'rollback':
+            rig.clock.value = 61
+        return result
+    monkeypatch.setattr(forward, '_flip', slow)
+    result = promote(rig)
+    assert result['outcome'] == 'rolled_back' and result['alert']
+    assert result['rollback']['commit_to_serving_upper_bound_seconds'] >= 61
+    assert result['rollback']['rollback_bound_met'] is False

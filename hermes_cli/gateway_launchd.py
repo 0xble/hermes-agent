@@ -143,17 +143,24 @@ def _forward_service_plist(plist_path: Path) -> Path | None:
     return path
 
 
-def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 30, runner=None) -> None:
+def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: float = 30, runner=None) -> None:
     """Bootstrap a launchd job, recovering from a stale still-registered label (EIO 5). Without the
     bootout + retry that case is misread as an unmanageable domain and degrades to detached, silently
     losing auto-start and crash-restart."""
+    deadline = time.monotonic() + max(float(timeout), 0.0)
     forward_only = _forward_only_plist(plist_path)
+    bootstrap = ["launchctl", "bootstrap", domain, str(plist_path)]
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise subprocess.TimeoutExpired(bootstrap, timeout)
+        return value
     if forward_only:
         from hermes_cli.gateway_launchd_generation import refresh_generation_scope
         refresh_generation_scope(Path(plist_path))
-    bootstrap = ["launchctl", "bootstrap", domain, str(plist_path)]
+    remaining()
     try:
-        (runner or subprocess.run)(bootstrap, check=True, timeout=timeout)
+        (runner or subprocess.run)(bootstrap, check=True, timeout=remaining())
     except subprocess.CalledProcessError as exc:
         if forward_only or exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
             raise
@@ -162,8 +169,8 @@ def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 
         # unloaded), so its expected 3/113/125 stderr must not leak to the terminal.
         (runner or subprocess.run)(
             ["launchctl", "bootout", f"{domain}/{label}"],
-            check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
-        (runner or subprocess.run)(bootstrap, check=True, timeout=timeout)
+            check=False, timeout=remaining(), **_gw()._CAPTURE_TEXT)
+        (runner or subprocess.run)(bootstrap, check=True, timeout=remaining())
 
 
 def _launchd_reload_log_path() -> Path:
@@ -190,13 +197,13 @@ def _launchd_reload_budget() -> float:
     return max(30.0, _gw()._get_restart_drain_timeout())
 
 
-def _launchctl_supervised_pid(label: str, *, runner=None) -> int | None:
+def _launchctl_supervised_pid(label: str, *, runner=None, timeout: float = 10) -> int | None:
     """PID launchd currently runs for ``label``, or None when it runs none. ``launchctl list`` exits 0 for
     a mere registered definition (``state = not running`` on macOS 26+), so a PID — not the exit code — is
     the answer. Domain-agnostic on purpose: ``launchctl print`` domain probes fail on macOS-26 per-user
     domains, which is why the invoking profile verifies through this and not ``_launchd_print_service_pid``."""
     try:
-        result = (runner or subprocess.run)(["launchctl", "list", label], check=False, timeout=10, **_gw()._CAPTURE_TEXT)
+        result = (runner or subprocess.run)(["launchctl", "list", label], check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if result.returncode != 0:
@@ -204,9 +211,9 @@ def _launchctl_supervised_pid(label: str, *, runner=None) -> int | None:
     return _gw()._parse_launchd_pid_from_list_output(result.stdout)
 
 
-def _launchctl_label_supervising_process(label: str) -> bool:
+def _launchctl_label_supervising_process(label: str, *, timeout: float = 10) -> bool:
     """True when launchd knows ``label`` AND runs a process for it."""
-    return _gw()._launchctl_supervised_pid(label) is not None
+    return _gw()._launchctl_supervised_pid(label, timeout=timeout) is not None
 
 
 def _retry_launchctl_bootstrap_until_registered(

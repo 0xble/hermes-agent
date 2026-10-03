@@ -107,7 +107,7 @@ def test_unrelated_invalid_update_key_does_not_block_repair(tmp_path, monkeypatc
     home, plist, label, *_ = layout(tmp_path)
     (home / "config.yaml").write_text("updates:\n  immutable_releases: not-a-boolean\n")
     calls = fake_launchctl(monkeypatch, label)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     assert guardian.run_once(home, plist, label) == "repaired"
     assert [row[1] for row in calls].count("bootstrap") == 1
 
@@ -125,7 +125,7 @@ def test_overlap_generation_guardian_is_observe_only(tmp_path, monkeypatch):
 def test_unloaded_service_bootstraps_once_and_records_receipt(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     assert guardian.run_once(home, plist, label, grace=0.000001) == "repaired"
     assert [row[1] for row in calls].count("bootstrap") == 1
     assert calls[-1][1] == "print"
@@ -146,7 +146,7 @@ def test_stop_marker_never_fights_unloaded_service(tmp_path, monkeypatch):
 def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     assert guardian.run_once(home, plist, label) == "healthy"
     assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
 
@@ -221,7 +221,7 @@ def test_acknowledged_or_mismatched_switch_is_not_abandoned(tmp_path):
 def test_switch_in_grace_or_acknowledged_does_not_rollback(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: False)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: False)
     txn = {"version": 1, "operation": "promote", "candidate": str(b),
            "previous_intended": str(a), "reload_issued": {"at": datetime.now(timezone.utc).isoformat()}}
     last = home / "release-last-txn.json"
@@ -259,7 +259,7 @@ def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
         "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
         "updated_at": "2020-01-01T00:00:00+00:00",
     }), encoding="utf-8")
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: os.getpid())
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **kwargs: os.getpid())
     monkeypatch.setattr(psutil.Process, "cwd", lambda self: str(b))
     assert not guardian.healthy(home, label, b)
 
@@ -269,7 +269,7 @@ def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
 def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch, operation):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     txn = {"version": 1, "operation": operation, "candidate": str(b),
            "previous_intended": str(a), "reload_issued": {"at": datetime.now(timezone.utc).isoformat()}}
     (home / "release-last-txn.json").write_text(json.dumps(txn))
@@ -320,7 +320,7 @@ def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeyp
     calls = []
     from hermes_cli import gateway_launchd
     import psutil
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: 123)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **kwargs: 123)
     class Previous:
         def __init__(self, pid):
             assert pid == 123
@@ -335,7 +335,7 @@ def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeyp
     monkeypatch.setattr(guardian.subprocess, "run", run)
     monkeypatch.setattr(guardian, "rollback", lambda *args, **kwargs:
                         kwargs["reload_callback"]() and {"reload_pending": False})
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     assert guardian.rollback_switch(home, plist, label, a, domain=f"gui/{os.getuid()}")
     assert calls[:4] == ["bootout", "drained", "bootstrap", "bootout"]
     assert calls[-1] == "bootstrap"
@@ -357,7 +357,7 @@ def test_repeated_alerts_are_deduplicated_and_old_receipts_pruned(tmp_path):
 def test_healthy_rollback_is_acknowledged_on_subsequent_run(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     fake_launchctl(monkeypatch, label, loaded=True)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     pending = home / "release-txn.json"
     pending.write_text(json.dumps({"version": 1, "operation": "rollback", "candidate": str(b)}))
     from hermes_cli import immutable_releases
@@ -387,7 +387,7 @@ def test_guardian_resolves_existing_gateway_domain(tmp_path, monkeypatch, domain
             return subprocess.CompletedProcess(argv, 0, stdout="Aqua", stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
     monkeypatch.setattr(guardian.subprocess, "run", run)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     assert guardian.run_once(home, plist, label) == "healthy"
     assert all(row[1] not in {"bootstrap", "bootout"} for row in calls)
     assert [row[2] for row in calls if row[1] == "print"][-1] == f"{selected}/{label}"
@@ -403,7 +403,7 @@ def test_user_domain_stays_healthy_when_gui_probe_errors(tmp_path, monkeypatch):
             return subprocess.CompletedProcess(argv, 5, stdout="", stderr="Input/output error")
         return subprocess.CompletedProcess(argv, 0, stdout="pid = 123", stderr="")
     monkeypatch.setattr(guardian.subprocess, "run", run)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: True)
     assert guardian.run_once(home, plist, label) == "healthy"
     assert not any(row[1] in {"bootstrap", "bootout"} for row in calls)
 
@@ -428,7 +428,7 @@ def test_failed_switch_rolls_back_only_verified_previous(tmp_path, monkeypatch):
            "reload_issued": {"at": "2020-01-01T00:00:00+00:00"}}
     (home / "release-last-txn.json").write_text(json.dumps(txn))
     calls = fake_launchctl(monkeypatch, label, loaded=True)
-    monkeypatch.setattr(guardian, "healthy", lambda *args: False)
+    monkeypatch.setattr(guardian, "healthy", lambda *args, **kwargs: False)
     done = []
     monkeypatch.setattr(guardian, "rollback_switch", lambda *args, **kwargs: done.append(True) or True)
     assert guardian.run_once(home, plist, label, grace=0.000001) == "rolled_back"
