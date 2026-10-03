@@ -220,22 +220,17 @@ def _retry_launchctl_bootstrap_until_registered(
     domain: str, plist_path, label: str, *, deadline: float
 ) -> bool:
     """Retry ``_launchctl_bootstrap`` until the label supervises a process or ``deadline`` passes. Under
-    load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is too short."""
+    load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is too short.
+
+    Legacy install/start path only (not the forward-only handover windows, which bound their own
+    launchd calls). It deliberately makes at least one full bootstrap+probe attempt even when the
+    caller's deadline has already elapsed (registration invariant verified on 2026-08-05)."""
     attempt = 0
     while True:
-        remaining = deadline - time.monotonic()
-        # This legacy install/start helper deliberately performs one probe even
-        # when its caller's deadline has already elapsed.  The documented
-        # registration invariant predates the bounded forward-handover windows;
-        # forward callers enforce their own deadline before entering this path.
-        if remaining <= 0 and attempt:
-            return False
         attempt += 1
         try:
-            _gw()._launchctl_bootstrap(domain, plist_path, label, timeout=max(0, min(30, remaining)))
-            remaining = deadline - time.monotonic()
-            if _gw()._launchctl_label_supervising_process(
-                    label, timeout=max(0, min(10, remaining))):
+            _gw()._launchctl_bootstrap(domain, plist_path, label, timeout=30)
+            if _gw()._launchctl_label_supervising_process(label):
                 return True
             outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl list)"
         except subprocess.CalledProcessError as exc:
@@ -243,10 +238,9 @@ def _retry_launchctl_bootstrap_until_registered(
         except subprocess.TimeoutExpired:
             outcome = f"timed out for {domain}/{label}"
         _gw()._append_launchd_reload_log(f"bootstrap attempt {attempt} {outcome} — retrying")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if time.monotonic() >= deadline:
             return False
-        time.sleep(min(2, remaining))
+        time.sleep(2)
 
 
 # launchd-unsupported marker: written when the domain can't be managed (exit 5/125, macOS 26+) so
