@@ -12,6 +12,7 @@ import shutil
 import signal
 import time
 from contextlib import suppress
+from contextvars import Context
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -264,11 +265,11 @@ def _bootout_retired_generation(label: str) -> bool:
 def _activate_cold_generation(coordinator, identity):
     lease = next((row for row in coordinator.leases() if row['resource'] == 'active_generation'), None)
     if lease is None:
-        epoch = coordinator.acquire_lease('active_generation', identity.id)
+        epoch = coordinator.acquire_lease('active_generation', identity.id, deadline=None)
         coordinator.transition_state(identity.id, 'standby', 'serving')
         return epoch
     return coordinator.takeover_dead_generation('active_generation', lease['generation_id'], identity.id,
-        bootout=lambda label: True if label == identity.label else _bootout_retired_generation(label))
+        bootout=lambda label: True if label == identity.label else _bootout_retired_generation(label), deadline=None)
 
 
 def claim_active_generation(*, forward_only: bool = True) -> tuple[GenerationCoordinator, GenerationIdentity]:
@@ -522,7 +523,7 @@ class ActiveGeneration:
         from gateway.owned_routing import OwnedRouting
         self.owned_routing = OwnedRouting(self)
         self.owned_routing.bind(runner)
-        self.owned_routing._task = asyncio.create_task(self.owned_routing.drain())
+        self.owned_routing._task = asyncio.create_task(self.owned_routing.drain(), context=Context())
 
     def _telegram_adapters(self) -> dict[str, object]:
         adapters = getattr(self.runner, "adapters", {}) or {}
@@ -585,7 +586,7 @@ class ActiveGeneration:
                     await asyncio.to_thread(
                         self.coordinator.record_poller_stopped,
                         self.identity.id, self.epoch, token, receipt["safe_offset"],
-                        attempt_nonce=nonce, **_deadline_kwargs(deadline))
+                        attempt_nonce=nonce, deadline=deadline)
                 # No more wire updates can extend a split text batch. Dispatch it
                 # while A still owns the lease, before the successor can receive it.
                 for adapter in roster.values():
@@ -609,7 +610,7 @@ class ActiveGeneration:
                         self._external_cron_stopped = True
                 self._stopped_receipts = stopped
                 self._pending_transfer = (new_id, nonce, time.monotonic() + HANDOVER_REQUEST_TIMEOUT)
-                self._drain_task = asyncio.create_task(self._drain_after_transfer())
+                self._drain_task = asyncio.create_task(self._drain_after_transfer(), context=Context())
                 return {"poller_stopped": True, "generation_id": self.identity.id,
                         "epoch": self.epoch, "tokens": len(stopped)}
             except Exception as original:
@@ -620,8 +621,7 @@ class ActiveGeneration:
                 return await self._recover_failed_transfer(new_id, nonce, deadline, original)
 
     async def _recover_failed_transfer(self, new_id, nonce, deadline, original):
-        from gateway.deadline import unbounded_scope
-        with unbounded_scope():
+        with deadline_scope(time.monotonic() + HANDOVER_ABORT_RESERVE, inherit=False):
             try:
                 await asyncio.to_thread(
                     self.coordinator.abort_transfer,
@@ -805,47 +805,48 @@ class ActiveGeneration:
                     # Roster requests share this lock, so a retry cannot replace
                     # the aborted nonce before recovery has reopened dispatch.
                     recovery_deadline = time.monotonic() + HANDOVER_ABORT_RESERVE
-                    try:
-                        aborted = await asyncio.to_thread(
-                            self.coordinator.abort_transfer, self.identity.id, new_id,
-                            self.epoch, attempt_nonce=nonce, deadline=recovery_deadline)
-                    except RuntimeError as exc:
-                        if str(exc) == "cannot abort a committed transfer":
-                            # A committed successor owns admission; do not re-arm A.
-                            self._pending_transfer = None
-                        else:
-                            logger.exception("transfer deadline abort failed; old gateway remains fenced")
-                    except Exception:
-                        logger.exception("transfer deadline abort failed; old gateway remains fenced")
-                    else:
-                        if not aborted:
-                            def read_transfer():
-                                with contextlib.closing(self.coordinator._deadline_connect(recovery_deadline)) as conn:
-                                    return conn.execute(
-                                        "SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
-                                        (self.identity.id, self.epoch)).fetchone()
-
-                            try:
-                                row = await asyncio.to_thread(read_transfer)
-                            except Exception:
-                                logger.exception("transfer deadline status unavailable; old gateway remains fenced")
-                                row = None
-                            if row is not None and row["attempt_nonce"] != nonce:
-                                logger.warning("transfer attempt changed; dropping stale pending recovery for %s", self.identity.id)
+                    with deadline_scope(recovery_deadline):
+                        try:
+                            aborted = await asyncio.to_thread(
+                                self.coordinator.abort_transfer, self.identity.id, new_id,
+                                self.epoch, attempt_nonce=nonce, deadline=recovery_deadline)
+                        except RuntimeError as exc:
+                            if str(exc) == "cannot abort a committed transfer":
+                                # A committed successor owns admission; do not re-arm A.
                                 self._pending_transfer = None
-                            elif row is not None and row["state"] == "committed":
-                                self._pending_transfer = None
-                            elif row is not None and row["state"] == "aborted":
-                                aborted = True
                             else:
-                                self._rearm_errors = ["transfer deadline abort could not be proved"]
-                                await asyncio.to_thread(self._sync_runtime_status)
-                        if aborted:
-                            logger.warning("transfer deadline expired; re-arming old gateway %s", self.identity.id)
-                            try:
-                                await self._rearm_stopped_pollers(new_id, nonce)
-                            except Exception:
-                                logger.exception("transfer deadline recovery failed; old gateway remains fenced")
+                                logger.exception("transfer deadline abort failed; old gateway remains fenced")
+                        except Exception:
+                            logger.exception("transfer deadline abort failed; old gateway remains fenced")
+                        else:
+                            if not aborted:
+                                def read_transfer():
+                                    with contextlib.closing(self.coordinator._deadline_connect(recovery_deadline)) as conn:
+                                        return conn.execute(
+                                            "SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
+                                            (self.identity.id, self.epoch)).fetchone()
+
+                                try:
+                                    row = await asyncio.to_thread(read_transfer)
+                                except Exception:
+                                    logger.exception("transfer deadline status unavailable; old gateway remains fenced")
+                                    row = None
+                                if row is not None and row["attempt_nonce"] != nonce:
+                                    logger.warning("transfer attempt changed; dropping stale pending recovery for %s", self.identity.id)
+                                    self._pending_transfer = None
+                                elif row is not None and row["state"] == "committed":
+                                    self._pending_transfer = None
+                                elif row is not None and row["state"] == "aborted":
+                                    aborted = True
+                                else:
+                                    self._rearm_errors = ["transfer deadline abort could not be proved"]
+                                    await asyncio.to_thread(self._sync_runtime_status)
+                            if aborted:
+                                logger.warning("transfer deadline expired; re-arming old gateway %s", self.identity.id)
+                                try:
+                                    await self._rearm_stopped_pollers(new_id, nonce)
+                                except Exception:
+                                    logger.exception("transfer deadline recovery failed; old gateway remains fenced")
             try:
                 if await self.finish_draining_once():
                     return
@@ -908,7 +909,7 @@ class ActiveGeneration:
             raise RuntimeError("generation control socket unavailable")
         self.socket_stat = self.paths["socket"].stat()
         write_generation_record(self.paths["state"], self.identity, state="serving", socket_path=self.paths["socket"])
-        self.task = asyncio.create_task(self._heartbeat())
+        self.task = asyncio.create_task(self._heartbeat(), context=Context())
 
     async def mark_ready(self) -> None:
         await asyncio.to_thread(self._sync_runtime_status)

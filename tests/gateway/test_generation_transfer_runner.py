@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -26,6 +27,38 @@ class PollingAdapter:
 
     async def start_polling_from_transfer(self, receipt):
         self.resumed = True
+
+
+@pytest.mark.asyncio
+async def test_transfer_drain_uses_a_clean_context_after_request_deadline(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="standby")
+    epoch = db.acquire_lease("active_generation", old.id)
+    adapter = PollingAdapter("clean-context")
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.bind_runner(Mock(adapters={"telegram": adapter}, _overlap_draining=False,
+                            _pending_approvals={}, _active_work_count=lambda: 0))
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id, deadline=asyncio.get_running_loop().time() + 0.5)
+    assert active._drain_task is not None
+    try:
+        # Force the pending-transfer watchdog immediately, after the request scope
+        # has expired. The watchdog must open its own reserve scope.
+        await asyncio.sleep(0.55)
+        _, nonce, _ = active._pending_transfer
+        active._pending_transfer = (new.id, nonce, time.monotonic() - 1)
+        for _ in range(20):
+            if adapter.resumed:
+                break
+            await asyncio.sleep(0.05)
+        assert adapter.resumed
+        assert active._pending_transfer is None
+    finally:
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

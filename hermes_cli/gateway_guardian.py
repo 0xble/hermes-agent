@@ -158,6 +158,7 @@ def _supervised_pid(label: str, *, runner=None, timeout: float = 10) -> int | No
                 _launchctl_supervised_pid(label, runner=runner))
 
 
+@with_deadline_scope
 def healthy(home: Path, label: str, expected: Path, runner=None, deadline: float | None = None) -> bool:
     from gateway.status import read_runtime_status, runtime_status_is_stale
     import psutil
@@ -204,9 +205,17 @@ def _launch_state(domain: str, label: str, *, runner=None, timeout: float = 5) -
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
-@with_deadline_scope
 def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
                     launchctl_runner=None) -> bool:
+    deadline = time.monotonic() + STARTUP_SECONDS
+    with deadline_scope(deadline):
+        return _rollback_switch_bounded(home, plist, label, old, domain=domain,
+                                        launchctl_runner=launchctl_runner, deadline=deadline)
+
+
+@with_deadline_scope
+def _rollback_switch_bounded(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
+                            launchctl_runner=None, deadline: float = 0.0) -> bool:
     """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
     from hermes_cli import gateway
     from hermes_cli.immutable_releases import wait_for_release_acknowledgement
@@ -223,7 +232,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
-    reload_deadline = time.monotonic() + STARTUP_SECONDS
+    reload_deadline = deadline
     domain = domain or _gateway_domain(label, None, runner=launchctl_runner,
                                        timeout=_remaining(reload_deadline, 10))
     def reload_target():
@@ -253,7 +262,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         wait_for_release_acknowledgement(home, timeout_seconds=_remaining(reload_deadline, 5))
     health_deadline = time.monotonic() + 12
     while time.monotonic() < health_deadline:
-        if healthy(home, label, old, launchctl_runner, health_deadline):
+        if healthy(home, label, old, launchctl_runner, deadline=health_deadline):
             if time.monotonic() < health_deadline:
                 return True
             break
@@ -263,9 +272,18 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
-@with_deadline_scope
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
          forward_only: bool = False, launchctl_runner=None) -> str:
+    deadline = time.monotonic() + STARTUP_SECONDS
+    with deadline_scope(deadline):
+        return _run_bounded(home, plist, label, grace=grace, domain=domain,
+                            forward_only=forward_only, launchctl_runner=launchctl_runner,
+                            deadline=deadline)
+
+
+@with_deadline_scope
+def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
+                forward_only: bool = False, launchctl_runner=None, deadline: float = 0.0) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
     if intent_path(home).exists():
         return "stopped"
@@ -302,13 +320,12 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     switch_state, switch = _switch(home, grace=grace)
     if switch_state == "waiting":
         return "waiting"
-    deadline = time.monotonic() + STARTUP_SECONDS
     domain = _gateway_domain(label, domain, runner=launchctl_runner,
                              timeout=_remaining(deadline, 10))
     state = _launch_state(domain, label, runner=launchctl_runner,
                           timeout=_remaining(deadline, 5))
     launchctl = launchctl_runner or subprocess.run
-    if state == "loaded" and healthy(home, label, current, launchctl_runner, deadline):
+    if state == "loaded" and healthy(home, label, current, launchctl_runner, deadline=deadline):
         pending = home / "release-txn.json"
         if pending.exists():
             record = json.loads(pending.read_text(encoding="utf-8-sig"))
@@ -362,7 +379,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     while time.monotonic() < deadline:
         state = _launch_state(domain, label, runner=launchctl_runner,
                               timeout=_remaining(deadline, 5))
-        if state in {"loaded", "parked"} and healthy(home, label, current, launchctl_runner, deadline):
+        if state in {"loaded", "parked"} and healthy(home, label, current, launchctl_runner, deadline=deadline):
             if time.monotonic() < deadline:
                 receipt(home, "bootstrap", "repaired", label=label, release=str(current))
                 return "repaired"
@@ -404,7 +421,7 @@ def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=N
               timeout=_remaining(deadline, 10))
     while time.monotonic() < deadline:
         state = _launch_state(domain, label, runner=launchctl, timeout=_remaining(deadline, 5))
-        if state == "loaded" and healthy(home, label, current, launchctl, deadline):
+        if state == "loaded" and healthy(home, label, current, launchctl, deadline=deadline):
             if time.monotonic() < deadline:
                 receipt(home, "bootstrap", "repaired", label=label, release=str(current))
                 return "repaired"

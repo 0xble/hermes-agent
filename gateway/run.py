@@ -6064,7 +6064,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 refresh=lambda: _refresh_host_gateway_record(runner),
             )
 
-        takeover_task = asyncio.create_task(_take_over_legacy_gateway_resources())
+        takeover_task = asyncio.create_task(_take_over_legacy_gateway_resources(), context=Context())
     # B leaves A's host record alone while A drains.
     if promoted_generation is None:
         _refresh_host_gateway_record(runner)

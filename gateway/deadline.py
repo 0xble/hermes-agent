@@ -69,32 +69,30 @@ def with_deadline_scope(fn: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
             deadline = kwargs.get("deadline")
-            if deadline is not None and current() is None and float(deadline) <= time.monotonic():
-                return await fn(*args, **kwargs)
             with deadline_scope(deadline):
                 return await fn(*args, **kwargs)
         return async_wrapped
     @wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         deadline = kwargs.get("deadline")
-        if deadline is not None and current() is None and float(deadline) <= time.monotonic():
-            return fn(*args, **kwargs)
         with deadline_scope(deadline):
             return fn(*args, **kwargs)
     return wrapped
 
 
 @contextmanager
-def deadline_scope(deadline: float | None) -> Iterator[float | None]:
-    """Install a deadline, retaining the earlier deadline in nested scopes.
+def deadline_scope(deadline: float | None, *, inherit: bool = True) -> Iterator[float | None]:
+    """Install a deadline, retaining the earlier deadline in nested scopes by default.
 
     Deadlines are absolute ``time.monotonic()`` values. ``None`` leaves an
     existing scope unchanged and does not create an unbounded inner window.
+    Recovery paths may pass ``inherit=False`` when their reserved budget starts
+    after the caller's cooperative window has ended.
     """
     parent = current()
     if deadline is None:
         effective = parent
-    elif parent is None:
+    elif not inherit or parent is None:
         effective = float(deadline)
     else:
         effective = min(parent, float(deadline))

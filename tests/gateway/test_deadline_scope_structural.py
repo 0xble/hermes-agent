@@ -13,6 +13,33 @@ from gateway.deadline import connect_sqlite, deadline_scope, remaining
 from gateway.generation import GenerationCoordinator
 
 ROOT = Path(__file__).parents[2]
+BOUNDED_FILES = (
+    "gateway/run_generation.py",
+    "gateway/generation*.py",
+    "gateway/owned_*.py",
+    "hermes_cli/gateway_forward_update.py",
+    "hermes_cli/gateway_guardian.py",
+)
+DEADLINE_CONSTANTS = {
+    "STARTUP_SECONDS",
+    "ROLLBACK_SECONDS",
+    "POLL_SECONDS",
+    "POLL_PROOF_SECONDS",
+    "HANDOVER_REQUEST_TIMEOUT",
+    "HANDOVER_ABORT_RESERVE",
+    "COOPERATIVE_ROLLBACK_SECONDS",
+}
+# These are deadline plumbing helpers, not bounded entry points. Their callers
+# install the scope and pass the value through to the coordinator operation.
+DEADLINE_HELPERS = {
+    "_deadline_kwargs",
+    "_deadline_connect",
+    "_check_transaction_deadline",
+    "_begin_immediate",
+    "_deadline_check",
+    "_remaining",
+}
+DEADLINE_CALCULATORS = {"_proof_deadline"}
 
 
 def _call_names(tree: ast.AST, name: str) -> list[ast.Call]:
@@ -20,6 +47,74 @@ def _call_names(tree: ast.AST, name: str) -> list[ast.Call]:
             if isinstance(node, ast.Call)
             and ((isinstance(node.func, ast.Name) and node.func.id == name)
                  or (isinstance(node.func, ast.Attribute) and node.func.attr == name))]
+
+
+def _source_paths() -> list[Path]:
+    paths: list[Path] = []
+    for pattern in BOUNDED_FILES:
+        paths.extend(sorted(ROOT.glob(pattern)))
+    return list(dict.fromkeys(paths))
+
+
+def _functions(path: Path) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def _direct_body_nodes(node: ast.FunctionDef | ast.AsyncFunctionDef):
+    """Walk a function without treating nested callbacks as its scope."""
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        yield from ast.walk(statement)
+
+
+def _has_deadline_scope(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return any(
+        isinstance(call, ast.Call)
+        and ((isinstance(call.func, ast.Name) and call.func.id == "deadline_scope")
+             or (isinstance(call.func, ast.Attribute) and call.func.attr == "deadline_scope"))
+        for call in _direct_body_nodes(node)
+    )
+
+
+def _is_deadline_computation(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Assign):
+        return False
+    names = {target.id for target in node.targets if isinstance(target, ast.Name)}
+    if not names & {"deadline", "request_deadline", "coordinator_deadline", "recovery_deadline", "reload_deadline"}:
+        return False
+    loaded = {child.id for child in ast.walk(node.value)
+              if isinstance(child, ast.Name)}
+    clocks = {"monotonic", "_now", "_REAL_MONOTONIC"}
+    return bool(loaded & clocks and loaded & DEADLINE_CONSTANTS)
+
+
+def _bounded_entries() -> list[tuple[Path, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    entries = []
+    for path in _source_paths():
+        for node in _functions(path):
+            args = {arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)}
+            direct = list(_direct_body_nodes(node))
+            if node.name in DEADLINE_HELPERS or node.name in DEADLINE_CALCULATORS:
+                continue
+            if "deadline" in args or any(_is_deadline_computation(item) for item in direct):
+                entries.append((path, node))
+    return entries
+
+
+def _decorated_with_deadline_scope(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return any(isinstance(dec, ast.Name) and dec.id == "with_deadline_scope"
+               for dec in node.decorator_list)
+
+
+def _production_calls(name: str) -> list[ast.Call]:
+    calls = []
+    for path in _source_paths():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls.extend(_call_names(tree, name))
+    return calls
 
 
 def test_nested_scope_keeps_tighter_deadline_and_restores_parent():
@@ -59,34 +154,85 @@ def test_coordinator_write_transactions_route_through_one_helper():
     assert _call_names(tree, "begin_immediate"), "coordinator must use the centralized helper"
 
 
-def test_bounded_entries_use_scope_or_scope_adapter():
-    entries = {
-        "gateway/run_generation.py": (
-            "handover_to_generation", "transfer_requested", "transfer_aborted",
-            "serve_standby_generation",
-        ),
-        "hermes_cli/gateway_forward_update.py": (
-            "_poller", "_await_wedge_proof", "_terminate_proven_wedged", "_rollback",
-        ),
-        "hermes_cli/gateway_guardian.py": ("_run", "_repair_parked", "rollback_switch"),
-    }
-    for relative, names in entries.items():
-        tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
-        functions = {node.name: node for node in ast.walk(tree)
-                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        for name in names:
-            node = functions[name]
-            has_call = any(
-                isinstance(call, ast.Call)
-                and ((isinstance(call.func, ast.Name) and call.func.id == "deadline_scope")
-                     or (isinstance(call.func, ast.Attribute) and call.func.attr == "deadline_scope"))
-                for call in ast.walk(node)
-            )
-            decorated = any(
-                isinstance(dec, ast.Name) and dec.id == "with_deadline_scope"
-                for dec in node.decorator_list
-            )
-            assert has_call or decorated, f"{relative}:{name} has no deadline scope"
+def test_every_bounded_entry_is_scoped_or_keyword_adapted():
+    missing = []
+    for path, node in _bounded_entries():
+        if _has_deadline_scope(node):
+            continue
+        if _decorated_with_deadline_scope(node):
+            calls = _production_calls(node.name)
+            if calls and all(any(keyword.arg == "deadline" for keyword in call.keywords) for call in calls):
+                continue
+            if not calls and node.name == "record_poller_stopped":
+                continue
+        missing.append(f"{path.relative_to(ROOT)}:{node.name}:{node.lineno}")
+    assert not missing, "bounded gateway entries without an ambient deadline scope: " + ", ".join(missing)
+
+
+def test_transfer_requests_carry_the_socket_deadline():
+    missing = []
+    for path in (ROOT / "gateway" / "run_generation.py", ROOT / "hermes_cli" / "gateway_forward_update.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for call in _call_names(tree, "_generation_request"):
+            if not call.args or not isinstance(call.args[1], ast.Constant):
+                continue
+            if call.args[1].value not in {"transfer_requested", "transfer_aborted"}:
+                continue
+            params = next((keyword.value for keyword in call.keywords if keyword.arg == "params"), None)
+            if not isinstance(params, ast.Dict):
+                missing.append(f"{path.relative_to(ROOT)}:{call.lineno}")
+                continue
+            keys = {key.value for key in params.keys if isinstance(key, ast.Constant)}
+            if "deadline" not in keys:
+                missing.append(f"{path.relative_to(ROOT)}:{call.lineno}")
+    assert not missing, "transfer control requests missing params.deadline: " + ", ".join(missing)
+
+
+def test_supervisor_transfer_abort_requests_carry_the_socket_deadline():
+    missing = []
+    path = ROOT / "hermes_cli" / "gateway_forward_update.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for call in _call_names(tree, "request"):
+        if len(call.args) < 2 or not isinstance(call.args[1], ast.Constant):
+            continue
+        if call.args[1].value not in {"transfer_requested", "transfer_aborted"}:
+            continue
+        params = next((keyword.value for keyword in call.keywords if keyword.arg == "params"), None)
+        keys = ({key.value for key in params.keys if isinstance(key, ast.Constant)}
+                if isinstance(params, ast.Dict) else set())
+        if "deadline" not in keys:
+            missing.append(f"{path.relative_to(ROOT)}:{call.lineno}")
+    assert not missing, "supervisor transfer requests missing params.deadline: " + ", ".join(missing)
+
+
+def test_unbounded_scope_is_not_used_for_gateway_recovery():
+    uses = []
+    for path in _source_paths():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for call in _call_names(tree, "unbounded_scope"):
+            uses.append(f"{path.relative_to(ROOT)}:{call.lineno}")
+    assert not uses, "unbounded_scope is forbidden in bounded gateway paths: " + ", ".join(uses)
+
+
+def test_long_lived_tasks_do_not_inherit_bounded_deadlines():
+    files = [ROOT / "gateway" / "run_generation.py", ROOT / "gateway" / "run.py",
+             ROOT / "gateway" / "owned_routing.py"]
+    violations = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not (_has_deadline_scope(node) or _decorated_with_deadline_scope(node)):
+                continue
+            for call in _direct_body_nodes(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", None)
+                if name in {"create_task", "ensure_future"} and not any(
+                        keyword.arg == "context" for keyword in call.keywords):
+                    violations.append(f"{path.relative_to(ROOT)}:{call.lineno}:{name}")
+    assert not violations, "long-lived task spawn inherits a bounded deadline: " + ", ".join(violations)
 
 
 @pytest.mark.parametrize("relative", [
