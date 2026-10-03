@@ -18,6 +18,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 
 from gateway.control_socket import GatewayControlServer
+from gateway import deadline as gateway_deadline
 
 from gateway.generation import (
     GenerationCoordinator,
@@ -31,7 +32,12 @@ from gateway.generation import (
 from gateway.deadline import begin_immediate, deadline_scope, remaining as deadline_remaining, with_deadline_scope
 
 logger = logging.getLogger(__name__)
-_REAL_MONOTONIC = time.monotonic
+
+
+def _now() -> float:
+    return gateway_deadline.now()
+
+
 HANDOVER_REQUEST_TIMEOUT = 45  # Same bound as generation control acknowledgements.
 HANDOVER_ABORT_RESERVE = 2  # Reserved inside the caller's budget, never added to it.
 DEFAULT_DRAIN_SECONDS = 7200  # Match the commit cap when the durable deadline is missing.
@@ -55,29 +61,29 @@ class HandoverCommittedUnverified(RuntimeError):
 def _generation_request(path: Path, verb: str, *, params: dict | None = None,
                         timeout: float = 30) -> dict:
     request = json.dumps({"protocol": 1, "verb": verb, "params": params or {}}).encode() + b"\n"
-    deadline = time.monotonic() + timeout
+    deadline = _now() + timeout
     ambient = deadline_remaining()
     if ambient is not None:
-        deadline = min(deadline, time.monotonic() + ambient)
+        deadline = min(deadline, _now() + ambient)
     response: dict | None = None
     # A live generation keeps its control socket. Tolerate only brief connection
     # startup/teardown races, not disappearance for the whole request timeout.
     for attempt in range(3):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - _now()
                 if remaining <= 0:
                     raise TimeoutError("generation control deadline exceeded")
                 sock.settimeout(remaining)
                 sock.connect(str(path))
-                remaining = deadline - time.monotonic()
+                remaining = deadline - _now()
                 if remaining <= 0:
                     raise TimeoutError("generation control deadline exceeded")
                 sock.settimeout(remaining)
                 sock.sendall(request)
                 chunks = bytearray()
                 while b"\n" not in chunks and len(chunks) < 65536:
-                    remaining = deadline - time.monotonic()
+                    remaining = deadline - _now()
                     if remaining <= 0:
                         raise TimeoutError("generation control deadline exceeded")
                     sock.settimeout(remaining)
@@ -86,13 +92,13 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
                         break
                     chunks.extend(part)
             response = json.loads(bytes(chunks).partition(b"\n")[0])
-            if time.monotonic() >= deadline:
+            if _now() >= deadline:
                 raise TimeoutError("generation control deadline exceeded")
             break
         except OSError as exc:
-            if attempt == 2 or time.monotonic() >= deadline:
+            if attempt == 2 or _now() >= deadline:
                 raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
-            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+            time.sleep(min(0.5, max(0, deadline - _now())))
         except ValueError as exc:
             raise RuntimeError(f"generation control unavailable: {type(exc).__name__}") from exc
     if not isinstance(response, dict) or response.get("ok") is not True or not isinstance(response.get("result"), dict):
@@ -112,10 +118,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     """
     if not 1 <= drain_seconds <= 86400:
         raise ValueError("drain_seconds must be between 1 and 86400")
-    deadline = time.monotonic() + timeout
+    deadline = _now() + timeout
     request_deadline = deadline - min(HANDOVER_ABORT_RESERVE, timeout / 5)
-    coordinator_deadline = (_REAL_MONOTONIC()
-                            + max(0, request_deadline - time.monotonic()))
+    coordinator_deadline = request_deadline
     with deadline_scope(coordinator_deadline):
         coordinator = GenerationCoordinator(home)
         lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
@@ -125,12 +130,12 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         identities = {row["id"]: row for row in coordinator.generations()}
     old, successor = identities.get(old_id), identities.get(to_id)
     def remaining(*, recovery=False):
-        budget = (deadline if recovery else request_deadline) - time.monotonic()
+        budget = (deadline if recovery else request_deadline) - _now()
         if budget <= 0:
             raise RuntimeError('handover deadline exceeded')
         return budget
     def check_deadline():
-        if time.monotonic() >= deadline:
+        if _now() >= deadline:
             raise RuntimeError('handover deadline exceeded')
     if old is None or successor is None or successor["state"] != "standby":
         raise RuntimeError("successor is not ready or old generation is missing")
@@ -164,17 +169,17 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     except Exception:
         # Never hide the transfer failure with a second failure during recovery.
         # Attempt both abort and re-arm even if either operation fails.
-        abort_budget = min(HANDOVER_ABORT_RESERVE, max(0.0, deadline - time.monotonic()))
+        abort_budget = min(HANDOVER_ABORT_RESERVE, max(0.0, deadline - _now()))
         try:
             abort_budget = min(HANDOVER_ABORT_RESERVE, remaining(recovery=True))
             coordinator.abort_transfer(old_id, to_id, epoch, attempt_nonce=nonce,
-                                       deadline=time.monotonic() + abort_budget)
+                                       deadline=_now() + abort_budget)
         except Exception:
             logger.exception("transfer abort failed after pre-commit failure")
         try:
             _generation_request(path, "transfer_aborted",
                                 params={"to": to_id, "nonce": nonce,
-                                        "deadline": time.monotonic() + abort_budget},
+                                        "deadline": _now() + abort_budget},
                                 timeout=abort_budget)
         except Exception:
             logger.exception("poller re-arm failed after pre-commit failure")
@@ -186,16 +191,16 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         return promoted
     successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})
     successor_socket = generation_paths(home, successor_identity)["socket"]
-    while time.monotonic() < deadline:
+    while _now() < deadline:
         claimed = next(row for row in coordinator.generations() if row['id'] == to_id)
         if coordinator._owner_is_dead(claimed):
             raise HandoverCommittedUnverified(to_id, promoted)
         try:
-            socket_remaining = deadline - time.monotonic()
+            socket_remaining = deadline - _now()
             if socket_remaining <= 0:
                 raise HandoverCommittedUnverified(to_id, promoted)
             status = _generation_request(successor_socket, "polling_status", timeout=min(2, socket_remaining))
-            if time.monotonic() >= deadline:
+            if _now() >= deadline:
                 raise HandoverCommittedUnverified(to_id, promoted)
             if status.get("generation_id") == to_id and status.get("polling") is True and set(status.get("tokens", [])) == set(tokens):
                 return promoted
@@ -609,7 +614,7 @@ class ActiveGeneration:
                         _stop_cron_provider(self.cron_provider)
                         self._external_cron_stopped = True
                 self._stopped_receipts = stopped
-                self._pending_transfer = (new_id, nonce, time.monotonic() + HANDOVER_REQUEST_TIMEOUT)
+                self._pending_transfer = (new_id, nonce, _now() + HANDOVER_REQUEST_TIMEOUT)
                 self._drain_task = asyncio.create_task(self._drain_after_transfer(), context=Context())
                 return {"poller_stopped": True, "generation_id": self.identity.id,
                         "epoch": self.epoch, "tokens": len(stopped)}
@@ -621,13 +626,13 @@ class ActiveGeneration:
                 return await self._recover_failed_transfer(new_id, nonce, deadline, original)
 
     async def _recover_failed_transfer(self, new_id, nonce, deadline, original):
-        with deadline_scope(time.monotonic() + HANDOVER_ABORT_RESERVE, inherit=False):
+        with deadline_scope(_now() + HANDOVER_ABORT_RESERVE, inherit=False):
             try:
                 await asyncio.to_thread(
                     self.coordinator.abort_transfer,
                     self.identity.id, new_id, self.epoch,
                     attempt_nonce=nonce,
-                    **_deadline_kwargs(time.monotonic() + HANDOVER_ABORT_RESERVE))
+                    **_deadline_kwargs(_now() + HANDOVER_ABORT_RESERVE))
             except Exception:
                 message = "poller stop failed and transfer abort could not be proved"
                 self._rearm_errors = [message]
@@ -799,12 +804,12 @@ class ActiveGeneration:
             if self.runner is None or not getattr(self.runner, "_overlap_draining", False):
                 return
             pending = self._pending_transfer
-            if pending and time.monotonic() >= pending[2]:
+            if pending and _now() >= pending[2]:
                 new_id, nonce, _ = pending
                 async with self._transfer_lock:
                     # Roster requests share this lock, so a retry cannot replace
                     # the aborted nonce before recovery has reopened dispatch.
-                    recovery_deadline = time.monotonic() + HANDOVER_ABORT_RESERVE
+                    recovery_deadline = _now() + HANDOVER_ABORT_RESERVE
                     with deadline_scope(recovery_deadline):
                         try:
                             aborted = await asyncio.to_thread(
@@ -877,7 +882,7 @@ class ActiveGeneration:
             # synchronous socket protocol simple without occupying an event-loop thread.
             wait_timeout = HANDOVER_REQUEST_TIMEOUT
             if deadline is not None:
-                wait_timeout = min(wait_timeout, max(0.0, float(deadline) - _REAL_MONOTONIC()))
+                wait_timeout = min(wait_timeout, max(0.0, float(deadline) - _now()))
             return future.result(timeout=wait_timeout)
 
         def _abort_handler(params: dict) -> dict:
@@ -892,7 +897,7 @@ class ActiveGeneration:
                                       deadline=None if deadline is None else float(deadline)), loop)
             wait_timeout = HANDOVER_REQUEST_TIMEOUT
             if deadline is not None:
-                wait_timeout = min(wait_timeout, max(0.0, float(deadline) - _REAL_MONOTONIC()))
+                wait_timeout = min(wait_timeout, max(0.0, float(deadline) - _now()))
             return future.result(timeout=wait_timeout)
 
         def _roster_handler() -> dict:
@@ -927,7 +932,7 @@ class ActiveGeneration:
         if self._rearm_errors:
             runtime = {**runtime, "needs_attention": True, "polling": False,
                        "error_message": f"poller re-arm failed for {', '.join(self._rearm_errors)}"}
-        now = time.monotonic()
+        now = _now()
         if runtime == self._last_runtime and now - self._last_status_write < 30:
             return
         row = next((row for row in self.coordinator.generations() if row["id"] == self.identity.id), None)
@@ -946,7 +951,7 @@ class ActiveGeneration:
                 await asyncio.to_thread(self._sync_runtime_status)
                 await asyncio.to_thread(self.coordinator.heartbeat, self.identity.id)
             except Exception:
-                now = time.monotonic()
+                now = _now()
                 if now - last_warning >= 30:
                     logger.warning("active generation heartbeat failed; retrying", exc_info=True)
                     last_warning = now
@@ -1104,7 +1109,7 @@ async def serve_standby_generation(config=None, *, claimed_generation=None) -> b
                         break
                     await asyncio.to_thread(coordinator.heartbeat, identity.id)
                 except Exception:
-                    now = time.monotonic()
+                    now = _now()
                     if now - last_warning >= 30:
                         logger.warning("standby generation heartbeat failed; retrying", exc_info=True)
                         last_warning = now

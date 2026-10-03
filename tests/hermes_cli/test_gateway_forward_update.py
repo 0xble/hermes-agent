@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths, write_generation_record
+from gateway import deadline as gateway_deadline
 from hermes_cli import immutable_releases as releases
 from hermes_cli import gateway_forward_update as forward
 
@@ -74,6 +75,7 @@ def rig(tmp_path, monkeypatch):
     db.record_poller_event('token-hash', old.id, 1, 'lock_acquired')
     db.record_poller_event('token-hash', old.id, 1, 'poller_started')
     clock = SimpleNamespace(value=0.)
+    monkeypatch.setattr(gateway_deadline, 'now', lambda: clock.value)
     monkeypatch.setattr(forward, '_now', lambda: clock.value)
     monkeypatch.setattr(forward, '_sleep', lambda seconds: setattr(clock, 'value', clock.value + seconds))
     events, loaded = [], {old.label}

@@ -23,6 +23,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
 from hermes_cli.gateway_forward_update import STARTUP_SECONDS
 from gateway.deadline import deadline_scope, with_deadline_scope
+from gateway import deadline as gateway_deadline
 
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
 INTERVAL = 30
@@ -38,20 +39,20 @@ def _domain(label: str) -> str:
 
 def _gateway_domain(label: str, preferred: str | None, *, runner=None, timeout: float = 10) -> str:
     """Observe both domains before trusting a saved domain or starting an unloaded job."""
-    deadline = time.monotonic() + max(0.0, timeout)
+    deadline = gateway_deadline.now() + max(0.0, timeout)
     domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")  # windows-footgun: ok (macOS launchd only)
     if preferred is not None and preferred not in domains:
         raise RuntimeError("guardian domain is not a gateway launchd domain for this user")
     states = {}
     for candidate in domains:
         try:
-            remaining = deadline - time.monotonic()
+            remaining = deadline - gateway_deadline.now()
             if remaining <= 0:
                 raise RuntimeError("gateway domain probe deadline exceeded")
             states[candidate] = _launch_state(candidate, label, runner=runner, timeout=min(5, remaining))
         except RuntimeError:
             states[candidate] = "unknown"
-    if time.monotonic() >= deadline:
+    if gateway_deadline.now() >= deadline:
         raise RuntimeError("gateway domain probe deadline exceeded")
     loaded = [candidate for candidate, state in states.items() if state in {"loaded", "parked"}]
     if len(loaded) > 1:
@@ -62,7 +63,7 @@ def _gateway_domain(label: str, preferred: str | None, *, runner=None, timeout: 
         raise RuntimeError("cannot prove gateway unloaded in both launchd domains")
     if preferred is not None:
         return preferred
-    remaining = deadline - time.monotonic()
+    remaining = deadline - gateway_deadline.now()
     if remaining <= 0:
         raise RuntimeError("gateway domain probe deadline exceeded")
     try:
@@ -137,7 +138,7 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
 
 
 def _remaining(deadline: float, cap: float) -> float:
-    remaining = deadline - time.monotonic()
+    remaining = deadline - gateway_deadline.now()
     if remaining <= 0:
         raise RuntimeError("guardian repair deadline exceeded")
     return min(cap, remaining)
@@ -175,14 +176,14 @@ def healthy(home: Path, label: str, expected: Path, runner=None, deadline: float
         return False
     if supervised is None:
         return False
-    if deadline is not None and time.monotonic() >= deadline:
+    if deadline is not None and gateway_deadline.now() >= deadline:
         return False
     try:
         process = psutil.Process(pid)
         running = process.is_running()
         parents = {p.pid for p in process.parents()}
         cwd = process.cwd()
-        if deadline is not None and time.monotonic() >= deadline:
+        if deadline is not None and gateway_deadline.now() >= deadline:
             return False
         return (running and
                 (supervised == pid or supervised in parents) and
@@ -207,7 +208,7 @@ def _launch_state(domain: str, label: str, *, runner=None, timeout: float = 5) -
 
 def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
                     launchctl_runner=None) -> bool:
-    deadline = time.monotonic() + STARTUP_SECONDS
+    deadline = gateway_deadline.now() + STARTUP_SECONDS
     with deadline_scope(deadline):
         return _rollback_switch_bounded(home, plist, label, old, domain=domain,
                                         launchctl_runner=launchctl_runner, deadline=deadline)
@@ -252,7 +253,7 @@ def _rollback_switch_bounded(home: Path, plist: Path, label: str, old: Path, *, 
             _launchctl_bootstrap(domain, plist, label, timeout=_remaining(reload_deadline, 30))
         else:
             _launchctl_bootstrap(domain, plist, label, timeout=_remaining(reload_deadline, 30), runner=launchctl_runner)
-        if time.monotonic() >= reload_deadline:
+        if gateway_deadline.now() >= reload_deadline:
             raise RuntimeError("guardian rollback deadline exceeded")
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
@@ -260,13 +261,13 @@ def _rollback_switch_bounded(home: Path, plist: Path, label: str, old: Path, *, 
         # The S2 acknowledgement may arrive after this one-shot invocation; live
         # process identity below is the independent health proof for this action.
         wait_for_release_acknowledgement(home, timeout_seconds=_remaining(reload_deadline, 5))
-    health_deadline = time.monotonic() + 12
-    while time.monotonic() < health_deadline:
+    health_deadline = gateway_deadline.now() + 12
+    while gateway_deadline.now() < health_deadline:
         if healthy(home, label, old, launchctl_runner, deadline=health_deadline):
-            if time.monotonic() < health_deadline:
+            if gateway_deadline.now() < health_deadline:
                 return True
             break
-        if time.monotonic() >= health_deadline:
+        if gateway_deadline.now() >= health_deadline:
             break
         time.sleep(min(.25, _remaining(health_deadline, .25)))
     return False
@@ -274,7 +275,7 @@ def _rollback_switch_bounded(home: Path, plist: Path, label: str, old: Path, *, 
 
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
          forward_only: bool = False, launchctl_runner=None) -> str:
-    deadline = time.monotonic() + STARTUP_SECONDS
+    deadline = gateway_deadline.now() + STARTUP_SECONDS
     with deadline_scope(deadline):
         return _run_bounded(home, plist, label, grace=grace, domain=domain,
                             forward_only=forward_only, launchctl_runner=launchctl_runner,
@@ -299,7 +300,7 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
         from gateway.generation import GenerationCoordinator
         coordinator = GenerationCoordinator(home)
         if coordinator.service_label() != label:
-            repair_deadline = time.monotonic() + STARTUP_SECONDS
+            repair_deadline = gateway_deadline.now() + STARTUP_SECONDS
             cleanup_domain = _gateway_domain(label, domain, runner=launchctl_runner,
                                              timeout=_remaining(repair_deadline, 10))
             if _launch_state(cleanup_domain, label, runner=launchctl_runner,
@@ -376,15 +377,15 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
         refresh_generation_scope(plist)
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
               timeout=_remaining(deadline, 10))
-    while time.monotonic() < deadline:
+    while gateway_deadline.now() < deadline:
         state = _launch_state(domain, label, runner=launchctl_runner,
                               timeout=_remaining(deadline, 5))
         if state in {"loaded", "parked"} and healthy(home, label, current, launchctl_runner, deadline=deadline):
-            if time.monotonic() < deadline:
+            if gateway_deadline.now() < deadline:
                 receipt(home, "bootstrap", "repaired", label=label, release=str(current))
                 return "repaired"
             break
-        if time.monotonic() >= deadline:
+        if gateway_deadline.now() >= deadline:
             break
         _sleep = min(.25, _remaining(deadline, .25))
         time.sleep(_sleep)
@@ -408,7 +409,7 @@ def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=N
         if coordinator.prepare_parked_repair(label) != "repair":
             return "waiting"
         receipt(home, "bootstrap", "attempt", label=label)
-    deadline = time.monotonic() + STARTUP_SECONDS if deadline is None else deadline
+    deadline = gateway_deadline.now() + STARTUP_SECONDS if deadline is None else deadline
     launchctl(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
               timeout=_remaining(deadline, 10))
     if _launch_state(domain, label, runner=launchctl, timeout=_remaining(deadline, 5)) != "unloaded":
@@ -419,14 +420,14 @@ def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=N
     refresh_generation_scope(plist)
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
               timeout=_remaining(deadline, 10))
-    while time.monotonic() < deadline:
+    while gateway_deadline.now() < deadline:
         state = _launch_state(domain, label, runner=launchctl, timeout=_remaining(deadline, 5))
         if state == "loaded" and healthy(home, label, current, launchctl, deadline=deadline):
-            if time.monotonic() < deadline:
+            if gateway_deadline.now() < deadline:
                 receipt(home, "bootstrap", "repaired", label=label, release=str(current))
                 return "repaired"
             break
-        if time.monotonic() >= deadline:
+        if gateway_deadline.now() >= deadline:
             break
         _sleep = min(.25, _remaining(deadline, .25))
         time.sleep(_sleep)

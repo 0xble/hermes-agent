@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from gateway.deadline import connect_sqlite, deadline_scope, remaining
+from gateway.deadline import check, connect_sqlite, deadline_scope, remaining, with_deadline_scope
 from gateway.generation import GenerationCoordinator
 
 ROOT = Path(__file__).parents[2]
@@ -117,6 +117,11 @@ def _production_calls(name: str) -> list[ast.Call]:
     return calls
 
 
+def _call_has_deadline(call: ast.Call, function_name: str) -> bool:
+    return (any(keyword.arg == "deadline" for keyword in call.keywords)
+            or function_name == "_await_wedge_proof" and len(call.args) >= 4)
+
+
 def test_nested_scope_keeps_tighter_deadline_and_restores_parent():
     outer = time.monotonic() + 10
     inner = time.monotonic() + 2
@@ -133,6 +138,19 @@ def test_expired_scope_rejects_sqlite_connect_without_opening():
     with pytest.raises(TimeoutError, match="deadline"):
         with deadline_scope(time.monotonic() - 1):
             connect_sqlite(":memory:")
+
+
+def test_expired_deadline_scope_rejects_bounded_entry_without_write():
+    writes = []
+
+    @with_deadline_scope
+    def bounded_write(*, deadline=None):
+        check()
+        writes.append(True)
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        bounded_write(deadline=time.monotonic() - 1)
+    assert writes == []
 
 
 def test_coordinator_connection_uses_ambient_busy_timeout(tmp_path):
@@ -154,6 +172,21 @@ def test_coordinator_write_transactions_route_through_one_helper():
     assert _call_names(tree, "begin_immediate"), "coordinator must use the centralized helper"
 
 
+def test_bounded_deadline_producers_use_canonical_clock():
+    paths = [ROOT / relative for relative in (
+        "gateway/run_generation.py",
+        "gateway/generation.py",
+        "hermes_cli/gateway_forward_update.py",
+        "hermes_cli/gateway_guardian.py",
+    )]
+    violations = []
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        if "time.monotonic()" in source or "_REAL_MONOTONIC" in source:
+            violations.append(str(path.relative_to(ROOT)))
+    assert not violations, "bounded deadline producers bypass gateway.deadline.now: " + ", ".join(violations)
+
+
 def test_every_bounded_entry_is_scoped_or_keyword_adapted():
     missing = []
     for path, node in _bounded_entries():
@@ -161,7 +194,7 @@ def test_every_bounded_entry_is_scoped_or_keyword_adapted():
             continue
         if _decorated_with_deadline_scope(node):
             calls = _production_calls(node.name)
-            if calls and all(any(keyword.arg == "deadline" for keyword in call.keywords) for call in calls):
+            if calls and all(_call_has_deadline(call, node.name) for call in calls):
                 continue
             if not calls and node.name == "record_poller_stopped":
                 continue

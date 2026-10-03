@@ -29,6 +29,7 @@ from gateway.deadline import (
     remaining as deadline_remaining,
     with_deadline_scope,
 )
+from gateway import deadline as gateway_deadline
 
 SCHEMA_VERSION = 1
 
@@ -286,7 +287,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
     def _deadline_connect(self, deadline: float | None):
         if deadline is None:
             return self.connect()
-        budget = deadline - time.monotonic()
+        budget = deadline - gateway_deadline.now()
         if budget <= 0:
             raise TimeoutError("generation transaction deadline exceeded")
         return self.connect(timeout=min(5.0, budget))
@@ -294,7 +295,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
     @staticmethod
     def _check_transaction_deadline(conn, deadline: float | None = None):
         try:
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and gateway_deadline.now() >= deadline:
                 conn.rollback()
                 raise TimeoutError("generation transaction deadline exceeded")
             check_deadline()
@@ -310,7 +311,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         try:
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError as exc:
-            if time.monotonic() >= deadline:
+            if gateway_deadline.now() >= deadline:
                 conn.rollback()
                 raise TimeoutError("generation transaction deadline exceeded") from exc
             raise
@@ -792,7 +793,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 if start in events:
                     conn.execute("INSERT INTO poller_journal(generation_id,epoch,token_hash,event,"
                                  "monotonic_at,wall_at,boot_id) VALUES(?,?,?,?,?,?,?)",
-                                 (generation_id, epoch, token, stop, time.monotonic(), time.time(), _boot_id()))
+                                 (generation_id, epoch, token, stop, gateway_deadline.now(), time.time(), _boot_id()))
 
     def record_poller_event(self, token_hash: str, generation_id: str, epoch: int,
                             event: str, *, monotonic_at: float | None = None,
@@ -808,7 +809,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 "INSERT INTO poller_journal(generation_id,epoch,token_hash,event,monotonic_at,wall_at,boot_id) "
                 "VALUES(?,?,?,?,?,?,?)",
                 (generation_id, int(epoch), token_hash, event,
-                 time.monotonic() if monotonic_at is None else float(monotonic_at),
+                 gateway_deadline.now() if monotonic_at is None else float(monotonic_at),
                  time.time() if wall_at is None else float(wall_at), owner["boot_id"]),
             )
             conn.commit()

@@ -19,8 +19,9 @@ import time
 import uuid
 
 from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths, forward_only_handover_enabled
+from gateway import deadline as gateway_deadline
 from gateway.deadline import begin_immediate, connect_sqlite, deadline_scope, with_deadline_scope
-from gateway.run_generation import handover_to_generation, _generation_request, HANDOVER_ABORT_RESERVE, _REAL_MONOTONIC
+from gateway.run_generation import handover_to_generation, _generation_request, HANDOVER_ABORT_RESERVE
 from hermes_cli.gateway_launchd_generation import generation_launchd_label, render_generation_launchd_plist, bootstrap_generation_plist
 from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _atomic_bytes, _atomic_json, _sync_dir, _release_is_ready, activate_release
 
@@ -42,7 +43,7 @@ _REARM_FENCES = ('poller', 'cron', 'kanban', 'goal_wakeup')
 
 
 def _now():
-    return time.monotonic()
+    return gateway_deadline.now()
 
 
 def _sleep(seconds):
@@ -830,16 +831,19 @@ def _observe_rollback_reply(home, db, row, proof, record):
             break
         _sleep(min(.2, remaining))
     until = record['commit_at'] + ROLLBACK_SECONDS
-    rollback['fresh_input_observed'] = _fresh_input(home, row, proof['epoch'], after, until, proof['tokens'])
-    rollback['rollback_bound_met'] = (
-        rollback['commit_to_serving_upper_bound_seconds'] <= ROLLBACK_SECONDS
-        and not late_reply
-        and (rollback['reply_observed'] or not rollback['fresh_input_observed']))
-    # Timing observation does not authorize completion under a different owner.
-    lease = _lease(db)
-    if ((lease['generation_id'], lease['epoch'], lease['state']) != (row['id'], proof['epoch'], 'active')
-            or not _live(_row(db, row['id']))):
-        raise RuntimeError('rollback owner changed during observation')
+    # The cooperative observation window is over, but classification and archival
+    # still need a small, explicit recovery budget; never rely on an expired-scope bypass.
+    with deadline_scope(_now() + HANDOVER_ABORT_RESERVE, inherit=False):
+        rollback['fresh_input_observed'] = _fresh_input(home, row, proof['epoch'], after, until, proof['tokens'])
+        rollback['rollback_bound_met'] = (
+            rollback['commit_to_serving_upper_bound_seconds'] <= ROLLBACK_SECONDS
+            and not late_reply
+            and (rollback['reply_observed'] or not rollback['fresh_input_observed']))
+        # Timing observation does not authorize completion under a different owner.
+        lease = _lease(db)
+        if ((lease['generation_id'], lease['epoch'], lease['state']) != (row['id'], proof['epoch'], 'active')
+                or not _live(_row(db, row['id']))):
+            raise RuntimeError('rollback owner changed during observation')
     record['alert'] = not rollback['rollback_bound_met']
 
 
@@ -889,7 +893,7 @@ def _terminate_proven_wedged(home, db, row, deadline, record, *, expected_lease=
     if not db._owner_is_dead(current):
         if not _live(current):
             raise RuntimeError('successor identity became unknown during probe')
-        proof = _await_wedge_proof(home, db, current, deadline=deadline)
+        proof = _await_wedge_proof(home, db, current, deadline)
         if proof is None:
             raise RuntimeError('live successor neither handed over nor proved wedged')
         current = _row(db, row['id'])
@@ -1022,7 +1026,7 @@ def _rollback_bounded(home, db, failed, previous, supervisor, record, *, late=Fa
                     if not db._owner_is_dead(current):
                         if not _live(current):
                             raise RuntimeError('successor identity became unknown during probe')
-                        if _await_wedge_proof(home, db, current, deadline=deadline) is None:
+                        if _await_wedge_proof(home, db, current, deadline) is None:
                             raise RuntimeError('live successor neither handed over nor proved wedged')
                         # The probe can outlive this PID incarnation. A replacement
                         # proves B dead and must never receive either signal.
@@ -1042,27 +1046,28 @@ def _rollback_bounded(home, db, failed, previous, supervisor, record, *, late=Fa
             # The standby itself can cold-takeover. CAS protects either participant.
             db.takeover_dead_generation('active_generation', failed['id'], fresh['id'],
                 bootout=lambda label: supervisor.bootout(_row(db, failed['id']), _remaining(deadline, 15)),
-                deadline=time.monotonic() + max(0, deadline - _now()))
+                deadline=_now() + max(0, deadline - _now()))
     proof = _poller(db, fresh, supervisor, deadline=deadline)
-    serving_clock = _now()
-    result = _flip(home, db, fresh, proof, supervisor, operation='rollback', record=record)
-    rollback = {'old_id': failed['id'], 'new_id': fresh['id'], 'old_label': failed['label'],
-                'new_label': fresh['label'], 'old_sha': failed['release_sha'], 'new_sha': fresh['release_sha'],
-                'epoch': proof['epoch'], 'poller': proof,
-                'death_observed_at': record['death_observed_at'], **result}
-    if same_boot:
-        rollback['serving_seconds'] = serving_clock - (death_clock if death_clock is not None else record['commit_clock'])
-        rollback['commit_to_serving_upper_bound_seconds'] = serving_clock - record['commit_clock']
-        if death_clock is not None:
-            rollback['death_to_serving_seconds'] = serving_clock - death_clock
-    else:
-        rollback.update(rollback_bound_met=None, timing_unprovable='boot changed', reply_observed=False)
-        record['alert'] = True
-    record['rollback'] = rollback
-    _save(home, record)
-    if same_boot:
-        _observe_rollback_reply(home, db, fresh, proof, record)
-    return _finish(home, record, 'rolled_back', **result)
+    with deadline_scope(_now() + HANDOVER_ABORT_RESERVE, inherit=False):
+        serving_clock = _now()
+        result = _flip(home, db, fresh, proof, supervisor, operation='rollback', record=record)
+        rollback = {'old_id': failed['id'], 'new_id': fresh['id'], 'old_label': failed['label'],
+                    'new_label': fresh['label'], 'old_sha': failed['release_sha'], 'new_sha': fresh['release_sha'],
+                    'epoch': proof['epoch'], 'poller': proof,
+                    'death_observed_at': record['death_observed_at'], **result}
+        if same_boot:
+            rollback['serving_seconds'] = serving_clock - (death_clock if death_clock is not None else record['commit_clock'])
+            rollback['commit_to_serving_upper_bound_seconds'] = serving_clock - record['commit_clock']
+            if death_clock is not None:
+                rollback['death_to_serving_seconds'] = serving_clock - death_clock
+        else:
+            rollback.update(rollback_bound_met=None, timing_unprovable='boot changed', reply_observed=False)
+            record['alert'] = True
+        record['rollback'] = rollback
+        _save(home, record)
+        if same_boot:
+            _observe_rollback_reply(home, db, fresh, proof, record)
+        return _finish(home, record, 'rolled_back', **result)
 
 
 def _superseded(home, db, record, lease, supervisor):
@@ -1225,7 +1230,7 @@ def recover_forward(home, *, supervisor=None):
                 record['old_id'], record['old_epoch'], 'active'):
             try:
                 old = _row(db, record['old_id'])
-                recovery_deadline = time.monotonic() + 2
+                recovery_deadline = _now() + 2
                 status = supervisor.request(old, 'polling_status', timeout=_remaining(recovery_deadline, 2))
                 with closing(db._deadline_connect(recovery_deadline)) as conn:
                     transfer = conn.execute('SELECT state FROM generation_transfers WHERE old_id=? AND epoch=?',
@@ -1325,7 +1330,7 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
             current = _lease(db)
             if (current['generation_id'], current['epoch'], current['state']) == (old['id'], lease['epoch'], 'active'):
                 try:
-                    recovery_deadline = time.monotonic() + min(
+                    recovery_deadline = _now() + min(
                         HANDOVER_ABORT_RESERVE, max(0, handover_deadline - _now()))
                     with deadline_scope(recovery_deadline):
                         with closing(db._deadline_connect(recovery_deadline)) as conn:
@@ -1339,7 +1344,7 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
                                 db.abort_transfer(old['id'], successor['id'], lease['epoch'],
                                                   attempt_nonce=transfer['attempt_nonce'],
                                                   deadline=recovery_deadline)
-                            resume_deadline = _REAL_MONOTONIC() + min(
+                            resume_deadline = _now() + min(
                                 HANDOVER_ABORT_RESERVE, max(0, handover_deadline - _now()))
                             resume = supervisor.request(old, 'transfer_aborted',
                                 params={'to': successor['id'], 'nonce': transfer['attempt_nonce'],

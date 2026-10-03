@@ -59,6 +59,7 @@ Every bounded startup, handover, takeover, rollback, guardian-repair, wedge-proo
 3. Re-check the deadline inside each irreversible transaction after its write lock is acquired; roll back when expired.
 4. After lease/pointer commit, lateness is a typed committed outcome or commit-clocked poll, never a plain failure or rollback of a healthy successor.
 5. Exception-path recovery uses the remaining budget or a named short reserve, never a fresh full interval. The one named exception is `recover_forward(late=True)` after the original rollback bound has expired: it records the missed original bound (`late_rollback.bound_missed=true`) and receives a fresh `ROLLBACK_SECONDS` operating budget, with an alert.
+6. The old owner's cooperative wire stop during `transfer_requested` is bounded by the poller's own long-poll limit (`timeout+1`), not the driver's window. The driver's window is protected by its socket timeout, and the owner self-rearms under the same lease and nonce.
 
 ## S1 — macOS cron run survives gateway restart
 

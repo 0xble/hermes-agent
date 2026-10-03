@@ -13,6 +13,11 @@ from typing import Any, Callable, Iterator
 _current_deadline: ContextVar[float | None] = ContextVar("gateway_deadline", default=None)
 
 
+def now() -> float:
+    """Return the canonical monotonic clock used by bounded gateway operations."""
+    return time.monotonic()
+
+
 def current() -> float | None:
     """Return the active absolute monotonic deadline, if any."""
     return _current_deadline.get()
@@ -23,7 +28,7 @@ def remaining() -> float | None:
     deadline = current()
     if deadline is None:
         return None
-    return max(0.0, deadline - time.monotonic())
+    return max(0.0, deadline - now())
 
 
 def check() -> None:
@@ -113,4 +118,4 @@ def unbounded_scope() -> Iterator[None]:
         _current_deadline.reset(token)
 
 
-__all__ = ["begin_immediate", "check", "connect_sqlite", "current", "deadline_scope", "remaining", "unbounded_scope", "with_deadline_scope"]
+__all__ = ["begin_immediate", "check", "connect_sqlite", "current", "deadline_scope", "now", "remaining", "unbounded_scope", "with_deadline_scope"]
