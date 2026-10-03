@@ -19,6 +19,7 @@ import time
 import uuid
 
 from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths, forward_only_handover_enabled
+from gateway.deadline import begin_immediate, connect_sqlite, deadline_scope, with_deadline_scope
 from gateway.run_generation import handover_to_generation, _generation_request, HANDOVER_ABORT_RESERVE
 from hermes_cli.gateway_launchd_generation import generation_launchd_label, render_generation_launchd_plist, bootstrap_generation_plist
 from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _atomic_bytes, _atomic_json, _sync_dir, _release_is_ready, activate_release
@@ -31,6 +32,7 @@ ROLLBACK_SECONDS = 60
 WEDGE_STALE_SECONDS = 35
 # Bounded SIGTERM/SIGKILL, takeover and A-prime polling proof after a wedge proof.
 WEDGE_RESERVE_SECONDS = 15
+WEDGE_RECOVERY_RESERVE_SECONDS = WEDGE_RESERVE_SECONDS + 3.4
 COOPERATIVE_ROLLBACK_SECONDS = 10
 POLL_SECONDS = 5
 # A committed successor must prove polling inside this share of the rollback
@@ -428,6 +430,7 @@ def _frozen_transfer_tokens(db, row, lease):
         transfer['old_id'], transfer['epoch'])}
 
 
+@with_deadline_scope
 def _poller(db, row, supervisor, deadline):
     last_failure = ''
     clock_error = False
@@ -542,7 +545,7 @@ def _refuse(db, row, supervisor, evidence, *, bootstrapped=True, bootstrap_scope
             never_claimed_only=False):
     # Fence a racing claim/cold takeover and never retire a serving lease holder.
     with closing(db.connect()) as conn, conn:
-        conn.execute('BEGIN IMMEDIATE')
+        begin_immediate(conn)
         current = conn.execute('SELECT * FROM generations WHERE id=?', (row['id'],)).fetchone()
         if never_claimed_only and current['pid'] is not None:
             return  # A racing claim is no longer this observer's cleanup to perform.
@@ -758,7 +761,7 @@ def _fresh_reply(home, row, epoch, after, tokens):
         outbox = Path(update['profile_home']) / 'gateway-outbox.db'
         if not outbox.exists():
             continue
-        with closing(sqlite3.connect(f'file:{outbox}?mode=ro', uri=True, timeout=2)) as conn:
+        with closing(connect_sqlite(f'file:{outbox}?mode=ro', uri=True, timeout=2)) as conn:
             delivered = conn.execute("SELECT a.turn_id,o.message_id FROM admissions a JOIN outbox o USING(turn_id) "
                 "WHERE a.platform='telegram' AND a.transport_event_id=? AND a.created_at>=? "
                 "AND a.profile=? AND a.event_kind='text' AND a.result='completed' "
@@ -838,6 +841,7 @@ def _proven_wedged(home, row):
         row['pid'], home=home, stale_after=WEDGE_STALE_SECONDS) == GATEWAY_LOOP_WEDGED
 
 
+@with_deadline_scope
 def _await_wedge_proof(home, db, row, deadline):
     """Probe until the successor answers, proves wedged, or the stop reserve is reached.
 
@@ -850,7 +854,7 @@ def _await_wedge_proof(home, db, row, deadline):
             return 'dead'
         if not _live(row):
             raise RuntimeError('successor identity became unknown during probe')
-        if deadline - _now() < WEDGE_RESERVE_SECONDS + 3.4:
+        if deadline - _now() < WEDGE_RECOVERY_RESERVE_SECONDS:
             return None
         verdict = probe_gateway_loop_liveness(row['pid'], home=home, stale_after=WEDGE_STALE_SECONDS)
         if verdict == GATEWAY_LOOP_WEDGED:
@@ -864,6 +868,7 @@ def _sqlite_locked(exc):
     return isinstance(exc, sqlite3.OperationalError) and 'database is locked' in str(exc).lower()
 
 
+@with_deadline_scope
 def _terminate_proven_wedged(home, db, row, deadline, record, *, expected_lease=None):
     """Release a wedged successor's SQLite transaction before coordinator retry."""
     from hermes_cli.gateway import _escalate_wedged_gateway
@@ -897,6 +902,7 @@ def _terminate_proven_wedged(home, db, row, deadline, record, *, expected_lease=
     return death_clock
 
 
+@with_deadline_scope
 def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
     from gateway.generation import _boot_id
     same_boot = record.get('commit_boot_id') == _boot_id()
@@ -985,7 +991,7 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
                 # A silent loop still needs heartbeat aging, bounded termination,
                 # takeover and polling proof inside the original rollback bound.
                 cooperative_budget = min(COOPERATIVE_ROLLBACK_SECONDS,
-                                         deadline - _now() - WEDGE_RESERVE_SECONDS - 3.4)
+                                         deadline - _now() - WEDGE_RECOVERY_RESERVE_SECONDS)
                 if cooperative_budget <= 0:
                     raise RuntimeError('cooperative handover has no reserved recovery budget')
                 handover_to_generation(home, fresh['id'], timeout=cooperative_budget, verify_after_commit=False, require_pollers=True)
@@ -1174,7 +1180,9 @@ def recover_forward(home, *, supervisor=None):
                 # Death authorizes a fresh takeover for any intended holder, including
                 # a rollback owner or a holder from an earlier boot. Never compare a
                 # prior boot's monotonic deadline with the current clock.
-                in_budget = same_boot and record['commit_clock'] + ROLLBACK_SECONDS > _now()
+                in_budget = (same_boot and
+                             record['commit_clock'] + ROLLBACK_SECONDS - _now()
+                             > WEDGE_RECOVERY_RESERVE_SECONDS)
                 committed = (record.get('pointer_commit') or {}).get('generation_id') == holder['id']
                 dead = db._owner_is_dead(holder)
                 # Re-read the commit after _flip: recovery may have activated it

@@ -1,0 +1,118 @@
+"""Context-local deadlines for bounded gateway handover operations."""
+from __future__ import annotations
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+import sqlite3
+import time
+import inspect
+from functools import wraps
+from typing import Any, Callable, Iterator
+
+
+_current_deadline: ContextVar[float | None] = ContextVar("gateway_deadline", default=None)
+
+
+def current() -> float | None:
+    """Return the active absolute monotonic deadline, if any."""
+    return _current_deadline.get()
+
+
+def remaining() -> float | None:
+    """Return seconds remaining in the active scope, or ``None`` if unbounded."""
+    deadline = current()
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def check() -> None:
+    """Raise ``TimeoutError`` when the active scope has expired."""
+    budget = remaining()
+    if budget is not None and budget <= 0:
+        raise TimeoutError("gateway deadline exceeded")
+
+
+def connect_sqlite(path: Any, *, timeout: float = 5.0, **kwargs: Any) -> sqlite3.Connection:
+    """Open SQLite with the ambient deadline folded into its busy timeout."""
+    budget = remaining()
+    if budget is not None:
+        if budget <= 0:
+            raise TimeoutError("gateway deadline exceeded")
+        timeout = min(float(timeout), budget)
+    conn = sqlite3.connect(path, timeout=max(0.0, timeout), **kwargs)
+    if budget is not None:
+        conn.execute(f"PRAGMA busy_timeout={max(0, int(timeout * 1000))}")
+    return conn
+
+
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """Acquire the coordinator write lock and re-check the ambient deadline."""
+    check()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        if remaining() == 0:
+            conn.rollback()
+            raise TimeoutError("gateway deadline exceeded") from exc
+        raise
+    try:
+        check()
+    except TimeoutError:
+        conn.rollback()
+        raise
+
+
+def with_deadline_scope(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Adapt legacy explicit ``deadline=`` parameters to the ambient scope."""
+    if inspect.iscoroutinefunction(fn):
+        @wraps(fn)
+        async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
+            deadline = kwargs.get("deadline")
+            if deadline is not None and current() is None and float(deadline) <= time.monotonic():
+                return await fn(*args, **kwargs)
+            with deadline_scope(deadline):
+                return await fn(*args, **kwargs)
+        return async_wrapped
+    @wraps(fn)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        deadline = kwargs.get("deadline")
+        if deadline is not None and current() is None and float(deadline) <= time.monotonic():
+            return fn(*args, **kwargs)
+        with deadline_scope(deadline):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+@contextmanager
+def deadline_scope(deadline: float | None) -> Iterator[float | None]:
+    """Install a deadline, retaining the earlier deadline in nested scopes.
+
+    Deadlines are absolute ``time.monotonic()`` values. ``None`` leaves an
+    existing scope unchanged and does not create an unbounded inner window.
+    """
+    parent = current()
+    if deadline is None:
+        effective = parent
+    elif parent is None:
+        effective = float(deadline)
+    else:
+        effective = min(parent, float(deadline))
+    token = _current_deadline.set(effective)
+    try:
+        yield effective
+    finally:
+        _current_deadline.reset(token)
+
+
+@contextmanager
+def unbounded_scope() -> Iterator[None]:
+    """Temporarily clear an ambient deadline for a separately reserved recovery path."""
+    token = _current_deadline.set(None)
+    try:
+        yield None
+    finally:
+        _current_deadline.reset(token)
+
+
+__all__ = ["begin_immediate", "check", "connect_sqlite", "current", "deadline_scope", "remaining", "unbounded_scope", "with_deadline_scope"]

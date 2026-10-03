@@ -22,6 +22,7 @@ from typing import Any
 from hermes_constants import get_hermes_home
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
 from hermes_cli.gateway_forward_update import STARTUP_SECONDS
+from gateway.deadline import deadline_scope, with_deadline_scope
 
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
 INTERVAL = 30
@@ -203,6 +204,7 @@ def _launch_state(domain: str, label: str, *, runner=None, timeout: float = 5) -
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
+@with_deadline_scope
 def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
                     launchctl_runner=None) -> bool:
     """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
@@ -261,6 +263,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
+@with_deadline_scope
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
          forward_only: bool = False, launchctl_runner=None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
@@ -372,6 +375,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     return "failed"
 
 
+@with_deadline_scope
 def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=None):
     from gateway.generation import GenerationCoordinator
     from hermes_cli.gateway_launchd_generation import refresh_generation_scope

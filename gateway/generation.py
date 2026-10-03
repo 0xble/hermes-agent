@@ -22,6 +22,13 @@ from typing import Any, Callable, Iterable
 from gateway.owned_admission import OwnedAdmissionMixin
 from gateway.generation_claims import GenerationClaimsMixin
 from gateway.generation_retention import GenerationRetentionMixin, install_retention_fences
+from gateway.deadline import (
+    begin_immediate,
+    check as check_deadline,
+    connect_sqlite,
+    remaining as deadline_remaining,
+    with_deadline_scope,
+)
 
 SCHEMA_VERSION = 1
 
@@ -266,34 +273,48 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         self._initialize()
 
     def connect(self, *, timeout: float = 5.0) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=max(0.0, float(timeout)), isolation_level=None)
+        budget = deadline_remaining()
+        effective_timeout = timeout if budget is None else min(float(timeout), budget)
+        if effective_timeout <= 0:
+            raise TimeoutError("gateway deadline exceeded")
+        conn = connect_sqlite(self.path, timeout=effective_timeout, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout={max(0, int(float(timeout) * 1000))}")
+        conn.execute(f"PRAGMA busy_timeout={max(0, int(effective_timeout * 1000))}")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def _deadline_connect(self, deadline: float | None):
         if deadline is None:
             return self.connect()
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        budget = deadline - time.monotonic()
+        if budget <= 0:
             raise TimeoutError("generation transaction deadline exceeded")
-        return self.connect(timeout=min(5.0, remaining))
+        return self.connect(timeout=min(5.0, budget))
 
     @staticmethod
-    def _check_transaction_deadline(conn, deadline: float | None):
-        if deadline is not None and time.monotonic() >= deadline:
+    def _check_transaction_deadline(conn, deadline: float | None = None):
+        try:
+            if deadline is not None and time.monotonic() >= deadline:
+                conn.rollback()
+                raise TimeoutError("generation transaction deadline exceeded")
+            check_deadline()
+        except TimeoutError:
             conn.rollback()
-            raise TimeoutError("generation transaction deadline exceeded")
+            raise
 
-    @classmethod
-    def _begin_immediate(cls, conn, deadline: float | None):
+    @staticmethod
+    def _begin_immediate(conn, deadline: float | None = None):
+        if deadline is None or deadline_remaining() is not None:
+            begin_immediate(conn)
+            return
         try:
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError as exc:
-            if deadline is not None and "locked" in str(exc).lower() and time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
+                conn.rollback()
                 raise TimeoutError("generation transaction deadline exceeded") from exc
             raise
+        GenerationCoordinator._check_transaction_deadline(conn, deadline)
 
     def _initialize(self) -> None:
         from gateway.generation_schema import layout_is_current, record_current_layout
@@ -306,7 +327,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 return
             conn.executescript(_SCHEMA)
             conn.execute("PRAGMA foreign_keys=OFF")
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(generations)")}
             additive_columns = {
                 "verdict": "TEXT",
@@ -446,7 +467,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             raise ValueError(f"invalid generation runtime state: {state}")
         now = time.time()
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             self._register_in_transaction(conn, identity, state=state, heartbeat_at=now)
             conn.commit()
 
@@ -476,7 +497,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             boot_id=boot_id or _boot_id(), start_fingerprint="",
         )
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             self._ensure_live_label_index(conn)
             self._reserve_in_transaction(conn, identity)
             conn.commit()
@@ -492,7 +513,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
     def register_unclaimed(self, identity: GenerationIdentity) -> None:
         """Compatibility spelling for reserving a caller-created generation identity."""
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             self._ensure_live_label_index(conn)
             self._reserve_in_transaction(conn, identity)
             conn.commit()
@@ -512,7 +533,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         if int(pid) <= 0 or not start_fingerprint:
             raise ValueError("a claimed generation needs a PID and start fingerprint")
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             changed = self._claim_in_transaction(conn, generation_id, int(pid), str(start_fingerprint),
                 boot_id or _boot_id(), scope_nonce, time.time() if claimed_at is None else float(claimed_at))
             conn.commit()
@@ -527,7 +548,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 expected_pid: int | None = None, expected_start_fingerprint: str | None = None,
                 expected_unclaimed: bool = False, verdict_at: float | None = None) -> bool:
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             changed = self._retire_in_transaction(
                 conn, generation_id, evidence=evidence, expected_pid=expected_pid,
                 expected_start_fingerprint=expected_start_fingerprint,
@@ -577,7 +598,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         if new_state not in _STATE_TRANSITIONS[expected_state]:
             raise RuntimeError(f"illegal generation transition {expected_state}->{new_state}")
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             changed = conn.execute(
                 "UPDATE generations SET state=?,drain_deadline=? WHERE id=? AND state=? AND verdict IS NULL",
                 (new_state, drain_deadline, generation_id, expected_state),
@@ -590,7 +611,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
     def observe_suspect(self, generation_id: str, *, evidence: str = "heartbeat_expired",
                         observed_at: float | None = None) -> bool:
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             changed = conn.execute(
                 "UPDATE generations SET suspect_at=COALESCE(suspect_at,?),suspect_evidence=? "
                 "WHERE id=? AND state!='exited'",
@@ -604,7 +625,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
 
     def heartbeat(self, generation_id: str, *, state: str | None = None) -> None:
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             now = time.time()
             if state is None:
                 conn.execute("UPDATE generations SET heartbeat_at=?,suspect_at=NULL,suspect_evidence=NULL WHERE id=?",
@@ -624,6 +645,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                              "AND state=?", (now, state, generation_id, current["state"]))
             conn.commit()
 
+    @with_deadline_scope
     def acquire_lease(self, resource: str, generation_id: str, *, state: str = "active",
                       deadline: float | None = None) -> int:
         with closing(self._deadline_connect(deadline)) as conn, conn:
@@ -658,6 +680,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             conn.commit()
             return epoch
 
+    @with_deadline_scope
     def takeover_dead_generation(self, resource: str, old_id: str, new_id: str, *,
                                  bootout: Callable[[str], Any],
                                  death_proof: Callable[[dict[str, Any]], bool] | None = None,
@@ -777,7 +800,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         if not token_hash or event not in _POLL_JOURNAL_EVENTS or type(epoch) is not int or epoch < 1:
             raise ValueError("invalid poller journal event")
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             owner = conn.execute("SELECT boot_id FROM generations WHERE id=?", (generation_id,)).fetchone()
             if owner is None:
                 raise RuntimeError("unknown polling generation")
@@ -804,6 +827,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         return check_poller_journal(self.poller_journal(token_hash=token_hash))
 
 
+    @with_deadline_scope
     def request_transfer(self, old_id: str, new_id: str, epoch: int, tokens: set[str], *,
                          deadline: float | None = None) -> None:
         """Freeze the expected token roster before asking the old process to stop."""
@@ -837,6 +861,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             self._check_transaction_deadline(conn, deadline)
             conn.commit()
 
+    @with_deadline_scope
     def transfer_attempt_nonce(self, old_id: str, epoch: int, *, deadline: float | None = None) -> str:
         with closing(self._deadline_connect(deadline)) as conn:
             self._check_transaction_deadline(conn, deadline)
@@ -847,6 +872,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             raise RuntimeError("transfer attempt is missing")
         return row["attempt_nonce"]
 
+    @with_deadline_scope
     def record_poller_stopped(self, old_id: str, epoch: int, token_hash: str,
                               safe_offset: int, *, attempt_nonce: str | None = None,
                               deadline: float | None = None) -> None:
@@ -877,6 +903,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 "SELECT token_hash,safe_offset,poller_stopped FROM transfer_tokens WHERE old_id=? AND epoch=? ORDER BY token_hash",
                 (old_id, epoch)).fetchall()]
 
+    @with_deadline_scope
     def commit_transfer(self, old_id: str, new_id: str, epoch: int,
                         *, drain_seconds: float = 7200,
                         deadline: float | None = None) -> int:
@@ -917,6 +944,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             conn.commit()
             return epoch + 1
 
+    @with_deadline_scope
     def abort_transfer(self, old_id: str, new_id: str, epoch: int,
                        *, attempt_nonce: str, deadline: float | None = None) -> bool:
         """CAS abort against the old lease and exact attempt, never a committed successor."""
@@ -950,7 +978,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         # these writes would let a successor acquire the lease and then be overwritten by this
         # stale writer before the legacy files are updated.
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             row = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             if not row or (row["generation_id"], row["epoch"], row["state"]) != (identity.id, epoch, "active"):
                 return False
@@ -965,7 +993,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
     def fence_draining_generation(self, generation_id: str) -> int:
         """At the hard cap, retain owner and payload evidence without replay eligibility."""
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             row = conn.execute("SELECT state,drain_deadline FROM generations WHERE id=?", (generation_id,)).fetchone()
             if not row or row["state"] != "draining" or (row["drain_deadline"] is not None and time.time() < row["drain_deadline"]):
                 raise RuntimeError("generation has not reached its drain cap")
@@ -978,7 +1006,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
     def project_stopped_summary(self, identity: GenerationIdentity, epoch: int) -> bool:
         """Clear the compatibility snapshot only while holding the exact active lease."""
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (identity.id, epoch, "active"):
                 return False
@@ -992,7 +1020,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
 
     def release_lease(self, resource: str, generation_id: str, epoch: int) -> bool:
         with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+            begin_immediate(conn)
             changed = conn.execute(
                 "UPDATE leases SET state='released' WHERE resource=? AND generation_id=? "
                 "AND epoch=? AND state!='released'",
@@ -1049,7 +1077,7 @@ def remove_generation_files(home: Path, identity: GenerationIdentity) -> None:
     """Remove only records whose identity and start fingerprint match this generation."""
     db_path = Path(home) / "gateway-coordinator.db"
     if db_path.exists():
-        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+        with closing(connect_sqlite(f"file:{db_path}?mode=ro", uri=True)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(generations)")}
             if "verdict" in columns:
                 row = conn.execute("SELECT verdict FROM generations WHERE id=?", (identity.id,)).fetchone()

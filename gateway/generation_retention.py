@@ -2,6 +2,8 @@
 from contextlib import closing
 import time
 
+from gateway.deadline import begin_immediate
+
 RETENTION_SECONDS = 7 * 86400
 
 # Retain every row current claim rules can read, and every authority reference.
@@ -46,7 +48,7 @@ class GenerationRetentionMixin:
             return {'generations': 0, 'journal': 0}
         cutoff = time.time() - RETENTION_SECONDS
         with closing(self.connect()) as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
+            begin_immediate(conn)
             candidates = conn.execute("SELECT j.generation_id FROM poller_journal j JOIN generations g "
                 "ON g.id=j.generation_id WHERE g.state='exited' GROUP BY j.generation_id "
                 "HAVING MAX(j.wall_at)<? AND COUNT(*)<=? AND "

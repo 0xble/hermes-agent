@@ -2082,6 +2082,21 @@ def test_review4_silent_successor_post_commit_wait_keeps_rollback_budget(rig, mo
     assert forward._row(rig.db, lease['generation_id'])['release_sha'] == rig.a.name
 
 
+def test_late_recovery_uses_fresh_budget_when_wedge_reserve_wont_fit(rig, monkeypatch):
+    rig.supervisor.mode = 'blocked'
+    blocked = promote(rig)
+    assert blocked['outcome'] == 'blocked'
+    # Five seconds remain in the original bound: the holder is already proven
+    # wedged, but there is no room left for termination/takeover reserve.
+    rig.clock.value = blocked['commit_clock'] + 55
+    rig.supervisor.mode = 'wedged'
+    rig.events.clear()
+    recovered = forward.recover_forward(rig.home, supervisor=rig.supervisor)
+    assert recovered['outcome'] == 'rolled_back', recovered
+    assert recovered['late_rollback']['bound_missed'] is True
+    assert any(event[0] == 'bounded-stop' for event in rig.events)
+
+
 def test_review4_late_recovery_replaces_a_proven_wedged_successor(rig, monkeypatch):
     rig.supervisor.mode = 'blocked'
     blocked = promote(rig)

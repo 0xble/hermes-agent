@@ -3,6 +3,9 @@ from contextlib import closing
 import time
 
 
+from gateway.deadline import begin_immediate
+
+
 class GenerationClaimsMixin:
     def _ensure_live_label_index(self, conn):
         """Enable the forward-only fence under the caller's BEGIN IMMEDIATE.
@@ -49,7 +52,7 @@ class GenerationClaimsMixin:
     def claim_process(self, process, scope_nonce):
         from gateway.generation import GenerationIdentity, _is_unclaimed
         with closing(self.connect()) as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
+            begin_immediate(conn)
             self._ensure_live_label_index(conn)
             if conn.execute('SELECT 1 FROM generations WHERE label=? AND boot_id=? AND scope_nonce=?',
                             (process.label, process.boot_id, scope_nonce)).fetchone():
@@ -91,7 +94,7 @@ class GenerationClaimsMixin:
         """Retire only the parked service's dead claimant, leaving its lease for takeover."""
         from gateway.generation import _boot_id, _is_unclaimed
         with closing(self.connect()) as conn, conn:
-            conn.execute('BEGIN IMMEDIATE')
+            begin_immediate(conn)
             rows = conn.execute('SELECT * FROM generations WHERE label=?', (label,)).fetchall()
             if label != self._service_label(conn):
                 return 'cleanup' if rows and all(row['state'] == 'exited' for row in rows) else 'waiting'

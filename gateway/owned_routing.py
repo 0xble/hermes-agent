@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import time
 from contextlib import closing
 from contextvars import ContextVar
@@ -12,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from gateway.config import Platform
+from gateway.deadline import connect_sqlite
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.session_identity import identity_of
@@ -121,7 +121,7 @@ class OwnedRouting:
             path = Path(home) / 'state.db'
             if not path.exists():
                 continue
-            with closing(sqlite3.connect(f'file:{path}?mode=ro', uri=True)) as conn:
+            with closing(connect_sqlite(f'file:{path}?mode=ro', uri=True)) as conn:
                 if conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone():
                     rows = conn.execute(
                         "SELECT origin_session, owner_started_at FROM async_delegations "
