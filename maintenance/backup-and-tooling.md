@@ -242,6 +242,12 @@ including after a release rebase. It does not advance the trailer floor.
 
 Fork-Patch-Backfill: f0a3bb8be8b611d30a990bb83db46aeaed37c39a; maintenance-tooling
 
+Published commit `a776676f5e12` (PR #285) also omitted its trailer during squash
+merge. Its PM and source-driver fixture portability fix for macOS is owned by
+`maintenance-tooling` on the same terms.
+
+Fork-Patch-Backfill: a18e5fe814c5f53d7ea1b79c1c99cbf6e1fd229d; maintenance-tooling
+
 `scripts/run_tests.sh` on `tests/hermes_cli/test_backup.py`,
 `tests/hermes_cli/test_backup_stability.py`, `tests/scripts/test_candidate_scripts.py`,
 `tests/scripts/test_schema_rehearsal.py`,
