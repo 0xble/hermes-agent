@@ -13,7 +13,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Mapping
-from contextvars import Context, ContextVar
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 from hermes_cli import setup_platforms
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
 from gateway.deadline import remaining as gateway_deadline_remaining
+from gateway.deadline import detached_context
 from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
@@ -2482,7 +2483,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if previous is not None and not previous.done():
             previous.cancel()
         task = asyncio.get_running_loop().create_task(
-            self._verify_polling_after_reconnect(generation, progress), context=Context())
+            self._verify_polling_after_reconnect(generation, progress), context=detached_context())
         self._polling_progress_verifier_task = task
         self._background_tasks.add(task)
 
@@ -2520,7 +2521,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _spawn_polling_recovery(self, loop, coro) -> None:
         """Start ``coro`` as the tracked in-flight recovery task (reentrancy guard)."""
-        self._polling_error_task = loop.create_task(coro, context=Context())
+        self._polling_error_task = loop.create_task(coro, context=detached_context())
         self._background_tasks.add(self._polling_error_task)
         self._polling_error_task.add_done_callback(self._background_tasks.discard)
 
@@ -2704,7 +2705,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _restart_polling_in_task(self, coro) -> None:
         """Run a recovery coroutine as the tracked in-flight ``_polling_error_task``."""
-        self._polling_error_task = asyncio.get_running_loop().create_task(coro, context=Context())
+        self._polling_error_task = asyncio.get_running_loop().create_task(coro, context=detached_context())
 
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption (NetworkError/TimedOut).
@@ -2774,7 +2775,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # Polling is dead and no more error callbacks will fire — chain the retry ourselves.
             if not self.has_fatal_error and not self._teardown_started:
                 task = asyncio.get_running_loop().create_task(
-                    self._handle_polling_network_error(retry_err), context=Context())
+                    self._handle_polling_network_error(retry_err), context=detached_context())
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
                 # The chained retry IS the in-flight recovery: it must replace the reentrancy guard.
@@ -2940,7 +2941,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._schedule_polling_recovery(_PollingStallError(reason), reason="controlled consumer stall")
             return
         self._polling_error_task = asyncio.get_running_loop().create_task(
-            self._handle_polling_network_error(RuntimeError(reason)), context=Context())
+            self._handle_polling_network_error(RuntimeError(reason)), context=detached_context())
 
     def _check_ingress_dispatch_stall(self) -> None:
         """Report fetched updates PTB's dispatcher is not handing to handlers (#102260).
@@ -3398,7 +3399,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if task and not task.done():
             return
         self._post_connect_task = asyncio.get_running_loop().create_task(
-            self._run_post_connect_housekeeping(), context=Context())
+            self._run_post_connect_housekeeping(), context=detached_context())
 
     async def _register_command_menu(self) -> None:
         """Register the command menu (from COMMAND_REGISTRY) in every scope — Telegram picks the
@@ -4131,7 +4132,7 @@ class TelegramAdapter(BasePlatformAdapter):
         prior = getattr(self, attr, None)
         if prior and not prior.done():
             prior.cancel()
-        setattr(self, attr, asyncio.get_running_loop().create_task(coro, context=Context()))
+        setattr(self, attr, asyncio.get_running_loop().create_task(coro, context=detached_context()))
 
     async def _cancel_task_attr(self, attr: str, label: str) -> bool:
         """Cancel + bounded-await the task stored at ``self.<attr>`` (may be missing: object.__new__ tests), then clear it."""

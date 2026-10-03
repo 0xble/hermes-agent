@@ -12,7 +12,6 @@ import shutil
 import signal
 import time
 from contextlib import suppress
-from contextvars import Context
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -30,6 +29,7 @@ from gateway.generation import (
     write_generation_record,
 )
 from gateway.deadline import begin_immediate, deadline_scope, remaining as deadline_remaining, with_deadline_scope
+from gateway.deadline import detached_context
 
 logger = logging.getLogger(__name__)
 
@@ -528,7 +528,7 @@ class ActiveGeneration:
         from gateway.owned_routing import OwnedRouting
         self.owned_routing = OwnedRouting(self)
         self.owned_routing.bind(runner)
-        self.owned_routing._task = asyncio.create_task(self.owned_routing.drain(), context=Context())
+        self.owned_routing._task = asyncio.create_task(self.owned_routing.drain(), context=detached_context())
 
     def _telegram_adapters(self) -> dict[str, object]:
         adapters = getattr(self.runner, "adapters", {}) or {}
@@ -615,7 +615,7 @@ class ActiveGeneration:
                         self._external_cron_stopped = True
                 self._stopped_receipts = stopped
                 self._pending_transfer = (new_id, nonce, _now() + HANDOVER_REQUEST_TIMEOUT)
-                self._drain_task = asyncio.create_task(self._drain_after_transfer(), context=Context())
+                self._drain_task = asyncio.create_task(self._drain_after_transfer(), context=detached_context())
                 return {"poller_stopped": True, "generation_id": self.identity.id,
                         "epoch": self.epoch, "tokens": len(stopped)}
             except Exception as original:
@@ -914,7 +914,7 @@ class ActiveGeneration:
             raise RuntimeError("generation control socket unavailable")
         self.socket_stat = self.paths["socket"].stat()
         write_generation_record(self.paths["state"], self.identity, state="serving", socket_path=self.paths["socket"])
-        self.task = asyncio.create_task(self._heartbeat(), context=Context())
+        self.task = asyncio.create_task(self._heartbeat(), context=detached_context())
 
     async def mark_ready(self) -> None:
         await asyncio.to_thread(self._sync_runtime_status)

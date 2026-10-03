@@ -249,7 +249,9 @@ def test_unbounded_scope_is_not_used_for_gateway_recovery():
 
 def test_long_lived_tasks_do_not_inherit_bounded_deadlines():
     files = [ROOT / "gateway" / "run_generation.py", ROOT / "gateway" / "run.py",
-             ROOT / "gateway" / "owned_routing.py"]
+             ROOT / "gateway" / "owned_routing.py",
+             ROOT / "plugins" / "platforms" / "telegram" / "adapter.py",
+             ROOT / "plugins" / "platforms" / "telegram" / "polling_transfer.py"]
     violations = []
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -283,3 +285,41 @@ def test_bounded_state_openers_use_connect_helper(relative):
             if node.func.value.id == "sqlite3":
                 direct.append(node.lineno)
     assert not direct, f"direct sqlite3.connect outside ambient helper at lines {direct}"
+
+
+def _spawn_context_names(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call):
+            continue
+        for keyword in call.keywords:
+            if keyword.arg == "context" and isinstance(keyword.value, ast.Call):
+                func = keyword.value.func
+                yield call.lineno, func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+
+
+def test_detached_tasks_keep_non_deadline_context():
+    """An empty Context() drops every other ContextVar (e.g. the Telegram polling
+    generation that gates journaled wire commits); detach only the deadline."""
+    files = [ROOT / "gateway" / "run_generation.py", ROOT / "gateway" / "run.py",
+             ROOT / "plugins" / "platforms" / "telegram" / "adapter.py",
+             ROOT / "plugins" / "platforms" / "telegram" / "polling_transfer.py"]
+    bad = [f"{path.relative_to(ROOT)}:{line}" for path in files
+           for line, name in _spawn_context_names(path) if name != "detached_context"]
+    assert not bad, "task spawned with a context other than detached_context(): " + ", ".join(bad)
+
+
+def test_detached_context_clears_only_the_deadline():
+    from contextvars import ContextVar
+    from gateway import deadline as gd
+
+    marker: ContextVar[str | None] = ContextVar("detached_marker", default=None)
+    token = marker.set("generation-7")
+    try:
+        with gd.deadline_scope(gd.now() - 1):
+            ctx = gd.detached_context()
+            assert gd.current() is not None
+        assert ctx.run(gd.current) is None
+        assert ctx.run(marker.get) == "generation-7"
+    finally:
+        marker.reset(token)

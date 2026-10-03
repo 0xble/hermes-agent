@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import Context, ContextVar, copy_context
 import sqlite3
 import time
 import inspect
@@ -16,6 +16,18 @@ _current_deadline: ContextVar[float | None] = ContextVar("gateway_deadline", def
 def now() -> float:
     """Return the canonical monotonic clock used by bounded gateway operations."""
     return time.monotonic()
+
+
+def detached_context() -> Context:
+    """Return a copy of the caller's context with no gateway deadline.
+
+    Long-lived tasks (drain, heartbeat, pollers, recovery) must not inherit a
+    request's deadline, but they must keep every other context variable, such
+    as the Telegram polling generation that gates journaled wire commits.
+    """
+    ctx = copy_context()
+    ctx.run(_current_deadline.set, None)
+    return ctx
 
 
 def current() -> float | None:
@@ -118,4 +130,4 @@ def unbounded_scope() -> Iterator[None]:
         _current_deadline.reset(token)
 
 
-__all__ = ["begin_immediate", "check", "connect_sqlite", "current", "deadline_scope", "now", "remaining", "unbounded_scope", "with_deadline_scope"]
+__all__ = ["begin_immediate", "check", "connect_sqlite", "current", "deadline_scope", "detached_context", "now", "remaining", "unbounded_scope", "with_deadline_scope"]

@@ -11,13 +11,13 @@ import asyncio
 import json
 import logging
 import time
-from contextvars import Context
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 
 from telegram import Update
 
 from gateway.deadline import remaining as gateway_deadline_remaining
+from gateway.deadline import detached_context
 from gateway.generation import GenerationCoordinator
 
 _RETENTION_SECONDS = 24 * 60 * 60
@@ -269,8 +269,8 @@ class ControlledPoller:
             # Evidence I/O must not gate the live wire. Preserve occurrence times
             # and flush this task before stop evidence and token-lock release.
             self._lifecycle_task = asyncio.create_task(self._record_lifecycle(
-                self._lifecycle_owner, "poller_started", time.monotonic(), time.time()), context=Context())
-        self._task = asyncio.create_task(self._run(), name="telegram-controlled-poller", context=Context())
+                self._lifecycle_owner, "poller_started", time.monotonic(), time.time()), context=detached_context())
+        self._task = asyncio.create_task(self._run(), name="telegram-controlled-poller", context=detached_context())
         _active_pollers[self.journal.token_hash] = self._task
         self._task.add_done_callback(self._observe_task)
         await asyncio.sleep(0)
