@@ -113,6 +113,43 @@ def test_faster_whisper_targets_are_gated(monkeypatch):
     assert supported == {"win32-arm64": False, "darwin-x64": False, "linux-x64": True}
 
 
+def test_documents_extra_is_gated_off_termux_and_android(monkeypatch):
+    """PyMuPDF has no wheel for Bionic libc. Termux reports sys_platform 'linux' with an
+    Android kernel release, so the gate must read platform_release, not only sys_platform."""
+    monkeypatch.setattr(extras, "_PLATFORM_GATES", None)
+    base = {"platform_system": "Linux", "platform_machine": "aarch64", "os_name": "posix"}
+    targets = {
+        "termux": {**base, "sys_platform": "linux", "platform_release": "5.15.148-android14-11-g1f8a"},
+        "android": {**base, "sys_platform": "android", "platform_release": "5.15.148-android14-11-g1f8a"},
+        "linux-aarch64": {**base, "sys_platform": "linux", "platform_release": "6.8.0-45-generic"},
+        "win32-arm64": {"sys_platform": "win32", "platform_system": "Windows", "platform_machine": "ARM64",
+                        "os_name": "nt", "platform_release": "11"},
+    }
+    supported = {
+        target: extras.extra_supported("documents", environment=environment, importable=lambda _: False)
+        for target, environment in targets.items()
+    }
+    assert supported == {"termux": False, "android": False, "linux-aarch64": True, "win32-arm64": False}
+
+
+def test_runtime_marker_environment_includes_platform_release(monkeypatch):
+    seen: dict[str, str] = {}
+    monkeypatch.setattr(extras, "_platform_gates", lambda: {"probe": "'android' not in platform_release"})
+
+    class Recorder:
+        def __init__(self, marker):
+            pass
+
+        def evaluate(self, environment):
+            seen.update(environment)
+            return True
+
+    import packaging.markers
+    monkeypatch.setattr(packaging.markers, "Marker", Recorder)
+    assert extras.extra_supported("probe", importable=lambda _: False) is True
+    assert "platform_release" in seen
+
+
 @pytest.fixture
 def synced(monkeypatch):
     calls: list[list[str]] = []

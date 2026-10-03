@@ -62,6 +62,9 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "acp": "acp",
     "web": "fastapi",
     "doc-extract": "anydoc",
+    "documents": ("docx", "pptx", "openpyxl", "pypdf", "pdfplumber", "pypdfium2", "lxml",
+                  "pandas", "matplotlib", "bs4", "fontTools", "playwright.sync_api", "fitz",
+                  "reportlab"),
     "computer-use": "mcp",
     "trace-upload": "huggingface_hub",
     # Pillow resize recovery for vision tools (the `vision` extra is a no-op
@@ -146,6 +149,7 @@ def extra_supported(extra: str, *, environment: dict[str, str] | None = None,
             "sys_platform": sys.platform,
             "platform_system": platform.system(),
             "platform_machine": platform.machine(),
+            "platform_release": platform.release(),
             "os_name": os.name,
         }
     try:
