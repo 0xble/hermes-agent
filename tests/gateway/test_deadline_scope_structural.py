@@ -461,3 +461,29 @@ def test_proof_deadline_fallback_is_marked_and_min_ed():
         bound = fu._proof_deadline(record, row)
         assert bound <= gd.current()
     assert record["proof_window"] == "reobservation"
+
+
+def test_guardian_has_no_unbounded_fresh_numeric_windows():
+    """Inside guardian, any now()+N window other than an entry point's STARTUP_SECONDS
+    must be min-ed with an enclosing deadline."""
+    source = (ROOT / "hermes_cli" / "gateway_guardian.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    bad = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.BinOp)
+                and isinstance(node.value.op, ast.Add)):
+            continue
+        left = node.value.left
+        if not (isinstance(left, ast.Call) and getattr(left.func, "attr", None) == "now"):
+            continue
+        right = node.value.right
+        if isinstance(right, ast.Name) and right.id == "STARTUP_SECONDS":
+            continue
+        target = node.targets[0].id if isinstance(node.targets[0], ast.Name) else None
+        fn = next(f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and f.lineno <= node.lineno <= f.end_lineno)
+        body = ast.get_source_segment(source, fn)
+        if target and f"{target} = min({target}, enclosing)" in body:
+            continue
+        bad.append(node.lineno)
+    assert not bad, f"fresh now()+N window not min-ed with the enclosing bound at lines {bad}"

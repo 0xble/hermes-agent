@@ -40,6 +40,9 @@ def _domain(label: str) -> str:
 def _gateway_domain(label: str, preferred: str | None, *, runner=None, timeout: float = 10) -> str:
     """Observe both domains before trusting a saved domain or starting an unloaded job."""
     deadline = gateway_deadline.now() + max(0.0, timeout)
+    enclosing = gateway_deadline.current()
+    if enclosing is not None:
+        deadline = min(deadline, enclosing)
     domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")  # windows-footgun: ok (macOS launchd only)
     if preferred is not None and preferred not in domains:
         raise RuntimeError("guardian domain is not a gateway launchd domain for this user")
@@ -206,6 +209,10 @@ def _launch_state(domain: str, label: str, *, runner=None, timeout: float = 5) -
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
+# Health-proof slice inside rollback_switch, capped by its startup bound.
+ROLLBACK_HEALTH_SECONDS = 12
+
+
 def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
                     launchctl_runner=None) -> bool:
     deadline = gateway_deadline.now() + STARTUP_SECONDS
@@ -261,7 +268,8 @@ def _rollback_switch_bounded(home: Path, plist: Path, label: str, old: Path, *, 
         # The S2 acknowledgement may arrive after this one-shot invocation; live
         # process identity below is the independent health proof for this action.
         wait_for_release_acknowledgement(home, timeout_seconds=_remaining(reload_deadline, 5))
-    health_deadline = gateway_deadline.now() + 12
+    # The health phase is a slice of the rollback's single startup bound.
+    health_deadline = min(reload_deadline, gateway_deadline.now() + ROLLBACK_HEALTH_SECONDS)
     while gateway_deadline.now() < health_deadline:
         if healthy(home, label, old, launchctl_runner, deadline=health_deadline):
             if gateway_deadline.now() < health_deadline:
