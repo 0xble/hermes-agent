@@ -146,7 +146,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         except Exception:
             logger.exception("poller re-arm failed after pre-commit failure")
         raise
-    check_deadline()
+    # The lease moved irreversibly at commit. A late commit is never a plain
+    # failure: callers would treat it as pre-commit and roll back a healthy
+    # successor. The commit-clocked poller (or the typed outcome below) bounds it.
     if not verify_after_commit:
         return promoted
     successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})

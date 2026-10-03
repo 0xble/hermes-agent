@@ -137,6 +137,41 @@ async def test_committed_but_unverified_handover_has_typed_outcome(tmp_path):
         await active.close()
 
 
+@pytest.mark.asyncio
+async def test_late_commit_returns_committed_epoch_not_plain_failure(tmp_path, monkeypatch):
+    """A commit that lands after the deadline already moved the lease.
+
+    Raising a plain error here would make the updater treat a healthy committed
+    successor as a pre-commit failure and roll it back.
+    """
+    import time as _time
+    db = GenerationCoordinator(tmp_path)
+    fp = f"{os.getpid()}:{_get_process_start_time(os.getpid())}"
+    old = GenerationIdentity.create(release_sha="a", label="a", start_fingerprint=fp)
+    new = GenerationIdentity.create(release_sha="b", label="b", start_fingerprint=fp)
+    db.register(old, state="serving")
+    epoch = db.acquire_lease("active_generation", old.id)
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.bind_runner(type("Runner", (), {"adapters": {}})())
+    await active.start()
+    db.register(new, state="standby")
+    original = GenerationCoordinator.commit_transfer
+
+    def late_commit(self, *args, **kwargs):
+        promoted = original(self, *args, **kwargs)
+        _time.sleep(1.2)  # commit completes, then the deadline passes
+        return promoted
+
+    monkeypatch.setattr(GenerationCoordinator, "commit_transfer", late_commit)
+    try:
+        promoted = await asyncio.to_thread(handover_to_generation, tmp_path, new.id,
+                                           timeout=1.0, verify_after_commit=False)
+        assert promoted == epoch + 1
+        assert db.leases()[0]["generation_id"] == new.id
+    finally:
+        await active.close()
+
+
 @pytest.fixture(autouse=True)
 def _coordinator_boot_identity(monkeypatch):
     # Unit transactions use a stable supplied boot identity. Native process
