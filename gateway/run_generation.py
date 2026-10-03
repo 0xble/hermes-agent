@@ -29,6 +29,7 @@ from gateway.generation import (
 )
 
 logger = logging.getLogger(__name__)
+_REAL_MONOTONIC = time.monotonic
 HANDOVER_REQUEST_TIMEOUT = 45  # Same bound as generation control acknowledgements.
 HANDOVER_ABORT_RESERVE = 2  # Reserved inside the caller's budget, never added to it.
 DEFAULT_DRAIN_SECONDS = 7200  # Match the commit cap when the durable deadline is missing.
@@ -95,6 +96,8 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     coordinator = GenerationCoordinator(home)
     deadline = time.monotonic() + timeout
     request_deadline = deadline - min(HANDOVER_ABORT_RESERVE, timeout / 5)
+    coordinator_deadline = (_REAL_MONOTONIC()
+                            + max(0, request_deadline - time.monotonic()))
     def remaining(*, recovery=False):
         budget = (deadline if recovery else request_deadline) - time.monotonic()
         if budget <= 0:
@@ -120,9 +123,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         raise RuntimeError("invalid old generation polling roster")
     if require_pollers and not tokens:
         raise RuntimeError('empty polling roster cannot qualify forward-only promotion')
-    coordinator.request_transfer(old_id, to_id, epoch, set(tokens))
+    coordinator.request_transfer(old_id, to_id, epoch, set(tokens), deadline=coordinator_deadline)
     check_deadline()
-    nonce = coordinator.transfer_attempt_nonce(old_id, epoch)
+    nonce = coordinator.transfer_attempt_nonce(old_id, epoch, deadline=coordinator_deadline)
     check_deadline()
     try:
         ack = _generation_request(path, "transfer_requested", params={"to": to_id}, timeout=remaining())
@@ -132,7 +135,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         if before_commit is not None:
             before_commit()
         check_deadline()
-        promoted = coordinator.commit_transfer(old_id, to_id, epoch, drain_seconds=drain_seconds)
+        promoted = coordinator.commit_transfer(old_id, to_id, epoch,
+                                               drain_seconds=drain_seconds,
+                                               deadline=coordinator_deadline)
     except Exception:
         # Never hide the transfer failure with a second failure during recovery.
         # Attempt both abort and re-arm even if either operation fails.

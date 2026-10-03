@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import sqlite3
+import time
 
 import pytest
 
@@ -170,6 +172,33 @@ async def test_late_commit_returns_committed_epoch_not_plain_failure(tmp_path, m
         assert db.leases()[0]["generation_id"] == new.id
     finally:
         await active.close()
+
+
+@pytest.mark.asyncio
+async def test_commit_transfer_does_not_move_lease_after_busy_deadline(tmp_path):
+    """A writer lock acquired after the handover window cannot move the lease."""
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="standby")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+
+    lock = sqlite3.connect(db.path, timeout=5.0, isolation_level=None)
+    try:
+        lock.execute("BEGIN IMMEDIATE")
+        deadline = time.monotonic() + 0.15
+        with pytest.raises(TimeoutError, match="deadline"):
+            await asyncio.to_thread(
+                db.commit_transfer, old.id, new.id, epoch, deadline=deadline
+            )
+    finally:
+        lock.rollback()
+        lock.close()
+
+    lease = db.leases()[0]
+    assert (lease["generation_id"], lease["epoch"]) == (old.id, epoch)
 
 
 @pytest.fixture(autouse=True)

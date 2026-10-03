@@ -265,12 +265,35 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         self.home.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
+    def connect(self, *, timeout: float = 5.0) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=max(0.0, float(timeout)), isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={max(0, int(float(timeout) * 1000))}")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _deadline_connect(self, deadline: float | None):
+        if deadline is None:
+            return self.connect()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("generation transaction deadline exceeded")
+        return self.connect(timeout=min(5.0, remaining))
+
+    @staticmethod
+    def _check_transaction_deadline(conn, deadline: float | None):
+        if deadline is not None and time.monotonic() >= deadline:
+            conn.rollback()
+            raise TimeoutError("generation transaction deadline exceeded")
+
+    @classmethod
+    def _begin_immediate(cls, conn, deadline: float | None):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if deadline is not None and "locked" in str(exc).lower() and time.monotonic() >= deadline:
+                raise TimeoutError("generation transaction deadline exceeded") from exc
+            raise
 
     def _initialize(self) -> None:
         from gateway.generation_schema import layout_is_current, record_current_layout
@@ -601,9 +624,11 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                              "AND state=?", (now, state, generation_id, current["state"]))
             conn.commit()
 
-    def acquire_lease(self, resource: str, generation_id: str, *, state: str = "active") -> int:
-        with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+    def acquire_lease(self, resource: str, generation_id: str, *, state: str = "active",
+                      deadline: float | None = None) -> int:
+        with closing(self._deadline_connect(deadline)) as conn, conn:
+            self._begin_immediate(conn, deadline)
+            self._check_transaction_deadline(conn, deadline)
             candidate = conn.execute("SELECT state,verdict,claim_pending FROM generations WHERE id=?",
                                      (generation_id,)).fetchone()
             if candidate is None:
@@ -629,19 +654,22 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             epoch = 1
             conn.execute("INSERT INTO leases(resource,epoch,generation_id,state) VALUES(?,?,?,?)",
                          (resource, epoch, generation_id, state))
+            self._check_transaction_deadline(conn, deadline)
             conn.commit()
             return epoch
 
     def takeover_dead_generation(self, resource: str, old_id: str, new_id: str, *,
                                  bootout: Callable[[str], Any],
                                  death_proof: Callable[[dict[str, Any]], bool] | None = None,
-                                 evidence: str = "pid_start_absent") -> int:
+                                 evidence: str = "pid_start_absent",
+                                 deadline: float | None = None) -> int:
         """Retire a proven-dead holder, boot it out, then move the lease once."""
-        with closing(self.connect()) as conn:
+        with closing(self._deadline_connect(deadline)) as conn:
             lease = conn.execute("SELECT resource,epoch,generation_id,state FROM leases WHERE resource=?",
                                  (resource,)).fetchone()
             holder = conn.execute("SELECT * FROM generations WHERE id=?", (old_id,)).fetchone()
             successor = conn.execute("SELECT * FROM generations WHERE id=?", (new_id,)).fetchone()
+            self._check_transaction_deadline(conn, deadline)
         if not lease or lease["generation_id"] != old_id or lease["state"] not in {"active", "released"}:
             raise RuntimeError("takeover lease changed")
         if holder is None or successor is None or lease["generation_id"] != old_id:
@@ -682,12 +710,14 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                              "WHERE id=?", (time.time(), evidence, old_id))
             elif not clean_exit and (recorded["verdict"] != "failed" or recorded["state"] != "exited"):
                 raise RuntimeError("holder has incompatible retirement verdict")
+            self._check_transaction_deadline(conn, deadline)
             conn.commit()
         result = bootout(holder["label"])
         if result is not True:
             raise RuntimeError("takeover bootout/readback failed")
-        with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._deadline_connect(deadline)) as conn, conn:
+            self._begin_immediate(conn, deadline)
+            self._check_transaction_deadline(conn, deadline)
             current = conn.execute("SELECT epoch,generation_id,state FROM leases WHERE resource=?",
                                    (resource,)).fetchone()
             if not current or (current["generation_id"], current["state"], current["epoch"]) != (old_id, lease["state"], lease["epoch"]):
@@ -712,6 +742,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                                  (time.time(), new_id)).rowcount
             if moved != 1:
                 raise RuntimeError("takeover successor state compare-and-swap failed")
+            self._check_transaction_deadline(conn, deadline)
             conn.commit()
             return new_epoch
 
@@ -772,10 +803,12 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         return check_poller_journal(self.poller_journal(token_hash=token_hash))
 
 
-    def request_transfer(self, old_id: str, new_id: str, epoch: int, tokens: set[str]) -> None:
+    def request_transfer(self, old_id: str, new_id: str, epoch: int, tokens: set[str], *,
+                         deadline: float | None = None) -> None:
         """Freeze the expected token roster before asking the old process to stop."""
-        with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._deadline_connect(deadline)) as conn, conn:
+            self._begin_immediate(conn, deadline)
+            self._check_transaction_deadline(conn, deadline)
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             successor = conn.execute("SELECT state,verdict,claim_pending,suspect_at FROM generations WHERE id=?", (new_id,)).fetchone()
             if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active"):
@@ -800,12 +833,15 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                              (old_id, new_id, epoch, attempt_nonce))
             conn.executemany("INSERT INTO transfer_tokens(old_id,epoch,token_hash) VALUES(?,?,?)",
                              [(old_id, epoch, token) for token in sorted(tokens)])
+            self._check_transaction_deadline(conn, deadline)
             conn.commit()
 
-    def transfer_attempt_nonce(self, old_id: str, epoch: int) -> str:
-        with closing(self.connect()) as conn:
+    def transfer_attempt_nonce(self, old_id: str, epoch: int, *, deadline: float | None = None) -> str:
+        with closing(self._deadline_connect(deadline)) as conn:
+            self._check_transaction_deadline(conn, deadline)
             row = conn.execute("SELECT attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
                                (old_id, epoch)).fetchone()
+            self._check_transaction_deadline(conn, deadline)
         if not row or not row["attempt_nonce"]:
             raise RuntimeError("transfer attempt is missing")
         return row["attempt_nonce"]
@@ -838,10 +874,15 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 (old_id, epoch)).fetchall()]
 
     def commit_transfer(self, old_id: str, new_id: str, epoch: int,
-                        *, drain_seconds: float = 7200) -> int:
+                        *, drain_seconds: float = 7200,
+                        deadline: float | None = None) -> int:
         """CAS promotion; a live old holder never loses its lease without its receipts."""
-        with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._deadline_connect(deadline)) as conn, conn:
+            # BEGIN IMMEDIATE may wait for a writer. The deadline check is
+            # intentionally after it: a late lock acquisition must roll back
+            # instead of moving the lease after the handover window.
+            self._begin_immediate(conn, deadline)
+            self._check_transaction_deadline(conn, deadline)
             transfer = conn.execute("SELECT new_id,state FROM generation_transfers WHERE old_id=? AND epoch=?",
                                     (old_id, epoch)).fetchone()
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
@@ -868,6 +909,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             conn.execute("UPDATE generations SET state='serving' WHERE id=?", (new_id,))
             conn.execute("UPDATE generation_transfers SET state='committed' WHERE old_id=? AND epoch=?",
                          (old_id, epoch))
+            self._check_transaction_deadline(conn, deadline)
             conn.commit()
             return epoch + 1
 

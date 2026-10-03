@@ -19,7 +19,7 @@ import time
 import uuid
 
 from gateway.generation import GenerationCoordinator, GenerationIdentity, generation_paths, forward_only_handover_enabled
-from gateway.run_generation import handover_to_generation, _generation_request
+from gateway.run_generation import handover_to_generation, _generation_request, HANDOVER_ABORT_RESERVE
 from hermes_cli.gateway_launchd_generation import generation_launchd_label, render_generation_launchd_plist, bootstrap_generation_plist
 from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _atomic_bytes, _atomic_json, _sync_dir, _release_is_ready, activate_release
 
@@ -234,9 +234,10 @@ class GenerationSupervisor:
         self.directory = directory or Path.home() / 'Library/LaunchAgents'
         self.domain = domain
 
-    def _domain(self, label):
+    def _domain(self, label, *, timeout=None):
         from hermes_cli.gateway_guardian import _gateway_domain
-        return _gateway_domain(label, self.domain, runner=self.runner)
+        return _gateway_domain(label, self.domain, runner=self.runner,
+                               timeout=10 if timeout is None else timeout)
 
     def _definition(self, label):
         path = self.directory / f'{label}.plist'
@@ -262,9 +263,9 @@ class GenerationSupervisor:
         return path
 
     def bootstrap(self, row, path, timeout, *, before_launch=None):
-        self._definition(row['label'])
-        domain = self._domain(row['label'])
         deadline = _now() + min(30, timeout)
+        self._definition(row['label'])
+        domain = self._domain(row['label'], timeout=_remaining(deadline, 10))
         from hermes_cli.gateway_guardian import _launch_state
         if _launch_state(domain, row['label'], runner=self.runner,
                          timeout=_remaining(deadline, 5)) != 'unloaded':
@@ -380,7 +381,7 @@ class GenerationSupervisor:
             return False
         return True
 
-    def request(self, row, verb, *, params=None, timeout=2):
+    def request(self, row, verb, *, params=None, timeout=2.0):
         return _generation_request(generation_paths(self.home, _identity(row))['socket'],
                                    verb, params=params, timeout=timeout)
 
@@ -1013,7 +1014,8 @@ def _rollback(home, db, failed, previous, supervisor, record, *, late=False):
         if _lease(db)['generation_id'] != fresh['id']:
             # The standby itself can cold-takeover. CAS protects either participant.
             db.takeover_dead_generation('active_generation', failed['id'], fresh['id'],
-                bootout=lambda label: supervisor.bootout(_row(db, failed['id']), _remaining(deadline, 15)))
+                bootout=lambda label: supervisor.bootout(_row(db, failed['id']), _remaining(deadline, 15)),
+                deadline=time.monotonic() + max(0, deadline - _now()))
     proof = _poller(db, fresh, supervisor, deadline)
     serving_clock = _now()
     result = _flip(home, db, fresh, proof, supervisor, operation='rollback', record=record)
@@ -1263,6 +1265,7 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
             return _finish(home, record, 'refused', failure=str(exc), startup_seconds=_now() - started)
         record.update(new_id=successor['id'], new_label=successor['label'], startup_seconds=_now() - started)
         _save(home, record)
+        handover_deadline = _now() + 45
         try:
             # Refuse an empty roster before transfer_requested can pause A or
             # move its lease. Standby startup by itself is side-effect isolated.
@@ -1274,8 +1277,9 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
             def record_commit_window():
                 record.update(commit_clock=_now(), commit_at=time.time(), commit_boot_id=old['boot_id'])
                 _save(home, record)
-            # The commit-clocked _poller below is the only post-commit wait, so the
-            # 60 s rollback budget is never spent inside the cooperative call.
+            # The handover helper reserves HANDOVER_ABORT_RESERVE inside its
+            # original 45-second window. Re-arm may consume only that remaining
+            # reserve; never start a fresh full handover interval here.
             handover_to_generation(home, successor['id'], timeout=45, before_commit=record_commit_window,
                                    verify_after_commit=False, require_pollers=True)
             # The rollback budget also starts at commit. The successor's proof
@@ -1301,7 +1305,9 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
                         if transfer['state'] != 'aborted':
                             db.abort_transfer(old['id'], successor['id'], lease['epoch'], attempt_nonce=transfer['attempt_nonce'])
                         resume = supervisor.request(old, 'transfer_aborted',
-                            params={'to': successor['id'], 'nonce': transfer['attempt_nonce']}, timeout=45)
+                            params={'to': successor['id'], 'nonce': transfer['attempt_nonce']},
+                            timeout=min(HANDOVER_ABORT_RESERVE,
+                                        max(0, handover_deadline - _now())))
                         if (resume.get('rearmed') is not True or not _all_fences_armed(resume)):
                             raise RuntimeError('precommit fences did not read back as armed')
                     _refuse(db, successor, supervisor, 'precommit_aborted')

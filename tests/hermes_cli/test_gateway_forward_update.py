@@ -3,6 +3,7 @@ from contextlib import closing
 import json
 import plistlib
 import sqlite3
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -87,7 +88,7 @@ def rig(tmp_path, monkeypatch):
         mode = 'happy'
         abort = False
         polled = set()
-        def _domain(self, label):
+        def _domain(self, label, **kwargs):
             return 'gui/fixture'
         def bootstrap(self, row, path, timeout, *, before_launch=None):
             reserved = next(item for item in db.generations() if item['id'] == row['id'])
@@ -200,6 +201,53 @@ def rig(tmp_path, monkeypatch):
                            events=events, clock=clock, loaded=loaded, alive=alive,
                            transfer_tokens=transfer_tokens, proof_tokens=proof_tokens,
                            armed_fences=armed_fences)
+
+
+def test_generation_bootstrap_passes_remaining_deadline_to_domain_probes(tmp_path, monkeypatch):
+    home = tmp_path / 'profile'
+    directory = tmp_path / 'LaunchAgents'
+    home.mkdir()
+    directory.mkdir()
+    label = 'ai.hermes.gateway.g-test'
+    path = directory / f'{label}.plist'
+    path.write_bytes(plistlib.dumps({
+        'Label': label,
+        'EnvironmentVariables': {'HERMES_HOME': str(home)},
+        'RunAtLoad': False,
+        'KeepAlive': False,
+    }))
+    timeouts = []
+
+    def runner(argv, **kwargs):
+        timeouts.append(kwargs['timeout'])
+        if argv[1] == 'managername':
+            return subprocess.CompletedProcess(argv, 0, stdout='Aqua', stderr='')
+        assert argv[1] == 'print'
+        return subprocess.CompletedProcess(argv, 113, stdout='', stderr='Could not find service')
+
+    monkeypatch.setattr(forward, 'bootstrap_generation_plist', lambda **kwargs: None)
+    supervisor = forward.GenerationSupervisor(
+        home, runner=runner, directory=directory, domain=f'gui/{forward.os.getuid()}'
+    )
+    supervisor.bootstrap({'label': label}, path, timeout=.2)
+    assert len(timeouts) == 3
+    assert all(0 < value <= .2 for value in timeouts)
+
+
+def test_precommit_abort_uses_named_reserve_not_fresh_handover_timeout(rig, monkeypatch):
+    seen = []
+    request = rig.supervisor.request
+
+    def bounded_request(row, verb, *, params=None, timeout=2):
+        if verb == 'transfer_aborted':
+            seen.append(timeout)
+        return request(row, verb, params=params, timeout=timeout)
+
+    monkeypatch.setattr(rig.supervisor, 'request', bounded_request)
+    rig.supervisor.abort = True
+    result = promote(rig)
+    assert result['outcome'] == 'aborted', result
+    assert seen and 0 < seen[0] <= forward.HANDOVER_ABORT_RESERVE
 
 
 def test_ready_bounds_polling_request_and_rejects_late_success(rig, monkeypatch):
@@ -668,7 +716,7 @@ def test_review_m2_cleanup_unlinks_only_owned_unloaded_definition(rig, monkeypat
         loaded = rig.old.label in rig.loaded
         return SimpleNamespace(returncode=0 if loaded else 1, stdout='', stderr='' if loaded else 'Could not find service')
     rig.supervisor.runner = runner
-    monkeypatch.setattr(rig.supervisor, '_domain', lambda label: 'gui/fixture')
+    monkeypatch.setattr(rig.supervisor, '_domain', lambda label, **kwargs: 'gui/fixture')
     monkeypatch.setattr(rig.supervisor, 'bootout', lambda row: forward.GenerationSupervisor.bootout(rig.supervisor, row))
     monkeypatch.setattr(forward, '_sync_dir', lambda directory: synced.append(directory))
     if foreign or readback_failed:
@@ -708,7 +756,7 @@ def test_review_m2_bootstrap_keeps_runtime_respawn_outside_login_directory(rig, 
         assert runtime['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] == login['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] == scopes[0]
         return SimpleNamespace(returncode=0)
     rig.supervisor.runner = runner
-    monkeypatch.setattr(rig.supervisor, '_domain', lambda label: 'gui/fixture')
+    monkeypatch.setattr(rig.supervisor, '_domain', lambda label, **kwargs: 'gui/fixture')
     forward.GenerationSupervisor.bootstrap(rig.supervisor, row, path, 30, before_launch=scopes.append)
     assert scopes
 

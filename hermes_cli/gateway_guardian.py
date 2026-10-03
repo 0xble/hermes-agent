@@ -35,17 +35,23 @@ def _domain(label: str) -> str:
     return _probe_launchd_domain_for_label(label)
 
 
-def _gateway_domain(label: str, preferred: str | None, *, runner=None) -> str:
+def _gateway_domain(label: str, preferred: str | None, *, runner=None, timeout: float = 10) -> str:
     """Observe both domains before trusting a saved domain or starting an unloaded job."""
+    deadline = time.monotonic() + max(0.0, timeout)
     domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")  # windows-footgun: ok (macOS launchd only)
     if preferred is not None and preferred not in domains:
         raise RuntimeError("guardian domain is not a gateway launchd domain for this user")
     states = {}
     for candidate in domains:
         try:
-            states[candidate] = _launch_state(candidate, label, runner=runner)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("gateway domain probe deadline exceeded")
+            states[candidate] = _launch_state(candidate, label, runner=runner, timeout=min(5, remaining))
         except RuntimeError:
             states[candidate] = "unknown"
+    if time.monotonic() >= deadline:
+        raise RuntimeError("gateway domain probe deadline exceeded")
     loaded = [candidate for candidate, state in states.items() if state in {"loaded", "parked"}]
     if len(loaded) > 1:
         raise RuntimeError("gateway label is loaded in both launchd domains")
@@ -53,7 +59,18 @@ def _gateway_domain(label: str, preferred: str | None, *, runner=None) -> str:
         return loaded[0]
     if "unknown" in states.values():
         raise RuntimeError("cannot prove gateway unloaded in both launchd domains")
-    return preferred or _domain(label)
+    if preferred is not None:
+        return preferred
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("gateway domain probe deadline exceeded")
+    try:
+        result = (runner or subprocess.run)(
+            ["launchctl", "managername"], capture_output=True, text=True,
+            encoding="utf-8", timeout=remaining)
+    except (OSError, subprocess.TimeoutExpired):
+        return domains[1]
+    return domains[0] if "Aqua" in (result.stdout or "") else domains[1]
 
 
 def intent_path(home: Path) -> Path:

@@ -50,6 +50,16 @@ The profile-local `cron/executions.py` ledger records attempt owner PID/start fi
 
 **Global invariants:** Never automatically retry an interrupted execution, chat turn, or delegation. Preserve one admitted owner per event/occurrence and one active Telegram poller per token; require a receipt from the owning process before acknowledging forwarded input. Preserve both gateway busy-message guards, identity/authorization and per-profile secret scope, prompt-cache stability, turn alternation, and existing durable delivery semantics. Shared databases and `~/.hermes/plugins` must remain readable and writable by both `current` and `previous` during overlap or rollback; use additive/backward-compatible migrations and dual-version contract tests, never a destructive migration during promotion. Do not infer a live runtime revision from source `HEAD`.
 
+## Deadline contract
+
+Every bounded startup, handover, takeover, rollback, guardian-repair, wedge-proof, poll-proof, and bootout operation follows these five rules:
+
+1. Give every blocking subprocess, socket, psutil wait, and SQLite busy wait no more than the remaining budget.
+2. Reject success observed at or after expiry.
+3. Re-check the deadline inside each irreversible transaction after its write lock is acquired; roll back when expired.
+4. After lease/pointer commit, lateness is a typed committed outcome or commit-clocked poll, never a plain failure or rollback of a healthy successor.
+5. Exception-path recovery uses the remaining budget or a named short reserve, never a fresh full interval.
+
 ## S1 — macOS cron run survives gateway restart
 
 **Dependency:** None. **Observable result:** A launchd-managed gateway can stop/restart while its active cron run continues, with its one scheduled occurrence still owned by that run. Extend the existing dispatch and handoff path in `tools/process_registry.py`, `cron/scheduler.py`, `cron/scheduler_detached_worker.py`, and relevant `tests/cron/` and macOS-marked process tests. Spawn a session-detached worker outside the launchd job's process group, with pinned profile scope, explicit startup acknowledgement, owner PID/start fingerprint, and durable state before gateway release. Do not equate detachment with an unlimited lifetime or use a bare PID as authority. A separate supervised termination strategy must reach descendants that escape through `setsid`; verify the actual macOS process topology, including double fork, rather than faking `sys.platform`.
