@@ -127,6 +127,31 @@ unresolved. Retire after an accepted upstream release passes these behavioral
 tests without this patch. Roll back this patch's adapter and tests together.
 There are no configuration or persistent-state changes.
 
+## Standalone Chunk Indicators
+
+**Patch identity:** `telegram-standalone-chunk-indicator`. When cron delivery
+falls back from the live adapter to the standalone sender (flood control,
+timeout, `send_path_degraded`), a long message is split and each chunk ends with
+a ` (n/m)` indicator. Those parentheses are reserved in MarkdownV2, so Telegram
+rejected every chunk with `Can't parse entities` and each one arrived as plain
+text. The live adapter already escapes the indicator, but the standalone sender
+did not. On 2026-10-01 standalone fallbacks rose from about 2 a day to 41, which
+made the problem visible across many crons.
+
+The adopted fix is upstream salvage PR
+[#126100](https://github.com/NousResearch/hermes-agent/pull/126100), for issue
+[#74004](https://github.com/NousResearch/hermes-agent/issues/74004). It is
+cherry-picked with original authorship. It escapes the indicator and separates
+it from a closing code fence, reusing `_separate_chunk_indicator_from_fence`.
+Source: `tools/send_message_senders.py`. Proof:
+`tests/tools/test_telegram_send_message_chunk_mdv2.py`, which fails on the
+unpatched sender. The standalone lane still sends MarkdownV2, never Rich
+Messages. That gap is unchanged.
+
+Retire after an accepted upstream release contains #126100, or an equivalent,
+and the proof test passes without this patch. Roll back by reverting the two
+commits. There are no configuration or persistent-state changes.
+
 ## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,
