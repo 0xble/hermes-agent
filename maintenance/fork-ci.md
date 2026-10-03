@@ -81,6 +81,7 @@ checks. That check is no longer required; `qualification` replaced it.
 Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
+Fork-Patch-Backfill: a18e5fe814c5f53d7ea1b79c1c99cbf6e1fd229d; fork-ci-reliability
 
 `ci-gate-cancelled-blocks` owns the requirement that interruption cannot count as
 success and that the Fork-Patch contract is checked. The portable static lane

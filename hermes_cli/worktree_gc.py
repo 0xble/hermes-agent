@@ -54,7 +54,7 @@ def _run(cmd: list, timeout: int, cwd: Optional[str] = None,
          env: Optional[dict[str, str]] = None, binary: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=not binary,
                           encoding=None if binary else "utf-8",
-                          errors=None if binary else "replace", timeout=timeout, cwd=cwd, env=env)
+                          errors=None if binary else "replace", timeout=timeout, cwd=cwd, env=env, stdin=subprocess.DEVNULL)
 
 
 @dataclass
@@ -70,16 +70,17 @@ class ExternalTreeRecord:
 
 
 def _git(args: list, cwd: str, timeout: int = 15, *, binary: bool = False) -> subprocess.CompletedProcess:
-    """Run git with host-wide config and excludes disabled.
+    """Run git with host-wide config and filter discovery disabled safely.
 
-    Worktree cleanup must see files that a user's global ignore rules hide; local
-    repository excludes still apply, because they are part of the repository's
-    own policy and ``--ignored`` below makes those files visible to the safety
-    check as well. Every verdict fails safe toward "keep" on nonzero, so a slow
-    ``git cherry`` on a huge repo degrades to keep instead of aborting the audit
-    mid-list.
+    Worktree cleanup must see files hidden by host policy, while upstream filter discovery
+    prevents repository clean filters and fsmonitor hooks from running unexpectedly.
+    Every verdict fails safe toward ``keep`` on nonzero.
     """
-    env = os.environ.copy()
+    from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
+    env = noninteractive_repo_git_env(cwd)
+    if env is None:
+        return subprocess.CompletedProcess(args=["git", *args], returncode=1, stdout=b"" if binary else "",
+                                           stderr=FILTER_DISCOVERY_FAILED)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     try:
