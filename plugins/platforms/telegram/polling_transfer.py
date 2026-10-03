@@ -16,11 +16,13 @@ from contextlib import contextmanager
 
 from telegram import Update
 
-from gateway.deadline import remaining as gateway_deadline_remaining
+from gateway.deadline import deadline_scope, now as gateway_deadline_now, remaining as gateway_deadline_remaining
 from gateway.deadline import detached_context
 from gateway.generation import GenerationCoordinator
 
 _RETENTION_SECONDS = 24 * 60 * 60
+# Bound for one poller lifecycle evidence write (lock wait + commit).
+POLLER_EVIDENCE_WRITE_SECONDS = 5
 _IDLE_RESET_SECONDS = 7 * 24 * 60 * 60
 _MAX_RAW_UPDATE = 1024 * 1024
 
@@ -75,8 +77,11 @@ class PollingJournal:
 
     def record_lifecycle(self, owner: tuple[str, int], event: str, *,
                          monotonic_at: float, wall_at: float) -> None:
-        self.coordinator.record_poller_event(self.token_hash, owner[0], owner[1], event,
-                                             monotonic_at=monotonic_at, wall_at=wall_at)
+        # Each evidence write gets its own named bound so a held coordinator lock
+        # cannot stall it; an enclosing (earlier) deadline still wins.
+        with deadline_scope(gateway_deadline_now() + POLLER_EVIDENCE_WRITE_SECONDS):
+            self.coordinator.record_poller_event(self.token_hash, owner[0], owner[1], event,
+                                                 monotonic_at=monotonic_at, wall_at=wall_at)
 
     def record_response(self, payload: bytes) -> None:
         envelope = json.loads(payload)

@@ -361,3 +361,51 @@ def test_cold_activation_and_promote_flip_are_bounded():
             if not scoped:
                 unscoped.append(node.lineno)
     assert not unscoped, f"_flip called outside a deadline scope at lines {unscoped}"
+
+
+def test_poller_evidence_write_is_bounded(tmp_path, monkeypatch):
+    from gateway import deadline as gd
+    from gateway.generation import GenerationCoordinator
+    from plugins.platforms.telegram import polling_transfer as pt
+    seen = {}
+    class Coordinator:
+        def record_poller_event(self, *args, **kwargs):
+            seen["deadline"] = gd.current()
+    journal = pt.PollingJournal.__new__(pt.PollingJournal)
+    journal.coordinator = Coordinator()
+    journal.token_hash = "t"
+    assert gd.current() is None
+    journal.record_lifecycle(("g", 1), "poller_started", monotonic_at=1.0, wall_at=1.0)
+    assert seen["deadline"] is not None
+    assert seen["deadline"] <= gd.now() + pt.POLLER_EVIDENCE_WRITE_SECONDS
+
+
+def test_flip_refuses_activation_after_expiry():
+    source = (ROOT / "hermes_cli" / "gateway_forward_update.py").read_text(encoding="utf-8")
+    flip = source[source.index("def _flip("):source.index("def _flip_scope(")]
+    assert flip.index("gateway_deadline.check()") < flip.index("activate_release(")
+
+
+def test_recovery_pointer_reconciliation_is_scoped():
+    tree = ast.parse((ROOT / "hermes_cli" / "gateway_forward_update.py").read_text(encoding="utf-8"))
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_observe_pointer_commit":
+            cur, ok = node, False
+            while cur in parents:
+                cur = parents[cur]
+                if isinstance(cur, ast.FunctionDef) and cur.name == "_flip":
+                    ok = True  # inside the already-scoped flip
+                    break
+                if isinstance(cur, ast.With) and any(
+                        isinstance(i.context_expr, ast.Call)
+                        and getattr(i.context_expr.func, "id", None) in {"_flip_scope", "deadline_scope"}
+                        for i in cur.items):
+                    ok = True
+                    break
+                if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    break
+            if not ok:
+                bad.append(node.lineno)
+    assert not bad, f"_observe_pointer_commit outside a deadline scope at lines {bad}"

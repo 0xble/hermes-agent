@@ -719,6 +719,9 @@ def _flip(home, db, row, proof, supervisor, *, operation='promote', record=None)
     if not _live(_row(db, row['id'])):
         raise RuntimeError('generation died before pointer flip')
     release = paths.release(row['release_sha'])
+    # activate_release is a local fsync'd pointer transaction with no blocking
+    # wait in this path (no reload callback). Refuse to start it after expiry.
+    gateway_deadline.check()
     try:
         result: dict = activate_release(home, release, operation=operation)
     except Exception:
@@ -1194,7 +1197,10 @@ def recover_forward(home, *, supervisor=None):
                 # A prior updater can die after current moved but before the
                 # forward marker was saved. Reconcile that commit before any
                 # clock, reservation cleanup, inventory or receipt can fail.
-                _observe_pointer_commit(home, record, row, proof)
+                # Reconciling an already-moved pointer writes the durable commit
+                # marker: bounded like the flip itself (proof window or named reserve).
+                with _flip_scope(home, record, deadline, rollback=False):
+                    _observe_pointer_commit(home, record, row, proof)
                 if proof.pop('_deadline_clock_error', False):
                     return _finish(home, record, 'blocked', failure='deadline clock unavailable',
                                    recovered=True, alert=True)

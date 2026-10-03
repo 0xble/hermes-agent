@@ -52,7 +52,7 @@ The profile-local `cron/executions.py` ledger records attempt owner PID/start fi
 
 ## Deadline contract
 
-Every bounded startup, handover, takeover, rollback, guardian-repair, wedge-proof, poll-proof, and bootout operation follows these five rules:
+Every bounded startup, handover, takeover, rollback, guardian-repair, wedge-proof, poll-proof, and bootout operation follows these rules:
 
 1. Give every blocking subprocess, socket, psutil wait, and SQLite busy wait no more than the remaining budget.
 2. Reject success observed at or after expiry.
@@ -60,6 +60,8 @@ Every bounded startup, handover, takeover, rollback, guardian-repair, wedge-proo
 4. After lease/pointer commit, lateness is a typed committed outcome or commit-clocked poll, never a plain failure or rollback of a healthy successor.
 5. Exception-path recovery uses the remaining budget or a named short reserve, never a fresh full interval. The one named exception is `recover_forward(late=True)` after the original rollback bound has expired: it records the missed original bound (`late_rollback.bound_missed=true`) and receives a fresh `ROLLBACK_SECONDS` operating budget, with an alert.
 6. The old owner's cooperative wire stop during `transfer_requested` is bounded by the poller's own long-poll limit (`timeout+1`), not the driver's window. The driver's window is protected by its socket timeout, and the owner self-rearms under the same lease and nonce.
+
+**Scope.** The contract covers the forward-only overlap paths (`gateway_forward_update`, `run_generation`, `generation`, guardian, controlled poller). Inside them, `activate_release` runs only within a `_flip_scope` and after an explicit expiry check; it is a local fsync'd pointer transaction with no wait in that path. The legacy non-overlap update and `repair-service` callers of `activate_release` (`update_cmd.py`, `immutable_releases.promote`/`rollback`) predate this design, are unchanged here and are not covered; bounding them is a follow-up, not a precondition of the forward-only flag.
 
 ## S1 — macOS cron run survives gateway restart
 
