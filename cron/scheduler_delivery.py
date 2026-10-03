@@ -17,12 +17,20 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
+
+# A live-lane send refused with a short ``flood_control:<seconds>`` penalty is retried on the live
+# lane after the wait instead of falling back to the standalone sender, which cannot send Telegram
+# Rich Messages. Cron output is not latency-sensitive, so a few seconds of delay beats degraded
+# formatting. Longer penalties, or repeated refusals past the budget, still fall back.
+_LIVE_FLOOD_WAIT_BUDGET_SECS = 15.0
+_LIVE_FLOOD_WAIT_SLACK_SECS = 0.5
 
 
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
@@ -1470,6 +1478,23 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
     return route_thread_id, route_metadata, media_metadata
 
 
+def _short_flood_wait(error: BaseException, already_waited: float) -> Optional[float]:
+    """Seconds to sit out a live-lane flood refusal before retrying, or ``None`` to fall back.
+
+    Only a ``flood_control:<seconds>`` refusal qualifies, and only while the total wait for this
+    target stays within ``_LIVE_FLOOD_WAIT_BUDGET_SECS``; a longer penalty keeps the standalone path."""
+    from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
+    if not is_flood_error(error):
+        return None
+    wait = flood_wait_seconds(error, default=0.0)
+    if wait <= 0:
+        return None
+    wait += _LIVE_FLOOD_WAIT_SLACK_SECS
+    if already_waited + wait > _LIVE_FLOOD_WAIT_BUDGET_SECS:
+        return None
+    return wait
+
+
 def _live_send_text(
     t: _TargetDelivery, text_to_send: str, route_thread_id: Optional[str], route_metadata: dict, *,
     target_errors: list, delivery_errors: list, unverified_targets: list,
@@ -1487,36 +1512,49 @@ def _live_send_text(
     # Send through the already-authorized transport: re-resolving from the plain target_adapters
     # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
     # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
-    future = safe_schedule_threadsafe(
-        router._deliver_to_platform(
-            route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
-    if future is None:
-        target_errors.append("live adapter event loop scheduling failed")
-        return False, False, None
-    try:
-        send_result = future.result(timeout=60)
-    except TimeoutError:
-        # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
-        # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
-        # started (loop wedged): MUST fall through to standalone or it is silently dropped.
-        if future.cancel():
-            msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
-            logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
-            target_errors.append(msg)
+    flood_waited = 0.0
+    while True:
+        future = safe_schedule_threadsafe(
+            router._deliver_to_platform(
+                route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
+        if future is None:
+            target_errors.append("live adapter event loop scheduling failed")
             return False, False, None
-        logger.warning(
-            "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
-            "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
-        return True, True, None
-    except Exception as ex:
-        # Real send error (not a slow confirmation): fall through to standalone. The router raises
-        # a failed SendResult's error string, so this is where send_path_degraded arrives.
-        t.live_error = str(ex)
-        target_errors.append(f"live adapter send failed: {ex}")
-        raise
+        try:
+            send_result = future.result(timeout=60)
+        except TimeoutError:
+            # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
+            # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
+            # started (loop wedged): MUST fall through to standalone or it is silently dropped.
+            if future.cancel():
+                msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
+                logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
+                target_errors.append(msg)
+                return False, False, None
+            logger.warning(
+                "Job '%s': live adapter send to %s:%s timed out "
+                "after 60s; already dispatched (in flight), "
+                "assuming delivered (skipping standalone fallback "
+                "to avoid duplicate)",
+                job["id"], t.platform_name, t.chat_id)
+            return True, True, None
+        except Exception as ex:
+            # A short flood window is cheaper to sit out than the standalone lane, which cannot send
+            # Telegram Rich Messages and degrades footnotes, tables and <details> to legacy markup.
+            wait = _short_flood_wait(ex, flood_waited)
+            if wait is not None:
+                logger.info(
+                    "Job '%s': live adapter send to %s hit %s; waiting %.1fs before retrying",
+                    job["id"], t.where, ex, wait)
+                time.sleep(wait)
+                flood_waited += wait
+                continue
+            # Real send error (not a slow confirmation): fall through to standalone. The router raises
+            # a failed SendResult's error string, so this is where send_path_degraded arrives.
+            t.live_error = str(ex)
+            target_errors.append(f"live adapter send failed: {ex}")
+            raise
+        break
 
     # _deliver_to_platform returns a SendResult, or a plain dict {"success": True, "delivered":
     # False, ...} when the silence-narration filter drops the message.

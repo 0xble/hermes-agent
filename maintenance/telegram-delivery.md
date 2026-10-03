@@ -152,6 +152,32 @@ Retire after an accepted upstream release contains #126100, or an equivalent,
 and the proof test passes without this patch. Roll back by reverting the two
 commits. There are no configuration or persistent-state changes.
 
+## Cron Short Flood Wait
+
+**Patch identity:** `cron-short-flood-wait`. The standalone lane sends legacy
+MarkdownV2 only, so a cron that falls back there loses Rich Message features:
+`[^n]` footnotes arrive as literal text, and tables and `<details>` flatten. On
+2026-10-03 a personal-alerts delivery fell back because the live adapter refused
+it locally with `flood_control:3.59` while four alert monitors and active chats
+shared one DM. The standalone sender then sent 0.8s later, inside the window.
+
+The live lane now sits out a `flood_control:<seconds>` refusal and retries on the
+live adapter, as long as the cumulative wait for that target stays within
+`_LIVE_FLOOD_WAIT_BUDGET_SECS` (15s). Longer penalties, repeated refusals past the
+budget, and every other error still fall back to standalone, as before. Source:
+`cron/scheduler_delivery.py` (`_short_flood_wait`, `_live_send_text`). Proof:
+`TestShortFloodWaitStaysOnTheLiveLane` in
+`tests/cron/test_cron_live_delivery_confirmation.py`, which fails without the patch.
+
+Rate budget: no new calls. A refused live attempt during a known window makes
+no API call. The retry replaces the standalone send that would otherwise have
+followed, and moves it after the published window instead of inside it. The
+worker thread blocks for at most 15s per target. Cron output is not
+latency-sensitive. No upstream issue or PR covered this on 2026-10-03. Retire
+when the standalone lane can send Rich Messages, or upstream retries short live
+floods equivalently. Roll back by reverting the commit. There are no
+configuration or persistent-state changes.
+
 ## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,
