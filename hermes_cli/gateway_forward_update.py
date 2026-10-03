@@ -298,13 +298,14 @@ class GenerationSupervisor:
 
     def bootstrap_state(self, row, scope, *, timeout=5):
         deadline = _now() + timeout
-        result = self.runner(['launchctl', 'print', f"{self._domain(row['label'])}/{row['label']}"],
+        domain = self._domain(row['label'], timeout=_remaining(deadline, 10))
+        result = self.runner(['launchctl', 'print', f"{domain}/{row['label']}"],
                              capture_output=True, text=True, encoding='utf-8',
                              timeout=_remaining(deadline, 5))
         _deadline_check(deadline)
         if result.returncode != 0:
             from hermes_cli.gateway_guardian import _launch_state
-            state = _launch_state(self._domain(row['label']), row['label'], runner=self.runner,
+            state = _launch_state(domain, row['label'], runner=self.runner,
                                   timeout=_remaining(deadline, 5))
             _deadline_check(deadline)
             if state == 'unloaded':
@@ -316,13 +317,13 @@ class GenerationSupervisor:
         return 'owned' if value('HERMES_HOME') == str(self.home) and value('HERMES_GENERATION_SCOPE') == scope else 'foreign'
 
     def bootout(self, row, timeout=15):
+        deadline = _now() + min(15, timeout)
         if row['state'] != 'exited':
             raise RuntimeError('cannot bootout a non-exited generation')
         path = self.directory / f"{row['label']}.plist"
         if path.exists():
             self._definition(row['label'])
-        domain = self._domain(row['label'])
-        deadline = _now() + min(15, timeout)
+        domain = self._domain(row['label'], timeout=_remaining(deadline, 10))
         self.runner(['launchctl', 'bootout', f"{domain}/{row['label']}"],
                     capture_output=True, timeout=_remaining(deadline, 15))
         from hermes_cli.gateway_guardian import _launch_state
@@ -1196,8 +1197,9 @@ def recover_forward(home, *, supervisor=None):
                 record['old_id'], record['old_epoch'], 'active'):
             try:
                 old = _row(db, record['old_id'])
-                status = supervisor.request(old, 'polling_status', timeout=2)
-                with closing(db.connect()) as conn:
+                recovery_deadline = time.monotonic() + 2
+                status = supervisor.request(old, 'polling_status', timeout=_remaining(recovery_deadline, 2))
+                with closing(db._deadline_connect(recovery_deadline)) as conn:
                     transfer = conn.execute('SELECT state FROM generation_transfers WHERE old_id=? AND epoch=?',
                                             (old['id'], lease['epoch'])).fetchone()
                 if (status.get('polling') is not True or not _all_fences_armed(status) or
@@ -1295,7 +1297,9 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
             current = _lease(db)
             if (current['generation_id'], current['epoch'], current['state']) == (old['id'], lease['epoch'], 'active'):
                 try:
-                    with closing(db.connect()) as conn:
+                    recovery_deadline = time.monotonic() + min(
+                        HANDOVER_ABORT_RESERVE, max(0, handover_deadline - _now()))
+                    with closing(db._deadline_connect(recovery_deadline)) as conn:
                         transfer = conn.execute('SELECT * FROM generation_transfers WHERE old_id=? AND epoch=?',
                                                 (old['id'], lease['epoch'])).fetchone()
                     resume = None
@@ -1303,7 +1307,9 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
                         if transfer['new_id'] != successor['id']:
                             raise RuntimeError('abort attempt changed')
                         if transfer['state'] != 'aborted':
-                            db.abort_transfer(old['id'], successor['id'], lease['epoch'], attempt_nonce=transfer['attempt_nonce'])
+                            db.abort_transfer(old['id'], successor['id'], lease['epoch'],
+                                              attempt_nonce=transfer['attempt_nonce'],
+                                              deadline=recovery_deadline)
                         resume = supervisor.request(old, 'transfer_aborted',
                             params={'to': successor['id'], 'nonce': transfer['attempt_nonce']},
                             timeout=min(HANDOVER_ABORT_RESERVE,

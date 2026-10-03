@@ -226,7 +226,7 @@ class Rig:
         # proof). Hardlinks save I/O. Nothing in the release is edited in place.
         excluded = {'.git', '.worktrees', '.venv', 'venv', 'tests', 'website', 'apps',
                     'web', 'ui-tui', 'node_modules', '__pycache__', '.pytest_cache', '.ruff_cache',
-                    '.release-ready', '.hermes_build_sha', 'sitecustomize.py'}
+                    '.release-ready', '.hermes_build_sha', 'install-stamp.json', 'sitecustomize.py'}
         def ignore(_directory, names):
             return [n for n in names if n in excluded or n.endswith('.pyc')]
         resource_directories = {'contributors', 'optional-skills', 'skills', 'plugin-catalog',
@@ -244,6 +244,10 @@ class Rig:
         (release / '.venv').symlink_to(REPOSITORY / '.venv', target_is_directory=True)
         # Process audit policy enforces the fixture's loopback-only contract.
         (release / 'sitecustomize.py').write_text(LOCAL_NETWORK_POLICY, encoding='utf-8')
+        from scripts.write_install_stamp import build_stamp
+        stamp = build_stamp(commit=sha, branch='', dirty=False, source='local',
+                            update_mechanism='self')
+        (release / 'install-stamp.json').write_text(json.dumps(stamp) + '\n', encoding='utf-8')
         for name in ('.release-ready', '.hermes_build_sha'):
             (release / name).write_text(sha, encoding='utf-8')
         assert forward.capable(release) and forward._release_is_ready(release, sha)

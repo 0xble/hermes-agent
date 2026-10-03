@@ -201,6 +201,89 @@ async def test_commit_transfer_does_not_move_lease_after_busy_deadline(tmp_path)
     assert (lease["generation_id"], lease["epoch"]) == (old.id, epoch)
 
 
+@pytest.mark.asyncio
+async def test_takeover_dead_generation_does_not_retire_after_busy_deadline(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="standby")
+    epoch = db.acquire_lease("active_generation", old.id)
+    lock = sqlite3.connect(db.path, timeout=5.0, isolation_level=None)
+    booted = []
+    try:
+        lock.execute("BEGIN IMMEDIATE")
+        deadline = time.monotonic() + 0.15
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="deadline"):
+            await asyncio.to_thread(
+                db.takeover_dead_generation, "active_generation", old.id, new.id,
+                bootout=lambda label: booted.append(label) or True,
+                death_proof=lambda row: True, deadline=deadline,
+            )
+        assert time.monotonic() - started < 1.0
+    finally:
+        lock.rollback()
+        lock.close()
+    assert not booted
+    assert db.leases()[0]["generation_id"] == old.id
+    retired = next(row for row in db.generations() if row["id"] == old.id)
+    assert retired["verdict"] is None and retired["state"] == "serving"
+
+
+@pytest.mark.asyncio
+async def test_abort_transfer_does_not_change_state_after_busy_deadline(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="standby")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, set())
+    nonce = db.transfer_attempt_nonce(old.id, epoch)
+    lock = sqlite3.connect(db.path, timeout=5.0, isolation_level=None)
+    try:
+        lock.execute("BEGIN IMMEDIATE")
+        with pytest.raises(TimeoutError, match="deadline"):
+            await asyncio.to_thread(
+                db.abort_transfer, old.id, new.id, epoch,
+                attempt_nonce=nonce, deadline=time.monotonic() + 0.15,
+            )
+    finally:
+        lock.rollback()
+        lock.close()
+    assert db.leases()[0]["generation_id"] == old.id
+    assert db.transfer_receipts(old.id, epoch) == []
+    with db.connect() as conn:
+        assert conn.execute(
+            "SELECT state FROM generation_transfers WHERE old_id=? AND epoch=?",
+            (old.id, epoch)).fetchone()["state"] == "requested"
+
+
+@pytest.mark.asyncio
+async def test_record_poller_stopped_does_not_persist_after_busy_deadline(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="standby")
+    epoch = db.acquire_lease("active_generation", old.id)
+    db.request_transfer(old.id, new.id, epoch, {"token"})
+    nonce = db.transfer_attempt_nonce(old.id, epoch)
+    lock = sqlite3.connect(db.path, timeout=5.0, isolation_level=None)
+    try:
+        lock.execute("BEGIN IMMEDIATE")
+        with pytest.raises(TimeoutError, match="deadline"):
+            await asyncio.to_thread(
+                db.record_poller_stopped, old.id, epoch, "token", 7,
+                attempt_nonce=nonce, deadline=time.monotonic() + 0.15,
+            )
+    finally:
+        lock.rollback()
+        lock.close()
+    assert db.transfer_receipts(old.id, epoch)[0]["poller_stopped"] == 0
+
+
 @pytest.fixture(autouse=True)
 def _coordinator_boot_identity(monkeypatch):
     # Unit transactions use a stable supplied boot identity. Native process

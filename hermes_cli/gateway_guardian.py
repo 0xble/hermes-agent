@@ -221,9 +221,9 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
-    domain = domain or (_domain(label) if launchctl_runner is None else
-                        _gateway_domain(label, None, runner=launchctl_runner))
     reload_deadline = time.monotonic() + STARTUP_SECONDS
+    domain = domain or _gateway_domain(label, None, runner=launchctl_runner,
+                                       timeout=_remaining(reload_deadline, 10))
     def reload_target():
         import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap
@@ -278,10 +278,14 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         from gateway.generation import GenerationCoordinator
         coordinator = GenerationCoordinator(home)
         if coordinator.service_label() != label:
-            cleanup_domain = _gateway_domain(label, domain, runner=launchctl_runner)
-            if _launch_state(cleanup_domain, label, runner=launchctl_runner) == "parked":
+            repair_deadline = time.monotonic() + STARTUP_SECONDS
+            cleanup_domain = _gateway_domain(label, domain, runner=launchctl_runner,
+                                             timeout=_remaining(repair_deadline, 10))
+            if _launch_state(cleanup_domain, label, runner=launchctl_runner,
+                             timeout=_remaining(repair_deadline, 5)) == "parked":
                 return _repair_parked(home, plist, label, cleanup_domain,
-                                      Path(definition.get("WorkingDirectory", "")), launchctl_runner or subprocess.run)
+                                      Path(definition.get("WorkingDirectory", "")), launchctl_runner or subprocess.run,
+                                      deadline=repair_deadline)
             return "waiting"
     paths = ReleasePaths.for_home(home)
     current = paths.current.resolve()
@@ -295,10 +299,13 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     switch_state, switch = _switch(home, grace=grace)
     if switch_state == "waiting":
         return "waiting"
-    domain = _gateway_domain(label, domain, runner=launchctl_runner)
-    state = _launch_state(domain, label, runner=launchctl_runner)
+    deadline = time.monotonic() + STARTUP_SECONDS
+    domain = _gateway_domain(label, domain, runner=launchctl_runner,
+                             timeout=_remaining(deadline, 10))
+    state = _launch_state(domain, label, runner=launchctl_runner,
+                          timeout=_remaining(deadline, 5))
     launchctl = launchctl_runner or subprocess.run
-    if state == "loaded" and healthy(home, label, current, launchctl_runner):
+    if state == "loaded" and healthy(home, label, current, launchctl_runner, deadline):
         pending = home / "release-txn.json"
         if pending.exists():
             record = json.loads(pending.read_text(encoding="utf-8-sig"))
@@ -311,7 +318,8 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             # Parked repair is cold recovery. A pending update owns fresh A-prime.
             return "waiting"
         if state == "parked":
-            return _repair_parked(home, plist, label, domain, current, launchctl)
+            return _repair_parked(home, plist, label, domain, current, launchctl,
+                                  deadline=deadline)
         # A loaded process is never forced out. An unloaded service uses the
         # same coordinator fence and repair budget as a parked one.
         if state == "loaded":
@@ -346,7 +354,6 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             return "waiting"
         from hermes_cli.gateway_launchd_generation import refresh_generation_scope
         refresh_generation_scope(plist)
-    deadline = time.monotonic() + STARTUP_SECONDS
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
               timeout=_remaining(deadline, 10))
     while time.monotonic() < deadline:
@@ -365,7 +372,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     return "failed"
 
 
-def _repair_parked(home, plist, label, domain, current, launchctl):
+def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=None):
     from gateway.generation import GenerationCoordinator
     from hermes_cli.gateway_launchd_generation import refresh_generation_scope
     coordinator = GenerationCoordinator(home)
@@ -380,7 +387,7 @@ def _repair_parked(home, plist, label, domain, current, launchctl):
         if coordinator.prepare_parked_repair(label) != "repair":
             return "waiting"
         receipt(home, "bootstrap", "attempt", label=label)
-    deadline = time.monotonic() + STARTUP_SECONDS
+    deadline = time.monotonic() + STARTUP_SECONDS if deadline is None else deadline
     launchctl(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
               timeout=_remaining(deadline, 10))
     if _launch_state(domain, label, runner=launchctl, timeout=_remaining(deadline, 5)) != "unloaded":

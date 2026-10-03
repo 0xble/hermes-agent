@@ -220,11 +220,7 @@ def _retry_launchctl_bootstrap_until_registered(
     domain: str, plist_path, label: str, *, deadline: float
 ) -> bool:
     """Retry ``_launchctl_bootstrap`` until the label supervises a process or ``deadline`` passes. Under
-    load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is too short.
-
-    Legacy install/start path only (not the forward-only handover windows, which bound their own
-    launchd calls). It deliberately makes at least one full bootstrap+probe attempt even when the
-    caller's deadline has already elapsed (registration invariant verified on 2026-08-05)."""
+    load bootstrap can fail even after bootout, during a drain (default 180s) — ~10s is too short."""
     attempt = 0
     while True:
         attempt += 1

@@ -35,6 +35,12 @@ HANDOVER_ABORT_RESERVE = 2  # Reserved inside the caller's budget, never added t
 DEFAULT_DRAIN_SECONDS = 7200  # Match the commit cap when the durable deadline is missing.
 
 
+def _deadline_kwargs(deadline, **kwargs):
+    if deadline is not None:
+        kwargs["deadline"] = deadline
+    return kwargs
+
+
 class HandoverCommittedUnverified(RuntimeError):
     """Lease changed irreversibly; inspect successor health, do not retry promotion."""
 
@@ -128,7 +134,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     nonce = coordinator.transfer_attempt_nonce(old_id, epoch, deadline=coordinator_deadline)
     check_deadline()
     try:
-        ack = _generation_request(path, "transfer_requested", params={"to": to_id}, timeout=remaining())
+        ack = _generation_request(path, "transfer_requested",
+                                  params={"to": to_id, "deadline": coordinator_deadline},
+                                  timeout=remaining())
         check_deadline()
         if (ack.get("generation_id"), ack.get("epoch"), ack.get("poller_stopped")) != (old_id, epoch, True):
             raise RuntimeError("old generation did not prove poller stopped")
@@ -142,7 +150,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         # Never hide the transfer failure with a second failure during recovery.
         # Attempt both abort and re-arm even if either operation fails.
         try:
-            coordinator.abort_transfer(old_id, to_id, epoch, attempt_nonce=nonce)
+            abort_budget = min(HANDOVER_ABORT_RESERVE, remaining(recovery=True))
+            coordinator.abort_transfer(old_id, to_id, epoch, attempt_nonce=nonce,
+                                       deadline=time.monotonic() + abort_budget)
         except Exception:
             logger.exception("transfer abort failed after pre-commit failure")
         try:
@@ -529,7 +539,7 @@ class ActiveGeneration:
         async with self._transfer_lock:
             return {"tokens": sorted(self._telegram_adapters())}
 
-    async def transfer_requested(self, new_id: str) -> dict:
+    async def transfer_requested(self, new_id: str, *, deadline: float | None = None) -> dict:
         """Old owner alone can stop its wire and persist receipts; never stop a live turn."""
         async with self._transfer_lock:
             if self.runner is None:
@@ -544,8 +554,9 @@ class ActiveGeneration:
             if self.owned_routing is not None:
                 self.owned_routing.validate_live()
             stopped = []
-            nonce = await asyncio.to_thread(self.coordinator.transfer_attempt_nonce,
-                                            self.identity.id, self.epoch)
+            nonce = await asyncio.to_thread(
+                self.coordinator.transfer_attempt_nonce, self.identity.id, self.epoch,
+                **_deadline_kwargs(deadline))
             self.runner._overlap_draining = True
             try:
                 for token, adapter in roster.items():
@@ -553,9 +564,10 @@ class ActiveGeneration:
                     if receipt.get("token_hash") != token:
                         raise RuntimeError("poller stop token mismatch")
                     stopped.append((adapter, receipt))
-                    await asyncio.to_thread(self.coordinator.record_poller_stopped,
-                                            self.identity.id, self.epoch, token, receipt["safe_offset"],
-                                            attempt_nonce=nonce)
+                    await asyncio.to_thread(
+                        self.coordinator.record_poller_stopped,
+                        self.identity.id, self.epoch, token, receipt["safe_offset"],
+                        attempt_nonce=nonce, **_deadline_kwargs(deadline))
                 # No more wire updates can extend a split text batch. Dispatch it
                 # while A still owns the lease, before the successor can receive it.
                 for adapter in roster.values():
@@ -587,9 +599,10 @@ class ActiveGeneration:
                 # recovery is incomplete, and do not mask the stop failure.
                 self._stopped_receipts = stopped
                 try:
-                    await asyncio.to_thread(self.coordinator.abort_transfer,
-                                            self.identity.id, new_id, self.epoch,
-                                            attempt_nonce=nonce)
+                    await asyncio.to_thread(
+                        self.coordinator.abort_transfer,
+                        self.identity.id, new_id, self.epoch,
+                        attempt_nonce=nonce, **_deadline_kwargs(deadline))
                 except Exception:
                     message = "poller stop failed and transfer abort could not be proved"
                     self._rearm_errors = [message]
@@ -764,10 +777,11 @@ class ActiveGeneration:
                 async with self._transfer_lock:
                     # Roster requests share this lock, so a retry cannot replace
                     # the aborted nonce before recovery has reopened dispatch.
+                    recovery_deadline = time.monotonic() + HANDOVER_ABORT_RESERVE
                     try:
                         aborted = await asyncio.to_thread(
                             self.coordinator.abort_transfer, self.identity.id, new_id,
-                            self.epoch, attempt_nonce=nonce)
+                            self.epoch, attempt_nonce=nonce, deadline=recovery_deadline)
                     except RuntimeError as exc:
                         if str(exc) == "cannot abort a committed transfer":
                             # A committed successor owns admission; do not re-arm A.
@@ -779,7 +793,7 @@ class ActiveGeneration:
                     else:
                         if not aborted:
                             def read_transfer():
-                                with contextlib.closing(self.coordinator.connect()) as conn:
+                                with contextlib.closing(self.coordinator._deadline_connect(recovery_deadline)) as conn:
                                     return conn.execute(
                                         "SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
                                         (self.identity.id, self.epoch)).fetchone()
@@ -826,10 +840,17 @@ class ActiveGeneration:
             new_id = params.get("to")
             if not isinstance(new_id, str):
                 raise RuntimeError("successor generation ID required")
-            future = asyncio.run_coroutine_threadsafe(self.transfer_requested(new_id), loop)
+            deadline = params.get("deadline")
+            if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float))):
+                raise RuntimeError("transfer deadline required")
+            future = asyncio.run_coroutine_threadsafe(
+                self.transfer_requested(new_id, deadline=None if deadline is None else float(deadline)), loop)
             # Control-socket handlers are rare, bounded operations; waiting here keeps the
             # synchronous socket protocol simple without occupying an event-loop thread.
-            return future.result(timeout=45)
+            wait_timeout = HANDOVER_REQUEST_TIMEOUT
+            if deadline is not None:
+                wait_timeout = min(wait_timeout, max(0.0, float(deadline) - _REAL_MONOTONIC()))
+            return future.result(timeout=wait_timeout)
 
         def _abort_handler(params: dict) -> dict:
             new_id = params.get("to")

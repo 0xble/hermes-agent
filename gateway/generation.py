@@ -698,8 +698,9 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         if not dead:
             self.observe_suspect(old_id, evidence="death_proof_failed")
             raise RuntimeError("takeover death proof failed")
-        with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._deadline_connect(deadline)) as conn, conn:
+            self._begin_immediate(conn, deadline)
+            self._check_transaction_deadline(conn, deadline)
             current = conn.execute("SELECT * FROM leases WHERE resource=?", (resource,)).fetchone()
             recorded = conn.execute("SELECT * FROM generations WHERE id=?", (old_id,)).fetchone()
             if (not current or dict(current) != dict(lease) or not recorded
@@ -847,12 +848,14 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
         return row["attempt_nonce"]
 
     def record_poller_stopped(self, old_id: str, epoch: int, token_hash: str,
-                              safe_offset: int, *, attempt_nonce: str | None = None) -> None:
+                              safe_offset: int, *, attempt_nonce: str | None = None,
+                              deadline: float | None = None) -> None:
         """Persist only a receipt for a token in the frozen roster and current lease."""
         if type(safe_offset) is not int or safe_offset < 0:
             raise RuntimeError("invalid polling cursor")
-        with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._deadline_connect(deadline)) as conn, conn:
+            self._begin_immediate(conn, deadline)
+            self._check_transaction_deadline(conn, deadline)
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             transfer = conn.execute("SELECT state,attempt_nonce FROM generation_transfers WHERE old_id=? AND epoch=?",
                                     (old_id, epoch)).fetchone()
@@ -865,6 +868,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                                    (safe_offset, old_id, epoch, token_hash)).rowcount
             if not changed:
                 raise RuntimeError("token is not pending a stop receipt")
+            self._check_transaction_deadline(conn, deadline)
             conn.commit()
 
     def transfer_receipts(self, old_id: str, epoch: int) -> list[dict[str, Any]]:
@@ -914,10 +918,11 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
             return epoch + 1
 
     def abort_transfer(self, old_id: str, new_id: str, epoch: int,
-                       *, attempt_nonce: str) -> bool:
+                       *, attempt_nonce: str, deadline: float | None = None) -> bool:
         """CAS abort against the old lease and exact attempt, never a committed successor."""
-        with closing(self.connect()) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with closing(self._deadline_connect(deadline)) as conn, conn:
+            self._begin_immediate(conn, deadline)
+            self._check_transaction_deadline(conn, deadline)
             lease = conn.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (old_id, epoch, "active"):
                 raise RuntimeError("cannot abort a committed transfer")
@@ -928,6 +933,7 @@ class GenerationCoordinator(GenerationClaimsMixin, GenerationRetentionMixin, Own
                 "UPDATE generation_transfers SET state='aborted' WHERE old_id=? AND new_id=? "
                 "AND epoch=? AND state='requested' AND attempt_nonce=?",
                 (old_id, new_id, epoch, attempt_nonce)).rowcount
+            self._check_transaction_deadline(conn, deadline)
             conn.commit()
             return changed == 1
 
