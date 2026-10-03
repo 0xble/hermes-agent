@@ -1640,6 +1640,9 @@ def test_late_rollback_polling_proof_alerts_but_does_not_block_next_promotion(ri
     assert result['rollback']['rollback_bound_met'] is False
     assert result['rollback']['reply_observed'] is False
     assert 'reply_seconds' not in result['rollback']
+    # The irreversible flip ran after the bound: classified late before it ran.
+    assert result['late_rollback']['bound_missed'] is True
+    assert result['late_rollback']['flip_after_bound'] is True
     assert not (rig.home / 'forward-update.json').exists()
     rig.supervisor.mode = 'happy'
     assert promote_different_release(rig)['outcome'] == 'success'
@@ -2235,3 +2238,20 @@ class TestReview5RealWedgeProof:
         assert recovered['outcome'] == 'rolled_back', recovered
         assert recovered['late_rollback']['bound_missed'] is True and recovered['alert']
         assert any(event[0] == 'bounded-stop' and event[1] == armed[0]['pid'] for event in rig.events)
+
+
+def test_rollback_serving_clock_is_taken_after_the_pointer_flip(rig, monkeypatch):
+    """serving_seconds must include the irreversible flip; a slow flip that crosses
+    the bound may not be recorded as within it."""
+    rig.supervisor.mode = 'dies'
+    flip = forward._flip
+    def slow(*args, **kwargs):
+        result = flip(*args, **kwargs)
+        if kwargs.get('operation') == 'rollback':
+            rig.clock.value = 61
+        return result
+    monkeypatch.setattr(forward, '_flip', slow)
+    result = promote(rig)
+    assert result['outcome'] == 'rolled_back' and result['alert']
+    assert result['rollback']['commit_to_serving_upper_bound_seconds'] >= 61
+    assert result['rollback']['rollback_bound_met'] is False

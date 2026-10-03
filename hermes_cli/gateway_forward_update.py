@@ -749,6 +749,25 @@ def _flip(home, db, row, proof, supervisor, *, operation='promote', record=None)
     return result
 
 
+def _flip_scope(home, record, bound, *, rollback):
+    """Scope for the irreversible pointer flip.
+
+    Inside ``bound`` while a full HANDOVER_ABORT_RESERVE still fits. Otherwise a
+    rollback is classified late *before* the flip (bound missed, alert) and the
+    flip gets its own named reserve. The original bound is never silently
+    stretched over an irreversible step, and the flip never runs unbounded.
+    """
+    if bound is not None and bound - _now() >= HANDOVER_ABORT_RESERVE:
+        return deadline_scope(bound)
+    if rollback:
+        late_info = record.setdefault('late_rollback', {'started_at': time.time()})
+        late_info['bound_missed'] = True
+        late_info['flip_after_bound'] = True
+        record['alert'] = True
+        _save(home, record)
+    return deadline_scope(_now() + HANDOVER_ABORT_RESERVE, inherit=False)
+
+
 def _fresh_reply(home, row, epoch, after, tokens):
     """Passive proof of fresh polled input answered after this owner took over.
 
@@ -1053,9 +1072,14 @@ def _rollback_bounded(home, db, failed, previous, supervisor, record, *, late=Fa
                 bootout=lambda label: supervisor.bootout(_row(db, failed['id']), _remaining(deadline, 15)),
                 deadline=_now() + max(0, deadline - _now()))
     proof = _poller(db, fresh, supervisor, deadline=deadline)
-    with deadline_scope(_now() + HANDOVER_ABORT_RESERVE, inherit=False):
-        serving_clock = _now()
+    # The pointer flip is irreversible. Run it inside the rollback bound when a
+    # full reserve still fits; otherwise classify the rollback late *before* the
+    # flip (bound missed, alert) and give the flip its own named reserve. Never
+    # silently stretch the original bound over an irreversible step.
+    with _flip_scope(home, record, deadline, rollback=True):
         result = _flip(home, db, fresh, proof, supervisor, operation='rollback', record=record)
+        # Serving is proven only once the pointer commit has landed.
+        serving_clock = _now()
         rollback = {'old_id': failed['id'], 'new_id': fresh['id'], 'old_label': failed['label'],
                     'new_label': fresh['label'], 'old_sha': failed['release_sha'], 'new_sha': fresh['release_sha'],
                     'epoch': proof['epoch'], 'poller': proof,
@@ -1174,7 +1198,6 @@ def recover_forward(home, *, supervisor=None):
                 if proof.pop('_deadline_clock_error', False):
                     return _finish(home, record, 'blocked', failure='deadline clock unavailable',
                                    recovered=True, alert=True)
-                serving_clock = _now()
                 rollback_owner = new != record.get('successor')
                 if not rollback_owner and record.get('rollback_generation'):
                     _discard_reservation(db, record['rollback_generation'], supervisor, 'rollback_abandoned')
@@ -1182,8 +1205,17 @@ def recover_forward(home, *, supervisor=None):
                     require_forward_inventory(home)
                 except Exception as exc:
                     return _finish(home, record, 'blocked', failure=str(exc), recovered=True)
-                result = _flip(home, db, row, proof, supervisor,
-                               operation='rollback' if rollback_owner else 'promote', record=record)
+                if rollback_owner:
+                    from gateway.generation import _boot_id as _flip_boot_id
+                    flip_bound = (record.get('rollback_deadline_clock')
+                                  if record.get('rollback_boot_id') == _flip_boot_id() else None)
+                else:
+                    flip_bound = deadline
+                with _flip_scope(home, record, flip_bound, rollback=rollback_owner):
+                    result = _flip(home, db, row, proof, supervisor,
+                                   operation='rollback' if rollback_owner else 'promote', record=record)
+                    # Serving is proven only once the pointer commit has landed.
+                    serving_clock = _now()
                 if rollback_owner:
                     from gateway.generation import _boot_id
                     rollback = record.setdefault('rollback', {
