@@ -67,7 +67,7 @@ def _worker(standby: bool):
         run_generation.HANDOVER_REQUEST_TIMEOUT = 2
     if not standby and os.environ.get("TEST_PAUSE_TRANSFER"):
         from gateway.run_generation import ActiveGeneration
-        async def paused_transfer(self, new_id: str) -> dict:
+        async def paused_transfer(self, new_id: str, **kwargs) -> dict:
             Path(os.environ["TEST_PAUSE_TRANSFER"]).touch()
             await asyncio.Event().wait()
             return {}
@@ -76,7 +76,7 @@ def _worker(standby: bool):
         from gateway.run_generation import ActiveGeneration
         from gateway.platforms.event import MessageEvent, MessageType
         original_transfer = ActiveGeneration.transfer_requested
-        async def transfer_with_photo(self, new_id):
+        async def transfer_with_photo(self, new_id, **kwargs):
             for adapter in self._telegram_adapters().values():
                 adapter._media_batch_delay_seconds = 120
                 source = adapter.build_source(chat_id="1", chat_type="dm", user_id="1")
@@ -86,7 +86,7 @@ def _worker(standby: bool):
                 batch_key = adapter._photo_batch_key(event, SimpleNamespace(media_group_id=None))
                 adapter._pending_photo_batches[batch_key] = event
                 adapter._pending_photo_batch_tasks[batch_key] = asyncio.create_task(adapter._flush_photo_batch(batch_key))
-            return await original_transfer(self, new_id)
+            return await original_transfer(self, new_id, **kwargs)
         from types import SimpleNamespace
         ActiveGeneration.transfer_requested = transfer_with_photo
     print(f"WORKER:{'B' if standby else 'A'}", flush=True)

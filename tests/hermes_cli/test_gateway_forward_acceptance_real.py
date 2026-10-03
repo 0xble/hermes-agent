@@ -989,11 +989,11 @@ def test_live_successor_refuses_handover_then_late_death_recovers(rig, monkeypat
         '    result=original_status(self)\n'
         '    if marker.exists(): result["healthy"]=False\n'
         '    return result\n'
-        'async def transfer(self,new_id):\n'
+        'async def transfer(self,new_id,**kwargs):\n'
         '    if marker.exists():\n'
         '        receipt.write_text(self.identity.id)\n'
         '        raise RuntimeError("native live loop refuses handover")\n'
-        '    return await original_transfer(self,new_id)\n'
+        '    return await original_transfer(self,new_id,**kwargs)\n'
         'ActiveGeneration.polling_status=status\n'
         'ActiveGeneration.transfer_requested=transfer\n', encoding='utf-8')
     signals = []
