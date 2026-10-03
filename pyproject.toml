@@ -218,6 +218,21 @@ dependencies = [
   "nemo-relay>=0.9,<0.10; ((sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')) and python_version >= '3.14'",]
 
 [project.optional-dependencies]
+documents = [
+  "python-docx==1.2.0",
+  "python-pptx==1.0.2",
+  "openpyxl==3.1.5",
+  "pypdf==6.19.0",
+  "pdfplumber==0.11.10",
+  "pypdfium2==5.13.0",
+  "lxml==6.1.2",
+  "pandas==3.0.5",
+  "matplotlib==3.11.2",
+  "beautifulsoup4==4.15.0",
+  "fonttools==4.65.0",
+  "playwright==1.62.0",
+  "pymupdf==1.27.2.3",
+]
 hindsight-embedded = ["hindsight-all>=0.6.1,<1"]
 hindsight = ["hindsight-client>=0.6.1,<1"]
 # High-performance event loop — uvloop replaces the stdlib asyncio loop with
@@ -710,6 +725,7 @@ alibabacloud-dingtalk = false
 anthropic = false
 asyncpg = false
 azure-identity = false
+beautifulsoup4 = false
 boto3 = false
 brotlicffi = false
 browser-harness = false
@@ -732,6 +748,7 @@ faster-whisper = false
 fire = false
 firecrawl-anydoc = false
 firecrawl-py = false
+fonttools = false
 google-api-python-client = false
 google-auth = false
 google-auth-httplib2 = false
@@ -746,7 +763,9 @@ huggingface_hub = false
 jinja2 = false
 langfuse = "2026-09-09T16:01:26Z"
 lark-oapi = false
+lxml = false
 markdown = false
+matplotlib = false
 maturin = false
 mautrix = false
 mcp = false
@@ -758,11 +777,14 @@ nemo-relay = false
 neutts = "2026-07-22T14:54:23Z"
 numpy = false
 openai = false
+openpyxl = false
 opentelemetry-exporter-otlp-proto-http = false
 opentelemetry-sdk = false
 packaging = false
+pandas = false
 parallel-web = false
 pathspec = false
+pdfplumber = false
 pillow = false
 playwright = false
 piper-tts = "2026-09-04T16:47:32Z"
@@ -772,11 +794,16 @@ pvporcupine = false
 pyasn1 = false
 pydantic = false
 pyjwt = false
+pymupdf = false
+pypdf = false
+pypdfium2 = false
 pytest = false
 pytest-asyncio = false
+python-docx = false
 python-dotenv = false
 python-multipart = false
 python-olm = false
+python-pptx = false
 python-telegram-bot = false
 pyyaml = false
 qrcode = false
