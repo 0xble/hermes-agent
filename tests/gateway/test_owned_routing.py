@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -21,6 +22,69 @@ from gateway.status import _get_process_start_time
 def _identity(release_sha, label):
     return GenerationIdentity.create(release_sha=release_sha, label=label,
         start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
+
+
+def _pending_delegation(home, *, owner_pid, owner_started_at):
+    conn = sqlite3.connect(home / "state.db")
+    try:
+        conn.execute("""CREATE TABLE async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT NOT NULL,
+            delivery_state TEXT NOT NULL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER
+        )""")
+        conn.execute(
+            "INSERT INTO async_delegations VALUES (?, ?, 'pending', ?, ?)",
+            ("delegation-1", "agent:default:telegram:chat-1", owner_pid, owner_started_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _routing_for_delegation(tmp_path, pid):
+    coordinator = SimpleNamespace(home=tmp_path)
+    generation = SimpleNamespace(
+        coordinator=coordinator,
+        identity=SimpleNamespace(pid=pid),
+        runner=SimpleNamespace(adapters={}),
+    )
+    return OwnedRouting(generation)
+
+
+def test_delegation_with_unknown_start_time_is_retained(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: 1000)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=None)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == {
+        "agent:default:telegram:chat-1"
+    }
+
+
+def test_delegation_with_drifting_start_time_is_retained(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: 1000)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=1199)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == {
+        "agent:default:telegram:chat-1"
+    }
+
+
+def test_delegation_is_retained_when_process_start_time_is_unavailable(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: None)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=1000)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == {
+        "agent:default:telegram:chat-1"
+    }
+
+
+def test_delegation_with_reused_pid_is_excluded(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: 1000)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=2001)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == set()
 
 
 @pytest.mark.asyncio

@@ -403,6 +403,14 @@ def record_model_result(turn: _LoopbackTurn, result: dict) -> None:
           or result.get("api_calls") != 1):
         turn.evidence["error"] = "model turn failed or did not complete in one call"
     elif not _matches_ready_reply(reply, turn.nonce):
+        # A refused text reply is still a probe result. Preserve it as terminal
+        # evidence, never as sendable work that a later promotion could recover.
+        from gateway.outbox import Outbox
+        Outbox(turn.outbox_home).enqueue_synthetic(turn.nonce, {
+            "chat_id": "loopback:" + turn.nonce, "content": reply,
+            "platform": LOOPBACK_PLATFORM, "nonce": turn.nonce,
+            "session_key": turn.evidence["session_key"],
+        })
         turn.evidence["error"] = "model reply did not match the loopback token"
     else:
         turn.evidence.update(model_reply=True, turn_completed=True)

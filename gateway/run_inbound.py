@@ -104,6 +104,44 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     return message_text[len(prefix):] if message_text.startswith(prefix) else message_text
 
 
+async def _admit_outbox_event(runner, event, source):
+    if not getattr(getattr(runner, "config", None), "durable_outbox_enabled", False) or source.platform != Platform.TELEGRAM:
+        return
+    from gateway.outbox import (
+        store_for, bind_turn, event_kind, transport_id,
+        event_admission_scope, local_admission_turn,
+    )
+    import uuid
+
+    home = getattr(runner, "_resolve_profile_home_for_source")(source)
+    profile = getattr(source, "profile", None) or "default"
+    kind = event_kind(event)
+    event_id = transport_id(event)
+    if not event_id:
+        event_id = uuid.uuid4().hex
+        setattr(event, "_outbox_transport_id", event_id)
+    store = store_for(home)
+    turn_id = local_admission_turn(event, runner, home)
+    if turn_id is None:
+        turn_id, fresh = await asyncio.to_thread(
+            store.admit, str(profile), "telegram", event_id, kind)
+        if fresh:
+            event._outbox_admission_scope = event_admission_scope(event, runner, home)
+    else:
+        fresh = True  # Native queue/deferred replay retains its admitted turn.
+    setattr(event, "_outbox_turn_id", turn_id)
+    setattr(event, "_outbox_home", home)
+    setattr(event, "_outbox_duplicate", not fresh)
+    if not fresh:
+        logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
+    else:
+        bind_turn(home, turn_id)
+    # A restore-queued event keeps its owned placeholder until it reaches
+    # this admission boundary, rather than losing it when a task is spawned.
+    if getattr(event, "_owned_local_pending", None) is not None:
+        event._owned_local_pending = None
+
+
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -269,6 +307,7 @@ class GatewayInboundMixin:
             return None
 
         if is_internal:
+            await _admit_outbox_event(self, event, source)
             return event, source, True
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
@@ -303,38 +342,7 @@ class GatewayInboundMixin:
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
-        if getattr(_config, "durable_outbox_enabled", False) and source.platform == Platform.TELEGRAM:
-            from gateway.outbox import (store_for, bind_turn, event_kind, transport_id,
-                                        event_admission_scope, local_admission_turn)
-            import uuid
-
-            home = getattr(self, "_resolve_profile_home_for_source")(source)
-            profile = getattr(source, "profile", None) or "default"
-            kind = event_kind(event)
-            event_id = transport_id(event)
-            if not event_id:
-                event_id = uuid.uuid4().hex
-                setattr(event, "_outbox_transport_id", event_id)
-            store = store_for(home)
-            turn_id = local_admission_turn(event, self, home)
-            if turn_id is None:
-                turn_id, fresh = await asyncio.to_thread(
-                    store.admit, str(profile), "telegram", event_id, kind)
-                if fresh:
-                    event._outbox_admission_scope = event_admission_scope(event, self, home)
-            else:
-                fresh = True  # Native queue/deferred replay retains its admitted turn.
-            setattr(event, "_outbox_turn_id", turn_id)
-            setattr(event, "_outbox_home", home)
-            setattr(event, "_outbox_duplicate", not fresh)
-            if not fresh:
-                logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
-            else:
-                bind_turn(home, turn_id)
-        # A restore-queued event keeps its owned placeholder until it reaches
-        # this admission boundary, rather than losing it when a task is spawned.
-        if getattr(event, "_owned_local_pending", None) is not None:
-            event._owned_local_pending = None
+        await _admit_outbox_event(self, event, source)
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:

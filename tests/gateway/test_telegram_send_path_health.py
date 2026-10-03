@@ -179,7 +179,7 @@ def test_mid_session_polling_death_publishes_retrying_while_running():
     adapter._polling_error_task = None
 
     class _Loop:
-        def create_task(self, coro):
+        def create_task(self, coro, **kwargs):
             coro.close()
             return MagicMock(done=lambda: False)
 
@@ -202,7 +202,7 @@ def test_polling_death_before_connect_does_not_publish():
     adapter._polling_error_task = None
 
     class _Loop:
-        def create_task(self, coro):
+        def create_task(self, coro, **kwargs):
             coro.close()
             return MagicMock(done=lambda: False)
 
