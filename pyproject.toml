@@ -218,6 +218,22 @@ dependencies = [
   "nemo-relay>=0.9,<0.10; ((sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')) and python_version >= '3.14'",]
 
 [project.optional-dependencies]
+documents = [
+  "python-docx==1.2.0; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "python-pptx==1.0.2; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "openpyxl==3.1.5; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "pypdf==6.19.0; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "pdfplumber==0.11.10; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "pypdfium2==5.13.0; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "lxml==6.1.2; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "pandas==3.0.5; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "matplotlib==3.11.2; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "beautifulsoup4==4.15.0; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "fonttools==4.65.0; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "playwright==1.62.0; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "pymupdf==1.27.2.3; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "reportlab==5.0.1; sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+]
 hindsight-embedded = ["hindsight-all>=0.6.1,<1"]
 hindsight = ["hindsight-client>=0.6.1,<1"]
 # High-performance event loop — uvloop replaces the stdlib asyncio loop with
@@ -580,8 +596,10 @@ hermes-acp = "acp_adapter.entry:main"
 # Extras that only an explicit selection installs (setup, sync_venv). Bundles
 # build with --all-extras and pass --no-extra for each of these, so their
 # closures never ship. KittenTTS pulls torch, transformers and spaCy through
-# misaki[en]: installed when the user picks it, not preinstalled.
-opt-in-extras = ["kittentts"]
+# misaki[en]: installed when the user picks it, not preinstalled. The
+# documents extra (Playwright, PyMuPDF, pandas, matplotlib) serves document
+# skills on hosts that select it and must not ship in every bundle.
+opt-in-extras = ["kittentts", "documents"]
 
 # Per-extra platform gates (settled 2026-09-02): an extra listed here is
 # only installable on platforms matching the marker. pm consults this
@@ -598,6 +616,10 @@ matrix = "sys_platform == 'linux'"
 google-chat = "platform_machine != 'ARM64' or sys_platform != 'win32'"
 # qdrant-client → grpcio (via mem0ai) has no win_arm64 wheel.
 mem0 = "platform_machine != 'ARM64' or sys_platform != 'win32'"
+# pymupdf has no win_arm64 or android wheel (sdist builds MuPDF from C). Termux
+# reports sys_platform 'linux' on a Bionic libc that no manylinux wheel fits,
+# so the Android kernel release guard used for nemo-relay applies too.
+documents = "sys_platform != 'android' and 'android' not in platform_release and (platform_machine != 'ARM64' or sys_platform != 'win32')"
 # Match the engine dependency markers so PM refuses an unsupported install.
 wake-openwakeword = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or sys_platform != 'darwin')"
 # faster-whisper's closure is prebuilt-only: ctranslate2 has no win_arm64 wheel and onnxruntime
@@ -710,6 +732,7 @@ alibabacloud-dingtalk = false
 anthropic = false
 asyncpg = false
 azure-identity = false
+beautifulsoup4 = false
 boto3 = false
 brotlicffi = false
 browser-harness = false
@@ -732,6 +755,7 @@ faster-whisper = false
 fire = false
 firecrawl-anydoc = false
 firecrawl-py = false
+fonttools = false
 google-api-python-client = false
 google-auth = false
 google-auth-httplib2 = false
@@ -746,7 +770,9 @@ huggingface_hub = false
 jinja2 = false
 langfuse = "2026-09-09T16:01:26Z"
 lark-oapi = false
+lxml = false
 markdown = false
+matplotlib = false
 maturin = false
 mautrix = false
 mcp = false
@@ -758,11 +784,14 @@ nemo-relay = false
 neutts = "2026-07-22T14:54:23Z"
 numpy = false
 openai = false
+openpyxl = false
 opentelemetry-exporter-otlp-proto-http = false
 opentelemetry-sdk = false
 packaging = false
+pandas = false
 parallel-web = false
 pathspec = false
+pdfplumber = false
 pillow = false
 playwright = false
 piper-tts = "2026-09-04T16:47:32Z"
@@ -772,11 +801,17 @@ pvporcupine = false
 pyasn1 = false
 pydantic = false
 pyjwt = false
+pymupdf = false
+pypdf = false
+pypdfium2 = false
 pytest = false
 pytest-asyncio = false
+python-docx = false
 python-dotenv = false
 python-multipart = false
 python-olm = false
+python-pptx = false
+reportlab = false
 python-telegram-bot = false
 pyyaml = false
 qrcode = false
