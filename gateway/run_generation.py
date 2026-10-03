@@ -262,19 +262,39 @@ async def start_active_generation(config, *, claimed_generation=None) -> "Active
 def _bootout_retired_generation(label: str) -> bool:
     from hermes_cli.gateway_guardian import _gateway_domain, _launch_state
     import subprocess
+    budget = deadline_remaining()
+    timeout = 10 if budget is None else min(10.0, budget)
+    if timeout <= 0:
+        raise TimeoutError("gateway deadline exceeded")
     domain = _gateway_domain(label, None)
-    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=10)
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=timeout)
+    gateway_deadline.check()
     return _launch_state(domain, label) == "unloaded"
 
 
+# Cold activation is part of startup; it shares the startup bound
+# (hermes_cli.gateway_forward_update.STARTUP_SECONDS, asserted equal in tests).
+COLD_ACTIVATION_SECONDS = 45
+
+
 def _activate_cold_generation(coordinator, identity):
-    lease = next((row for row in coordinator.leases() if row['resource'] == 'active_generation'), None)
-    if lease is None:
-        epoch = coordinator.acquire_lease('active_generation', identity.id, deadline=None)
-        coordinator.transition_state(identity.id, 'standby', 'serving')
-        return epoch
-    return coordinator.takeover_dead_generation('active_generation', lease['generation_id'], identity.id,
-        bootout=lambda label: True if label == identity.label else _bootout_retired_generation(label), deadline=None)
+    """Acquire or take over the active lease within a concrete startup bound.
+
+    An enclosing scope (the guardian's or the standby's) wins when it is
+    earlier; otherwise the bound is COLD_ACTIVATION_SECONDS from now.
+    """
+    deadline = gateway_deadline.current()
+    own = gateway_deadline.now() + COLD_ACTIVATION_SECONDS
+    deadline = own if deadline is None else min(deadline, own)
+    with deadline_scope(deadline):
+        lease = next((row for row in coordinator.leases() if row['resource'] == 'active_generation'), None)
+        if lease is None:
+            epoch = coordinator.acquire_lease('active_generation', identity.id, deadline=deadline)
+            coordinator.transition_state(identity.id, 'standby', 'serving')
+            return epoch
+        return coordinator.takeover_dead_generation('active_generation', lease['generation_id'], identity.id,
+            bootout=lambda label: True if label == identity.label else _bootout_retired_generation(label),
+            deadline=deadline)
 
 
 def claim_active_generation(*, forward_only: bool = True) -> tuple[GenerationCoordinator, GenerationIdentity]:
@@ -1026,8 +1046,7 @@ async def serve_standby_generation(config=None, *, claimed_generation=None) -> b
         holder = next((row for row in coordinator.generations() if lease and row['id'] == lease['generation_id']), None)
         if lease is None or (holder and (coordinator._owner_is_dead(holder) or
                 (lease['state'] == 'released' and holder['state'] == 'exited' and holder['verdict'] is None))):
-            with deadline_scope(deadline_remaining()):
-                epoch = _activate_cold_generation(coordinator, identity)
+            epoch = _activate_cold_generation(coordinator, identity)
             from gateway.run import start_gateway
             return await start_gateway(config, promoted_generation=(identity, epoch))
         logger.info('Standby waiting for cooperative handover: holder is live or identity unknown')

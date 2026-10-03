@@ -981,3 +981,35 @@ def _coordinator_boot_identity(monkeypatch):
     # Unit transactions use a stable supplied boot identity. Native process
     # and launchd suites continue to probe the actual host.
     monkeypatch.setattr("gateway.generation._boot_id", lambda: "unit-test-boot")
+
+
+def test_cold_activation_honours_an_expired_enclosing_deadline(tmp_path):
+    from gateway import deadline as gd
+    from gateway.run_generation import _activate_cold_generation
+    db = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    db.register(identity, state="standby")
+    with gd.deadline_scope(gd.now() - 1):
+        with pytest.raises(TimeoutError):
+            _activate_cold_generation(db, identity)
+    assert not [row for row in db.leases() if row["resource"] == "active_generation"
+                and row["generation_id"] == identity.id and row["state"] == "active"]
+
+
+def test_cold_activation_without_scope_gets_a_concrete_bound(tmp_path, monkeypatch):
+    from gateway import deadline as gd
+    from gateway import run_generation
+    db = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    db.register(identity, state="standby")
+    seen = {}
+    acquire = db.acquire_lease
+    def spy(*args, **kwargs):
+        seen["deadline"] = kwargs.get("deadline")
+        seen["scope"] = gd.current()
+        return acquire(*args, **kwargs)
+    monkeypatch.setattr(db, "acquire_lease", spy)
+    assert gd.current() is None
+    run_generation._activate_cold_generation(db, identity)
+    assert seen["deadline"] is not None and seen["scope"] == seen["deadline"]
+    assert seen["deadline"] <= gd.now() + run_generation.COLD_ACTIVATION_SECONDS

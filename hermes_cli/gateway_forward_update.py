@@ -1360,9 +1360,13 @@ def promote_forward(home, candidate, sha, *, supervisor=None):
             # The rollback budget also starts at commit. The successor's proof
             # window leaves A' STARTUP_SECONDS to start, take over and poll.
             commit = record['commit_clock']
-            proof = _poller(db, successor, supervisor, deadline=min(
-                commit + ROLLBACK_SECONDS, max(commit + POLL_PROOF_SECONDS, _now() + POLL_SECONDS)))
-            result = _flip(home, db, successor, proof, supervisor, record=record)
+            proof_deadline = min(
+                commit + ROLLBACK_SECONDS, max(commit + POLL_PROOF_SECONDS, _now() + POLL_SECONDS))
+            proof = _poller(db, successor, supervisor, deadline=proof_deadline)
+            # The pointer flip is irreversible: bounded by the proof window while a
+            # full reserve fits, else by the named reserve. Never unbounded.
+            with _flip_scope(home, record, proof_deadline, rollback=False):
+                result = _flip(home, db, successor, proof, supervisor, record=record)
             return _finish(home, record, 'success', poller=proof, epoch=proof['epoch'],
                            promotion_seconds=_now() - started, **result)
         except Exception as exc:

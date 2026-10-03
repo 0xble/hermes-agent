@@ -323,3 +323,41 @@ def test_detached_context_clears_only_the_deadline():
         assert ctx.run(marker.get) == "generation-7"
     finally:
         marker.reset(token)
+
+
+def test_cold_activation_shares_the_startup_bound():
+    from gateway import run_generation
+    from hermes_cli import gateway_forward_update
+    assert run_generation.COLD_ACTIVATION_SECONDS == gateway_forward_update.STARTUP_SECONDS
+
+
+def test_cold_activation_and_promote_flip_are_bounded():
+    """No irreversible lease CAS or pointer flip may pass deadline=None or run outside a scope."""
+    rg = ast.parse((ROOT / "gateway" / "run_generation.py").read_text(encoding="utf-8"))
+    for node in ast.walk(rg):
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) in {"acquire_lease", "takeover_dead_generation"}:
+            for keyword in node.keywords:
+                if keyword.arg == "deadline":
+                    assert not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None), node.lineno
+    fu = ast.parse((ROOT / "hermes_cli" / "gateway_forward_update.py").read_text(encoding="utf-8"))
+    parents = {}
+    for node in ast.walk(fu):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    unscoped = []
+    for node in ast.walk(fu):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_flip":
+            cur, scoped = node, False
+            while cur in parents:
+                cur = parents[cur]
+                if isinstance(cur, ast.With) and any(
+                        isinstance(item.context_expr, ast.Call)
+                        and getattr(item.context_expr.func, "id", None) in {"_flip_scope", "deadline_scope"}
+                        for item in cur.items):
+                    scoped = True
+                    break
+                if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    break
+            if not scoped:
+                unscoped.append(node.lineno)
+    assert not unscoped, f"_flip called outside a deadline scope at lines {unscoped}"
