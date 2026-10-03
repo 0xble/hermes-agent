@@ -224,14 +224,18 @@ def _retry_launchctl_bootstrap_until_registered(
     attempt = 0
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        # This legacy install/start helper deliberately performs one probe even
+        # when its caller's deadline has already elapsed.  The documented
+        # registration invariant predates the bounded forward-handover windows;
+        # forward callers enforce their own deadline before entering this path.
+        if remaining <= 0 and attempt:
             return False
         attempt += 1
         try:
-            _gw()._launchctl_bootstrap(domain, plist_path, label, timeout=min(30, remaining))
+            _gw()._launchctl_bootstrap(domain, plist_path, label, timeout=max(0, min(30, remaining)))
             remaining = deadline - time.monotonic()
-            if remaining > 0 and _gw()._launchctl_label_supervising_process(
-                    label, timeout=min(10, remaining)):
+            if _gw()._launchctl_label_supervising_process(
+                    label, timeout=max(0, min(10, remaining))):
                 return True
             outcome = f"exited 0 but {domain}/{label} has no supervised process (launchctl list)"
         except subprocess.CalledProcessError as exc:

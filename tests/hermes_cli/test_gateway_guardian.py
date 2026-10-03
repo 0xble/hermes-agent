@@ -259,7 +259,7 @@ def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
         "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
         "updated_at": "2020-01-01T00:00:00+00:00",
     }), encoding="utf-8")
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: os.getpid())
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **kwargs: os.getpid())
     monkeypatch.setattr(psutil.Process, "cwd", lambda self: str(b))
     assert not guardian.healthy(home, label, b)
 
@@ -320,7 +320,7 @@ def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeyp
     calls = []
     from hermes_cli import gateway_launchd
     import psutil
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: 123)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **kwargs: 123)
     class Previous:
         def __init__(self, pid):
             assert pid == 123

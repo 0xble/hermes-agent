@@ -30,7 +30,7 @@ import pytest
 
 SIGKILL = getattr(signal, 'SIGKILL', signal.SIGTERM)
 
-pytestmark = [pytest.mark.integration, pytest.mark.macos_only,
+pytestmark = [pytest.mark.integration, pytest.mark.platforms("macos"),
               pytest.mark.skipif(sys.platform != 'darwin', reason='requires native launchd'),
               pytest.mark.live_system_guard_bypass]
 

@@ -117,7 +117,7 @@ def test_health_probe_uses_injected_launchctl(tmp_path, monkeypatch):
     assert calls == [['launchctl', 'list', 'ai.hermes.gateway']]
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_parked_repair_waits_for_documented_startup_budget(tmp_path, monkeypatch):
     monkeypatch.setattr('gateway.generation._boot_id', lambda: 'boot')
     home, release = layout(tmp_path)

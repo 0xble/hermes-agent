@@ -510,7 +510,7 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
             raise subprocess.CalledProcessError(1, args)
         return subprocess.CompletedProcess(args, 0)
     monkeypatch.setattr(gateway_launchd.subprocess, "run", submit)
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _: None)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: None)
     def reload():
         submitted = gateway_launchd._spawn_deferred_launchd_reload(
             domain=f"gui/{os.getuid()}", label=plist.stem,
@@ -673,7 +673,7 @@ def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong)
     home, _, plist, _, b, _, _, intended = _fixture(tmp_path, "promote")
     assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
                                      reload_callback=lambda: "deferred")["reload_pending"]
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _: 31415)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: 31415)
     gateway = SimpleNamespace(
         pid=31416 if wrong == "pid" else 31415,
         cmdline=lambda: (["python", "-m", "hermes_cli.stderr_timestamp", "--", "python",
