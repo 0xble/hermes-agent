@@ -50,8 +50,10 @@ async def test_transfer_drain_uses_a_clean_context_after_request_deadline(tmp_pa
         await asyncio.sleep(0.55)
         _, nonce, _ = active._pending_transfer
         active._pending_transfer = (new.id, nonce, time.monotonic() - 1)
-        for _ in range(20):
-            if adapter.resumed:
+        # Re-arm resumes the adapter, then re-checks ownership before it clears
+        # the pending transfer; wait for both rather than racing the second await.
+        for _ in range(40):
+            if adapter.resumed and active._pending_transfer is None:
                 break
             await asyncio.sleep(0.05)
         assert adapter.resumed

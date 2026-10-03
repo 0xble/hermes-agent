@@ -813,7 +813,12 @@ def _observe_rollback_reply(home, db, row, proof, record):
     rollback['reply_observed'] = False
     late_reply = False
     while _now() < deadline:
-        reply = _fresh_reply(home, row, proof['epoch'], after, proof['tokens'])
+        try:
+            with deadline_scope(deadline, inherit=False):
+                reply = _fresh_reply(home, row, proof['epoch'], after, proof['tokens'])
+        except TimeoutError:
+            # The observation window closed mid-read: a missed bound, not a failure.
+            break
         observed = _now()
         if reply:
             if observed > deadline:
@@ -1065,8 +1070,11 @@ def _rollback_bounded(home, db, failed, previous, supervisor, record, *, late=Fa
             record['alert'] = True
         record['rollback'] = rollback
         _save(home, record)
-        if same_boot:
-            _observe_rollback_reply(home, db, fresh, proof, record)
+    if same_boot:
+        # The reply window is its own named bound (ROLLBACK_SECONDS), not the
+        # short abort reserve that covers the flip and its bookkeeping.
+        _observe_rollback_reply(home, db, fresh, proof, record)
+    with deadline_scope(_now() + HANDOVER_ABORT_RESERVE, inherit=False):
         return _finish(home, record, 'rolled_back', **result)
 
 
