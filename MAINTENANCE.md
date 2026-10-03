@@ -6,7 +6,7 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.24 + qualified checkpoint`, `eb8d21f482142c236550762ebdb5df4004c39696`.
+`upstream-live/main reconciliation cutoff`, `a510d6c64a61582688133b5f54c8191e190a1f49`.
 Brian authorized a newer stable pre-tip checkpoint on 2026-09-30 for one
 sync and personal-runtime promotion. This selected checkpoint retains prior
 `ca6782850432927f33df4775cb6dd45bb51460d2` and released baseline
