@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import plistlib
 import subprocess
+import time
 import uuid
 
 
@@ -53,6 +54,13 @@ def render_generation_launchd_plist(*, slot: str, release_sha: str, release_root
 def bootstrap_generation_plist(*, domain: str, plist_path: Path, label: str,
                                runner=None, timeout: float = 30, before_launch=None) -> None:
     """Bootstrap once; never bootout an existing generation on an EIO collision."""
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    command = ["launchctl", "bootstrap", domain, str(plist_path)]
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return value
     payload = plistlib.loads(Path(plist_path).read_bytes())
     from gateway.generation import forward_only_handover_enabled
     from hermes_cli.config_effective import load_user_config_effective
@@ -74,10 +82,14 @@ def bootstrap_generation_plist(*, domain: str, plist_path: Path, label: str,
     elif label not in {"ai.hermes.gateway-a", "ai.hermes.gateway-b"}:
         raise ValueError("only reserved generation labels may be bootstrapped")
     refresh_generation_scope(plist_path)
+    remaining()
     if before_launch is not None:
         before_launch(plistlib.loads(Path(plist_path).read_bytes())['EnvironmentVariables']['HERMES_GENERATION_SCOPE'])
-    (runner or subprocess.run)(["launchctl", "bootstrap", domain, str(plist_path)],
-                               check=True, timeout=min(30, timeout))
+    remaining_time = remaining()
+    (runner or subprocess.run)(command,
+                               check=True, timeout=min(30, remaining_time))
+    if time.monotonic() >= deadline:
+        raise subprocess.TimeoutExpired(command, timeout)
 
 
 def refresh_generation_scope(plist_path: Path) -> None:

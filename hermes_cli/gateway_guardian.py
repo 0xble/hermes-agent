@@ -118,9 +118,30 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
     return "none", None
 
 
-def healthy(home: Path, label: str, expected: Path, runner=None) -> bool:
-    from gateway.status import read_runtime_status, runtime_status_is_stale
+def _remaining(deadline: float, cap: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("guardian repair deadline exceeded")
+    return min(cap, remaining)
+
+
+def _supervised_pid(label: str, *, runner=None, timeout: float = 10) -> int | None:
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
+    try:
+        if runner is None:
+            return _launchctl_supervised_pid(label, timeout=timeout)
+        return _launchctl_supervised_pid(label, runner=runner, timeout=timeout)
+    except TypeError as exc:
+        # Keep older injected test doubles source-compatible; the production helper
+        # accepts the deadline-bound timeout above.
+        if "timeout" not in str(exc):
+            raise
+        return (_launchctl_supervised_pid(label) if runner is None else
+                _launchctl_supervised_pid(label, runner=runner))
+
+
+def healthy(home: Path, label: str, expected: Path, runner=None, deadline: float | None = None) -> bool:
+    from gateway.status import read_runtime_status, runtime_status_is_stale
     import psutil
     state = read_runtime_status(home / "gateway_state.json") or {}
     pid = state.get("pid")
@@ -128,15 +149,25 @@ def healthy(home: Path, label: str, expected: Path, runner=None) -> bool:
         return False
     if state.get("code_sha") != expected.name or runtime_status_is_stale(state):
         return False
-    supervised = (_launchctl_supervised_pid(label) if runner is None else
-                  _launchctl_supervised_pid(label, runner=runner))
+    try:
+        timeout = _remaining(deadline, 10) if deadline is not None else 10
+        supervised = _supervised_pid(label, runner=runner, timeout=timeout)
+    except RuntimeError:
+        return False
     if supervised is None:
+        return False
+    if deadline is not None and time.monotonic() >= deadline:
         return False
     try:
         process = psutil.Process(pid)
-        return (process.is_running() and
-                (supervised == pid or supervised in {p.pid for p in process.parents()}) and
-                process.cwd() == str(expected))
+        running = process.is_running()
+        parents = {p.pid for p in process.parents()}
+        cwd = process.cwd()
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        return (running and
+                (supervised == pid or supervised in parents) and
+                cwd == str(expected))
     except (psutil.Error, OSError):
         return False
 
@@ -175,32 +206,41 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         body = plistlib.dumps(definition)
     domain = domain or (_domain(label) if launchctl_runner is None else
                         _gateway_domain(label, None, runner=launchctl_runner))
+    reload_deadline = time.monotonic() + STARTUP_SECONDS
     def reload_target():
         import psutil
-        from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
-        old_pid = (_launchctl_supervised_pid(label) if launchctl_runner is None else
-                   _launchctl_supervised_pid(label, runner=launchctl_runner))
-        (launchctl_runner or subprocess.run)(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
+        from hermes_cli.gateway_launchd import _launchctl_bootstrap
+        old_pid = _supervised_pid(label, runner=launchctl_runner,
+                                  timeout=_remaining(reload_deadline, 10))
+        (launchctl_runner or subprocess.run)(["launchctl", "bootout", f"{domain}/{label}"],
+                                             capture_output=True,
+                                             timeout=_remaining(reload_deadline, 15))
         if old_pid is not None:
             try:
-                psutil.Process(old_pid).wait(timeout=30)
+                psutil.Process(old_pid).wait(timeout=_remaining(reload_deadline, 30))
             except psutil.NoSuchProcess:
                 pass
         if launchctl_runner is None:
-            _launchctl_bootstrap(domain, plist, label, timeout=30)
+            _launchctl_bootstrap(domain, plist, label, timeout=_remaining(reload_deadline, 30))
         else:
-            _launchctl_bootstrap(domain, plist, label, timeout=30, runner=launchctl_runner)
+            _launchctl_bootstrap(domain, plist, label, timeout=_remaining(reload_deadline, 30), runner=launchctl_runner)
+        if time.monotonic() >= reload_deadline:
+            raise RuntimeError("guardian rollback deadline exceeded")
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
     if result.get("reload_pending"):
         # The S2 acknowledgement may arrive after this one-shot invocation; live
         # process identity below is the independent health proof for this action.
-        wait_for_release_acknowledgement(home, timeout_seconds=5)
-    deadline = time.monotonic() + 12
-    while time.monotonic() < deadline:
-        if healthy(home, label, old, launchctl_runner):
-            return True
-        time.sleep(.25)
+        wait_for_release_acknowledgement(home, timeout_seconds=_remaining(reload_deadline, 5))
+    health_deadline = time.monotonic() + 12
+    while time.monotonic() < health_deadline:
+        if healthy(home, label, old, launchctl_runner, health_deadline):
+            if time.monotonic() < health_deadline:
+                return True
+            break
+        if time.monotonic() >= health_deadline:
+            break
+        time.sleep(min(.25, _remaining(health_deadline, .25)))
     return False
 
 
@@ -289,13 +329,21 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             return "waiting"
         from hermes_cli.gateway_launchd_generation import refresh_generation_scope
         refresh_generation_scope(plist)
-    launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
     deadline = time.monotonic() + STARTUP_SECONDS
+    launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
+              timeout=_remaining(deadline, 10))
     while time.monotonic() < deadline:
-        if _launch_state(domain, label, runner=launchctl_runner) in {"loaded", "parked"} and healthy(home, label, current, launchctl_runner):
-            receipt(home, "bootstrap", "repaired", label=label, release=str(current))
-            return "repaired"
-        time.sleep(.25)
+        state = _launch_state(domain, label, runner=launchctl_runner,
+                              timeout=_remaining(deadline, 5))
+        if state in {"loaded", "parked"} and healthy(home, label, current, launchctl_runner, deadline):
+            if time.monotonic() < deadline:
+                receipt(home, "bootstrap", "repaired", label=label, release=str(current))
+                return "repaired"
+            break
+        if time.monotonic() >= deadline:
+            break
+        _sleep = min(.25, _remaining(deadline, .25))
+        time.sleep(_sleep)
     receipt(home, "bootstrap", "failed", label=label, reason="gateway not healthy after bootstrap")
     return "failed"
 
@@ -315,20 +363,28 @@ def _repair_parked(home, plist, label, domain, current, launchctl):
         if coordinator.prepare_parked_repair(label) != "repair":
             return "waiting"
         receipt(home, "bootstrap", "attempt", label=label)
-    launchctl(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=10)
-    if _launch_state(domain, label, runner=launchctl) != "unloaded":
+    deadline = time.monotonic() + STARTUP_SECONDS
+    launchctl(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
+              timeout=_remaining(deadline, 10))
+    if _launch_state(domain, label, runner=launchctl, timeout=_remaining(deadline, 5)) != "unloaded":
         raise RuntimeError("parked label bootout did not read back unloaded")
     if action == "cleanup":
         receipt(home, "bootout", "cleaned", label=label)
         return "cleaned"
     refresh_generation_scope(plist)
-    launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
-    deadline = time.monotonic() + STARTUP_SECONDS
+    launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
+              timeout=_remaining(deadline, 10))
     while time.monotonic() < deadline:
-        if _launch_state(domain, label, runner=launchctl) == "loaded" and healthy(home, label, current, launchctl):
-            receipt(home, "bootstrap", "repaired", label=label, release=str(current))
-            return "repaired"
-        time.sleep(.25)
+        state = _launch_state(domain, label, runner=launchctl, timeout=_remaining(deadline, 5))
+        if state == "loaded" and healthy(home, label, current, launchctl, deadline):
+            if time.monotonic() < deadline:
+                receipt(home, "bootstrap", "repaired", label=label, release=str(current))
+                return "repaired"
+            break
+        if time.monotonic() >= deadline:
+            break
+        _sleep = min(.25, _remaining(deadline, .25))
+        time.sleep(_sleep)
     receipt(home, "bootstrap", "failed", label=label, reason="gateway not healthy after bootstrap")
     return "failed"
 

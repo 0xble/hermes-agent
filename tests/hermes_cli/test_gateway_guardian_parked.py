@@ -140,3 +140,79 @@ def test_parked_repair_waits_for_documented_startup_budget(tmp_path, monkeypatch
 
     assert guardian.run_once(home, plist, label, grace=12,
                             domain=f'gui/{os.getuid()}', launchctl_runner=runner) == 'repaired'
+
+
+def test_bootstrap_repair_rejects_healthy_result_after_deadline(tmp_path, monkeypatch):
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'boot')
+    home, release = layout(tmp_path)
+    label = 'ai.hermes.gateway'
+    db = GenerationCoordinator(home)
+    old = GenerationIdentity.create(release_sha=release.name, label=label, pid=123,
+        start_fingerprint='123:1', boot_id='boot')
+    db.register(old, state='serving')
+    db.acquire_lease('active_generation', old.id)
+    monkeypatch.setattr('gateway.status._pid_exists', lambda pid: False)
+    monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: 1)
+    plist = tmp_path / 'service.plist'
+    plist.write_bytes(plistlib.dumps({'Label': label, 'WorkingDirectory': str(release),
+        'EnvironmentVariables': {'HERMES_HOME': str(home), 'HERMES_GENERATION_SCOPE': 'old'}}))
+    runner, calls, state = fake_launchctl(label, plist, home)
+    state['loaded'] = False
+    timeouts = []
+    real_launch_state = guardian._launch_state
+    def bounded_launch_state(*args, **kwargs):
+        if 'timeout' in kwargs:
+            timeouts.append(kwargs['timeout'])
+        return real_launch_state(*args, **kwargs)
+    monkeypatch.setattr(guardian, '_launch_state', bounded_launch_state)
+    clock = [0.0]
+    monkeypatch.setattr(guardian.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(guardian.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def late_healthy(*args):
+        clock[0] = guardian.STARTUP_SECONDS + .1
+        return True
+
+    monkeypatch.setattr(guardian, 'healthy', late_healthy)
+    outcome = guardian.run_once(home, plist, label, grace=12,
+                               domain=f'gui/{os.getuid()}', launchctl_runner=runner)
+    assert outcome == 'failed'
+    assert timeouts and all(0 < timeout <= guardian.STARTUP_SECONDS for timeout in timeouts)
+    assert any(row[0] == 'print' for row in calls)
+
+
+def test_parked_repair_passes_remaining_timeout_and_rejects_late_health(tmp_path, monkeypatch):
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'boot')
+    home, release = layout(tmp_path)
+    label = 'ai.hermes.gateway'
+    db = GenerationCoordinator(home)
+    old = GenerationIdentity.create(release_sha=release.name, label=label, pid=123,
+        start_fingerprint='123:1', boot_id='boot')
+    db.register(old, state='serving')
+    db.acquire_lease('active_generation', old.id)
+    monkeypatch.setattr('gateway.status._pid_exists', lambda pid: False)
+    monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: 1)
+    plist = tmp_path / 'service.plist'
+    plist.write_bytes(plistlib.dumps({'Label': label, 'WorkingDirectory': str(release),
+        'EnvironmentVariables': {'HERMES_HOME': str(home), 'HERMES_GENERATION_SCOPE': 'old'}}))
+    runner, calls, _state = fake_launchctl(label, plist, home)
+    timeouts = []
+    real_launch_state = guardian._launch_state
+    def bounded_launch_state(*args, **kwargs):
+        if 'timeout' in kwargs:
+            timeouts.append(kwargs['timeout'])
+        return real_launch_state(*args, **kwargs)
+    monkeypatch.setattr(guardian, '_launch_state', bounded_launch_state)
+    clock = [0.0]
+    monkeypatch.setattr(guardian.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(guardian.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def late_healthy(*args):
+        clock[0] = guardian.STARTUP_SECONDS + .1
+        return True
+
+    monkeypatch.setattr(guardian, 'healthy', late_healthy)
+    outcome = guardian._repair_parked(home, plist, label, f'gui/{os.getuid()}', release, runner)
+    assert outcome == 'failed'
+    assert timeouts and all(0 < timeout <= guardian.STARTUP_SECONDS for timeout in timeouts)
+    assert any(argv[0] == 'print' for argv in calls)

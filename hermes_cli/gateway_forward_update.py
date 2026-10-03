@@ -269,6 +269,7 @@ class GenerationSupervisor:
         if _launch_state(domain, row['label'], runner=self.runner,
                          timeout=_remaining(deadline, 5)) != 'unloaded':
             raise RuntimeError('generation label was already loaded before bootstrap')
+        _deadline_check(deadline)
         # launchd retains the loaded definition. It needs crash respawn when this
         # standby becomes holder, but SuccessfulExit implies RunAtLoad at login
         # (launchd.plist(5)). Bootstrap that definition outside LaunchAgents.
@@ -299,10 +300,13 @@ class GenerationSupervisor:
         result = self.runner(['launchctl', 'print', f"{self._domain(row['label'])}/{row['label']}"],
                              capture_output=True, text=True, encoding='utf-8',
                              timeout=_remaining(deadline, 5))
+        _deadline_check(deadline)
         if result.returncode != 0:
             from hermes_cli.gateway_guardian import _launch_state
-            if _launch_state(self._domain(row['label']), row['label'], runner=self.runner,
-                             timeout=_remaining(deadline, 5)) == 'unloaded':
+            state = _launch_state(self._domain(row['label']), row['label'], runner=self.runner,
+                                  timeout=_remaining(deadline, 5))
+            _deadline_check(deadline)
+            if state == 'unloaded':
                 return 'unloaded'
             raise RuntimeError('cannot establish interrupted bootstrap ownership')
         def value(name):
@@ -350,6 +354,8 @@ class GenerationSupervisor:
     def ready(self, row, *, deadline=None):
         if row['pid'] is None or not _live(row) or row['verdict'] is not None:
             return False
+        if deadline is not None and _now() >= deadline:
+            return False
         # This generation-scoped record is published only AFTER the startup gate.
         path = generation_paths(self.home, _identity(row))['state']
         try:
@@ -370,11 +376,18 @@ class GenerationSupervisor:
             if deadline is not None and _now() >= deadline:
                 return False
             return status.get('polling') is True and status.get('healthy') is True and bool(status.get('tokens'))
+        if deadline is not None and _now() >= deadline:
+            return False
         return True
 
     def request(self, row, verb, *, params=None, timeout=2):
         return _generation_request(generation_paths(self.home, _identity(row))['socket'],
                                    verb, params=params, timeout=timeout)
+
+
+def _deadline_check(deadline):
+    if _now() >= deadline:
+        raise RuntimeError('forward update deadline exceeded')
 
 
 def _remaining(deadline, cap):
@@ -387,9 +400,11 @@ def _remaining(deadline, cap):
 def _wait_ready(db, generation_id, supervisor, deadline):
     while True:
         row = _row(db, generation_id)
+        _deadline_check(deadline)
         if row['verdict'] is not None or row['state'] == 'exited':
             raise RuntimeError('standby failed its startup gate')
         if supervisor.ready(row, deadline=deadline):
+            _deadline_check(deadline)
             return row
         _sleep(min(.2, _remaining(deadline, .2)))
 
@@ -413,13 +428,23 @@ def _frozen_transfer_tokens(db, row, lease):
 
 def _poller(db, row, supervisor, deadline):
     last_failure = ''
+    clock_error = False
     while True:
+        try:
+            _deadline_check(deadline)
+        except RuntimeError as exc:
+            if last_failure:
+                raise RuntimeError(f'{exc}; last poller failure: {last_failure}') from exc
+            raise
         current = _row(db, row['id'])
+        _deadline_check(deadline)
         lease = _lease(db)
+        _deadline_check(deadline)
         if lease['generation_id'] != row['id'] or lease['state'] != 'active' or current['state'] != 'serving':
             raise RuntimeError('poller proof owner changed')
         if db._owner_is_dead(current):
             raise RuntimeError('successor died')
+        _deadline_check(deadline)
         def budget(cap):
             try:
                 return _remaining(deadline, cap)
@@ -430,6 +455,12 @@ def _poller(db, row, supervisor, deadline):
         wait = budget(2)
         try:
             proof = supervisor.request(current, 'polling_status', timeout=wait)
+            try:
+                _deadline_check(deadline)
+            except OSError:
+                # A transient clock read failure is not evidence that the proof was
+                # late; let recovery reconcile durable pointer state first.
+                clock_error = True
             if (proof.get('generation_id'), proof.get('release_sha'), proof.get('epoch'),
                     proof.get('polling'), proof.get('healthy')) == (
                     current['id'], current['release_sha'], lease['epoch'], True, True):
@@ -441,6 +472,7 @@ def _poller(db, row, supervisor, deadline):
                     raise RuntimeError('successor reported an invalid polling roster')
                 actual_tokens = set(tokens)
                 expected_tokens = _frozen_transfer_tokens(db, current, lease)
+                _deadline_check(deadline)
                 if expected_tokens is None:
                     expected_tokens = actual_tokens
                 if not expected_tokens:
@@ -452,14 +484,20 @@ def _poller(db, row, supervisor, deadline):
                 # Socket answers alone never authorize a pointer flip under a stale lease.
                 if _lease(db) != lease or not _live(current):
                     raise RuntimeError('poller identity changed during observation')
+                _deadline_check(deadline)
                 starts = {event['token_hash']: event['wall_at'] for event in db.poller_journal()
                           if event['generation_id'] == row['id'] and event['epoch'] == lease['epoch']
                           and event['event'] == 'poller_started' and event['token_hash'] in expected_tokens}
+                _deadline_check(deadline)
                 missing = expected_tokens - starts.keys()
                 if missing:
                     raise RuntimeError('successor lacks durable poller starts for: ' + ', '.join(sorted(missing)))
                 proof['poller_started_at'] = max(starts.values())
                 proof.update(pid=current['pid'], label=current['label'])
+                if clock_error:
+                    proof['_deadline_clock_error'] = True
+                else:
+                    _deadline_check(deadline)
                 return proof
         except RuntimeError as exc:
             proof, last_failure = {}, str(exc)
@@ -599,11 +637,14 @@ def _resume_launch(db, release, supervisor, record, key, deadline):
         _remaining(deadline, STARTUP_SECONDS)
         db.reserve_generation(generation_id=generation_id, label=label, release_sha=release.name,
                               started_at=info['reservation_at'])
+        _deadline_check(deadline)
     elif (row['started_at'], row['label'], row['release_sha']) != (info['reservation_at'], label, release.name):
         raise RuntimeError('reservation identity changed')
     info['reserved'] = True
     _save(db.home, record)
+    _deadline_check(deadline)
     row = _row(db, generation_id)
+    _deadline_check(deadline)
     launch_needed = not info.get('bootstrap_scope')
     if row['pid'] is None and row['state'] == 'standby' and not launch_needed:
         state = supervisor.bootstrap_state(row, info['bootstrap_scope'],
@@ -1088,6 +1129,9 @@ def recover_forward(home, *, supervisor=None):
                 # forward marker was saved. Reconcile that commit before any
                 # clock, reservation cleanup, inventory or receipt can fail.
                 _observe_pointer_commit(home, record, row, proof)
+                if proof.pop('_deadline_clock_error', False):
+                    return _finish(home, record, 'blocked', failure='deadline clock unavailable',
+                                   recovered=True, alert=True)
                 serving_clock = _now()
                 rollback_owner = new != record.get('successor')
                 if not rollback_owner and record.get('rollback_generation'):

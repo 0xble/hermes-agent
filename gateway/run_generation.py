@@ -53,7 +53,9 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
     for attempt in range(3):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                remaining = max(0.1, deadline - time.monotonic())
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("generation control deadline exceeded")
                 sock.settimeout(remaining)
                 sock.connect(str(path))
                 sock.sendall(request)
@@ -64,6 +66,8 @@ def _generation_request(path: Path, verb: str, *, params: dict | None = None,
                         break
                     chunks.extend(part)
             response = json.loads(bytes(chunks).partition(b"\n")[0])
+            if time.monotonic() >= deadline:
+                raise TimeoutError("generation control deadline exceeded")
             break
         except OSError as exc:
             if attempt == 2 or time.monotonic() >= deadline:
@@ -96,6 +100,9 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         if budget <= 0:
             raise RuntimeError('handover deadline exceeded')
         return budget
+    def check_deadline():
+        if time.monotonic() >= deadline:
+            raise RuntimeError('handover deadline exceeded')
     lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
     if not lease or lease["state"] != "active":
         raise RuntimeError("no active generation lease to transfer")
@@ -107,19 +114,24 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
     old_identity = GenerationIdentity(**{key: old[key] for key in GenerationIdentity.__dataclass_fields__})
     path = generation_paths(home, old_identity)["socket"]
     roster = _generation_request(path, "polling_roster", timeout=remaining())
+    check_deadline()
     tokens = roster.get("tokens")
     if not isinstance(tokens, list) or any(not isinstance(token, str) for token in tokens):
         raise RuntimeError("invalid old generation polling roster")
     if require_pollers and not tokens:
         raise RuntimeError('empty polling roster cannot qualify forward-only promotion')
     coordinator.request_transfer(old_id, to_id, epoch, set(tokens))
+    check_deadline()
     nonce = coordinator.transfer_attempt_nonce(old_id, epoch)
+    check_deadline()
     try:
         ack = _generation_request(path, "transfer_requested", params={"to": to_id}, timeout=remaining())
+        check_deadline()
         if (ack.get("generation_id"), ack.get("epoch"), ack.get("poller_stopped")) != (old_id, epoch, True):
             raise RuntimeError("old generation did not prove poller stopped")
         if before_commit is not None:
             before_commit()
+        check_deadline()
         promoted = coordinator.commit_transfer(old_id, to_id, epoch, drain_seconds=drain_seconds)
     except Exception:
         # Never hide the transfer failure with a second failure during recovery.
@@ -134,6 +146,7 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         except Exception:
             logger.exception("poller re-arm failed after pre-commit failure")
         raise
+    check_deadline()
     if not verify_after_commit:
         return promoted
     successor_identity = GenerationIdentity(**{key: successor[key] for key in GenerationIdentity.__dataclass_fields__})
@@ -143,7 +156,12 @@ def handover_to_generation(home: Path, to_id: str, *, timeout: float = 45,
         if coordinator._owner_is_dead(claimed):
             raise HandoverCommittedUnverified(to_id, promoted)
         try:
-            status = _generation_request(successor_socket, "polling_status", timeout=min(2, max(.1, deadline-time.monotonic())))
+            socket_remaining = deadline - time.monotonic()
+            if socket_remaining <= 0:
+                raise HandoverCommittedUnverified(to_id, promoted)
+            status = _generation_request(successor_socket, "polling_status", timeout=min(2, socket_remaining))
+            if time.monotonic() >= deadline:
+                raise HandoverCommittedUnverified(to_id, promoted)
             if status.get("generation_id") == to_id and status.get("polling") is True and set(status.get("tokens", [])) == set(tokens):
                 return promoted
         except RuntimeError:

@@ -218,6 +218,40 @@ def test_bootout_bounds_readback_and_rejects_late_unloaded_success(rig, monkeypa
     assert calls[1][1] <= 1
 
 
+def test_poller_rejects_late_successful_status(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+
+    def late_status(request_row, verb, *, timeout=2, params=None):
+        assert verb == 'polling_status'
+        rig.clock.value += timeout + .1
+        return {
+            'generation_id': row['id'], 'release_sha': row['release_sha'], 'epoch': 1,
+            'release_root': str(rig.home / 'releases' / row['release_sha']),
+            'tokens': ['token-hash'], 'polling': True, 'healthy': True,
+            'armed': dict.fromkeys(('poller', 'cron', 'kanban', 'goal_wakeup'), True),
+        }
+
+    monkeypatch.setattr(rig.supervisor, 'request', late_status)
+    with pytest.raises(RuntimeError, match='deadline'):
+        forward._poller(rig.db, row, rig.supervisor, deadline=1.0)
+
+
+def test_poller_rejects_late_proof_query(rig, monkeypatch):
+    row = forward._row(rig.db, rig.old.id)
+    request = rig.supervisor.request
+    monkeypatch.setattr(rig.supervisor, 'request', request)
+    original = forward._frozen_transfer_tokens
+
+    def late_roster(*args, **kwargs):
+        result = original(*args, **kwargs)
+        rig.clock.value = 1.1
+        return result
+
+    monkeypatch.setattr(forward, '_frozen_transfer_tokens', late_roster)
+    with pytest.raises(RuntimeError, match='deadline'):
+        forward._poller(rig.db, row, rig.supervisor, deadline=1.0)
+
+
 def promote(rig):
     return forward.promote_forward(rig.home, rig.b, rig.b.name, supervisor=rig.supervisor)
 
