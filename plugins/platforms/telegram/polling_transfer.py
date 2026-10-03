@@ -364,23 +364,12 @@ class ControlledPoller:
     async def stop(self):
         self._stop.set()
         if self._task is not None:
-            timeout = self.timeout + 1
-            budget = gateway_deadline_remaining()
-            if budget is not None:
-                timeout = min(timeout, budget)
-            if timeout <= 0:
-                return {"stopped": False, "error": "PollDrainTimeout"}
             try:
                 # A cancelled HTTP task can finish before the Bot API has closed its
                 # long poll. Only a complete response (or a finished request error)
                 # proves the old request cannot overlap the successor.
-                await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
-                budget = gateway_deadline_remaining()
-                if budget is not None:
-                    timeout = min(self.timeout + 1, budget)
-                if timeout <= 0:
-                    return {"stopped": False, "error": "PollDrainTimeout"}
-                await asyncio.wait_for(self.app.update_queue.join(), timeout=timeout)
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=self.timeout + 1)
+                await asyncio.wait_for(self.app.update_queue.join(), timeout=self.timeout + 1)
             except asyncio.TimeoutError:
                 return {"stopped": False, "error": "PollDrainTimeout"}
             except asyncio.CancelledError:
@@ -392,16 +381,7 @@ class ControlledPoller:
         if self._lifecycle_owner is not None:
             stopped_at, wall_at = time.monotonic(), time.time()
             if self._lifecycle_task is not None:
-                timeout = gateway_deadline_remaining()
-                if timeout is not None and timeout <= 0:
-                    return {"stopped": False, "error": "PollDrainTimeout"}
-                try:
-                    if timeout is None:
-                        await self._lifecycle_task
-                    else:
-                        await asyncio.wait_for(asyncio.shield(self._lifecycle_task), timeout=timeout)
-                except asyncio.TimeoutError:
-                    return {"stopped": False, "error": "PollDrainTimeout"}
+                await self._lifecycle_task
                 self._lifecycle_task = None
             await self._record_lifecycle(self._lifecycle_owner, "poller_stopped", stopped_at, wall_at)
             self._lifecycle_owner = None

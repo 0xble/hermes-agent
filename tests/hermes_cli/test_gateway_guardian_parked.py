@@ -73,7 +73,7 @@ def test_parked_repair_is_service_only_and_death_fenced(tmp_path, monkeypatch, c
         'EnvironmentVariables': {'HERMES_HOME': str(home), 'HERMES_GENERATION_SCOPE': 'old'}}))
     runner, calls, state = fake_launchctl(label, plist, home, pid=123 if case == 'running' else None,
                                          bootout_succeeds=case != 'bootout-fails')
-    monkeypatch.setattr(guardian, 'healthy', lambda *args: state['rebootstrapped'])
+    monkeypatch.setattr(guardian, 'healthy', lambda *args, **kwargs: state['rebootstrapped'])
     if case == 'capped':
         for _ in range(guardian.MAX_REPAIRS):
             guardian.receipt(home, 'bootstrap', 'attempt', label=label)
@@ -136,7 +136,7 @@ def test_parked_repair_waits_for_documented_startup_budget(tmp_path, monkeypatch
     clock = [0.0]
     monkeypatch.setattr(guardian.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(guardian.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
-    monkeypatch.setattr(guardian, 'healthy', lambda *args: clock[0] >= 13.0)
+    monkeypatch.setattr(guardian, 'healthy', lambda *args, **kwargs: clock[0] >= 13.0)
 
     assert guardian.run_once(home, plist, label, grace=12,
                             domain=f'gui/{os.getuid()}', launchctl_runner=runner) == 'repaired'
@@ -169,7 +169,7 @@ def test_bootstrap_repair_rejects_healthy_result_after_deadline(tmp_path, monkey
     monkeypatch.setattr(guardian.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(guardian.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
 
-    def late_healthy(*args):
+    def late_healthy(*args, **kwargs):
         clock[0] = guardian.STARTUP_SECONDS + .1
         return True
 
@@ -207,7 +207,7 @@ def test_parked_repair_passes_remaining_timeout_and_rejects_late_health(tmp_path
     monkeypatch.setattr(guardian.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(guardian.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
 
-    def late_healthy(*args):
+    def late_healthy(*args, **kwargs):
         clock[0] = guardian.STARTUP_SECONDS + .1
         return True
 
