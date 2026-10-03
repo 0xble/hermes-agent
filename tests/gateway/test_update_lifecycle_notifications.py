@@ -426,6 +426,54 @@ async def test_notice_retry_honors_flood_delay_and_prior_result(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_legacy_nested_previous_outcomes_are_bounded_in_rendered_notice(tmp_path):
+    from gateway.update_notifications import save_pending
+
+    pending(tmp_path)
+    marker, record = read_pending(tmp_path)
+    previous = None
+    for index in range(50):
+        previous = {
+            "reason": f"prior reason {index} " + "R" * 2000,
+            "success": index % 2 == 0,
+            "detail": f"prior detail {index} " + "D" * 5000,
+            "previous_outcome": previous,
+        }
+    record["previous_outcome"] = previous
+    save_pending(marker, record)
+    finalize_update(tmp_path)
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is True
+
+    text = adapter.send.call_args_list[-1].args[1]
+    assert len(text) <= 4096
+    assert text.count("Previous update ") <= 8
+    assert read_pending(tmp_path) is None
+
+
+def test_bounded_previous_outcome_history_keeps_new_marker_small(tmp_path):
+    data = pending(tmp_path)
+    for index in range(50):
+        finalize_update(tmp_path)
+        result = launch_native_update(
+            home=tmp_path, hermes_cmd=["hermes"],
+            pending={**data, "reason": f"update {index}"}, spawn=Mock(),
+        )
+        assert result["started"] is True
+        data = read_pending(tmp_path)[1]
+
+    previous = data["previous_outcome"]
+    assert isinstance(previous, dict)
+    assert "previous_outcome" not in previous
+    assert data["previous_outcome_older_count"] == 49
+    assert len(previous["detail"]) <= 240
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("send_path", ["final_notice", "final_output", "phase_ack"])
 @pytest.mark.parametrize("error", [TimeoutError("transport timed out"), Exception("transport unavailable")])
 async def test_post_deadline_delivery_exception_persists_retry_backoff(tmp_path, send_path, error):

@@ -38,6 +38,44 @@ def _update_failed_notice() -> str:
 # configured at all — no adapter will ever appear — would keep itself on disk and re-log a
 # deferred line on every poll, in every process, forever. Stop waiting past this age.
 _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS = 3600.0
+_UPDATE_MAX_PRIOR_OUTCOMES = 8
+_UPDATE_MAX_PRIOR_DETAIL_CHARS = 2800
+_UPDATE_MAX_NOTICE_CHARS = 4096
+
+
+def _bounded_previous_update_detail(detail: str, pending: dict[str, Any]) -> str:
+    """Render bounded prior-update history, including legacy nested markers."""
+    previous = pending.get("previous_outcome")
+    remaining = _UPDATE_MAX_PRIOR_DETAIL_CHARS
+    rendered = 0
+    while isinstance(previous, dict) and rendered < _UPDATE_MAX_PRIOR_OUTCOMES and remaining > 0:
+        prior_heading = "Previous update completed" if previous.get("success") else "Previous update failed"
+        prior_reason = str(previous.get("reason") or "").strip()
+        prior_detail = str(previous.get("detail") or "").strip()
+        fragment = "\n\n" + prior_heading + ": " + " ".join(
+            part for part in (prior_reason, prior_detail) if part
+        )
+        if len(fragment) > remaining:
+            fragment = fragment[:remaining - 1].rstrip() + "…"
+        detail += fragment
+        remaining -= len(fragment)
+        rendered += 1
+        previous = previous.get("previous_outcome")
+    omitted = pending.get("previous_outcome_older_count", 0)
+    if not isinstance(omitted, int) or isinstance(omitted, bool) or omitted < 0:
+        omitted = 0
+    if isinstance(previous, dict):
+        omitted += 1
+    if omitted and remaining:
+        fragment = f"\n\nOlder undelivered update history omitted: {omitted} update(s)."
+        detail += fragment[:remaining]
+    return detail
+
+
+def _bounded_update_notice(text: str) -> str:
+    if len(text) <= _UPDATE_MAX_NOTICE_CHARS:
+        return text
+    return text[:_UPDATE_MAX_NOTICE_CHARS - 1].rstrip() + "…"
 
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
@@ -1026,14 +1064,8 @@ class GatewayNotificationsMixin:
                 heading, detail = self._update_result_heading(paths.pending.parent, pending, 0)
             else:
                 heading, detail = "❌ Update Failed", detail
-            previous = pending.get("previous_outcome")
-            while isinstance(previous, dict):
-                prior_heading = "Previous update completed" if previous.get("success") else "Previous update failed"
-                prior_reason = str(previous.get("reason") or "").strip()
-                prior_detail = str(previous.get("detail") or "").strip()
-                detail += f"\n\n{prior_heading}: " + " ".join(part for part in (prior_reason, prior_detail) if part)
-                previous = previous.get("previous_outcome")
-            result = await target.send(notice(heading, pending, detail))
+            detail = _bounded_previous_update_detail(detail, pending)
+            result = await target.send(_bounded_update_notice(notice(heading, pending, detail)))
             current = self._current_update(paths, original)
             if not current:
                 return False

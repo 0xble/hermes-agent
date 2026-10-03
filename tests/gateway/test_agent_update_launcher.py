@@ -195,6 +195,32 @@ def test_finished_undelivered_v2_notice_does_not_block_next_update(tmp_path):
     spawn.assert_called_once()
 
 
+def test_replacement_clears_prior_update_lifecycle_artifacts_and_offset(tmp_path):
+    from gateway.update_launcher import launch_native_update
+    from tests.gateway.update_fixtures import finalize_update
+    from datetime import datetime, timezone
+
+    marker = tmp_path / ".update_pending.json"
+    marker.write_text(json.dumps({"notification_version": 2, "reason": "prior",
+                                  "timestamp": datetime.now(timezone.utc).isoformat()}), encoding="utf-8")
+    finalize_update(tmp_path)
+    (tmp_path / ".update_output.txt").write_text("stale output", encoding="utf-8")
+    (tmp_path / ".update_prompt.json").write_text("stale prompt", encoding="utf-8")
+    (tmp_path / ".update_response").write_text("stale response", encoding="utf-8")
+
+    result = launch_native_update(
+        home=tmp_path, hermes_cmd=["hermes"],
+        pending={"reason": "new", "output_offset": 999}, spawn=Mock(),
+    )
+
+    assert result == {"started": True, "pending": False}
+    assert not (tmp_path / ".update_output.txt").exists()
+    assert not (tmp_path / ".update_prompt.json").exists()
+    assert not (tmp_path / ".update_response").exists()
+    replacement = json.loads(marker.read_text(encoding="utf-8"))
+    assert "output_offset" not in replacement
+
+
 def test_failed_superseding_spawn_restores_old_notice(tmp_path):
     from gateway.update_launcher import launch_native_update
     from tests.gateway.update_fixtures import finalize_update
@@ -204,11 +230,20 @@ def test_failed_superseding_spawn_restores_old_notice(tmp_path):
     marker = tmp_path / ".update_pending.json"
     marker.write_text(json.dumps(old), encoding="utf-8")
     finalize_update(tmp_path)
+    old_artifacts = {
+        ".update_output.txt": b"prior output",
+        ".update_prompt.json": b"prior prompt",
+        ".update_response": b"prior response",
+    }
+    for name, content in old_artifacts.items():
+        (tmp_path / name).write_bytes(content)
     with pytest.raises(OSError):
         launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={"reason": "new"},
                              spawn=Mock(side_effect=OSError("cannot launch")))
     assert json.loads(marker.read_text(encoding="utf-8")) == old
     assert (tmp_path / ".update_process_exit_code").read_text(encoding="utf-8") == "0"
+    for name, content in old_artifacts.items():
+        assert (tmp_path / name).read_bytes() == content
 
 
 def test_finished_marker_admission_is_exclusive_across_threads(tmp_path):
