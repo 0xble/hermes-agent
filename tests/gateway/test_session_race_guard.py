@@ -432,15 +432,7 @@ async def test_shutdown_invalidates_all_deferred_commands():
         async def send(self, *args, **kwargs): pass
         async def get_chat_info(self, *args, **kwargs): return None
 
-    adapter = object.__new__(_Adapter)
-    adapter._deferred_commands = {}
-    adapter._session_generations = {}
-    adapter._background_tasks = set()
-    adapter._expected_cancelled_tasks = set()
-    adapter._session_tasks = {}
-    adapter._pending_messages = {}
-    adapter._active_sessions = {}
-    adapter._text_debounce = {}
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
     adapter.defer_command_until_idle("session", _make_event("/undo"))
     before = adapter._session_generations["session"]
 

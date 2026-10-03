@@ -232,7 +232,7 @@ def _quietly(what: str, fn, default=None):
 
 def _load_etag() -> str:
     """Last-known ETag from disk, or "" if missing."""
-    return _quietly("load models.dev ETag", lambda: _get_etag_path().read_text(encoding="utf-8").strip() if _get_etag_path().exists() else "", "")
+    return _quietly("load models.dev ETag", lambda: _get_etag_path().read_text(encoding="utf-8-sig").strip() if _get_etag_path().exists() else "", "")
 
 
 def _save_etag(etag: str) -> None:
@@ -269,7 +269,7 @@ def _load_disk_cache() -> Dict[str, Any]:
     try:
         cache_path = _get_cache_path()
         if cache_path.exists():
-            with open(cache_path, encoding="utf-8") as f:
+            with open(cache_path, encoding="utf-8-sig") as f:
                 data = json.load(f)
             if _validate_registry(data):
                 return data
@@ -803,9 +803,11 @@ def _relay_vision_marker_metadata(provider: str, model: str) -> Optional[Dict[st
     ``-vision`` token is the vendor's own capability marker; without it ``image_input_mode: auto`` treats
     the model as text-only and detours images through the lossy describe path (#96066). Every other field
     keeps the unknown-model defaults, so only vision is claimed."""
+    if "-vision" not in (model or "").strip().lower():
+        return None
     from hermes_cli.models import opencode_provider_family
 
-    if "-vision" not in (model or "").strip().lower() or opencode_provider_family(provider) is None:
+    if opencode_provider_family(provider) is None:
         return None
     return {**_UNKNOWN_MODEL_BASE, "modalities": {"input": ["text", "image"], "output": ["text"]}}
 

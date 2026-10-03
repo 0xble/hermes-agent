@@ -59,7 +59,8 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
                (execution_id, terminal_status, finished_at, projected)
                SELECT execution_id, status, finished_at, projected FROM deliveries
                WHERE status IN ('delivered','failed','unknown','suppressed')
-               ORDER BY finished_at, created_at, execution_id
+               ORDER BY julianday(finished_at), finished_at,
+                        julianday(created_at), created_at, execution_id
                LIMIT ?""",
             (excess,),
         )
@@ -67,7 +68,8 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
             """DELETE FROM deliveries WHERE execution_id IN (
                  SELECT execution_id FROM deliveries
                  WHERE status IN ('delivered','failed','unknown','suppressed')
-                 ORDER BY finished_at, created_at, execution_id
+                 ORDER BY julianday(finished_at), finished_at,
+                          julianday(created_at), created_at, execution_id
                  LIMIT ?
                )""",
             (excess,),
@@ -347,7 +349,7 @@ def claim_next() -> Optional[dict]:
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT execution_id, for_failure, terminal_gate, created_at FROM deliveries WHERE status='pending' "
-            "ORDER BY created_at, execution_id"
+            "ORDER BY julianday(created_at), created_at, execution_id"
         ).fetchall()
         row = None
         suppressed_missing = False

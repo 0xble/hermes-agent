@@ -21,6 +21,7 @@ from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from agent.i18n import t
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -46,6 +47,11 @@ def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bo
     """Resolve the process verdict after either startup abort or normal shutdown."""
     if _exit_with_failure_verdict(runner):
         return False
+    if getattr(runner, '_restart_requested', False) and (runner.exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+                                      or runner._restart_via_service):
+        from gateway.run_generation import defer_forward_launchd_restart
+        if defer_forward_launchd_restart(getattr(runner, 'config', None)):
+            return True  # Clean exit parks KeepAlive until the fresh bootstrap.
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
     if signal_initiated_shutdown and not runner._restart_requested:
@@ -144,6 +150,20 @@ def _send_error(result: Any) -> str:
 def _notice_target_key(platform_value: str, chat_id, thread_id) -> tuple:
     """Dedup key for one notice destination: thread/topic platforms share a chat but route apart."""
     return (platform_value, str(chat_id), str(thread_id) if thread_id else None)
+
+
+def _delivery_target_key(platform_value: str, chat_id, thread_id, *, profile: Optional[str] = None) -> tuple:
+    """Dedupe key for one DELIVERED chat: profile-independent, except Telegram private chats.
+
+    Two served profiles can share one home chat (one Telegram group for the whole host) and owe it
+    ONE notice per host restart. A positive Telegram chat id names the USER, though: the same id
+    under two bot tokens is two conversations, so those stay keyed per served profile (#118233).
+    """
+    from gateway.delivery import looks_like_telegram_private_chat_id
+    if (profile and profile != "default" and platform_value == "telegram"
+            and looks_like_telegram_private_chat_id(chat_id)):
+        platform_value = f"{profile}:{platform_value}"
+    return _notice_target_key(platform_value, chat_id, thread_id)
 
 
 def _effective_watchdog_leash(runner: object) -> float:
@@ -902,9 +922,12 @@ class GatewayShutdownMixin:
         platform_cfg = self.config.platforms.get(platform)
         return platform_cfg is None or bool(platform_cfg.gateway_restart_notification)
 
-    def _notice_allowed(self, platform: Platform, what: str) -> bool:
-        """``_restart_notification_allowed`` with the INFO suppression line for shutdown notices."""
-        if self._restart_notification_allowed(platform):
+    def _notice_allowed(self, platform: Platform, what: str, platform_cfg=None) -> bool:
+        """``_restart_notification_allowed`` with the INFO suppression line for shutdown notices.
+        ``platform_cfg`` is a SERVED profile's own platform entry; ``self.config`` is the launch profile's."""
+        allowed = (self._restart_notification_allowed(platform) if platform_cfg is None
+                   else bool(platform_cfg.gateway_restart_notification))
+        if allowed:
             return True
         logger.info(
             "Shutdown notification suppressed for %s: %s has gateway_restart_notification=false", what, platform.value,
@@ -934,7 +957,7 @@ class GatewayShutdownMixin:
         except Exception as e:
             logger.debug("Cron interrupt notification unavailable: %s", e)
             return 0
-        action = "restarting" if self._restart_requested else "shutting down"
+        action = t("gateway.shutdown.action_restarting" if self._restart_requested else "gateway.shutdown.action_shutting_down")
         notified: set = set()
         for job_id in job_ids:
             try:
@@ -949,11 +972,7 @@ class GatewayShutdownMixin:
                 logger.debug("Cron interrupt targets unresolved for %s: %s", job_id, e)
                 continue
             job_name = job.get("name") or job_id
-            msg = (
-                f"⚠️ Scheduled job '{job_name}' was cut short because Hermes is {action}; "
-                "no result this run. It will run again on schedule, or run it now with "
-                f"`hermes cron run {job_name}` once Hermes is back."
-            )
+            msg = t("gateway.shutdown.cron_interrupted", job=job_name, action=action)
             for target in targets or ():
                 try:
                     platform = Platform(str(target.get("platform", "")).lower())
@@ -1019,7 +1038,8 @@ class GatewayShutdownMixin:
         adapter, chat_id: str, msg: str, platform_str: str, fail_fmt: str, raise_fmt: Optional[str] = None, **kw
     ) -> bool:
         """``adapter.send`` whose failure is debug-logged as ``fmt % (platform, chat, error)`` — ``fail_fmt``
-        for success=False, ``raise_fmt`` (default ``fail_fmt``) for a raise; True only on a delivered send."""
+        for success=False, ``raise_fmt`` (default ``fail_fmt``) for a raise; True only on a delivered send.
+        Every shutdown notice races live turns, so it always carries the interim marker (#98432)."""
         from gateway.run import _interim_metadata
         kw["metadata"] = _interim_metadata(kw.get("metadata"))
         try:
@@ -1066,15 +1086,25 @@ class GatewayShutdownMixin:
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):
-                restart_key = _notice_target_key(
-                    restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
-                )
+                restart_adapter = self._delivery_adapter_for(restart_source)
+                if restart_adapter is not None:
+                    _, restart_profile = self._owning_profile(restart_adapter, restart_source.platform)
+                    restart_key = _delivery_target_key(
+                        restart_source.platform.value, restart_source.chat_id, restart_source.thread_id,
+                        profile=restart_profile,
+                    )
         notified: set[tuple[str, str, Optional[str]]] = set()
         # A DM topic reaches its private parent, but a forum topic does not replace a group broadcast.
         private_topic_parents: set[tuple[int, str]] = set()
         if update_notified and update_record:
             data = update_record[1]
-            notified.add(_notice_target_key(str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id")))
+            update_target = self._resolve_update_target(self._update_paths())
+            if update_target is not None:
+                _, update_profile = self._owning_profile(update_target.adapter, update_target.platform)
+                notified.add(_delivery_target_key(
+                    str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id"),
+                    profile=update_profile,
+                ))
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1084,9 +1114,6 @@ class GatewayShutdownMixin:
                 profile = None
             else:
                 source, platform_str, chat_id, thread_id, profile = target
-            dedup_key = _notice_target_key(platform_str, chat_id, thread_id)
-            if dedup_key in notified:
-                continue
             try:
                 platform = Platform(platform_str)
                 # The session's OWN profile's bot (transport ref → profile map), never a bare
@@ -1096,6 +1123,10 @@ class GatewayShutdownMixin:
                 if adapter is None:
                     adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
+                    continue
+                _, delivery_profile = self._owning_profile(adapter, platform)
+                dedup_key = _delivery_target_key(platform_str, chat_id, thread_id, profile=delivery_profile)
+                if dedup_key in notified:
                     continue
                 if not self._notice_allowed(platform, "active session"):
                     continue
@@ -1140,15 +1171,22 @@ class GatewayShutdownMixin:
                     "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
                 )
                 return
-        # Snapshot adapters: adapter.send() can hit a fatal path (_handle_fatal) that pops the adapter
-        # from self.adapters -> ``RuntimeError: dictionary changed size during iteration``.
-        for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
+        # EVERY served profile's home channel, through that profile's OWN bot: ``self.adapters`` and
+        # ``self.config`` are the launch profile's alone, so iterating them left the secondaries'
+        # channels silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit
+        # a fatal path (_handle_fatal) that pops the adapter -> "dictionary changed size during iteration".
+        profile_adapters = getattr(self, "_profile_adapters", None) or {}
+        for profile, platform, platform_cfg in list(self._served_home_channel_configs()):
+            home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue
-            if not self._notice_allowed(platform, "home channel"):
+            adapter = (self.adapters if profile is None else profile_adapters.get(profile) or {}).get(platform)
+            if adapter is None:
                 continue
-            dedup_key = _notice_target_key(platform.value, home.chat_id, home.thread_id)
+            if not self._notice_allowed(platform, "home channel", platform_cfg):
+                continue
+            _, delivery_profile = self._owning_profile(adapter, platform)
+            dedup_key = _delivery_target_key(platform.value, home.chat_id, home.thread_id, profile=delivery_profile)
             if dedup_key in notified or (
                 platform == Platform.TELEGRAM and home.thread_id is None
                 and (id(adapter), str(home.chat_id)) in private_topic_parents
@@ -1161,7 +1199,6 @@ class GatewayShutdownMixin:
                     "Failed to send shutdown notification to home channel %s:%s: %s", platform.value, home.chat_id, e,
                 )
                 continue
-            # Home channels omit ``metadata=`` when empty (adapter doubles may not accept the kwarg).
             async def _send_home(adapter=adapter, home=home, platform=platform, metadata=metadata):
                 if await self._send_shutdown_notice(
                     adapter, str(home.chat_id), shutdown_message(adapter), "home channel", platform.value,
@@ -1169,7 +1206,11 @@ class GatewayShutdownMixin:
                 ):
                     notified.add(dedup_key)
             from gateway.warning_notifications import present_notification
-            await present_notification(_send_home, platform=platform)
+            from gateway.run import _async_profile_runtime_scope
+            # present_notification reads the ACTIVE profile's display settings: bind the served one's.
+            profile_home = (getattr(self, "_served_profile_homes", None) or {}).get(profile) if profile else None
+            async with _async_profile_runtime_scope(profile_home) if profile_home else nullcontext():
+                await present_notification(_send_home, platform=platform)
 
     # Agent finalization / resource cleanup
     @staticmethod
@@ -1376,7 +1417,7 @@ class GatewayShutdownMixin:
     def _read_json_counts(path: Path) -> Optional[dict]:
         """Parsed counter dict, or None when the file is missing/unreadable (no exists() pre-check needed)."""
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception:
             return None
 
@@ -1437,10 +1478,53 @@ class GatewayShutdownMixin:
     # Restart orchestration
     @staticmethod
     def _restart_watcher_env() -> dict:
-        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down)."""
+        """Watcher env minus ``_HERMES_GATEWAY`` (else the CLI's self-restart guard refuses; gateway stays down).
+
+        The host multiplexer is respawned with ``host_gateway_child_env`` (default-root
+        secrets via ``served_profile_child_env``, not ``os.environ.copy()``). A standalone
+        named-profile gateway keeps that profile's home — only a multiplexer, or a process
+        already on the default root, is the host.
+        """
         from gateway.config_loader import drop_bridged_env
-        from tools.environments.local import build_subprocess_env
-        watcher_env = drop_bridged_env(build_subprocess_env(scrub_secrets=False, inherit_profile_home=True))
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+        from tools.environments.local import host_gateway_child_env, served_profile_child_env
+
+        home = get_hermes_home()
+        try:
+            on_default = home.resolve() == get_default_hermes_root().resolve()
+        except Exception:
+            on_default = False
+        # ``resolve_multiplex_mode`` settles the default-on/unset decision before
+        # restart. Carry that runtime identity instead of re-reading raw config:
+        # ``None`` is the normal pre-resolution value for a named launcher.
+        from agent.secret_scope import is_multiplex_active
+        settled_multiplex = is_multiplex_active()
+        multiplex = False
+        if not on_default and not settled_multiplex:
+            # Second settled source: the live host gateway's OWN published record
+            # (its settled served set). Only when NO settled identity exists may the
+            # raw config re-read stand — it reads the UNSET flag as False, which is
+            # wrong exactly when this process IS the default-on host (#120305).
+            try:
+                from gateway import host_rendezvous as hr
+                record = hr.read_record(hr.ROLE_GATEWAY)
+                if record is not None and hr.liveness_is_proven(record) and len(record.profiles) > 1:
+                    multiplex = True
+            except Exception:
+                multiplex = False
+        if not on_default and not settled_multiplex and not multiplex:
+            try:
+                from gateway.config import load_gateway_config
+                multiplex = bool(load_gateway_config().multiplex_profiles)
+            except Exception:
+                multiplex = False
+        if on_default or settled_multiplex or multiplex:
+            watcher_env = host_gateway_child_env()
+        else:
+            watcher_env = served_profile_child_env(
+                target_home=home, inherit_credentials=True,
+            )
+        watcher_env = drop_bridged_env(watcher_env)
         watcher_env.pop("_HERMES_GATEWAY", None)
         return watcher_env
 
@@ -1452,25 +1536,24 @@ class GatewayShutdownMixin:
             windows_detach_flags_without_breakaway, windows_detach_popen_kwargs
         )
         watcher_env = GatewayShutdownMixin._restart_watcher_env()
+        # host_gateway_child_env does not copy the parent dotenv. The watcher
+        # still has to run inside the venv this process is using, or the
+        # respawn cannot import hermes.
+        if not watcher_env.get("VIRTUAL_ENV"):
+            inherited = os.environ.get("VIRTUAL_ENV")
+            if inherited:
+                watcher_env["VIRTUAL_ENV"] = inherited
         project_root = Path(__file__).resolve().parent.parent
         # Console python under CREATE_NO_WINDOW: nothing flashes. NOT pythonw.exe — a console-less
         # watcher makes every console-subsystem descendant allocate a visible conhost (#54220/#56747).
         # The watcher runs sys.executable (console python) under the CREATE_NO_WINDOW detach kwargs below:
         # it owns one hidden console, inherited by the `hermes gateway restart` child, so nothing flashes.
         # See #54220, #56747.
-        watcher_python = sys.executable
-        venv_dir = Path(watcher_env.get("VIRTUAL_ENV") or project_root / "venv")
-        site_packages = venv_dir / "Lib" / "site-packages"
-        if site_packages.exists():
-            watcher_env["VIRTUAL_ENV"] = str(venv_dir)
-            pythonpath = [str(project_root), str(site_packages)]
-            if watcher_env.get("PYTHONPATH"):
-                pythonpath.append(watcher_env["PYTHONPATH"])
-            watcher_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath))
-        watcher_argv = [
-            watcher_python, "-c", _WINDOWS_RESTART_WATCHER,
-            str(current_pid), str(restart_after_s), *hermes_cmd, "gateway", "restart",
-        ]
+        from hermes_cli._launchers import runtime_command
+        watcher_argv = runtime_command(project_root,
+            [str(current_pid), str(restart_after_s), *hermes_cmd, "gateway", "restart"],
+            code=_WINDOWS_RESTART_WATCHER)
+        watcher_python = watcher_argv[0]
         popen_kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=watcher_env)
         # Break away from the parent CLI's job object or be reaped when the CLI exits; a job without
         # BREAKAWAY_OK rejects CREATE_BREAKAWAY_FROM_JOB (OSError) — retry once without the bit.
@@ -1786,7 +1869,11 @@ class GatewayShutdownMixin:
 
         def _kill_processes() -> None:
             from tools.process_registry import process_registry
-            _count_step("Shutdown (%s): killed %d tool subprocess(es)", process_registry.kill_all)
+            # Host shutdown: kill even persist_on_release jobs or they become
+            # PPID=1 orphans (#41225/#46778); an explicit source reaches them.
+            _count_step(
+                "Shutdown (%s): killed %d tool subprocess(es)",
+                lambda: process_registry.kill_all(source="gateway_shutdown"))
 
         def _mark_cron_interrupted() -> list:
             # kill_all() is global: a cron job mid-dispatch lost its tool subprocess and its agent thread may

@@ -1,6 +1,9 @@
 """Recovery retention regressions for upstream #106087, adapted from #106101."""
 
 import sqlite3
+from collections import Counter
+
+import pytest
 
 from hermes_cli import backup
 
@@ -64,3 +67,57 @@ def test_unusable_claimed_copy_cannot_replace_complete_generation(tmp_path, monk
     assert backup.verify_sqlite_integrity(root / complete / "state.db")["valid"]
     assert (root / latest).exists()
     assert not (root / newer).exists(), "stale partial generations must not accumulate"
+
+
+@pytest.mark.parametrize("keep", [1, 4])
+def test_pruning_only_verifies_live_recovery_anchors_once(tmp_path, monkeypatch, keep):
+    home = _home(tmp_path)
+    snapshots = [backup.create_quick_snapshot(hermes_home=home, keep=20) for _ in range(5)]
+    root = home / "state-snapshots"
+    hashes, checks = Counter(), Counter()
+    from hermes_cli import backup_snapshot_integrity as integrity
+    digest, verify = integrity.payload_digest, backup.verify_sqlite_integrity
+    def traced_digest(path):
+        hashes[path] += 1
+        return digest(path)
+    def traced_verify(path):
+        checks[path] += 1
+        return verify(path)
+    monkeypatch.setattr(integrity, "payload_digest", traced_digest)
+    monkeypatch.setattr(backup, "verify_sqlite_integrity", traced_verify)
+    backup.prune_quick_snapshots(keep=keep, hermes_home=home)
+    latest = root / snapshots[-1]
+    assert {p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")} == {
+        root / name for name in snapshots[-keep:]}
+    assert hashes and all(path.is_relative_to(latest) and count == 1 for path, count in hashes.items())
+    assert checks and all(path.is_relative_to(latest) and count == 1 for path, count in checks.items())
+
+
+def test_pruning_caches_failed_and_successful_recovery_checks(tmp_path, monkeypatch):
+    home = _home(tmp_path)
+    snapshots = [backup.create_quick_snapshot(hermes_home=home, keep=20) for _ in range(3)]
+    root = home / "state-snapshots"
+    latest = root / snapshots[-1]
+    changed = latest / "state.db"
+    size = changed.stat().st_size
+    with sqlite3.connect(changed) as conn:
+        conn.execute("UPDATE records SET value=?", ("x" * 10000,))
+    assert changed.stat().st_size == size and backup.verify_sqlite_integrity(changed)["valid"]
+    from hermes_cli import backup_snapshot_integrity as integrity
+    hashes, checks = Counter(), Counter()
+    digest, verify = integrity.payload_digest, backup.verify_sqlite_integrity
+    def traced_digest(path):
+        hashes[path] += 1
+        return digest(path)
+    def traced_verify(path):
+        checks[path] += 1
+        return verify(path)
+    monkeypatch.setattr(integrity, "payload_digest", traced_digest)
+    monkeypatch.setattr(backup, "verify_sqlite_integrity", traced_verify)
+    backup.prune_quick_snapshots(keep=1, hermes_home=home)
+    genuine = root / snapshots[-2]
+    assert latest.exists() and genuine.exists() and not (root / snapshots[0]).exists()
+    assert hashes and all(count == 1 for count in hashes.values())
+    assert checks and all(count == 1 for count in checks.values())
+    assert not any(path.is_relative_to(root / snapshots[0]) for path in hashes)
+    assert changed not in checks, "a digest mismatch must fail before SQLite verification"

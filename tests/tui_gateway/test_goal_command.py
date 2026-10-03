@@ -222,7 +222,7 @@ def test_successful_goal_turn_accepts_only_valid_completion_outcomes(
 def test_goal_budget_flows_through_command_and_prompt_manager(
     server, session, hermes_home, configured, expected,
 ):
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli import goals
 
     (hermes_home / "config.yaml").write_text(yaml.safe_dump({"goals": {"max_turns": configured}}))

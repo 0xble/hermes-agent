@@ -569,7 +569,8 @@ async def test_controlled_first_poll_failure_wakes_cold_start_gate(monkeypatch):
     adapter._controlled_journal = object()
     adapter._app = SimpleNamespace()
     class FailedPoller:
-        def __init__(self, app, journal, *, on_error, on_failure):
+        def __init__(self, app, journal, *, timeout=20, on_error=None,
+                     on_failure=None, on_progress=None, lifecycle_predecessor=None):
             self.on_failure = on_failure
         async def start(self):
             self.on_failure(OSError("first poll failed"))

@@ -114,6 +114,22 @@ def event_kind(event) -> str:
     return getattr(getattr(event, "message_type", None), "value", None) or "message"
 
 
+def event_admission_scope(event, runner, home: Path) -> tuple:
+    """Bind local replay to its native runner, routing identity and ingress payload."""
+    source = event.source
+    return (id(event), runner, Path(home).resolve(), str(source.profile or "default"),
+            source.platform, source.chat_id, source.thread_id, source.user_id,
+            transport_id(event), event_kind(event))
+
+
+def local_admission_turn(event, runner, home: Path) -> str | None:
+    """Only the same event's unchanged local admission can bypass transport dedup."""
+    if (not getattr(event, "_outbox_duplicate", False)
+            and getattr(event, "_outbox_admission_scope", None) == event_admission_scope(event, runner, home)):
+        return getattr(event, "_outbox_turn_id", None)
+    return None
+
+
 def durable_control(method):
     """Control cards return a raw Telegram message so callback state can bind its ID."""
     @functools.wraps(method)
@@ -363,7 +379,7 @@ def _retention_days(home: Path) -> int:
     """Read only this setting using the gateway loader's layer precedence."""
     from gateway import config_loader
     from gateway.config import GatewayConfig, validate_outbox_retention_days
-    import yaml
+    import hermes_yaml as yaml
 
     default = GatewayConfig.durable_outbox_retention_days
     legacy = config_loader.load_legacy_gateway_json(home)
@@ -630,6 +646,30 @@ class Outbox:
                 db.rollback()
                 raise
 
+    def enqueue_synthetic(self, nonce: str, payload: dict[str, Any], owner_epoch: int = 0) -> OutboxRow:
+        """Insert a loopback terminal reply without ever creating sendable work.
+
+        N-1 shares this database and knows failed_unsent, not a new synthetic state.
+        The disposition is separate; the state CHECK and normal pruning stay intact.
+        Current status() hides these rows. N-1 status() still lists them as
+        failed_unsent during overlap, but neither version recovers or retries them.
+        """
+        key = "startup-gate:" + nonce
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    "INSERT OR IGNORE INTO outbox "
+                    "(turn_id,sequence,type,payload,idempotency_key,owner_epoch,state,send_status) "
+                    "VALUES (?,1,'send',?,?,?,'failed_unsent','synthetic')",
+                    (key, json.dumps(payload, default=str), key, owner_epoch))
+                row = db.execute("SELECT * FROM outbox WHERE idempotency_key=?", (key,)).fetchone()
+                db.commit()
+                return self._row(row)
+            except BaseException:
+                db.rollback()
+                raise
+
     @staticmethod
     def _row(row: sqlite3.Row) -> OutboxRow:
         return OutboxRow(row["turn_id"], row["sequence"], row["type"], json.loads(row["payload"]),
@@ -698,7 +738,8 @@ class Outbox:
             return [dict(r) for r in db.execute(
                 "SELECT turn_id, sequence, type, idempotency_key, state, created_at, "
                 "retry_at, attempts, send_status, edit_status FROM outbox "
-                "WHERE state IN ('sending','ambiguous','expired_ambiguous','pending','failed_unsent') "
+                "WHERE COALESCE(send_status, '') != 'synthetic' "
+                "AND state IN ('sending','ambiguous','expired_ambiguous','pending','failed_unsent') "
                 "ORDER BY created_at DESC")]
 
     def begin_send(self, row: OutboxRow) -> bool:

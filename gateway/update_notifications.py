@@ -52,7 +52,7 @@ def read_pending(home: Path) -> tuple[Path, dict] | None:
     for name in (".update_pending.claimed.json", ".update_pending.json"):
         path = home / name
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(data, dict):
                 data.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
                 return path, data
@@ -123,7 +123,7 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
         exit_path = process_exit if pending.get("notification_version") == 2 else home / ".update_exit_code"
         if not exit_path.exists():
             return None
-        exit_code = int(exit_path.read_text(encoding="utf-8").strip())
+        exit_code = int(exit_path.read_text(encoding="utf-8-sig").strip())
         if exit_code:
             return False, f"The updater exited with code {exit_code}. Runtime state is unverified; see the update output."
         receipt_path = home / "logs" / "update_receipts" / "latest.json"
@@ -131,7 +131,7 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
             # Legacy gateway markers predate runtime receipts. Preserve their terminal
             # notification contract while v2 markers remain fail-closed.
             return True, "Hermes update finished successfully."
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
         started = _timestamp(receipt["started_at"])
         finished = _timestamp(receipt["finished_at"])
         requested = _timestamp(pending["timestamp"]) if pending.get("timestamp") else exit_path.stat().st_mtime

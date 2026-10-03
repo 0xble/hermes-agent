@@ -28,10 +28,11 @@ def receipt_home(tmp_path, monkeypatch):
     # ``_receipt_dir`` resolves through ``hermes_constants.get_hermes_home`` (env var), not
     # ``hermes_cli.config`` — patch where production reads.
     monkeypatch.setenv("HERMES_HOME", str(home))
-    # ensure no receipt bleeds between tests
-    ur._current = None
-    yield home
-    ur._current = None
+    # These tests own receipt boundaries, not retargeting another installation.
+    monkeypatch.setattr("hermes_cli.update_owning_install.owning_install_root", lambda *_: None)
+    # The open receipt is per-context; the scope isolates it from any enclosing receipt.
+    with ur.update_receipt_scope():
+        yield home
 
 
 def _finalize(outcome="success", fleet=None):
@@ -159,7 +160,7 @@ class TestCommandBoundaryFinalization:
         assert payload["exit_code"] == 2
         assert payload["stop_reason"] == "sys.exit(2)"
         assert payload["finished_at"] is not None
-        assert ur._current is None
+        assert ur.current_correlation_id() is None
 
     def test_pending_receipt_persisted_on_exit_1_failure(self, receipt_home):
         ur.begin_update_receipt()
@@ -239,10 +240,65 @@ class TestCommandBoundaryFinalization:
         assert latest["exit_code"] == 2
         assert latest["stop_reason"] == "sys.exit(2)"
         assert latest["steps"][0]["name"] == "windows_preflight"
-        assert ur._current is None
+        assert ur.current_correlation_id() is None
         # exactly-once: exactly one receipt file
         directory = receipt_home / "logs" / "update_receipts"
         assert len(list(directory.glob("update_*.json"))) == 1
+
+
+def _desktop_correlated_receipt(home, correlation):
+    """Desktop's managed SSH receipt lookup (managed-ssh-update.ts ``receipt()``)."""
+    directory = home / "logs" / "update_receipts"
+    for path in sorted(directory.glob("update_*.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("correlation_id") != correlation:
+            continue
+        if payload.get("outcome") == "running" or not payload.get("finished_at"):
+            continue
+        return payload
+    return None
+
+
+class TestLauncherCorrelation:
+    """Desktop matches the remote receipt by HERMES_UPDATE_CORRELATION_ID (#101516)."""
+
+    CORRELATION = "1e7cb007-a6f8-4f6c-badb-d80e204942bf"
+
+    def test_receipt_carries_launcher_correlation(self, receipt_home, monkeypatch):
+        monkeypatch.setenv("HERMES_UPDATE_CORRELATION_ID", self.CORRELATION)
+        ur.begin_update_receipt()
+        update_id = ur.current_correlation_id()
+        _finalize("success")
+
+        payload = _desktop_correlated_receipt(receipt_home, self.CORRELATION)
+        assert payload is not None
+        assert payload["outcome"] == "success"
+        # update_id stays the CLI's own id (pm sync receipts bind to it).
+        assert payload["update_id"] == update_id != self.CORRELATION
+
+    def test_handoff_receipt_keeps_correlation(self, receipt_home, monkeypatch):
+        monkeypatch.setenv("HERMES_UPDATE_CORRELATION_ID", self.CORRELATION)
+        ur.begin_update_receipt()
+        pre_swap = dict(ur._current.get().data)
+        with ur.update_receipt_scope():
+            # The post-swap interpreter need not inherit the env var.
+            monkeypatch.delenv("HERMES_UPDATE_CORRELATION_ID")
+            ur.begin_update_receipt(previous=pre_swap, correlation_id=pre_swap["update_id"])
+            _finalize("success")
+        assert _desktop_correlated_receipt(receipt_home, self.CORRELATION) is not None
+
+    def test_legacy_handoff_receipt_gains_correlation(self, receipt_home, monkeypatch):
+        # A pre-swap receipt from an older updater has no correlation_id field.
+        monkeypatch.setenv("HERMES_UPDATE_CORRELATION_ID", self.CORRELATION)
+        ur.begin_update_receipt(previous={"update_id": "abc123", "steps": []}, correlation_id="abc123")
+        _finalize("success")
+        assert _desktop_correlated_receipt(receipt_home, self.CORRELATION)["update_id"] == "abc123"
+
+    def test_no_launcher_correlation_is_null(self, receipt_home, monkeypatch):
+        monkeypatch.delenv("HERMES_UPDATE_CORRELATION_ID", raising=False)
+        ur.begin_update_receipt()
+        _finalize("success")
+        assert ur.read_latest_receipt()["correlation_id"] is None
 
 
 @pytest.mark.parametrize("gateway_mode", [False, True])
@@ -256,7 +312,6 @@ def test_invalid_update_config_exits_cleanly_with_failed_receipt(receipt_home, m
     monkeypatch.setattr(hermes_main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(hermes_main, "_finalize_update_output", lambda state: None)
     monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
-    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
     monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "test")
     class FakeLock:
         holder = None
@@ -290,7 +345,6 @@ def test_unreadable_update_config_fails_cleanly(receipt_home, monkeypatch, capsy
     monkeypatch.setattr(hermes_main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(hermes_main, "_finalize_update_output", lambda state: None)
     monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
-    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
     monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "test")
     monkeypatch.setattr(hermes_config, "load_config", lambda: (_ for _ in ()).throw(OSError("unreadable config")))
     exit_codes = []
@@ -347,7 +401,7 @@ class TestFleetClassification:
             json.dumps(gateway_record), encoding="utf-8"
         )
         monkeypatch.setattr(
-            "hermes_cli.build_info.get_code_identity",
+            "hermes_cli.version_info.get_code_identity",
             lambda refresh=False: {"sha": expected_sha, "short_sha": expected_sha[:8],
                                    "version": "1.0", "source": "git"},
         )
@@ -373,7 +427,7 @@ class TestFleetClassification:
         home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setattr(
-            "hermes_cli.build_info.get_code_identity",
+            "hermes_cli.version_info.get_code_identity",
             lambda refresh=False: {"sha": "a" * 40, "short_sha": "a" * 8,
                                    "version": "1.0", "source": "git"},
         )
@@ -512,7 +566,7 @@ class TestGatewayStatusStamping:
         import gateway.status as gs
 
         monkeypatch.setattr(
-            "hermes_cli.build_info.get_code_identity",
+            "hermes_cli.version_info.get_code_identity",
             lambda refresh=False: {"sha": "c" * 40, "short_sha": "c" * 8,
                                    "version": "2.0", "source": "git"},
         )
@@ -526,7 +580,7 @@ class TestGatewayStatusStamping:
         def _boom(refresh=False):
             raise RuntimeError("no build info")
 
-        monkeypatch.setattr("hermes_cli.build_info.get_code_identity", _boom)
+        monkeypatch.setattr("hermes_cli.version_info.get_code_identity", _boom)
         record = gs._build_runtime_status_record()
         # Must not raise, and must not stamp bogus values.
         assert "code_sha" not in record

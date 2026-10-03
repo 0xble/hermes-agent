@@ -28,7 +28,8 @@ from typing import Iterable
 # name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT)")
+    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "HERMES_RPC_|HERMES_KERNEL_DIR)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -76,9 +77,32 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # env; a snapshot taken inside that window would re-assert them on every
         # later ``source`` and fence the PARENT session's kanban CLI (#90782).
         "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION "
+        # Remote code-execution channel vars (RPC token, kernel/rpc dirs): a
+        # leaked token in the snapshot would re-export into every later command
+        # on the backend and outlive the private dir it protects.
+        "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")
+
+
+def _shell_state_dump(tmp_path: str, excluded_names: Iterable[str] = ()) -> str:
+    """Shell snippet writing the whole replayable shell state to *tmp_path*: exports (via
+    ``_export_dump_excluding_session_vars``), then functions and aliases. Both snapshot writers
+    (the bootstrap and the per-command re-dump) MUST use this one snippet: the re-dump replaces the
+    snapshot, so a writer that dumps only exports silently deletes every function and alias after
+    the first command. Functions are filtered by NAME via ``declare -F`` (a line-based
+    ``declare -f | grep -v`` strips the header and leaves an orphaned body that breaks every sourced
+    command); the non-empty guard matters because bare ``declare -f`` dumps ALL functions. The
+    trailing ``shopt``/``set`` lines make aliases expand under ``bash -c`` and keep a profile's
+    ``set -eu`` from killing later commands. Succeeds only if every write to *tmp_path* did."""
+    return (
+        f"{_export_dump_excluding_session_vars(tmp_path, excluded_names)} && "
+        "{ __hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true; "
+        "if [ -n \"$__hermes_fns\" ]; then declare -f $__hermes_fns 2>/dev/null; fi; "
+        "alias -p; "
+        "printf '%s\\n' 'shopt -s expand_aliases' 'set +e' 'set +u'; "
+        f"}} >> {tmp_path}")
 
 
 def _snapshot_bootstrap_script(
@@ -87,23 +111,16 @@ def _snapshot_bootstrap_script(
     """Login-shell bootstrap that captures env/functions/aliases into the snapshot. Atomic publish:
     assemble in a ``mktemp`` file, then ``mv`` over the final path so a concurrent ``source`` never
     reads a half-written snapshot (``$$`` is the parent PID in ``&``-launched subshells and macOS
-    bash 3.2 lacks ``$BASHPID``, so only ``mktemp`` is portable). Functions are filtered by NAME via
-    ``declare -F`` (a line-based ``declare -f | grep -v`` strips the header and leaves an orphaned
-    body that breaks every sourced command); the non-empty guard matters because bare ``declare -f``
-    dumps ALL functions. The trailing ``cd`` restores the configured cwd after profile scripts (e.g.
-    ``cd ~``) so ``pwd -P`` reports terminal.cwd, not the profile's directory."""
+    bash 3.2 lacks ``$BASHPID``, so only ``mktemp`` is portable). The state written is
+    ``_shell_state_dump``, shared with the per-command re-dump. The trailing ``cd`` restores the
+    configured cwd after profile scripts (e.g. ``cd ~``) so ``pwd -P`` reports terminal.cwd, not
+    the profile's directory."""
     return (
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) || exit 1\n"
-        f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names)}\n"
-        "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
-        f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {_SNAP_TMP} 2>/dev/null || true\n"
-        f"alias -p >> {_SNAP_TMP}\n"
-        f"echo 'shopt -s expand_aliases' >> {_SNAP_TMP}\n"
-        f"echo 'set +e' >> {_SNAP_TMP}\n"
-        f"echo 'set +u' >> {_SNAP_TMP}\n"
         # Publish only if assembly succeeded; otherwise drop the partial temp.
-        f"mv -f {_SNAP_TMP} {quoted_snap} || rm -f {_SNAP_TMP}\n"
+        f"{_shell_state_dump(_SNAP_TMP, excluded_names)} && mv -f {_SNAP_TMP} {quoted_snap} "
+        f"|| rm -f {_SNAP_TMP}\n"
         f"builtin cd -- {quoted_cwd} 2>/dev/null || true\n"
         f"{_cwd_marker_printf(cwd_marker)}\n")
 
@@ -131,9 +148,10 @@ def _wrap_command_script(
     ``source`` stdout goes to /dev/null because macOS bash 3.2 / some Homebrew builds echo
     ``declare -x`` lines when sourcing. AI_AGENT/HERMES_AGENT advertise the harness to remote
     backends (whose env is not inherited); ``${VAR:-default}`` never clobbers an outer harness.
-    GIT_PAGER/PAGER=cat stop pager-happy tools hanging a PTY-backed command. The env re-dump
-    uses the same mktemp+mv atomic publish as the bootstrap and chains ``mv`` on the dump
-    succeeding so a failed dump never replaces a good snapshot. ``umask 077`` is applied after
+    GIT_PAGER/PAGER=cat stop pager-happy tools hanging a PTY-backed command. The state re-dump
+    writes the same ``_shell_state_dump`` as the bootstrap (exports, functions, aliases), uses the
+    same mktemp+mv atomic publish, and chains ``mv`` on the dump succeeding so a failed dump never
+    replaces a good snapshot. ``umask 077`` is applied after
     the user's command so snapshot files (which may carry secrets) are private without
     changing the command's umask.
     """
@@ -154,7 +172,7 @@ def _wrap_command_script(
     if snapshot_ready:
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
-            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
+            f"{{ {_shell_state_dump(_SNAP_TMP, passthrough_names)} "
             f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]

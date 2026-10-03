@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -241,9 +242,16 @@ async def test_queued_voice_transcribes_immediately_and_drain_reuses_it():
         assert release_stt.wait(timeout=3)
         return {"success": True, "transcript": "queued hello", "provider": "mock"}
 
-    with patch("tools.transcription_tools.transcribe_audio", side_effect=_transcribe) as mock_transcribe:
-        runner._queue_or_replace_pending_event(session_key, event)
+    with (
+        patch("tools.transcription_tools.transcribe_audio", side_effect=_transcribe) as mock_transcribe,
+        patch.object(runner, "_BUSY_QUEUE_MAX_PENDING", 1),
+    ):
+        assert runner._queue_or_replace_pending_event(session_key, event) is True
         assert adapter._pending_messages[session_key] is event  # still queued, FIFO unchanged
+        refused = _voice_event(source, event.media_urls)
+        assert runner._queue_or_replace_pending_event(session_key, refused) is False
+        assert not getattr(refused, "_gateway_accepted", False)
+        assert not hasattr(refused, "_gateway_pending_stt_prefetch")
         assert await asyncio.to_thread(stt_started.wait, 3)  # STT began before any drain
 
         # Current task finishes while STT is still running: the drain joins the in-flight call.
@@ -299,6 +307,156 @@ async def test_text_merged_during_inflight_stt_is_not_lost():
         )
 
     assert "spoken part" in pending and "typed part" in pending
+
+
+@pytest.mark.asyncio
+async def test_fifo_voice_from_queue_command_prefetches_before_drain():
+    adapter = _PendingVoiceAdapter()
+    runner = _run_agent_runner(adapter)
+    source = _source()
+    event = MessageEvent(
+        text="/queue", message_type=MessageType.VOICE, source=source,
+        media_urls=["/tmp/explicit-queue.ogg"], media_types=["audio/ogg"],
+    )
+    with patch("tools.transcription_tools.transcribe_audio", return_value={
+        "success": True, "transcript": "explicit queue", "provider": "mock",
+    }) as transcribe:
+        reply = await runner._busy_queue_command(event, "telegram:dm:12345", source)
+        queued = adapter._pending_messages["telegram:dm:12345"]
+        await asyncio.wait_for(queued._gateway_pending_stt_prefetch, 3)
+        text, _transcripts = await runner._transcribe_pending_audio_event_once(queued)
+    assert reply.startswith("Queued for the next turn")
+    assert text == '"explicit queue"'
+    transcribe.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_voices_limit_provider_concurrency():
+    adapter = _PendingVoiceAdapter()
+    runner = _run_agent_runner(adapter)
+    source = _source()
+    lock = threading.Lock()
+    active = peak = 0
+    release = threading.Event()
+
+    def transcribe(*_args):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            assert release.wait(5)
+            return {"success": True, "transcript": "spoken", "provider": "mock"}
+        finally:
+            with lock:
+                active -= 1
+
+    events = [MessageEvent(
+        text="", message_type=MessageType.VOICE, source=source,
+        media_urls=[f"/tmp/queued-{i}.ogg"], media_types=["audio/ogg"],
+    ) for i in range(8)]
+    with patch("tools.transcription_tools.transcribe_audio", side_effect=transcribe):
+        try:
+            for event in events:
+                runner._queue_or_replace_pending_event("telegram:dm:12345", event)
+            deadline = time.monotonic() + 2
+            while peak < 2 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            assert peak == 2
+            assert all(e._gateway_pending_stt_prefetch for e in events)
+        finally:
+            release.set()
+            await asyncio.gather(*(e._gateway_pending_stt_prefetch for e in events))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_prefetch_retains_result_without_second_stt():
+    adapter = _PendingVoiceAdapter()
+    runner = _run_agent_runner(adapter)
+    source = _source()
+    event = MessageEvent(
+        text="", message_type=MessageType.VOICE, source=source,
+        media_urls=["/tmp/cancelled-voice.ogg"], media_types=["audio/ogg"],
+    )
+    started, release = threading.Event(), threading.Event()
+
+    def transcribe(*_args):
+        started.set()
+        assert release.wait(5)
+        return {"success": True, "transcript": "retained", "provider": "mock"}
+
+    with patch("tools.transcription_tools.transcribe_audio", side_effect=transcribe) as mock_stt:
+        runner._queue_or_replace_pending_event("telegram:dm:12345", event)
+        assert await asyncio.to_thread(started.wait, 3)
+        inner = event._gateway_pending_stt_task
+        assert inner in runner._background_tasks
+        event._gateway_pending_stt_prefetch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await event._gateway_pending_stt_prefetch
+        try:
+            assert inner in runner._background_tasks
+        finally:
+            release.set()
+        await inner
+        await asyncio.sleep(0)
+        text, transcripts = await runner._transcribe_pending_audio_event_once(event)
+    assert text == '"retained"'
+    assert transcripts == ["retained"]
+    assert not hasattr(event, "_gateway_pending_stt_task")
+    mock_stt.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_both_prefetch_and_inner_stt():
+    adapter = _PendingVoiceAdapter()
+    runner = _run_agent_runner(adapter)
+    event = MessageEvent(
+        text="", message_type=MessageType.VOICE, source=_source(),
+        media_urls=["/tmp/shutdown-voice.ogg"], media_types=["audio/ogg"],
+    )
+    started, release = threading.Event(), threading.Event()
+
+    def transcribe(*_args):
+        started.set()
+        assert release.wait(5)
+        return {"success": True, "transcript": "too late"}
+
+    with patch("tools.transcription_tools.transcribe_audio", side_effect=transcribe):
+        runner._queue_or_replace_pending_event("telegram:dm:12345", event)
+        assert await asyncio.to_thread(started.wait, 3)
+        inner = event._gateway_pending_stt_task
+        # The shutdown sweep cancels every tracked task in one snapshot.
+        tasks = list(runner._background_tasks)
+        for task in tasks:
+            task.cancel()
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert inner.cancelled()
+            assert not hasattr(event, "_gateway_pending_stt_task")
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+async def test_failed_queued_voice_has_visible_note_without_fake_transcript():
+    adapter = _PendingVoiceAdapter()
+    runner = _run_agent_runner(adapter)
+    event = MessageEvent(
+        text="", message_type=MessageType.VOICE, source=_source(),
+        media_urls=["/tmp/failed-voice.ogg"], media_types=["audio/ogg"],
+    )
+    with (
+        patch("tools.transcription_tools.transcribe_audio", return_value={"success": False, "error": "provider down"}),
+        patch("tools.transcription_tools.transcribe_audio_local_fallback", return_value={"success": False, "error": "unavailable"}),
+    ):
+        runner._queue_or_replace_pending_event("telegram:dm:12345", event)
+        await event._gateway_pending_stt_prefetch
+        text, transcripts = await runner._transcribe_pending_audio_event_once(event)
+    assert "could not be transcribed" in text
+    assert transcripts == []
+    assert not adapter.sent
 
 
 @pytest.mark.asyncio

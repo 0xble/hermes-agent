@@ -24,7 +24,7 @@ def accepted_release_baseline(root: Path, revision: str | None = None) -> str | 
     """
     if revision is None:
         try:
-            text = (root / "MAINTENANCE.md").read_text(encoding="utf-8")
+            text = (root / "MAINTENANCE.md").read_text(encoding="utf-8-sig")
         except OSError:
             return None
     else:

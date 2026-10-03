@@ -6,11 +6,15 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.24 + qualified checkpoint`, `ca6782850432927f33df4775cb6dd45bb51460d2`.
-Brian explicitly selected this exact upstream checkpoint on 2026-09-25 for
-one sync and personal-runtime promotion. It contains released baseline
-`v2026.9.24` (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) plus 256 upstream
-commits, with successful upstream CI run `36022678358` and over 24 hours of age.
+`v2026.9.24 + qualified checkpoint`, `eb8d21f482142c236550762ebdb5df4004c39696`.
+Brian authorized a newer stable pre-tip checkpoint on 2026-09-30 for one
+sync and personal-runtime promotion. This selected checkpoint retains prior
+`ca6782850432927f33df4775cb6dd45bb51460d2` and released baseline
+`v2026.9.24` (`f97608f178d1ffeca59860195ab7da295f7c8e5f`) as ancestors.
+Upstream CI run `36801643187` succeeded in every substantive lane, with no
+cancelled lanes. The selected revision was 86 commits before frozen upstream
+tip `484ebdf16a5127894f16ba883e9630968f945c5e`. Fork qualification and
+independent exact-head review remain required before promotion.
 This one-run non-release exception does not change recurring release selection
 or waive fork tests, independent review, protected landing, or backup safeguards.
 
@@ -50,9 +54,12 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |
+| Launchd account home | Keep service labels and plist placement on the same real account identity even when process HOME changes | Service naming, sandbox gateway startup or launchd profile ownership | [Launchd account home](maintenance/launchd-account-home.md) |
+| Build store dependencies | Resolve package hook dependencies from the caller-owned build store, with scoped cleanup and ordinary sealed-store fallback | PM install lifecycle, dependency lookup, archived web builds, or ARM64 Windows ripgrep staging | [Build store dependencies](maintenance/build-store-dependencies.md) |
 | TTS discovery without installation | Defer optional SDK installation until TTS use instead of blocking unrelated turns | TTS capability registration, lazy SDK imports, or tool-schema discovery changes | [TTS discovery](maintenance/tts-discovery-no-install.md) |
 | Goal lifecycle | Complete judge criteria, conversational recovery of blocker pauses, and durable command authority during judging | Goal judging, admission, continuation, or concurrent goal-command changes | [Goal lifecycle](maintenance/goal-lifecycle.md) |
 | Parked goal idle wake | A parked goal resumes when its wait ends, even when no completion turn arrives (restart-killed process, no notify, elapsed timer) | Goal wait barriers, the gateway loop wakeup watcher, TUI notification poller, or restart process cleanup changes | [Parked goal idle wake](maintenance/goal-parked-idle-wake.md) |
+| Gateway stop stays stopped | `/stop` pauses the standing goal and holds the completions it produced until the user's next turn | Gateway `/stop`, completion injection, or goal pause/revival changes | [Gateway stop stays stopped](maintenance/gateway-stop-stays-stopped.md) |
 | Telegram rendering | Preserve rich mode selection and prompt/delivery agreement | Telegram rendering changes and every upstream sync; also load runtime ownership before promotion | [Telegram rendering](maintenance/telegram-rendering.md) |
 | Session-link rendering | Keep internal session references on Desktop only while preserving Telegram link-target safety | Session-search result or platform dispatch changes | [Session-link rendering](maintenance/session-link-rendering.md) |
 | Telegram inbound Rich Messages | Formatted pastes reach the agent as Markdown; unclaimed message families are logged, not dropped | Telegram handler registration, inbound classification, mention sources, or reply context changes | [Telegram inbound Rich Messages](maintenance/telegram-inbound-rich-messages.md) |
@@ -61,6 +68,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Copilot ACP usage-less compaction | ACP responses report unknown usage, never fabricated zeros, so estimate-driven compaction still fires | Copilot ACP client response or usage accounting changes | [Copilot ACP usage](maintenance/copilot-acp-usage.md) |
 | Nightly concurrency and compaction regressions | Preserve early process output, tolerate concurrent DB quarantine, and exercise actual ACP summarization | Process heartbeat, state DB preflight/quarantine, or ACP compaction E2E changes | [Nightly regression repairs](maintenance/nightly-regression-0926b.md) |
 | Foreground command exit cleanup | Fence graceful exit against spawning foreground commands so no child outlives its host | Foreground spawn publication, terminal environment process-exit cleanup, or live foreground killing changes | [Foreground exit cleanup](maintenance/foreground-exit-cleanup.md) |
+| Snapshot keeps shell functions | Functions and aliases survive every command of a terminal session, not just the first | Terminal session snapshot bootstrap or per-command re-dump changes | [Snapshot functions](maintenance/snapshot-keep-functions.md) |
 | Explicit topic title receipts | Report the stored alias and actual Bot API rename result | `/title` Telegram topic changes and upstream title sync | [Explicit title receipts](maintenance/telegram-title-receipts.md) |
 | Cron fallback routing | Keep scheduled agents' backup chain independent of interactive routing | Changing cron/provider resolution or evaluating an upstream release | [Cron fallback routing](maintenance/cron-fallback-routing.md) |
 | Cron restart survival | Keep launchd-managed macOS cron workers alive through gateway process-group termination | Cron external worker dispatch, liveness recovery, or launchd restart changes | [Cron restart survival](maintenance/cron-restart-survival.md) |
@@ -79,12 +87,14 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Plugin-claimed failure notices | A plugin that recovers a child failure (review fallback) can suppress the premature "Subagent failed" notice, decided once per failure | Subagent failure notice or `subagent_failure_notice` hook changes | [Review fallback notice](maintenance/review-fallback-notice.md) |
 | Hygiene prompt not reused | A prompt persisted by memory-only gateway hygiene compaction is rebuilt on the next real turn, not adopted as a surface | Stored-prompt restore or hygiene compaction prompt handling | [Hygiene prompt not reused](maintenance/hygiene-prompt-not-reused.md) |
 | Gateway commands while busy | Preserve alias expansion and defer-until-idle on the busy path | Busy-session guards, `quick_commands`, or slash-command admission changes | [Gateway commands](maintenance/gateway-commands.md) |
-| Background topic recovery | Keep detached background answers in recovered Telegram DM topics without cross-topic reply anchors | `/bg` or Telegram DM-topic source routing changes | [Background topic recovery](maintenance/background-topic-recovery.md) |
+| Background topic recovery | Keep detached `/bg` and `/btw` answers in recovered Telegram DM topics without cross-topic reply anchors | `/bg`, `/btw`, or Telegram DM-topic source routing changes | [Background topic recovery](maintenance/background-topic-recovery.md) |
 | Live gateway inference controls | Apply busy `/reasoning` and `/fast` at the live agent's next model request without eviction | Gateway inference controls, agent request overrides, or cache wiring | [Live inference controls](maintenance/live-inference-controls.md) |
-| Queued voice transcription | Transcribe and echo queued voice immediately, reuse it at drain | Busy queueing, pending-event STT cache, transcript echo, or drain changes | [Queued voice STT](maintenance/queued-voice-stt.md) |
+| Queued voice transcription | Transcribe and echo queued voice immediately with bounded concurrency, reuse it at drain | Busy queueing, pending-event STT cache, transcript echo, or drain changes | [Queued voice STT](maintenance/queued-voice-stt.md) |
+| Worktree GC Git isolation | Host Git config never hides files from the reclaim safety check; every listed path is archived exactly or the worktree is kept | Worktree-GC dirty checks, archiving, or reclaim changes | [Worktree GC Git isolation](maintenance/worktree-gc-git-isolation.md) |
 | Camofox accounts and vault | Preserve named accounts, Connect/secret-safe fills, shadow-DOM login forms | Browser account, vault, or 1Password backend changes | [Camofox and vault](maintenance/camofox-vault.md) |
 | Camofox navigation titles | Return the exact owned tab's title without crossing account boundaries | Camofox navigation or tab-list changes | [Camofox navigation titles](maintenance/camofox-navigation-titles.md) |
 | Browser upload | Attach local files to the page's upload control, including cross-origin iframes, with safe path checks and staging | Camofox tab actions, upload route, or `uploads_dir` changes | [Browser upload](maintenance/browser-upload.md) |
+| Slack ordered list numbering | Preserve authored starts across paragraphs, bullets, and nesting | Slack rich-text list parsing, grouping, or outbound Block Kit rendering changes | [Slack ordered list numbering](maintenance/slack-ordered-list-numbering.md) |
 | Slack status on the legacy API | Thread status and its clear stay on `assistant.threads.setStatus`; titles may use Agent Sessions | Slack status/title calls or upstream Agent Sessions changes | [Slack status legacy](maintenance/slack-status-legacy.md) |
 | Agent secret entry | The agent may type a self-fetched password when the vault has no item for the origin, and a self-fetched code when the vault cannot mint one; values shown on a page or in chat never count | Vault tool descriptions, the browser input vault note, or upstream vault prompt changes | [Agent secret entry](maintenance/agent-secret-entry.md) |
 | Security guidance plugin | Keep bounded path-aware security pattern guidance and explicit warning/block semantics | Security-guidance pattern, plugin wiring, or focused-test changes | [Security guidance plugin](maintenance/security-guidance.md) |

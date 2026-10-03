@@ -1,0 +1,117 @@
+"""Parked recovery uses coordinator authority and a fully injected launchctl."""
+import os
+import plistlib
+import subprocess
+
+import pytest
+
+from gateway.generation import GenerationCoordinator, GenerationIdentity
+from hermes_cli import gateway_guardian as guardian
+
+
+def layout(tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir()
+    release = home / 'releases' / ('a' * 40)
+    release.mkdir(parents=True)
+    for marker in ('.release-ready', '.hermes_build_sha'):
+        (release / marker).write_text(release.name, encoding="utf-8")
+    (home / 'current').symlink_to(release)
+    (home / 'config.yaml').write_text('gateway:\n  forward_only_handover:\n    enabled: true\n', encoding="utf-8")
+    return home, release
+
+
+def fake_launchctl(label, plist, home, *, pid=None, bootout_succeeds=True):
+    calls = []
+    state = {'loaded': True, 'rebootstrapped': False}
+    def run(argv, **kwargs):
+        calls.append(argv[1:])
+        if argv[1] == 'print':
+            loaded = state['loaded'] and argv[2] == f'gui/{os.getuid()}/{label}'  # windows-footgun: ok (macos_only caller)
+            output = 'state = waiting\nlast exit code = 0\n'
+            if pid or state['rebootstrapped']:
+                output += f'pid = {pid or 789}\n'
+            return subprocess.CompletedProcess(argv, 0 if loaded else 113,
+                stdout=output if loaded else '', stderr='' if loaded else 'Could not find service')
+        if argv[1] == 'bootout' and bootout_succeeds:
+            state['loaded'] = False
+        if argv[1] == 'bootstrap':
+            state.update(loaded=True, rebootstrapped=True)
+            assert plistlib.loads(plist.read_bytes())['EnvironmentVariables']['HERMES_GENERATION_SCOPE'] != 'old'
+            # Retirement precedes launch actions and never releases the lease.
+            db = GenerationCoordinator(home)
+            assert all(row['state'] == 'exited' for row in db.generations() if row['label'] == label)
+        return subprocess.CompletedProcess(argv, 0, stdout='', stderr='')
+    return run, calls, state
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize('case', ['dead', 'reboot', 'live', 'unknown', 'other-serving', 'drainer', 'running', 'bootout-fails', 'capped'])
+def test_parked_repair_is_service_only_and_death_fenced(tmp_path, monkeypatch, case):
+    monkeypatch.setattr('gateway.generation._boot_id', lambda: 'boot')
+    home, release = layout(tmp_path)
+    label = 'ai.hermes.gateway'
+    db = GenerationCoordinator(home)
+    old = GenerationIdentity.create(release_sha=release.name, label=label, pid=123,
+        start_fingerprint='123:1', boot_id='prior' if case == 'reboot' else 'boot')
+    db.register(old, state='serving')
+    db.acquire_lease('active_generation', old.id)
+    if case in {'drainer', 'other-serving'}:
+        successor = GenerationIdentity.create(release_sha=release.name, label='successor',
+                                             pid=456, boot_id='boot')
+        db.register(successor)
+        db.request_transfer(old.id, successor.id, 1, set())
+        db.commit_transfer(old.id, successor.id, 1)
+        if case == 'drainer':
+            db.heartbeat(old.id, state='exited')
+    monkeypatch.setattr('gateway.status._pid_exists', lambda pid: case in {'live', 'unknown', 'running'})
+    monkeypatch.setattr('gateway.status._get_process_start_time', lambda pid: None if case == 'unknown' else 1)
+    if case == 'drainer':
+        release = home / 'releases' / ('b' * 40)  # Completed labels may pin a previous release.
+    plist = tmp_path / 'service.plist'
+    plist.write_bytes(plistlib.dumps({'Label': label, 'WorkingDirectory': str(release),
+        'EnvironmentVariables': {'HERMES_HOME': str(home), 'HERMES_GENERATION_SCOPE': 'old'}}))
+    runner, calls, state = fake_launchctl(label, plist, home, pid=123 if case == 'running' else None,
+                                         bootout_succeeds=case != 'bootout-fails')
+    monkeypatch.setattr(guardian, 'healthy', lambda *args: state['rebootstrapped'])
+    if case == 'capped':
+        for _ in range(guardian.MAX_REPAIRS):
+            guardian.receipt(home, 'bootstrap', 'attempt', label=label)
+    outcome = guardian.run_once(home, plist, label, grace=12, domain=f'gui/{os.getuid()}', launchctl_runner=runner)  # windows-footgun: ok (macos_only test)
+    mutations = [call[0] for call in calls if call[0] in {'bootout', 'bootstrap'}]
+    if case in {'dead', 'reboot'}:
+        assert outcome == 'repaired' and mutations == ['bootout', 'bootstrap']
+        retired = next(row for row in db.generations() if row['id'] == old.id)
+        assert (retired['state'], retired['verdict'], retired['verdict_evidence']) == (
+            'exited', 'failed', 'boot_changed' if case == 'reboot' else 'dead')
+        assert db.leases()[0]['generation_id'] == old.id and db.leases()[0]['state'] == 'active'
+        assert guardian._repair_count(home) == 1
+    elif case == 'drainer':
+        assert outcome == 'cleaned' and mutations == ['bootout']
+        assert guardian._repair_count(home) == 0
+    elif case == 'bootout-fails':
+        assert outcome == 'alert' and mutations == ['bootout']
+    elif case == 'capped':
+        assert outcome == 'capped' and mutations == []
+    else:
+        assert outcome == 'waiting' and mutations == []
+
+
+@pytest.mark.platforms("macos")
+def test_health_probe_uses_injected_launchctl(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import json
+    import psutil
+    home, release = layout(tmp_path)
+    (home / 'gateway_state.json').write_text(json.dumps({'pid': 123, 'gateway_state': 'running',
+        'code_sha': release.name, 'updated_at': guardian.datetime.now(guardian.timezone.utc).isoformat()}),
+        encoding='utf-8')
+    monkeypatch.setattr(guardian.subprocess, 'run', lambda *args, **kwargs: pytest.fail('real launchctl'))
+    calls = []
+    def launchctl(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout='"PID" = 123;', stderr='')
+    monkeypatch.setattr(psutil, 'Process', lambda pid: SimpleNamespace(is_running=lambda: True,
+        parents=lambda: [], cwd=lambda: str(release)))
+    assert guardian.healthy(home, 'ai.hermes.gateway', release, launchctl)
+    assert calls == [['launchctl', 'list', 'ai.hermes.gateway']]
