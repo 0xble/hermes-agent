@@ -548,6 +548,12 @@ class TurnRunner:
         # A permanent edit failure already moved progress to a fresh bubble that has not yet been
         # edited successfully. A second failure in a row means edits are unusable, not one dead bubble.
         reanchored: bool = False
+        # Monotonic deadline set by a flood refusal. Until it passes, new lines are only buffered:
+        # no edit, split, or send, so a refused bubble is not retried once per incoming tool line.
+        defer_until: float = 0.0
+
+    # Minimum seconds between progress edits (Telegram flood control).
+    _PROGRESS_EDIT_INTERVAL = 1.5
 
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
@@ -617,6 +623,8 @@ class TurnRunner:
         groups = self._split_progress_groups(st, st.progress_lines)
         if len(groups) <= 1:
             return False
+        if self._progress_deferred(st):
+            return True
         if st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
             if result.success:
@@ -651,12 +659,18 @@ class TurnRunner:
         the platform just said is exhausted.
         """
         if cls._is_flood_refusal(result):
-            logger.info("[%s] Progress edit flood control, deferring to the next edit", st.adapter.name)
+            wait = max(float(getattr(result, "retry_after", None) or 0.0), cls._PROGRESS_EDIT_INTERVAL)
+            st.defer_until = time.monotonic() + wait
+            logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
             return True
         if getattr(result, "retryable", False):
             logger.debug("[%s] Transient progress edit failure, retrying next tick", st.adapter.name)
             return True
         return False
+
+    @staticmethod
+    def _progress_deferred(st) -> bool:
+        return time.monotonic() < st.defer_until
 
     @staticmethod
     def _abandon_progress_bubble(st) -> bool:
@@ -692,7 +706,8 @@ class TurnRunner:
         return raw
 
     async def _flush_progress_edit(self, st) -> None:
-        if st.can_edit and st.progress_lines and st.progress_msg_id:
+        # A deferred bubble may still hold an unsplit, over-limit buffer: never send that as one edit.
+        if st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_deferred(st):
             with suppress(Exception):
                 await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
 
@@ -762,7 +777,7 @@ class TurnRunner:
             return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
+        EDIT_INTERVAL = self._PROGRESS_EDIT_INTERVAL
         while True:
             try:
                 if not ctx._run_still_current():
@@ -778,6 +793,13 @@ class TurnRunner:
                     self._reset_progress_bubble(st)
                     continue
                 msg = self._progress_absorb(st, raw)
+                defer_remaining = st.defer_until - time.monotonic()
+                if defer_remaining > 0:
+                    # Inside a flood refusal: wait it out, then edit once with everything buffered
+                    # meanwhile, instead of retrying the refused bubble once per incoming line.
+                    await asyncio.sleep(defer_remaining)
+                    if not ctx._run_still_current():
+                        return
                 if not await self._roll_progress_overflow_if_needed(st):
                     # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
                     # proactively rate-limit rather than react to 429s). Loop back to drain further
