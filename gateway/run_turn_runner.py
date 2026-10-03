@@ -545,6 +545,9 @@ class TurnRunner:
         _progress_len_fn: Any
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
+        # A permanent edit failure already moved progress to a fresh bubble that has not yet been
+        # edited successfully. A second failure in a row means edits are unusable, not one dead bubble.
+        reanchored: bool = False
 
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
@@ -616,14 +619,15 @@ class TurnRunner:
             return False
         if st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(groups[0]))
-            if not result.success:
-                if getattr(result, "retryable", False):
-                    logger.debug("[%s] Transient overflow edit failure — keeping can_edit=True", st.adapter.name)
-                    return True
-                st.can_edit = False
-                # Fall back to the existing non-edit behavior.
+            if result.success:
+                st.reanchored = False
+                groups = groups[1:]
+            elif self._edit_failure_is_deferrable(st, result):
+                # Keep the buffer intact; the next tick retries the same split.
+                return True
+            elif not self._abandon_progress_bubble(st):
                 return False
-            groups = groups[1:]
+            # An abandoned bubble never received groups[0], so it is re-sent below in a fresh one.
         for group in groups:
             result = await self._send_progress_text(st, self._progress_text(group))
             if result.success and result.message_id:
@@ -631,6 +635,39 @@ class TurnRunner:
         # The newest continuation is the only mutable bubble: keep just its lines so later
         # edits update it instead of replaying the full transcript into new messages.
         st.progress_lines = groups[-1]
+        return True
+
+    @staticmethod
+    def _is_flood_refusal(result) -> bool:
+        error = (getattr(result, "error", "") or "").lower()
+        return getattr(result, "retry_after", None) is not None or any(w in error for w in ("flood", "retry after"))
+
+    @classmethod
+    def _edit_failure_is_deferrable(cls, st, result) -> bool:
+        """Transient and rate-limit edit failures leave the bubble editable for a later tick.
+
+        A flood refusal says "not now", not "never": disabling edits on it turns every later tool
+        line into its own message for the rest of the turn, and sending one now spends the budget
+        the platform just said is exhausted.
+        """
+        if cls._is_flood_refusal(result):
+            logger.info("[%s] Progress edit flood control, deferring to the next edit", st.adapter.name)
+            return True
+        if getattr(result, "retryable", False):
+            logger.debug("[%s] Transient progress edit failure, retrying next tick", st.adapter.name)
+            return True
+        return False
+
+    @staticmethod
+    def _abandon_progress_bubble(st) -> bool:
+        """After a permanent edit failure, continue in a fresh bubble (True) unless the previous
+        fresh bubble also failed, which means editing itself is unusable (False, can_edit off)."""
+        if st.reanchored:
+            st.can_edit = False
+            return False
+        logger.info("[%s] Progress bubble no longer editable, starting a fresh one", st.adapter.name)
+        st.reanchored = True
+        st.progress_msg_id = None
         return True
 
     @staticmethod
@@ -687,22 +724,21 @@ class TurnRunner:
     async def _progress_send_or_edit(self, st, msg) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
 
-        Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
-        failures (not found, permissions) set can_edit=False. Flood control backs off but keeps editing.
+        Transient and flood failures keep the bubble and its lines for a later edit. A permanent
+        failure (not found, permissions) moves progress to a fresh bubble; only a second one in a
+        row sets can_edit=False.
         """
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
             if result.success:
+                st.reanchored = False
                 return True
-            if getattr(result, "retryable", False):
-                logger.debug("[%s] Transient edit failure — keeping can_edit=True", st.adapter.name)
-                return False
-            if any(w in (getattr(result, "error", "") or "").lower() for w in ("flood", "retry after")):
-                logger.info("[%s] Progress edit flood control, backing off", st.adapter.name)
-            else:
-                st.can_edit = False
-            await self._send_progress_text(st, msg)
-            return True
+            if self._edit_failure_is_deferrable(st, result):
+                # Flood keeps the throttle cadence (True); a bare transient error retries next tick.
+                return self._is_flood_refusal(result)
+            if self._abandon_progress_bubble(st):
+                # The fresh bubble starts at the newest line; the dead one keeps what it shows.
+                st.progress_lines = st.progress_lines[-1:]
         # First tool: send all accumulated text as a new message; editing unsupported: just this line.
         result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
         if result.success and result.message_id:
