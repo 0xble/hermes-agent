@@ -39,7 +39,7 @@ def locked_update_marker(home: Path):
 def same_update(path: Path, pending: dict) -> bool:
     """A watcher may finish after a new admission replaced the marker."""
     try:
-        current = json.loads(path.read_text(encoding="utf-8"))
+        current = json.loads(path.read_text(encoding="utf-8-sig"))
         if pending.get("request_id") or current.get("request_id"):
             return bool(pending.get("request_id") and current.get("request_id") == pending["request_id"])
         current.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())

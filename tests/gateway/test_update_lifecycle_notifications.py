@@ -11,7 +11,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.update_launcher import launch_native_update
-from gateway.update_notifications import final_outcome, read_pending
+from gateway.update_notifications import final_outcome, read_pending, same_update
 from tests.gateway.test_update_command import _make_runner
 from tests.gateway.update_fixtures import finalize_update
 
@@ -42,6 +42,14 @@ def pending(home, *, reason=True):
         data["reason"] = "Activating the delegation-label fix."
     launch_native_update(home=home, hermes_cmd=["hermes"], pending=data, spawn=Mock())
     return read_pending(home)[1]
+
+
+def test_same_update_accepts_bom_prefixed_marker(tmp_path):
+    pending = {"request_id": "request-1", "reason": "Apply the update"}
+    marker = tmp_path / ".update_pending.json"
+    marker.write_bytes(b"\xef\xbb\xbf" + json.dumps(pending).encode("utf-8"))
+
+    assert same_update(marker, pending)
 
 
 @pytest.mark.asyncio
