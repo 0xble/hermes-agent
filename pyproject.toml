@@ -232,6 +232,7 @@ documents = [
   "fonttools==4.65.0; sys_platform != 'android' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
   "playwright==1.62.0; sys_platform != 'android' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
   "pymupdf==1.27.2.3; sys_platform != 'android' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+  "reportlab==5.0.1; sys_platform != 'android' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
 ]
 hindsight-embedded = ["hindsight-all>=0.6.1,<1"]
 hindsight = ["hindsight-client>=0.6.1,<1"]
@@ -808,6 +809,7 @@ python-dotenv = false
 python-multipart = false
 python-olm = false
 python-pptx = false
+reportlab = false
 python-telegram-bot = false
 pyyaml = false
 qrcode = false
