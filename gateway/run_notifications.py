@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
@@ -38,6 +38,44 @@ def _update_failed_notice() -> str:
 # configured at all — no adapter will ever appear — would keep itself on disk and re-log a
 # deferred line on every poll, in every process, forever. Stop waiting past this age.
 _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS = 3600.0
+_UPDATE_MAX_PRIOR_OUTCOMES = 8
+_UPDATE_MAX_PRIOR_DETAIL_CHARS = 2800
+_UPDATE_MAX_NOTICE_CHARS = 4096
+
+
+def _bounded_previous_update_detail(detail: str, pending: dict[str, Any]) -> str:
+    """Render bounded prior-update history, including legacy nested markers."""
+    previous = pending.get("previous_outcome")
+    remaining = _UPDATE_MAX_PRIOR_DETAIL_CHARS
+    rendered = 0
+    while isinstance(previous, dict) and rendered < _UPDATE_MAX_PRIOR_OUTCOMES and remaining > 0:
+        prior_heading = "Previous update completed" if previous.get("success") else "Previous update failed"
+        prior_reason = str(previous.get("reason") or "").strip()
+        prior_detail = str(previous.get("detail") or "").strip()
+        fragment = "\n\n" + prior_heading + ": " + " ".join(
+            part for part in (prior_reason, prior_detail) if part
+        )
+        if len(fragment) > remaining:
+            fragment = fragment[:remaining - 1].rstrip() + "…"
+        detail += fragment
+        remaining -= len(fragment)
+        rendered += 1
+        previous = previous.get("previous_outcome")
+    omitted = pending.get("previous_outcome_older_count", 0)
+    if not isinstance(omitted, int) or isinstance(omitted, bool) or omitted < 0:
+        omitted = 0
+    if isinstance(previous, dict):
+        omitted += 1
+    if omitted and remaining:
+        fragment = f"\n\nOlder undelivered update history omitted: {omitted} update(s)."
+        detail += fragment[:remaining]
+    return detail
+
+
+def _bounded_update_notice(text: str) -> str:
+    if len(text) <= _UPDATE_MAX_NOTICE_CHARS:
+        return text
+    return text[:_UPDATE_MAX_NOTICE_CHARS - 1].rstrip() + "…"
 
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
@@ -508,10 +546,52 @@ class GatewayNotificationsMixin:
                 getattr(result, "error", None) or "no result")
         return result
 
+    def _schedule_update_notice_retry(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Housekeeping thread hands retries to the adapter's owning event loop."""
+        loop.call_soon_threadsafe(self._retry_update_notice_if_due)
+
+    def _retry_update_notice_if_due(self) -> None:
+        from gateway.update_notifications import read_pending
+        from gateway.run import _hermes_home
+        current = read_pending(_hermes_home)
+        if not current or current[1].get("notification_version") != 2:
+            return
+        watcher = getattr(self, "_update_notification_task", None)
+        if (watcher is not None and not watcher.done()) or getattr(self, "_update_final_send_active", False):
+            return
+        now = datetime.now(timezone.utc).timestamp()
+        try:
+            due = float(current[1].get("notice_retry_at", 0))
+        except (TypeError, ValueError):
+            due = 0
+        if now < due:
+            return
+        # Only one retry task per tick, even when a network send spans multiple ticks.
+        task = getattr(self, "_update_notice_retry_task", None)
+        if task is not None and not task.done():
+            return
+        self._update_notice_retry_task = asyncio.create_task(self._send_update_notification())
+
+    def _defer_update_notice(self, marker: Path, pending: dict, result=None) -> None:
+        from gateway.update_notifications import save_pending
+        from gateway.delivery_ledger import flood_wait_seconds
+        attempts = min(int(pending.get("notice_attempts", 0)) + 1, 6)
+        retry_after = getattr(result, "retry_after", None)
+        if retry_after is None:
+            retry_after = flood_wait_seconds(getattr(result, "error", None), default=0)
+        pending["notice_attempts"] = attempts
+        pending["notice_retry_at"] = datetime.now(timezone.utc).timestamp() + max(
+            60, min(3600, 60 * 2 ** (attempts - 1)), float(retry_after or 0))
+        save_pending(marker, pending)
+
     def _schedule_update_notification_watch(self) -> None:
         """Ensure a background task is watching for update completion."""
         existing_task = getattr(self, "_update_notification_task", None)
         if existing_task and not existing_task.done():
+            # A completed notice may have been superseded while this watcher was
+            # awaiting its last send; start the next request as soon as it exits.
+            existing_task.add_done_callback(lambda _task: self._schedule_update_notification_watch()
+                                            if self._update_paths().any_pending() else None)
             return
         try:
             self._update_notification_task = asyncio.create_task(self._watch_update_progress())
@@ -592,13 +672,26 @@ class GatewayNotificationsMixin:
             reply_to_message_id=data.get("message_id"), adapter=adapter,
         )
 
-    async def _watch_update_completion_only(self, paths: "_UpdatePaths", deadline: float, poll_interval: float) -> None:
+    @staticmethod
+    def _current_update(paths: "_UpdatePaths", original: dict) -> Optional[tuple[Path, dict]]:
+        """A notice must not adopt state belonging to a later admission."""
+        from gateway.update_notifications import read_pending, same_update
+        current = read_pending(paths.pending.parent)
+        return current if current and same_update(current[0], original) else None
+
+    async def _watch_update_completion_only(self, paths: "_UpdatePaths", deadline: float, poll_interval: float,
+                                            original: dict) -> None:
         loop = asyncio.get_running_loop()
         while paths.any_pending() and loop.time() < deadline:
-            if await self._send_update_notification():
+            if not self._current_update(paths, original):
+                return
+            if await self._send_update_notification(original=original):
+                return
+            if not self._current_update(paths, original):
                 return
             await asyncio.sleep(poll_interval)
-        await self._send_update_notification(timed_out=True)
+        if self._current_update(paths, original):
+            await self._send_update_notification(timed_out=True, original=original)
 
     @staticmethod
     def _update_exit_code(paths: "_UpdatePaths") -> int:
@@ -651,7 +744,7 @@ class GatewayNotificationsMixin:
             return b"", len(data)
         return data[offset:], len(data)
 
-    async def _send_update_output(self, target: "_UpdateTarget", data: bytes,
+    async def _send_update_output(self, target: "_UpdateTarget", data: bytes, original: dict,
                                   *, trailer: str = "") -> int:
         """Return the exact raw byte prefix delivered (or blank), even on partial failure.
 
@@ -664,6 +757,11 @@ class GatewayNotificationsMixin:
         consumed = 0
         pos = 0
         while pos < len(raw):
+            current = self._current_update(self._update_paths(), original)
+            if not current:
+                return consumed
+            if float(current[1].get("notice_retry_at", 0)) > datetime.now(timezone.utc).timestamp():
+                return consumed
             end = min(pos + 3500, len(raw))
             while len(raw[pos:end].encode("utf-8", errors="surrogateescape")) > 3500:
                 end -= 1
@@ -679,16 +777,24 @@ class GatewayNotificationsMixin:
             if clean:
                 try:
                     result = await target.send(f"```\n{clean}\n```")
+                    current = self._current_update(self._update_paths(), original)
+                    if not current:
+                        return consumed
                     if _send_failed(result):
+                        if current[1].get("notification_version") == 2:
+                            self._defer_update_notice(*current, result)
                         return consumed
                 except Exception:
+                    current = self._current_update(self._update_paths(), original)
+                    if current and current[1].get("notification_version") == 2:
+                        self._defer_update_notice(*current)
                     logger.debug("Update stream send failed", exc_info=True)
                     return consumed
             consumed += len(chunk.encode("utf-8", errors="surrogateescape"))
             pos = end
         return consumed
 
-    async def _forward_update_prompt(self, target: "_UpdateTarget", prompt_text: str, default: str) -> None:
+    async def _forward_update_prompt(self, target: "_UpdateTarget", prompt_text: str, default: str, original: dict) -> None:
         """Forward an update prompt: platform-native buttons first (Discord, Telegram), else text."""
         sent_buttons = False
         adapter = target.adapter
@@ -698,20 +804,33 @@ class GatewayNotificationsMixin:
                     chat_id=target.chat_id, prompt=prompt_text, default=default,
                     session_key=target.session_key, metadata=target.send_metadata(),
                 )
+                if not self._current_update(self._update_paths(), original):
+                    return
                 sent_buttons = True
+        if not self._current_update(self._update_paths(), original):
+            return
         if not sent_buttons:
             default_hint = t("gateway.update.prompt_default", default=default) if default else ""
             _p = getattr(adapter, "typed_command_prefix", "/")
             await target.send(t("gateway.update.prompt", prompt=prompt_text, default_hint=default_hint, prefix=_p))
+        if not self._current_update(self._update_paths(), original):
+            return
         # Keep the prompt marker on disk until answered so a restarted watcher can re-forward it.
         self._session_state(target.session_key).persistent.update_prompt_pending = True
         logger.info("Forwarded update prompt to %s: %s", target.session_key, prompt_text[:80])
 
-    def _clear_update_markers(self, paths: "_UpdatePaths", session_key: Optional[str]) -> None:
-        paths.unlink_all()
+    def _clear_update_markers(self, paths: "_UpdatePaths", session_key: Optional[str], pending: dict) -> bool:
+        from gateway.update_notifications import locked_update_marker, read_pending, same_update
+        with locked_update_marker(paths.pending.parent):
+            current = read_pending(paths.pending.parent)
+            if not current or not same_update(current[0], pending):
+                return False
+            paths.unlink_all()
+            (paths.pending.parent / ".update_process_exit_code").unlink(missing_ok=True)
         state = self._peek_session_state(session_key)
         if state is not None:
             state.persistent.update_prompt_pending = False
+        return True
 
     async def _watch_update_progress(
         self, poll_interval: float = 2.0, stream_interval: float = 4.0, timeout: float = 1800.0
@@ -724,19 +843,22 @@ class GatewayNotificationsMixin:
         paths = self._update_paths()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        target = self._resolve_update_target(paths)
-        if target is None:
-            await self._watch_update_completion_only(paths, deadline, poll_interval)
-            return
-        session_key = target.session_key
         from gateway.update_notifications import final_outcome, read_pending, save_pending
         record = read_pending(paths.pending.parent)
-        bytes_sent = int(record[1].get("output_offset", 0)) if record else 0
+        if not record:
+            return
+        original = record[1]
+        target = self._resolve_update_target(paths)
+        if target is None:
+            await self._watch_update_completion_only(paths, deadline, poll_interval, original)
+            return
+        session_key = target.session_key
+        bytes_sent = int(original.get("output_offset", 0))
         last_stream_time = loop.time()
         buffer = b""
 
         def _checkpoint_output() -> None:
-            current = read_pending(paths.pending.parent)
+            current = self._current_update(paths, original)
             if current:
                 marker, pending = current
                 pending["output_offset"] = bytes_sent - len(buffer)
@@ -750,7 +872,7 @@ class GatewayNotificationsMixin:
                 _checkpoint_output()
                 return
             if buffer:
-                delivered = await self._send_update_output(target, buffer)
+                delivered = await self._send_update_output(target, buffer, original)
                 buffer = buffer[delivered:]
                 if delivered:
                     last_stream_time = loop.time()
@@ -766,19 +888,27 @@ class GatewayNotificationsMixin:
         while loop.time() < deadline:
             if not paths.any_pending():
                 return
-            current = read_pending(paths.pending.parent)
-            if current and current[1].get("notification_version") == 2 and not await self._send_update_phase("updating"):
+            current = self._current_update(paths, original)
+            if not current:
+                return
+            if current[1].get("notification_version") == 2 and not await self._send_update_phase("updating", original=original):
                 await asyncio.sleep(poll_interval)
                 continue
-            current = read_pending(paths.pending.parent)
-            if current and final_outcome(paths.pending.parent, current[1]) is not None:
+            current = self._current_update(paths, original)
+            if not current:
+                return
+            if final_outcome(paths.pending.parent, current[1]) is not None:
                 _read_new_output()
                 await _flush_buffer()
-                if not buffer and await self._send_update_notification():
+                if not self._current_update(paths, original):
+                    return
+                if not buffer and await self._send_update_notification(original=original):
                     return
             _read_new_output()
             if buffer.strip() and (loop.time() - last_stream_time) >= stream_interval:
                 await _flush_buffer()
+                if not self._current_update(paths, original):
+                    return
             # Forward a prompt only when none is pending, else every poll re-forwards the same prompt.
             _pending_state = self._peek_session_state(session_key) if session_key else None
             if paths.prompt.exists() and session_key and not getattr(
@@ -789,31 +919,41 @@ class GatewayNotificationsMixin:
                     prompt_text = prompt_data.get("prompt", "")
                     if prompt_text:
                         await _flush_buffer()  # user sees context before the prompt
-                        await self._forward_update_prompt(target, prompt_text, prompt_data.get("default", ""))
+                        if not self._current_update(paths, original):
+                            return
+                        await self._forward_update_prompt(target, prompt_text, prompt_data.get("default", ""), original)
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
             await asyncio.sleep(poll_interval)
+        if not self._current_update(paths, original):
+            return
         await _flush_buffer()
-        await self._send_update_notification(timed_out=True)
+        if self._current_update(paths, original):
+            await self._send_update_notification(timed_out=True, original=original)
 
-    async def _send_update_phase(self, phase: str) -> bool:
+    async def _send_update_phase(self, phase: str, *, original: Optional[dict] = None) -> bool:
         lock = getattr(self, "_update_phase_send_lock", None)
         if lock is None:
             lock = self._update_phase_send_lock = asyncio.Lock()
         async with lock:
-            return await self._send_update_phase_inner(phase)
+            return await self._send_update_phase_inner(phase, original=original)
 
-    async def _send_update_phase_inner(self, phase: str) -> bool:
+    async def _send_update_phase_inner(self, phase: str, *, original: Optional[dict] = None) -> bool:
         from gateway.update_notifications import notice, read_pending, save_pending
         paths = self._update_paths()
-        current = read_pending(paths.pending.parent)
+        current = self._current_update(paths, original) if original is not None else read_pending(paths.pending.parent)
+        if not current:
+            return False
         target = self._resolve_update_target(paths)
-        if not current or target is None:
+        if target is None:
             return False
         marker, pending = current
+        original = original if original is not None else pending.copy()
         flag = phase + "_notified"
         if pending.get(flag):
             return True
+        if float(pending.get("notice_retry_at", 0)) > datetime.now(timezone.utc).timestamp():
+            return False
         if phase == "restarting":
             heading = "🔄 Restarting"
             detail = "The gateway is restarting. If work is interrupted, recovery will be attempted where supported; it is not guaranteed."
@@ -821,19 +961,27 @@ class GatewayNotificationsMixin:
             heading = "⬆️ Updating"
             detail = "The native update was started. Progress follows here."
         try:
-            if _send_failed(await target.send(notice(heading, pending, detail))):
+            result = await target.send(notice(heading, pending, detail))
+            current = self._current_update(paths, original)
+            if not current:
                 return False
-            current = read_pending(paths.pending.parent)
-            if current:
-                marker, pending = current
-                pending[flag] = True
-                save_pending(marker, pending)
+            marker, pending = current
+            if _send_failed(result):
+                if pending.get("notification_version") == 2:
+                    self._defer_update_notice(marker, pending, result)
+                return False
+            pending[flag] = True
+            save_pending(marker, pending)
             return True
         except Exception:
+            current = self._current_update(paths, original)
+            if current and current[1].get("notification_version") == 2:
+                marker, pending = current
+                self._defer_update_notice(marker, pending)
             logger.warning("Update phase notification failed", exc_info=True)
             return False
 
-    async def _send_update_notification(self, *, timed_out: bool = False) -> bool:
+    async def _send_update_notification(self, *, timed_out: bool = False, original: Optional[dict] = None) -> bool:
         """One final send path for live watchers and startup; retain state on send failure."""
         from gateway.update_notifications import final_outcome, notice, read_pending, save_pending
         if getattr(self, "_update_final_send_active", False):
@@ -841,13 +989,15 @@ class GatewayNotificationsMixin:
         self._update_final_send_active = True
         legacy_marker = False
         paths = None
+        pending = None
         try:
             paths = self._update_paths()
-            current = read_pending(paths.pending.parent)
-            target = self._resolve_update_target(paths)
+            current = self._current_update(paths, original) if original is not None else read_pending(paths.pending.parent)
             if not current:
                 return False
-            _, pending = current
+            target = self._resolve_update_target(paths)
+            marker, pending = current
+            original = original if original is not None else pending.copy()
             if target is None:
                 # Expire only a valid destination whose adapter never returned. Malformed
                 # metadata must not be mistaken for a confirmed transport outage.
@@ -859,10 +1009,13 @@ class GatewayNotificationsMixin:
                     logger.warning(
                         "Post-update notification for %s:%s dropped after %.1fh: adapter never connected",
                         platform.value, pending["chat_id"], age / 3600.0)
-                    self._clear_update_markers(paths, pending.get("session_key"))
+                    self._clear_update_markers(paths, pending.get("session_key"), pending)
                     return True
                 return False
             legacy_marker = pending.get("notification_version") != 2
+            if (not legacy_marker and target is not None and
+                    float(pending.get("notice_retry_at", 0)) > datetime.now(timezone.utc).timestamp()):
+                return False
             outcome = final_outcome(paths.pending.parent, pending)
             if outcome is None:
                 if not timed_out:
@@ -870,12 +1023,12 @@ class GatewayNotificationsMixin:
                 outcome = (False, "Update finalization could not be verified before the notification deadline. Runtime state is unknown. Inspect the update output before retrying.")
             success, detail = outcome
             if pending.get("notification_version") == 2 and not pending.get("updating_notified"):
-                if not await self._send_update_phase("updating"):
+                if not await self._send_update_phase("updating", original=original):
                     return False
-                current = read_pending(paths.pending.parent)
+                current = self._current_update(paths, original)
                 if not current:
                     return False
-                _, pending = current
+                marker, pending = current
             # Startup can reach here without a live watcher; preserve unsent native output.
             offset = int(pending.get("output_offset", 0))
             output, end_offset = self._read_update_output_since(paths.output, offset)
@@ -883,46 +1036,57 @@ class GatewayNotificationsMixin:
             if output.strip():
                 trailer = (("\n\nHermes update finished successfully." if success
                             else f"\n\nHermes update failed. {detail}") if legacy_marker else "")
-                delivered = await self._send_update_output(target, output, trailer=trailer)
+                delivered = await self._send_update_output(target, output, original, trailer=trailer)
+                current = self._current_update(paths, original)
+                if not current:
+                    return False
+                marker, pending = current
                 if delivered:
-                    current = read_pending(paths.pending.parent)
-                    if current:
-                        marker, pending = current
-                        pending["output_offset"] = offset + delivered
-                        save_pending(marker, pending)
+                    pending["output_offset"] = offset + delivered
+                    save_pending(marker, pending)
                 if delivered != len(output):
                     if legacy_marker:
                         # Pre-v2 markers retain their historical terminal failure contract.
-                        self._clear_update_markers(paths, target.session_key)
+                        self._clear_update_markers(paths, target.session_key, pending)
                     return False
                 output_sent = True
             elif output:
-                current = read_pending(paths.pending.parent)
-                if current:
-                    marker, pending = current
-                    pending["output_offset"] = end_offset
-                    save_pending(marker, pending)
+                current = self._current_update(paths, original)
+                if not current:
+                    return False
+                marker, pending = current
+                pending["output_offset"] = end_offset
+                save_pending(marker, pending)
             if legacy_marker and output_sent:
-                self._clear_update_markers(paths, target.session_key)
+                self._clear_update_markers(paths, target.session_key, pending)
                 return True
             if success:
                 heading, detail = self._update_result_heading(paths.pending.parent, pending, 0)
             else:
                 heading, detail = "❌ Update Failed", detail
-            result = await target.send(notice(heading, pending, detail))
+            detail = _bounded_previous_update_detail(detail, pending)
+            result = await target.send(_bounded_update_notice(notice(heading, pending, detail)))
+            current = self._current_update(paths, original)
+            if not current:
+                return False
+            marker, pending = current
             if _send_failed(result):
                 if legacy_marker:
-                    self._clear_update_markers(paths, target.session_key)
+                    self._clear_update_markers(paths, target.session_key, pending)
+                else:
+                    self._defer_update_notice(marker, pending, result)
                 return False
-            self._clear_update_markers(paths, target.session_key)
-            (paths.pending.parent / ".update_process_exit_code").unlink(missing_ok=True)
-            return True
+            return self._clear_update_markers(paths, target.session_key, pending)
         except Exception:
             logger.warning("Update final notification failed", exc_info=True)
             # Pre-v2 markers did not support retry-safe delivery; preserve that legacy
             # cleanup contract while native reason-bearing markers remain durable.
-            if legacy_marker and paths is not None:
-                self._clear_update_markers(paths, None)
+            if legacy_marker and paths is not None and pending is not None:
+                self._clear_update_markers(paths, None, original)
+            elif paths is not None and original is not None:
+                current = self._current_update(paths, original)
+                if current and current[1].get("notification_version") == 2:
+                    self._defer_update_notice(*current)
             return False
         finally:
             self._update_final_send_active = False

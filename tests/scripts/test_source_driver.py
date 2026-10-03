@@ -165,7 +165,8 @@ def test_pm_observer_accepts_ready_fixture_and_leaves_failed_fixture_untouched(t
     path = os.pathsep.join(p for p in os.get_exec_path() if ".hermes" not in Path(p).parts)
     node = shutil.which("node", path=path)
     assert node
-    setup = '''import sys
+    setup = '''import shlex
+import sys
 from pathlib import Path
 root, store, node, deps = map(Path, sys.argv[1:])
 sys.path.insert(0, str(root))
@@ -179,7 +180,16 @@ lock.save()
 for name, executable in [('python', Path(sys.executable)), ('node', node)]:
     binary = store / name / 'bin' / ('python3' if name == 'python' else name)
     binary.parent.mkdir(parents=True)
-    binary.symlink_to(executable)
+    if name == 'python':
+        # A uv standalone Python cannot discover its stdlib when entered
+        # through an arbitrary symlink.  Keep the store path as the published
+        # command, but use a tiny forwarding shim for this fixture so the
+        # observer exercises the same command identity without inventing a
+        # second interpreter tree.
+        binary.write_text('#!/bin/sh\\nexec ' + shlex.quote(str(executable)) + ' "$@"\\n', encoding='utf-8')
+        binary.chmod(0o755)
+    else:
+        binary.symlink_to(executable)
     Facts(store / 'facts.json').record(name, 'fixture', name, {}, store)
 selected = install_state_dir(root) / 'environments/fixture/venv'
 selected.mkdir(parents=True)

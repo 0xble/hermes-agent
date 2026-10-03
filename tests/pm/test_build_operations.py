@@ -299,7 +299,12 @@ def test_requirements_build_installs_offline_markers_and_seals_only_build_pth(tm
          "print(json.dumps([app_dep.__version__, leaf_dep.__version__, sys.base_prefix, "
          "importlib.util.find_spec('missing_dep') is None]))"], cwd=tmp_path, env=build_tools,
     ))
-    assert result == ["1.0", "1.0", sys.base_prefix, True]
+    assert result[:2] == ["1.0", "1.0"]
+    # uv's macOS standalone Python exposes a minor-version alias for the
+    # base prefix.  The runtime identity is the resolved directory, not its
+    # spelling through that alias.
+    assert Path(result[2]).resolve() == Path(sys.base_prefix).resolve()
+    assert result[3] is True
     assert executable.parent.parent == out
     assert bool(list(out.rglob("_virtualenv.pth"))) is not sealed
     assert not poison.exists()

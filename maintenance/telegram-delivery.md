@@ -127,6 +127,57 @@ unresolved. Retire after an accepted upstream release passes these behavioral
 tests without this patch. Roll back this patch's adapter and tests together.
 There are no configuration or persistent-state changes.
 
+## Standalone Chunk Indicators
+
+**Patch identity:** `telegram-standalone-chunk-indicator`. When cron delivery
+falls back from the live adapter to the standalone sender (flood control,
+timeout, `send_path_degraded`), a long message is split and each chunk ends with
+a ` (n/m)` indicator. Those parentheses are reserved in MarkdownV2, so Telegram
+rejected every chunk with `Can't parse entities` and each one arrived as plain
+text. The live adapter already escapes the indicator, but the standalone sender
+did not. On 2026-10-01 standalone fallbacks rose from about 2 a day to 41, which
+made the problem visible across many crons.
+
+The adopted fix is upstream salvage PR
+[#126100](https://github.com/NousResearch/hermes-agent/pull/126100), for issue
+[#74004](https://github.com/NousResearch/hermes-agent/issues/74004). It is
+cherry-picked with original authorship. It escapes the indicator and separates
+it from a closing code fence, reusing `_separate_chunk_indicator_from_fence`.
+Source: `tools/send_message_senders.py`. Proof:
+`tests/tools/test_telegram_send_message_chunk_mdv2.py`, which fails on the
+unpatched sender. The standalone lane still sends MarkdownV2, never Rich
+Messages. That gap is unchanged.
+
+Retire after an accepted upstream release contains #126100, or an equivalent,
+and the proof test passes without this patch. Roll back by reverting the two
+commits. There are no configuration or persistent-state changes.
+
+## Cron Short Flood Wait
+
+**Patch identity:** `cron-short-flood-wait`. The standalone lane sends legacy
+MarkdownV2 only, so a cron that falls back there loses Rich Message features:
+`[^n]` footnotes arrive as literal text, and tables and `<details>` flatten. On
+2026-10-03 a personal-alerts delivery fell back because the live adapter refused
+it locally with `flood_control:3.59` while four alert monitors and active chats
+shared one DM. The standalone sender then sent 0.8s later, inside the window.
+
+The live lane now sits out a `flood_control:<seconds>` refusal and retries on the
+live adapter, as long as the cumulative wait for that target stays within
+`_LIVE_FLOOD_WAIT_BUDGET_SECS` (15s). Longer penalties, repeated refusals past the
+budget, and every other error still fall back to standalone, as before. Source:
+`cron/scheduler_delivery.py` (`_short_flood_wait`, `_live_send_text`). Proof:
+`TestShortFloodWaitStaysOnTheLiveLane` in
+`tests/cron/test_cron_live_delivery_confirmation.py`, which fails without the patch.
+
+Rate budget: no new calls. A refused live attempt during a known window makes
+no API call. The retry replaces the standalone send that would otherwise have
+followed, and moves it after the published window instead of inside it. The
+worker thread blocks for at most 15s per target. Cron output is not
+latency-sensitive. No upstream issue or PR covered this on 2026-10-03. Retire
+when the standalone lane can send Rich Messages, or upstream retries short live
+floods equivalently. Roll back by reverting the commit. There are no
+configuration or persistent-state changes.
+
 ## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,

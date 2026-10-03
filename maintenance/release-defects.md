@@ -493,6 +493,33 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   2026-09-25 10:09 receipt: the old code reports failure, the patched code reports success
   (`b6fb36d94a21`).
 
+## Finished update notice retained past the watcher deadline
+
+- Fork patch identity: `update-lifecycle`.
+- A finished v2 marker whose final send was flood-refused once blocked new requests forever:
+  the watcher expired, boot was the only retry, and `O_EXCL` refused admission.
+  `launch_native_update` now atomically replaces only an unclaimed marker with a matching
+  finalized outcome and real process-exit sentinel. The old result and reason ride in
+  `previous_outcome` and appear in the next request's final notice; claimed or unfinished
+  updaters still block. Marker writes and clears compare identity under the admission lock.
+  Phases, output checkpoints, and final sends retain the starting identity across awaited
+  adapter sends, so an in-flight old notice cannot adopt, announce, or alter the new request.
+  Housekeeping retries post-deadline notices with persisted exponential backoff honoring
+  the platform's `retry_after`; raised delivery errors in phase acknowledgements,
+  output chunks and final notices use the same backoff as failed send results.
+  A never-connected adapter retains its existing expiry. No profile state or
+  updater process is restarted by these retries.
+- Guards: `tests/gateway/test_agent_update_launcher.py` (finished, unfinished, claimed,
+  concurrent and failed-spawn admission) and
+  `tests/gateway/test_update_lifecycle_notifications.py` (post-deadline retry, flood
+  delay, stream/final retry, adapter expiry,
+  `test_post_deadline_delivery_exception_persists_retry_backoff` for output,
+  final notice and phase acknowledgement, and
+  `test_inflight_old_notice_cannot_mutate_superseding_request` for final notice,
+  final output, phase acknowledgement and watcher checkpoint).
+- Related upstream [#42191](https://github.com/NousResearch/hermes-agent/pull/42191) preserves state after a soft send failure but does not admit a subsequent request or schedule post-deadline retries; [#111307](https://github.com/NousResearch/hermes-agent/pull/111307) addresses a distinct `fleet_restart_pending` warning. Both were open at qualification, neither is an equivalent released replacement.
+- Retire only when an upstream *released tag* has equivalent finished-marker admission with old-outcome delivery, race-safe claim protection and periodic flood-aware retry after watcher expiry. Roll back this patch as a unit; do not delete an existing pending notice to work around admission.
+
 ## Restart notices hid the reason from other interrupted chats
 
 - Fork patch identity: `update-lifecycle`.
