@@ -381,6 +381,69 @@ try {
             with self.assertRaisesRegex(RuntimeError, 'require'):
                 ci.require_tools(('node',), {})
 
+    def test_local_environment_resolves_pinned_uv_and_node_from_mise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mise = Path(directory) / 'mise'
+            executables = {}
+            for name in ('uv', 'node'):
+                relative = Path('uv-native') / name if name == 'uv' else Path('bin') / name
+                executable = mise / 'installs' / name / ci.PINS[name] / relative
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                version = ci.PINS[name]
+                executable.write_text(
+                    f'#!/bin/sh\nprintf "%s\\n" "{("uv " if name == "uv" else "v") + version}"\n',
+                    encoding='utf-8',
+                )
+                executable.chmod(0o755)
+                executables[name] = executable
+            isolated = Path(directory) / 'isolated-home'
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': '', 'HOME': directory, 'MISE_DATA_DIR': str(mise), 'PATH': '/host/bin'}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'):
+                env = ci.resolve_local_toolchain(ci.environment(isolated))
+            parts = env['PATH'].split(os.pathsep)
+            self.assertEqual(parts[:2], [str(executables['uv'].parent.resolve()), str(executables['node'].parent.resolve())])
+            self.assertEqual(ci.windows_command('uv', env), str(executables['uv'].resolve()))
+            self.assertEqual(ci.windows_command('node', env), str(executables['node'].resolve()))
+            self.assertLess(parts.index(str(executables['uv'].parent.resolve())), parts.index('/host/bin'))
+            self.assertLess(parts.index(str(executables['node'].parent.resolve())), parts.index('/host/bin'))
+            ci.require_tools(('uv', 'node'), env)
+
+    def test_local_environment_accepts_exact_path_tools_without_mise_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tool_dir = Path(directory) / 'path-tools'
+            tool_dir.mkdir()
+            for name in ('uv', 'node'):
+                executable = tool_dir / name
+                version = ci.PINS[name]
+                executable.write_text(
+                    f'#!/bin/sh\nprintf "%s\\n" "{("uv " if name == "uv" else "v") + version}"\n',
+                    encoding='utf-8',
+                )
+                executable.chmod(0o755)
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': '', 'HOME': directory, 'MISE_DATA_DIR': str(Path(directory) / 'missing-mise'), 'PATH': str(tool_dir)}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'), \
+                    patch.object(ci, 'resolve_pinned_mise_tool', side_effect=AssertionError('mise should not be consulted')):
+                env = ci.resolve_local_toolchain(ci.environment(Path(directory) / 'isolated-home'))
+            self.assertEqual(ci.windows_command('uv', env), str((tool_dir / 'uv').resolve()))
+            self.assertEqual(ci.windows_command('node', env), str((tool_dir / 'node').resolve()))
+            ci.require_tools(('uv', 'node'), env)
+
+    def test_local_environment_fails_with_install_hint_when_pinned_mise_tool_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': '', 'HOME': directory, 'MISE_DATA_DIR': str(Path(directory) / 'mise'), 'PATH': '/host/bin'}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'):
+                with self.assertRaisesRegex(RuntimeError, r'Missing pinned uv 0\.12\.13.*mise install uv@0\.12\.13'):
+                    ci.resolve_local_toolchain(ci.environment(Path(directory) / 'isolated-home'))
+
+    def test_github_environment_keeps_host_toolchain_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'HOME': directory, 'MISE_DATA_DIR': str(Path(directory) / 'mise'), 'PATH': '/host/bin'}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'):
+                env = ci.resolve_local_toolchain(ci.environment(Path(directory) / 'isolated-home'))
+            self.assertNotIn('mise/installs/uv', env['PATH'])
+            self.assertNotIn('mise/installs/node', env['PATH'])
+            self.assertIn('/host/bin', env['PATH'])
+
     def test_windows_npm_cmd_is_resolved_for_version_check_and_execution(self):
         with patch.object(ci.os, 'name', 'nt'), \
                 patch.object(ci.shutil, 'which', return_value='C:\\node\\npm.cmd') as which, \

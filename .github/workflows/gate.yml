@@ -48,7 +48,7 @@ jobs:
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
-          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
+          runuser -u ci -- env HOME="$HOME" GITHUB_ACTIONS=true ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
   python-shard:
     name: Python and e2e (${{ matrix.shard }}/10)
     runs-on: ubuntu-latest
@@ -90,7 +90,7 @@ jobs:
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
-          runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
+          runuser -u ci -- env HOME="$HOME" GITHUB_ACTIONS=true ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
   qualification:
     if: always()
     needs: [linux, python-shard]
