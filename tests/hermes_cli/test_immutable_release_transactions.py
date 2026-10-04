@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import plistlib
+import shlex
 import stat
 import subprocess
 import sys
@@ -686,6 +687,43 @@ def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong)
     assert not releases.acknowledge_running_release(home)
     record = json.loads((home / "release-txn.json").read_text())
     assert not record.get("reload_done") and "reload_ack" not in record
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("launcher", ["generated", "other-release", "foreign-code"])
+def test_generated_launchd_gateway_acknowledges_only_its_release(tmp_path, monkeypatch, launcher):
+    """The gateway launchd starts from the generated plist acknowledges its own release only."""
+    import psutil
+    from hermes_cli import gateway as gateway_cli, gateway_launchd
+    from hermes_cli._launchers import runtime_command
+
+    home, _, plist, a, b, _, _, intended = _fixture(tmp_path, "promote")
+    assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                     reload_callback=lambda: "deferred")["reload_pending"]
+    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+    target = releases.read_pointer(home / "current")
+    definition = plistlib.loads(gateway_cli.generate_launchd_plist(release_target=target).encode())
+    shell, _ = json.JSONDecoder().raw_decode(definition["ProgramArguments"][-1].split("$.system(", 1)[1])
+    wrapper = shlex.split(shell.removeprefix("exec ").split(" >> ", 1)[0])
+    argv = wrapper[wrapper.index("--") + 1:]
+    assert argv[-3:] == ["gateway", "run", "--external-supervisor"]
+    if launcher == "other-release":
+        argv = [argv[0], *runtime_command(a, (), module="hermes_cli.main")[1:4], *argv[4:]]
+    elif launcher == "foreign-code":
+        argv = [argv[0], "-I", "-c", "import time; time.sleep(60)", *argv[4:]]
+
+    interpreter = tmp_path / "interpreter"
+    monkeypatch.setattr(releases, "_interpreter_process_executable", lambda _: interpreter)
+    process = lambda pid, cmd: SimpleNamespace(  # noqa: E731
+        pid=pid, cmdline=lambda: cmd, exe=lambda: str(interpreter), cwd=lambda: str(target),
+        environ=lambda: {}, children=lambda **_: [])
+    supervisor = process(31415, definition["ProgramArguments"])
+    supervisor.children = lambda **_: [process(31416, wrapper), process(31417, argv)]
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: supervisor.pid)
+    monkeypatch.setattr(psutil, "Process", lambda _: supervisor)
+
+    assert releases.acknowledge_running_release(home) is (launcher == "generated")
+    assert (home / "release-txn.json").exists() is (launcher != "generated")
 
 
 @pytest.mark.platforms("macos")
