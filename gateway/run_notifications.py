@@ -1494,8 +1494,10 @@ class GatewayNotificationsMixin:
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
             fail = "Async delegation delivery persist failed for session %s: %s"
+            # This route is persist-only: the client owns the next model turn, so
+            # keep the durable row's content exactly as produced.
             deliver = lambda: persist_delegation_delivery(
-                adapter, text=_mark_internal_notification(synth_text), session_id=raw_sid, evt=evt,
+                adapter, text=synth_text, session_id=raw_sid, evt=evt,
             )  # noqa: E731
         else:
             info = "Watch pattern notification — waking api_server session %s via self-post"

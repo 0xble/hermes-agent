@@ -2298,6 +2298,14 @@ class GoalManager:
             target = f"until:{state.waiting_until:.6f}:delegations:{state.waiting_on_delegations}"
         return f"{target}|reason:{reason}"
 
+    @staticmethod
+    def _waiting_target(state: GoalState) -> str:
+        if state.waiting_on_session is not None:
+            return f"session {state.waiting_on_session}"
+        if state.waiting_on_pid is not None:
+            return f"pid {state.waiting_on_pid}"
+        return f"{max(0, int(state.waiting_until - time.time()))}s remaining"
+
     def _wait_notice_decision(
         self, state: GoalState, *, verdict: str, message: str, notify: bool = True,
     ) -> Dict[str, Any]:
@@ -2309,15 +2317,10 @@ class GoalManager:
         else:
             state.last_wait_notice_key = key
             self._save()
-        return _decision("active", False, None, verdict, state.waiting_reason or key, message)
+        return _decision("active", False, None, verdict, state.waiting_reason or self._waiting_target(state), message)
 
     def _waiting_decision(self, state: GoalState, *, suppress_notice: bool = False) -> Dict[str, Any]:
-        if state.waiting_on_session is not None:
-            tgt = f"session {state.waiting_on_session}"
-        elif state.waiting_on_pid is not None:
-            tgt = f"pid {state.waiting_on_pid}"
-        else:
-            tgt = f"{max(0, int(state.waiting_until - time.time()))}s remaining"
+        tgt = self._waiting_target(state)
         reason = state.waiting_reason or tgt
         return self._wait_notice_decision(
             state, verdict="waiting",

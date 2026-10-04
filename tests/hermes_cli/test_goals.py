@@ -63,6 +63,34 @@ class TestParseJudgeResponse:
 
 
 
+class TestWaitingDecision:
+    @pytest.mark.parametrize(
+        ("wait_fields", "expected_reason"),
+        [
+            ({"waiting_on_session": "worker-session-7"}, "session worker-session-7"),
+            ({"waiting_on_pid": 4242}, "pid 4242"),
+            ({"waiting_until": 1030.0}, "30s remaining"),
+        ],
+    )
+    def test_wait_notice_reason_keeps_readable_target_when_waiting_reason_missing(
+        self, hermes_home, monkeypatch, wait_fields, expected_reason,
+    ):
+        from hermes_cli.goals import GoalManager, GoalState
+
+        monkeypatch.setattr("hermes_cli.goals.time.time", lambda: 1000.0)
+        manager = GoalManager(session_id="wait-reason-sid")
+        manager._save = lambda: None
+        state = GoalState(goal="wait for the process", waiting_reason=None, **wait_fields)
+
+        decision = manager._waiting_decision(state)
+
+        assert decision["reason"] == expected_reason
+        assert state.last_wait_notice_key == manager._wait_notice_key(state)
+        repeated = manager._waiting_decision(state)
+        assert repeated["reason"] == expected_reason
+        assert repeated["message"] == ""
+
+
 # ──────────────────────────────────────────────────────────────────────
 # judge_goal — fail-open semantics
 # ──────────────────────────────────────────────────────────────────────
