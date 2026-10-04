@@ -217,7 +217,7 @@ def windows_appdata_environment(home: Path) -> dict[str, str]:
 def environment(home: Path) -> dict[str, str]:
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
-    env = {key: os.environ[key] for key in ('PATH', 'GITHUB_ACTIONS', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
     env.update({
         'HOME': str(home), 'USERPROFILE': str(home),
         'PATH': os.pathsep.join((str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
@@ -296,7 +296,7 @@ def exact_path_tool(name: str, env: Mapping[str, str]) -> Path | None:
 
 def resolve_local_toolchain(env: dict[str, str]) -> dict[str, str]:
     """Use exact PATH tools or replace mismatches with exact local mise pins."""
-    if env.get('GITHUB_ACTIONS') == 'true' or os.environ.get('GITHUB_ACTIONS') == 'true':
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
         return env
     resolved = {}
     mise_paths = []
@@ -311,10 +311,15 @@ def resolve_local_toolchain(env: dict[str, str]) -> dict[str, str]:
     if npm.is_file():
         env['HERMES_CI_PINNED_NPM'] = str(npm.resolve())
     existing = [part for part in env.get('PATH', '').split(os.pathsep) if part]
-    # Keep mise directories visible to shebang-based tools, while
-    # windows_command() uses absolute paths for uv/node/npm so checkout entries
-    # cannot shadow the selected exact tools or the provisioned npm package.
-    env['PATH'] = os.pathsep.join(dict.fromkeys([*mise_paths, *existing]))
+    # Keep checkout-owned npm and ripgrep ahead of mise's Node directory: the
+    # latter may carry a different bundled npm than the repository pin.
+    checkout_paths = [
+        str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
+        str(TOOLCHAIN / 'bin'),
+        str(TOOLCHAIN / 'node_modules' / '.bin'),
+    ]
+    host_paths = [part for part in existing if part not in checkout_paths and part not in mise_paths]
+    env['PATH'] = os.pathsep.join(dict.fromkeys([*checkout_paths, *mise_paths, *host_paths]))
     return env
 
 
@@ -382,6 +387,9 @@ def provision_rg(env: dict[str, str]) -> None:
 def setup(env: dict[str, str]) -> None:
     require_tools(('uv', 'node'), env)
     provision_npm(env)
+    # npm is created after the initial resolver pass on a fresh checkout; refresh
+    # its absolute command and PATH ordering before any npm-dependent check.
+    resolve_local_toolchain(env)
     provision_rg(env)
     require_tools(('npm', 'rg'), env)
     run(['uv', 'sync', '--locked', '--python', PINS['python'], '--group', 'dev', '--group', 'test', *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)

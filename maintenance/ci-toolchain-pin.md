@@ -9,21 +9,24 @@ wrapper: it validates the exact SHA and invokes `./bin/ci gate <sha>`; the
 repository gate owns tool resolution and exact-version validation.
 
 Local resolution reads the host mise data directory (`MISE_DATA_DIR`, or
-`$HOME/.local/share/mise`) and prepends the exact versioned install directories
-for `uv` and `node`. The gate also carries their resolved absolute paths into
-its subprocess environment, so checkout-owned or host PATH entries cannot
-shadow the exact pins; the provisioned npm package is similarly selected when
-present. It handles mise's `bin/<tool>` layout and uv's one-level platform
-archive layout. The existing `require_tools()` check remains strict;
-resolution never accepts a different version or falls back to `PATH`.
+`$HOME/.local/share/mise`). It first accepts an exact-version `uv` or Node
+already found on `PATH`; otherwise it resolves the exact versioned mise install
+for that tool. The checkout-owned `.ci/toolchain/node_modules/.bin` remains
+ahead of mise and host directories so a provisioned npm cannot be shadowed by
+Node's bundled npm. The gate also carries resolved absolute paths for `uv`, Node,
+and provisioned npm into its subprocess environment. It handles mise's
+`bin/<tool>` layout and uv's one-level platform archive layout. The existing
+`require_tools()` check remains strict; resolution never accepts a different
+version or falls back to an unvalidated tool.
 
 If a pinned local install is absent, the gate fails before setup with the exact
 missing version and a copyable `mise install <tool>@<version>` hint. GitHub
-Actions keeps its existing workflow-provisioned PATH and does not use local
-mise resolution. The two existing `runuser` gate invocations pass
-`GITHUB_ACTIONS=true` explicitly because `runuser -- env HOME=...` intentionally
-starts with a minimal environment; this preserves the hosted-runner branch of
-the resolver without changing the runner's toolchain or test lanes.
+Actions keeps its existing workflow-provisioned PATH and does not use local mise
+resolution. util-linux `runuser -u ci` without `-l` preserves the workflow
+process environment, including `GITHUB_ACTIONS`; `portable.py` then intentionally
+strips `GITHUB_ACTIONS` from the isolated lane environment while reading it from
+`os.environ` only to select the hosted resolver branch. Both gate and nightly
+workflows therefore use the same `runuser -u ci -- env HOME="$HOME"` form.
 
 ## Provenance and disposition
 
@@ -60,18 +63,20 @@ local behavior without changing toolchain pins.
 Regression tests in `scripts/ci/tests/test_portable.py` cover:
 
 - nested mise uv layout plus Node `bin` layout winning over an incompatible host PATH;
+- `test_local_environment_accepts_exact_path_tools_without_mise_install`;
+- a fresh setup provisioning pinned npm after initial resolution, then keeping it ahead of mise's bundled npm;
 - a missing pinned uv producing the exact install hint; and
 - GitHub Actions retaining host/workflow tool resolution.
 
 Focused command:
 
 ```text
-python3 -m unittest scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_resolves_pinned_uv_and_node_from_mise scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_fails_with_install_hint_when_pinned_mise_tool_is_missing scripts.ci.tests.test_portable.PortableGateTests.test_github_environment_keeps_host_toolchain_resolution
+python3 -m unittest scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_resolves_pinned_uv_and_node_from_mise scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_accepts_exact_path_tools_without_mise_install scripts.ci.tests.test_portable.PortableGateTests.test_setup_re_resolves_pinned_npm_after_provisioning scripts.ci.tests.test_portable.PortableGateTests.test_local_environment_fails_with_install_hint_when_pinned_mise_tool_is_missing scripts.ci.tests.test_portable.PortableGateTests.test_github_environment_keeps_host_toolchain_resolution
 ```
 
 The focused regression was red before the implementation and green afterward.
 After `./bin/ci setup` provisioned the pinned toolchain/dependencies, the full
 portable unit module passed (`.venv/bin/python -m unittest scripts.ci.tests.test_portable`;
-33 tests, exit 0). A preliminary system-Python run was invalid because it lacked
+35 tests, exit 0). A preliminary system-Python run was invalid because it lacked
 `ruamel` and the required SQLite constants; it is not counted as candidate
 verification.
