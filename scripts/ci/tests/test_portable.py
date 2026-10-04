@@ -113,7 +113,7 @@ class PortableGateTests(unittest.TestCase):
             resolved = ci.resolve_local_toolchain(env)
             node = resolved['HERMES_CI_PINNED_NODE']
             self.assertEqual(
-                subprocess.check_output([node, '--version'], env=resolved, text=True).strip(),
+                subprocess.check_output([node, '--version'], env=resolved, text=True, encoding='utf-8').strip(),
                 f'v{ci.PINS["node"]}',
             )
 
