@@ -666,13 +666,14 @@ class GoalState:
         instructs the change or the revision records concrete evidence that the requirement is obsolete
         or impossible; evidence-backed changes remain superseded unless later tool results contradict it."""
         lines = []
-        for i, rev in enumerate(self.revisions, start=1):
+        binding_revisions = [rev for rev in self.revisions if rev.get("kind") != "replace"]
+        for i, rev in enumerate(binding_revisions, start=1):
             quote = str(rev.get("user_quote") or "").strip()
             source = str(rev.get("user_message") or "").strip()
             if quote:
                 authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
-            elif str(rev.get("evidence") or "").strip():
-                authority = f'agent, evidence: {_truncate(str(rev.get("evidence")), 300)}'
+            elif rev.get("authority") == "evidence" and str(rev.get("evidence") or "").strip():
+                authority = f'evidence: {_truncate(str(rev.get("evidence")), 300)}'
             else:
                 authority = "agent, no user authority"
             before, after = rev.get("before") or {}, rev.get("after") or {}
@@ -1958,29 +1959,30 @@ class GoalManager:
 
     # --- revisions ------------------------------------------------------
 
-    # Changes that need an identifiable user instruction: the objective itself, dropping criteria,
-    # and changing constraints. Other contract fields may be restructured by the agent; the judge
-    # still holds an unauthorized revision to any earlier requirement it weakened.
-    _AUTHORITY_FIELDS = ("goal", "constraints")
+    # Changes that need an identifiable user instruction: the objective itself, hard limits,
+    # boundaries, stop conditions, and dropped criteria. Verification may be superseded by
+    # concrete evidence that it is obsolete or impossible; the judge still holds an unauthorized
+    # revision to any earlier requirement it weakened.
+    _AUTHORITY_FIELDS = ("goal", "outcome", "constraints", "boundaries", "stop_when")
 
-    def _quote_source(self, quote: str, state: GoalState, user_messages: Optional[List[str]] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """Validate a user quote using the same normalized, post-enrollment source as revisions."""
+    def _quote_source(self, quote: str, state: GoalState, user_messages: Optional[List[str]] = None) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+        """Validate a user quote and return its normalized source message."""
         quote = " ".join((quote or "").split())
         if len(quote) < _REVISION_QUOTE_MIN_CHARS:
-            return "", {"error_code": "user_quote_too_short",
-                         "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
+            return "", "", {"error_code": "user_quote_too_short",
+                              "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
         pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
         sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
         if not sources:
-            return "", {"error_code": "user_quote_not_found",
-                         "error": "user_quote does not match any user message sent since the goal was set"}
+            return "", "", {"error_code": "user_quote_not_found",
+                              "error": "user_quote does not match any user message sent since the goal was set"}
         source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
         if not source:
-            return "", {"error_code": "user_message_too_long",
-                         "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
-                                  "long to judge whether it authorizes this change; ask the user to state the "
-                                  "change in a short message and quote that"}
-        return quote, None
+            return "", "", {"error_code": "user_message_too_long",
+                              "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
+                                       "long to judge whether it authorizes this change; ask the user to state the "
+                                       "change in a short message and quote that"}
+        return quote, source, None
 
     def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
                 contract: Optional[GoalContract] = None, user_quote: str = "",
@@ -1995,11 +1997,9 @@ class GoalManager:
             return {"ok": False, "error_code": "reason_required", "error": "a replacement needs a reason"}
         if not goal:
             return {"ok": False, "error_code": "invalid_goal", "error": "goal text is empty"}
-        quote, quote_error = self._quote_source(user_quote, state, user_messages)
+        quote, source, quote_error = self._quote_source(user_quote, state, user_messages)
         if quote_error:
             return {"ok": False, **quote_error}
-        source_pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-        source = next((m for m in source_pool if quote in " ".join(m.split()) and len(" ".join(m.split())) <= _REVISION_SOURCE_MAX_CHARS), "")
         previous = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals)}
         new_state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
@@ -2022,10 +2022,12 @@ class GoalManager:
         """Record a versioned revision of the goal, contract fields and/or subgoal list.
 
         ``contract`` updates only the named fields (``""`` clears one); ``subgoals`` replaces the list.
-        A change to the objective or constraints, or a dropped subgoal, needs ``user_quote``: a verbatim
-        excerpt (12+ chars) of a real user message in ``user_messages`` (defaults to this session's
-        user messages since the goal was set). A verification change or dropped subgoal may instead carry
-        non-empty ``evidence`` when it is obsolete or impossible. Returns ``{"ok", "error_code", "error", "revision"}``."""
+        A change to the objective, outcome, constraints, boundaries, stop condition, or a dropped
+        subgoal needs ``user_quote``: a verbatim excerpt (12+ chars) of a real user message in
+        ``user_messages`` (defaults to this session's user messages since the goal was set). A
+        verification change or dropped subgoal may instead carry evidence of at least 12 characters
+        when it is obsolete or impossible; evidence cannot authorize any other field. Returns
+        ``{"ok", "error_code", "error", "revision"}``."""
         state = self._require_goal()
         reason = (reason or "").strip()
         if not reason:
@@ -2045,8 +2047,14 @@ class GoalManager:
             return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
         dropped = [s for s in before["subgoals"] if s not in after["subgoals"]]
         evidence = " ".join((evidence or "").split())
+        if evidence and len(evidence) < _REVISION_QUOTE_MIN_CHARS:
+            return {"ok": False, "error_code": "evidence_too_short",
+                    "error": f"evidence must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
         needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
         evidence_changes = [k for k in changed if k == "verification"] + (["subgoals"] if dropped else [])
+        if evidence and set(changed) - set(evidence_changes):
+            return {"ok": False, "error_code": "evidence_not_authorized",
+                    "error": "evidence may authorize only verification changes or dropped subgoals"}
         quote = " ".join((user_quote or "").split())
         if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS and not (evidence and not set(needs_authority) - {"subgoals"}):
             return {"ok": False, "error_code": "user_authority_required",
@@ -2056,11 +2064,9 @@ class GoalManager:
         source = ""
         authority = ""
         if quote:
-            quote, quote_error = self._quote_source(quote, state, user_messages)
+            quote, source, quote_error = self._quote_source(quote, state, user_messages)
             if quote_error:
                 return {"ok": False, **quote_error}
-            source = next((m for m in (user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at))
-                           if quote in " ".join(m.split()) and len(" ".join(m.split())) <= _REVISION_SOURCE_MAX_CHARS), "")
             authority = "user_quote"
         elif evidence and evidence_changes and not set(needs_authority) - {"subgoals"}:
             authority = "evidence"
@@ -2079,7 +2085,8 @@ class GoalManager:
         state.consecutive_disputes = 0
         state.last_dispute_evidence = ""
         self._save()
-        return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
+        return {"ok": True, "revision": revision,
+                "version": sum(1 for rev in state.revisions if rev.get("kind") != "replace") + 1}
 
     # --- /subgoal user controls ---------------------------------------
 

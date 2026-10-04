@@ -360,7 +360,8 @@ def test_revision_resets_the_dispute_streak_and_round_trips(hermes_home):
     mgr = GoalManager(session_id="rev-roundtrip")
     mgr.set("Ship X", max_turns=100)
     mgr.state.consecutive_disputes = 2
-    mgr.revise(reason="clarify", contract={"outcome": "X live"}, user_messages=[])
+    mgr.revise(reason="clarify", contract={"outcome": "X live"}, user_quote="clarify the outcome",
+               user_messages=["Please clarify the outcome now."])
     assert mgr.state.consecutive_disputes == 0
     state = load_goal("rev-roundtrip")
     assert goals.GoalState.from_json(state.to_json()).revisions == state.revisions
@@ -478,7 +479,7 @@ def test_revision_refuses_a_source_message_too_long_to_judge(hermes_home):
     assert mgr.state.contract.verification == "security audit passes"
 
 
-def test_evidence_can_supersede_an_obsolete_verification_without_user_quote(hermes_home, monkeypatch):
+def test_evidence_can_supersede_an_obsolete_verification_without_user_quote(hermes_home):
     mgr = GoalManager(session_id="rev-evidence")
     mgr.set("Ship X", contract=GoalContract(verification="Check the removed component"))
     result = mgr.revise(
@@ -493,14 +494,35 @@ def test_evidence_can_supersede_an_obsolete_verification_without_user_quote(herm
     assert "removed the component" in revision["evidence"]
     history = load_goal("rev-evidence").render_revisions_block()
     assert "agent, evidence:" in history
+    assert "evidence: The approved plan removed the component" in history
+    assert "agent, agent" not in history
     assert "earlier verification: Check the removed component" in history
 
 
 def test_evidence_does_not_authorize_objective_or_constraint_changes(hermes_home):
     mgr = GoalManager(session_id="rev-evidence-boundary")
     mgr.set("Ship X", contract=GoalContract(constraints="Never publish secrets"))
-    assert mgr.revise(reason="descoped", goal="Ship Y", evidence="The old path was removed")["error_code"] == "user_authority_required"
-    assert mgr.revise(reason="loosened", contract={"constraints": ""}, evidence="The old path was removed")["error_code"] == "user_authority_required"
+    assert mgr.revise(reason="descoped", goal="Ship Y", evidence="The old path was removed")["error_code"] == "evidence_not_authorized"
+    assert mgr.revise(reason="loosened", contract={"constraints": ""}, evidence="The old path was removed")["error_code"] == "evidence_not_authorized"
+
+
+@pytest.mark.parametrize("change", [
+    {"contract": {"boundaries": ""}},
+    {"contract": {"stop_when": ""}},
+    {"contract": {"outcome": ""}},
+])
+def test_evidence_is_rejected_for_non_authorizable_contract_fields(hermes_home, change):
+    mgr = GoalManager(session_id="rev-evidence-fields")
+    mgr.set("Ship X", contract=GoalContract(outcome="X live", boundaries="repo only", stop_when="ask first"))
+    result = mgr.revise(reason="obsolete", evidence="The old path is gone now", **change)
+    assert result["error_code"] == "evidence_not_authorized"
+
+
+def test_short_evidence_is_refused(hermes_home):
+    mgr = GoalManager(session_id="rev-short-evidence")
+    mgr.set("Ship X", contract=GoalContract(verification="check old component"))
+    result = mgr.revise(reason="obsolete", contract={"verification": "X is live"}, evidence="gone")
+    assert result["error_code"] == "evidence_too_short"
 
 
 def test_replace_uses_current_user_quote_and_records_the_replaced_goal(hermes_home):
@@ -522,6 +544,21 @@ def test_replace_uses_current_user_quote_and_records_the_replaced_goal(hermes_ho
     assert record["kind"] == "replace"
     assert record["authority"] == "user_quote"
     assert record["before"]["goal"] == "Ship the original outcome"
+    assert record["user_message"] == "Please set a better goal for this work."
+
+
+def test_replace_starts_new_revision_numbering_and_is_not_binding_history(hermes_home, monkeypatch):
+    mgr = GoalManager(session_id="replace-version")
+    mgr.set("Old goal", contract=GoalContract(constraints="never push to main"))
+    mgr.replace(reason="new direction", goal="New goal", user_quote="replace with the new goal",
+                user_messages=["Please replace with the new goal now."])
+    assert mgr.revise(reason="clarify", contract={"verification": "New goal is live"})["version"] == 2
+    block = mgr.state.render_revisions_block()
+    assert "Old goal" not in block and "never push to main" not in block
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
+    mgr.evaluate_after_turn("working")
+    assert "Old goal" not in prompts[0] and "never push to main" not in prompts[0]
+    assert "v2" in prompts[0]
 
 
 def test_replace_requires_a_real_current_user_quote(hermes_home):

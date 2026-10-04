@@ -98,12 +98,18 @@ Failed or interrupted model turns do not run completion judging.
     changes remain superseded unless later recorded tool results contradict the
     evidence. Changing the objective or constraints, or dropping a subgoal,
     still needs a verbatim quote of 12+ characters from a real user message sent
-    since the goal was set; evidence cannot authorize those changes. A
-    verification criterion may be reworded or dropped with non-empty evidence.
+    since the goal was set; evidence cannot authorize those changes. Boundaries
+    and stop_when are also user-quote-only when changed. A verification
+    criterion may be reworded or dropped with evidence of at least 12 characters
+    showing it is obsolete or impossible; evidence cannot authorize any other
+    field.
     `GoalManager.replace()` replaces an active or paused goal only after the same
     fresh quote check, resets the new goal active with the configured budget,
-    and records the complete replaced goal in the audit entry. The plugin
-    degrades with `unsupported_core` until these primitives are promoted.
+    and records the complete replaced goal in an audit entry that is not binding
+    revision history for the new goal. The companion plugin lives in
+    `0xble/agents` at `sources/plugins/goal-lifecycle`; it degrades with
+    `unsupported_core` until these primitives are promoted, and remains safe to
+    deploy before the core by preserving plain revise/set/status/subgoal_add.
   The judge prompt judges the end state, not the route. A remedied state
   invariant stops blocking `done`, while a breached irreversible prohibition
   returns BLOCKED.
