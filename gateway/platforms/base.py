@@ -1754,7 +1754,18 @@ def is_chat_level_not_found(exc: Optional[BaseException] = None, error_text: str
             and _any_in(blob, *_CHAT_LEVEL_NOT_FOUND_SUBSTRINGS))
 
 
-class EphemeralReply(str):
+class CommandReply(str):
+    """Gateway-authored reply (slash-command output), not agent output. Bare local paths in it
+    stay text: a goal or title that names ``~/plan.md`` must not upload that file. Explicit
+    ``MEDIA:`` tags still deliver."""
+
+
+def as_command_reply(value: Any) -> Any:
+    """Mark a plain-string handler result as :class:`CommandReply`; other values pass through."""
+    return CommandReply(value) if type(value) is str else value
+
+
+class EphemeralReply(CommandReply):
     """System-notice reply that auto-deletes after ``ttl_seconds`` on platforms implementing
     ``delete_message`` (others leave it). ``None`` ttl uses ``display.ephemeral_system_ttl``
     (``0`` disables globally). Subclassing ``str`` keeps it transparent to everything that
@@ -4664,12 +4675,15 @@ class BasePlatformAdapter(ABC):
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
                                         *, is_ephemeral_response: bool) -> "_ExtractedResponse":
         """Split a handler response into deliverable text + attachments. Order matters: MEDIA tags →
-        image URLs → residual directives → bare local paths (skipped for ephemeral notices so config
-        paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
+        image URLs → residual directives → bare local paths (skipped for command replies and
+        ephemeral notices so paths they mention stay text; unknown-extension MEDIA tags survive for
+        the bare-path detector). History
         dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
         # Captured before extract_media strips it: images then go via send_document (no recompression).
         force_document = "[[as_document]]" in response
         pre_extract = response
+        # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.
+        skip_bare_paths = is_ephemeral_response or isinstance(response, CommandReply)
         # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
@@ -4683,7 +4697,7 @@ class BasePlatformAdapter(ABC):
             if images:
                 logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
             local_files = []
-            if not is_ephemeral_response:
+            if not skip_bare_paths:
                 local_files, text_content = self.extract_local_files(text_content)
                 local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
         history = (await self._bounded_history_media_paths_for_session(session_key)
