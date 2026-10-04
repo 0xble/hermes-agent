@@ -750,6 +750,12 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     # The sudo password callback is thread-local: without re-wiring here, sudo prompts
     # fall through to /dev/tty and hang the headless gateway (re-run is a no-op).
     _wire_callbacks(sid)
+    # A /moa queued while the previous turn ran applies to its own queued prompt only. A failed
+    # switch must not kill the turn thread: run the prompt on the current model instead.
+    try:
+        _apply_pending_moa(sid, session, text)
+    except Exception:
+        logger.warning("queued MoA one-shot could not be applied; running on the current model", exc_info=True)
     if not st.one_turn_restore and not session.get("moa_one_shot_restore"):
         # Skip the config-model sync while a /model --once override or /moa one-shot is active: the
         # temporary model is intentionally not pinned as a session model_override (it must not persist),
@@ -1204,7 +1210,6 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
-        _apply_pending_moa(sid, session, text)
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
