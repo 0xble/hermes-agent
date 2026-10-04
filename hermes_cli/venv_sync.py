@@ -502,6 +502,11 @@ def relaunch_command(
         if option in ("-W", "-X") and index < len(original):
             options.append(original[index])
             index += 1
+    if argv[0] == "-c":
+        # The inline code runs again from the top, so it must see the argv it started with.
+        # Its own edits (``sys.argv.pop(1)`` in the release-to-source re-entry) would
+        # otherwise apply twice and consume the subcommand.
+        argv = ["-c", *original[index + 2:]]
     prefix = f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
     if argv[0] == "-c":
         body = f"exec({original[index + 1]!r})"
