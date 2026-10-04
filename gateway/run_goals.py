@@ -26,6 +26,32 @@ logger = logging.getLogger("gateway.run")
 # Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
 _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
 
+# The retry runs as a tracked background task so post-delivery callbacks and the next turn do not
+# wait on Telegram's flood window. The shared short-wait helper owns the 15s budget and 0.5s slack;
+# this attempt cap bounds additional traffic when Telegram keeps extending the penalty.
+_GOAL_NOTICE_MAX_ATTEMPTS = 3
+
+
+def _goal_notice_kind(message: str) -> str:
+    """Stable warning label for the user-visible goal state a notice represents."""
+    text = str(message or "")
+    lowered = text.lower()
+    if "blocked" in lowered:
+        return "blocked"
+    if "wait ended" in lowered:
+        return "wait-ended"
+    if text.startswith("⏳"):
+        return "parked"
+    if text.startswith("↻"):
+        return "continuing"
+    if text.startswith("✓"):
+        return "achieved"
+    if text.startswith("⏸"):
+        return "paused"
+    if text.startswith("▶"):
+        return "resumed"
+    return "status"
+
 
 class GatewayGoalsMixin:
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
@@ -215,19 +241,83 @@ class GatewayGoalsMixin:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
         return adapter
 
+    def _log_goal_status_notice_failure(self, message: str, error: Any, attempts: int) -> None:
+        logger.warning(
+            "goal continuation: status send failed notice_kind=%s attempts=%d: %s",
+            _goal_notice_kind(message), attempts, error or "unknown error",
+        )
+
+    def _track_goal_notice_retry(self, task: "asyncio.Task") -> None:
+        retain = getattr(self, "_retain_background_task", None)
+        if callable(retain):
+            retain(task)
+            return
+        tasks = getattr(self, "_background_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = self._background_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _retry_goal_status_notice(
+        self, source: Any, message: str, metadata: Any, wait: float, already_waited: float,
+        attempts: int,
+    ) -> None:
+        from gateway.delivery_ledger import short_flood_wait
+
+        error: Any = "retry attempts exhausted"
+        while attempts < _GOAL_NOTICE_MAX_ATTEMPTS:
+            await asyncio.sleep(wait)
+            adapter = self._goal_notice_adapter(source)
+            if not adapter:
+                self._log_goal_status_notice_failure(message, "delivery adapter unavailable", attempts)
+                return
+            try:
+                result = await adapter.send(source.chat_id, message, metadata=metadata)
+            except Exception as exc:
+                error = exc
+                result = None
+            else:
+                if result is None or getattr(result, "success", True):
+                    return
+                error = getattr(result, "error", "unknown error")
+            attempts += 1
+            next_wait = short_flood_wait(error, already_waited)
+            if next_wait is None:
+                self._log_goal_status_notice_failure(message, error, attempts)
+                return
+            already_waited += next_wait
+            wait = next_wait
+
+        self._log_goal_status_notice_failure(message, error, attempts)
+
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
-        """Send a /goal judge status line back to the originating chat/thread."""
+        """Send a /goal judge status line without holding the turn open for flood recovery."""
         adapter = self._goal_notice_adapter(source)
         if not adapter:
             return
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
-        result = await adapter.send(source.chat_id, message, metadata=metadata)
-        if result is not None and not getattr(result, "success", True):
-            logger.warning(
-                "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
-            )
+        try:
+            result = await adapter.send(source.chat_id, message, metadata=metadata)
+        except Exception as exc:
+            error = exc
+            result = None
+        else:
+            if result is None or getattr(result, "success", True):
+                return
+            error = getattr(result, "error", "unknown error")
+
+        from gateway.delivery_ledger import short_flood_wait
+        wait = short_flood_wait(error)
+        if wait is None:
+            self._log_goal_status_notice_failure(message, error, attempts=1)
+            return
+        task = asyncio.create_task(
+            self._retry_goal_status_notice(source, message, metadata, wait, wait, attempts=1),
+            name=f"goal-status-retry:{_goal_notice_kind(message)}",
+        )
+        self._track_goal_notice_retry(task)
 
     async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
         """Send a /goal status line after the main response is delivered.

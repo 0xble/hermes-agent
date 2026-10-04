@@ -70,6 +70,12 @@ FLOOD_RETRY_DEFAULT_SECONDS = 60.0
 FLOOD_RETRY_CAP_SECONDS = 15 * 60.0
 FLOOD_RETRY_SLACK_SECONDS = 2.0
 
+# A short flood window is worth sitting out for user-visible notices and other non-latency-sensitive
+# deliveries. Keep these thresholds shared with the cron live-lane fix (#290), rather than letting each
+# producer invent a different retry budget.
+SHORT_FLOOD_WAIT_BUDGET_SECONDS = 15.0
+SHORT_FLOOD_WAIT_SLACK_SECONDS = 0.5
+
 # A penalty this long is not a wait to sit out: the reply would land hours after it was useful, and
 # a row parked on that deadline keeps waking the redelivery timer until the staleness sweep drops it
 # with no explanation. Such a row is abandoned immediately and visibly instead, so the operator sees
@@ -128,6 +134,22 @@ def flood_wait_seconds(error: Any, default: float = FLOOD_RETRY_DEFAULT_SECONDS)
         if raw is not None:
             wait = raw
     return wait if wait > 0 else default
+
+
+def short_flood_wait(error: Any, already_waited: float = 0.0) -> Optional[float]:
+    """Return a bounded wait before retrying a short flood refusal, or ``None`` to stop.
+
+    The cumulative budget and slack are shared by the cron live lane and gateway status notices.
+    """
+    if not is_flood_error(error):
+        return None
+    wait = flood_wait_seconds(error, default=0.0)
+    if wait <= 0:
+        return None
+    wait += SHORT_FLOOD_WAIT_SLACK_SECONDS
+    if already_waited + wait > SHORT_FLOOD_WAIT_BUDGET_SECONDS:
+        return None
+    return wait
 
 
 def flood_retry_delay(seconds: Any) -> float:

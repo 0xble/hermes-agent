@@ -25,12 +25,15 @@ from typing import Any, List, Optional
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
 
+from gateway.delivery_ledger import (
+    SHORT_FLOOD_WAIT_BUDGET_SECONDS as _LIVE_FLOOD_WAIT_BUDGET_SECS,
+    short_flood_wait as _short_flood_wait,
+)
+
 # A live-lane send refused with a short ``flood_control:<seconds>`` penalty is retried on the live
 # lane after the wait instead of falling back to the standalone sender, which cannot send Telegram
 # Rich Messages. Cron output is not latency-sensitive, so a few seconds of delay beats degraded
 # formatting. Longer penalties, or repeated refusals past the budget, still fall back.
-_LIVE_FLOOD_WAIT_BUDGET_SECS = 15.0
-_LIVE_FLOOD_WAIT_SLACK_SECS = 0.5
 
 
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
@@ -1476,23 +1479,6 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         route_metadata.setdefault("scope_id", str(t.origin["scope_id"]))
         media_metadata.setdefault("scope_id", str(t.origin["scope_id"]))
     return route_thread_id, route_metadata, media_metadata
-
-
-def _short_flood_wait(error: BaseException, already_waited: float) -> Optional[float]:
-    """Seconds to sit out a live-lane flood refusal before retrying, or ``None`` to fall back.
-
-    Only a ``flood_control:<seconds>`` refusal qualifies, and only while the total wait for this
-    target stays within ``_LIVE_FLOOD_WAIT_BUDGET_SECS``; a longer penalty keeps the standalone path."""
-    from gateway.delivery_ledger import flood_wait_seconds, is_flood_error
-    if not is_flood_error(error):
-        return None
-    wait = flood_wait_seconds(error, default=0.0)
-    if wait <= 0:
-        return None
-    wait += _LIVE_FLOOD_WAIT_SLACK_SECS
-    if already_waited + wait > _LIVE_FLOOD_WAIT_BUDGET_SECS:
-        return None
-    return wait
 
 
 def _live_send_text(
