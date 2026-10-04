@@ -39,8 +39,15 @@ OPTIONAL_LANES = {
 # explicit profiles rather than treating partial --lane runs as qualification.
 GATE_LANES = ('static', 'node-gate')
 # Upgrade requires upstream release tags and a 900s per-file bound. The SQLite
-# torture chamber remains nightly-only while its kill9/FTS failures are resolved.
+# torture chamber and the transfer runner remain nightly-only while their
+# environment/process races are resolved.
 NIGHTLY_ONLY_E2E = ('tests/e2e/core/upgrade', 'tests/e2e/core/sqlite/test_torture_chamber.py')
+NIGHTLY_ONLY_TESTS = (*NIGHTLY_ONLY_E2E, 'tests/gateway/test_generation_transfer_runner.py')
+
+
+def is_nightly_only(path: Path, root: Path = ROOT) -> bool:
+    return any(path == root / relative or path.is_relative_to(root / relative)
+               for relative in NIGHTLY_ONLY_TESTS)
 
 
 def shard_files(root: Path, count: int) -> list[list[str]]:
@@ -55,9 +62,7 @@ def shard_files(root: Path, count: int) -> list[list[str]]:
         raise ValueError('Shard count must be positive')
     files = [path for path in (root / 'tests').rglob('test_*.py')
              if not {'integration', 'docker'} & set(path.relative_to(root).parts)
-             and not (path.relative_to(root).parts[1] == 'e2e'
-                      and (path.is_relative_to(root / NIGHTLY_ONLY_E2E[0])
-                           or path == root / NIGHTLY_ONLY_E2E[1]))]
+             and not is_nightly_only(path, root)]
     # Most files live in tests/; candidate-extensions is an additional ordinary root.
     files.extend((root / 'candidate-extensions').rglob('test_*.py') if (root / 'candidate-extensions').is_dir() else ())
     timings = json.loads((ROOT / 'scripts/ci/python_shard_timings.json').read_text(encoding='utf-8-sig'))
@@ -88,8 +93,8 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
 
 def nightly_only_e2e(env: dict[str, str], workers: int) -> None:
     failures = []
-    for path, timeout in ((NIGHTLY_ONLY_E2E[1], None),
-                          (NIGHTLY_ONLY_E2E[0], E2E_UPGRADE_FILE_TIMEOUT)):
+    for path in NIGHTLY_ONLY_TESTS:
+        timeout = E2E_UPGRADE_FILE_TIMEOUT if path == NIGHTLY_ONLY_E2E[0] else None
         try:
             python_tests(env, [path], workers, file_timeout=timeout)
         except subprocess.CalledProcessError as error:
