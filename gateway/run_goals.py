@@ -544,8 +544,7 @@ class GatewayGoalsMixin:
         entry = store.lookup_by_session_id(sid) if store is not None else None
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
-        if getattr(entry, "resume_pending", False):
-            return  # restart auto-resume owns this chat; its turn's judge re-evaluates the barrier
+        assert store is not None
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source) if source is not None else None
         if adapter is None or not getattr(adapter, "_message_handler", None):
@@ -554,6 +553,30 @@ class GatewayGoalsMixin:
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
                 or self._queue_depth(key, adapter=adapter) > 0):
             return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
+
+        if getattr(entry, "resume_pending", False):
+            # Startup auto-resume owns a fresh restart marker. Once its bounded freshness window
+            # expires, it will no longer schedule this session; do not let that stale marker wedge
+            # an otherwise eligible parked goal forever. Snapshot + CAS-clear so a successor that
+            # refreshed the marker wins rather than being stolen by the idle ticker.
+            from gateway.run import _auto_continue_freshness_window, _is_fresh_gateway_interruption
+
+            marker = store.get_resume_pending_marker(key)
+            marked_at = marker[2] if marker is not None else getattr(entry, "last_resume_marked_at", None)
+            if _is_fresh_gateway_interruption(
+                    marked_at, window_secs=_auto_continue_freshness_window()):
+                return  # restart auto-resume still owns this chat
+            if marker is None:
+                cleared = store.clear_resume_pending(key)
+            else:
+                cleared = store.clear_resume_pending(key, expected_marker=marker)
+            if not cleared:
+                return  # marker changed or the session disappeared; retry on the next scan
+            logger.info(
+                "goal wakeup: stale resume_pending cleared for session %s; idle ticker owns continuation",
+                sid,
+            )
+
         max_turns = self._goal_max_turns_from_config()
 
         def _check():

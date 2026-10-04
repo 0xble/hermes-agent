@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,7 +68,26 @@ def _runner(adapter, entry):
     runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")})
     runner._running = True
     runner._running_agents = {}
-    runner.session_store = SimpleNamespace(lookup_by_session_id=lambda sid: entry if sid == SID else None)
+    def _get_marker(key):
+        if key != KEY or not entry.resume_pending:
+            return None
+        return (entry.session_id, getattr(entry, "resume_marker_token", None),
+                getattr(entry, "last_resume_marked_at", None))
+
+    def _clear_marker(key, *, expected_marker=None):
+        if key != KEY or not entry.resume_pending:
+            return False
+        current = _get_marker(key)
+        if expected_marker is not None and expected_marker != current:
+            return False
+        entry.resume_pending = False
+        return True
+
+    runner.session_store = SimpleNamespace(
+        lookup_by_session_id=lambda sid: entry if sid == SID else None,
+        get_resume_pending_marker=_get_marker,
+        clear_resume_pending=_clear_marker,
+    )
     runner._restored_source = lambda e: e.origin
     runner._delivery_adapter_for = lambda source: adapter
     runner._is_session_running = lambda key: False
@@ -146,7 +166,14 @@ async def test_watcher_resumes_goal_parked_on_restart_killed_process(hermes_home
 async def test_watcher_defers_when_the_chat_is_busy_or_owned(hermes_home, monkeypatch, busy):
     _park_killed(hermes_home)
     adapter = _Adapter()
-    entry = _entry(resume_pending=busy == "resume_pending", suspended=busy == "suspended")
+    entry_kwargs = {"resume_pending": busy == "resume_pending", "suspended": busy == "suspended"}
+    if busy == "resume_pending":
+        entry_kwargs.update(
+            resume_reason="restart_interrupted",
+            resume_marker_token="fresh-marker",
+            last_resume_marked_at=datetime.now(),
+        )
+    entry = _entry(**entry_kwargs)
     runner = _runner(adapter, entry)
     if busy == "running":
         runner._is_session_running = lambda key: True
@@ -159,6 +186,27 @@ async def test_watcher_defers_when_the_chat_is_busy_or_owned(hermes_home, monkey
 
     assert adapter.handled == []
     assert goals.load_goal(SID).waiting_on_session == PROC  # kept for the next scan
+
+
+@pytest.mark.asyncio
+async def test_stale_resume_pending_does_not_block_lifted_barrier(hermes_home, monkeypatch):
+    _park_killed(hermes_home)
+    adapter = _Adapter()
+    entry = _entry(
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        resume_marker_token="stale-marker",
+        last_resume_marked_at=datetime.now() - timedelta(hours=2),
+    )
+    runner = _runner(adapter, entry)
+
+    await _one_scan(runner, monkeypatch)
+
+    assert len(adapter.handled) == 1
+    assert "was killed by a gateway restart" in adapter.handled[0].text
+    assert entry.resume_pending is False
+    assert adapter.sent == ["▶ Goal wait ended — resuming."]
+    assert goals.load_goal(SID).waiting_on_session is None
 
 
 @pytest.mark.asyncio
