@@ -2537,8 +2537,10 @@ class GoalManager:
         if not s or s.status != "active":
             return None
         prompt = self._current_continuation_prompt(s)
-        if s.revisions:
-            prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=s.render_revisions_block())
+        # A replace leaves only an audit record, which renders nothing; skip the notice then.
+        revision_lines = s.render_revisions_block() if s.revisions else ""
+        if revision_lines.strip():
+            prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=revision_lines)
         return prompt
 
     @staticmethod

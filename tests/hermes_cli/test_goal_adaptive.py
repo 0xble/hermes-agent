@@ -588,6 +588,19 @@ def test_replace_uses_current_user_quote_and_records_the_replaced_goal(hermes_ho
     assert record["user_message"] == "Please set a better goal for this work."
 
 
+def test_freshly_replaced_goal_has_no_revision_notice(hermes_home):
+    mgr = GoalManager(session_id="replace-notice")
+    mgr.set("Old goal", contract=GoalContract(constraints="never push to main"))
+    mgr.replace(reason="new direction", goal="New goal", user_quote="replace with the new goal",
+                user_messages=["Please replace with the new goal now."])
+    prompt = mgr.next_continuation_prompt()
+    assert prompt is not None and "New goal" in prompt
+    assert "This goal has been revised" not in prompt
+    mgr.revise(reason="clarify", contract={"verification": "New goal is live"})
+    revised = mgr.next_continuation_prompt()
+    assert revised is not None and "This goal has been revised" in revised
+
+
 def test_replace_starts_new_revision_numbering_and_is_not_binding_history(hermes_home, monkeypatch):
     mgr = GoalManager(session_id="replace-version")
     mgr.set("Old goal", contract=GoalContract(constraints="never push to main"))
