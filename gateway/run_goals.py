@@ -36,20 +36,20 @@ def _goal_notice_kind(message: str) -> str:
     """Stable warning label for the user-visible goal state a notice represents."""
     text = str(message or "")
     lowered = text.lower()
-    if "blocked" in lowered:
-        return "blocked"
-    if "wait ended" in lowered:
-        return "wait-ended"
     if text.startswith("⏳"):
         return "parked"
     if text.startswith("↻"):
         return "continuing"
     if text.startswith("✓"):
         return "achieved"
-    if text.startswith("⏸"):
-        return "paused"
     if text.startswith("▶"):
-        return "resumed"
+        return "wait-ended" if "wait ended" in lowered else "resumed"
+    if text.startswith("⏸"):
+        return "blocked" if "blocked" in lowered else "paused"
+    if "blocked" in lowered:
+        return "blocked"
+    if "wait ended" in lowered:
+        return "wait-ended"
     return "status"
 
 

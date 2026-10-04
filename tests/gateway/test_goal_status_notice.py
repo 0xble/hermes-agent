@@ -156,7 +156,7 @@ async def test_goal_status_notice_bounds_flood_retries_and_warns_once(monkeypatc
     source = SessionSource(platform=Platform.DISCORD, chat_id="parent-channel", user_id="user-1")
 
     with caplog.at_level("WARNING", logger="gateway.run"):
-        await runner._send_goal_status_notice(source, "✓ Goal achieved: done")
+        await runner._send_goal_status_notice(source, "✓ Goal achieved: blocked issue resolved")
         await next(iter(runner._background_tasks))
 
     assert len(adapter.calls) == 3
