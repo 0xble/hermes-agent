@@ -312,6 +312,35 @@ async def test_real_store_cas_loss_keeps_marker_and_barrier(hermes_home, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_resume_marker_appearing_during_barrier_check_defers_without_clearing(
+    hermes_home, monkeypatch,
+):
+    store, entry = _real_store(hermes_home)
+    proc = "proc_marker_during_check"
+    _park_killed(hermes_home, sid=entry.session_id, proc=proc)
+    adapter = _Adapter()
+    calls = 0
+
+    async def _in_executor(func, *args):
+        nonlocal calls
+        result = func(*args)
+        if calls == 0:
+            assert store.mark_resume_pending(entry.session_key, reason="successor_restart")
+        calls += 1
+        return result
+
+    runner = _real_runner(adapter, store, entry)
+    runner._run_in_executor_with_context = _in_executor
+
+    await _one_scan(runner, monkeypatch)
+
+    assert calls >= 1
+    assert adapter.handled == []
+    assert store.lookup_by_session_id(entry.session_id).resume_pending is True
+    assert goals.load_goal(entry.session_id).waiting_on_session == proc
+
+
+@pytest.mark.asyncio
 async def test_real_store_legacy_marker_falls_back_to_old_updated_at(hermes_home, monkeypatch):
     store, entry = _real_store(hermes_home)
     old = datetime.now() - timedelta(hours=2)

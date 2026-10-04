@@ -583,6 +583,16 @@ class GatewayGoalsMixin:
         mgr, prompt = await self._run_in_executor_with_context(_check)
         if not prompt:
             return
+        # A marker absent from the initial snapshot may be created while the barrier check runs.
+        # The live SessionEntry is the generation fence for that narrow race: defer to the next
+        # scan without clearing the fresh marker or admitting a continuation under stale fences.
+        if resume_marker is None and getattr(entry, "resume_pending", False):
+            return
+        # The barrier check ran off-loop; a turn, adapter guard, or queued event may have appeared
+        # while it was running. Re-check every admission fence before clearing or injecting.
+        if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
+                or self._queue_depth(key, adapter=adapter) > 0):
+            return
         since = mgr.state.waiting_since
         logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
@@ -592,15 +602,11 @@ class GatewayGoalsMixin:
             cleared = await self.async_session_store.clear_resume_pending(
                 key, expected_marker=resume_marker,
             )
-        elif getattr(entry, "resume_pending", False):
-            # Keep compatibility with the narrow in-memory test seam and legacy stores that cannot
-            # return a marker; real SessionStore entries always provide the CAS tuple.
-            cleared = await self.async_session_store.clear_resume_pending(key)
         else:
             cleared = True
         if not cleared:
             return  # marker changed or the session disappeared; retry on the next scan
-        if resume_marker is not None or getattr(entry, "resume_pending", False):
+        if resume_marker is not None:
             logger.info(
                 "goal wakeup: stale resume_pending cleared for session %s; idle ticker owns continuation",
                 sid,

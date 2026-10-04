@@ -8,7 +8,9 @@ Fork patch identity: `goal-restart-parked-wake`. This is a fork-only adaptation 
 
 A parked gateway `/goal` whose wait barrier has lifted must resume from the idle ticker even when its session still carries `resume_pending` from an interrupted gateway turn. Fresh restart markers remain owned by startup auto-resume; once the marker is outside the auto-resume freshness window, the stale flag must no longer block the goal wake. Legacy entries without `last_resume_marked_at` use `updated_at` for the same freshness decision. A non-positive `HERMES_AUTO_CONTINUE_FRESHNESS` disables stale takeover, consistently leaving ownership with startup auto-resume. The wake must preserve existing busy-session and admission fences so startup auto-resume and the idle ticker cannot both run the session. The stale marker is cleared through the async SessionStore facade only after the barrier prompt is confirmed and immediately before admission; a failed CAS aborts admission and leaves the marker for retry.
 
-The continuation prompt must retain the shared lifted-barrier note, including that the awaited process exited with code 1 when the durable process receipt provides that fact.
+The continuation prompt must retain the shared lifted-barrier note, including that the awaited process exited with code 1 when the durable process receipt provides that fact. If a stale marker is consumed before admission is refused with `WakeNotAccepted`, it is not restored: the session remains parked and the next scan retries the wake, while restoring the marker could incorrectly hand ownership back to startup auto-resume after its freshness window.
+
+Startup auto-resume may also decline to nominate a session because the restart-loop breaker tripped or its `resume_reason` is not an auto-resume reason. The idle ticker still takes over after the marker freshness window; it does not depend on the session having entered the startup candidate list.
 
 ## Independent proposal before upstream search
 
