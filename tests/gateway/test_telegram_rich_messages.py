@@ -341,6 +341,25 @@ async def test_unknown_endpoint_error_falls_back_to_legacy():
     adapter._bot.send_message.assert_awaited()
 
 
+def test_rich_capability_latch_resets_for_new_polling_generation():
+    adapter = _make_adapter()
+    adapter._rich_send_disabled = True
+
+    generation, _ = adapter._begin_polling_generation()
+
+    assert generation == 1
+    assert adapter._rich_send_disabled is False
+
+
+def test_rich_capability_rejection_logs_redacted_warning(caplog):
+    adapter = _make_adapter()
+
+    with caplog.at_level(logging.WARNING):
+        assert adapter._rich_rejected(RuntimeError("Method not found"), "sendRichMessage", "MarkdownV2")
+
+    assert "sendRichMessage rejected" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_capability_error_latches_rich_send_off():
     """Endpoint-missing errors latch rich off so later sends skip the

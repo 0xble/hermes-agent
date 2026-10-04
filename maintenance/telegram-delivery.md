@@ -198,6 +198,31 @@ files) still refuse on a retired instance and remain a follow-up. Upstream has t
 same gap at `343500b354`. Retire when an upstream release forwards these calls.
 Roll back by reverting this patch's adapter and test changes. No state changes.
 
+## Transient Rich Delivery Recovery and Capability Latch
+
+**Patch identity:** `telegram-rich-delivery-recovery`. Cron delivery keeps a Telegram
+live-adapter send on the Rich Message path for a bounded 120-second exponential-backoff
+window after `send_path_degraded` or a short flood refusal. Only after that window does
+it use the legacy standalone sender. If that fallback succeeds after a transient live
+failure, the job records `last_delivery_formatting_degraded` with the affected target
+and emits a WARNING; non-Telegram targets are unchanged. The existing delivery ledger
+remains the recovery path when fallback cannot send.
+
+Rich capability rejection is WARNING-logged with the existing redaction helper and the
+adapter latch resets at the next polling generation. The latch still suppresses retries
+within one generation, so a genuine unsupported endpoint cannot create a retry storm.
+The current fork already contains the currency protection from `f9a4ab8558`; a direct
+payload reproduction for `costs $500 and $1,200` produces ``costs `$500` and `$1,200` ``
+and does not reproduce the reported LaTeX defect, so no currency source change is made.
+
+Source: `cron/scheduler_delivery.py` and `plugins/platforms/telegram/adapter.py`.
+Proof: `tests/cron/test_cron_reconnect_only_rejection.py` and
+`tests/gateway/test_telegram_rich_messages.py`. Upstream search on 2026-10-04 found no
+matching issue or pull request for these exact symbols. Retire when an upstream release
+keeps transient cron delivery on the rich live lane and resets capability latches by
+polling generation. Roll back the two source files and their regression tests together;
+there are no configuration or persistent-state migrations.
+
 ## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,
