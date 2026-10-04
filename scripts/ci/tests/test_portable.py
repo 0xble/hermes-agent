@@ -26,11 +26,11 @@ class PortableGateTests(unittest.TestCase):
         from scripts.run_tests_parallel import _discover_files
 
         ordinary = {p.relative_to(ci.ROOT).as_posix()
-                    for p in _discover_files([ci.ROOT / 'tests'])}
+                    for p in _discover_files([ci.ROOT / 'tests'])
+                    if not ci.is_nightly_only(p)}
         e2e = {p.relative_to(ci.ROOT).as_posix()
                for p in _discover_files([ci.ROOT / 'tests/e2e'])
-               if not p.is_relative_to(ci.ROOT / ci.NIGHTLY_ONLY_E2E[0])
-               and p != ci.ROOT / ci.NIGHTLY_ONLY_E2E[1]}
+               if not ci.is_nightly_only(p)}
         expected = ordinary | e2e
         buckets = ci.shard_files(ci.ROOT, 10)
         self.assertEqual(set().union(*(set(bucket) for bucket in buckets)), expected)
