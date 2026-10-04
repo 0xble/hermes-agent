@@ -611,6 +611,9 @@ class GoalState:
     # Comma-joined ids of recorded results cited during the current dispute streak; a dispute that
     # cites none beyond these counts toward the stall breaker.
     last_dispute_evidence: str = ""
+    # Stable identity of the last parked state announced to the user. This is durable so repeated
+    # internal wakes and gateway restarts do not replay an unchanged wait notice.
+    last_wait_notice_key: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -643,6 +646,7 @@ class GoalState:
             revisions=[r for r in (data.get("revisions") or []) if isinstance(r, dict)]
             if isinstance(data.get("revisions"), list) else [],
             last_dispute_evidence=str(data.get("last_dispute_evidence") or ""),
+            last_wait_notice_key=(str(data["last_wait_notice_key"]) if data.get("last_wait_notice_key") else None),
             **ints, **floats,
         )
 
@@ -686,6 +690,7 @@ class GoalState:
         self.waiting_on_delegations = 0
         self.waiting_reason = None
         self.waiting_since = 0.0
+        self.last_wait_notice_key = None
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
@@ -2282,7 +2287,31 @@ class GoalManager:
 
     # --- the main entry point called after every turn -----------------
 
-    def _waiting_decision(self, state: GoalState) -> Dict[str, Any]:
+    def _wait_notice_key(self, state: GoalState) -> str:
+        """Stable identity for the current wait barrier, excluding elapsed presentation text."""
+        reason = state.waiting_reason or ""
+        if state.waiting_on_session is not None:
+            target = f"session:{state.waiting_on_session}"
+        elif state.waiting_on_pid is not None:
+            target = f"pid:{state.waiting_on_pid}"
+        else:
+            target = f"until:{state.waiting_until:.6f}:delegations:{state.waiting_on_delegations}"
+        return f"{target}|reason:{reason}"
+
+    def _wait_notice_decision(
+        self, state: GoalState, *, verdict: str, message: str, notify: bool = True,
+    ) -> Dict[str, Any]:
+        key = self._wait_notice_key(state)
+        if not notify:
+            message = ""
+        elif state.last_wait_notice_key == key:
+            message = ""
+        else:
+            state.last_wait_notice_key = key
+            self._save()
+        return _decision("active", False, None, verdict, state.waiting_reason or key, message)
+
+    def _waiting_decision(self, state: GoalState, *, suppress_notice: bool = False) -> Dict[str, Any]:
         if state.waiting_on_session is not None:
             tgt = f"session {state.waiting_on_session}"
         elif state.waiting_on_pid is not None:
@@ -2290,12 +2319,20 @@ class GoalManager:
         else:
             tgt = f"{max(0, int(state.waiting_until - time.time()))}s remaining"
         reason = state.waiting_reason or tgt
-        return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked — waiting on {tgt}: {reason}")
+        return self._wait_notice_decision(
+            state, verdict="waiting",
+            message=f"⏳ Goal parked — waiting on {tgt}: {reason}",
+            notify=not suppress_notice,
+        )
 
-    def _apply_wait_directive(self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0) -> Optional[Dict[str, Any]]:
+    def _apply_wait_directive(
+        self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0,
+        suppress_notice: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
         unobservable here, so the caller continues instead."""
+        state = self._require_active()
         if wait_directive.get("session_id"):
             tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
         elif wait_directive.get("pid"):
@@ -2312,7 +2349,11 @@ class GoalManager:
         else:
             self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
             tgt = f"{wait_directive['seconds']}s"
-        return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
+        return self._wait_notice_decision(
+            state, verdict="wait",
+            message=f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
+            notify=not suppress_notice,
+        )
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
         return self._pause_decision(
@@ -2326,13 +2367,14 @@ class GoalManager:
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
+        suppress_wait_notice: bool = False,
     ) -> Dict[str, Any]:
         """Evaluate an isolated snapshot and atomically commit against its durable state."""
         from hermes_cli.goals_evaluation import evaluate_goal_snapshot
         return evaluate_goal_snapshot(
             self, last_response, user_initiated=user_initiated,
             background_processes=background_processes, active_delegations=active_delegations,
-            evidence_session_id=evidence_session_id,
+            evidence_session_id=evidence_session_id, suppress_wait_notice=suppress_wait_notice,
         )
 
     def _evaluate_after_turn(
@@ -2340,6 +2382,7 @@ class GoalManager:
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
+        suppress_wait_notice: bool = False,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -2353,7 +2396,7 @@ class GoalManager:
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
-            return self._waiting_decision(state)
+            return self._waiting_decision(state, suppress_notice=suppress_wait_notice)
 
         state.turns_used += 1
         state.last_turn_at = time.time()
@@ -2402,7 +2445,10 @@ class GoalManager:
             state.last_dispute_evidence = ",".join(sorted(seen | current, key=_evidence_id_order)[-_DISPUTE_SEEN_MAX:])
 
         if verdict == "wait" and wait_directive:
-            parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
+            parked = self._apply_wait_directive(
+                wait_directive, reason, active_delegations=active_delegations,
+                suppress_notice=suppress_wait_notice,
+            )
             if parked is not None:
                 return parked
 

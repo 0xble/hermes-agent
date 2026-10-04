@@ -727,8 +727,10 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
     assert len(persisted) == 1
     assert persisted[0]["session_id"] == "raw-hq-session-id"
     assert persisted[0]["evt"]["delegation_id"] == "deleg_85957"
-    # Persist-only route stays verbatim: the client reads this row, no model turn is woken.
-    assert persisted[0]["text"] == "[ASYNC DELEGATION BATCH COMPLETE — deleg_85957]"
+    from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
+    assert persisted[0]["text"] == (
+        "[ASYNC DELEGATION BATCH COMPLETE — deleg_85957]\n\n" + INTERNAL_NOTIFICATION_FOOTER
+    )
 
 
 @pytest.mark.asyncio

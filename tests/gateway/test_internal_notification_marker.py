@@ -112,6 +112,15 @@ def _user_entries(calls):
     ]
 
 
+def test_internal_footer_is_idempotent_and_carries_silence_contract():
+    from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER, _mark_internal_notification
+
+    marked = _mark_internal_notification("completion")
+    assert marked.endswith(INTERNAL_NOTIFICATION_FOOTER)
+    assert marked.count(INTERNAL_NOTIFICATION_FOOTER) == 1
+    assert _mark_internal_notification(marked) == marked
+
+
 # ── 1+2: the marker is threaded to the agent run for internal events only ──
 
 

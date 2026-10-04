@@ -15,6 +15,7 @@ class FakeAdapter:
     def __init__(self):
         self.calls = []
         self.callbacks = {}
+        self.callback_registrations = []
         self._active_sessions = {}
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
@@ -29,6 +30,7 @@ class FakeAdapter:
         return SimpleNamespace(success=True)
 
     def register_post_delivery_callback(self, session_key, callback, *, generation=None):
+        self.callback_registrations.append((session_key, generation, callback))
         self.callbacks[session_key] = (generation, callback)
 
 
@@ -78,5 +80,3 @@ async def test_goal_status_notice_defers_until_post_delivery_callback():
             "metadata": {"thread_id": "thread-123"},
         }
     ]
-
-

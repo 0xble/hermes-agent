@@ -343,10 +343,18 @@ class GatewayGoalsMixin:
                 logger.debug("goal recovery notice failed: %s", exc)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, is_internal: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
-        continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        continuation through the adapter FIFO so a simultaneous real user message takes priority.
+
+        Internal machinery turns that answer with the exact silence marker are intentionally quiet
+        only for parked-wait notices; other actionable goal notices still reach the user.
+        """
+        suppress_parked_notice = False
+        if is_internal:
+            from gateway.response_filters import is_intentional_silence_response
+            suppress_parked_notice = is_intentional_silence_response(final_response)
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -372,12 +380,16 @@ class GatewayGoalsMixin:
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
+                active_delegations=_active_deleg, suppress_wait_notice=suppress_parked_notice,
             ),
         )
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
-        if msg and source is not None:
+        # An intentional internal silence suppresses only parked-wait status; achieved, paused,
+        # resumed, and blocked notices remain user-facing and must continue to be delivered.
+        if msg and source is not None and not (
+            suppress_parked_notice and decision.get("verdict") in {"waiting", "wait"}
+        ):
             await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
@@ -409,12 +421,15 @@ class GatewayGoalsMixin:
             return
         # Unsuccessful or empty responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
-        hooks = [("loop completion", self._post_turn_loop_completion)]
+        hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip():
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
-        for label, hook in hooks:
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, {"is_internal": is_internal}))
+        for label, hook, hook_kwargs in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(
+                    session_entry=session_entry, source=source, final_response=final_text,
+                    **hook_kwargs,
+                )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 
