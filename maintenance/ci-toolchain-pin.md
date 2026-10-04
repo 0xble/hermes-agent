@@ -77,6 +77,6 @@ python3 -m unittest scripts.ci.tests.test_portable.PortableGateTests.test_local_
 The focused regression was red before the implementation and green afterward.
 After `./bin/ci setup` provisioned the pinned toolchain/dependencies, the full
 portable unit module passed (`.venv/bin/python -m unittest scripts.ci.tests.test_portable`;
-35 tests, exit 0). A preliminary system-Python run was invalid because it lacked
+36 tests, exit 0). A preliminary system-Python run was invalid because it lacked
 `ruamel` and the required SQLite constants; it is not counted as candidate
 verification.
