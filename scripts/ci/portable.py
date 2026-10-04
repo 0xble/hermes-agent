@@ -291,7 +291,8 @@ def exact_path_tool(name: str, env: Mapping[str, str]) -> Path | None:
     if not match or match.group(1) != PINS[name]:
         return None
     resolved = command if os.path.isabs(command) else shutil.which(name, path=env.get('PATH'))
-    return Path(resolved).resolve() if resolved else None
+    # Preserve argv[0] dispatch for PATH shims (for example, mise and volta).
+    return Path(os.path.abspath(resolved)) if resolved else None
 
 
 def resolve_local_toolchain(env: dict[str, str]) -> dict[str, str]:

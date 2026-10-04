@@ -87,6 +87,36 @@ class PortableGateTests(unittest.TestCase):
         self.assertNotIn('GITHUB_ACTIONS=true', profile['run'])
         self.assertIn('chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"', profile['run'])
 
+    def test_local_toolchain_preserves_argv0_dispatching_node_shim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            uv = tools / 'uv'
+            uv.write_text(
+                f'#!{sys.executable}\n'
+                'import sys\n'
+                f'print("uv {ci.PINS["uv"]}")\n',
+                encoding='utf-8',
+            )
+            uv.chmod(0o755)
+            node_real = tools / 'node-real'
+            node_real.write_text(
+                f'#!{sys.executable}\n'
+                'from pathlib import Path\n'
+                'import sys\n'
+                f'version = {ci.PINS["node"]!r} if Path(sys.argv[0]).name == "node" else "0.0.0"\n'
+                'print(f"v{version}")\n',
+                encoding='utf-8',
+            )
+            node_real.chmod(0o755)
+            (tools / 'node').symlink_to(node_real)
+            env = {'PATH': str(tools)}
+            resolved = ci.resolve_local_toolchain(env)
+            node = resolved['HERMES_CI_PINNED_NODE']
+            self.assertEqual(
+                subprocess.check_output([node, '--version'], env=resolved, text=True).strip(),
+                f'v{ci.PINS["node"]}',
+            )
+
     def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -435,8 +465,8 @@ try {
                     patch.object(ci, 'STATE', Path(directory) / '.ci'), \
                     patch.object(ci, 'resolve_pinned_mise_tool', side_effect=AssertionError('mise should not be consulted')):
                 env = ci.resolve_local_toolchain(ci.environment(Path(directory) / 'isolated-home'))
-            self.assertEqual(ci.windows_command('uv', env), str((tool_dir / 'uv').resolve()))
-            self.assertEqual(ci.windows_command('node', env), str((tool_dir / 'node').resolve()))
+            self.assertEqual(ci.windows_command('uv', env), os.path.abspath(tool_dir / 'uv'))
+            self.assertEqual(ci.windows_command('node', env), os.path.abspath(tool_dir / 'node'))
             ci.require_tools(('uv', 'node'), env)
 
     def test_local_environment_fails_with_install_hint_when_pinned_mise_tool_is_missing(self):
