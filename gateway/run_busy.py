@@ -995,6 +995,9 @@ class GatewayBusySessionMixin:
             if reject_key is not None:
                 return t(reject_key)
         if policy == "defer_until_idle":
+            if name == "moa" and not (event.get_command_args() or "").strip():
+                from hermes_cli.moa_config import moa_usage
+                return moa_usage()
             adapter = self._delivery_adapter_for(source)
             if adapter is None or not hasattr(adapter, "defer_command_until_idle"):
                 return f"⚠️ `/{name}` could not be scheduled because this session has no deferred-command queue."

@@ -3678,6 +3678,7 @@ export interface CommandDispatchResult {
   display?: string | null
   name?: string | null
   status?: string | null
+  queued?: boolean | null
 }
 /** ``apps/shared/src/slash.ts::parseCommandDispatch`` branches on this. */
 export type DispatchType = 'exec' | 'alias' | 'plugin' | 'send' | 'skill' | 'prefill'
@@ -3697,6 +3698,7 @@ export interface SlashExecResult {
   display?: string | null
   name?: string | null
   status?: string | null
+  queued?: boolean | null
 }
 export interface InsightsGetParams {
   days?: number | null

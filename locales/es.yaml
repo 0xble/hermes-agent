@@ -701,7 +701,6 @@ gateway:
     action_shutting_down: "apagándose"
     reject_model: "El agente está en ejecución — espera o usa /stop primero, y luego cambia de modelo."
     reject_codex_runtime: "El agente está en ejecución — espera o usa /stop primero, y luego cambia el runtime."
-    reject_moa: "El agente está en ejecución — espera o usa /stop primero, y luego ejecuta /moa."
     drain_queued: "⏳ El gateway está {action} — en cola para el siguiente turno cuando vuelva."
     drain_rejected: "⏳ El gateway está {action} y ahora mismo no acepta otro turno."
     drain_rejected_new_work: "⏳ El gateway está {action} y ahora mismo no acepta trabajo nuevo."

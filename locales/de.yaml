@@ -701,7 +701,6 @@ gateway:
     action_shutting_down: "wird heruntergefahren"
     reject_model: "Agent läuft — warten Sie oder verwenden Sie zuerst /stop, dann wechseln Sie das Modell."
     reject_codex_runtime: "Agent läuft — warten Sie oder verwenden Sie zuerst /stop, dann ändern Sie die Runtime."
-    reject_moa: "Agent läuft — warten Sie oder verwenden Sie zuerst /stop, dann führen Sie /moa aus."
     drain_queued: "⏳ Gateway {action} — für den nächsten Zug eingereiht, sobald es zurück ist."
     drain_rejected: "⏳ Gateway {action} und nimmt gerade keinen weiteren Zug an."
     drain_rejected_new_work: "⏳ Gateway {action} und nimmt gerade keine neue Arbeit an."
