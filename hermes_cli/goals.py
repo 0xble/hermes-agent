@@ -140,8 +140,8 @@ CONTINUATION_REVISIONS_TEMPLATE = (
     "\n\nThis goal has been revised. Each earlier requirement listed below still "
     "binds you unless the user message cited for that revision plainly instructs "
     "that specific change, or the revision records concrete evidence that the "
-    "requirement is obsolete or impossible. Evidence-backed changes remain "
-    "superseded unless later recorded tool results contradict that evidence. "
+    "requirement is obsolete or impossible. An evidence-backed change counts "
+    "only if your recorded tool results support that evidence. "
     "When in doubt, honor the earlier requirement.\n"
     "{revision_lines}"
 )
@@ -312,13 +312,16 @@ JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
 # Judge prompt block for the goal's revision history (empty without revisions).
 JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "Revision history (the goal and criteria above are the CURRENT version). "
-    "A revision may clarify or restructure, but only the user can lower the "
-    "bar. For each earlier requirement a revision dropped or weakened: it is "
+    "A revision may clarify or restructure. On the objective, outcome, "
+    "constraints, boundaries or stop condition, only the user can lower the bar; the "
+    "agent may retire an obsolete verification criterion or subgoal only with "
+    "recorded evidence. For each earlier requirement a revision dropped or weakened: it is "
     "superseded only when the cited user message plainly instructs that "
     "specific change, or when the revision includes concrete evidence that the "
     "requirement became impossible or irrelevant. An evidence-backed drop is "
-    "superseded unless later recorded tool results contradict that evidence; "
-    "otherwise, including every revision with no user authority or evidence, "
+    "superseded only when the recorded tool results support that evidence; "
+    "unsupported or contradicted evidence does not lower the bar. Otherwise, "
+    "including every revision with no user authority or evidence, "
     "hold the agent to the earlier requirement.\n{revision_lines}\n\n"
 )
 
@@ -664,7 +667,7 @@ class GoalState:
 
         Nothing is windowed or truncated: a replaced requirement stays binding unless a user message
         instructs the change or the revision records concrete evidence that the requirement is obsolete
-        or impossible; evidence-backed changes remain superseded unless later tool results contradict it."""
+        or impossible; an evidence-backed change is superseded only when recorded tool results support it."""
         lines = []
         binding_revisions = [rev for rev in self.revisions if rev.get("kind") != "replace"]
         for i, rev in enumerate(binding_revisions, start=1):
@@ -1988,8 +1991,8 @@ class GoalManager:
                 contract: Optional[GoalContract] = None, user_quote: str = "",
                 user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
         """Replace an active or paused goal after verifying fresh user direction."""
-        state = self._require_goal()
-        if state.status not in {"active", "paused"}:
+        state = self._state
+        if state is None or state.status not in {"active", "paused"}:
             return {"ok": False, "error_code": "no_active_goal", "error": "no active or paused goal"}
         reason = (reason or "").strip()
         goal = (goal or "").strip()
@@ -2052,10 +2055,11 @@ class GoalManager:
                     "error": f"evidence must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
         needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
         evidence_changes = [k for k in changed if k == "verification"] + (["subgoals"] if dropped else [])
-        if evidence and set(changed) - set(evidence_changes):
+        quote = " ".join((user_quote or "").split())
+        # Evidence scope matters only when evidence is the authority; a valid quote can authorize more.
+        if evidence and not quote and set(changed) - set(evidence_changes):
             return {"ok": False, "error_code": "evidence_not_authorized",
                     "error": "evidence may authorize only verification changes or dropped subgoals"}
-        quote = " ".join((user_quote or "").split())
         if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS and not (evidence and not set(needs_authority) - {"subgoals"}):
             return {"ok": False, "error_code": "user_authority_required",
                     "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "

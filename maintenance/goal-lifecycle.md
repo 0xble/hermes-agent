@@ -94,19 +94,22 @@ Failed or interrupted model turns do not run completion judging.
     requirement it replaced, in full. The continuation prompt shows the current
     version and the same history, with each replaced requirement still binding
     unless its cited user message plainly instructs the change, or recorded
-    evidence shows the requirement is obsolete/impossible. Evidence-backed
-    changes remain superseded unless later recorded tool results contradict the
-    evidence. Changing the objective or constraints, or dropping a subgoal,
-    still needs a verbatim quote of 12+ characters from a real user message sent
-    since the goal was set; evidence cannot authorize those changes. Boundaries
-    and stop_when are also user-quote-only when changed. A verification
-    criterion may be reworded or dropped with evidence of at least 12 characters
-    showing it is obsolete or impossible; evidence cannot authorize any other
-    field.
+    evidence shows the requirement is obsolete/impossible. An evidence-backed
+    change is superseded only when recorded tool results support the evidence;
+    the judge holds the earlier requirement otherwise. Changing the objective, outcome, constraints, boundaries or
+    stop_when still needs a verbatim quote of 12+ characters from a real user
+    message sent since the goal was set; evidence cannot authorize those
+    changes. A verification criterion may be reworded or dropped, and a subgoal
+    dropped, with evidence of at least 12 characters showing it is obsolete or
+    impossible (Brian's decision: the notice shows each evidence-backed drop so
+    he can veto it). When a valid quote is supplied, the evidence scope check
+    does not apply.
     `GoalManager.replace()` replaces an active or paused goal only after the same
     fresh quote check, resets the new goal active with the configured budget,
-    and records the complete replaced goal in an audit entry that is not binding
-    revision history for the new goal. The companion plugin lives in
+    and records the replaced goal, contract and subgoals in an audit entry that
+    is not binding revision history for the new goal. The replaced goal's gates
+    and earlier revisions are intentionally not carried over: the new goal
+    starts clean. The companion plugin lives in
     `0xble/agents` at `sources/plugins/goal-lifecycle`; it degrades with
     `unsupported_core` until these primitives are promoted, and remains safe to
     deploy before the core by preserving plain revise/set/status/subgoal_add.
