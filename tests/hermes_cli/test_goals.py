@@ -548,21 +548,24 @@ class TestWaitBarrier:
             proc.terminate()
             proc.wait(timeout=10)
 
-    def test_barrier_on_a_process_that_never_exits_expires(self, hermes_home):
-        """A poller that outlives the work parked one run for 3h22m; a live barrier ages out."""
+    def test_barrier_on_a_process_that_never_exits_rearms_after_age_cap(self, hermes_home):
+        """A live poller must rearm after the probe window, not wake the agent into busy-work."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         proc = self._spawn_sleeper()
         try:
-            mgr = GoalManager(session_id="wb-expire")
+            mgr = GoalManager(session_id="wb-rearm")
             mgr.set("g")
             mgr.wait_on(proc.pid, reason="poller")
             assert mgr.is_waiting() is True
             mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
             mgr._save()
-            assert mgr.is_waiting() is False
-            assert mgr.state.waiting_on_pid is None
+            before = time.time()
+            assert mgr.is_waiting() is True
+            assert mgr.state.waiting_on_pid == proc.pid
+            assert mgr.state.waiting_until > before
+            assert mgr.state.barrier_rearms == 1
         finally:
             proc.terminate()
             proc.wait(timeout=10)

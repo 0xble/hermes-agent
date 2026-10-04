@@ -75,14 +75,18 @@ def test_barrier_that_still_holds_yields_no_prompt(hermes_home, monkeypatch):
     assert mgr.lifted_barrier_prompt() is None
 
 
-def test_age_cap_lifts_a_still_running_wait(hermes_home, monkeypatch):
-    mgr = _park_on_session("s-cap", "proc_slow0000000")
+def test_age_cap_rearms_a_still_running_wait(hermes_home, monkeypatch):
+    mgr = _park_on_session("s-cap", "proc_slow000000")
     monkeypatch.setattr(goals, "_session_waiting", lambda sid: True)
     mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 5
     mgr._save()
     monkeypatch.setattr(goals, "_process_outcome", lambda sid: {"running": True})
     prompt = mgr.lifted_barrier_prompt()
-    assert prompt is not None and "still running" in prompt
+    assert prompt is None
+    assert mgr.is_waiting() is True
+    assert mgr.state is not None
+    assert mgr.state.waiting_until > time.time()
+    assert mgr.state.barrier_rearms == 1
 
 
 def test_elapsed_timed_wait_lifts_without_a_note(hermes_home):

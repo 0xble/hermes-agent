@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -125,6 +126,17 @@ DEFAULT_GATE_MAX_RETRIES = 3
 # Longest a pid/session wait barrier may hold the loop before judging resumes. Timed barriers
 # (``waiting_until``) carry their own deadline and are exempt.
 _MAX_BARRIER_WAIT_S = 30 * 60
+# A live pid/session barrier is re-checked on an escalating schedule after the
+# probe window. Each interval remains bounded by _MAX_BARRIER_WAIT_S so the
+# process can still be observed promptly when it exits or emits its trigger.
+_BARRIER_REARM_BACKOFF_S = (5 * 60, 15 * 60, _MAX_BARRIER_WAIT_S)
+# A judge-selected timed wait must be long enough to avoid another immediate poke, but cannot
+# strand a goal indefinitely when the model guesses a distant deadline.
+_MIN_JUDGE_WAIT_S = 60
+# After repeated automatic turns with no new evidence, park the goal even if the judge keeps saying
+# CONTINUE. The escalating waits are deliberately bounded by _MAX_BARRIER_WAIT_S.
+DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS = 3
+_NO_PROGRESS_BACKOFF_S = (5 * 60, 15 * 60, _MAX_BARRIER_WAIT_S)
 # Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
@@ -241,8 +253,13 @@ JUDGE_SYSTEM_PROMPT = (
     "- The agent has delegated subagents still running (stated below as "
     "active delegations) and the response says it is waiting on them with "
     "nothing else dispatchable — return ``wait_for_seconds`` between 600 and "
-    "1800. Their results wake the agent on their own; re-poking it now only "
+    "their results wake the agent on their own; re-poking it now only "
     "produces a status recap.\n"
+    "- Progress is gated on work outside this session that is running or scheduled "
+    "on its own — for example an external service, cron/watchdog, a stated next "
+    "check time, or an elapsed-time hold — and the response says there is no "
+    "actionable step now. Return ``wait_for_seconds`` between 60 and 1800, "
+    "honoring the stated next check when it is bounded.\n"
     "Picking WAIT parks the loop without burning a turn; it resumes "
     "automatically when the pid exits or the time elapses. Do NOT pick WAIT "
     "just because work remains — only when re-poking now would be pure "
@@ -605,6 +622,10 @@ class GoalState:
     waiting_seconds: int = 0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
+    # Number of age-cap re-arms for a still-live pid/session barrier. This is
+    # durable so a gateway restart does not reset a long-running poller to a
+    # tight wake cadence.
+    barrier_rearms: int = 0
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
@@ -619,6 +640,10 @@ class GoalState:
     # Stable identity of the last parked state announced to the user. This is durable so repeated
     # internal wakes and gateway restarts do not replay an unchanged wait notice.
     last_wait_notice_key: Optional[str] = None
+    # Deterministic busy-loop backstop. A fingerprint of recorded tool evidence is the progress
+    # signal; repeated automatic CONTINUEs with no new evidence and the same reason are parked.
+    consecutive_no_progress: int = 0
+    last_progress_fingerprint: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -629,7 +654,7 @@ class GoalState:
         raw_subgoals = data.get("subgoals") or []
         ints = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_disputes",
-            "waiting_on_delegations", "waiting_seconds")}
+            "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -652,6 +677,9 @@ class GoalState:
             if isinstance(data.get("revisions"), list) else [],
             last_dispute_evidence=str(data.get("last_dispute_evidence") or ""),
             last_wait_notice_key=(str(data["last_wait_notice_key"]) if data.get("last_wait_notice_key") else None),
+            last_progress_fingerprint=(str(data["last_progress_fingerprint"])
+                                       if data.get("last_progress_fingerprint") else None),
+            barrier_rearms=int(data.get("barrier_rearms") or 0),
             **ints, **floats,
         )
 
@@ -698,6 +726,7 @@ class GoalState:
         self.waiting_since = 0.0
         if not preserve_notice_key:
             self.last_wait_notice_key = None
+        self.barrier_rearms = 0
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
@@ -1301,6 +1330,52 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
         entries.append({"tool": name, "call": call_text, "output": output,
                         "timestamp": float(row.get("timestamp") or 0.0)})
     return entries[-max_entries:]
+
+
+def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """Return a stable identity for recorded tool progress, or ``None`` when there is no signal.
+
+    Tool-result timestamps and content are runtime-owned, unlike the agent's prose. Hashing the
+    bounded evidence ledger keeps the durable state small while distinguishing a new result from a
+    repeated no-op evaluation.
+    """
+    rows = []
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append({k: item.get(k) for k in ("tool", "call", "output", "timestamp")})
+    if not rows:
+        return None
+    payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+_READ_ONLY_STATUS_CALL_RE = re.compile(
+    r"^(?:gh\s+(?:pr|run)\s+(?:view|checks|status|list)|"
+    r"git\s+(?:status|diff|log|show|branch|rev-parse)|"
+    r"(?:ls|pwd|find|rg|grep|cat|head|tail)\b)",
+    re.I,
+)
+_READ_ONLY_STATUS_TOOLS = frozenset({
+    "browser_console", "browser_get_images", "browser_snapshot", "read_file", "search_files",
+    "web_extract", "web_search",
+})
+
+
+def _evidence_only_read_only_status(evidence: Optional[List[Dict[str, Any]]]) -> bool:
+    """Whether recorded evidence consists only of bounded status/read operations."""
+    rows = [item for item in (evidence or []) if isinstance(item, dict)]
+    if not rows:
+        return True
+    for item in rows:
+        tool = str(item.get("tool") or "").strip().lower()
+        if tool in _READ_ONLY_STATUS_TOOLS:
+            continue
+        call = str(item.get("call") or "").strip()
+        if tool in {"terminal", "shell"} and _READ_ONLY_STATUS_CALL_RE.match(call):
+            continue
+        return False
+    return True
 
 
 def _render_evidence_block(evidence: Optional[List[Dict[str, Any]]], now: Optional[float] = None) -> str:
@@ -2260,21 +2335,52 @@ class GoalManager:
                     still = False
         else:
             return False
-        if still and s.waiting_since and s.waiting_until == 0.0 and time.time() - s.waiting_since > _MAX_BARRIER_WAIT_S:
-            logger.info("goal %s: wait barrier on %s exceeded %ds; resuming judging",
-                        self.session_id, s.waiting_on_session or s.waiting_on_pid, _MAX_BARRIER_WAIT_S)
-            still = False
         return still
 
+    def _rearm_running_barrier(self) -> bool:
+        """Re-arm an aged live pid/session barrier instead of waking the goal into polling.
+
+        ``waiting_until`` is used as the next liveness probe deadline while the
+        pid/session identity remains the authoritative wake condition. A real
+        exit or watch-pattern match still makes ``_barrier_holds`` false; this
+        method only extends the observation interval when the target is alive.
+        """
+        s = self._state
+        if s is None or s.waiting_since <= 0.0 or not (s.waiting_on_pid is not None or s.waiting_on_session is not None):
+            return False
+        now = time.time()
+        if now - s.waiting_since <= _MAX_BARRIER_WAIT_S:
+            return False
+        if s.waiting_until and now < s.waiting_until:
+            return False
+        if s.waiting_on_session is not None:
+            still = _session_waiting(s.waiting_on_session)
+        else:
+            still = s.waiting_on_pid is not None and _pid_alive(s.waiting_on_pid)
+        if not still:
+            return False
+        index = min(max(0, s.barrier_rearms), len(_BARRIER_REARM_BACKOFF_S) - 1)
+        delay = _BARRIER_REARM_BACKOFF_S[index]
+        s.barrier_rearms += 1
+        s.waiting_until = now + delay
+        self._save()
+        logger.info(
+            "goal %s: live wait barrier on %s exceeded %ds; rearming liveness check in %ds (rearm %d)",
+            self.session_id, s.waiting_on_session or s.waiting_on_pid,
+            _MAX_BARRIER_WAIT_S, delay, s.barrier_rearms,
+        )
+        return True
+
     def is_waiting(self) -> bool:
-        """True iff a barrier is set AND not yet satisfied. A satisfied barrier is cleared here
-        (lazy auto-clear) so the next evaluation resumes normal judging. A pid/session barrier
-        also expires after ``_MAX_BARRIER_WAIT_S``: a watcher or poller that never exits would
-        otherwise park the goal indefinitely (one run sat 3 h 22 min on a poller that outlived
-        the work it was polling)."""
+        """True iff a barrier is set AND not yet satisfied.
+
+        A live pid/session barrier is re-armed with bounded backoff after
+        ``_MAX_BARRIER_WAIT_S`` rather than waking the goal into busy-work.
+        """
         s = self._state
         if s is None or not (s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until):
             return False
+        self._rearm_running_barrier()
         still = self._barrier_holds()
         if not still:
             self.stop_waiting()
@@ -2289,7 +2395,10 @@ class GoalManager:
         only runs after a turn: a barrier whose completion notice never arrives (a gateway restart
         killed the process, notify_on_complete was off, a timed wait elapsed) otherwise parks the
         goal until an unrelated message happens to arrive."""
-        if not self.is_parked() or self._barrier_holds():
+        if not self.is_parked():
+            return None
+        self._rearm_running_barrier()
+        if self._barrier_holds():
             return None
         if self._state.waiting_on_session and _completion_notice_pending(self._state.waiting_on_session):
             return None
@@ -2362,11 +2471,35 @@ class GoalManager:
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
                 return None
         else:
-            self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
-            tgt = f"{wait_directive['seconds']}s"
+            seconds = max(_MIN_JUDGE_WAIT_S, min(_MAX_BARRIER_WAIT_S, int(wait_directive["seconds"])))
+            self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+            tgt = f"{seconds}s"
         return self._wait_notice_decision(
             state, verdict="wait",
             message=f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
+        )
+
+    def _no_progress_wait(self, state: GoalState, reason: str, *, active_delegations: int = 0) -> Dict[str, Any]:
+        """Park after repeated automatic no-op continuations as a deterministic backstop."""
+        index = min(max(0, state.consecutive_no_progress - DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS),
+                    len(_NO_PROGRESS_BACKOFF_S) - 1)
+        seconds = _NO_PROGRESS_BACKOFF_S[index]
+        self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+        return self._wait_notice_decision(
+            state, verdict="wait",
+            message=(
+                f"⏳ Goal parked (no progress for {state.consecutive_no_progress} automatic turns) — "
+                f"waiting {seconds}s: {reason}"
+            ),
+        )
+
+    def _delegation_no_progress_wait(self, state: GoalState, reason: str, active_delegations: int) -> Dict[str, Any]:
+        """Park immediately when live delegations leave an automatic turn with no action."""
+        seconds = max(10 * 60, _NO_PROGRESS_BACKOFF_S[0])
+        self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+        return self._wait_notice_decision(
+            state, verdict="wait",
+            message=f"⏳ Goal parked — waiting for {active_delegations} active delegation(s): {reason}",
         )
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
@@ -2431,6 +2564,9 @@ class GoalManager:
         ]
         citations = resolve_cited_evidence(evidence_session_id or self.session_id, last_response,
                                            since=state.created_at)
+        previous_reason = state.last_reason
+        progress_fingerprint = _goal_progress_fingerprint(evidence)
+        new_progress = bool(progress_fingerprint and progress_fingerprint != state.last_progress_fingerprint)
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
@@ -2438,6 +2574,16 @@ class GoalManager:
         )
         state.last_verdict = verdict
         state.last_reason = reason
+        # Real user turns and newly recorded tool results are progress signals. For automatic turns,
+        # only a repeated CONTINUE with the same judge reason and no new evidence qualifies as a
+        # no-progress turn; this avoids prose-only heuristics while catching external-work stalls.
+        if progress_fingerprint:
+            state.last_progress_fingerprint = progress_fingerprint
+        same_reason = bool(previous_reason and reason and previous_reason.strip() == reason.strip())
+        if verdict == "continue" and not user_initiated and not new_progress:
+            state.consecutive_no_progress = state.consecutive_no_progress + 1 if same_reason else 1
+        else:
+            state.consecutive_no_progress = 0
         # Parse failures reset on any usable reply INCLUDING transport errors, so a flaky network
         # doesn't trip the auto-pause meant for bad judge models; transport failures are counted
         # separately because persistent API errors (401, DNS) mean a broken config.
@@ -2509,10 +2655,29 @@ class GoalManager:
         if state.max_turns > 0 and state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
 
+        # A live delegation is an explicit external wake source. If an automatic turn produced no
+        # actionable evidence, park immediately instead of trusting a flaky CONTINUE verdict to keep polling.
+        if verdict == "continue" and not user_initiated and active_delegations > 0 and (
+            not new_progress or _evidence_only_read_only_status(evidence)
+        ):
+            return self._delegation_no_progress_wait(state, reason, active_delegations)
+
+        if state.consecutive_no_progress >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
+            return self._no_progress_wait(state, reason, active_delegations=active_delegations)
+
+        reason_text = (reason or "").strip()
+        # Reuse S1's durable notice identity so continuation and parked-state notices
+        # remain coordinated across internal turns and gateway restarts.
+        notice_key = f"continuation|reason:{reason_text}"
+        if state.last_wait_notice_key == notice_key:
+            notice = ""
+        else:
+            state.last_wait_notice_key = notice_key
+            notice = f"↻ Continuing toward goal ({_goal_budget_label(state.turns_used, state.max_turns)}): {reason}"
         self._save()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,
-            f"↻ Continuing toward goal ({_goal_budget_label(state.turns_used, state.max_turns)}): {reason}",
+            notice,
         )
 
     def next_continuation_prompt(self) -> Optional[str]:
