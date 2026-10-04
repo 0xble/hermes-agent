@@ -107,6 +107,13 @@ def _get_max_concurrent_children() -> int:
         )
     return result
 
+def _get_max_queued_delegations() -> int:
+    """Maximum pending background delegation units; zero rejects at capacity."""
+    return _knob(
+        "max_queued_delegations", "DELEGATION_MAX_QUEUED_DELEGATIONS", lambda v: max(0, int(v)),
+        8, "delegation.max_queued_delegations=%r is not a valid integer; using default 8",
+    )
+
 def _get_independent_completions() -> bool:
     """delegation.independent_completions (bool, default False): split a background call into per-task / per-group
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
@@ -119,9 +126,10 @@ def _get_worktree_isolation() -> bool:
     return bool(_cfg().get("worktree_isolation", False))
 
 def _get_max_async_children() -> int:
-    """Concurrency cap for background delegations == delegation.max_concurrent_children. At capacity a new async
-    dispatch is REJECTED (not queued) so a runaway model can't pile up unbounded background work; the caller then
-    runs synchronously. A leftover ``delegation.max_async_children`` key is ignored with a one-time warning."""
+    """Concurrency cap for background delegations == delegation.max_concurrent_children.
+    At capacity, async-capable sessions enter the bounded pending queue; queue overflow
+    is rejected without a synchronous fallback. A leftover ``delegation.max_async_children``
+    key is ignored with a one-time warning."""
     from tools.delegate_tool import _get_max_concurrent_children
     if _cfg().get("max_async_children") is not None:
         _warn_once(

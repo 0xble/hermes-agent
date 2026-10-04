@@ -1,0 +1,84 @@
+# Async delegation capacity admission
+
+Load this unit when changing background `delegate_task` admission, capacity
+handling, pending work visibility, cancellation, or completion routing.
+
+## Required behavior
+
+- A gateway or other async-capable session must never run a rejected background
+  delegation inline merely because the async pool is full. The tool returns a
+  non-blocking `queued` handle while bounded pending capacity remains, and a
+  clear non-blocking rejection when that queue is full.
+- The existing synchronous fallback remains for sessions that cannot receive a
+  detached completion (`no_async`), including one-shot, cron, Kanban, and
+  stateless HTTP paths.
+- Pending work is admitted when a slot finishes, preserves the original routing
+  identity, and is visible to `delegate_task(action='list')` with cancellation
+  honoring `/stop` and session teardown.
+- Pending admission is bounded. Queued state is durable or is surfaced as an
+  explicit interrupted/unknown outcome on owner restart; it must not disappear
+  silently.
+
+## Independent hypothesis (frozen 2026-10-04T19:14:32Z, before upstream search)
+
+Current `tools/delegate_tool_dispatch._dispatch_background` treats the async
+registry's capacity rejection as a reason to call `_run_sync_with_note()`.
+That call executes the entire batch in the gateway tool handler, so the parent
+turn cannot drain queued user messages until every child returns. The correction
+belongs at the shared async admission boundary, not in gateway adapters: retain
+`no_async` inline behavior, but give async-capable delegation units a bounded
+pending-admission queue and a distinct queued result.
+
+The narrow solution is a process-local bounded queue backed by the existing
+async-delegation records. Queued records retain the same owner/routing and
+interrupt callback as dispatched records, become runnable when `_finalize`
+releases a slot, and are included in live control/list views. Persisting the
+queued state allows restart recovery to mark an unadmitted unit explicitly
+unknown instead of silently losing it. The queue cap is the runaway protection;
+queue-full admission is a non-blocking rejection.
+
+Alternatives rejected for now: raising the global worker count (removes the
+safety invariant and still permits unbounded work), sleeping/retrying in the
+handler (still blocks the gateway), or inline fallback (the incident behavior).
+A durable cross-process scheduler is broader than this defect and is not needed
+for process-local background delegation; restart recovery must nevertheless
+leave a truthful terminal record/event.
+
+Expected failing regression: occupy the configured async slot, call
+`delegate_task(background=True)` from an async-capable session with a child
+that waits on a gate, and prove the call returns a queued handle before the
+child gate opens. Additional coverage must prove slot-release admission,
+queue-full rejection, queued cancellation, and owner completion routing.
+
+## Upstream status
+
+Fork patch identities: `Async delegation capacity admission`.
+
+Search performed against `NousResearch/hermes-agent` on 2026-10-04 after the
+independent hypothesis was frozen.
+
+- **Exact, closed without merge:** [PR #80526](https://github.com/NousResearch/hermes-agent/pull/80526), `feat(delegation): bounded resource-aware background admission queue`, proposed a larger FIFO admission queue with `max_queued_delegations`, timeout, memory/PSI gating, queued interruption, persistence, and restart recovery. Its implementation is the closest prior art, but it was closed without merge; the fork patch keeps the smaller defect boundary and does not copy its resource-governor or timeout machinery.
+- **Exact, open policy alternative:** [PR #123145](https://github.com/NousResearch/hermes-agent/pull/123145), `feat(delegation): add delegation.at_capacity policy (sync | reject)`, adds an opt-in `sync | reject` choice and preserves synchronous fallback by default. It confirms the same root cause and has focused tests, but does not provide queued admission; this patch intentionally chooses bounded queueing for async-capable sessions so the default path cannot block the parent.
+- **Related incident:** [Issue #52868](https://github.com/NousResearch/hermes-agent/issues/52868) was closed as a duplicate of [Issue #52484](https://github.com/NousResearch/hermes-agent/issues/52484). It documents pool exhaustion causing repeated sequential session creation and token explosion, matching the observed silent-fallback failure mode. The issue's referenced PR #52557 addresses per-turn spawn limits, not non-blocking capacity admission.
+- **Related failure mode:** [Issue #63769](https://github.com/NousResearch/hermes-agent/issues/63769) remains open for a saturated pool crashing the synchronous fallback with missing `_initializer`; it is a Python 3.14 daemon-pool compatibility problem, not the parent-turn blocking contract fixed here.
+- **Related but not equivalent:** [PR #49690](https://github.com/NousResearch/hermes-agent/pull/49690) uses the executor's unbounded internal queue for batch tasks, which does not bound independent background calls or provide queued lifecycle/control visibility. [PR #102112](https://github.com/NousResearch/hermes-agent/pull/102112) adds dependency-aware scheduling and is broader than this fix. [PR #109940](https://github.com/NousResearch/hermes-agent/pull/109940) addresses restart delivery of already-admitted completions, not admission at pool capacity.
+
+Current `upstream-live/main` still contains the synchronous `at capacity;
+running the whole batch synchronously instead` path and has no
+`max_queued_delegations` implementation. The selected fork design therefore
+remains a narrow core patch: preserve `no_async` synchronous behavior, add a
+bounded FIFO for async-capable calls, reject queue overflow without running
+inline, and retain synchronous fallback only for non-capacity scheduler failures.
+
+## Surfaces and verification
+
+Primary surfaces: `tools/delegate_tool_dispatch.py`, `tools/async_delegation.py`,
+`tools/delegate_tool_config.py`, `tools/delegate_tool_registry.py`, and focused
+`tests/tools/` plus gateway stop/delivery tests. Run the focused regression and
+affected modules, then `./bin/ci preflight` and the exact-SHA gate contract.
+
+Retire this fork patch when a released upstream Hermes version provides the same
+non-blocking admission, bounded pending queue, cancellation, restart truth, and
+completion-routing contract. Roll back by reverting the commit carrying this
+unit and its tests/record; queued rows use their existing terminal/unknown
+recovery path and require no destructive schema rollback.

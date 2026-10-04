@@ -123,7 +123,7 @@ def registry_state(tmp_path, monkeypatch):
     async_delegation._reset_for_tests()
 
 
-@pytest.mark.parametrize("rejection", ["capacity", "schedule_failure", "partial_schedule_failure"])
+@pytest.mark.parametrize("rejection", ["schedule_failure", "partial_schedule_failure"])
 @pytest.mark.parametrize("stop_timing", ["running", "during_admission"])
 @pytest.mark.parametrize("stop_kind", ["soft", "hard"])
 def test_rejected_background_child_stops_with_parent(
@@ -303,3 +303,35 @@ def test_accepted_background_child_keeps_registry_cancellation_ownership(registr
             child.hard_interrupt("test teardown")
         child.allow_finish.set()
         assert child.closed.wait(5)
+
+
+def test_capacity_queues_background_batch_without_inline_execution(registry_state, monkeypatch):
+    """Gateway-capable background admission never runs a full pool inline."""
+    release = threading.Event()
+    occupied = async_delegation.dispatch_async_delegation(
+        goal="occupy the only slot", context=None, toolsets=None, role="leaf", model="m",
+        session_key="other-session", runner=lambda: (release.wait(30), {"status": "completed"})[1],
+        max_async_children=1,
+    )
+    monkeypatch.setattr("tools.delegate_tool_dispatch._resolve_async_wake_sid", lambda *_args: "")
+    monkeypatch.setattr("tools.delegate_tool._get_max_async_children", lambda: 1)
+    monkeypatch.setattr("tools.delegate_tool._get_max_queued_delegations", lambda: 1)
+    parent, child = _Parent(), _ControlledChild()
+
+    result = json.loads(_dispatch_background(_batch(parent, child)))
+
+    assert occupied["status"] == "dispatched"
+    assert result["status"] == "queued"
+    assert "queued" in result["note"].lower()
+    assert not child.started.is_set()
+    assert parent._active_children == []
+
+    release.set()
+    assert registry_state.get(timeout=5)["delegation_id"] == occupied["delegation_id"]
+    assert child.started.wait(5)
+    assert async_delegation.interrupt_for_session(parent_session_id=parent.session_id, reason="test cleanup") == 1
+    assert child.unwinding.wait(5)
+    child.allow_finish.set()
+    assert registry_state.get(timeout=10)["type"] == "async_delegation"
+    assert child.finished.is_set()
+    assert child.closed.wait(5)
