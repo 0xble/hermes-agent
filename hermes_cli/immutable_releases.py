@@ -701,6 +701,22 @@ def _verify_transaction(paths: ReleasePaths, record: dict[str, Any]) -> None:
             raise RuntimeError("launchd plist differs from transaction intent")
 
 
+def _runs_hermes_main(argv: list[str], root: Path) -> bool:
+    """Is ``argv`` an interpreter entering ``hermes_cli.main`` for exactly ``root``?
+
+    Two launch shapes exist: ``python -m hermes_cli.main`` and the generated
+    ``python -I -c <bootstrap>`` launcher that launchd services run. The second
+    is accepted only when its code equals the bootstrap generated for ``root``,
+    so another tree's or an arbitrary ``-c`` program cannot pass.
+    """
+    if argv[1:3] == ["-m", "hermes_cli.main"]:
+        return True
+    if len(argv) < 4:
+        return False
+    from hermes_cli._launchers import runtime_command
+    return argv[1:4] == runtime_command(root, (), module="hermes_cli.main", python=argv[0])[1:4]
+
+
 def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -> bool:
     """Finish a pending reload only after observing its supervised gateway."""
     paths = ReleasePaths.for_home(home)
@@ -753,7 +769,7 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
             # interpreter's entrypoint before applying the canonical parser,
             # which also accepts a profile selector before `gateway run`.
             from gateway.status import looks_like_gateway_command_line
-            if (argv[1:3] != ["-m", "hermes_cli.main"] or
+            if (not _runs_hermes_main(argv, intended_root) or
                     not looks_like_gateway_command_line(shlex.join(argv))):
                 continue
             executable = Path(process.exe()).resolve()
