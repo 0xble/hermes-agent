@@ -15,6 +15,12 @@ handling, pending work visibility, cancellation, or completion routing.
 - Pending work is admitted when a slot finishes, preserves the original routing
   identity, and is visible to `delegate_task(action='list')` with cancellation
   honoring `/stop` and session teardown.
+- All independent completion units from one `delegate_task` call reserve one
+  capacity slot and one bounded queue reservation. If queued, the units are
+  admitted together when that slot frees; a sibling is never silently dropped
+  because an earlier sibling consumed the queue limit.
+- Queued responses advertise only their `delegation_id` controls. They do not
+  claim that a live `subagent_id` exists before admission.
 - Pending admission is bounded. Queued state is durable or is surfaced as an
   explicit interrupted/unknown outcome on owner restart; it must not disappear
   silently.
@@ -32,10 +38,13 @@ pending-admission queue and a distinct queued result.
 The narrow solution is a process-local bounded queue backed by the existing
 async-delegation records. Queued records retain the same owner/routing and
 interrupt callback as dispatched records, become runnable when `_finalize`
-releases a slot, and are included in live control/list views. Persisting the
-queued state allows restart recovery to mark an unadmitted unit explicitly
-unknown instead of silently losing it. The queue cap is the runaway protection;
-queue-full admission is a non-blocking rejection.
+releases a slot, and are included in live control/list views. A call-wide slot
+key makes independent completion units share one queue reservation; admission
+promotes every queued sibling for that key together. Persisting the queued state
+allows restart recovery to mark an unadmitted unit explicitly unknown instead of
+silently losing it. The queue cap is the runaway protection; queue-full admission
+is a non-blocking rejection. Queued responses expose delegation handles rather
+than pre-admission child-agent ids.
 
 Alternatives rejected for now: raising the global worker count (removes the
 safety invariant and still permits unbounded work), sleeping/retrying in the

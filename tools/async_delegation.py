@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_hermes_home, hermes_home_key
 from tools.daemon_pool import DaemonThreadPoolExecutor
+from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ _ACTIVE_STATES = ("running", "stalling")
 _FINALIZABLE_STATES = {"queued", "running", "stalling"}
 _INTERRUPTIBLE_STATES = {"queued", "running", "stalling"}
 _PENDING_QUEUE = deque()
+_BACKEND_RETIRING = "backend is retiring; reconnect to continue"
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
 _ROUTING_KEYS = ("scope_id", "user_id", "user_name")
@@ -190,20 +192,20 @@ def _prune_durable_records() -> None:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?", (cutoff,))
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
+            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('queued','running','stalling','finalizing')").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE state NOT IN ('queued','running','stalling','finalizing')
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
+               WHERE state NOT IN ('queued','running','stalling','finalizing') AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                     WHERE state NOT IN ('queued','running','stalling','finalizing') AND delivery_state='pending'
                      ORDER BY updated_at ASC LIMIT ?
                    )""", (pending_count - _MAX_DURABLE_PENDING,))
 
@@ -803,8 +805,9 @@ def _dispatch(**kwargs) -> Dict[str, Any]:
 
 
 def _queued_count_locked() -> int:
-    return sum(1 for delegation_id in _PENDING_QUEUE
-               if (_records.get(delegation_id) or {}).get("status") == "queued")
+    return len({(_records.get(delegation_id) or {}).get("slot_key") or delegation_id
+                for delegation_id in _PENDING_QUEUE
+                if (_records.get(delegation_id) or {}).get("status") == "queued"})
 
 
 def _active_slots_locked() -> set:
@@ -840,11 +843,10 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
             _finalize(delegation_id, result, status)
 
     from hermes_cli.backend_retirement import retirement
-    retirement.acquire()
+    if not retirement.acquire():
+        return _BACKEND_RETIRING
     try:
-        future = executor.submit(
-            (lambda: record.get("_context", contextvars.copy_context()).run(_worker))
-        )
+        future = executor.submit(record["_worker_context_runner"], _worker)
         future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
@@ -856,11 +858,18 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
 
 
 def _admit_pending() -> None:
-    """Admit FIFO queued records whenever a running slot becomes available."""
+    """Admit FIFO queued records whenever a running slot becomes available.
+
+    Units from one delegate call share a slot key, so once that key reaches the
+    front of the queue all of its queued units are admitted together. If the
+    retirement fence closes between units, the units not yet submitted remain
+    queued rather than being reported as started or silently discarded.
+    """
     while True:
         with _records_lock:
             active_slots = _active_slots_locked()
-            selected = None
+            selected: List[Dict[str, Any]] = []
+            selected_slot = None
             for delegation_id in list(_PENDING_QUEUE):
                 record = _records.get(delegation_id)
                 if record is None or record.get("status") != "queued":
@@ -872,23 +881,54 @@ def _admit_pending() -> None:
                 slot_key = record.get("slot_key") or delegation_id
                 if slot_key in active_slots or len(active_slots) >= record["max_async_children"]:
                     continue
-                _PENDING_QUEUE.remove(delegation_id)
-                record["status"] = "running"
-                record["_started"] = False
-                selected = dict(record)
-                active_slots.add(slot_key)
+                selected_slot = slot_key
+                for sibling_id in list(_PENDING_QUEUE):
+                    sibling = _records.get(sibling_id)
+                    if sibling is None or sibling.get("status") != "queued":
+                        continue
+                    if (sibling.get("slot_key") or sibling_id) != selected_slot:
+                        continue
+                    _PENDING_QUEUE.remove(sibling_id)
+                    sibling["status"] = "running"
+                    sibling["_started"] = False
+                    selected.append(dict(sibling))
                 break
-        if selected is None:
+        if not selected:
             return
-        try:
-            with _DB_LOCK, _transaction() as conn:
-                conn.execute("UPDATE async_delegations SET state='running', updated_at=? WHERE delegation_id=? AND state='queued'",
-                             (time.time(), selected["delegation_id"]))
-        except Exception:
-            logger.exception("Could not persist admission of queued delegation %s", selected["delegation_id"])
-        error = _submit_record(selected, selected["max_async_children"])
-        if error:
-            _finalize(selected["delegation_id"], selected["crash_result"](error, 0.0), "error")
+        for item in selected:
+            try:
+                with _DB_LOCK, _transaction() as conn:
+                    conn.execute("UPDATE async_delegations SET state='running', updated_at=? WHERE delegation_id=? AND state='queued'",
+                                 (time.time(), item["delegation_id"]))
+            except Exception:
+                logger.exception("Could not persist admission of queued delegation %s", item["delegation_id"])
+
+        for index, item in enumerate(selected):
+            error = _submit_record(item, item["max_async_children"])
+            if not error:
+                continue
+            if error == _BACKEND_RETIRING:
+                # The fence can close after the first sibling is admitted. Keep
+                # this and every later sibling queued; their results remain
+                # controllable and durable until a later admission pass.
+                with _records_lock:
+                    for pending in reversed(selected[index:]):
+                        live = _records.get(pending["delegation_id"])
+                        if live is None or live.get("status") != "running":
+                            continue
+                        live["status"] = "queued"
+                        live["queue_reason"] = "async pool capacity"
+                        live["queued_at"] = time.time()
+                        _PENDING_QUEUE.appendleft(pending["delegation_id"])
+                for pending in selected[index:]:
+                    try:
+                        with _DB_LOCK, _transaction() as conn:
+                            conn.execute("UPDATE async_delegations SET state='queued', updated_at=? WHERE delegation_id=? AND state='running'",
+                                         (time.time(), pending["delegation_id"]))
+                    except Exception:
+                        logger.exception("Could not requeue retiring delegation %s", pending["delegation_id"])
+                return
+            _finalize(item["delegation_id"], item["crash_result"](error, 0.0), "error")
 
 
 def _dispatch_admitted(
@@ -925,14 +965,20 @@ def _dispatch_admitted(
         "slot_key": slot_key or delegation_id, "max_async_children": max_async_children,
         **(cron_execution or {}), **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
-        "_context": contextvars.copy_context(), "_progress_token": None,
+        "_context": contextvars.copy_context(),
+        "_worker_context_runner": propagate_context_to_thread(lambda worker: worker()), "_progress_token": None,
         "_progress_ts": dispatched_at, "_interrupted_at": None, "_started": False,
     }
     with _records_lock:
         active_slots = _active_slots_locked()
         slot = record["slot_key"]
         if slot not in active_slots and len(active_slots) >= max_async_children:
-            if _queued_count_locked() >= max(0, int(max_queued_delegations)):
+            queued_same_slot = any(
+                (_records.get(queued_id) or {}).get("status") == "queued"
+                and ((_records.get(queued_id) or {}).get("slot_key") or queued_id) == slot
+                for queued_id in _PENDING_QUEUE
+            )
+            if _queued_count_locked() >= max(0, int(max_queued_delegations)) and not queued_same_slot:
                 return {"status": "rejected", "at_capacity": True, "queue_full": True,
                         "error": capacity_error + " The bounded pending queue is also full; nothing was started."}
             record["status"] = "queued"
@@ -1062,22 +1108,30 @@ def supersede_delegation(delegation_id: str, replacement_id: str, reason: str = 
     return True
 
 
-def _finalize(delegation_id: str, result: Any, status: str) -> None:
+def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot: Optional[Dict[str, Any]] = None) -> None:
     """Atomically claim terminal delivery, push the completion event, then mark ``status``.
     ``result`` is a dict or a callable receiving the record snapshot (stall path). The record
     stays active ("finalizing") until durable persistence and queue publication finish; otherwise
     process shutdown can kill this daemon worker after status flips but before SQLite commits.
-    A second call for the same id (late runner return after a forced stall) is a no-op."""
-    with _records_lock:
-        record = _records.get(delegation_id)
-        if record is None or record.get("status") not in _FINALIZABLE_STATES:
-            return
-        was_queued = record.get("status") == "queued"
-        record["status"] = "finalizing"
-        record["completed_at"] = time.time()
-        record["interrupt_fn"] = None  # drop the closure; child is done
-        record["progress_fn"] = None  # stop stale-monitor sampling
-        snapshot = dict(record)
+    A second call for the same id (late runner return after a forced stall) is a no-op.
+
+    ``_claimed_snapshot`` is used by queued cancellation, which must transition
+    queued -> finalizing under ``_records_lock`` before admission can race it.
+    """
+    if _claimed_snapshot is None:
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is None or record.get("status") not in _FINALIZABLE_STATES:
+                return
+            was_queued = record.get("status") == "queued"
+            record["status"] = "finalizing"
+            record["completed_at"] = time.time()
+            record["interrupt_fn"] = None  # drop the closure; child is done
+            record["progress_fn"] = None  # stop stale-monitor sampling
+            snapshot = dict(record)
+    else:
+        snapshot = _claimed_snapshot
+        was_queued = True
     if was_queued and snapshot.get("cancel_fn") is not None:
         try:
             snapshot["cancel_fn"]("queued delegation cancelled")
@@ -1396,18 +1450,46 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
     """Cancel queued records or signal running records; returns how many changed."""
     count = 0
     for record in targets:
-        was_queued = record.get("status") == "queued"
-        if _call_interrupt(
-            record.get("interrupt_fn"), "%s: %s interrupt failed: %s", caller, record.get("delegation_id"), reason=reason,
-        ) or was_queued:
+        queued_snapshot = None
+        queued_interrupt_fn = None
+        delegation_id = record.get("delegation_id")
+        if not delegation_id:
+            continue
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is None or live.get("status") not in _INTERRUPTIBLE_STATES:
+                continue
+            if live.get("status") == "queued":
+                try:
+                    _PENDING_QUEUE.remove(live["delegation_id"])
+                except ValueError:
+                    pass
+                live["status"] = "finalizing"
+                live["completed_at"] = time.time()
+                queued_interrupt_fn = live.get("interrupt_fn")
+                live["interrupt_fn"] = None
+                live["progress_fn"] = None
+                queued_snapshot = dict(live)
+                interrupt_fn = None
+            else:
+                interrupt_fn = live.get("interrupt_fn")
+        if queued_snapshot is not None:
             count += 1
-        if was_queued:
-            _finalize(
-                record["delegation_id"],
-                {"status": "interrupted", "summary": None, "error": reason, "exit_reason": "interrupted",
-                 "results": [] if record.get("is_batch") else None},
-                "interrupted",
+            _call_interrupt(
+                queued_interrupt_fn, "%s: %s interrupt failed: %s", caller, delegation_id, reason=reason,
             )
+            _finalize(
+                queued_snapshot["delegation_id"],
+                {"status": "interrupted", "summary": None, "error": reason, "exit_reason": "interrupted",
+                 "results": [] if queued_snapshot.get("is_batch") else None},
+                "interrupted",
+                _claimed_snapshot=queued_snapshot,
+            )
+            continue
+        if _call_interrupt(
+            interrupt_fn, "%s: %s interrupt failed: %s", caller, record.get("delegation_id"), reason=reason,
+        ):
+            count += 1
     if count:
         logger.info(msg, count, reason)
     return count

@@ -40,7 +40,7 @@ class _ControlledChild(_Parent):
         self._delegate_depth = 1
         self._delegate_saved_tool_names = []
         self._credential_pool = None
-        self._subagent_id = None
+        self._subagent_id: str | None = None
         self.tool_progress_callback = None
         self.model = "test-model"
         self.started = threading.Event()
@@ -305,6 +305,39 @@ def test_accepted_background_child_keeps_registry_cancellation_ownership(registr
         assert child.closed.wait(5)
 
 
+def test_queued_cancellation_closes_delegation_metrics(monkeypatch, registry_state):
+    import tools.delegate_tool_dispatch as dispatch_mod
+    from hermes_cli.observability.shared_metrics_loop import begin_delegation_run
+
+    release = threading.Event()
+    occupied = async_delegation.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    finished = []
+    monkeypatch.setattr(
+        dispatch_mod,
+        "finish_delegation_unit",
+        lambda call_key, results, *, background: finished.append((call_key, results, background)),
+    )
+    begin_delegation_run(batch.task_list, subagents=1, depth=1)
+    result = json.loads(_dispatch_background(batch))
+    assert result["status"] == "queued"
+    assert async_delegation.interrupt_delegation(result["delegation_id"], reason="metrics cleanup")
+    assert finished and finished[0][0] is batch.task_list
+    assert finished[0][2] is True
+    release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        event = registry_state.get(timeout=5)
+        if event["delegation_id"] == occupied["delegation_id"]:
+            break
+    else:
+        pytest.fail("occupier completion did not arrive")
+
+
 def test_capacity_queues_background_batch_without_inline_execution(registry_state, monkeypatch):
     """Gateway-capable background admission never runs a full pool inline."""
     release = threading.Event()
@@ -317,12 +350,16 @@ def test_capacity_queues_background_batch_without_inline_execution(registry_stat
     monkeypatch.setattr("tools.delegate_tool._get_max_async_children", lambda: 1)
     monkeypatch.setattr("tools.delegate_tool._get_max_queued_delegations", lambda: 1)
     parent, child = _Parent(), _ControlledChild()
+    child._subagent_id = "would-be-live-id"
 
     result = json.loads(_dispatch_background(_batch(parent, child)))
 
     assert occupied["status"] == "dispatched"
     assert result["status"] == "queued"
-    assert "queued" in result["note"].lower()
+    assert "subagent_ids" not in result
+    assert "control_hint" not in result
+    assert "delegation_id" in result["note"]
+    assert result["delegation_id"] in result["queued_units"]
     assert not child.started.is_set()
     assert parent._active_children == []
 

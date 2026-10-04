@@ -404,7 +404,8 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
             from tools.async_delegation import interrupt_delegation, list_async_delegations
             parent_sid = str(getattr(parent_agent, "session_id", "") or "")
             owned = next((r for r in list_async_delegations()
-                          if r.get("delegation_id") == sid
+                          if parent_sid
+                          and r.get("delegation_id") == sid
                           and str(r.get("parent_session_id") or "") == parent_sid), None)
             if owned is not None and interrupt_delegation(sid, reason="stopped via delegate_task"):
                 return json.dumps({"action": "stop", "subagent_id": sid, "status": "interrupt_requested",

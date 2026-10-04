@@ -283,7 +283,119 @@ def test_pending_queue_overflow_rejects_without_starting():
     assert _drain_for(second["delegation_id"]) is not None
 
 
-def test_queued_delegation_can_be_cancelled_before_runner_starts():
+def test_queued_siblings_share_one_bounded_slot_and_admit_together():
+    """Independent completion units from one call share one pending-slot reservation."""
+    release = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
+    )
+    started = [threading.Event(), threading.Event()]
+    slot_key = "one-call-slot"
+    units = [
+        ad.dispatch_async_delegation_batch(
+            goals=[f"unit-{i}"], context=None, toolsets=None, role="leaf", model="m", session_key="",
+            slot_key=slot_key,
+            runner=lambda i=i: (started[i].set(), {"results": [{"task_index": 0, "status": "completed"}]})[1],
+            max_async_children=1, max_queued_delegations=1,
+        )
+        for i in range(2)
+    ]
+    assert first["status"] == "dispatched"
+    assert [unit["status"] for unit in units] == ["queued", "queued"]
+    with ad._records_lock:
+        assert ad._queued_count_locked() == 1
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert all(event.wait(5) for event in started)
+    assert all(_drain_for(unit["delegation_id"]) is not None for unit in units)
+
+
+def test_queued_worker_preserves_parent_prompt_callbacks(monkeypatch):
+    """A queued worker inherits the dispatching thread's approval callback."""
+    from tools import thread_context
+
+    class CallbackSlot:
+        value: object | None = None
+
+    slot = CallbackSlot()
+    callback = object()
+    monkeypatch.setattr(thread_context, "_callback_api", lambda: ((lambda: slot.value, lambda value: setattr(slot, "value", value)),))
+    slot.value = callback
+    release = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    observed = []
+    queued = ad.dispatch_async_delegation(
+        goal="callback", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (observed.append(slot.value), {"status": "completed"})[1], max_async_children=1,
+    )
+    assert queued["status"] == "queued"
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert _drain_for(queued["delegation_id"]) is not None
+    assert observed == [callback]
+
+
+def test_durable_prune_never_evicts_queued_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        for i in range(ad._MAX_RETAINED_COMPLETED + 1):
+            conn.execute(
+                "INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (f"done-{i}", "test", "completed", now, now),
+            )
+        conn.execute(
+            "INSERT INTO async_delegations (delegation_id, origin_session, state, dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("queued-row", "test", "queued", now, now),
+        )
+    ad._prune_durable_records()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id='queued-row'"
+        ).fetchone() == ("queued",)
+
+
+def test_queued_cancel_claims_before_admission_can_race(monkeypatch):
+    """Queued cancellation removes the row before callbacks or slot release can admit it."""
+    release = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    started = threading.Event()
+    queued = ad.dispatch_async_delegation(
+        goal="cancel", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (started.set(), {"status": "completed"})[1], max_async_children=1,
+    )
+    callback_entered = threading.Event()
+    allow_callback = threading.Event()
+    original = ad._call_interrupt
+
+    def pause_callback(*args, **kwargs):
+        callback_entered.set()
+        assert allow_callback.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ad, "_call_interrupt", pause_callback)
+    stopper = threading.Thread(target=lambda: ad.interrupt_delegation(queued["delegation_id"], reason="race"))
+    stopper.start()
+    assert callback_entered.wait(5)
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert not started.is_set()
+    allow_callback.set()
+    stopper.join(timeout=5)
+    assert not stopper.is_alive()
+    completion = _drain_for(queued["delegation_id"])
+    assert completion is not None
+    assert completion["status"] == "interrupted"
+
+
     ev = threading.Event()
     started = threading.Event()
     interrupted = []

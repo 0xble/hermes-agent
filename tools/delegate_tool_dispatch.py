@@ -342,7 +342,7 @@ _BACKGROUND_NOTES = {
     ),
 }
 
-def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
+def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]], *, include_controls: bool = True) -> dict:
     """Model-facing handle for an accepted background call: one entry per async unit."""
     goals = [t["goal"] for t in batch.task_list]
     n = len(goals)
@@ -357,7 +357,7 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
             for unit, uid in units
         ]
     sids = [getattr(c, "_subagent_id", None) for (_, _, c) in batch.children]
-    if any(isinstance(s, str) and s for s in sids):
+    if include_controls and any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
     if batch.live_paths:
@@ -402,6 +402,11 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
                 with _quiet("Live transcript finalize failed", exc_info=True):
                     unit.live_writers[i].finalize(rejected)
         update_manifest_statuses(unit.live_deleg_id, [{"task_index": i, **rejected} for i, _, _ in unit.children])
+        finish_delegation_unit(
+            unit.task_list,
+            [{"task_index": i, **rejected} for i, _, _ in unit.children],
+            background=True,
+        )
 
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
@@ -447,7 +452,10 @@ def _dispatch_background(batch: _Batch) -> str:
     dispatched: List[tuple[_Batch, str]] = []
     queued: List[tuple[_Batch, str]] = []
     inline_results: List[dict] = []
-    slot_key: Optional[str] = None
+    # Reserve one capacity identity for the whole call before the first unit is
+    # admitted. This keeps a queued call's later units in the same bounded slot
+    # and lets the registry admit them together when that slot frees.
+    slot_key: Optional[str] = batch.live_deleg_id or _new_delegation_id()
     for k, unit in enumerate(units):
         # One unit keeps the live-transcript directory's id so the returned delegation_id matches
         # cache/delegation/live/<id>/; several units suffix it (-1, -2, ...) and the call keeps the bare id.
@@ -469,17 +477,36 @@ def _dispatch_background(batch: _Batch) -> str:
         if dispatch.get("at_capacity"):
             logger.warning("delegate_task: async pool at capacity and pending queue unavailable; rejecting without synchronous fallback: %s",
                            dispatch.get("error", "rejected"))
+            rejected_units = [unit_id]
+            for rejected_index in range(k + 1, len(units)):
+                rejected_unit = units[rejected_index]
+                rejected_unit_id = batch.live_deleg_id if len(units) == 1 else (
+                    f"{batch.live_deleg_id}-{rejected_index + 1}" if batch.live_deleg_id else None
+                )
+                rejected_unit.unit_id = rejected_unit_id = rejected_unit_id or _new_delegation_id()
+                _restore_parent_cancellation(rejected_unit)
+                rejected_units.append(rejected_unit_id)
+            finish_delegation_unit(
+                batch.task_list,
+                [{"task_index": task_index, "status": "rejected", "exit_reason": "capacity"}
+                 for rejected_unit in units[k:]
+                 for task_index, _, _ in rejected_unit.children],
+                background=True,
+            )
             if not dispatched and not queued:
                 return json.dumps({
                     "status": "rejected", "mode": "background", "goals": [t["goal"] for t in batch.task_list],
+                    "rejected_units": rejected_units,
                     "error": dispatch.get("error", "Async delegation capacity is full; nothing was started."),
                 }, ensure_ascii=False)
-            payload = _dispatched_payload(batch, dispatched + queued)
+            payload = _dispatched_payload(batch, dispatched + queued, include_controls=not queued)
             payload.update({
                 "status": "partial",
                 "error": dispatch.get("error", "Async delegation capacity is full; this unit was not started."),
-                "rejected_units": [unit_id],
+                "rejected_units": rejected_units,
             })
+            if queued:
+                payload["queued_units"] = [uid for _, uid in queued]
             return json.dumps(payload, ensure_ascii=False)
         if not dispatched and not queued:
             logger.info(
@@ -494,15 +521,18 @@ def _dispatch_background(batch: _Batch) -> str:
                        k + 1, len(units), dispatch.get("error"))
         inline_results.extend(_execute_and_aggregate(unit)["results"])
     if queued and not dispatched:
-        payload = _dispatched_payload(batch, queued)
+        payload = _dispatched_payload(batch, queued, include_controls=False)
+        payload["delegation_id"] = queued[0][1]
+        payload["queued_units"] = [uid for _, uid in queued]
         payload["status"] = "queued"
         payload["note"] = (
             "The delegation is queued because the async pool is at capacity. It will start automatically "
-            "when a slot frees, and its result will re-enter the conversation. Do not poll or re-dispatch it."
+            "when a slot frees, and its result will re-enter the conversation. Do not poll or re-dispatch it. "
+            "Queued units are controlled by their delegation_id, not a subagent_id."
         )
         payload["queue_reason"] = "async pool capacity"
         return json.dumps(payload, ensure_ascii=False)
-    payload = _dispatched_payload(batch, dispatched)
+    payload = _dispatched_payload(batch, dispatched, include_controls=not queued)
     if queued:
         payload["queued_units"] = [uid for _, uid in queued]
     if inline_results:
