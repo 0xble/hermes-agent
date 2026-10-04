@@ -525,6 +525,47 @@ def test_short_evidence_is_refused(hermes_home):
     assert result["error_code"] == "evidence_too_short"
 
 
+def test_evidence_can_drop_an_obsolete_subgoal_and_is_shown_as_agent_evidence(hermes_home):
+    mgr = GoalManager(session_id="rev-evidence-subgoal")
+    mgr.set("Ship X")
+    mgr.add_subgoal("Willow watch runs on schedule")
+    result = mgr.revise(reason="Willow watch was removed by the approved plan", subgoals=[],
+                        evidence="measurement-plan.md removes the Willow watch instead of migrating it")
+    assert result["ok"]
+    revision = load_goal("rev-evidence-subgoal").revisions[-1]
+    assert revision["authority"] == "evidence"
+    history = load_goal("rev-evidence-subgoal").render_revisions_block()
+    assert "agent, evidence:" in history
+    assert "dropped criteria: Willow watch runs on schedule" in history
+
+
+def test_valid_quote_is_not_limited_by_evidence_scope(hermes_home):
+    mgr = GoalManager(session_id="rev-quote-and-evidence")
+    mgr.set("Ship X", contract=GoalContract(boundaries="repo only"))
+    result = mgr.revise(reason="user widened scope", contract={"boundaries": "repo and docs"},
+                        user_quote="docs are in scope too", evidence="The docs live in a separate repository",
+                        user_messages=["Yes, docs are in scope too."])
+    assert result["ok"]
+    assert load_goal("rev-quote-and-evidence").revisions[-1]["authority"] == "user_quote"
+
+
+def test_evidence_prompts_require_support_from_recorded_results(hermes_home, monkeypatch):
+    mgr = GoalManager(session_id="rev-evidence-judge")
+    mgr.set("Ship X", contract=GoalContract(verification="Check the removed component"))
+    mgr.revise(reason="obsolete", contract={"verification": "X is live"},
+               evidence="The approved plan removed the component entirely")
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
+    mgr.evaluate_after_turn("working")
+    assert "only when the recorded tool results support that evidence" in prompts[0]
+    assert "unless later recorded tool results contradict" not in prompts[0]
+
+
+def test_replace_without_a_goal_returns_an_error_dict(hermes_home):
+    result = GoalManager(session_id="replace-none").replace(
+        reason="new", goal="Ship Y", user_quote="set a better goal", user_messages=["set a better goal"])
+    assert result == {"ok": False, "error_code": "no_active_goal", "error": "no active or paused goal"}
+
+
 def test_replace_uses_current_user_quote_and_records_the_replaced_goal(hermes_home):
     mgr = GoalManager(session_id="replace-goal")
     old = mgr.set("Ship the original outcome", contract=GoalContract(verification="old proof"))
