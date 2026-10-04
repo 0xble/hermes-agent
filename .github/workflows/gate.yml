@@ -99,10 +99,15 @@ jobs:
       - name: Require every gate job
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          DRAFT_PR: ${{ github.event.pull_request.draft }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
           print(results)
-          sys.exit(0 if results and all(result == 'success' for result in results.values()) else 1)
+          if results and all(result == 'success' for result in results.values()):
+              sys.exit(0)
+          message = 'draft: gate not run' if os.environ.get('DRAFT_PR') == 'true' else 'gate not qualified'
+          print(message, file=sys.stderr)
+          sys.exit(1)
           PY
