@@ -34,7 +34,9 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   make them reachable. Regression exercises `_handle_message` with an active agent
   and verifies handler invocation without interruption or queueing.
 
-- Follow-up patch identity: `moa-busy-defer`. Upstream PR: see the Upstream section once opened.
+- Follow-up patch identity: `moa-busy-defer`. TUI half contributed as
+  [upstream PR 132644](https://github.com/NousResearch/hermes-agent/pull/132644); the gateway half
+  waits on upstream `defer_until_idle` (PR 116295 / 125345).
 
 ## Verification
 
@@ -46,7 +48,8 @@ Load this unit when changing the adapter active-session guard, the runner busy f
 
 ## Retirement and rollback
 
-Retire `moa-busy-defer` when upstream accepts `/moa` while busy with prior-model restore.
+Retire `moa-busy-defer` when PR 132644 (or equivalent) and an upstream `defer_until_idle` that
+lists `/moa` are both in the candidate release.
 Retire alias expansion when upstream expands alias quick commands on the busy path. Retire
 defer-until-idle when PR 116295 or equivalent is in the candidate release. Roll back by
 reverting the logical patch; no persistent data changes.
