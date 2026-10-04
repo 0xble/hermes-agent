@@ -7,6 +7,7 @@ formatting, capacity rejection, and crash handling.
 
 import json
 import os
+import queue
 import sqlite3
 import subprocess
 import sys
@@ -1153,9 +1154,19 @@ def test_units_of_one_call_share_a_single_capacity_slot():
     assert (first["status"], second["status"], other["status"]) == ("dispatched", "dispatched", "queued")
     assert ad.active_task_count() == 2
     gate.set()
-    assert _drain_for("deleg_call-1") is not None
-    assert _drain_for("deleg_call-2") is not None
-    assert _drain_for("deleg_other") is not None
+    # The two slot-sharing units finish in either order once the gate opens, so collect every
+    # expected completion instead of draining for one id at a time (which discards the other).
+    wanted = {"deleg_call-1", "deleg_call-2", "deleg_other"}
+    seen = set()
+    deadline = time.monotonic() + 10.0
+    while seen != wanted and time.monotonic() < deadline:
+        try:
+            evt = process_registry.completion_queue.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        if evt.get("delegation_id") in wanted:
+            seen.add(evt["delegation_id"])
+    assert seen == wanted
 
 
 def test_multi_task_call_is_one_completion_unless_independent_completions(monkeypatch):
