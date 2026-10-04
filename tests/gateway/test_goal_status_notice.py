@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -162,5 +163,35 @@ async def test_goal_status_notice_bounds_flood_retries_and_warns_once(monkeypatc
     assert len(adapter.calls) == 3
     assert caplog.text.count("goal continuation: status send failed") == 1
     assert "notice_kind=achieved" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_goal_status_notice_logs_when_retry_is_cancelled(monkeypatch, caplog):
+    from gateway import run_goals
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = FakeAdapter([SimpleNamespace(success=False, error="flood_control:3.0")])
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner.config = SimpleNamespace(group_sessions_per_user=True, thread_sessions_per_user=False)
+    runner._background_tasks = set()
+    source = SessionSource(platform=Platform.DISCORD, chat_id="parent-channel", user_id="user-1")
+    retry_started = asyncio.Event()
+    retry_wait = asyncio.Event()
+
+    async def wait_for_retry(_delay):
+        retry_started.set()
+        await retry_wait.wait()
+
+    monkeypatch.setattr(run_goals.asyncio, "sleep", wait_for_retry)
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        await runner._send_goal_status_notice(source, "↻ Continuing toward goal: more work")
+        await retry_started.wait()
+        task = next(iter(runner._background_tasks))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "goal continuation: status retry cancelled" in caplog.text
+    assert "notice_kind=continuing" in caplog.text
 
 

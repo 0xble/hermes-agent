@@ -32,8 +32,9 @@ from gateway.delivery_ledger import (
 
 # A live-lane send refused with a short ``flood_control:<seconds>`` penalty is retried on the live
 # lane after the wait instead of falling back to the standalone sender, which cannot send Telegram
-# Rich Messages. Cron output is not latency-sensitive, so a few seconds of delay beats degraded
-# formatting. Longer penalties, or repeated refusals past the budget, still fall back.
+# Rich Messages. Keep the shared budget and parser beside the call site so cron and goal notices
+# use the same bounded recovery contract. Longer penalties, or repeated refusals past the budget,
+# still fall back.
 
 
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
