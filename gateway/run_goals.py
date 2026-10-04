@@ -554,28 +554,25 @@ class GatewayGoalsMixin:
                 or self._queue_depth(key, adapter=adapter) > 0):
             return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
 
+        resume_marker = None
         if getattr(entry, "resume_pending", False):
             # Startup auto-resume owns a fresh restart marker. Once its bounded freshness window
             # expires, it will no longer schedule this session; do not let that stale marker wedge
             # an otherwise eligible parked goal forever. Snapshot + CAS-clear so a successor that
-            # refreshed the marker wins rather than being stolen by the idle ticker.
-            from gateway.run import _auto_continue_freshness_window, _is_fresh_gateway_interruption
+            # refreshed the marker wins rather than being stolen by the idle ticker. Legacy entries
+            # without last_resume_marked_at use updated_at, matching startup recovery.
+            from gateway.run import (
+                _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+                _resume_pending_marker_timestamp,
+            )
 
-            marker = store.get_resume_pending_marker(key)
-            marked_at = marker[2] if marker is not None else getattr(entry, "last_resume_marked_at", None)
+            resume_marker = store.get_resume_pending_marker(key)
+            if resume_marker is None:
+                return  # marker disappeared or the session was replaced; retry on the next scan
+            marked_at = _resume_pending_marker_timestamp(entry, resume_marker)
             if _is_fresh_gateway_interruption(
                     marked_at, window_secs=_auto_continue_freshness_window()):
                 return  # restart auto-resume still owns this chat
-            if marker is None:
-                cleared = store.clear_resume_pending(key)
-            else:
-                cleared = store.clear_resume_pending(key, expected_marker=marker)
-            if not cleared:
-                return  # marker changed or the session disappeared; retry on the next scan
-            logger.info(
-                "goal wakeup: stale resume_pending cleared for session %s; idle ticker owns continuation",
-                sid,
-            )
 
         max_turns = self._goal_max_turns_from_config()
 
@@ -591,6 +588,23 @@ class GatewayGoalsMixin:
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
         event = self._synthetic_prompt_event(source, prompt)
         event.metadata["gateway_session_key"] = key
+        if resume_marker is not None:
+            cleared = await self.async_session_store.clear_resume_pending(
+                key, expected_marker=resume_marker,
+            )
+        elif getattr(entry, "resume_pending", False):
+            # Keep compatibility with the narrow in-memory test seam and legacy stores that cannot
+            # return a marker; real SessionStore entries always provide the CAS tuple.
+            cleared = await self.async_session_store.clear_resume_pending(key)
+        else:
+            cleared = True
+        if not cleared:
+            return  # marker changed or the session disappeared; retry on the next scan
+        if resume_marker is not None or getattr(entry, "resume_pending", False):
+            logger.info(
+                "goal wakeup: stale resume_pending cleared for session %s; idle ticker owns continuation",
+                sid,
+            )
         from gateway.wake import WakeNotAccepted, admit_internal_event
 
         try:
