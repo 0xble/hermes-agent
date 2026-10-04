@@ -79,4 +79,3 @@ def test_pending_moa_applies_to_matching_next_turn_and_restores(monkeypatch):
     assert calls == ["default --provider moa", "gpt-4 --provider openai"]
     assert session["agent"].model == "gpt-4"
     assert session["model_override"] == {"model": "standing", "provider": "openai"}
-
