@@ -2531,8 +2531,11 @@ class GoalManager:
         )
         if current is not None:
             self._state = current
-        self._last_live_barrier_notice = notice if changed else None
-        return self._last_live_barrier_notice
+        # The notice is delivered directly by idle callers. Do not retain it on the
+        # manager: an immediate evaluator pass would otherwise replay the already
+        # committed age notice through _waiting_decision().
+        self._last_live_barrier_notice = None
+        return notice if changed else None
 
     def _stage_live_barrier(self) -> tuple[bool, Optional[str], Optional[str]]:
         """Stage live-barrier maintenance on an isolated evaluator state.
@@ -2806,6 +2809,11 @@ class GoalManager:
         )
         state.last_verdict = verdict
         state.last_reason = reason
+        # A non-WAIT verdict is a real lifecycle transition out of the previous
+        # parked state. Preserve the key only across timer/barrier lifts that
+        # re-park on the same reason; CONTINUE must announce a later re-park.
+        if verdict == "continue":
+            state.last_wait_notice_key = None
         # Real user turns and actionable tool results are progress signals. Automatic turns whose
         # current evidence is empty or read-only/status-only count toward the backoff regardless of
         # wording or changing command output; a write/actionable result resets the streak.

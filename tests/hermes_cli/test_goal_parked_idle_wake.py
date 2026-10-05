@@ -171,7 +171,7 @@ def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch)
     outcomes = []
     real_clear = goals.GoalState.clear_wait
 
-    def clear_with_competitor(self):
+    def clear_with_competitor(self, *args, **kwargs):
         other = sqlite3.connect(str(db_path), timeout=0)
         try:
             other.execute("UPDATE state_meta SET value = value WHERE key = ?", (goals._meta_key("s-lock"),))
@@ -181,7 +181,7 @@ def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch)
             outcomes.append(str(exc))
         finally:
             other.close()
-        return real_clear(self)
+        return real_clear(self, *args, **kwargs)
 
     monkeypatch.setattr(goals.GoalState, "clear_wait", clear_with_competitor)
     assert mgr.clear_lifted_wait(since) is True
