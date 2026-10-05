@@ -15,7 +15,7 @@ import sys
 import threading
 from typing import Iterator, TextIO
 
-__all__ = ["thread_scoped_silence"]
+__all__ = ["thread_scoped_silence", "is_routing_stream"]
 
 _install_lock = threading.Lock()
 # Proxy installed per attribute ("stdout"/"stderr"): never double-wrap.
@@ -87,17 +87,34 @@ class _ThreadRoutingStream:
         return getattr(self._target(), name)
 
 
+def _routing_stream_under(stream: object) -> "_ThreadRoutingStream | None":
+    """The routing proxy at ``stream`` or directly under a single transparent wrapper."""
+    if isinstance(stream, _ThreadRoutingStream):
+        return stream
+    try:
+        inner = object.__getattribute__(stream, "_inner")
+    except AttributeError:
+        return None
+    return inner if isinstance(inner, _ThreadRoutingStream) else None
+
+
+def is_routing_stream(stream: object) -> bool:
+    """True when ``stream`` is this module's routing proxy (which already tolerates a dead target)."""
+    return isinstance(stream, _ThreadRoutingStream)
+
+
 def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
     """Install (idempotently) a routing proxy as ``sys.<attr>`` and return it."""
     with _install_lock:
         proxy = _installed.get(attr)
         current = getattr(sys, attr, None)
-        if isinstance(current, _ThreadRoutingStream):
-            # A redirect context may restore an older proxy; adopt it rather
-            # than wrapping it into an unbounded chain.
-            _installed[attr] = current
-            _routing_states[attr] = current._state
-            return current
+        # A redirect context may restore an older proxy, or a crash-safety wrapper may
+        # sit on top of one; adopt it rather than wrapping it into an unbounded chain.
+        adopted = _routing_stream_under(current)
+        if adopted is not None:
+            _installed[attr] = adopted
+            _routing_states[attr] = adopted._state
+            return adopted
         if proxy is not None and current is proxy:
             return proxy
         # Route non-silenced threads to whatever is currently bound (an active

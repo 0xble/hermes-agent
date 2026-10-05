@@ -612,3 +612,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `update-lifecycle`.
 - A release-origin `hermes update` re-enters the source checkout with `python -c "...sys.argv.pop(1)..." <source> update ...`. `hermes_bootstrap` then relaunched that `-c` program under the managed interpreter with the already-popped `sys.argv`, so the replayed code popped again and consumed `update`. `hermes update --check` and `--plan` exited 2 with "unrecognized arguments", which made the gateway `request_update` tool fail with `update_check_failed`. `relaunch_command` now rebuilds a `-c` relaunch's argv from the original command line.
 - Guard: `tests/hermes_cli/test_venv_sync_relaunch.py`.
+
+## Stdio Wrapper Chain Recursion
+
+- Fork patch identity: `stdio-wrapper-chain`.
+- `agent.process_bootstrap._install_safe_stdio` (run on every `AIAgent` init) wrapped the thread-routing proxy that `thread_scoped_silence` installs in a `_SafeWriter`. The next silence then saw a non-proxy `sys.stdout` and installed a new proxy over the wrapper. Every agent init followed by background review or code-execution RPC therefore added two layers. In a long-lived gateway the alternating `__getattr__` chain reached the recursion limit. On 2026-10-05 `review_candidate` and subagent construction failed at `agent_init._setup_logging` with `maximum recursion depth exceeded` across many sessions. Safe stdio now leaves the routing proxy unwrapped, since it already tolerates a dead target, and the proxy installer adopts a proxy directly under one transparent wrapper. Upstream `main` has the same code.
+- Guard: `tests/agent/test_thread_scoped_output.py` (`test_safe_stdio_and_silence_do_not_grow_a_wrapper_chain`).

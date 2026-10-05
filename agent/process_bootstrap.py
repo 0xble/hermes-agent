@@ -325,10 +325,18 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
 
 
 def _install_safe_stdio() -> None:
-    """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
+    """Wrap stdout/stderr so best-effort console output cannot crash the agent.
+
+    The thread-routing proxy already swallows a dead target's errors, so it is left
+    unwrapped. Wrapping it let each agent init and each later silence install add one
+    more layer, and a long-lived gateway's ``__getattr__`` chain eventually hit the
+    recursion limit inside ``review_candidate`` and subagent construction.
+    """
+    from agent.thread_scoped_output import is_routing_stream
+
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
-        if stream is not None and not isinstance(stream, _SafeWriter):
+        if stream is not None and not isinstance(stream, _SafeWriter) and not is_routing_stream(stream):
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
