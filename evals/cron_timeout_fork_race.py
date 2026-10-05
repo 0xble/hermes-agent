@@ -66,15 +66,22 @@ def main():
             elapsed = time.monotonic() - start
         finally:
             psutil._ppid_map = original
-        states = {}
         owned = psutil.Process().children(recursive=True)
         try:
             ids = json.loads(marker.read_text(encoding="utf-8"))
-            for pid in ids:
-                try:
-                    states[pid] = psutil.Process(pid).status()
-                except psutil.NoSuchProcess:
-                    states[pid] = "gone"
+            settle_deadline = time.monotonic() + 5
+            while True:
+                states = {}
+                for pid in ids:
+                    try:
+                        states[pid] = psutil.Process(pid).status()
+                    except psutil.NoSuchProcess:
+                        states[pid] = "gone"
+                if all(state in ("gone", psutil.STATUS_ZOMBIE) for state in states.values()):
+                    break
+                if time.monotonic() >= settle_deadline:
+                    break
+                time.sleep(0.01)
             print(json.dumps({"result": result, "elapsed": elapsed, "states": states,
                               "real_snapshot_sizes": schedules}), flush=True)
             assert result[1].startswith("Script timed out after 2s:"), result

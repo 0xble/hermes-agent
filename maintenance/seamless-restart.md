@@ -315,6 +315,10 @@ Every row merged with an independent `review_candidate` approval on its exact he
 | H1: update config errors | [#220](https://github.com/0xble/hermes-agent/pull/220) | `b633a3532c` |
 | H1: resumed turn reply attribution | [#214](https://github.com/0xble/hermes-agent/pull/214) | `96f6a8eb2f` |
 | Part 2 review follow-ups | [#228](https://github.com/0xble/hermes-agent/pull/228) | `f7d27da20d` |
+| Forward-only amendment | [#269](https://github.com/0xble/hermes-agent/pull/269) | `4f40197eba` |
+| Forward-only cold start | [#275](https://github.com/0xble/hermes-agent/pull/275) | `8841a62478` |
+| Forward-only promotion, rollback | [#276](https://github.com/0xble/hermes-agent/pull/276) | `942ffd6f28` |
+| Native forward-only acceptance | [#282](https://github.com/0xble/hermes-agent/pull/282) | `60d389afb3` |
 
 Drafts [#215](https://github.com/0xble/hermes-agent/pull/215) (S4.2 spike) and [#224](https://github.com/0xble/hermes-agent/pull/224) (S4.2 rerun spike) were closed unmerged.
 
@@ -344,6 +348,20 @@ S3 landed before S2 (its code-SHA ledger column works without releases). S2 is *
   - Receipt ordering and resumed-reply attribution were observed live.
   - The pointer and config validation were reproduced in a disposable `HERMES_HOME` with the release interpreter.
   - The error-surface, manual-cron, double-fork and commit/enqueue-gap items are covered by named regression tests: 30 passed at `96f6a8eb2f`. No live trigger occurred for them.
+
+**Forward-only bootstrap on this Mac (2026-10-05).**
+
+- **Starting point:** `current` and `previous` were both capable releases containing #282 (`d0251975` and `cada7e8f`), with no `gateway-coordinator.db`, `forward-update.json` or `release-txn.json`. `main` equalled `current`, so there was no update to install.
+- **Step 1, 05:02 PT:** `hermes config set gateway.forward_only_handover.enabled true`, read back with `gateway.overlap_handover.enabled` unset, then one native restart. The new process created the coordinator and took epoch 1, but it ran from the installed flag-off plist, so its generation recorded `release_sha='unknown'`. `promote_forward` refuses such a holder (`serving release identity is unproved`).
+- **Step 2, 05:13 PT:** `hermes gateway install` rewrote `ai.hermes.gateway.plist` as the forward-only service definition: pinned release root, `HERMES_RELEASE_SHA`, `HERMES_LAUNCHD_LABEL` and a fresh `HERMES_GENERATION_SCOPE`. Its deferred reload stopped epoch 1, and the next generation took over at 05:14:07. The coordinator records one `takeover` lease move from epoch 1 to 2, the holder serving `d0251975` under `ai.hermes.gateway`, and no startup-gate failure. Telegram polling was healthy at 05:14:31.
+- **Poller evidence:** six journal events, both epoch-1 intervals closed, only the live epoch-2 holder open, and no overlap. The cold takeover left a 9.6 s zero-poller gap, which is a restart gap, not a handover interval.
+- **Cost:** both steps were ordinary drain-first restarts, so each cut its in-flight turns, delegations and tool processes once, with restart notices suppressed. They are excluded from the post-promotion measurement.
+
+**Bootstrap rules learned.**
+
+- After turning the flag on, render the forward-only service definition before the first cold start: run `hermes gateway install` (or let an update activation render it). A native restart alone reuses the flag-off plist and produces an unpromotable `unknown` holder.
+- A live holder's lock and poller intervals are always open. Offline `check_poller_journal()` therefore reports `unclosed_intervals` while the gateway runs. A healthy live reading has no other violation, and every open interval belongs to the current lease holder and epoch.
+- `polling_cursors.confirmed_offset` advances only when a `getUpdates` response carries updates, to the highest `update_id` + 1. Internal injections (background-process notices, delegation completions, goal continuations and relays) never pass through Telegram, so a stationary cursor during internal traffic is expected. Cursor continuity across a handover is proved from `telegram_updates`: contiguous ids through the window, each admitted once, ending one below the confirmed offset.
 
 **Remaining risks.**
 

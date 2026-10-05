@@ -667,8 +667,14 @@ class GatewayModelCommandsMixin:
             return False
 
     def _live_agent_for_session_control(self, session_key: str):
-        """Return this session's running agent without touching its cached prompt or transcript."""
-        return (getattr(self, "_running_agents", None) or {}).get(session_key)
+        """Return this session's running agent without touching its cached prompt or transcript.
+
+        A turn claimed but not yet built holds the pending sentinel; it has no request state, so
+        it counts as no live agent (the idle cached agent is evicted instead)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        agent = (getattr(self, "_running_agents", None) or {}).get(session_key)
+        return None if agent is _AGENT_PENDING_SENTINEL else agent
 
     def _evict_idle_agent_after_session_control(self, session_key: str) -> None:
         if self._live_agent_for_session_control(session_key) is None:
@@ -820,13 +826,22 @@ class GatewayModelCommandsMixin:
             baseline = dict(getattr(agent, "request_overrides", None) or {})
             agent._gateway_base_request_overrides = dict(baseline)
         overrides = dict(baseline)
+        fast_overlay: dict = {}
         if tier == "priority":
-            overrides.update(resolve_fast_mode_overrides(
+            fast_overlay = dict(resolve_fast_mode_overrides(
                 agent.model, provider=getattr(agent, "provider", None),
                 base_url=getattr(agent, "base_url", None),
             ) or {})
+            overrides.update(fast_overlay)
         agent.request_overrides = overrides
         agent.service_tier = tier
+        expiry_loader = getattr(self, "_session_service_tier_expiry", None)
+        try:
+            expiry_at, _ = expiry_loader(session_key) if callable(expiry_loader) else (0.0, 0.0)
+        except (AttributeError, TypeError, ValueError):
+            expiry_at = 0.0
+        from agent.fast_mode import set_gateway_fast_expiry_state
+        set_gateway_fast_expiry_state(agent, expiry_at, tier, overlay=fast_overlay)
         agent._fast_until = (time.monotonic() + getattr(agent, "fast_auto_seconds", DEFAULT_WINDOW_SECONDS)
                              if tier == "auto" else 0.0)
 
@@ -872,17 +887,35 @@ class GatewayModelCommandsMixin:
         # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
         session_key = self._session_key_for_source(event.source)
-        self._service_tier = self._resolve_session_service_tier(session_key=session_key)
+        transition = self._resolve_session_service_tier(
+            session_key=session_key, report_transition=True,
+        )
+        if isinstance(transition, tuple):
+            self._service_tier, expiry_notice = transition
+        else:
+            self._service_tier, expiry_notice = transition, None
         model = _resolve_gateway_model(_load_gateway_config())
         if not model_supports_fast_mode(model):
-            return t("gateway.fast.not_supported")
+            reply = t("gateway.fast.not_supported")
+            return reply + ("\n\n" + expiry_notice if expiry_notice else "")
         ultrafast = model_supports_ultrafast(model)
         if args == "ultrafast" and not ultrafast:
-            return t("gateway.fast.ultrafast_not_supported", model=model)
+            reply = t("gateway.fast.ultrafast_not_supported", model=model)
+            return reply + ("\n\n" + expiry_notice if expiry_notice else "")
         if args and args != "status":
-            return self._apply_fast_selection(session_key, args, persist=persist_global)
+            reply = self._apply_fast_selection(session_key, args, persist=persist_global)
+            return (expiry_notice + "\n\n" + reply) if expiry_notice else reply
         mode = service_tier_word(self._service_tier)
         status = {"fast": t("gateway.fast.status_fast"), "normal": t("gateway.fast.status_normal")}.get(mode, mode)
+        expiry_at, _ = self._session_service_tier_expiry(session_key)
+        if expiry_at and self._service_tier in {"priority", "ultrafast"}:
+            import math
+            import time
+            from agent.fast_mode import format_expiry_remaining
+            remaining = max(0.0, expiry_at - time.time())
+            status += t("gateway.fast.status_expiring", remaining=format_expiry_remaining(math.ceil(remaining)))
+        if expiry_notice:
+            status += "\n\n" + expiry_notice
 
         async def _on_fast_choice(_chat_id: str, value: str) -> str:
             return self._apply_fast_selection(session_key, value, persist=persist_global)

@@ -180,6 +180,8 @@ gateway:
     label_normal: "عادي"
     status_fast: "سريع"
     status_normal: "عادي"
+    status_expiring: "\n\n⏱ ينتهي خلال: {remaining}"
+    expired: "⚡ تم إيقاف الوضع السريع بعد {duration}."
     picker_title: "⚡ **المعالجة ذات الأولوية**\n\nالوضع الحالي: `{mode}`\n\nاختر خيارًا:"
     choice_fast: "fast — المعالجة ذات الأولوية مُفعّلة"
     choice_normal: "normal — المعالجة القياسية"
