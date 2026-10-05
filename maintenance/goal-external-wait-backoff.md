@@ -16,14 +16,15 @@ target exit or the process session's watch trigger remains the wake condition.
 
 ## Independent hypothesis and upstream comparison
 
-The frozen hypothesis is recorded at
-`~/.hermes/cache/scratch/goal-busy-poll-hypothesis-20261004.md`. The native
-judge prompt omitted external prerequisites, so it defaulted to CONTINUE, and
-pid/session barriers treated the 30-minute probe cap as permission to resume
-judging even when the target was still alive. A core patch is required because
-this behavior spans judge semantics, durable goal state, barrier liveness, and
-idle wake admission; instructions or a plugin cannot atomically own those
-boundaries.
+The frozen hypothesis is: repeated automatic judge WAITs can spend one turn every
+minute even when the external condition is unchanged, because timed WAITs clamp
+to the 60-second minimum, `consecutive_no_progress` only advances on CONTINUE,
+and `clear_wait()` erases the parked-notice identity during an idle lift. The
+same boundary also needs explicit lifecycle coverage for live pid/session waits,
+delegation waits, and every CLI, gateway, and TUI wake surface. A core patch is
+required because this behavior spans judge semantics, durable goal state, barrier
+liveness, and idle wake admission; instructions or a plugin cannot atomically own
+those boundaries.
 
 Related upstream PRs reviewed before implementation: #106925, #118705,
 #129380, and #107130. None supplied a released equivalent for the complete
@@ -33,12 +34,14 @@ external-wait, no-progress, and live-barrier contract.
 
 ### Production entry points and turn provenance
 
-`GoalManager.evaluate_after_turn()` is the shared evaluator entry point. The
-CLI calls it from `CLILoopsMixin._maybe_continue_goal_after_turn`; the gateway
-calls it from `GatewayGoalsMixin._post_turn_goal_continuation`; and the TUI
-calls it from `tui_gateway.prompt_turn._post_turn_goal_continuation`. Each
-caller must pass the provenance of the turn that just completed, rather than
-letting the evaluator infer it from prose or queue state:
+`GoalManager.evaluate_after_turn()` is the shared evaluator entry point. The CLI
+calls it from `CLILoopsMixin._maybe_continue_goal_after_turn`; the gateway calls
+it from `GatewayGoalsMixin._post_turn_goal_continuation`; and the TUI calls it
+from `tui_gateway.prompt_turn._goal_followup_after_turn` after
+`_dispatch_followup_turn` routes the follow-up through
+`_run_prompt_submit(user_turn=False)`. Each caller must pass the provenance of
+the turn that just completed, rather than letting the evaluator infer it from
+prose or queue state:
 
 - admitted human input is `user_initiated=True`;
 - a goal continuation, idle wake, heartbeat, loop wakeup, process/delegation
@@ -105,13 +108,43 @@ current turn by `timestamp > previous_turn_at`; quality-gate rows are excluded
 from the progress fingerprint, while still being shown to the judge.
 
 For an automatic CONTINUE, empty evidence or evidence consisting only of
-approved read-only/status operations increments
-`consecutive_no_progress`. A write/actionable result or a real user turn resets
-it. Three consecutive qualifying turns call `_no_progress_wait()`, persist a
-timed barrier, and return `should_continue=False`; the backoff waits are 5,
-15, and 30 minutes (the last is bounded by `_MAX_BARRIER_WAIT_S`). Judge
-wording and changing status output do not convert a read-only poll into
+approved read-only/status operations increments the shared no-progress streak. A
+write/actionable result or a real user turn resets it. Three consecutive
+qualifying turns call `_no_progress_wait()`, persist a timed barrier, and return
+`should_continue=False`; the backoff waits are 5, 15, and 30 minutes (the last is
+bounded by `_MAX_BARRIER_WAIT_S`). Judge WAITs use the same streak state rather
+than a second counter. A timed WAIT with no new actionable evidence uses a
+minimum of 300 seconds and escalates the effective wait as 300 → 900 → 1800
+seconds on consecutive no-new-evidence WAITs, capped at 1800 seconds. A user
+turn or new actionable evidence resets the shared streak before the next wait.
+Judge wording and changing status output do not convert a read-only poll into
 progress.
+
+### Repeated judge WAITs
+
+Only automatic turns participate in judge-WAIT escalation. The effective wait is
+computed before parking: 300 seconds for the first no-new-evidence WAIT, then
+900, then 1800 seconds for later WAITs in the same shared no-progress streak.
+The judge's requested `wait_for_seconds` remains bounded to 60..1800 for the
+ordinary path, but it cannot reduce this automatic no-new-evidence floor or the
+current escalation level. A user turn or a new actionable evidence fingerprint
+resets the shared streak and allows a later WAIT to start again at 300 seconds.
+
+The timed parked-notice identity is `target-type + reason`: `timed|reason:<r>`
+for timed waits, `session:<id>|reason:<r>` for session waits, and
+`pid:<pid>|reason:<r>` for pid waits. It never includes the deadline,
+`waiting_seconds`, or the escalated duration. The identity survives an idle
+lift-and-re-park when the next timed WAIT has the same reason. `clear_wait()` may
+clear `last_wait_notice_key` only for a non-WAIT verdict, a user turn, pause,
+resume, done, or a changed target/reason; a timer lift preserves the key when
+re-parking would reuse it. A changed target or reason starts a new notice.
+
+A judge WAIT on a pid or session uses the live-barrier lifecycle: the target
+stays armed through its 5/15/30-minute rechecks, emits one age notice, pauses at
+the six-hour ceiling if still live, and lifts only when the target exits. A
+judge WAIT with active delegations is a timed delegation barrier: it parks for
+at least ten minutes, records the active count, and lifts early when that count
+decreases. Neither lifecycle spends a judge turn while its barrier still holds.
 
 ### Read-only command grammar
 
@@ -138,7 +171,8 @@ not consume the complete argument string. The classifier consumes the parsed
 These durable keys have separate domains:
 
 - `last_wait_notice_key` identifies the parked barrier (`session`, `pid`, or
-  timed/delegation target plus reason). It deduplicates the initial judge-WAIT
+  `timed`/delegation target plus reason). For timed judge waits it is stable
+  across deadline and backoff changes; it deduplicates the initial judge-WAIT
   or deterministic no-progress parked notice only;
 - `last_age_notice_key` identifies the live target and reason after the first
   30-minute threshold. It emits exactly one `⏳ ... after 30 minutes ...`
@@ -156,14 +190,15 @@ that message until visible response delivery; the TUI emits its goal status
 update.
 
 On the idle path, the gateway ticker enters
-`GatewayGoalsMixin._goal_wakeup_fire_one()` and the TUI/session-owner poller
-uses the same parked-goal check. They call `rearm_live_barrier()` first. A
+`GatewayGoalsMixin._goal_wakeup_fire_one()`, the TUI/session-owner poller enters
+`_maybe_resume_tui_parked_goal()` → `_notif_loop_status`, and the CLI process loop
+enters `_maybe_resume_parked_goal()`. They call `rearm_live_barrier()` first. A
 successful re-arm persists the next deadline and, only for the first age
 threshold, returns the age notice; gateway sends it through
-`_send_goal_status_notice(..., notice_kind="wait-age")`, while TUI emits its
-status update. The pure `is_waiting()`/`lifted_barrier_prompt()` checks never
-write state. A notice already committed by the evaluator is suppressed by
-`last_age_notice_key` on the idle scan, preventing a duplicate.
+`_send_goal_status_notice(..., notice_kind="wait-age")`, while TUI and CLI emit
+their status/console update. The pure `is_waiting()`/`lifted_barrier_prompt()`
+checks never write state. A notice already committed by the evaluator is
+suppressed by `last_age_notice_key` on every idle scan, preventing a duplicate.
 
 ### Live-barrier lifecycle
 
@@ -208,12 +243,22 @@ coverage; they are not evidence for the rows below.
 | Evidence storage shape is JSON and parsed before classification | `SessionDB.append_message` → `collect_goal_evidence` | `test_real_collector_preserves_json_argument_representation` | yes | none |
 | `&&`, `||`, `;`, backticks, `$(`, `-exec`, `-execdir`, and `-ok` are rejected | same CLI/evaluator path with real terminal rows | `test_real_evidence_classifier_rejects_shell_operators` | yes | judge response |
 | Passing quality-gate rows do not reset no-progress state | CLI post-turn hook → real gate execution → evaluator fingerprint | `test_real_passing_quality_gate_rows_do_not_reset_no_progress` | yes | judge response |
+| Actionable SessionDB evidence or a real user turn resets the shared WAIT/CONTINUE streak | `SessionDB.append_message` / `_tui_process_one_input` → evaluator streak update | `test_real_actionable_evidence_and_user_turn_reset_shared_wait_streak` | yes | judge response |
+| Four repeated timed judge WAITs lift through the CLI idle path with 300 → 900 → 1800 → 1800 seconds and one parked notice | `evaluate_after_turn` → `_apply_wait_directive` → `_maybe_resume_parked_goal` → `clear_lifted_wait` | `test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice` | yes | judge response, wall clock |
+| Timed WAIT notice identity excludes deadline and escalated seconds and survives lift/re-park | `_wait_notice_key` → `clear_wait` → `_apply_wait_directive` | same repeated-WAIT test plus direct state assertions | yes | judge response, wall clock |
 | Plain, contract, subgoal, and quality-gate continuation templates are synthetic | `GoalManager.next_continuation_prompt` / real `_check_gates` → CLI and gateway provenance matchers | `test_real_continuation_builders_are_synthetic_to_cli_and_gateway` | yes | none |
+| Gateway synthetic continuation, gate-failed continuation, and idle-wake event reach the evaluator as automatic | `GatewayRunner._run_post_turn_hooks` → `_is_user_turn_event` → `_post_turn_goal_continuation` | `test_real_gateway_post_turn_hooks_mark_continuation_gate_failure_and_idle_wake_automatic` | yes | judge response |
+| CLI input provenance is resolved by the TUI entry point, not a preset flag | `_tui_process_one_input` → `_tui_after_turn` → `_maybe_continue_goal_after_turn` | `test_real_cli_tui_input_provenance_reaches_goal_evaluator_as_automatic` | yes | judge response, runtime shell/UI |
+| TUI follow-up dispatch passes `user_turn=False` into `_goal_followup_after_turn` | `_dispatch_followup_turn` → `_run_prompt_submit` → `tui_gateway.prompt_turn._goal_followup_after_turn` | `test_real_tui_followup_dispatch_reaches_goal_followup_as_automatic` | yes | judge response, turn submit |
 | Judge WAIT session park uses real JSON parsing and durable barrier | CLI post-turn hook → `judge_goal` → `_apply_wait_directive` | `test_real_judge_wait_then_evaluator_age_notice_reaches_cli_user` | yes | judge response, session liveness |
 | Evaluator-path 30-minute age notice reaches the user once | `_stage_live_barrier` → evaluator decision → CLI output | `test_real_judge_wait_then_evaluator_age_notice_reaches_cli_user` | yes | judge response, session liveness |
-| Idle-path 30-minute age notice reaches the user once | `rearm_live_barrier` (called by gateway/TUI idle poller) | `test_real_judge_wait_then_idle_rearm_delivers_age_notice` | yes | judge response, session liveness |
-| Live barrier rechecks at 5/15/30 minutes | `rearm_live_barrier` after real judge WAIT | `test_real_judge_wait_rearms_live_barrier_at_five_fifteen_and_thirty_minutes` | yes | judge response, wall clock, session liveness |
+| Gateway idle age notice is delivered with `notice_kind="wait-age"`, deduped on a second due scan, and suppressed after evaluator commit | `_goal_wakeup_fire_one` → `rearm_live_barrier` → `_send_goal_status_notice` | `test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan` | yes | session liveness, capturing adapter |
+| TUI idle age notice reaches `_notif_loop_status` once | `_maybe_resume_tui_parked_goal` → `_notif_loop_status` | `test_real_tui_idle_age_notice_reaches_status_and_dedupes` | yes | session liveness, status sink |
+| CLI idle age notice reaches the console once | `_maybe_resume_parked_goal` → CLI status output | `test_real_cli_idle_age_notice_reaches_user_and_dedupes` | yes | session liveness, console sink |
+| Live barrier rechecks at 5/15/30 minutes and `lifted_barrier_prompt()` stays `None` while target is alive | `rearm_live_barrier` → `lifted_barrier_prompt` | `test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks` | yes | wall clock, session liveness |
+| Exited target after at least one re-arm admits exactly one idle continuation and clears only that wait | CLI idle hook → `lifted_barrier_prompt` → `clear_lifted_wait` | `test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks` | yes | session liveness, console sink |
 | Six-hour live target pauses without a second judge | evaluator live-barrier stage | `test_real_judge_wait_at_six_hours_pauses_without_a_second_judge` | yes | judge response, wall clock, session liveness |
+| A live delegation plus real SessionDB status evidence parks an automatic no-action CONTINUE for ten minutes and lifts when one returns | `SessionDB.append_message` → CLI post-turn hook → real `count_active_delegations` → `_delegation_no_progress_wait` → CLI idle hook | `test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early` | yes | judge response, delegation registry lifecycle |
 | Exited target clears the barrier and resumes judging | evaluator live-barrier stage → normal judge | `test_real_exited_target_lifts_barrier_for_a_continuation` | yes | judge response, session liveness |
 | Gateway idle wake injects an admitted continuation after exit/receipt | `_goal_wakeup_fire_one` → `admit_internal_event` → `clear_lifted_wait` | `tests/gateway/test_goal_parked_idle_wake.py::test_watcher_resumes_goal_parked_on_restart_killed_process` | yes | process/session liveness |
 | CAS loss preserves a concurrent re-park | `rearm_live_barrier` → `rearm_goal_barrier_if_since` | `tests/hermes_cli/test_goal_external_wait_backoff.py::test_live_barrier_rearm_respects_cas_loss` | yes | session liveness |
@@ -231,10 +276,56 @@ Expected-red design reset command:
 TMPDIR=~/.cache/hermes-s2-tmp .venv/bin/python -m pytest -q -p no:cacheprovider tests/hermes_cli/test_goal_external_wait_backoff_real_path.py
 ```
 
-On the pre-fix head, the real-path file is intentionally red for the P1 JSON
-argument classification, the P2 continuation provenance prefix, and the P2
-evaluator age-notice delivery. The remaining matrix tests provide green
-coverage for the already-correct paths and keep the expected behavior explicit.
+On the pre-fix head, the exact real-path result is **8 failed, 19 passed** in
+27 collected cases (`8 failed, 19 passed in 176.31s (0:02:56)`). The eight red
+cases are intentional acceptance blockers:
+
+- `test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice`: every
+  timed judge WAIT remains 60 seconds and reposts its parked notice instead of
+  using 300 → 900 → 1800 → 1800 seconds with one notice;
+- `test_real_session_evidence_drives_three_status_continuations_to_backoff`:
+  JSON terminal arguments are not parsed before classification, so read-only
+  status polls are treated as actionable and the no-progress streak stays 0;
+- `test_real_continuation_builders_are_synthetic_to_cli_and_gateway`: the
+  quality-gate continuation prefix is not recognized as synthetic;
+- `test_real_gateway_post_turn_hooks_mark_continuation_gate_failure_and_idle_wake_automatic`:
+  the gate-failed gateway event reaches the evaluator as `user_initiated=True`;
+- `test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan`:
+  the gateway sends a second `wait-age` notice after a second due scan and
+  after an evaluator-committed age notice;
+- `test_real_tui_idle_age_notice_reaches_status_and_dedupes`: the TUI repeats
+  the age notice on the second due scan;
+- `test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early`:
+  despite a real active delegation count of 1, the JSON status evidence is
+  misclassified, so the automatic CONTINUE does not enter the ten-minute
+  delegation wait;
+- `test_real_judge_wait_then_evaluator_age_notice_reaches_cli_user`: an aged
+  live barrier returns the generic parked notice instead of the 30-minute age
+  notice.
+
+The full collected set that must turn green is:
+
+- `test_real_actionable_evidence_and_user_turn_reset_shared_wait_streak`;
+- `test_real_session_evidence_drives_three_status_continuations_to_backoff`;
+- `test_real_collector_preserves_json_argument_representation`;
+- all eight cases of `test_real_evidence_classifier_rejects_shell_operators`;
+- `test_real_passing_quality_gate_rows_do_not_reset_no_progress`;
+- `test_real_continuation_builders_are_synthetic_to_cli_and_gateway`;
+- `test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice`;
+- `test_real_gateway_post_turn_hooks_mark_continuation_gate_failure_and_idle_wake_automatic`;
+- `test_real_cli_tui_input_provenance_reaches_goal_evaluator_as_automatic`;
+- `test_real_tui_followup_dispatch_reaches_goal_followup_as_automatic`;
+- `test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan`;
+- `test_real_tui_idle_age_notice_reaches_status_and_dedupes`;
+- `test_real_cli_idle_age_notice_reaches_user_and_dedupes`;
+- `test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks`;
+- `test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early`;
+- `test_real_judge_wait_then_evaluator_age_notice_reaches_cli_user`;
+- `test_real_judge_wait_then_idle_rearm_delivers_age_notice`;
+- `test_real_judge_wait_rearms_live_barrier_at_five_fifteen_and_thirty_minutes`;
+- `test_real_judge_wait_at_six_hours_pauses_without_a_second_judge`;
+- `test_real_exited_target_lifts_barrier_for_a_continuation`.
+
 Production code is intentionally unchanged in this design/test phase.
 
 ## Retirement and rollback
