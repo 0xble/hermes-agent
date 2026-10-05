@@ -21,7 +21,7 @@ from pathlib import Path
 
 from agent.i18n import t
 from gateway.config import Platform
-from gateway.platforms.base import EphemeralReply
+from gateway.platforms.base import EphemeralReply, as_command_reply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
@@ -691,7 +691,8 @@ class GatewayInboundMixin:
                 return True, _denied
             # Any recognized slash command dispatches per its declared busy_policy (dispatch /
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
-            return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
+            return True, as_command_reply(
+                await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source))
 
         # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
         # photo-only follow-up; adapter-level batching absorbs them.
@@ -1380,6 +1381,8 @@ class GatewayInboundMixin:
             _result = await self._run_in_executor_with_context(
                 self._hm_skill_slash_rewrite, event, source, _quick_key, command)
             _handled = _result is not None
+        if _handled and canonical != "retry":  # /retry returns the re-run agent turn's own reply
+            _result = as_command_reply(_result)
         return _handled, _result
 
     def _hm_rescue_orphaned_fifo(

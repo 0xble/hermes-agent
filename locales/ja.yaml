@@ -180,6 +180,8 @@ gateway:
     label_normal: "標準"
     status_fast: "高速"
     status_normal: "標準"
+    status_expiring: "\n\n⏱ 有効期限まで: {remaining}"
+    expired: "⚡ 高速モードは{duration}後にオフになりました。"
     picker_title: "⚡ **Priority Processing**\\n\\n現在のモード: `{mode}`\\n\\nオプションを選択:"
     choice_fast: "fast — Priority Processing オン"
     choice_normal: "normal — 標準処理"

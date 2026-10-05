@@ -1023,9 +1023,23 @@ def _stamp_hygiene_compression_provenance(
         logger.debug(debug_label, exc_info=True)
 
 
+def _resume_pending_marker_timestamp(entry: Any, marker: Optional[tuple] = None) -> Any:
+    """Use the marker timestamp, with the legacy ``updated_at`` fallback used by startup recovery.
+
+    Older routing entries can carry ``resume_pending`` without ``last_resume_marked_at``. A non-positive
+    freshness window disables the age gate (handled by ``_is_fresh_gateway_interruption``), so those
+    entries remain owned by startup auto-resume rather than being taken by the idle ticker.
+    """
+    marked_at = marker[2] if marker is not None else getattr(entry, "last_resume_marked_at", None)
+    return marked_at or getattr(entry, "updated_at", None)
+
+
 def _is_fresh_gateway_interruption(
     value: Any, *, now: Optional[float] = None, window_secs: Optional[float] = None) -> bool:
-    """True when an interruption marker is fresh enough to auto-continue (unknown timestamps count as fresh)."""
+    """True when an interruption marker is fresh enough to auto-continue.
+
+    Unknown timestamps count as fresh for compatibility; a non-positive window disables the age gate.
+    """
     window = float(window_secs) if window_secs is not None else float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
     if window <= 0:
         return True

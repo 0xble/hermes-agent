@@ -2128,6 +2128,15 @@ class GatewayTurnMixin:
             self._hmwa_apply_message_timestamp(event, message_text)
         )
 
+        # Resolve once after preparation so expiry behaves like /fast off and its notice rides this turn.
+        if session_key:
+            transition = self._resolve_session_service_tier(
+                session_key=session_key, report_transition=True,
+            )
+            expiry_notice = transition[1] if isinstance(transition, tuple) else None
+            if expiry_notice:
+                turn_sidecar_notes.append(expiry_notice)
+
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
         if turn_sidecar_notes and session_key:
@@ -4179,19 +4188,30 @@ class GatewayTurnMixin:
             snapshot = list(dict.fromkeys(ids))
             deleted = 0
             failures = []
+            # Group by owning adapter so a platform with a batch API spends one request per turn,
+            # not one per bubble, out of the chat's shared outbound budget.
+            by_owner: dict = {}
             for mid in snapshot:
+                live = (delivery.owners.get(mid) if delivery is not None else None) or self._delivery_adapter_for(turn_ctx.source) or _cleanup_adapter
+                by_owner.setdefault(id(live), (live, []))[1].append(mid)
+            for live, owned in by_owner.values():
                 try:
-                    live = (delivery.owners.get(mid) if delivery is not None else None) or self._delivery_adapter_for(turn_ctx.source) or _cleanup_adapter
-                    if await live.delete_message(chat_id, mid):
-                        deleted += 1
+                    batch_delete = getattr(live, "delete_messages", None)
+                    if len(owned) > 1 and inspect.iscoroutinefunction(batch_delete):
+                        outcome = await batch_delete(chat_id, owned)
                     else:
-                        failures.append(f"{mid}:returned_false")
+                        outcome = {mid: await live.delete_message(chat_id, mid) for mid in owned}
+                    for mid in owned:
+                        if outcome.get(str(mid)) or outcome.get(mid):
+                            deleted += 1
+                        else:
+                            failures.append(f"{mid}:returned_false")
                 except asyncio.CancelledError:
                     logger.warning("Temp bubble cleanup cancelled for session %s: remaining=%d", key,
                                    len(snapshot) - deleted - len(failures))
                     raise
                 except Exception as error:
-                    failures.append(f"{mid}:{type(error).__name__}")
+                    failures.extend(f"{mid}:{type(error).__name__}" for mid in owned)
             if failures:
                 logger.warning("Temp bubble cleanup failures for session %s: %s", key,
                                ", ".join(failures[:10]))

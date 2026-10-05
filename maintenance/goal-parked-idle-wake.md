@@ -24,8 +24,9 @@ case stayed parked for 14.5 hours.
 - Gateway: `_loop_wakeup_watcher` (15 s, all served profiles) also scans parked goals through
   `list_parked_goals`, gated per profile by `profile_has_parked_goal`. Delivery uses the persisted
   routing entry and `_restored_source`. The scan defers while a turn runs, while the adapter
-  guard is held, while messages are queued, while restart auto-resume (`resume_pending`) owns the
-  chat, and for suspended or unroutable sessions. One ticker owns both `/loop` and goal idle
+  guard is held, while messages are queued, while **fresh** restart auto-resume (`resume_pending`)
+  owns the chat (see [restart-parked goal wake](goal-restart-parked-wake.md)), and for suspended or
+  unroutable sessions. One ticker owns both `/loop` and goal idle
   injection, so any future overlapping-gateway admission fence has one owner to transfer.
 - TUI/Desktop/dashboard: the session-owner notification poller resumes the goal like `/loop` and
   `/heartbeat` ticks and leaves gateway-routed conversations to the gateway.

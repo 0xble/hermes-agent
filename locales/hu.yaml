@@ -183,6 +183,8 @@ gateway:
     label_normal: "NORMÁL"
     status_fast: "gyors"
     status_normal: "normál"
+    status_expiring: "\n\n⏱ Lejár ennyi idő múlva: {remaining}"
+    expired: "⚡ A gyors mód {duration} után kikapcsolt."
     picker_title: "⚡ **Priority Processing**\\n\\nJelenlegi mód: `{mode}`\\n\\nVálassz egy opciót:"
     choice_fast: "fast — Priority Processing bekapcsolva"
     choice_normal: "normal — normál feldolgozás"

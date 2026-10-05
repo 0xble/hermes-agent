@@ -39,8 +39,15 @@ OPTIONAL_LANES = {
 # explicit profiles rather than treating partial --lane runs as qualification.
 GATE_LANES = ('static', 'node-gate')
 # Upgrade requires upstream release tags and a 900s per-file bound. The SQLite
-# torture chamber remains nightly-only while its kill9/FTS failures are resolved.
+# torture chamber and the transfer runner remain nightly-only while their
+# environment/process races are resolved.
 NIGHTLY_ONLY_E2E = ('tests/e2e/core/upgrade', 'tests/e2e/core/sqlite/test_torture_chamber.py')
+NIGHTLY_ONLY_TESTS = (*NIGHTLY_ONLY_E2E, 'tests/gateway/test_generation_transfer_runner.py')
+
+
+def is_nightly_only(path: Path, root: Path = ROOT) -> bool:
+    return any(path == root / relative or path.is_relative_to(root / relative)
+               for relative in NIGHTLY_ONLY_TESTS)
 
 
 def shard_files(root: Path, count: int) -> list[list[str]]:
@@ -55,9 +62,7 @@ def shard_files(root: Path, count: int) -> list[list[str]]:
         raise ValueError('Shard count must be positive')
     files = [path for path in (root / 'tests').rglob('test_*.py')
              if not {'integration', 'docker'} & set(path.relative_to(root).parts)
-             and not (path.relative_to(root).parts[1] == 'e2e'
-                      and (path.is_relative_to(root / NIGHTLY_ONLY_E2E[0])
-                           or path == root / NIGHTLY_ONLY_E2E[1]))]
+             and not is_nightly_only(path, root)]
     # Most files live in tests/; candidate-extensions is an additional ordinary root.
     files.extend((root / 'candidate-extensions').rglob('test_*.py') if (root / 'candidate-extensions').is_dir() else ())
     timings = json.loads((ROOT / 'scripts/ci/python_shard_timings.json').read_text(encoding='utf-8-sig'))
@@ -88,8 +93,8 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
 
 def nightly_only_e2e(env: dict[str, str], workers: int) -> None:
     failures = []
-    for path, timeout in ((NIGHTLY_ONLY_E2E[1], None),
-                          (NIGHTLY_ONLY_E2E[0], E2E_UPGRADE_FILE_TIMEOUT)):
+    for path in NIGHTLY_ONLY_TESTS:
+        timeout = E2E_UPGRADE_FILE_TIMEOUT if path == NIGHTLY_ONLY_E2E[0] else None
         try:
             python_tests(env, [path], workers, file_timeout=timeout)
         except subprocess.CalledProcessError as error:
@@ -137,6 +142,9 @@ def preflight() -> None:
 
 
 def windows_command(name: str, env: Mapping[str, str]) -> str:
+    pinned = env.get(f'HERMES_CI_PINNED_{name.upper()}')
+    if pinned:
+        return pinned
     # CreateProcess resolves bare executables against the *parent* PATH, not the
     # isolated child's PATH. Resolve checkout-owned tools explicitly on Windows.
     if os.name == 'nt':
@@ -247,6 +255,80 @@ def environment(home: Path) -> dict[str, str]:
     return env
 
 
+def mise_data_root() -> Path:
+    """Return the host mise data directory before CI isolates ``HOME``."""
+    configured = os.environ.get('MISE_DATA_DIR')
+    if configured:
+        return Path(configured).expanduser()
+    source_home = os.environ.get('HOME') or str(Path.home())
+    return Path(source_home).expanduser() / '.local' / 'share' / 'mise'
+
+
+def resolve_pinned_mise_tool(name: str) -> Path:
+    """Resolve one exact tool pin without consulting the caller's ``PATH``."""
+    version = PINS[name]
+    install_root = mise_data_root() / 'installs' / name / version
+    executable = name + ('.exe' if os.name == 'nt' else '')
+    candidates = [
+        install_root / 'bin' / executable,
+        install_root / executable,
+        *sorted(install_root.glob(f'*/{executable}')),
+    ]
+    for candidate in candidates:
+        if candidate.is_file() and (os.name == 'nt' or os.access(candidate, os.X_OK)):
+            return candidate.resolve()
+    raise RuntimeError(
+        f'Missing pinned {name} {version} under {install_root}. '
+        f'Install it with `mise install {name}@{version}` and rerun bin/ci.'
+    )
+
+
+def exact_path_tool(name: str, env: Mapping[str, str]) -> Path | None:
+    """Return a PATH tool only when it reports the repository's exact pin."""
+    command = windows_command(name, env)
+    try:
+        output = subprocess.check_output(
+            [command, '--version'], env=env, text=True, encoding='utf-8', errors='replace'
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    match = re.search(r'(?<!\d)(\d+\.\d+\.\d+)\b', output)
+    if not match or match.group(1) != PINS[name]:
+        return None
+    resolved = command if os.path.isabs(command) else shutil.which(name, path=env.get('PATH'))
+    # Preserve argv[0] dispatch for PATH shims (for example, mise and volta).
+    return Path(os.path.abspath(resolved)) if resolved else None
+
+
+def resolve_local_toolchain(env: dict[str, str]) -> dict[str, str]:
+    """Use exact PATH tools or replace mismatches with exact local mise pins."""
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        return env
+    resolved = {}
+    mise_paths = []
+    for name in ('uv', 'node'):
+        executable = exact_path_tool(name, env)
+        if executable is None:
+            executable = resolve_pinned_mise_tool(name)
+            mise_paths.append(str(executable.parent))
+        resolved[name] = executable
+        env[f'HERMES_CI_PINNED_{name.upper()}'] = str(executable)
+    npm = TOOLCHAIN / 'node_modules' / '.bin' / ('npm.cmd' if os.name == 'nt' else 'npm')
+    if npm.is_file():
+        env['HERMES_CI_PINNED_NPM'] = str(npm.resolve())
+    existing = [part for part in env.get('PATH', '').split(os.pathsep) if part]
+    # Keep checkout-owned npm and ripgrep ahead of mise's Node directory: the
+    # latter may carry a different bundled npm than the repository pin.
+    checkout_paths = [
+        str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
+        str(TOOLCHAIN / 'bin'),
+        str(TOOLCHAIN / 'node_modules' / '.bin'),
+    ]
+    host_paths = [part for part in existing if part not in checkout_paths and part not in mise_paths]
+    env['PATH'] = os.pathsep.join(dict.fromkeys([*checkout_paths, *mise_paths, *host_paths]))
+    return env
+
+
 def msvc_linker_environment(tools: Path, source: Mapping[str, str]) -> dict[str, str]:
     """Select MSVC rather than Git-for-Windows' unrelated link.exe."""
     linker = tools / 'bin/Hostx64/x64/link.exe'
@@ -311,6 +393,9 @@ def provision_rg(env: dict[str, str]) -> None:
 def setup(env: dict[str, str]) -> None:
     require_tools(('uv', 'node'), env)
     provision_npm(env)
+    # npm is created after the initial resolver pass on a fresh checkout; refresh
+    # its absolute command and PATH ordering before any npm-dependent check.
+    resolve_local_toolchain(env)
     provision_rg(env)
     require_tools(('npm', 'rg'), env)
     run(['uv', 'sync', '--locked', '--python', PINS['python'], '--group', 'dev', '--group', 'test', *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
@@ -618,7 +703,7 @@ def main() -> int:
         return 0
     STATE.mkdir(exist_ok=True)
     with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
-        env = environment(home)
+        env = resolve_local_toolchain(environment(home))
         if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)
             if args.command == 'setup':

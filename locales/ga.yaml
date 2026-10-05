@@ -180,6 +180,8 @@ gateway:
     label_normal: "GNÁTH"
     status_fast: "tapa"
     status_normal: "gnáth"
+    status_expiring: "\n\n⏱ Rachaidh sé in éag i gceann: {remaining}"
+    expired: "⚡ Múchadh an mód tapa tar éis {duration}."
     picker_title: "⚡ **Priority Processing**\\n\\nMód reatha: `{mode}`\\n\\nRoghnaigh rogha:"
     choice_fast: "fast — Priority Processing ar siúl"
     choice_normal: "normal — gnáthphróiseáil"
