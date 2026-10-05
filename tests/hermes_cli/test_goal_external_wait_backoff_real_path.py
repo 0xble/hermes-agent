@@ -473,8 +473,9 @@ async def test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan(
     assert runner._send_goal_status_notice.await_count == 1
     assert runner._send_goal_status_notice.await_args.kwargs["notice_kind"] == "wait-age"
 
-    manager.state.barrier_recheck_at = 0.0
-    manager._save()
+    st = goals.GoalManager(sid).state
+    st.barrier_recheck_at = 0.0
+    goals.save_goal(sid, st)
     await GatewayRunner._goal_wakeup_fire_one(runner, sid)
     assert runner._send_goal_status_notice.await_count == 1
 
@@ -510,8 +511,9 @@ def test_real_tui_idle_age_notice_reaches_status_and_dedupes(hermes_home, monkey
     session = {"session_key": sid, "running": False}
 
     session_notifications._maybe_resume_tui_parked_goal("tui-age", session)
-    manager.state.barrier_recheck_at = 0.0
-    manager._save()
+    st = goals.GoalManager(sid).state
+    st.barrier_recheck_at = 0.0
+    goals.save_goal(sid, st)
     session_notifications._maybe_resume_tui_parked_goal("tui-age", session)
     assert len(notices) == 1 and "30 minutes" in notices[0]
 

@@ -59,8 +59,17 @@ _SELF_INJECTED_TURN_PREFIXES = (
 
 
 def _is_self_injected_turn(text: Any) -> bool:
-    # This release renders delegation notifications as framed strings.
-    return isinstance(text, str) and text.lstrip().startswith(_SELF_INJECTED_TURN_PREFIXES)
+    # Standing-goal prompt forms are registered centrally; the remaining frames are
+    # runtime-specific notifications that never represent user input.
+    if not isinstance(text, str):
+        return False
+    try:
+        from hermes_cli.goals import is_goal_continuation_text
+        if is_goal_continuation_text(text):
+            return True
+    except Exception:
+        pass
+    return text.lstrip().startswith(_SELF_INJECTED_TURN_PREFIXES)
 
 
 class CLILoopsMixin:

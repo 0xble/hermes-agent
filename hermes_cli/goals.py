@@ -132,8 +132,9 @@ _MAX_LIVE_BARRIER_S = 6 * 60 * 60
 # separately from ``waiting_until`` so pid/session readers retain their target semantics.
 _BARRIER_REARM_BACKOFF_S = (5 * 60, 15 * 60, 30 * 60)
 # A judge-selected timed wait must be long enough to avoid another immediate poke, but cannot
-# strand a goal indefinitely when the model guesses a distant deadline.
-_MIN_JUDGE_WAIT_S = 60
+# strand a goal indefinitely when the model guesses a distant deadline. Automatic no-progress
+# waits share this floor and escalate through the same bounded schedule.
+_MIN_JUDGE_WAIT_S = 5 * 60
 # After repeated automatic turns with no new evidence, park the goal even if the judge keeps saying
 # CONTINUE. The escalating waits are deliberately bounded by _MAX_BARRIER_WAIT_S.
 DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS = 3
@@ -207,6 +208,18 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "confirm. Do not declare the goal complete while any gate fails. If the "
     "gate itself is wrong or cannot pass, say so clearly and stop."
 )
+
+# All standing-goal continuation prompts are runtime injections, including the gate-failure form.
+# Keep this registry shared by CLI, gateway, and TUI admission classifiers.
+GOAL_CONTINUATION_PREFIXES = (
+    "[Continuing toward your standing goal]",
+    "[Continuing toward your standing goal — a quality gate failed]",
+)
+
+
+def is_goal_continuation_text(text: Any) -> bool:
+    return isinstance(text, str) and text.lstrip().startswith(GOAL_CONTINUATION_PREFIXES)
+
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
@@ -651,6 +664,8 @@ class GoalState:
     # Deterministic busy-loop backstop. A fingerprint of recorded tool evidence is the progress
     # signal; repeated automatic CONTINUEs with no new evidence and the same reason are parked.
     consecutive_no_progress: int = 0
+    # Escalation level for backoff parks within the current no-progress streak. Old rows default 0.
+    backoff_level: int = 0
     last_progress_fingerprint: Optional[str] = None
 
     def to_json(self) -> str:
@@ -662,7 +677,7 @@ class GoalState:
         raw_subgoals = data.get("subgoals") or []
         ints = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_disputes",
-            "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress")}
+            "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -935,7 +950,7 @@ def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[boo
         has_wait = state.waiting_on_pid is not None or state.waiting_on_session is not None or state.waiting_until
         if state.status != "active" or not has_wait or state.waiting_since != waiting_since:
             return False, state
-        state.clear_wait()
+        state.clear_wait(preserve_notice_key=True)
         state.mutation_id = uuid.uuid4().hex
         conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
         return True, state
@@ -1430,17 +1445,35 @@ def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Opti
 
 
 _READ_ONLY_STATUS_CALL_RE = re.compile(
-    r"^(?!.*(?:>>|>|\|))(?:gh\s+(?:pr|run)\s+(?:view|checks|status|list)|"
-    r"git\s+(?:status|diff|log|show|rev-parse)(?:\s|$)|"
-    r"git\s+branch(?:\s+(?:--show-current|--list|-a|--all))?\s*$|"
-    r"(?:ls|pwd|rg|grep|cat|head|tail)\b(?!.*(?:-delete|--delete))|"
-    r"find\b(?!.*(?:\s-delete\b|\s--delete\b)))",
+    r"^(?![^\r\n]*[\r\n])(?!.*(?:>>|>|\||&&|\|\||;|`|\$\(|\n|\r|&|<\(|>\())"
+    r"(?!.*(?:\s-(?:exec|execdir|ok|fprint|fprintf|fls|delete)(?:\s|$)|\s--delete(?:\s|$)))"
+    r"(?!.*(?:--output)(?:=|\s|$))(?!.*(?:--pre)(?:=|\s|$))"
+    r"(?:gh\s+(?:pr|run)\s+(?:view|checks|status|list)(?:\s+.*)?|"
+    r"git\s+(?:status|diff|log|show|rev-parse)(?:\s+.*)?|"
+    r"git\s+branch(?:\s+(?:--show-current|--list|-a|--all))?\s*\Z|"
+    r"(?:ls|pwd|rg|grep|cat|head|tail)(?:\s+.*)?|"
+    r"find(?:\s+.*)?)\Z",
     re.I,
 )
 _READ_ONLY_STATUS_TOOLS = frozenset({
     "browser_console", "browser_get_images", "browser_snapshot", "read_file", "search_files",
     "web_extract", "web_search",
 })
+
+
+def _read_only_status_call(call: Any) -> str:
+    """Extract a shell command from the collector's bounded JSON argument representation."""
+    text = str(call or "").strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        text = payload.get("command") or payload.get("cmd") or ""
+    return str(text).strip() if isinstance(text, str) else ""
+
 
 
 def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_at: float) -> List[Dict[str, Any]]:
@@ -1467,8 +1500,8 @@ def _evidence_only_read_only_status(evidence: Optional[List[Dict[str, Any]]]) ->
         tool = str(item.get("tool") or "").strip().lower()
         if tool in _READ_ONLY_STATUS_TOOLS:
             continue
-        call = str(item.get("call") or "").strip()
-        if tool in {"terminal", "shell"} and _READ_ONLY_STATUS_CALL_RE.match(call):
+        call = _read_only_status_call(item.get("call"))
+        if tool in {"terminal", "shell"} and _READ_ONLY_STATUS_CALL_RE.fullmatch(call):
             continue
         return False
     return True
@@ -2512,7 +2545,7 @@ class GoalManager:
             still = _pid_alive(s.waiting_on_pid) if s.waiting_on_pid is not None else False
             target = f"pid {s.waiting_on_pid}"
         if not still:
-            s.clear_wait()
+            s.clear_wait(preserve_notice_key=True)
             return False, None, None
         now = time.time()
         age = now - s.waiting_since
@@ -2572,8 +2605,10 @@ class GoalManager:
             target = f"session:{state.waiting_on_session}"
         elif state.waiting_on_pid is not None:
             target = f"pid:{state.waiting_on_pid}"
+        elif state.waiting_on_delegations:
+            target = "delegations"
         else:
-            target = f"seconds:{state.waiting_seconds}:delegations:{state.waiting_on_delegations}"
+            target = "timed"
         return f"{target}|reason:{reason}"
 
     @staticmethod
@@ -2603,9 +2638,13 @@ class GoalManager:
         if notice is None:
             notice = getattr(self, "_last_live_barrier_notice", None)
             self._last_live_barrier_notice = None
+        if notice:
+            # Age notices are a separate delivery domain from the initial parked notice. They
+            # must reach the user even when the parked barrier key was already announced.
+            return _decision("active", False, None, "waiting", reason, notice)
         return self._wait_notice_decision(
             state, verdict="waiting",
-            message=notice or f"⏳ Goal parked — waiting on {tgt}: {reason}",
+            message=f"⏳ Goal parked — waiting on {tgt}: {reason}",
         )
 
     def _apply_wait_directive(
@@ -2629,8 +2668,14 @@ class GoalManager:
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
                 return None
         else:
-            seconds = max(_MIN_JUDGE_WAIT_S, min(_MAX_BARRIER_WAIT_S, int(wait_directive["seconds"])))
+            requested = int(wait_directive["seconds"])
+            level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
+            backoff_floor = _NO_PROGRESS_BACKOFF_S[level]
+            seconds = max(_MIN_JUDGE_WAIT_S, min(_MAX_BARRIER_WAIT_S, requested), backoff_floor)
+            delegation_floor = 10 * 60 if active_delegations else 0
+            seconds = min(_MAX_BARRIER_WAIT_S, max(seconds, delegation_floor))
             self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+            state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
             tgt = f"{seconds}s"
         return self._wait_notice_decision(
             state, verdict="wait",
@@ -2639,10 +2684,10 @@ class GoalManager:
 
     def _no_progress_wait(self, state: GoalState, reason: str, *, active_delegations: int = 0) -> Dict[str, Any]:
         """Park after repeated automatic no-op continuations as a deterministic backstop."""
-        index = min(max(0, state.consecutive_no_progress - DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS),
-                    len(_NO_PROGRESS_BACKOFF_S) - 1)
-        seconds = _NO_PROGRESS_BACKOFF_S[index]
+        level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
+        seconds = _NO_PROGRESS_BACKOFF_S[level]
         self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+        state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
         return self._wait_notice_decision(
             state, verdict="wait",
             message=(
@@ -2653,8 +2698,11 @@ class GoalManager:
 
     def _delegation_no_progress_wait(self, state: GoalState, reason: str, active_delegations: int) -> Dict[str, Any]:
         """Park immediately when live delegations leave an automatic turn with no action."""
-        seconds = max(10 * 60, _NO_PROGRESS_BACKOFF_S[0])
+        level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
+        seconds = max(10 * 60, _NO_PROGRESS_BACKOFF_S[level])
+        seconds = min(_MAX_BARRIER_WAIT_S, seconds)
         self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
+        state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
         return self._wait_notice_decision(
             state, verdict="wait",
             message=f"⏳ Goal parked — waiting for {active_delegations} active delegation(s): {reason}",
@@ -2712,7 +2760,7 @@ class GoalManager:
                 return self._waiting_decision(state)
             # Timed waits and delegation waits lift in the evaluator snapshot; the normal
             # optimistic commit persists the clear without a side-channel write.
-            state.clear_wait()
+            state.clear_wait(preserve_notice_key=True)
 
         state.turns_used += 1
         previous_turn_at = state.last_turn_at
@@ -2753,11 +2801,13 @@ class GoalManager:
         if progress_fingerprint:
             state.last_progress_fingerprint = progress_fingerprint
         automatic_read_only = not user_initiated and _evidence_only_read_only_status(turn_evidence)
-        if verdict == "continue" and automatic_read_only:
+        if automatic_read_only:
+            # WAIT and CONTINUE share one durable no-progress streak. Changing status output,
+            # judge wording, and a repeated parked turn are not actionable progress.
             state.consecutive_no_progress += 1
         else:
             state.consecutive_no_progress = 0
-        # Parse failures reset on any usable reply INCLUDING transport errors, so a flaky network
+            state.backoff_level = 0
         # doesn't trip the auto-pause meant for bad judge models; transport failures are counted
         # separately because persistent API errors (401, DNS) mean a broken config.
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
