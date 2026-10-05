@@ -114,6 +114,33 @@ def _record_terminal_turn(
     )
 
 
+def _record_tool_result(
+    db, sid: str, tool_name: str, arguments: dict, output: str, index: int,
+) -> None:
+    """Persist one real assistant tool-call/result pair for a non-terminal tool."""
+    call_id = f"real-{tool_name}-{index}-{uuid.uuid4().hex}"
+    timestamp = time.time()
+    db.append_message(
+        sid,
+        "assistant",
+        "",
+        timestamp=timestamp,
+        tool_calls=[{
+            "id": call_id,
+            "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps(arguments)},
+        }],
+    )
+    db.append_message(
+        sid,
+        "tool",
+        output,
+        tool_name=tool_name,
+        tool_call_id=call_id,
+        timestamp=timestamp + 0.001,
+    )
+
+
 def _discard_continuation(cli) -> None:
     if not cli._pending_input.empty():
         cli._pending_input.get_nowait()
@@ -294,6 +321,65 @@ def test_real_session_evidence_drives_three_status_continuations_to_backoff(
     assert state.last_reason == "CI is still running"
 
 
+def test_real_write_survives_eight_read_only_results_per_automatic_turn(
+    hermes_home, monkeypatch,
+):
+    """P1: per-turn classification sees a write even when the judge ledger is capped at eight."""
+    from hermes_cli import goals
+
+    sid, db, manager = _new_goal()
+    _stub_judge(monkeypatch, {"verdict": "continue", "reason": "keep working"})
+
+    for turn in range(4):
+        _record_tool_result(db, sid, "write_file", {"path": f"turn-{turn}.txt", "content": "changed"},
+                            "wrote file", turn)
+        for read in range(9):
+            _record_tool_result(db, sid, "read_file", {"path": f"turn-{turn}-read-{read}.txt"},
+                                "read file", turn * 10 + read)
+        decision = manager.evaluate_after_turn("I made progress.", user_initiated=False)
+        assert decision["should_continue"] is True
+        assert manager.state is not None
+        assert manager.state.consecutive_no_progress == 0
+        assert manager.state.waiting_until == 0.0
+
+
+def test_real_pause_resume_resets_no_progress_backoff_before_status_turn(
+    hermes_home, monkeypatch,
+):
+    """P2: resuming a parked goal starts a fresh automatic no-progress streak."""
+    from hermes_cli import goals
+
+    sid, db, manager = _new_goal()
+    _stub_judge(monkeypatch, {"verdict": "continue", "reason": "still waiting"})
+
+    for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS + 1):
+        manager.evaluate_after_turn("No local action.", user_initiated=False)
+        state = manager.state
+        assert state is not None
+        if state.waiting_until:
+            state.waiting_until = time.time() - 1
+            manager._save()
+    state = manager.state
+    assert state is not None
+    assert state.backoff_level == 2
+    assert state.waiting_seconds == 900
+
+    manager.pause()
+    manager.resume(reset_budget=False)
+    state = manager.state
+    assert state is not None
+    assert state.consecutive_no_progress == 0
+    assert state.backoff_level == 0
+
+    _record_tool_result(db, sid, "read_file", {"path": "status.txt"}, "status", 100)
+    decision = manager.evaluate_after_turn("I checked the status.", user_initiated=False)
+    state = manager.state
+    assert state is not None
+    assert decision["should_continue"] is True
+    assert state.consecutive_no_progress == 1
+    assert state.waiting_until == 0.0
+
+
 def test_real_collector_preserves_json_argument_representation(hermes_home):
     """The persisted evidence shape is JSON text; classification must parse it before matching."""
     from hermes_cli import goals
@@ -318,8 +404,11 @@ def test_real_collector_preserves_json_argument_representation(hermes_home):
         "git status & rm -r build",
         "git diff <(cat x)",
         "git diff --output=x",
+        "git diff --ext-diff",
+        "git diff --textconv",
         "rg --pre cat x",
         "find . -fprint x",
+        "find . -fprint0 x",
         "find . -exec rm {} ;",
         "find . -execdir rm {} ;",
         "find . -ok rm {} ;",
