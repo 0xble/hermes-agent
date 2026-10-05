@@ -131,10 +131,10 @@ _MAX_LIVE_BARRIER_S = 6 * 60 * 60
 # Liveness is re-checked on an escalating schedule after the age notice. The deadline is stored
 # separately from ``waiting_until`` so pid/session readers retain their target semantics.
 _BARRIER_REARM_BACKOFF_S = (5 * 60, 15 * 60, 30 * 60)
-# A judge-selected timed wait must be long enough to avoid another immediate poke, but cannot
-# strand a goal indefinitely when the model guesses a distant deadline. Automatic no-progress
-# waits share this floor and escalate through the same bounded schedule.
-_MIN_JUDGE_WAIT_S = 5 * 60
+# A judge-selected timed wait is bounded to the existing one-minute minimum. Automatic
+# no-progress turns impose a higher floor and escalate through the same bounded schedule.
+_MIN_JUDGE_WAIT_S = 60
+_MIN_AUTOMATIC_JUDGE_WAIT_S = 5 * 60
 # After repeated automatic turns with no new evidence, park the goal even if the judge keeps saying
 # CONTINUE. The escalating waits are deliberately bounded by _MAX_BARRIER_WAIT_S.
 DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS = 3
@@ -1462,17 +1462,25 @@ _READ_ONLY_STATUS_TOOLS = frozenset({
 
 
 def _read_only_status_call(call: Any) -> str:
-    """Extract a shell command from the collector's bounded JSON argument representation."""
+    """Extract a shell command from the collector's bounded JSON argument representation.
+
+    The collector stores shell arguments as bounded JSON. A bare, truncated, or redacted call is
+    deliberately not accepted: the classifier must fail closed rather than turn an allowed prefix
+    into an actionable-command bypass.
+    """
     text = str(call or "").strip()
-    if text.startswith("{"):
-        try:
-            payload = json.loads(text)
-        except (TypeError, ValueError):
-            return ""
-        if not isinstance(payload, dict):
-            return ""
-        text = payload.get("command") or payload.get("cmd") or ""
-    return str(text).strip() if isinstance(text, str) else ""
+    if not text.startswith("{"):
+        return ""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    command = payload.get("command")
+    if not isinstance(command, str):
+        command = payload.get("cmd")
+    return command.strip() if isinstance(command, str) else ""
 
 
 
@@ -2649,6 +2657,7 @@ class GoalManager:
 
     def _apply_wait_directive(
         self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0,
+        automatic: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
@@ -2668,14 +2677,16 @@ class GoalManager:
                 logger.info("goal judge: wait_on_pid %s is not alive on this host; continuing", pid)
                 return None
         else:
-            requested = int(wait_directive["seconds"])
+            requested = max(_MIN_JUDGE_WAIT_S, min(_MAX_BARRIER_WAIT_S, int(wait_directive["seconds"])))
             level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
-            backoff_floor = _NO_PROGRESS_BACKOFF_S[level]
-            seconds = max(_MIN_JUDGE_WAIT_S, min(_MAX_BARRIER_WAIT_S, requested), backoff_floor)
+            if automatic:
+                requested = max(requested, _MIN_AUTOMATIC_JUDGE_WAIT_S, _NO_PROGRESS_BACKOFF_S[level])
+                state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
             delegation_floor = 10 * 60 if active_delegations else 0
-            seconds = min(_MAX_BARRIER_WAIT_S, max(seconds, delegation_floor))
+            seconds = min(_MAX_BARRIER_WAIT_S, max(requested, delegation_floor))
+            # Assign the durable escalation before _park() writes the state. Direct manager callers
+            # must persist the same level as optimistic evaluator callers.
             self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
-            state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
             tgt = f"{seconds}s"
         return self._wait_notice_decision(
             state, verdict="wait",
@@ -2685,9 +2696,9 @@ class GoalManager:
     def _no_progress_wait(self, state: GoalState, reason: str, *, active_delegations: int = 0) -> Dict[str, Any]:
         """Park after repeated automatic no-op continuations as a deterministic backstop."""
         level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
+        state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
         seconds = _NO_PROGRESS_BACKOFF_S[level]
         self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
-        state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
         return self._wait_notice_decision(
             state, verdict="wait",
             message=(
@@ -2701,8 +2712,8 @@ class GoalManager:
         level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
         seconds = max(10 * 60, _NO_PROGRESS_BACKOFF_S[level])
         seconds = min(_MAX_BARRIER_WAIT_S, seconds)
-        self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
         state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
+        self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
         return self._wait_notice_decision(
             state, verdict="wait",
             message=f"⏳ Goal parked — waiting for {active_delegations} active delegation(s): {reason}",
@@ -2828,6 +2839,7 @@ class GoalManager:
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(
                 wait_directive, reason, active_delegations=active_delegations,
+                automatic=not user_initiated,
             )
             if parked is not None:
                 return parked

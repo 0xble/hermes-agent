@@ -113,12 +113,17 @@ write/actionable result or a real user turn resets it. Three consecutive
 qualifying turns call `_no_progress_wait()`, persist a timed barrier, and return
 `should_continue=False`; the backoff waits are 5, 15, and 30 minutes (the last is
 bounded by `_MAX_BARRIER_WAIT_S`). Judge WAITs use the same streak state rather
-than a second counter. A timed WAIT with no new actionable evidence uses a
-minimum of 300 seconds and escalates the effective wait as 300 → 900 → 1800
-seconds on consecutive no-new-evidence WAITs, capped at 1800 seconds. A user
-turn or new actionable evidence resets the shared streak before the next wait.
-Judge wording and changing status output do not convert a read-only poll into
-progress.
+than a second counter. A timed WAIT's effective duration is the bounded maximum of
+the judge request and the current escalation floor: automatic turns impose a
+300-second floor and use 300 → 900 → 1800 seconds as `backoff_level` advances;
+user turns keep the ordinary 60-second minimum. Active delegations impose an
+additional 600-second floor, with every timed wait capped at 1800 seconds. A user
+turn or new actionable evidence resets both the shared streak and `backoff_level`.
+Judge WAITs and CONTINUE-triggered no-progress parks therefore share one durable
+escalation path, including mixed CONTINUE/WAIT sequences. The parked key for
+delegation waits is `delegations|reason:<r>` and excludes the active count and
+seconds. Judge wording and changing status output do not convert a read-only poll
+into progress.
 
 ### Repeated judge WAITs
 
@@ -133,11 +138,13 @@ resets the shared streak and allows a later WAIT to start again at 300 seconds.
 The timed parked-notice identity is `target-type + reason`: `timed|reason:<r>`
 for timed waits, `session:<id>|reason:<r>` for session waits, and
 `pid:<pid>|reason:<r>` for pid waits. It never includes the deadline,
-`waiting_seconds`, or the escalated duration. The identity survives an idle
-lift-and-re-park when the next timed WAIT has the same reason. `clear_wait()` may
-clear `last_wait_notice_key` only for a non-WAIT verdict, a user turn, pause,
-resume, done, or a changed target/reason; a timer lift preserves the key when
-re-parking would reuse it. A changed target or reason starts a new notice.
+`waiting_seconds`, or the escalated duration. The identity survives every timer
+lift path—evaluator expiry before `_evaluate_after_turn`, conditional
+`clear_lifted_wait`/`clear_goal_wait_if_since`, and gateway or TUI idle wakes—when
+the next timed WAIT has the same reason. `clear_wait()` may clear
+`last_wait_notice_key` only for a non-WAIT verdict, a user turn, pause, resume,
+done, or a changed target/reason; a timer lift preserves the key when re-parking
+would reuse it. A changed target or reason starts a new notice.
 
 A judge WAIT on a pid or session uses the live-barrier lifecycle: the target
 stays armed through its 5/15/30-minute rechecks, emits one age notice, pauses at
@@ -159,12 +166,14 @@ single commands in these families:
   `tail`, and `find` only when no destructive option/operator is present; and
 - the explicit non-shell read-only tool allowlist.
 
-The parser rejects shell composition and execution syntax even when an allowed
-prefix appears first: `>`, `>>`, `|`, `&&`, `||`, `;`, backticks, `$(`, and
-`find` `-exec`, `-execdir`, and `-ok`. It also rejects destructive options such
-as `-delete`, `--delete`, branch deletion, redirects, and any command that does
-not consume the complete argument string. The classifier consumes the parsed
-`command`, never the raw JSON representation.
+The grammar rejects shell composition and execution syntax even when an allowed
+prefix appears first: newline, `>`, `>>`, `|`, `&&`, `||`, `;`, backticks, `$(`,
+`&`, `<(`, `>(`, and `find` `-exec`, `-execdir`, and `-ok`. It also rejects
+`rg --pre`, `--output`, destructive options such as `-delete`, `--delete`,
+branch deletion, redirects, and any command that does not consume the complete
+argument string. The parser consumes the complete JSON argument representation,
+extracts `command`, and applies the grammar only to that value; truncated,
+malformed, or redacted shell calls are actionable by default.
 
 ### Parked, age, continuation, and delivery notice keys
 
@@ -245,6 +254,10 @@ coverage; they are not evidence for the rows below.
 | Passing quality-gate rows do not reset no-progress state | CLI post-turn hook → real gate execution → evaluator fingerprint | `test_real_passing_quality_gate_rows_do_not_reset_no_progress` | yes | judge response |
 | Actionable SessionDB evidence or a real user turn resets the shared WAIT/CONTINUE streak | `SessionDB.append_message` / `_tui_process_one_input` → evaluator streak update | `test_real_actionable_evidence_and_user_turn_reset_shared_wait_streak` | yes | judge response |
 | Four repeated timed judge WAITs lift through the CLI idle path with 300 → 900 → 1800 → 1800 seconds and one parked notice | `evaluate_after_turn` → `_apply_wait_directive` → `_maybe_resume_parked_goal` → `clear_lifted_wait` | `test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice` | yes | judge response, wall clock |
+| Timed WAIT expiry before evaluator turn, conditional idle clear, gateway wake, and TUI wake preserve the parked key while advancing the shared streak | evaluator `_evaluate_after_turn` / `clear_lifted_wait` / gateway and TUI idle wakes | review-mandated B1 real-path lift matrix | yes | judge response, wall clock |
+| Full-string evidence grammar rejects newline, `&`, process substitution, `--output`, `rg --pre`, `find` print actions, and truncated/unparseable JSON | `collect_goal_evidence` → classifier | review-mandated B2 classifier matrix | yes | none |
+| CONTINUE and WAIT share one durable no-progress streak and `backoff_level`; mixed turns use the 300/900/1800 ladder and a requested 1200-second wait is honored | evaluator → `_apply_wait_directive` / `_no_progress_wait` | review-mandated B3 mixed escalation matrix | yes | judge response |
+| Judge WAIT with active delegations uses the 600-second floor, 1800-second cap, and `delegations|reason:<r>` notice key | evaluator → `_apply_wait_directive` → delegation barrier | review-mandated B4 delegation WAIT row | yes | judge response, delegation registry |
 | Timed WAIT notice identity excludes deadline and escalated seconds and survives lift/re-park | `_wait_notice_key` → `clear_wait` → `_apply_wait_directive` | same repeated-WAIT test plus direct state assertions | yes | judge response, wall clock |
 | Plain, contract, subgoal, and quality-gate continuation templates are synthetic | `GoalManager.next_continuation_prompt` / real `_check_gates` → CLI and gateway provenance matchers | `test_real_continuation_builders_are_synthetic_to_cli_and_gateway` | yes | none |
 | Gateway synthetic continuation, gate-failed continuation, and idle-wake event reach the evaluator as automatic | `GatewayRunner._run_post_turn_hooks` → `_is_user_turn_event` → `_post_turn_goal_continuation` | `test_real_gateway_post_turn_hooks_mark_continuation_gate_failure_and_idle_wake_automatic` | yes | judge response |
@@ -290,17 +303,19 @@ cases are intentional acceptance blockers:
   quality-gate continuation prefix is not recognized as synthetic;
 - `test_real_gateway_post_turn_hooks_mark_continuation_gate_failure_and_idle_wake_automatic`:
   the gate-failed gateway event reaches the evaluator as `user_initiated=True`;
-- `test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan`:
-  the gateway sends a second `wait-age` notice after a second due scan and
-  after an evaluator-committed age notice;
-- `test_real_tui_idle_age_notice_reaches_status_and_dedupes`: the TUI repeats
-  the age notice on the second due scan;
+- `test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan` and
+  `test_real_tui_idle_age_notice_reaches_status_and_dedupes`: the evaluator's
+  age notice was committed, but `_wait_notice_decision` then applied parked-key
+  suppression and returned an empty message; the durable age key made the lost
+  notice unrecoverable. Age notices now bypass parked-key suppression. The second
+  idle-scan fixtures also reload a fresh durable row before forcing a due scan,
+  so the test does not overwrite its CAS-written state with a stale manager;
 - `test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early`:
-  despite a real active delegation count of 1, the JSON status evidence is
-  misclassified, so the automatic CONTINUE does not enter the ten-minute
+  despite a real active delegation count of 1, the JSON status evidence was
+  misclassified, so the automatic CONTINUE did not enter the ten-minute
   delegation wait;
 - `test_real_judge_wait_then_evaluator_age_notice_reaches_cli_user`: an aged
-  live barrier returns the generic parked notice instead of the 30-minute age
+  live barrier returned the generic parked notice instead of the 30-minute age
   notice.
 
 The full collected set that must turn green is:

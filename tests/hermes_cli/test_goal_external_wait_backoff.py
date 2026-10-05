@@ -170,9 +170,9 @@ def test_read_only_status_turns_back_off_with_varied_results(hermes_home):
     mgr = GoalManager("varied-status-backoff", default_max_turns=20)
     mgr.set("wait for external consolidation", max_turns=20)
     rows = [
-        [{"tool": "terminal", "call": "gh run view 1", "output": "queued", "timestamp": time.time() + 1}],
-        [{"tool": "terminal", "call": "gh run view 1", "output": "in_progress", "timestamp": time.time() + 2}],
-        [{"tool": "terminal", "call": "gh run view 1", "output": "completed", "timestamp": time.time() + 3}],
+        [{"tool": "terminal", "call": '{"command": "gh run view 1"}', "output": "queued", "timestamp": time.time() + 1}],
+        [{"tool": "terminal", "call": '{"command": "gh run view 1"}', "output": "in_progress", "timestamp": time.time() + 2}],
+        [{"tool": "terminal", "call": '{"command": "gh run view 1"}', "output": "completed", "timestamp": time.time() + 3}],
     ]
     with patch.object(goals, "collect_goal_evidence", side_effect=rows), patch.object(
         goals, "judge_goal", side_effect=[
@@ -253,7 +253,7 @@ def test_read_only_status_checks_with_live_delegation_also_park(hermes_home):
 
     mgr = GoalManager("delegation-status-only", default_max_turns=20)
     mgr.set("wait for delegated PR review", max_turns=20)
-    evidence = [{"tool": "terminal", "call": "gh pr checks 302", "output": "pending", "timestamp": 1.0}]
+    evidence = [{"tool": "terminal", "call": '{"command": "gh pr checks 302"}', "output": "pending", "timestamp": 1.0}]
     with patch.object(goals, "collect_goal_evidence", return_value=evidence), patch.object(
         goals, "judge_goal", return_value=("continue", "the delegated review is still pending", False, None, False)
     ):
