@@ -180,6 +180,8 @@ gateway:
     label_normal: "NORMAL"
     status_fast: "rápido"
     status_normal: "normal"
+    status_expiring: "\n\n⏱ Expira em: {remaining}"
+    expired: "⚡ O modo rápido foi desativado após {duration}."
     picker_title: "⚡ **Priority Processing**\\n\\nModo atual: `{mode}`\\n\\nEscolha uma opção:"
     choice_fast: "fast — Priority Processing ativado"
     choice_normal: "normal — processamento padrão"

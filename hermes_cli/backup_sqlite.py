@@ -6,6 +6,7 @@ imports cannot load. Full and quick backups use the same SQLite copy operation.
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -22,6 +23,25 @@ class _SQLiteBackupTimeout(RuntimeError):
     """Raised when a SQLite snapshot remains busy past its deadline."""
 
 
+_SNAPSHOT_FREE_SPACE_MARGIN = 64 * 1024 * 1024
+
+
+def _required_snapshot_bytes(src: Path) -> int:
+    """Estimate the space needed before opening a snapshot destination.
+
+    SQLite's backup API materializes the database image at the destination and
+    may also need the live WAL while the source is being read.  Refuse to start
+    a large copy when the destination volume cannot hold both, rather than
+    discovering ENOSPC after hours of copying.
+    """
+    required = src.stat().st_size
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(f"{src}{suffix}")
+        with suppress(OSError):
+            required += sidecar.stat().st_size
+    return required + _SNAPSHOT_FREE_SPACE_MARGIN
+
+
 def _close_quietly(conn: Optional[sqlite3.Connection]) -> None:
     if conn is not None:
         with suppress(Exception):
@@ -35,6 +55,13 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
     """
     conn = backup_conn = None
     try:
+        required_bytes = _required_snapshot_bytes(src)
+        available_bytes = shutil.disk_usage(dst.parent).free
+        if available_bytes < required_bytes:
+            raise OSError(
+                f"insufficient free space for SQLite snapshot: "
+                f"need {required_bytes} bytes, have {available_bytes}"
+            )
         # sqlite3.connect() creates a missing destination with the process
         # umask, which is commonly 0022 (0644).  Snapshot databases contain
         # session and tool state, so create the inode owner-only before SQLite

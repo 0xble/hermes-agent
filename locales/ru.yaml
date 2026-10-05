@@ -180,6 +180,8 @@ gateway:
     label_normal: "ОБЫЧНЫЙ"
     status_fast: "быстрый"
     status_normal: "обычный"
+    status_expiring: "\n\n⏱ Истекает через: {remaining}"
+    expired: "⚡ Быстрый режим отключён через {duration}."
     picker_title: "⚡ **Priority Processing**\\n\\nТекущий режим: `{mode}`\\n\\nВыберите вариант:"
     choice_fast: "fast — Priority Processing включён"
     choice_normal: "normal — стандартная обработка"
