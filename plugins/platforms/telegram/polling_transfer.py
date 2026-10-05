@@ -229,6 +229,23 @@ def token_has_active_poller(token_hash: str) -> bool:
     return _active_pollers.get(token_hash) is not None
 
 
+async def wait_for_poller_release(token_hash: str, timeout: float) -> bool:
+    """Wait up to ``timeout`` for this process's previous poller on the token to finish and release
+    it; True once no in-process poller owns the token. A poller that never stops still refuses."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        task = _active_pollers.get(token_hash)
+        if task is None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if not task.done():
+            await asyncio.wait({task}, timeout=remaining)
+        else:
+            await asyncio.sleep(0)  # the release is scheduled with call_soon after completion
+
+
 class ControlledPoller:
     """One serial request at a time; stopping never abandons an outstanding request."""
 
