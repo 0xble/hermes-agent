@@ -108,7 +108,7 @@ def _get_max_concurrent_children() -> int:
     return result
 
 def _get_max_queued_delegations() -> int:
-    """Maximum pending background delegation units; zero rejects at capacity."""
+    """Maximum pending background delegation calls; zero rejects at capacity."""
     return _knob(
         "max_queued_delegations", "DELEGATION_MAX_QUEUED_DELEGATIONS", lambda v: max(0, int(v)),
         8, "delegation.max_queued_delegations=%r is not a valid integer; using default 8",

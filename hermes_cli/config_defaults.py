@@ -1393,7 +1393,7 @@ DEFAULT_CONFIG = {
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it enter a bounded pending queue. Floor 1, no ceiling.
         "max_concurrent_children": 10,
-        # Maximum pending background delegation units while the async pool is full.
+        # Maximum pending background delegation calls while the async pool is full.
         # Zero rejects at capacity without blocking the parent turn.
         "max_queued_delegations": 8,
         # Background fan-outs return as ONE message when the whole call finishes. true = each task

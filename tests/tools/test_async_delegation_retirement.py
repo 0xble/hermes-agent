@@ -7,6 +7,7 @@ import time
 def test_queued_admission_requeues_when_retirement_fence_closes(monkeypatch):
     from hermes_cli import backend_retirement
     from tools import async_delegation
+    monkeypatch.setattr(async_delegation, "_STALE_CHECK_INTERVAL", 0.01)
 
     class Fence:
         def __init__(self):
@@ -65,10 +66,12 @@ def test_queued_admission_requeues_when_retirement_fence_closes(monkeypatch):
         time.sleep(0.02)
     assert fence.active == 0
     fence.reject = False
-    async_delegation._admit_pending()
+    # The existing stale monitor retries pending admission after the transient
+    # retirement fence reopens. No later completion is required to retrigger it.
     deadline = time.monotonic() + 5
     while async_delegation.active_count() and time.monotonic() < deadline:
         time.sleep(0.02)
+    assert async_delegation.list_async_delegations()
     async_delegation._reset_for_tests()
 
 

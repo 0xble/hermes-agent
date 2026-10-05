@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -1247,6 +1248,23 @@ def test_ungrouped_task_completes_alone_and_group_completes_together(monkeypatch
 
     gates[0].set()
     assert [r["task_index"] for r in _drain_one()["results"]] == [0]
+
+
+def test_multi_unit_background_payload_uses_per_unit_handles():
+    """A split call must not expose unit 1 as a misleading call-wide cancellation handle."""
+    from tools.delegate_tool_dispatch import _Batch, _dispatched_payload
+
+    tasks = [{"goal": "one"}, {"goal": "two"}]
+    batch = _Batch(
+        task_list=tasks, children=[], parent_agent=object(), creds={"model": "m"}, context=None,
+        top_role="leaf", max_children=2, live_deleg_id="call-id", live_writers=[], live_paths=[],
+        origin_wake_sid="", origin_ui_session_id="", origin_owner_transport=None,
+        origin_owner_session_record=None, origin_session_history_delivery=False, overall_start=time.monotonic(),
+    )
+    units = [replace(batch, children=[(0, tasks[0], object())]), replace(batch, children=[(1, tasks[1], object())])]
+    payload = _dispatched_payload(batch, [(units[0], "call-id-1"), (units[1], "call-id-2")])
+    assert "delegation_id" not in payload
+    assert [unit["delegation_id"] for unit in payload["units"]] == ["call-id-1", "call-id-2"]
 
 
 def test_units_of_one_call_share_a_single_capacity_slot():

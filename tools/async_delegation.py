@@ -820,9 +820,13 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
     delegation_id = record["delegation_id"]
     is_batch = bool(record.get("is_batch"))
     label = " batch" if is_batch else ""
-    with _records_lock:
-        live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    executor = _get_executor(max(max_async_children, live_units))
+    try:
+        with _records_lock:
+            live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+        executor = _get_executor(max(max_async_children, live_units))
+    except Exception as exc:  # noqa: BLE001 - admission must settle a failed executor lookup
+        logger.warning("Async delegation %s could not create an executor: %s", delegation_id, exc)
+        return f"Failed to schedule async delegation{label}: {exc}"
 
     def _worker() -> None:
         result: Dict[str, Any] = {}
@@ -895,16 +899,19 @@ def _admit_pending() -> None:
                 break
         if not selected:
             return
-        for item in selected:
-            try:
-                with _DB_LOCK, _transaction() as conn:
-                    conn.execute("UPDATE async_delegations SET state='running', updated_at=? WHERE delegation_id=? AND state='queued'",
-                                 (time.time(), item["delegation_id"]))
-            except Exception:
-                logger.exception("Could not persist admission of queued delegation %s", item["delegation_id"])
-
         for index, item in enumerate(selected):
-            error = _submit_record(item, item["max_async_children"])
+            item_context = item.get("_context") or contextvars.copy_context()
+
+            def admit_and_submit() -> Optional[str]:
+                try:
+                    with _DB_LOCK, _transaction() as conn:
+                        conn.execute("UPDATE async_delegations SET state='running', updated_at=? WHERE delegation_id=? AND state='queued'",
+                                     (time.time(), item["delegation_id"]))
+                except Exception:
+                    logger.exception("Could not persist admission of queued delegation %s", item["delegation_id"])
+                return _submit_record(item, item["max_async_children"])
+
+            error = item_context.copy().run(admit_and_submit)
             if not error:
                 continue
             if error == _BACKEND_RETIRING:
@@ -921,14 +928,20 @@ def _admit_pending() -> None:
                         live["queued_at"] = time.time()
                         _PENDING_QUEUE.appendleft(pending["delegation_id"])
                 for pending in selected[index:]:
-                    try:
-                        with _DB_LOCK, _transaction() as conn:
-                            conn.execute("UPDATE async_delegations SET state='queued', updated_at=? WHERE delegation_id=? AND state='running'",
-                                         (time.time(), pending["delegation_id"]))
-                    except Exception:
-                        logger.exception("Could not requeue retiring delegation %s", pending["delegation_id"])
+                    pending_context = pending.get("_context") or contextvars.copy_context()
+
+                    def requeue_pending() -> None:
+                        try:
+                            with _DB_LOCK, _transaction() as conn:
+                                conn.execute("UPDATE async_delegations SET state='queued', updated_at=? WHERE delegation_id=? AND state='running'",
+                                             (time.time(), pending["delegation_id"]))
+                        except Exception:
+                            logger.exception("Could not requeue retiring delegation %s", pending["delegation_id"])
+
+                    pending_context.copy().run(requeue_pending)
                 return
-            _finalize(item["delegation_id"], item["crash_result"](error, 0.0), "error")
+            item_context.copy().run(
+                _finalize, item["delegation_id"], item["crash_result"](error, 0.0), "error")
 
 
 def _dispatch_admitted(
@@ -997,6 +1010,7 @@ def _dispatch_admitted(
                 pass
         return {"status": "rejected", "error": f"Failed to persist async delegation{label}: {exc}"}
     if record["status"] == "queued":
+        _ensure_stale_monitor()
         return {"status": "queued", "delegation_id": delegation_id, "queue_reason": record["queue_reason"]}
     error = _submit_record(record, max_async_children)
     if error:
@@ -1264,6 +1278,9 @@ def _sweep_stale_locked(now: float):
     stalled, expired, any_monitorable = [], [], False  # (delegation_id, quiet_for, in_tool) / ids past grace
     for record in _records.values():
         status = record.get("status")
+        if status == "queued":
+            any_monitorable = True
+            continue
         if status == "stalling":
             any_monitorable = True
             if now - (record.get("_interrupted_at") or now) >= _STALL_GRACE_SECONDS:
@@ -1330,6 +1347,7 @@ def _stale_monitor_loop() -> None:
     ``stalling`` and calls ``interrupt_fn``; a ``stalling`` record still unreturned after the
     grace window is force-finalized with a terminal ``stalled`` event."""
     while not _monitor_stop.wait(_STALE_CHECK_INTERVAL):
+        _admit_pending()
         now = time.time()
         with _records_lock:
             stalled, expired, any_monitorable = _sweep_stale_locked(now)
@@ -1475,16 +1493,21 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
                 interrupt_fn = live.get("interrupt_fn")
         if queued_snapshot is not None:
             count += 1
-            _call_interrupt(
-                queued_interrupt_fn, "%s: %s interrupt failed: %s", caller, delegation_id, reason=reason,
-            )
-            _finalize(
-                queued_snapshot["delegation_id"],
-                {"status": "interrupted", "summary": None, "error": reason, "exit_reason": "interrupted",
-                 "results": [] if queued_snapshot.get("is_batch") else None},
-                "interrupted",
-                _claimed_snapshot=queued_snapshot,
-            )
+            queued_context = queued_snapshot.get("_context") or contextvars.copy_context()
+
+            def finalize_queued() -> None:
+                _call_interrupt(
+                    queued_interrupt_fn, "%s: %s interrupt failed: %s", caller, delegation_id, reason=reason,
+                )
+                _finalize(
+                    queued_snapshot["delegation_id"],
+                    {"status": "interrupted", "summary": None, "error": reason, "exit_reason": "interrupted",
+                     "results": [] if queued_snapshot.get("is_batch") else None},
+                    "interrupted",
+                    _claimed_snapshot=queued_snapshot,
+                )
+
+            queued_context.copy().run(finalize_queued)
             continue
         if _call_interrupt(
             interrupt_fn, "%s: %s interrupt failed: %s", caller, record.get("delegation_id"), reason=reason,

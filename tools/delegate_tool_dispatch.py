@@ -347,11 +347,12 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]], *, inclu
     goals = [t["goal"] for t in batch.task_list]
     n = len(goals)
     payload = {
-        "status": "dispatched", "mode": "background", "count": n,
-        "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
+        "status": "dispatched", "mode": "background", "count": n, "goals": goals,
         "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
     }
-    if len(units) > 1:
+    if len(units) == 1:
+        payload["delegation_id"] = batch.live_deleg_id or units[0][1]
+    else:
         payload["units"] = [
             {"delegation_id": uid, "group": unit.group, "task_indexes": [i for (i, _, _) in unit.children]}
             for unit, uid in units
@@ -382,6 +383,22 @@ def _units_of(batch: _Batch) -> List[_Batch]:
         members.setdefault(key, []).append((i, t, c))
     return [replace(batch, children=ch, group=(key[1] if key[0] == "g" else None)) for key, ch in members.items()]
 
+def _cleanup_unit(unit: _Batch, reason: str, outcome: dict) -> None:
+    """Release children, live writers, manifests, and metrics for a unit that will not run."""
+    from tools.delegation_live_log import update_manifest_statuses
+
+    for i, _, child in unit.children:
+        _signal_child_stop(child, reason)
+        _detach_child(unit.parent_agent, child)
+        _close_child(child, "Failed to close rejected child agent")
+        if i < len(unit.live_writers) and unit.live_writers[i] is not None:
+            with _quiet("Live transcript finalize failed", exc_info=True):
+                unit.live_writers[i].finalize(outcome)
+    results = [{"task_index": i, **outcome} for i, _, _ in unit.children]
+    update_manifest_statuses(unit.live_deleg_id, results)
+    finish_delegation_unit(unit.task_list, results, background=True)
+
+
 def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
@@ -392,21 +409,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
             _signal_child_stop(c, reason)
 
     def _cancel_queued(reason: str = "Queued delegation cancelled"):
-        from tools.delegation_live_log import update_manifest_statuses
-        rejected = {"status": "interrupted", "exit_reason": "interrupted"}
-        for i, _, child in unit.children:
-            _signal_child_stop(child, reason)
-            _detach_child(unit.parent_agent, child)
-            _close_child(child, "Failed to close queued child agent")
-            if i < len(unit.live_writers) and unit.live_writers[i] is not None:
-                with _quiet("Live transcript finalize failed", exc_info=True):
-                    unit.live_writers[i].finalize(rejected)
-        update_manifest_statuses(unit.live_deleg_id, [{"task_index": i, **rejected} for i, _, _ in unit.children])
-        finish_delegation_unit(
-            unit.task_list,
-            [{"task_index": i, **rejected} for i, _, _ in unit.children],
-            background=True,
-        )
+        _cleanup_unit(unit, reason, {"status": "interrupted", "exit_reason": "interrupted"})
 
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
@@ -422,6 +425,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
                           and unit.live_writers[i].path is not None},
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
+
 
 def _restore_parent_cancellation(unit: _Batch) -> None:
     """Rejected children stay owned by the parent: re-attach them (``_attach_child`` replays a stop that
@@ -473,7 +477,6 @@ def _dispatch_background(batch: _Batch) -> str:
         if dispatch.get("status") == "queued":
             queued.append((unit, dispatch["delegation_id"]))
             continue
-        _restore_parent_cancellation(unit)
         if dispatch.get("at_capacity"):
             logger.warning("delegate_task: async pool at capacity and pending queue unavailable; rejecting without synchronous fallback: %s",
                            dispatch.get("error", "rejected"))
@@ -484,15 +487,12 @@ def _dispatch_background(batch: _Batch) -> str:
                     f"{batch.live_deleg_id}-{rejected_index + 1}" if batch.live_deleg_id else None
                 )
                 rejected_unit.unit_id = rejected_unit_id = rejected_unit_id or _new_delegation_id()
-                _restore_parent_cancellation(rejected_unit)
                 rejected_units.append(rejected_unit_id)
-            finish_delegation_unit(
-                batch.task_list,
-                [{"task_index": task_index, "status": "rejected", "exit_reason": "capacity"}
-                 for rejected_unit in units[k:]
-                 for task_index, _, _ in rejected_unit.children],
-                background=True,
-            )
+            for rejected_unit in units[k:]:
+                _cleanup_unit(
+                    rejected_unit, "Async delegation capacity is full",
+                    {"status": "rejected", "exit_reason": "capacity"},
+                )
             if not dispatched and not queued:
                 return json.dumps({
                     "status": "rejected", "mode": "background", "goals": [t["goal"] for t in batch.task_list],
@@ -509,6 +509,7 @@ def _dispatch_background(batch: _Batch) -> str:
                 payload["queued_units"] = [uid for _, uid in queued]
             return json.dumps(payload, ensure_ascii=False)
         if not dispatched and not queued:
+            _restore_parent_cancellation(unit)
             logger.info(
                 "delegate_task: async schedule failed (%s); running the whole batch synchronously instead.",
                 dispatch.get("error", "rejected"),
@@ -519,10 +520,12 @@ def _dispatch_background(batch: _Batch) -> str:
         # never execute inline in an async-capable session.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.",
                        k + 1, len(units), dispatch.get("error"))
+        _restore_parent_cancellation(unit)
         inline_results.extend(_execute_and_aggregate(unit)["results"])
     if queued and not dispatched:
         payload = _dispatched_payload(batch, queued, include_controls=False)
-        payload["delegation_id"] = queued[0][1]
+        if len(queued) == 1:
+            payload["delegation_id"] = queued[0][1]
         payload["queued_units"] = [uid for _, uid in queued]
         payload["status"] = "queued"
         payload["note"] = (

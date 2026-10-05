@@ -88,7 +88,7 @@ class _ControlledChild(_Parent):
         return {"api_call_count": 0}
 
     def close(self):
-        self.closed_while_running |= not self.finished.is_set()
+        self.closed_while_running |= self.started.is_set() and not self.finished.is_set()
         self.close_count += 1
         self.closed.set()
 
@@ -123,7 +123,7 @@ def registry_state(tmp_path, monkeypatch):
     async_delegation._reset_for_tests()
 
 
-@pytest.mark.parametrize("rejection", ["schedule_failure", "partial_schedule_failure"])
+@pytest.mark.parametrize("rejection", ["schedule_failure", "partial_schedule_failure", "capacity"])
 @pytest.mark.parametrize("stop_timing", ["running", "during_admission"])
 @pytest.mark.parametrize("stop_kind", ["soft", "hard"])
 def test_rejected_background_child_stops_with_parent(
@@ -157,6 +157,7 @@ def test_rejected_background_child_stops_with_parent(
         return {"status": "completed", "summary": "slot released"}
 
     if rejection == "capacity":
+        monkeypatch.setattr("tools.delegate_tool._get_max_queued_delegations", lambda: 0)
         accepted = async_delegation.dispatch_async_delegation(
             goal="occupy the only slot", context=None, toolsets=None, role="leaf",
             model=child.model, session_key="other-session", runner=occupy_slot,
@@ -220,6 +221,18 @@ def test_rejected_background_child_stops_with_parent(
         if stop_timing == "during_admission":
             request_stop(stop_message)
         continue_admission.set()
+        if rejection == "capacity":
+            if stop_timing == "running":
+                request_stop(stop_message)
+            result = outcome.result(timeout=5)
+            assert result["status"] == "rejected"
+            assert result["rejected_units"]
+            assert not child.started.is_set()
+            assert child.closed.wait(5)
+            assert child.close_count == 1
+            assert not child.closed_while_running
+            assert parent._active_children == []
+            return
         assert child.started.wait(5)
         if stop_timing == "running":
             request_stop(stop_message)

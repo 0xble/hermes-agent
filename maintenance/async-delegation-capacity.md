@@ -24,6 +24,12 @@ handling, pending work visibility, cancellation, or completion routing.
 - Pending admission is bounded. Queued state is durable or is surfaced as an
   explicit interrupted/unknown outcome on owner restart; it must not disappear
   silently.
+- Admission persistence, submit-failure finalization, and queued cancellation run
+  in the queued unit's captured profile context. A process serving multiple
+  profiles must never write another profile's `state.db` or completion manifest.
+- The existing stale-delegation monitor also retries pending admission, so a
+  transient retirement prepare fence reopening retriggers the queue without
+  requiring another completion.
 
 ## Independent hypothesis (frozen 2026-10-04T19:14:32Z, before upstream search)
 
@@ -42,9 +48,9 @@ releases a slot, and are included in live control/list views. A call-wide slot
 key makes independent completion units share one queue reservation; admission
 promotes every queued sibling for that key together. Persisting the queued state
 allows restart recovery to mark an unadmitted unit explicitly unknown instead of
-silently losing it. The queue cap is the runaway protection; queue-full admission
-is a non-blocking rejection. Queued responses expose delegation handles rather
-than pre-admission child-agent ids.
+silently losing it. The queue cap bounds pending calls; queue-full admission is a
+non-blocking rejection. Queued responses expose delegation handles rather than
+pre-admission child-agent ids.
 
 Alternatives rejected for now: raising the global worker count (removes the
 safety invariant and still permits unbounded work), sleeping/retrying in the
