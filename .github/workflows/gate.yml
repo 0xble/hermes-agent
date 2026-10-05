@@ -107,7 +107,10 @@ jobs:
           print(results)
           if results and all(result == 'success' for result in results.values()):
               sys.exit(0)
-          message = 'draft: gate not run' if os.environ.get('DRAFT_PR') == 'true' else 'gate not qualified'
+          not_run = [name for name, result in results.items() if result != 'success']
+          only_skipped = bool(not_run) and all(results[name] == 'skipped' for name in not_run)
+          draft_skip = os.environ.get('DRAFT_PR') == 'true' and only_skipped
+          message = 'draft: gate not run' if draft_skip else 'gate not qualified'
           print(message, file=sys.stderr)
           sys.exit(1)
           PY
