@@ -103,6 +103,33 @@ def test_check_receipt_ignores_pm_latest_for_the_newest_update(tmp_path, monkeyp
     assert mod.check_receipt(tmp_path) == []
 
 
+def test_check_receipt_treats_lone_pm_latest_as_no_update(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    monkeypatch.setattr(mod, "_git", lambda *args: "b" * 40)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    (directory / "latest.json").write_text(json.dumps({"kind": "sync", "outcome": "ok", "steps": []}), encoding="utf-8")
+    assert mod.check_receipt(tmp_path) == []
+    # A non-PM legacy pointer is still schema-checked, not silently skipped.
+    (directory / "latest.json").write_text(json.dumps({"sha": "b" * 40}), encoding="utf-8")
+    assert any("not a native" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_newest_update_receipt_orders_by_mtime_not_local_name(tmp_path):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    # When DST ends the local-time stamp repeats, so a later run can sort earlier by name.
+    later_by_name = directory / "update_20261101_015900_1_a.json"
+    newer_on_disk = directory / "update_20261101_011000_2_b.json"
+    later_by_name.write_text("{}", encoding="utf-8")
+    newer_on_disk.write_text("{}", encoding="utf-8")
+    os.utime(later_by_name, (1_000, 1_000))
+    os.utime(newer_on_disk, (2_000, 2_000))
+    assert mod._newest_update_receipt(tmp_path) == newer_on_disk
+
+
 @pytest.mark.parametrize("kind", ["directory", "file"])
 def test_non_symlink_current_fails_closed(tmp_path, monkeypatch, kind):
     mod = _load("check_fork_patches")

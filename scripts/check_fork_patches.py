@@ -267,17 +267,25 @@ def _newest_update_receipt(home: Path) -> Path | None:
     """Choose the newest updater receipt without trusting the shared latest pointer.
 
     PM syncs rotate ``latest.json`` in this directory too, so an updater receipt
-    named ``update_*.json`` is authoritative whenever one exists. The updater's
-    filename starts with its UTC timestamp, making name order the same as update
-    order. A lone ``latest.json`` remains supported for older installations, but
-    its native schema is still validated by ``check_receipt`` below.
+    named ``update_*.json`` is authoritative whenever one exists. Its filename
+    stamp is local time, which repeats an hour when DST ends, so order by mtime
+    and use the name only to break ties. A lone ``latest.json`` remains supported
+    for older installations unless it is a PM receipt (PM receipts always carry
+    ``kind``, updater receipts never do). That case means no update has run yet.
+    Any other ``latest.json`` is still schema-checked by ``check_receipt`` below.
     """
     directory = home / "logs" / "update_receipts"
-    update_receipts = sorted(path for path in directory.glob("update_*.json") if path.is_file())
+    update_receipts = [path for path in directory.glob("update_*.json") if path.is_file()]
     if update_receipts:
-        return update_receipts[-1]
+        return max(update_receipts, key=lambda path: (path.stat().st_mtime, path.name))
     latest = directory / "latest.json"
-    return latest if latest.is_file() else None
+    if not latest.is_file():
+        return None
+    try:
+        data = json.loads(latest.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return latest  # unreadable is reported by check_receipt, never skipped
+    return None if isinstance(data, dict) and "kind" in data else latest
 
 
 def check_receipt(home: Path) -> list[str]:
