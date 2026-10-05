@@ -459,7 +459,8 @@ class GatewayGoalsMixin:
         self, *, session_entry: Any, source: Any, final_response: str,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
-        continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        continuation through the adapter FIFO so a simultaneous real user message takes priority.
+        """
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -522,12 +523,15 @@ class GatewayGoalsMixin:
             return
         # Unsuccessful or empty responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
-        hooks = [("loop completion", self._post_turn_loop_completion)]
+        hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip():
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
-        for label, hook in hooks:
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, {}))
+        for label, hook, hook_kwargs in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(
+                    session_entry=session_entry, source=source, final_response=final_text,
+                    **hook_kwargs,
+                )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 

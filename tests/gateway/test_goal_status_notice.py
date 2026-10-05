@@ -16,6 +16,7 @@ class FakeAdapter:
     def __init__(self, results=None):
         self.calls = []
         self.callbacks = {}
+        self.callback_registrations = []
         self._active_sessions = {}
         self.results = list(results or [])
 
@@ -31,6 +32,7 @@ class FakeAdapter:
         return self.results.pop(0) if self.results else SimpleNamespace(success=True)
 
     def register_post_delivery_callback(self, session_key, callback, *, generation=None):
+        self.callback_registrations.append((session_key, generation, callback))
         self.callbacks[session_key] = (generation, callback)
 
 
@@ -193,5 +195,3 @@ async def test_goal_status_notice_logs_when_retry_is_cancelled(monkeypatch, capl
 
     assert "goal continuation: status retry cancelled" in caplog.text
     assert "notice_kind=continuing" in caplog.text
-
-
