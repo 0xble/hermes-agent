@@ -1285,6 +1285,11 @@ class TestSyncTurn:
         payload_marker = "If you are blocked and need input from the user, say so clearly and stop."
         payload = CONTINUATION_PROMPT_TEMPLATE.format(goal=f"Mention this sentence: {payload_marker}")
         assert filter_retain_messages(payload, "[SILENT]") == (None, None)
+        copied_boundary = plain.split("\n\n", 1)[1]
+        boundary_payload = CONTINUATION_PROMPT_TEMPLATE.format(
+            goal=f"Nested copied prompt:\n\n{copied_boundary}\n\nINNER"
+        )
+        assert filter_retain_messages(boundary_payload, "[SILENT]") == (None, None)
         quoted_suffix = "I quoted: If you are blocked and need input from the user, say so clearly and stop. Keep this note."
         assert filter_retain_messages(plain + "\n\n" + quoted_suffix, "[SILENT]") == (quoted_suffix, None)
         malformed_revisions = plain + CONTINUATION_REVISIONS_TEMPLATE.format(

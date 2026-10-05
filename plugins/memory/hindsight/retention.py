@@ -42,7 +42,7 @@ def _template_pattern(template: str) -> re.Pattern[str]:
     for literal, field_name, _format_spec, _conversion in Formatter().parse(template):
         parts.append(re.escape(literal))
         if field_name is not None:
-            parts.append(".*?")
+            parts.append(".*")
     return re.compile("".join(parts), re.DOTALL)
 
 
@@ -52,8 +52,9 @@ def _template_terminal(template: str) -> str:
 
 
 # Match complete generated prompts from their defining templates. The formatter literals make this
-# stricter than a loose prefix while the non-greedy fields stop at the actual generated boundary;
-# quoted terminal prose in a goal or later human suffix is not itself treated as the boundary.
+# stricter than a loose prefix while the greedy fields absorb any copied formatter prose inside
+# untrusted payloads and leave only the final generated boundary; quoted terminal prose in a later
+# human suffix is not itself treated as the boundary.
 _INJECTED_TURN_PATTERNS = (
     ("goal", CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE)),
     ("goal", CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE)),
