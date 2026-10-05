@@ -868,95 +868,44 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
 
 
 _VAULT_ALIAS_WRITE_DESCRIPTION = "modify vault.origin_aliases security policy via direct/common-wrapper Hermes CLI"
-_HERMES_CLI_VALUE_FLAGS_FALLBACK = frozenset({
-    "-z", "--oneshot", "-m", "--model", "--provider", "--reasoning", "-t", "--toolsets",
-    "-r", "--resume", "-s", "--skills", "--usage-file", "--in", "-p", "--profile",
-    "-c", "--continue",
-})
-_HERMES_CLI_OPTION_FLAGS_FALLBACK = _HERMES_CLI_VALUE_FLAGS_FALLBACK | frozenset({
-    "-V", "--version", "-h", "--help", "--no-restore-cwd", "--worktree", "-w", "--accept-hooks", "--yolo",
-    "--pass-session-id", "--ignore-user-config", "--ignore-rules", "--safe-mode", "--tui",
-    "--native", "--tui-native", "--cli", "--dev",
-})
-_HERMES_CONFIG_SUBCOMMAND_FLAGS = frozenset({"--force"})
 _PYTHON_OPTIONS_WITH_ARG = frozenset({"-X", "--check-hash-based-pycs"})
 
 
-@functools.lru_cache(maxsize=1)
-def _hermes_cli_option_sets() -> tuple[frozenset[str], frozenset[str]]:
-    """Return ``(all top-level options, value-taking options)`` from the real parser.
-
-    The detector must not drift when a new global CLI flag is added. Import lazily because approval
-    detection is also used by low-level tools that do not otherwise need to construct the CLI parser;
-    the static snapshot keeps detection fail-closed if parser construction is unavailable.
-    """
-    try:
-        from hermes_cli._parser import PRE_ARGPARSE_INHERITED_FLAGS, build_top_level_parser
-
-        parser = build_top_level_parser()[0]
-        options: set[str] = set()
-        value_options: set[str] = set()
-        for action in parser._actions:
-            options.update(action.option_strings)
-            if action.option_strings and action.nargs != 0:
-                value_options.update(action.option_strings)
-        for option, takes_value in PRE_ARGPARSE_INHERITED_FLAGS:
-            options.add(option)
-            if takes_value:
-                value_options.add(option)
-        return frozenset(options), frozenset(value_options)
-    except Exception:
-        return _HERMES_CLI_OPTION_FLAGS_FALLBACK, _HERMES_CLI_VALUE_FLAGS_FALLBACK
-
-
 def _is_vault_alias_config_key(token: str) -> bool:
-    return token == "vault" or token == "vault.origin_aliases" or token.startswith("vault.origin_aliases.")
+    return token == "vault" or token.startswith("vault.")
 
 
 def _is_vault_alias_config_write_argv(argv: list[str]) -> bool:
-    """Recognize a real ``hermes config set|unset`` invocation from tokenized argv.
+    """Conservatively recognize Hermes config writes without emulating argparse.
 
-    Parse global options before the subcommand using the live parser's option metadata. Unknown
-    options are treated as value-taking so an option added by a newer CLI cannot hide a sensitive
-    config command from the approval gate.
+    Scan every remaining token rather than interpreting global options. This intentionally accepts
+    harmless false positives such as ``hermes skills config set vault.x`` or an option value that
+    happens to be ``config``; an approval prompt is safer than allowing a bypass when the CLI grows.
     """
     if not argv or os.path.basename(argv[0]).lower() not in {"hermes", "hermes.py"}:
         return False
-    all_options, value_options = _hermes_cli_option_sets()
-    index = 1
-    while index < len(argv):
-        token = argv[index]
-        if token == "config":
-            break
-        if not token.startswith("-") or token == "--":
-            return False
-        option = token.split("=", 1)[0]
-        consumes = option in value_options or option not in all_options
-        index += 2 if consumes and "=" not in token and index + 1 < len(argv) else 1
-    if index >= len(argv) or argv[index] != "config":
-        return False
-    index += 1
-    if index >= len(argv) or argv[index] not in {"set", "unset"}:
-        return False
 
-    # A key can follow flags such as --force, and a future config option may be unknown here too.
-    # Preserve the existing distinction between a bare `vault` key and a value for another key.
-    first_operand = True
-    remaining = argv[index + 1:]
-    position = 0
-    while position < len(remaining):
-        token = remaining[position]
-        if token.startswith("-"):
-            option = token.split("=", 1)[0]
-            consumes = option in value_options or (
-                option not in all_options and option not in _HERMES_CONFIG_SUBCOMMAND_FLAGS
-            )
-            position += 2 if consumes and "=" not in token and position + 1 < len(remaining) else 1
+    for index, token in enumerate(argv):
+        if token != "config":
             continue
-        if _is_vault_alias_config_key(token) and (first_operand or token != "vault"):
+        remaining = argv[index + 1:]
+        subcommand_index = next(
+            (offset for offset, candidate in enumerate(remaining)
+             if candidate != "--" and not candidate.startswith("-")),
+            None,
+        )
+        if subcommand_index is None or remaining[subcommand_index] not in {"set", "unset"}:
+            continue
+        key_token = next(
+            (candidate for candidate in remaining[subcommand_index + 1:]
+             if candidate != "--" and not candidate.startswith("-")),
+            None,
+        )
+        if key_token is None:
+            continue
+        key = key_token.split("=", 1)[0].strip("'\"")
+        if _is_vault_alias_config_key(key):
             return True
-        first_operand = False
-        position += 1
     return False
 
 
@@ -1051,6 +1000,14 @@ def _python_source_writes_hermes_config(source: str) -> bool:
     return False
 
 
+def _is_python_write_marker(token: str) -> bool:
+    if token in {"--write", "--in-place", "-i"}:
+        return True
+    if token.startswith("--write=") or token.startswith("--in-place="):
+        return True
+    return token.startswith("-i") and len(token) > 2 and not token[2].isalpha()
+
+
 def _python_config_write_finding(command: str) -> str | None:
     """Gate explicit Python config writers without matching comments or prose arguments.
 
@@ -1059,7 +1016,6 @@ def _python_config_write_finding(command: str) -> str | None:
     and a separate explicit write operation is present, preserving the existing script regression.
     """
     code_markers = ("open(", "write_text", "write_bytes", "yaml.dump", "safe_dump")
-    flag_markers = {"-i", "--in-place", "--write"}
     for segment in _iter_top_level_shell_segments(command):
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = _deobfuscate_shell_word_for_detection(word)
@@ -1073,8 +1029,10 @@ def _python_config_write_finding(command: str) -> str | None:
                     if _python_source_writes_hermes_config(tokens[index + 1]):
                         return "in-place edit of Hermes config with Python"
                     break
-            has_write_marker = any(token in flag_markers or any(marker in token for marker in code_markers)
-                                   for token in tokens[1:])
+            has_write_marker = any(
+                _is_python_write_marker(token) or any(marker in token for marker in code_markers)
+                for token in tokens[1:]
+            )
             if (any(_is_hermes_config_path_token(token) for token in tokens[1:])
                     and has_write_marker):
                 return "in-place edit of Hermes config with Python"
