@@ -565,8 +565,10 @@ class TurnRunner:
         # no edit, split, or send, so a refused bubble is not retried once per incoming tool line.
         defer_until: float = 0.0
 
-    # Minimum seconds between progress edits (Telegram flood control).
-    _PROGRESS_EDIT_INTERVAL = 1.5
+    # Minimum seconds between progress edits. Kept no faster than Telegram's per-chat interim-edit
+    # floor (plugins/platforms/telegram/chat_budget.EDIT_FLOOR_SECS): a producer faster than the
+    # transport delivers no extra updates, it only parks edits inside the chat's send lock.
+    _PROGRESS_EDIT_INTERVAL = 3.0
 
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
