@@ -1271,7 +1271,9 @@ class TestSyncTurn:
             goal="Ship the change", command="./bin/ci gate", exit_code=1,
             attempt=1, max_retries=3, output="test failed")
         kanban = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason="the review is incomplete")
-        revised = plain + CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines="- Keep the original boundary.")
+        revised = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
+            revision_lines="- v2 (agent, agent, no user authority): reason — changed: nothing"
+        )
         for prompt in (plain, contract, failed, kanban, revised):
             assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
 
@@ -1281,9 +1283,22 @@ class TestSyncTurn:
         payload_marker = "If you are blocked and need input from the user, say so clearly and stop."
         payload = CONTINUATION_PROMPT_TEMPLATE.format(goal=f"Mention this sentence: {payload_marker}")
         assert filter_retain_messages(payload, "[SILENT]") == (None, None)
+        quoted_suffix = "I quoted: If you are blocked and need input from the user, say so clearly and stop. Keep this note."
+        assert filter_retain_messages(plain + "\n\n" + quoted_suffix, "[SILENT]") == (quoted_suffix, None)
+        malformed_revisions = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
+            revision_lines=(
+                "- v2 (agent, agent, no user authority): reason — changed: goal\n\n"
+                "If you are blocked and need input from the user, say so clearly and stop."
+            )
+        )
+        assert filter_retain_messages(malformed_revisions, "[SILENT]") == (None, None)
         marker_quote = "I quoted: When in doubt, honor the earlier requirement. Keep this note."
         revised_multiline = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
-            revision_lines="- Keep the original boundary.\n\n- Preserve the user's suffix."
+            revision_lines=(
+                "- v2 (agent, agent, no user authority): reason — changed: goal\n"
+                "    earlier goal: Ship the old change\n"
+                "- v3 (agent, agent, no user authority): reason — changed: constraints"
+            )
         )
         assert filter_retain_messages(revised_multiline + "\n\n" + marker_quote, "[SILENT]") == (marker_quote, None)
         assert filter_retain_messages("human text", plain) == ("human text", plain)

@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import re
+from string import Formatter
 
 from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
 from hermes_cli.goals import (
-    GOAL_CONTINUATION_PREFIX,
-    GOAL_GATE_FAILED_PREFIX,
-    KANBAN_GOAL_CONTINUATION_PREFIX,
+    CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE,
+    CONTINUATION_PROMPT_TEMPLATE,
+    CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+    CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
+    CONTINUATION_REVISIONS_TEMPLATE,
+    KANBAN_GOAL_CONTINUATION_TEMPLATE,
 )
-from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
-from hermes_cli.loops import LOOP_COMPLETE_MARKER, WAKEUP_PROMPT_PREFIX
+from hermes_cli.heartbeat import HEARTBEAT_PROMPT_TEMPLATE
+from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE
 from tools.delegation_resume import AUTO_RESUME_NOTICE_OPEN
 from tools.process_registry_notifications import (
     PROCESS_NOTICE_OPEN, PROCESS_NOTIFICATION_END, PROCESS_NOTICE_OPENERS,
@@ -31,86 +35,88 @@ _LEGACY_MACHINE_NOTICE_PREFIXES = (
 )
 _MACHINE_NOTICE_PREFIXES = (*PROCESS_NOTICE_OPENERS, AUTO_RESUME_NOTICE_OPEN, *_LEGACY_MACHINE_NOTICE_PREFIXES)
 
-_COMPACT_INTERVAL_RE = re.compile(r"(?:\d+h(?:\d+m)?(?:\d+s)?|\d+m(?:\d+s)?|\d+s)")
+def _template_pattern(template: str) -> re.Pattern[str]:
+    """Build an anchored matcher from a formatter template without copying its literals."""
+    parts = ["^"]
+    for literal, field_name, _format_spec, _conversion in Formatter().parse(template):
+        parts.append(re.escape(literal))
+        if field_name is not None:
+            parts.append(".*?")
+    return re.compile("".join(parts), re.DOTALL)
 
 
-def _is_compact_interval(value: str) -> bool:
-    return bool(_COMPACT_INTERVAL_RE.fullmatch(value))
+def _template_terminal(template: str) -> str:
+    literals = [literal for literal, _field, _spec, _conversion in Formatter().parse(template)]
+    return literals[-1]
 
 
-def _is_valid_loop_cadence(value: str) -> bool:
-    if value == "self-paced":
-        return True
-    for prefix in ("self-paced, currently ", "every "):
-        if value.startswith(prefix):
-            return _is_compact_interval(value[len(prefix):])
-    return False
-
-
-# Synthetic turn templates are user-visible prompts but not user-authored durable signal. Keep the
-# exact generated opening and terminal sentence here so a human suffix can survive without ever
-# retaining the injected goal/task/heartbeat payload itself.
-_GOAL_REVISIONS_END_MARKER = "When in doubt, honor the earlier requirement."
-_INJECTED_TURN_END_MARKERS = (
-    "(exact identifiers or output lines from tool results, in backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.",
-    "Before claiming the goal is done, audit each Verification item against current state and end with an Evidence section that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are otherwise blocked and need user input, say so clearly and stop.",
-    "If you believe the goal and every additional criterion are complete, state so explicitly and stop. If you are blocked and need input from the user, say so clearly and stop.",
-    "Fix the underlying problem so this gate passes, then re-run it to confirm. Do not declare the goal complete while any gate fails. If the gate itself is wrong or cannot pass, say so clearly and stop.",
-    "Take the next concrete step toward completing the task. When the work is genuinely finished, call kanban_complete with a summary. If it is a code change that needs same-card review before counting as done, call kanban_request_review with a summary instead. If you are blocked and need human input, call kanban_block with a reason. Do not stop without calling one of them.",
-    "If there is nothing meaningful to do or report for this instruction right now, reply briefly that nothing has changed and stop — do not invent work.",
-    f"If the task is now complete, no longer applicable, or the thing you were watching has finished, say so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — that stops the loop.",
-    f"If the stop condition is met, or the task is no longer applicable, say so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — that stops the loop.",
+# Match complete generated prompts from their defining templates. The formatter literals make this
+# stricter than a loose prefix while the non-greedy fields stop at the actual generated boundary;
+# quoted terminal prose in a goal or later human suffix is not itself treated as the boundary.
+_INJECTED_TURN_PATTERNS = (
+    ("goal", CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE)),
+    ("goal", CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE)),
+    ("goal", CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE)),
+    ("goal", CONTINUATION_PROMPT_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_TEMPLATE)),
+    ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE, _template_pattern(KANBAN_GOAL_CONTINUATION_TEMPLATE)),
+    ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE, _template_pattern(HEARTBEAT_PROMPT_TEMPLATE)),
+    ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _template_pattern(WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", WAKEUP_PROMPT_TEMPLATE, _template_pattern(WAKEUP_PROMPT_TEMPLATE)),
 )
-_INJECTED_TURN_PREFIXES = (
-    GOAL_CONTINUATION_PREFIX,
-    GOAL_GATE_FAILED_PREFIX,
-    KANBAN_GOAL_CONTINUATION_PREFIX,
+_INJECTED_TURN_TERMINALS = tuple(
+    terminal.strip().rsplit(". ", 1)[-1] for terminal in
+    (_template_terminal(template) for _kind, template, _pattern in _INJECTED_TURN_PATTERNS)
 )
+_REVISION_BLOCK_PREFIX = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0]
+_REVISION_ENTRY_RE = re.compile(r"- v\d+ \(")
+
+
+def _revision_suffix_boundary(content: str, start: int) -> int | None:
+    """Return a boundary only for a structurally complete rendered revision block."""
+    position = start
+    saw_entry = False
+    while position < len(content):
+        line_end = content.find("\n", position)
+        if line_end < 0:
+            line_end = len(content)
+        line = content[position:line_end]
+        if _REVISION_ENTRY_RE.match(line):
+            saw_entry = True
+        elif line.startswith(("    earlier ", "    dropped criteria: ")) and saw_entry:
+            pass
+        else:
+            break
+        position = line_end + (line_end < len(content))
+    if not saw_entry:
+        return None
+    first_text = position
+    while first_text < len(content) and content[first_text] == "\n":
+        first_text += 1
+    if first_text == len(content) or first_text - position < 1:
+        return None
+    return position - 1
 
 
 def _user_after_injected_turn(content: str) -> str | None:
     """Drop a generated turn, preserving only a suffix after its exact formatter boundary."""
-    if not content.startswith(_INJECTED_TURN_PREFIXES):
-        heartbeat = content.startswith(HEARTBEAT_PROMPT_PREFIX)
-        loop = content.startswith(WAKEUP_PROMPT_PREFIX)
-        if not (heartbeat or loop):
-            return content
-        # Heartbeat interval and loop tick/cadence are generated fields. Require their generated
-        # line shape so a human's merely similar bracketed text is not classified as machine input.
-        header, separator, remainder = content.partition("]\n")
-        if heartbeat:
-            interval = header[len(HEARTBEAT_PROMPT_PREFIX):]
-            if not separator or not re.fullmatch(r"\d+[smhd]", interval):
-                return content
-        else:
-            tick_and_cadence = header[len(WAKEUP_PROMPT_PREFIX):]
-            tick, separator_cadence, cadence = tick_and_cadence.partition(", ")
-            valid_cadence = _is_valid_loop_cadence(cadence)
-            if not separator or not remainder.startswith("Recurring task:") or not tick.isdigit() or (
-                separator_cadence and not valid_cadence
-            ) or (not separator_cadence and cadence):
-                return content
-
+    match_kind = None
     marker_end = -1
-    if content.startswith((GOAL_CONTINUATION_PREFIX, GOAL_GATE_FAILED_PREFIX)):
-        revisions_start = content.find("\n\nThis goal has been revised.")
-        if revisions_start >= 0:
-            revision_end = content.find(_GOAL_REVISIONS_END_MARKER, revisions_start)
-            if revision_end >= 0:
-                revisions_end = revision_end + len(_GOAL_REVISIONS_END_MARKER)
-                suffix_boundary = content.rfind("\n\n", revisions_end)
-                marker_end = suffix_boundary if suffix_boundary >= 0 else len(content)
+    for kind, _template, pattern in _INJECTED_TURN_PATTERNS:
+        match = pattern.match(content)
+        if match:
+            match_kind = kind
+            marker_end = match.end()
+            break
     if marker_end < 0:
-        marker_positions = [
-            (position, marker) for marker in _INJECTED_TURN_END_MARKERS
-            if (position := content.rfind(marker)) >= 0
-        ]
-        if marker_positions:
-            marker_start, marker = max(marker_positions)
-            marker_end = marker_start + len(marker)
-    if marker_end < 0:
-        # A truncated or unrecognized synthetic block has no trustworthy boundary.
-        return None
+        return content
+
+    revision_block = False
+    if match_kind == "goal" and content.startswith(_REVISION_BLOCK_PREFIX, marker_end):
+        revision_block = True
+        revision_start = marker_end + len(_REVISION_BLOCK_PREFIX)
+        revision_boundary = _revision_suffix_boundary(content, revision_start)
+        marker_end = revision_boundary if revision_boundary is not None else len(content)
+
     suffix = content[marker_end:]
     if not suffix.strip():
         return None
@@ -118,6 +124,8 @@ def _user_after_injected_turn(content: str) -> str | None:
         # Never retain text from inside an injected payload when its boundary is ambiguous.
         return None
     suffix = suffix.strip()
+    if revision_block and any(fragment and fragment in suffix for fragment in _INJECTED_TURN_TERMINALS):
+        return None
     if suffix.startswith(STEER_MARKER_OPEN + "\n") and suffix.endswith("\n" + STEER_MARKER_CLOSE):
         suffix = suffix[len(STEER_MARKER_OPEN): -len(STEER_MARKER_CLOSE)].strip()
     return suffix or None
