@@ -642,6 +642,74 @@ class TestJudgeDrivenWait:
         assert mgr.state.waiting_on_pid is None
         assert mgr.is_waiting() is False
 
+    def test_judge_repark_on_same_session_dedupes_notice(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-repark-session")
+        mgr.set("ship the PR")
+        first = mgr._apply_wait_directive(
+            {"session_id": "worker-session-7"}, "CI still running",
+        )
+        second = mgr._apply_wait_directive(
+            {"session_id": "worker-session-7"}, "CI still running",
+        )
+        assert first["message"]
+        assert second["message"] == ""
+
+    def test_judge_repark_on_same_timed_wait_dedupes_notice(self, hermes_home, monkeypatch):
+        from hermes_cli.goals import GoalManager
+
+        now = iter((1000.0, 1000.0, 1000.0, 1005.0))
+        monkeypatch.setattr(
+            "hermes_cli.goals.time.time", lambda: next(now, 1005.0),
+        )
+        mgr = GoalManager(session_id="jw-repark-timed")
+        mgr.set("ship the PR")
+        first = mgr._apply_wait_directive(
+            {"seconds": 30}, "cooldown", active_delegations=2,
+        )
+        second = mgr._apply_wait_directive(
+            {"seconds": 30}, "cooldown", active_delegations=2,
+        )
+        assert first["message"]
+        assert second["message"] == ""
+
+    def test_judge_repark_change_target_or_reason_reannounces(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="jw-repark-change")
+        mgr.set("ship the PR")
+        first = mgr._apply_wait_directive({"session_id": "worker-session-7"}, "CI still running")
+        different_target = mgr._apply_wait_directive({"session_id": "worker-session-8"}, "CI still running")
+        different_reason = mgr._apply_wait_directive({"session_id": "worker-session-8"}, "deploy still running")
+        assert first["message"]
+        assert different_target["message"]
+        assert different_reason["message"]
+
+    def test_judge_repark_after_continue_reannounces(self, hermes_home, monkeypatch):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        monkeypatch.setattr("hermes_cli.goals.time.time", lambda: 1000.0)
+        mgr = GoalManager(session_id="jw-repark-resume")
+        mgr.set("ship the PR")
+        with patch.object(
+            goals, "judge_goal",
+            side_effect=[
+                ("wait", "cooldown", False, {"seconds": 30}, False),
+                ("continue", "more work", False, None, False),
+                ("wait", "cooldown", False, {"seconds": 30}, False),
+            ],
+        ):
+            first = mgr.evaluate_after_turn("start")
+            mgr.state.waiting_until = 999.0
+            mgr._save()
+            continued = mgr.evaluate_after_turn("deadline passed")
+            parked_again = mgr.evaluate_after_turn("more progress")
+        assert first["message"]
+        assert continued["verdict"] == "continue"
+        assert parked_again["message"]
+
     def test_judge_wait_pid_parks_loop(self, hermes_home):
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager

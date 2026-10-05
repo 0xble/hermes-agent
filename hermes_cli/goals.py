@@ -598,6 +598,9 @@ class GoalState:
     # Live delegation batches when a timed WAIT was set because of them; the barrier lifts as soon
     # as that count drops (a batch returned), not only when the timer runs out.
     waiting_on_delegations: int = 0
+    # Requested timed-wait duration, kept stable across judge re-parks so notice dedupe does not
+    # depend on the new absolute deadline. Old rows default to zero and remain readable.
+    waiting_seconds: int = 0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
     contract: GoalContract = field(default_factory=GoalContract)
@@ -624,7 +627,7 @@ class GoalState:
         raw_subgoals = data.get("subgoals") or []
         ints = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_disputes",
-            "waiting_on_delegations")}
+            "waiting_on_delegations", "waiting_seconds")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -683,14 +686,16 @@ class GoalState:
                         lines.append("    dropped criteria: " + "; ".join(str(s) for s in dropped))
         return "\n".join(lines)
 
-    def clear_wait(self) -> None:
+    def clear_wait(self, *, preserve_notice_key: bool = False) -> None:
         self.waiting_on_pid = None
         self.waiting_on_session = None
         self.waiting_until = 0.0
         self.waiting_on_delegations = 0
+        self.waiting_seconds = 0
         self.waiting_reason = None
         self.waiting_since = 0.0
-        self.last_wait_notice_key = None
+        if not preserve_notice_key:
+            self.last_wait_notice_key = None
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
@@ -1874,6 +1879,7 @@ class GoalManager:
         return self._state
 
     def _pause_state(self, reason: str) -> None:
+        self._state.clear_wait()
         self._state.status = "paused"
         self._state.paused_reason = reason
         self._save()
@@ -1947,6 +1953,7 @@ class GoalManager:
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
+        self._state.clear_wait()
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
@@ -2165,7 +2172,9 @@ class GoalManager:
 
     def _park(self, reason: str, **barrier) -> GoalState:
         state = self._require_active()
-        state.clear_wait()
+        # Re-parking is not progress: keep the last notice key so an unchanged judge WAIT
+        # remains silent, while clearing barrier fields before applying the new target.
+        state.clear_wait(preserve_notice_key=True)
         for k, v in barrier.items():
             setattr(state, k, v)
         state.waiting_reason = (reason or "").strip() or None
@@ -2202,7 +2211,10 @@ class GoalManager:
         seconds = int(seconds)
         if seconds <= 0:
             raise ValueError("seconds must be a positive integer")
-        return self._park(reason, waiting_until=time.time() + seconds, waiting_on_delegations=max(0, int(on_delegations)))
+        return self._park(
+            reason, waiting_until=time.time() + seconds,
+            waiting_on_delegations=max(0, int(on_delegations)), waiting_seconds=seconds,
+        )
 
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
@@ -2295,7 +2307,7 @@ class GoalManager:
         elif state.waiting_on_pid is not None:
             target = f"pid:{state.waiting_on_pid}"
         else:
-            target = f"until:{state.waiting_until:.6f}:delegations:{state.waiting_on_delegations}"
+            target = f"seconds:{state.waiting_seconds}:delegations:{state.waiting_on_delegations}"
         return f"{target}|reason:{reason}"
 
     @staticmethod
