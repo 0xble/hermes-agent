@@ -394,6 +394,18 @@ DANGEROUS_PATTERNS = [
     # with auto-approve. Same unpaired-door rationale as #14639 / the sed-tee-redirect pairing on these
     # targets. `authorized_keys` after the `~/.ssh/` fragment).
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc path"),
+    # The origin-alias registry changes where credentials may be written, so even the supported
+    # `hermes config` mutator requires the normal user approval gate. Do not let a model widen
+    # exact-origin bindings silently.
+    (r'\bhermes(?:\.py)?\s+config\s+(?:set|unset)\s+vault\.origin_aliases(?:\b|[.\[])', "modify vault.origin_aliases security policy"),
+    # yq's in-place flag bypasses the generic redirection/tee rules; keep this scoped to the
+    # Hermes config rather than gating ordinary project YAML edits.
+    (rf'\byq\b[^;|&\n]*(?:\s-i(?:\s|$)|\s--inplace\b)[^;|&\n]*{_HERMES_CONFIG_PATH}', "in-place edit of Hermes config with yq"),
+    (rf'\byq\b(?=[^;|&\n]*{_HERMES_CONFIG_PATH})(?=[^;|&\n]*(?:\s-i(?:\s|$)|\s--inplace\b))[^;|&\n]*', "in-place edit of Hermes config with yq"),
+    # Python -c is already covered by the interpreter execution gate. This supplements it for a
+    # script invocation that names the Hermes config and performs an obvious write operation.
+    (rf'\bpython(?:3)?\b(?=[^;|&\n]*{_HERMES_CONFIG_PATH})(?=[^;|&\n]*(?:write_text|open\s*\(|safe_dump|yaml\.dump))[^;|&\n]*', "in-place edit of Hermes config with Python"),
+    (rf'\bpython(?:3)?\b(?=[^;|&\n]*(?:write_text|open\s*\(|safe_dump|yaml\.dump))(?=[^;|&\n]*{_HERMES_CONFIG_PATH})[^;|&\n]*', "in-place edit of Hermes config with Python"),
     # In-place edits mutate the file directly, bypassing redirection/tee/cp coverage; gate the same
     # startup/credential files.
     (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),

@@ -74,11 +74,12 @@ def _alias_keys(meta: VaultItemMeta) -> tuple[str, ...]:
     return tuple(keys)
 
 
-def _meta_with_origin_aliases(meta: VaultItemMeta) -> VaultItemMeta:
+def _meta_with_origin_aliases(
+    meta: VaultItemMeta, configured: Dict[str, tuple[str, ...]]
+) -> VaultItemMeta:
     """Augment one login's exact allowed origins without changing its vault item."""
     if meta.kind != "login" or not meta.origin:
         return meta
-    configured = _configured_aliases()
     extra: list[str] = []
     for key in _alias_keys(meta):
         for origin in configured.get(key, ()):
@@ -93,4 +94,5 @@ def _meta_with_origin_aliases(meta: VaultItemMeta) -> VaultItemMeta:
 
 def apply_origin_aliases(metas: Iterable[VaultItemMeta]) -> list[VaultItemMeta]:
     """Apply the shared registry path to metadata returned by a backend."""
-    return [_meta_with_origin_aliases(meta) for meta in metas]
+    configured = _configured_aliases()
+    return [_meta_with_origin_aliases(meta, configured) for meta in metas]

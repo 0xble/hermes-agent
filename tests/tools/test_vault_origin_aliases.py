@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+from agent.vault_origin_aliases import _configured_aliases
 from agent.vault_store import VaultItemMeta
 from tools import browser_vault_tool as vault
 
@@ -48,6 +49,7 @@ def _fill_patches(monkeypatch, backend, page_origin="https://login.gusto.com"):
     monkeypatch.setattr("agent.vault_backends.backend_for_handle", lambda _: backend)
     monkeypatch.setattr(vault, "_focus_bound_origin", lambda *_: None)
     monkeypatch.setattr(vault, "_current_page_origin", lambda _: page_origin)
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *_: "accept")
     monkeypatch.setattr(vault, "_eval_js", lambda *_: {"success": True, "result": json.dumps([
         {"type": "password", "autocomplete": "current-password", "index": 0},
     ])})
@@ -100,7 +102,7 @@ def test_origin_alias_rejects_http_and_wildcards(monkeypatch):
         ]},
     }}):
         from agent.vault_origin_aliases import _meta_with_origin_aliases
-        result = _meta_with_origin_aliases(backend.meta)
+        result = _meta_with_origin_aliases(backend.meta, _configured_aliases())
     assert result.allowed_origins == ("https://gusto.com", "https://login.gusto.com")
 
 
@@ -113,6 +115,56 @@ def test_raw_onepassword_item_id_alias_does_not_match_another_item(monkeypatch):
         result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="synthetic"))
     assert result["success"] is False
     assert result["error_type"] == "origin_mismatch"
+
+
+def test_alias_only_login_fill_confirms_once_and_saved_origin_does_not(monkeypatch):
+    backend = _Backend(_meta(handle="op:confirm-id"))
+    _fill_patches(monkeypatch, backend, page_origin="https://login.gusto.com")
+    prompts = []
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda label, origin: prompts.append((label, origin)) or "accept")
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "origin_aliases": {"op:confirm-id": ["https://login.gusto.com"]},
+    }}):
+        first = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="confirm"))
+        second = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="confirm"))
+    assert first["success"] and second["success"]
+    assert prompts == [("Synthetic login", "https://login.gusto.com")]
+
+    prompts.clear()
+    _fill_patches(monkeypatch, backend, page_origin="https://gusto.com")
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "origin_aliases": {"op:confirm-id": ["https://login.gusto.com"]},
+    }}):
+        saved = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="saved"))
+    assert saved["success"]
+    assert prompts == []
+
+
+
+def test_declined_alias_only_login_fill_refuses_retries(monkeypatch):
+    backend = _Backend(_meta(handle="op:decline-id"))
+    _fill_patches(monkeypatch, backend)
+    prompts = []
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *_: prompts.append(True) or "decline")
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "origin_aliases": {"op:decline-id": ["https://login.gusto.com"]},
+    }}):
+        first = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="decline"))
+        second = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="decline"))
+    assert first["error_type"] == "origin_alias_declined"
+    assert second["error_type"] == "origin_alias_retry_refused"
+    assert prompts == [True]
+
+
+def test_raw_item_id_alias_matches_multi_account_onepassword_handles(monkeypatch):
+    for handle in ("op@business:gusto-id", "op:connect:vault:gusto-id"):
+        backend = _Backend(_meta(handle=handle))
+        _fill_patches(monkeypatch, backend, page_origin="https://login.gusto.com")
+        with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+            "origin_aliases": {"gusto-id": ["https://login.gusto.com"]},
+        }}):
+            result = json.loads(vault.browser_vault_fill(handle, task_id="synthetic"))
+        assert result["success"] is True, (handle, result)
 
 
 def test_browser_vault_list_uses_aliases_for_origin_filter(monkeypatch):

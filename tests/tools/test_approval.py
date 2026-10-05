@@ -472,6 +472,11 @@ class TestHermesConfigWriteProtection:
             "echo x | tee ~/.hermes/config.yaml",
             "echo x | tee $HERMES_HOME/config.yaml",
             "cp /tmp/evil.yaml ~/.hermes/config.yaml",
+            "hermes config set vault.origin_aliases.example-item-id '[\"https://signin.example.com\"]'",
+            "hermes config unset vault.origin_aliases.example-item-id",
+            "yq -i '.vault.origin_aliases.example-item-id = [\"https://signin.example.com\"]' ~/.hermes/config.yaml",
+            "yq eval --inplace '.vault.origin_aliases.example-item-id = []' ~/.hermes/config.yaml",
+            "python edit_config.py ~/.hermes/config.yaml --write_text",
         ):
             dangerous, key, desc = detect_dangerous_command(command)
             assert dangerous is True, command

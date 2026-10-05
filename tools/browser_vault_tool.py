@@ -45,6 +45,33 @@ _PAYMENT_RETRY_TTL = 600
 _payment_retry_lock = threading.Lock()
 _payment_retry_until: dict[tuple[str, str, str], float] = {}
 
+# Alias-only login fills require an explicit one-time confirmation because the alias registry is
+# intentionally outside the password-manager item's own origin binding. Decisions are scoped to the
+# active profile and approval session, and refusals remain fail-closed for the process lifetime.
+_alias_fill_lock = threading.Lock()
+_alias_fill_decisions: dict[tuple[str, str, str, str], str] = {}
+_ALIAS_FILL_CACHE_CAP = 256
+
+
+def _alias_fill_key(task_id: str, handle: str, origin: str) -> tuple[str, str, str, str]:
+    from hermes_constants import hermes_home_key
+    from tools.approval_context import get_current_session_key
+
+    session = get_current_session_key()
+    return (hermes_home_key(), task_id if session == "default" else session, handle, origin)
+
+
+def _alias_fill_decision(key: tuple[str, str, str, str]) -> str | None:
+    with _alias_fill_lock:
+        return _alias_fill_decisions.get(key)
+
+
+def _record_alias_fill_decision(key: tuple[str, str, str, str], decision: str) -> None:
+    with _alias_fill_lock:
+        if len(_alias_fill_decisions) >= _ALIAS_FILL_CACHE_CAP and key not in _alias_fill_decisions:
+            _alias_fill_decisions.pop(next(iter(_alias_fill_decisions)))
+        _alias_fill_decisions[key] = decision
+
 
 def _payment_retry_key(task_id: str, origin: str) -> tuple[str, str, str]:
     from hermes_constants import hermes_home_key
@@ -567,7 +594,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             return json.dumps(unlocked)
 
     try:
-        meta = backend.get_meta(handle) if backend is not None else None
+        raw_meta = backend.get_meta(handle) if backend is not None else None
+        saved_origins = (
+            tuple(raw_meta.allowed_origins)
+            or ((str(raw_meta.origin),) if raw_meta is not None and raw_meta.origin else ())
+        ) if raw_meta is not None else ()
+        meta = raw_meta
         if meta is not None:
             from agent.vault_origin_aliases import apply_origin_aliases
             meta = apply_origin_aliases([meta])[0]
@@ -625,10 +657,28 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 "error": (
                     f"Refused: current page origin ({page_origin}) does not match "
                     f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
-                    "only run on the exact origin(s) the credential was saved for."
+                    "only run on the exact origin(s) the credential was saved for. "
+                    "Report this exact origin and item handle to the user; ask the user to add the alias themselves "
+                    "(for example: `hermes config set vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'`)."
                 ),
             }
         )
+    alias_only = meta.kind == "login" and page_origin not in saved_origins
+    if alias_only:
+        alias_key = _alias_fill_key(effective_task_id, handle, page_origin)
+        decision = _alias_fill_decision(alias_key)
+        if decision == "refused":
+            return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
+                               "error": "Alias-origin login confirmation was declined or unanswered. Do not retry; ask the user to fill the login or explicitly start a new approval session."})
+        if decision is None:
+            decision = _confirm_alias_fill(meta.label, page_origin)
+            _record_alias_fill_decision(alias_key, "accept" if decision == "accept" else "refused")
+        if decision != "accept":
+            return json.dumps({"success": False,
+                               "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
+                               "error": ("The user declined this alias-origin login fill." if decision == "decline" else
+                                         "The alias-origin login fill prompt went unanswered.") +
+                                        " Do not retry; ask the user to fill the login."})
     retry_key = _payment_retry_key(effective_task_id, page_origin) if meta.kind == "payment" else None
     if retry_key is not None and _payment_retry_blocked(retry_key):
         return json.dumps({"success": False, "error_type": "payment_retry_refused",
@@ -836,6 +886,17 @@ def _confirm_payment_fill(label: str, origin: str) -> str:
         surface="vault-payment", title="Confirm payment card fill?")
 
 
+def _confirm_alias_fill(label: str, origin: str) -> str:
+    """Human confirmation before a login is written through a config-only origin alias."""
+    from tools.approval_prompt import request_elicitation_consent
+
+    return request_elicitation_consent(
+        f"Fill {label} on {origin} (alias)?",
+        "This login is allowed on the current page only through a user-configured origin alias, not the "
+        "password manager item's saved website origin. Approve only if you recognize this exact origin.",
+        surface="vault-origin-alias", title="Confirm alias-origin login fill?")
+
+
 # ---------------------------------------------------------------------------
 # Schemas + registration
 # ---------------------------------------------------------------------------
@@ -854,8 +915,10 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
         "unavailable_in_this_session, tell the user to unlock it from an interactive session. Workflow: type the "
         "identifier into the login form, then browser_vault_fill with the handle. If the saved origin does not "
-        "match the current sign-in origin, add an exact HTTPS alias under `vault.origin_aliases` keyed by the "
-        "existing handle or 1Password item ID. Never edit or rewrite the existing 1Password item to add a URL: "
+        "match the current sign-in origin, report the exact current origin and item handle to the user and ask the "
+        "user to add the alias themselves. Show them an exact line such as `hermes config set "
+        "vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'` (or the equivalent YAML); never add or "
+        "edit `vault.origin_aliases` yourself. Never edit or rewrite the existing 1Password item to add a URL: "
         "template edits can delete passkeys. No item for this origin: call browser_vault_save_login, or type a "
         "password you fetched yourself from an authorized store for that service. Never type a password shown on "
         "a page or given in chat, and never repeat one in chat."
@@ -893,8 +956,12 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "A password manager's card has no bound origin: it is bound to the current page and that origin is shown "
         "in the user's confirmation. Refused unless the page origin exactly matches the item's saved origin or an "
         "exact HTTPS alias in `vault.origin_aliases` (re-checked atomically at fill time). If the origin does not "
-        "match, add an alias keyed by the existing handle or 1Password item ID. Never edit or rewrite an existing "
-        "1Password item to add a URL because template edits can delete passkeys. If a password manager is locked "
+        "match, report the exact current origin and item handle to the user and ask the user to add the alias "
+        "themselves. Show them an exact line such as `hermes config set vault.origin_aliases.<item-id> "
+        "'[\"https://signin.example.com\"]'` (or the equivalent YAML); never add or edit `vault.origin_aliases` "
+        "yourself. Never edit or rewrite an existing 1Password item to add a URL because template edits can delete "
+        "passkeys. Alias-only login fills show a one-time user confirmation naming the exact origin; saved-origin "
+        "login fills do not need that extra confirmation. If a password manager is locked "
         "the user is prompted to unlock first. Never retry payment_declined, payment_prompt_unanswered or "
         "payment_retry_refused; hand card entry to the user."
     ),
