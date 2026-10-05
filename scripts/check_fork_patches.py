@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -279,9 +280,11 @@ def _newest_update_receipt(home: Path) -> Path | None:
     for path in directory.glob("update_*.json"):
         try:
             # The updater prunes old receipts; one can vanish between glob() and stat().
-            update_receipts.append((path.stat().st_mtime, path.name, path))
+            info = path.stat()
         except OSError:
             continue
+        if stat.S_ISREG(info.st_mode):  # a directory or FIFO is not a receipt (a FIFO would block read)
+            update_receipts.append((info.st_mtime, path.name, path))
     if update_receipts:
         return max(update_receipts)[2]
     latest = directory / "latest.json"

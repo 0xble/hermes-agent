@@ -142,6 +142,18 @@ def test_newest_update_receipt_skips_a_receipt_pruned_after_glob(tmp_path, monke
     assert mod._newest_update_receipt(tmp_path) == kept
 
 
+def test_newest_update_receipt_ignores_non_regular_entries(tmp_path):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    kept = directory / "update_20261005_045152_1_a.json"
+    kept.write_text("{}", encoding="utf-8")
+    os.utime(kept, (1_000, 1_000))
+    (directory / "update_20261005_045153_2_dir.json").mkdir()
+    os.mkfifo(directory / "update_20261005_045154_3_fifo.json")
+    assert mod._newest_update_receipt(tmp_path) == kept
+
+
 @pytest.mark.parametrize("kind", ["directory", "file"])
 def test_non_symlink_current_fails_closed(tmp_path, monkeypatch, kind):
     mod = _load("check_fork_patches")
