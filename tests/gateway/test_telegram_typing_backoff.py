@@ -16,6 +16,9 @@ from plugins.platforms.telegram.adapter import TelegramAdapter
 def _make_adapter():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._bot = AsyncMock()
+    # These tests pin failure classification and cooldown on back-to-back ticks; switch off the
+    # per-chat typing share (test_telegram_chat_outbound_budget.py) so only the cooldown is measured.
+    adapter._telegram_chat_outbound_slot_secs = 0.0
     return adapter
 
 
