@@ -1,4 +1,4 @@
-# Oneshot plugin-hook startup parity
+# Oneshot plugin-hook discovery
 
 Fork patch identity: `oneshot-plugin-hook-discovery-barrier`.
 
@@ -19,9 +19,11 @@ contention, `pre_llm_call` observed an empty hook registry, so the turn still
 completed but the plugin marker and injected canary were absent.
 
 `_delivery_manager()` now joins the background worker unconditionally before
-checking the discovery flag. The regression test forces the intermediate state
-(`_discovered=True` while discovery is in flight) and verifies the barrier is
-used.
+checking the discovery flag. Every registry reader on the delivery path goes
+through it: `invoke_hook`, `has_hook`, middleware, and the streaming hook
+snapshot `iter_hook_callbacks`. The regression tests force the intermediate
+state (`_discovered=True` while discovery is in flight), both with a stubbed
+join and with a real worker thread that registers `pre_llm_call` late.
 
 ## Verification and retirement
 

@@ -1994,8 +1994,12 @@ def has_hook(hook_name: str) -> bool:
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
-    """Return a stable snapshot of callbacks registered for a hook."""
-    return get_plugin_manager().iter_hook_callbacks(hook_name)
+    """Return a stable snapshot of callbacks registered for a hook.
+
+    Goes through :func:`_delivery_manager` so streaming hook consumers wait for an in-flight
+    background discovery, like :func:`invoke_hook` and :func:`has_hook`.
+    """
+    return _delivery_manager().iter_hook_callbacks(hook_name)
 
 
 def fire_pre_command_hook(
