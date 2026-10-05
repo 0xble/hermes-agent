@@ -2255,3 +2255,25 @@ def test_rollback_serving_clock_is_taken_after_the_pointer_flip(rig, monkeypatch
     assert result['outcome'] == 'rolled_back' and result['alert']
     assert result['rollback']['commit_to_serving_upper_bound_seconds'] >= 61
     assert result['rollback']['rollback_bound_met'] is False
+
+
+def test_cleanup_keeps_service_definition_during_cold_reload(rig, monkeypatch):
+    """Live 2026-10-05 11:11: a guardian tick inside a planned reload booted out the fresh
+    service process and deleted ai.hermes.gateway.plist. An older cold-start row reused the
+    service label, and the reloading holder had already exited, so no live row protected it."""
+    path = rig.supervisor.directory / f'{rig.old.label}.plist'
+    original = path.read_bytes()
+    earlier = GenerationIdentity.create(release_sha='unknown', label=rig.old.label, pid=99,
+                                        start_fingerprint='99:1.0')
+    rig.db.register(earlier, state='serving')
+    rig.db.heartbeat(earlier.id, state='exited')
+    rig.db.heartbeat(rig.old.id, state='exited')  # Lease holder mid-reload: exited, successor unclaimed.
+    assert rig.db.leases()[0]['generation_id'] == rig.old.id
+    calls = []
+    rig.supervisor.runner = lambda argv, **kwargs: calls.append(argv) or SimpleNamespace(
+        returncode=0, stdout='', stderr='')
+    monkeypatch.setattr(rig.supervisor, 'boot_active',
+                        lambda row, active: pytest.fail('service definition rewritten'))
+    forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+    assert not any(argv[1] == 'bootout' for argv in calls)
+    assert path.read_bytes() == original

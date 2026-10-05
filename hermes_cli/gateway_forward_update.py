@@ -609,6 +609,10 @@ def cleanup_exited(home, *, supervisor=None):
     holder = lease['generation_id'] if lease else None
     rows = db.generations()
     live_labels = {row['label'] for row in rows if row['state'] != 'exited'}
+    # The service label stays registered while its lease holder reloads (old process
+    # exited, successor not yet claimed). An older cold-start row reusing that label
+    # must never boot out or unlink the definition launchd is about to run.
+    live_labels.add(db.service_label())
     for row in rows:
         if row['state'] == 'exited' and row['id'] != holder:
             if row['pid'] is None:
