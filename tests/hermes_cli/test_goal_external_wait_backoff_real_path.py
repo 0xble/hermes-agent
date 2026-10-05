@@ -365,6 +365,10 @@ def test_real_pause_resume_resets_no_progress_backoff_before_status_turn(
     assert state.waiting_seconds == 900
 
     manager.pause()
+    state = manager.state
+    assert state is not None
+    assert state.consecutive_no_progress == 0
+    assert state.backoff_level == 0
     manager.resume(reset_budget=False)
     state = manager.state
     assert state is not None

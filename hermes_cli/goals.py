@@ -2160,6 +2160,8 @@ class GoalManager:
         self._state.status = "paused"
         self._state.paused_reason = reason
         self._state.clear_wait()   # a wait barrier is meaningless once paused
+        self._state.consecutive_no_progress = 0
+        self._state.backoff_level = 0
         return self._save()
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:

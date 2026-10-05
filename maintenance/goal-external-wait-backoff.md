@@ -103,27 +103,33 @@ The `call` field is intentionally the bounded, one-line JSON argument string
 written by the collector; it is not a bare shell command. The classifier must
 parse JSON arguments first (for terminal/shell calls), extract the `command`
 field, and only then apply its command grammar. Non-shell read-only tools are
-accepted by their explicit tool-name allowlist. Evidence is filtered to the
-current turn by `timestamp > previous_turn_at`; quality-gate rows are excluded
-from the progress fingerprint, while still being shown to the judge.
+accepted by their explicit tool-name allowlist. The judge-facing evidence ledger
+remains capped at `_EVIDENCE_MAX_ENTRIES`, but no-progress classification reads a
+separate complete per-turn slice before that cap, filtered by `timestamp >
+previous_turn_at`. The per-turn scan is bounded; if it may have omitted rows from
+the current turn, classification fails closed as actionable rather than treating
+an incomplete read-only suffix as proof of no progress. Quality-gate rows are
+excluded from the progress fingerprint, while still being shown to the judge.
 
 For an automatic CONTINUE, empty evidence or evidence consisting only of
 approved read-only/status operations increments the shared no-progress streak. A
-write/actionable result or a real user turn resets it. Three consecutive
-qualifying turns call `_no_progress_wait()`, persist a timed barrier, and return
-`should_continue=False`; the backoff waits are 5, 15, and 30 minutes (the last is
-bounded by `_MAX_BARRIER_WAIT_S`). Judge WAITs use the same streak state rather
-than a second counter. A timed WAIT's effective duration is the bounded maximum of
-the judge request and the current escalation floor: automatic turns impose a
-300-second floor and use 300 → 900 → 1800 seconds as `backoff_level` advances;
-user turns keep the ordinary 60-second minimum. Active delegations impose an
-additional 600-second floor, with every timed wait capped at 1800 seconds. A user
-turn or new actionable evidence resets both the shared streak and `backoff_level`.
-Judge WAITs and CONTINUE-triggered no-progress parks therefore share one durable
-escalation path, including mixed CONTINUE/WAIT sequences. The parked key for
-delegation waits is `delegations|reason:<r>` and excludes the active count and
-seconds. Judge wording and changing status output do not convert a read-only poll
-into progress.
+write/actionable result or a real user turn resets it. Explicit pause and resume
+also reset `consecutive_no_progress` and `backoff_level`, because they are user
+lifecycle actions and the next automatic continuation starts a fresh streak. Three
+consecutive qualifying turns call `_no_progress_wait()`, persist a timed barrier,
+and return `should_continue=False`; the backoff waits are 5, 15, and 30 minutes
+(the last is bounded by `_MAX_BARRIER_WAIT_S`). Judge WAITs use the same streak
+state rather than a second counter. A timed WAIT's effective duration is the
+bounded maximum of the judge request and the current escalation floor: automatic
+turns impose a 300-second floor and use 300 → 900 → 1800 seconds as
+`backoff_level` advances; user turns keep the ordinary 60-second minimum. Active
+delegations impose an additional 600-second floor, with every timed wait capped
+at 1800 seconds. A user turn or new actionable evidence resets the shared streak
+and `backoff_level`. Judge WAITs and CONTINUE-triggered no-progress parks therefore
+share one durable escalation path, including mixed CONTINUE/WAIT sequences. The
+parked key for delegation waits is `delegations|reason:<r>` and excludes the active
+count and seconds. Judge wording and changing status output do not convert a
+read-only poll into progress.
 
 ### Repeated judge WAITs
 
@@ -170,8 +176,9 @@ single commands in these families:
 
 The grammar rejects shell composition and execution syntax even when an allowed
 prefix appears first: newline, `>`, `>>`, `|`, `&&`, `||`, `;`, backticks, `$(`,
-`&`, `<(`, `>(`, and `find` `-exec`, `-execdir`, and `-ok`. It also rejects
-`rg --pre`, `--output`, destructive options such as `-delete`, `--delete`,
+`&`, `<(`, `>(`, and `find` `-exec`, `-execdir`, `-ok`, `-fprint`, and
+`-fprint0`. It also rejects `rg --pre`, `--output`, git `--ext-diff` and
+`--textconv`, destructive options such as `-delete`, `--delete`,
 branch deletion, redirects, and any command that does not consume the complete
 argument string. The parser consumes the complete JSON argument representation,
 extracts `command`, and applies the grammar only to that value; truncated,
@@ -251,10 +258,13 @@ coverage; they are not evidence for the rows below.
 | Behaviour | Production entry point | Test name | Uses real path | Mocks allowed |
 | --- | --- | --- | --- | --- |
 | JSON tool arguments make three changing status polls back off | `SessionDB.append_message` → `collect_goal_evidence` → CLI `_maybe_continue_goal_after_turn` → `evaluate_after_turn` | `test_real_session_evidence_drives_three_status_continuations_to_backoff` | yes | judge response |
+| Per-turn evidence keeps a write actionable after nine read-only calls and across four automatic turns | `SessionDB.append_message` → uncapped per-turn `collect_goal_evidence` → evaluator classifier | `test_real_write_survives_eight_read_only_results_per_automatic_turn` | yes | judge response |
 | Evidence storage shape is JSON and parsed before classification | `SessionDB.append_message` → `collect_goal_evidence` | `test_real_collector_preserves_json_argument_representation` | yes | none |
 | `&&`, `||`, `;`, backticks, `$(`, `-exec`, `-execdir`, and `-ok` are rejected | same CLI/evaluator path with real terminal rows | `test_real_evidence_classifier_rejects_shell_operators` | yes | judge response |
+| `find -fprint0`, git `--ext-diff`, and git `--textconv` are rejected as actionable | same CLI/evaluator path with real terminal rows | `test_real_evidence_classifier_rejects_shell_operators` | yes | judge response |
 | Passing quality-gate rows do not reset no-progress state | CLI post-turn hook → real gate execution → evaluator fingerprint | `test_real_passing_quality_gate_rows_do_not_reset_no_progress` | yes | judge response |
 | Actionable SessionDB evidence or a real user turn resets the shared WAIT/CONTINUE streak | `SessionDB.append_message` / `_tui_process_one_input` → evaluator streak update | `test_real_actionable_evidence_and_user_turn_reset_shared_wait_streak` | yes | judge response |
+| Pause and resume reset a level-2 no-progress park before one automatic read-only status turn | CLI evaluator path → `GoalManager.pause()` / `resume()` → evaluator classifier | `test_real_pause_resume_resets_no_progress_backoff_before_status_turn` | yes | judge response |
 | Four repeated timed judge WAITs lift through the CLI idle path with 300 → 900 → 1800 → 1800 seconds and one parked notice | `evaluate_after_turn` → `_apply_wait_directive` → `_maybe_resume_parked_goal` → `clear_lifted_wait` | `test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice` | yes | judge response, wall clock |
 | Timed WAIT expiry before the next evaluator turn preserves the parked key, advances 300 → 900, and emits exactly one parked notice | evaluator `_evaluate_after_turn` → `_apply_wait_directive` | `test_real_timed_wait_expiry_reparks_through_evaluator_with_one_notice` | yes | judge response, wall clock |
 | Full-string evidence grammar rejects newline, `&`, process substitution, `--output`, `rg --pre`, `find` print actions, and truncated/unparseable JSON | `SessionDB.append_message` → `collect_goal_evidence` → CLI evaluator classifier | `test_real_evidence_classifier_rejects_shell_operators` + `test_real_truncated_terminal_arguments_fail_closed_as_actionable` | yes | judge response |
