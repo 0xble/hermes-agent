@@ -152,15 +152,20 @@ def test_age_notice_does_not_repost_parked_notice(hermes_home):
     with patch.object(goals, "_session_waiting", return_value=True):
         first = mgr.evaluate_after_turn("internal status", user_initiated=False)
         assert "Goal parked" in first["message"]
-        mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
-        mgr.state.barrier_recheck_at = 0.0
-        mgr._save()
-        assert mgr.rearm_live_barrier()
-        second = mgr.evaluate_after_turn("internal status", user_initiated=False)
+        sid = "age-notice-dedupe"
+        st = goals.GoalManager(sid).state
+        assert st is not None
+        st.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+        st.barrier_recheck_at = 0.0
+        goals.save_goal(sid, st)
+        fresh = goals.GoalManager(sid)
+        assert fresh.rearm_live_barrier()
+        second = fresh.evaluate_after_turn("internal status", user_initiated=False)
 
     assert second["message"] == ""
-    assert mgr.state.last_wait_notice_key == "session:watcher-dedupe|reason:external watcher"
-    assert mgr.state.last_age_notice_key.startswith("live-barrier:session watcher-dedupe")
+    assert fresh.state is not None
+    assert fresh.state.last_wait_notice_key == "session:watcher-dedupe|reason:external watcher"
+    assert fresh.state.last_age_notice_key.startswith("live-barrier:session watcher-dedupe")
 
 
 def test_read_only_status_turns_back_off_with_varied_results(hermes_home):
