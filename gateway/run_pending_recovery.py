@@ -59,9 +59,12 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         elif not (entry and entry is eligible.get(key) and entry.resume_pending
                   and entry.session_id == session_id and entry.origin):
             return False
-    from gateway.run import _auto_continue_freshness_window, _is_fresh_gateway_interruption
+    from gateway.run import (
+        _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+        _resume_pending_marker_timestamp,
+    )
     if not drain_deferred:
-        marker = entry.last_resume_marked_at or entry.updated_at
+        marker = _resume_pending_marker_timestamp(entry)
         if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
             return False
     if runner._is_session_running(key):

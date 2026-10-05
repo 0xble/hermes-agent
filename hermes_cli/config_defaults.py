@@ -154,9 +154,12 @@ DEFAULT_CONFIG = {
             "cost_threshold_usd": 0.25,
         },
         # Fast mode: "" / "normal" (off), "fast" (always), "auto" (first fast_auto_seconds of every
-        # turn), "cold" (first turn of a session only).
+        # turn), "cold" (first turn of a session only). Messaging gateway sessions only:
+        # agent.fast_expiry_seconds is the seconds before a session fast/ultrafast override switches
+        # to normal; 0 disables. CLI/TUI sessions do not expire.
         "service_tier": "",
         "fast_auto_seconds": 60,
+        "fast_expiry_seconds": 0,
         # Responses API final-answer length (`text.verbosity`): "" = not sent (provider default),
         # or low | medium | high. Responses-family transports only; chat_completions never sends it.
         "text_verbosity": "",

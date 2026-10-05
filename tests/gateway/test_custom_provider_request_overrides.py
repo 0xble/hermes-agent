@@ -275,10 +275,10 @@ async def test_reused_agent_turn_merges_request_overrides_not_overwrite(monkeypa
             session_key=session_key,
         )
 
-    # Turn 1: /fast active — provider extra_body AND service_tier both present.
-    # The turn path re-resolves the tier per session, so stub the resolver.
-    tier_box = {"tier": "priority"}
-    runner._resolve_session_service_tier = lambda *a, **k: tier_box["tier"]
+    # Turn 1: session Fast is active — provider extra_body AND service_tier both present.
+    monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
+    clock = {"now": 100.0}
+    runner._set_session_service_tier_override(session_key, "priority", expiry_seconds=10)
     with patch(
         "hermes_cli.models.resolve_fast_mode_overrides",
         return_value={"service_tier": "priority"},
@@ -292,12 +292,12 @@ async def test_reused_agent_turn_merges_request_overrides_not_overwrite(monkeypa
         "service_tier": "priority",
     }
 
-    # Turn 2: back to normal — the SAME cached agent must drop only the stale
-    # fast-mode key; the init-time provider extra_body survives the refresh.
-    tier_box["tier"] = None
+    # Turn 2: the deadline has passed. run_sync resolves the session tier, evicts the
+    # idle cached agent through the /fast off path, then builds and wires a fresh one.
+    clock["now"] = 111.0
     result = await run_turn()
     assert result["final_response"] == "ok"
-    assert len(seen_agents) == 1, "agent should be reused from the gateway cache"
-    assert agent.request_overrides == {
+    assert len(seen_agents) == 2, "expired Fast must rebuild the cached agent"
+    assert seen_agents[1].request_overrides == {
         "extra_body": {"text": {"verbosity": "low"}},
     }
