@@ -5,6 +5,13 @@ from __future__ import annotations
 import re
 
 from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+from hermes_cli.goals import (
+    GOAL_CONTINUATION_PREFIX,
+    GOAL_GATE_FAILED_PREFIX,
+    KANBAN_GOAL_CONTINUATION_PREFIX,
+)
+from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
+from hermes_cli.loops import LOOP_COMPLETE_MARKER, WAKEUP_PROMPT_PREFIX
 from tools.delegation_resume import AUTO_RESUME_NOTICE_OPEN
 from tools.process_registry_notifications import (
     PROCESS_NOTICE_OPEN, PROCESS_NOTIFICATION_END, PROCESS_NOTICE_OPENERS,
@@ -23,6 +30,59 @@ _LEGACY_MACHINE_NOTICE_PREFIXES = (
     "[System note:",
 )
 _MACHINE_NOTICE_PREFIXES = (*PROCESS_NOTICE_OPENERS, AUTO_RESUME_NOTICE_OPEN, *_LEGACY_MACHINE_NOTICE_PREFIXES)
+
+# Synthetic turn templates are user-visible prompts but not user-authored durable signal. Keep the
+# exact generated opening and terminal sentence here so a human suffix can survive without ever
+# retaining the injected goal/task/heartbeat payload itself.
+_INJECTED_TURN_END_MARKERS = (
+    "If you are blocked and need input from the user, say so clearly and stop.",
+    "If you hit the stated stop condition or are otherwise blocked and need user input, say so clearly and stop.",
+    "When in doubt, honor the earlier requirement.",
+    "If the gate itself is wrong or cannot pass, say so clearly and stop.",
+    "Do not stop without calling one of them.",
+    "If there is nothing meaningful to do or report for this instruction right now, reply briefly that nothing has changed and stop — do not invent work.",
+    f"If the task is now complete, no longer applicable, or the thing you were watching has finished, say so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — that stops the loop.",
+    f"If the stop condition is met, or the task is no longer applicable, say so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — that stops the loop.",
+)
+_INJECTED_TURN_PREFIXES = (
+    GOAL_CONTINUATION_PREFIX,
+    GOAL_GATE_FAILED_PREFIX,
+    KANBAN_GOAL_CONTINUATION_PREFIX,
+)
+
+
+def _user_after_injected_turn(content: str) -> str | None:
+    """Drop a generated turn, preserving only a suffix after its exact formatter boundary."""
+    if not content.startswith(_INJECTED_TURN_PREFIXES):
+        heartbeat = content.startswith(HEARTBEAT_PROMPT_PREFIX)
+        loop = content.startswith(WAKEUP_PROMPT_PREFIX)
+        if not (heartbeat or loop):
+            return content
+        # Heartbeat interval and loop tick/cadence are generated fields. Require their generated
+        # line shape so a human's merely similar bracketed text is not classified as machine input.
+        if heartbeat and (content.find("]\n") <= len(HEARTBEAT_PROMPT_PREFIX)):
+            return content
+        if loop and not (content.startswith(WAKEUP_PROMPT_PREFIX) and content.split("]\n", 1)[0][len(WAKEUP_PROMPT_PREFIX):].split(", ", 1)[0].isdigit() and content.split("]\n", 1)[1].startswith("Recurring task:")):
+            return content
+
+    marker_end = -1
+    for marker in _INJECTED_TURN_END_MARKERS:
+        marker_end = max(marker_end, content.rfind(marker) + len(marker))
+    if marker_end < 0:
+        # A truncated or unrecognized synthetic block has no trustworthy boundary.
+        return None
+    suffix = content[marker_end:]
+    if not suffix.strip():
+        return None
+    if not suffix.startswith("\n\n"):
+        # Never retain text from inside an injected payload when its boundary is ambiguous.
+        return None
+    suffix = suffix.strip()
+    if suffix.startswith(STEER_MARKER_OPEN + "\n") and suffix.endswith("\n" + STEER_MARKER_CLOSE):
+        suffix = suffix[len(STEER_MARKER_OPEN): -len(STEER_MARKER_CLOSE)].strip()
+    return suffix or None
+
+
 _MEMORY_CONTEXT_BLOCK_RE = re.compile(
     r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>",
     re.IGNORECASE,
@@ -56,7 +116,10 @@ def _clean_message(content: str, *, preserve_unmatched_literal: bool = False) ->
 
 
 def _user_after_machine_notice(content: str) -> str | None:
-    """Keep only text after the formatter's boundary, never its untrusted payload."""
+    """Keep only text after a machine formatter boundary, never its untrusted payload."""
+    injected = _user_after_injected_turn(content)
+    if injected != content:
+        return injected
     if not content.startswith(_MACHINE_NOTICE_PREFIXES):
         return content
     if content.startswith(PROCESS_NOTICE_OPEN) and f"\n{PROCESS_NOTIFICATION_END}" not in content:

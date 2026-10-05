@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+from hermes_cli.heartbeat import HEARTBEAT_PROMPT_TEMPLATE
+from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -1252,12 +1254,51 @@ class TestSyncTurn:
     def test_retain_filter_drops_injected_notice_but_keeps_real_user_message(self, notice):
         assert filter_retain_messages("Keep this decision", notice) == ("Keep this decision", None)
 
+    def test_retain_filter_drops_injected_goal_continuations_but_keeps_real_suffix(self):
+        from agent.prompt_builder import format_steer_marker
+        from hermes_cli.goals import (
+            CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE,
+            CONTINUATION_PROMPT_TEMPLATE,
+            CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+            KANBAN_GOAL_CONTINUATION_TEMPLATE,
+        )
+
+        plain = CONTINUATION_PROMPT_TEMPLATE.format(goal="Ship the change")
+        contract = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            goal="Ship the change", contract_block="Verification: focused tests pass.")
+        failed = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+            goal="Ship the change", command="./bin/ci gate", exit_code=1,
+            attempt=1, max_retries=3, output="test failed")
+        kanban = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason="the review is incomplete")
+        for prompt in (plain, contract, failed, kanban):
+            assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
+
+        request = "Remember the design decision."
+        assert filter_retain_messages(plain + "\n\n" + request, "[SILENT]") == (request, None)
+        assert filter_retain_messages(plain + format_steer_marker(request), "[SILENT]") == (request, None)
+
     def test_retain_filter_drops_recalled_context_and_status_only_assistant(self):
         user, assistant = filter_retain_messages(
             "<memory-context>old recalled fact</memory-context>Keep this request",
             "[SILENT]",
         )
         assert (user, assistant) == ("Keep this request", None)
+
+    @pytest.mark.parametrize("prompt", [
+        "[Continuing toward your standing goal]\nNot a generated continuation",
+        "[Continuing toward your standing goal — a quality gate failed]\nNot a generated continuation",
+        "[Heartbeat — recurring instruction]\nNot a generated heartbeat",
+        "[/loop wakeup]\nNot a generated wakeup",
+    ])
+    def test_retain_filter_keeps_similar_looking_human_bracketed_text(self, prompt):
+        assert filter_retain_messages(prompt, "answer") == (prompt, "answer")
+
+    @pytest.mark.parametrize("prompt", [
+        HEARTBEAT_PROMPT_TEMPLATE.format(interval="1m", prompt="Check the inbox"),
+        WAKEUP_PROMPT_TEMPLATE.format(tick=1, cadence=", self-paced", prompt="Check the inbox", until=""),
+    ])
+    def test_retain_filter_drops_other_generated_injected_turns(self, prompt):
+        assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
 
     def test_retain_filter_keeps_substantive_one_line_status_report(self):
         assert filter_retain_messages("Question", "Status: deployment failed because the database is unavailable.") == (
