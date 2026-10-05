@@ -329,7 +329,8 @@ def _remove_launchd_gateway() -> bool:
         for domain in (f"gui/{uid}", f"user/{uid}"):
             subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, check=False)
         subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
-        plist_path.unlink()
+        from hermes_cli.gateway_launchd_records import remove_definition
+        remove_definition(plist_path, reason="hermes uninstall")
         log_success(f"Removed macOS gateway service ({plist_path})")
     return bool(plists)
 
@@ -983,7 +984,8 @@ def remove_dashboard_launchd_jobs() -> "list[Path]":
                 except (OSError, subprocess.TimeoutExpired) as e:
                     log_warn(f"Could not boot out {domain}/{label}: {e}")
             try:
-                plist_path.unlink()
+                from hermes_cli.gateway_launchd_records import remove_definition
+                remove_definition(plist_path, reason="hermes uninstall (dashboard service)")
                 removed.append(plist_path)
             except OSError as e:
                 log_warn(f"Could not remove {plist_path}: {e}")

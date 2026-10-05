@@ -503,7 +503,7 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
     monkeypatch.setattr(gateway_launchd, "_launchd_reload_log_path", lambda: tmp_path / "reload.log")
     monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 1)
     monkeypatch.setattr(gateway_launchd, "_gw", lambda: SimpleNamespace(
-        _append_launchd_reload_log=lambda *_: None,
+        _append_launchd_reload_log=lambda *_: None, get_hermes_home=lambda: home,
         logger=SimpleNamespace(warning=lambda *_: None)))
     def submit(args, **kwargs):
         calls.append(args)

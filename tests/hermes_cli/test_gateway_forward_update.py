@@ -2255,3 +2255,71 @@ def test_rollback_serving_clock_is_taken_after_the_pointer_flip(rig, monkeypatch
     assert result['outcome'] == 'rolled_back' and result['alert']
     assert result['rollback']['commit_to_serving_upper_bound_seconds'] >= 61
     assert result['rollback']['rollback_bound_met'] is False
+
+
+def _planned_restart_gap(rig):
+    """A second same-label planned restart, after the old row exits and before a new row exists.
+
+    The earlier restart left an exited row on the service label; the serving row then drains,
+    releases its lease and exits while the deferred launchd reload still owns the label.
+    """
+    earlier = GenerationIdentity.create(release_sha=rig.a.name, label=rig.old.label, pid=99,
+                                        start_fingerprint='99:1.0')
+    rig.db.register(earlier, state='exited')
+    rig.db.release_lease('active_generation', rig.old.id, rig.db.leases()[0]['epoch'])
+    rig.db.heartbeat(rig.old.id, state='exited')
+    rig.alive.pop(rig.old.pid, None)
+    return rig.supervisor.directory / f'{rig.old.label}.plist'
+
+
+@pytest.mark.parametrize('caller', ['cleanup', 'guardian'])
+def test_restart_gap_never_retires_the_service_label_definition(rig, monkeypatch, caller):
+    """Regression for the 2026-10-05 outage: a guardian tick in the planned-restart gap ran
+    cleanup_exited, which booted out the freshly reloaded service and deleted its plist."""
+    from hermes_cli import gateway_guardian
+    plist = _planned_restart_gap(rig)
+    original = plist.read_bytes()
+    if caller == 'cleanup':
+        forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+    else:
+        import os
+        def launchctl(argv, **kwargs):
+            if argv[1] == 'print' and argv[2].startswith('user/'):
+                return SimpleNamespace(returncode=113, stdout='', stderr='Could not find service')
+            return rig.supervisor.runner(argv, **kwargs)
+        monkeypatch.setattr(gateway_guardian, '_run', lambda *a, **k: 'waiting')
+        gateway_guardian.run_once(rig.home, plist, rig.old.label, grace=180, domain=f'gui/{os.getuid()}',
+                                  launchctl_runner=launchctl)
+    assert plist.read_bytes() == original
+    assert rig.old.label in rig.loaded
+    assert not any(event[0] == 'bootout' for event in rig.events)
+
+
+def test_retired_generation_labels_are_still_cleaned_after_the_service_moves(rig):
+    first = promote(rig)
+    assert first['outcome'] == 'success'
+    rig.db.heartbeat(rig.old.id, state='exited')
+    second = promote_different_release(rig)
+    assert second['outcome'] == 'success'
+    retired = forward._row(rig.db, first['new_id'])
+    rig.db.heartbeat(retired['id'], state='exited')
+    forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+    for label in (rig.old.label, first['new_label']):
+        assert label not in rig.loaded
+        assert not (rig.supervisor.directory / f'{label}.plist').exists()
+    assert (rig.supervisor.directory / f"{second['new_label']}.plist").exists()
+
+
+def test_pending_reload_fences_its_label_from_cleanup_until_cleared(rig):
+    from hermes_cli.gateway_launchd_records import clear_reload_pending, write_reload_pending
+    assert promote(rig)['outcome'] == 'success'
+    rig.db.heartbeat(rig.old.id, state='exited')
+    plist = rig.supervisor.directory / f'{rig.old.label}.plist'
+    nonce = write_reload_pending(rig.home, label=rig.old.label, generation_id=rig.old.id, seconds=60)
+    forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+    assert plist.exists() and rig.old.label in rig.loaded
+    clear_reload_pending(rig.home, nonce)
+    forward.cleanup_exited(rig.home, supervisor=rig.supervisor)
+    assert not plist.exists() and rig.old.label not in rig.loaded
+    log = (rig.home / 'logs/launchd-reload.log').read_text(encoding='utf-8')
+    assert f'generation={rig.old.id}' in log and 'gateway_forward_update.cleanup_exited' in log
