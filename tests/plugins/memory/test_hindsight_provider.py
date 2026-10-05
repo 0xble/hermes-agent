@@ -1262,6 +1262,7 @@ class TestSyncTurn:
             CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
             CONTINUATION_REVISIONS_TEMPLATE,
             KANBAN_GOAL_CONTINUATION_TEMPLATE,
+            KANBAN_GOAL_FINALIZE_TEMPLATE,
         )
 
         plain = CONTINUATION_PROMPT_TEMPLATE.format(goal="Ship the change")
@@ -1271,10 +1272,11 @@ class TestSyncTurn:
             goal="Ship the change", command="./bin/ci gate", exit_code=1,
             attempt=1, max_retries=3, output="test failed")
         kanban = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason="the review is incomplete")
+        kanban_finalize = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason="the terminal board call is missing")
         revised = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
             revision_lines="- v2 (agent, agent, no user authority): reason — changed: nothing"
         )
-        for prompt in (plain, contract, failed, kanban, revised):
+        for prompt in (plain, contract, failed, kanban, kanban_finalize, revised):
             assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
 
         request = "Remember the design decision."
