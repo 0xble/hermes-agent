@@ -130,6 +130,18 @@ def test_newest_update_receipt_orders_by_mtime_not_local_name(tmp_path):
     assert mod._newest_update_receipt(tmp_path) == newer_on_disk
 
 
+def test_newest_update_receipt_skips_a_receipt_pruned_after_glob(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    directory = tmp_path / "logs" / "update_receipts"
+    directory.mkdir(parents=True)
+    kept = directory / "update_20261005_045152_1_a.json"
+    kept.write_text("{}", encoding="utf-8")
+    pruned = directory / "update_20261005_045153_2_b.json"
+    real_glob = Path.glob
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [*real_glob(self, pattern), pruned])
+    assert mod._newest_update_receipt(tmp_path) == kept
+
+
 @pytest.mark.parametrize("kind", ["directory", "file"])
 def test_non_symlink_current_fails_closed(tmp_path, monkeypatch, kind):
     mod = _load("check_fork_patches")

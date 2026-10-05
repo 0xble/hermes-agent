@@ -275,9 +275,15 @@ def _newest_update_receipt(home: Path) -> Path | None:
     Any other ``latest.json`` is still schema-checked by ``check_receipt`` below.
     """
     directory = home / "logs" / "update_receipts"
-    update_receipts = [path for path in directory.glob("update_*.json") if path.is_file()]
+    update_receipts: list[tuple[float, str, Path]] = []
+    for path in directory.glob("update_*.json"):
+        try:
+            # The updater prunes old receipts; one can vanish between glob() and stat().
+            update_receipts.append((path.stat().st_mtime, path.name, path))
+        except OSError:
+            continue
     if update_receipts:
-        return max(update_receipts, key=lambda path: (path.stat().st_mtime, path.name))
+        return max(update_receipts)[2]
     latest = directory / "latest.json"
     if not latest.is_file():
         return None
