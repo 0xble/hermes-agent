@@ -324,12 +324,13 @@ def _remove_launchd_gateway() -> bool:
     """
     plists = _launchd_gateway_plists()
     uid = os.getuid()  # windows-footgun: ok — darwin-only (called from the macOS branch)
+    from hermes_cli.gateway_launchd_records import remove_definition, stop_owning_guardian
     for plist_path in plists:
         label = plist_path.stem
+        stop_owning_guardian(plist_path)
         for domain in (f"gui/{uid}", f"user/{uid}"):
             subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, check=False)
         subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True, check=False)
-        from hermes_cli.gateway_launchd_records import remove_definition
         remove_definition(plist_path, reason="hermes uninstall")
         log_success(f"Removed macOS gateway service ({plist_path})")
     return bool(plists)

@@ -76,31 +76,41 @@ def _text(home: Path, payload: dict) -> str:
     return "\n".join(lines)
 
 
+def flood_active(home: Path, chat_key: object) -> bool:
+    """Whether a chat named by an earlier attempt is still inside its flood window."""
+    return isinstance(chat_key, str) and bool(chat_key) and _flood_remaining(Path(home), chat_key) > 0
+
+
 def notify(home: Path, payload: dict, *, resolve=resolve_target, post=_post) -> str:
-    """Send one alert. Returns sent, unconfigured, flood or failed:<kind>; never raises."""
+    """Send one alert. Returns sent, unconfigured, flood or failed:<kind>; never raises.
+
+    The targeted chat (an id, not a credential) is recorded in ``payload["notify_chat"]`` so a
+    flood-deferred retry can wait out the deadline without resolving credentials every tick."""
     try:
-        target = resolve(Path(home))
-    except Exception as exc:  # noqa: BLE001 - alerting must not break the guardian tick
-        return f"failed:{type(exc).__name__}"
+        return _notify(Path(home), payload, resolve, post)
+    except Exception as exc:  # noqa: BLE001 - alerting must not break the guardian tick; the
+        return f"failed:{type(exc).__name__}"  # type name only, since str(exc) could carry the URL
+
+
+def _notify(home: Path, payload: dict, resolve, post) -> str:
+    target = resolve(home)
     if target is None:
         return "unconfigured"
     token, chat_id, thread_id = target
     from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
     chat_key = str(normalize_telegram_chat_id(chat_id))
-    if _flood_remaining(Path(home), chat_key) > 0:
+    payload["notify_chat"] = chat_key
+    if _flood_remaining(home, chat_key) > 0:
         return "flood"
-    body = {"chat_id": normalize_telegram_chat_id(chat_id), "text": _text(Path(home), payload),
+    body = {"chat_id": normalize_telegram_chat_id(chat_id), "text": _text(home, payload),
             "disable_web_page_preview": True}
     if thread_id and str(thread_id).lstrip("-").isdigit():
         body["message_thread_id"] = int(thread_id)
-    try:
-        status, response = post(f"{API}/bot{token}/sendMessage", body)
-    except Exception as exc:  # noqa: BLE001 - str(exc) could carry the request URL
-        return f"failed:{type(exc).__name__}"
+    status, response = post(f"{API}/bot{token}/sendMessage", body)
     if status == 200 and response.get("ok"):
         return "sent"
     retry_after = (response.get("parameters") or {}).get("retry_after")
     if status == 429 and type(retry_after) in (int, float) and retry_after > 0:
-        _record_flood(Path(home), chat_key, float(retry_after))
+        _record_flood(home, chat_key, float(retry_after))
         return "flood"
     return f"failed:http-{status}"

@@ -70,7 +70,7 @@ def test_missing_service_plist_is_regenerated_bootstrapped_and_capped(tmp_path, 
     assert definition["Label"] == rig.label
     assert definition["EnvironmentVariables"]["HERMES_HOME"] == str(rig.home.resolve())
     assert [argv[1] for argv in state["calls"]].count("bootstrap") == 1
-    assert ("regenerate", "repaired") in {(row["action"], row["outcome"]) for row in receipts(rig.home)}
+    assert ("regenerate", "written") in {(row["action"], row["outcome"]) for row in receipts(rig.home)}
 
     # Three regenerations per hour, then one capped alert, never another write or bootstrap.
     for _ in range(2):
@@ -192,6 +192,11 @@ def test_alert_notifies_once_per_reason_per_hour_and_keeps_the_token_out(tmp_pat
     assert "gateway plist missing" in posted[0][1]["text"]
     stored = "".join(path.read_text() for path in (home / "logs/guardian").glob("*.json"))
     assert token not in stored and '"notify": "sent"' in stored
+    # Free-text reasons (exception messages) cannot flood the chat: a total hourly cap applies.
+    for attempt in range(4):
+        guardian.receipt(home, "inspect", "alert", reason=f"launchctl timed out after {attempt}.5s")
+    assert len(posted) == guardian.MAX_ALERTS_PER_HOUR
+    assert '"notify": "hourly-cap"' in "".join(p.read_text() for p in (home / "logs/guardian").glob("*.json"))
 
 
 def test_alert_respects_the_persisted_flood_deadline_and_records_a_new_one(tmp_path, monkeypatch):
@@ -227,3 +232,22 @@ def test_alert_target_resolves_like_the_gateway_from_the_profile(tmp_path, monke
     (home / ".env").write_text("TELEGRAM_BOT_TOKEN=123456:fixture-token-aaaaaaaaaaaaaaaaaaaaaaaaa\n"
                                "TELEGRAM_HOME_CHANNEL=424242\n", encoding="utf-8")
     assert alert.resolve_target(home)[:2] == ("123456:fixture-token-aaaaaaaaaaaaaaaaaaaaaaaaa", "424242")
+
+
+def test_uninstall_stops_the_owning_guardian_before_the_plist_disappears(tmp_path, monkeypatch):
+    """A guardian tick between removal and its own uninstall must see a stopped service."""
+    from hermes_cli import uninstall
+    home = tmp_path / "profile"
+    home.mkdir()
+    plist = tmp_path / "ai.hermes.gateway.plist"
+    plist.write_bytes(plistlib.dumps({"Label": "ai.hermes.gateway",
+                                      "EnvironmentVariables": {"HERMES_HOME": str(home)}}))
+    seen = []
+    def run(argv, **kwargs):
+        seen.append((argv[1], guardian.intent_path(home).exists(), plist.exists()))
+        return subprocess.CompletedProcess(argv, 0)
+    monkeypatch.setattr(uninstall, "_launchd_gateway_plists", lambda: [plist])
+    monkeypatch.setattr(uninstall.subprocess, "run", run)
+    assert uninstall._remove_launchd_gateway()
+    assert seen and all(stopped and present for _, stopped, present in seen)
+    assert not plist.exists()

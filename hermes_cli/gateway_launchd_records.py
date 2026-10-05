@@ -14,6 +14,8 @@ import time
 import uuid
 
 RELOAD_PENDING_NAME = "launchd-reload-pending.json"
+# Two drain-sized waits at the largest drain timeout a deployment plausibly configures.
+MAX_RELOAD_FENCE_SECONDS = 2 * 3600
 
 
 def _home(home: Path | None) -> Path:
@@ -49,6 +51,19 @@ def _call_path(depth: int = 4) -> str:
             names.append(f"{module.rsplit('.', 1)[-1]}.{frame.f_code.co_name}")
         frame = frame.f_back
     return " < ".join(names) or "unknown"
+
+
+def stop_owning_guardian(path: Path) -> None:
+    """Before a deliberate service removal, record the stopped intent for the definition's own home
+    so its guardian cannot regenerate the service in the window before its own uninstall."""
+    import plistlib
+    try:
+        owner = plistlib.loads(path.read_bytes()).get("EnvironmentVariables", {}).get("HERMES_HOME")
+    except Exception:  # noqa: BLE001 - plistlib has no single error class; no owner, no intent
+        return
+    if isinstance(owner, str) and Path(owner).is_dir():
+        from hermes_cli.gateway_guardian import set_intent
+        set_intent(Path(owner), stopped=True)
 
 
 def remove_definition(path: Path, *, reason: str, home: Path | None = None,
@@ -103,7 +118,10 @@ def reload_pending(home: Path) -> dict | None:
         return None
     if not isinstance(record, dict) or not isinstance(record.get("label"), str):
         return None
-    expires = record.get("expires_at")
-    if type(expires) not in (int, float) or expires <= time.time():
+    expires, created, now = record.get("expires_at"), record.get("created_at"), time.time()
+    if type(expires) not in (int, float) or type(created) not in (int, float):
+        return None
+    # A record from the future or with an implausible lifetime is clock damage, not a reload.
+    if expires <= now or created > now + 60 or expires - created > MAX_RELOAD_FENCE_SECONDS:
         return None
     return record

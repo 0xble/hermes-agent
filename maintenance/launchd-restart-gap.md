@@ -27,9 +27,13 @@ retirement. The patch keeps four promises around it:
   with the install renderer pinned to `current`, then reuses its existing
   bounded bootstrap repair. It does this only for the home's own install label
   and path, never for a stopped intent (`gateway-guardian-stopped`) or a
-  pending reload. Regeneration is capped at three attempts per rolling hour,
-  then the guardian records `regenerate/capped` and alerts. Bootstrap keeps
-  its own existing three-per-hour cap.
+  pending reload, and it re-reads both fences immediately before any
+  bootstrap. Regeneration is capped at three attempts per rolling hour, then
+  the guardian records `regenerate/capped` and alerts. Bootstrap keeps its own
+  existing three-per-hour cap. `hermes uninstall` and profile service removal
+  record the stopped intent for the plist's own home before removing it, as
+  `hermes gateway uninstall` already did, so a guardian tick inside an
+  uninstall cannot restore the service.
 - Every `alert` or `capped` receipt sends one Telegram message straight to the
   Bot API, never through the gateway. The bot token and home channel resolve
   through `load_hermes_dotenv` and `load_gateway_config`, as the gateway does.
@@ -37,8 +41,12 @@ retirement. The patch keeps four promises around it:
   deadline (`telegram-flood-state.db`, plus its fallback directory) suppresses
   the send. A 429 records its `retry_after` there for the gateway to honor.
   Delivery is deduplicated per `(action, outcome, reason)` per hour through
-  the receipt directory. A flood-suppressed alert is retried on a later tick.
-  A sent, failed or unconfigured alert is not retried within that hour.
+  the receipt directory, and capped at four sends per hour in total, because
+  some reasons carry free exception text. A flood-suppressed alert is retried
+  on a later tick once the recorded chat's deadline passes, without resolving
+  credentials meanwhile. A sent, failed, unconfigured or in-flight
+  (`pending`) alert is not retried within that hour. The receipt is written
+  before the send, so a tick killed mid-send never resends.
 
 Every removal of a LaunchAgents plist appends one line to
 `logs/launchd-reload.log` naming the caller path, generation id and reason.

@@ -1914,9 +1914,10 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> bool:
         elif system == "Darwin":
             plist_path = get_launchd_plist_path()
             if plist_path.exists():
+                from hermes_cli.gateway_launchd_records import remove_definition, stop_owning_guardian
+                stop_owning_guardian(plist_path)
                 _run("launchctl", "unload", str(plist_path))
-                from hermes_cli.gateway_launchd_records import remove_definition
-                remove_definition(plist_path, reason="profile delete", missing_ok=True)
+                remove_definition(plist_path, reason="profile service removal", missing_ok=True)
                 print("✓ Launchd service removed")
                 removed = True
         elif system == "Windows":

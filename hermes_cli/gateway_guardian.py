@@ -93,6 +93,8 @@ def set_intent(home: Path, *, stopped: bool) -> None:
 
 
 ALERTING = frozenset({"alert", "capped"})
+# Reasons can carry free text (an exception message), so dedupe alone cannot bound the chat.
+MAX_ALERTS_PER_HOUR = 4
 
 
 def _observed_generations(home: Path) -> dict | None:
@@ -111,12 +113,13 @@ def _observed_generations(home: Path) -> dict | None:
 
 
 def _comparable(payload: dict) -> dict:
-    return {key: value for key, value in payload.items() if key not in {"at", "notify"}}
+    return {key: value for key, value in payload.items() if key not in {"at", "notify", "notify_chat"}}
 
 
 def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
     """Write one receipt. An alert or capped outcome also sends one out-of-band Telegram alert per
-    action, outcome and reason per hour; an identical receipt inside the hour is not rewritten."""
+    action, outcome and reason per hour, at most MAX_ALERTS_PER_HOUR in all. An identical receipt
+    inside the hour is reused, not duplicated."""
     directory = home / "logs" / "guardian"
     directory.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
@@ -126,7 +129,7 @@ def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
     if generations is not None:
         payload.setdefault("generations", generations)
     key = (action, outcome, payload.get("reason"))
-    duplicate, notified = None, False
+    duplicate, notified, sent = None, False, 0
     for prior in directory.glob("*.json"):
         try:
             if prior.stat().st_mtime < cutoff:
@@ -137,21 +140,29 @@ def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
             old = json.loads(prior.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             continue
-        if (old.get("action"), old.get("outcome"), old.get("reason")) == key and old.get("notify") not in (
-                None, *gateway_guardian_alert.DEFERRED):
+        attempted = old.get("notify") not in (None, "hourly-cap", *gateway_guardian_alert.DEFERRED)
+        sent += attempted
+        if (old.get("action"), old.get("outcome"), old.get("reason")) == key and attempted:
             notified = True
         if _comparable(old) == _comparable(payload):
             duplicate = (prior, old)
-    if outcome in ALERTING and not notified:
-        payload["notify"] = gateway_guardian_alert.notify(home, payload)
+    send = outcome in ALERTING and not notified
     if duplicate is not None:
-        prior, old = duplicate
-        if "notify" in payload and old.get("notify") != payload["notify"]:
-            prior.write_text(json.dumps({**old, "notify": payload["notify"]}, sort_keys=True) + "\n",
-                             encoding="utf-8")
-        return prior
-    path = directory / f"{now.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
+        path, payload = duplicate[0], dict(duplicate[1])
+        if (not send or (payload.get("notify") == "hourly-cap" and sent >= MAX_ALERTS_PER_HOUR)
+                or (payload.get("notify") == "flood"
+                    and gateway_guardian_alert.flood_active(home, payload.get("notify_chat")))):
+            return path  # Unchanged: its mtime keeps bounding the hourly window.
+    else:
+        path = directory / f"{now.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
+    if send:
+        # Written before sending: a tick killed mid-send leaves "pending", which is never resent.
+        payload["notify"] = "pending" if sent < MAX_ALERTS_PER_HOUR else "hourly-cap"
+        send = payload["notify"] == "pending"
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    if send:
+        payload["notify"] = gateway_guardian_alert.notify(home, payload)
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 
@@ -352,7 +363,7 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
         if not _regenerate_service_plist(home, plist):
             receipt(home, "regenerate", "alert", reason="gateway plist could not be regenerated", label=label)
             return "alert"
-        receipt(home, "regenerate", "repaired", label=label, plist=str(plist))
+        receipt(home, "regenerate", "written", label=label, plist=str(plist))
         regenerated = True
     definition = plistlib.loads(plist.read_bytes())
     if (definition.get("Label") != label or
@@ -439,6 +450,8 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
             return "waiting"
         from hermes_cli.gateway_launchd_generation import refresh_generation_scope
         refresh_generation_scope(plist)
+    if intent_path(home).exists() or reload_pending(home) is not None:
+        return "stopped" if intent_path(home).exists() else "waiting"  # Changed during this tick.
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
               timeout=_remaining(deadline, 10))
     while gateway_deadline.now() < deadline:
@@ -486,6 +499,8 @@ def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=N
         receipt(home, "bootout", "cleaned", label=label)
         return "cleaned"
     refresh_generation_scope(plist)
+    if intent_path(home).exists() or reload_pending(home) is not None:
+        return "stopped" if intent_path(home).exists() else "waiting"  # Changed during this tick.
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
               timeout=_remaining(deadline, 10))
     while gateway_deadline.now() < deadline:
