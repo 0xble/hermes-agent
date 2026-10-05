@@ -1260,6 +1260,7 @@ class TestSyncTurn:
             CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE,
             CONTINUATION_PROMPT_TEMPLATE,
             CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+            CONTINUATION_REVISIONS_TEMPLATE,
             KANBAN_GOAL_CONTINUATION_TEMPLATE,
         )
 
@@ -1270,12 +1271,16 @@ class TestSyncTurn:
             goal="Ship the change", command="./bin/ci gate", exit_code=1,
             attempt=1, max_retries=3, output="test failed")
         kanban = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason="the review is incomplete")
-        for prompt in (plain, contract, failed, kanban):
+        revised = plain + CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines="- Keep the original boundary.")
+        for prompt in (plain, contract, failed, kanban, revised):
             assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
 
         request = "Remember the design decision."
         assert filter_retain_messages(plain + "\n\n" + request, "[SILENT]") == (request, None)
         assert filter_retain_messages(plain + format_steer_marker(request), "[SILENT]") == (request, None)
+        marker_quote = "I quoted: When in doubt, honor the earlier requirement. Keep this note."
+        assert filter_retain_messages(revised + "\n\n" + marker_quote, "[SILENT]") == (marker_quote, None)
+        assert filter_retain_messages("human text", plain) == ("human text", plain)
 
     def test_retain_filter_drops_recalled_context_and_status_only_assistant(self):
         user, assistant = filter_retain_messages(

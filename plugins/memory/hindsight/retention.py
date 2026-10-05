@@ -34,12 +34,13 @@ _MACHINE_NOTICE_PREFIXES = (*PROCESS_NOTICE_OPENERS, AUTO_RESUME_NOTICE_OPEN, *_
 # Synthetic turn templates are user-visible prompts but not user-authored durable signal. Keep the
 # exact generated opening and terminal sentence here so a human suffix can survive without ever
 # retaining the injected goal/task/heartbeat payload itself.
+_GOAL_REVISIONS_END_MARKER = "When in doubt, honor the earlier requirement."
 _INJECTED_TURN_END_MARKERS = (
-    "If you are blocked and need input from the user, say so clearly and stop.",
-    "If you hit the stated stop condition or are otherwise blocked and need user input, say so clearly and stop.",
-    "When in doubt, honor the earlier requirement.",
-    "If the gate itself is wrong or cannot pass, say so clearly and stop.",
-    "Do not stop without calling one of them.",
+    "(exact identifiers or output lines from tool results, in backticks), and stop. If you are blocked and need input from the user, say so clearly and stop.",
+    "Before claiming the goal is done, audit each Verification item against current state and end with an Evidence section that quotes exact identifiers or output lines from tool results in backticks (commit SHAs, run ids, URLs, `N passed` lines), so the runtime can locate them. If you hit the stated stop condition or are otherwise blocked and need user input, say so clearly and stop.",
+    "If you believe the goal and every additional criterion are complete, state so explicitly and stop. If you are blocked and need input from the user, say so clearly and stop.",
+    "Fix the underlying problem so this gate passes, then re-run it to confirm. Do not declare the goal complete while any gate fails. If the gate itself is wrong or cannot pass, say so clearly and stop.",
+    "Take the next concrete step toward completing the task. When the work is genuinely finished, call kanban_complete with a summary. If it is a code change that needs same-card review before counting as done, call kanban_request_review with a summary instead. If you are blocked and need human input, call kanban_block with a reason. Do not stop without calling one of them.",
     "If there is nothing meaningful to do or report for this instruction right now, reply briefly that nothing has changed and stop — do not invent work.",
     f"If the task is now complete, no longer applicable, or the thing you were watching has finished, say so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — that stops the loop.",
     f"If the stop condition is met, or the task is no longer applicable, say so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — that stops the loop.",
@@ -60,14 +61,41 @@ def _user_after_injected_turn(content: str) -> str | None:
             return content
         # Heartbeat interval and loop tick/cadence are generated fields. Require their generated
         # line shape so a human's merely similar bracketed text is not classified as machine input.
-        if heartbeat and (content.find("]\n") <= len(HEARTBEAT_PROMPT_PREFIX)):
-            return content
-        if loop and not (content.startswith(WAKEUP_PROMPT_PREFIX) and content.split("]\n", 1)[0][len(WAKEUP_PROMPT_PREFIX):].split(", ", 1)[0].isdigit() and content.split("]\n", 1)[1].startswith("Recurring task:")):
-            return content
+        header, separator, remainder = content.partition("]\n")
+        if heartbeat:
+            interval = header[len(HEARTBEAT_PROMPT_PREFIX):]
+            if not separator or not re.fullmatch(r"\d+[smhd]", interval):
+                return content
+        else:
+            tick_and_cadence = header[len(WAKEUP_PROMPT_PREFIX):]
+            tick, separator_cadence, cadence = tick_and_cadence.partition(", ")
+            valid_cadence = (
+                cadence == "self-paced"
+                or bool(re.fullmatch(r"self-paced, currently \d+[smhd]", cadence))
+                or bool(re.fullmatch(r"every \d+[smhd]", cadence))
+            )
+            if not separator or not remainder.startswith("Recurring task:") or not tick.isdigit() or (
+                separator_cadence and not valid_cadence
+            ) or (not separator_cadence and cadence):
+                return content
 
     marker_end = -1
-    for marker in _INJECTED_TURN_END_MARKERS:
-        marker_end = max(marker_end, content.rfind(marker) + len(marker))
+    if content.startswith((GOAL_CONTINUATION_PREFIX, GOAL_GATE_FAILED_PREFIX)):
+        revisions_start = content.find("\n\nThis goal has been revised.")
+        if revisions_start >= 0:
+            revision_end = content.find(_GOAL_REVISIONS_END_MARKER, revisions_start)
+            if revision_end >= 0:
+                revisions_end = revision_end + len(_GOAL_REVISIONS_END_MARKER)
+                suffix_boundary = content.find("\n\n", revisions_end)
+                marker_end = suffix_boundary if suffix_boundary >= 0 else len(content)
+    if marker_end < 0:
+        marker_positions = [
+            (position, marker) for marker in _INJECTED_TURN_END_MARKERS
+            if (position := content.find(marker)) >= 0
+        ]
+        if marker_positions:
+            marker_start, marker = min(marker_positions)
+            marker_end = marker_start + len(marker)
     if marker_end < 0:
         # A truncated or unrecognized synthetic block has no trustworthy boundary.
         return None
@@ -115,11 +143,12 @@ def _clean_message(content: str, *, preserve_unmatched_literal: bool = False) ->
     return cleaned.strip()
 
 
-def _user_after_machine_notice(content: str) -> str | None:
+def _user_after_machine_notice(content: str, *, include_injected: bool = True) -> str | None:
     """Keep only text after a machine formatter boundary, never its untrusted payload."""
-    injected = _user_after_injected_turn(content)
-    if injected != content:
-        return injected
+    if include_injected:
+        injected = _user_after_injected_turn(content)
+        if injected != content:
+            return injected
     if not content.startswith(_MACHINE_NOTICE_PREFIXES):
         return content
     if content.startswith(PROCESS_NOTICE_OPEN) and f"\n{PROCESS_NOTIFICATION_END}" not in content:
@@ -151,7 +180,8 @@ def _user_after_machine_notice(content: str) -> str | None:
 
 
 def _is_machine_notice(content: str) -> bool:
-    return _user_after_machine_notice(content) is None
+    # Synthetic-turn filtering is user-side only; assistant text keeps the historical notice rules.
+    return _user_after_machine_notice(content, include_injected=False) is None
 
 
 def _is_assistant_status_only(content: str) -> bool:
