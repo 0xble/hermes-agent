@@ -15,6 +15,9 @@ def test_registered_agent_origin_headers_match_only_as_the_first_full_line():
     assert not is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1")
     assert not is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1 extra=value]" )
     assert not is_agent_origin_text("body\n[relay from=x receipt=y]\n\n[relay from=z receipt=q]")
+    # Same value class as relay's own parser: a value may not contain "]".
+    assert not is_agent_origin_text("[relay from=a] receipt=b]\nbody")
+    assert is_agent_origin_text("[relay from=hermes:default/20261005_123248_1ad0e297 receipt=59666700-260a-4356-8533-8d889ca51de4]\nbody")
 
 
 def test_exact_silence_tokens_are_intentional_silence():

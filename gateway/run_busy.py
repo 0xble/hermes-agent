@@ -1133,7 +1133,14 @@ class GatewayBusySessionMixin:
             return t("gateway.steer.failed", error=exc)
         if not accepted:
             return t("gateway.steer.rejected_empty")
+        # Admission saw "/steer <header>", so mark agent origin on the stripped text before the
+        # fold; otherwise absorbing an unknown expectation resets a relay turn's False to None.
+        agent_origin = is_agent_origin_text(steer_text)
+        if agent_origin and event.reply_expected is not True:
+            event.reply_expected = False
         self._fold_into_running_turn(running_agent, quick_key, event)
+        if agent_origin:
+            return None
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)
                   else t("gateway.steer.target_run"))

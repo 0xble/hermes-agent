@@ -105,6 +105,24 @@ async def test_a_turn_that_takes_in_an_addressed_message_keeps_the_silence_fallb
 
 
 @pytest.mark.asyncio
+async def test_accepted_relay_steer_keeps_a_relay_turn_unaddressed_and_sends_no_ack():
+    """Relay sends "/steer <header>"; admission sees the slash and cannot mark it. Folding an
+    unknown expectation into a relay-opened turn used to reset False to None, so a bare NO_REPLY
+    posted the visible fallback again."""
+    runner = GatewayRunner(config=GatewayConfig())
+    receiver = Receiver()
+    opening, ctx, incoming, source = _running_turn(runner, "key", receiver)
+    opening.reply_expected = ctx.reply_expected = False
+    incoming.text = "/steer [relay from=agent@example.com receipt=receipt-2]\nplease also check this"
+
+    reply = await runner._busy_steer_command(incoming, "key", source)
+
+    assert reply is None
+    assert incoming.reply_expected is False
+    assert (opening.reply_expected, ctx.reply_expected) == (False, False)
+
+
+@pytest.mark.asyncio
 async def test_steer_queue_fallback_marks_relay_origin_unaddressed():
     runner = GatewayRunner(config=GatewayConfig())
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
