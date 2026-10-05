@@ -1445,6 +1445,8 @@ def _real_media_tag_spans(masked: str) -> list:
 
 _FENCED_CODE_RE = re.compile(r'```[^\n]*\n.*?```', re.DOTALL)
 _INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
+# A tool preview that is exactly one http(s) URL stays plain text so platform auto-linking keeps it tappable.
+_BARE_HTTP_URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
 
 
 def _code_spans(content: str) -> list:
@@ -2189,18 +2191,21 @@ class BasePlatformAdapter(ABC):
         from gateway.stream_events import ToolCallChunk
         if not isinstance(event, ToolCallChunk):
             return None
-        from agent.display import get_tool_emoji, prepare_tool_preview
-        emoji, tool = get_tool_emoji(event.tool_name, default='⚙️'), event.tool_name
+        from agent.display import prepare_tool_preview, progress_tool_label
+        emoji, label = progress_tool_label(event.tool_name, default='⚙️')
+        literal = self.format_progress_literal
+        tool = literal(label)
         if mode == "verbose" and event.args:
             import json
             args_str = json.dumps(event.args, ensure_ascii=False, default=str)
             if preview_max_len > 0 and len(args_str) > preview_max_len:
                 args_str = args_str[:preview_max_len - 3] + "..."
-            return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool, keys=list(event.args.keys()), args=args_str)
+            return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool,
+                     keys=literal(str(list(event.args.keys()))), args=literal(args_str))
         if not event.preview:
             return t("gateway.progress.tool_pending", emoji=emoji, tool=tool)
         if mode == "verbose":
-            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=event.preview)
+            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=literal(event.preview))
         # "all" / "new": short capped preview (default 40; progress bubbles persist as messages).
         cap = preview_max_len if preview_max_len > 0 else 40
         prepared = prepare_tool_preview(
@@ -2208,10 +2213,19 @@ class BasePlatformAdapter(ABC):
         return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=self.format_tool_preview(prepared))
 
 
+    def format_progress_literal(self, text: str) -> str:
+        """Markup that shows ``text`` (a tool name, argument preview or args dump) verbatim in a
+        tool-progress line. Identity here; adapters that parse progress text as Markdown override it
+        so ``mcp__a__b``, ``**/*.md`` or ``\\s+`` are not read as formatting."""
+        return text
+
     def format_tool_preview(self, preview: "ToolPreview") -> str:
         """Platform-native formatting of a compact tool preview; rich-text adapters may use
-        the preview's metadata (e.g. a URL shortened for display)."""
-        return preview.text
+        the preview's metadata (e.g. a URL shortened for display). A URL preview stays plain text so
+        platform auto-linking keeps it tappable; anything else goes through ``format_progress_literal``."""
+        if preview.url or _BARE_HTTP_URL_RE.fullmatch(preview.text):
+            return preview.text
+        return self.format_progress_literal(preview.text)
 
     has_fatal_error = property(lambda self: self._fatal_error_message is not None)
     fatal_error_message = property(lambda self: self._fatal_error_message)
