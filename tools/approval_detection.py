@@ -874,7 +874,7 @@ _HERMES_CLI_VALUE_FLAGS_FALLBACK = frozenset({
     "-c", "--continue",
 })
 _HERMES_CLI_OPTION_FLAGS_FALLBACK = _HERMES_CLI_VALUE_FLAGS_FALLBACK | frozenset({
-    "-V", "--version", "--no-restore-cwd", "--worktree", "-w", "--accept-hooks", "--yolo",
+    "-V", "--version", "-h", "--help", "--no-restore-cwd", "--worktree", "-w", "--accept-hooks", "--yolo",
     "--pass-session-id", "--ignore-user-config", "--ignore-rules", "--safe-mode", "--tui",
     "--native", "--tui-native", "--cli", "--dev",
 })
