@@ -2331,18 +2331,16 @@ class GoalManager:
             self._save()
         return _decision("active", False, None, verdict, state.waiting_reason or self._waiting_target(state), message)
 
-    def _waiting_decision(self, state: GoalState, *, suppress_notice: bool = False) -> Dict[str, Any]:
+    def _waiting_decision(self, state: GoalState) -> Dict[str, Any]:
         tgt = self._waiting_target(state)
         reason = state.waiting_reason or tgt
         return self._wait_notice_decision(
             state, verdict="waiting",
             message=f"⏳ Goal parked — waiting on {tgt}: {reason}",
-            notify=not suppress_notice,
         )
 
     def _apply_wait_directive(
         self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0,
-        suppress_notice: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
@@ -2367,7 +2365,6 @@ class GoalManager:
         return self._wait_notice_decision(
             state, verdict="wait",
             message=f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
-            notify=not suppress_notice,
         )
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
@@ -2382,14 +2379,13 @@ class GoalManager:
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
-        suppress_wait_notice: bool = False,
     ) -> Dict[str, Any]:
         """Evaluate an isolated snapshot and atomically commit against its durable state."""
         from hermes_cli.goals_evaluation import evaluate_goal_snapshot
         return evaluate_goal_snapshot(
             self, last_response, user_initiated=user_initiated,
             background_processes=background_processes, active_delegations=active_delegations,
-            evidence_session_id=evidence_session_id, suppress_wait_notice=suppress_wait_notice,
+            evidence_session_id=evidence_session_id,
         )
 
     def _evaluate_after_turn(
@@ -2397,7 +2393,6 @@ class GoalManager:
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
-        suppress_wait_notice: bool = False,
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
@@ -2411,7 +2406,7 @@ class GoalManager:
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
-            return self._waiting_decision(state, suppress_notice=suppress_wait_notice)
+            return self._waiting_decision(state)
 
         state.turns_used += 1
         state.last_turn_at = time.time()
@@ -2462,7 +2457,6 @@ class GoalManager:
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(
                 wait_directive, reason, active_delegations=active_delegations,
-                suppress_notice=suppress_wait_notice,
             )
             if parked is not None:
                 return parked

@@ -352,36 +352,3 @@ async def test_parked_goal_notice_is_deduplicated_and_persisted(hermes_home):
         session_entry=session_entry, source=src, final_response="changed wait",
     )
     assert len(adapter.callback_registrations) == 2
-
-
-@pytest.mark.asyncio
-async def test_internal_no_reply_does_not_emit_parked_goal_notice(hermes_home):
-    runner, adapter, session_entry, src = _make_runner_with_adapter(callbacks=True)
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager(session_entry.session_id)
-    mgr.set("finish the task")
-    mgr.wait_for_seconds(600, reason="waiting for build")
-
-    await runner._post_turn_goal_continuation(
-        session_entry=session_entry, source=src, final_response="NO_REPLY", is_internal=True,
-    )
-
-    assert adapter.callback_registrations == []
-    assert GoalManager(session_entry.session_id).state.last_wait_notice_key is None
-
-
-@pytest.mark.asyncio
-async def test_internal_no_reply_keeps_non_parked_goal_notice(hermes_home):
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
-    from hermes_cli.goals import GoalManager
-
-    GoalManager(session_entry.session_id).set("finish the task")
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "all work is complete", False, None, False)):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry, source=src, final_response="NO_REPLY", is_internal=True,
-        )
-        await _drain_until(lambda: adapter.sends)
-
-    assert len(adapter.sends) == 1
-    assert "achieved" in adapter.sends[0]["content"].lower()
