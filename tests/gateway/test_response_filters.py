@@ -1,8 +1,20 @@
 from gateway.response_filters import (
+    is_agent_origin_text,
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
 )
+
+
+def test_registered_agent_origin_headers_match_only_as_the_first_full_line():
+    header = "[relay from=agent@example.com receipt=receipt-1]"
+    assert is_agent_origin_text(header)
+    assert is_agent_origin_text(f"  \n{header}\nbody")
+    assert is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1 task=task-1]\nbody")
+    assert not is_agent_origin_text(f"body\n{header}")
+    assert not is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1")
+    assert not is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1 extra=value]" )
+    assert not is_agent_origin_text("body\n[relay from=x receipt=y]\n\n[relay from=z receipt=q]")
 
 
 def test_exact_silence_tokens_are_intentional_silence():

@@ -316,6 +316,8 @@ class GatewayInboundMixin:
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        event = apply_agent_origin_reply_expectation(event)
         source = event.source
 
         if not self._is_user_authorized_for_source(source):

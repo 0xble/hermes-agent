@@ -102,3 +102,40 @@ async def test_a_turn_that_takes_in_an_addressed_message_keeps_the_silence_fallb
         assert outcome.redirected or outcome.steered
 
     assert (opening.reply_expected, ctx.reply_expected) == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_steer_queue_fallback_marks_relay_origin_unaddressed():
+    runner = GatewayRunner(config=GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
+    queued = []
+    runner._delivery_adapter_for = lambda _source: object()
+    runner._enqueue_fifo = lambda _key, queued_event, _adapter: queued.append(queued_event)
+    runner._peek_session_state = lambda _key: None
+    event = MessageEvent(
+        text="/steer [relay from=agent@example.com receipt=receipt-1]\nplease handle this",
+        source=source, message_id="steer-1",
+    )
+
+    reply = await runner._busy_steer_command(event, "key", source)
+
+    assert reply is None
+    assert len(queued) == 1
+    assert queued[0].reply_expected is False
+
+
+@pytest.mark.asyncio
+async def test_typed_steer_queue_fallback_keeps_its_ack():
+    runner = GatewayRunner(config=GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
+    queued = []
+    runner._delivery_adapter_for = lambda source: object()
+    runner._enqueue_fifo = lambda session_key, queued_event, adapter: queued.append(queued_event)
+    runner._peek_session_state = lambda session_key: None
+    event = MessageEvent(text="/steer please handle this", source=source, message_id="steer-2")
+
+    reply = await runner._busy_steer_command(event, "key", source)
+
+    assert reply == "No active agent — /steer queued for the next turn."
+    assert len(queued) == 1
+    assert queued[0].reply_expected is None

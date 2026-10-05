@@ -6,19 +6,48 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any, Optional
 
-# Exact whole-response markers meaning "the agent intentionally chose not to
-# reply". Keep small and explicit; arbitrary empty output remains an
+_AGENT_ORIGIN_HEADERS = (re.compile(r"^\[relay from=\S+ receipt=\S+( task=\S+)?\]$"),)
+
+
+def is_agent_origin_text(text: Any) -> bool:
+    """True when the first non-whitespace line is a complete registered agent-origin header."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0]
+    return any(pattern.fullmatch(first_line) for pattern in _AGENT_ORIGIN_HEADERS)
+
+
+def apply_agent_origin_reply_expectation(event: Any) -> Any:
+    """Mark agent-origin events as not requiring a reply without overriding an explicit True."""
+    if getattr(event, "reply_expected", None) is not True and is_agent_origin_text(
+        getattr(event, "text", "")
+    ):
+        event.reply_expected = False
+    return event
+
+
+# Exact whole-response markers meaning "the agent intentionally chose not to reply". Keep small and explicit; arbitrary empty output remains an
 # error/empty-response path, not silence. A lane that does not think in English
 # translates the sentinel rather than dropping it, and the whole control token
 # then reaches the user as content, so the translated forms are carried here
 # too. zh-Hans is the only non-English locale this project ships documentation
 # for, which is where the list stops.
 LIVE_GATEWAY_SILENT_MARKERS = frozenset({
-    "[SILENT]", "SILENT", "NO_REPLY", "NO REPLY",
-    "[静默]", "静默", "[沉默]", "沉默",
+    "[SILENT]",
+    "SILENT",
+    "NO_REPLY",
+    "NO REPLY",
+    "[静默]",
+    "静默",
+    "[沉默]",
+    "沉默",
 })
 
 # Bracketed markers drive the autonomous lane's prefix rule ("[SILENT] nothing
@@ -72,7 +101,10 @@ def is_intentional_silence_response(response: Any) -> bool:
     Prose that merely mentions ``NO_REPLY`` must be delivered normally. A blank
     response is not silence either — that is the empty-response failure path.
     """
-    return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
+    return any(
+        c in LIVE_GATEWAY_SILENT_MARKERS
+        for c in _canonical_silence_candidates(response)
+    )
 
 
 def is_autonomous_silence_response(response: Any) -> bool:
@@ -96,9 +128,15 @@ def is_autonomous_silence_response(response: Any) -> bool:
     )
 
 
-def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
+def is_intentional_silence_agent_result(
+    agent_result: dict | None, response: Any
+) -> bool:
     """Silence markers suppress delivery only for successful agent turns."""
-    return isinstance(agent_result, dict) and not agent_result.get("failed") and is_intentional_silence_response(response)
+    return (
+        isinstance(agent_result, dict)
+        and not agent_result.get("failed")
+        and is_intentional_silence_response(response)
+    )
 
 
 def display_kind_for_event(event: Any) -> str | None:
@@ -108,7 +146,9 @@ def display_kind_for_event(event: Any) -> str | None:
     by the gateway poller, never inferred from inbound text), but it deliberately stays
     non-internal so authorization and the emergency stop still apply to it.
     """
-    if getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None):
+    if getattr(event, "internal", False) or getattr(
+        event, "_heartbeat_session_id", None
+    ):
         return INTERNAL_NOTIFICATION_DISPLAY_KIND
     return None
 

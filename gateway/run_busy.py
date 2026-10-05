@@ -19,6 +19,7 @@ from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.response_filters import apply_agent_origin_reply_expectation, is_agent_origin_text
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1077,7 +1078,7 @@ class GatewayBusySessionMixin:
             return t("gateway.queue.usage")
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            self._enqueue_fifo(quick_key, MessageEvent(
+            queued_event = MessageEvent(
                 text=queued_text, message_type=event.message_type if has_media else MessageType.TEXT,
                 source=event.source, raw_message=event.raw_message, message_id=event.message_id,
                 media_urls=list(getattr(event, "media_urls", []) or []),
@@ -1089,7 +1090,11 @@ class GatewayBusySessionMixin:
                 reply_to_is_own_message=event.reply_to_is_own_message, auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt, channel_context=event.channel_context,
                 internal=event.internal, timestamp=event.timestamp,
-            ), adapter)
+                reply_expected=event.reply_expected,
+            )
+            self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+            if is_agent_origin_text(queued_event.text):
+                return None
         depth = self._queue_depth(quick_key, adapter=adapter)
         return t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
 
@@ -1103,15 +1108,18 @@ class GatewayBusySessionMixin:
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
 
-        def _queue_fallback(reply: str) -> str:
+        def _queue_fallback(reply: str) -> Optional[str]:
             # Turn-boundary fallback: queue the steer text as its own follow-up turn.
             adapter = self._delivery_adapter_for(source)
             if adapter:
-                self._enqueue_fifo(quick_key, MessageEvent(
+                queued_event = MessageEvent(
                     text=steer_text, message_type=MessageType.TEXT, source=event.source,
                     message_id=event.message_id, channel_prompt=event.channel_prompt,
-                    channel_context=event.channel_context,
-                ), adapter)
+                    channel_context=event.channel_context, reply_expected=event.reply_expected,
+                )
+                self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+                if is_agent_origin_text(queued_event.text):
+                    return None
             return reply
 
         if running_agent is _AGENT_PENDING_SENTINEL:
