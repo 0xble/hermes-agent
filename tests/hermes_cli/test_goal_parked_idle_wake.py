@@ -82,6 +82,7 @@ def test_age_cap_rearms_a_still_running_wait(hermes_home, monkeypatch):
     mgr.state.barrier_recheck_at = 0.0
     mgr._save()
     monkeypatch.setattr(goals, "_process_outcome", lambda sid: {"running": True})
+    mgr.rearm_live_barrier()
     prompt = mgr.lifted_barrier_prompt()
     assert prompt is None
     assert mgr.is_waiting() is True

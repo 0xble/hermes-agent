@@ -45,13 +45,13 @@ real admitted input is `True`, while goal continuation, idle wake, and internal
 notification turns are `False`. This keeps the no-progress counter on the real
 production paths instead of relying on direct test calls with a default.
 
-The counter fingerprints only stable evidence from the current turn. Quality-
-gate
-rows are excluded from that fingerprint (their pass output is still supplied to
-the judge), and the read-only-status test examines only rows added by this turn.
-Three consecutive synthetic CONTINUE decisions with the same reason and no new
-progress park the goal with escalating bounded timed waits; any new evidence or
-real user turn resets the streak.
+The counter examines only evidence rows recorded during the current turn.
+Quality-gate rows are excluded from its fingerprint (their pass output is still
+supplied to the judge). An automatic CONTINUE with no evidence or only bounded
+read-only/status calls counts toward the streak regardless of judge wording or
+changing command output; actionable evidence and real user turns reset it. Three
+such turns park the goal with escalating bounded timed waits. The read-only
+classifier rejects shell redirects and pipes, including `cat a > b` and `| tee`.
 
 ### Live-barrier lifetime
 
@@ -59,17 +59,21 @@ A live pid/session target is the authoritative wake source. While it is alive,
 keep the barrier armed and re-arm its next liveness check with escalating
 backoff; do not wake the agent merely because a 30-minute probe window elapsed.
 The first time a wait exceeds 30 minutes, emit one user-visible notice, deduped
-by S1's durable `last_wait_notice_key`. Use a separate `barrier_recheck_at`
-deadline so `waiting_until` retains its existing timed-wait meaning and pid/
-session readers continue to show the target. At six hours, pause the goal with a
-clear blocker notice naming the still-live pid/session. If the target has exited,
-clear the barrier and resume promptly, including the existing receipt-based
-restart/idle-wake path.
+by a dedicated `last_age_notice_key`; S1's `last_wait_notice_key` remains solely
+for parked notices, and continuation notices use `last_continuation_notice_key`.
+The initial `barrier_recheck_at` is derived lazily from `waiting_since` and is
+not persisted at park time, so CLI, gateway, and TUI produce identical durable
+state. At six hours, pause the goal with a clear blocker notice naming the
+still-live pid/session. If the target has exited, clear the barrier and resume
+promptly, including the existing receipt-based restart/idle-wake path.
 
-`lifted_barrier_prompt` remains pure: it only reads state and returns a prompt.
-Any re-arm persistence uses a CAS-style conditional update keyed by the original
-`waiting_since` (the same pattern as `clear_goal_wait_if_since`), so a concurrent
-pause, clear, or re-park wins rather than being overwritten by a blind save.
+`is_waiting()` is read-only. Idle surfaces explicitly call `rearm_live_barrier`,
+which persists due notices and escalating probe deadlines with a CAS keyed by the
+original `waiting_since`. During an evaluator snapshot, due age notices and the
+six-hour pause are staged on the isolated state and committed through the normal
+optimistic evaluator commit, returning directly without a judge call or turn
+increment. This prevents an evaluator CAS conflict from losing the notice or
+burning a user turn.
 
 Old goal rows load with zero/empty defaults; no schema migration is needed.
 
@@ -79,13 +83,15 @@ Old goal rows load with zero/empty defaults; no schema migration is needed.
 | --- | --- |
 | Synthetic production continuation counts as automatic | `test_gateway_goal_continuation_uses_synthetic_provenance` |
 | Three no-progress turns park with escalating backoff | `test_three_qualifying_no_progress_turns_back_off_and_persist` |
-| 30-minute live-wait notice is emitted once | `test_live_barrier_emits_one_age_notice` |
-| Six-hour live wait pauses with target named | `test_live_barrier_pauses_at_hard_ceiling` |
+| 30-minute live-wait notice is emitted once | `test_live_barrier_emits_one_age_notice`, `test_user_turn_at_age_cap_stages_notice_without_conflict` |
+| Six-hour live wait pauses with target named and no judge call | `test_live_barrier_pauses_at_hard_ceiling`, `test_user_turn_at_hard_cap_pauses_without_judge` |
+| Age notice does not disturb parked-notice dedupe | `test_age_notice_does_not_repost_parked_notice` |
+| Three read-only automatic turns back off despite changed output/reasons | `test_read_only_status_turns_back_off_with_varied_results` |
 | CAS loss leaves a concurrent re-park intact | `test_live_barrier_rearm_respects_cas_loss` |
 | Exited targets resume promptly | `test_restart_killed_process_lifts_barrier_with_a_factual_note`, `test_untracked_process_reports_unknown_outcome` |
 | Idle wake remains pure and clear is conditional | `test_clear_lifted_wait_respects_a_newer_repark_or_pause` |
 | Stable evidence excludes quality-gate timestamps and old rows | `test_quality_gate_rows_do_not_reset_no_progress` |
-| Read-only classification is scoped to this turn | `test_read_only_status_only_uses_new_rows` |
+| Read-only classification rejects redirects/pipes | `test_read_only_status_regex_rejects_destructive_variants` |
 | Judge prompt and command safety are correct | `test_judge_prompt_allows_external_scheduled_wait`, regex unit coverage |
 
 ## Verification

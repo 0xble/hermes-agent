@@ -13,8 +13,11 @@ case stayed parked for 14.5 hours.
 - `GoalManager.lifted_barrier_prompt()` is the single shared pure check and appends one factual line
   about an awaited process. Live pid/session barriers are refreshed separately with escalating
   backoff after 30 minutes, using `barrier_recheck_at` rather than `waiting_until` so target
-  presentation remains unchanged. The first age notice is deduped through `last_wait_notice_key`;
-  a still-live target pauses with a named blocker after six hours. The line is built from the live
+  presentation remains unchanged. The initial deadline is derived from `waiting_since` and is not
+  persisted at park time, keeping CLI, gateway, and TUI state identical. The first age notice is
+  deduped through `last_age_notice_key`; parked notices remain in `last_wait_notice_key`, and
+  continuation notices use `last_continuation_notice_key`. A still-live target pauses with a named
+  blocker after six hours.
   registry or, after a restart, the durable `logs/process-results` receipt: killed by a restart or
   shutdown, killed explicitly, finished with its exit code, or no longer tracked (outcome unknown).
 - Surfaces clear the barrier only after the continuation was admitted, through
@@ -49,7 +52,16 @@ barrier", or "goal parked forever" as of 2026-09-26.
 
 ## Verification
 
-Focused verification uses one-file pytest commands for the goal, gateway, TUI, and CLI surfaces listed in the patch record; the repository-wide `scripts/run_tests.sh` wrapper is intentionally not used here.
+- Focused verification uses exact one-file commands:
+  - `tests/hermes_cli/test_goal_parked_idle_wake.py`
+  - `tests/gateway/test_goal_continuation_drain.py`
+  - `tests/gateway/test_goal_parked_idle_wake.py`
+  - `tests/tui_gateway/test_goal_parked_idle_wake.py`
+  - `tests/hermes_cli/test_goals.py`
+  - `tests/hermes_cli/test_goal_external_wait_backoff.py`
+  - `tests/hermes_cli/test_goal_dispatch.py`
+  plus the related goal and session-control modules. The repository-wide
+  `scripts/run_tests.sh` wrapper is intentionally not used here.
 
 ## Retirement and rollback
 

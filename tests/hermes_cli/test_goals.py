@@ -563,6 +563,7 @@ class TestWaitBarrier:
             mgr.state.barrier_recheck_at = 0.0
             mgr._save()
             before = time.time()
+            mgr.rearm_live_barrier()
             assert mgr.is_waiting() is True
             assert mgr.state.waiting_on_pid == proc.pid
             assert mgr.state.barrier_recheck_at > before
@@ -763,6 +764,7 @@ class TestJudgeDrivenWait:
         # Force the deadline into the past → barrier auto-clears.
         mgr.state.waiting_until = time.time() - 1
         assert mgr.is_waiting() is False
+        mgr.stop_waiting()
         assert mgr.state.waiting_until == 0.0
 
     def test_continue_verdict_still_continues_with_background(self, hermes_home):

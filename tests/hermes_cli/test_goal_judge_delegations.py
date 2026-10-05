@@ -60,7 +60,9 @@ def test_a_delegation_wait_lifts_when_a_batch_returns_not_only_when_the_timer_ru
         mgr.wait_for_seconds(1200, reason="4 batches running", on_delegations=4)
         assert mgr.is_waiting() is True                     # all four still live: parked
     with patch.object(goals, "count_active_delegations", return_value=3):
-        assert mgr.is_waiting() is False                    # one returned: barrier lifted early
+        assert mgr.is_waiting() is False                    # one returned: barrier is observably lifted
+    assert mgr.state.waiting_until != 0.0                    # is_waiting is read-only
+    assert mgr.stop_waiting() is True
     assert mgr.state.waiting_until == 0.0 and mgr.state.waiting_on_delegations == 0
     # a plain timed wait (no delegations) is unaffected by the delegation count
     mgr.wait_for_seconds(1200, reason="cooldown")
