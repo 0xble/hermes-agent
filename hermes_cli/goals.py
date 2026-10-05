@@ -1376,8 +1376,16 @@ def _tail(text: str, limit: int) -> str:
     return text if len(text) <= limit else "[…] " + text[-limit:]
 
 
+class _EvidenceRows(list):
+    """Evidence entries plus whether the bounded SessionDB scan omitted rows."""
+
+    def __init__(self, entries: List[Dict[str, Any]], *, truncated: bool = False):
+        super().__init__(entries)
+        self.truncated = truncated
+
+
 def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
-                          max_entries: int = _EVIDENCE_MAX_ENTRIES) -> List[Dict[str, Any]]:
+                          max_entries: Optional[int] = _EVIDENCE_MAX_ENTRIES) -> List[Dict[str, Any]]:
     """Recent tool results from ``session_id`` recorded at or after ``since`` (oldest first).
 
     Each entry is ``{"tool", "call", "output", "timestamp"}``: the tool name, its arguments (from the
@@ -1390,10 +1398,13 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
     if db is None:
         return []
     try:
-        rows = db.get_messages(session_id, limit=_EVIDENCE_SCAN_ROWS, latest=True)
+        rows = db.get_messages(session_id, limit=_EVIDENCE_SCAN_ROWS + 1, latest=True)
     except Exception as exc:
         logger.debug("goal evidence: message read failed: %s", exc)
         return []
+    scan_truncated = len(rows) > _EVIDENCE_SCAN_ROWS
+    if scan_truncated:
+        rows = rows[-_EVIDENCE_SCAN_ROWS:]
     calls: Dict[str, Tuple[str, str]] = {}
     for row in rows:
         for call in (row.get("tool_calls") or []) if row.get("role") == "assistant" else []:
@@ -1423,7 +1434,8 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
             output = redact_sensitive_text(output, force=True)
         entries.append({"tool": name, "call": call_text, "output": output,
                         "timestamp": float(row.get("timestamp") or 0.0)})
-    return entries[-max_entries:]
+    selected = entries if max_entries is None else entries[-max_entries:]
+    return _EvidenceRows(selected, truncated=scan_truncated)
 
 
 def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Optional[str]:
@@ -1446,7 +1458,8 @@ def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Opti
 
 _READ_ONLY_STATUS_CALL_RE = re.compile(
     r"^(?![^\r\n]*[\r\n])(?!.*(?:>>|>|\||&&|\|\||;|`|\$\(|\n|\r|&|<\(|>\())"
-    r"(?!.*(?:\s-(?:exec|execdir|ok|fprint|fprintf|fls|delete)(?:\s|$)|\s--delete(?:\s|$)))"
+    r"(?!.*(?:\s-(?:exec|execdir|ok|fprint|fprint0|fprintf|fls|delete)(?:\s|$)|\s--delete(?:\s|$)))"
+    r"(?!.*(?:--ext-diff|--textconv)(?:\s|$))"
     r"(?!.*(?:--output)(?:=|\s|$))(?!.*(?:--pre)(?:=|\s|$))"
     r"(?:gh\s+(?:pr|run)\s+(?:view|checks|status|list)(?:\s+.*)?|"
     r"git\s+(?:status|diff|log|show|rev-parse)(?:\s+.*)?|"
@@ -1497,6 +1510,27 @@ def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_a
         if previous_turn_at <= 0.0 or timestamp > previous_turn_at:
             rows.append(item)
     return rows
+
+
+def _evidence_scan_truncated_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_at: float) -> bool:
+    """Whether the bounded evidence scan may have omitted rows from this turn.
+
+    A long transcript alone is not enough: older rows can fill the scan while the current
+    turn remains fully visible. If every returned row is newer than the previous-turn boundary,
+    the current turn may itself exceed the scan bound, so classify it as actionable.
+    """
+    if not bool(getattr(evidence, "truncated", False)):
+        return False
+    rows = [item for item in (evidence or []) if isinstance(item, dict)]
+    if previous_turn_at <= 0.0:
+        return True
+    timestamps = []
+    for item in rows:
+        try:
+            timestamps.append(float(item.get("timestamp") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return bool(timestamps) and all(timestamp > previous_turn_at for timestamp in timestamps)
 
 
 def _evidence_only_read_only_status(evidence: Optional[List[Dict[str, Any]]]) -> bool:
@@ -2135,6 +2169,8 @@ class GoalManager:
         self._state.paused_reason = None
         self._state.consecutive_disputes = 0
         self._state.last_dispute_evidence = ""
+        self._state.consecutive_no_progress = 0
+        self._state.backoff_level = 0
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
@@ -2788,8 +2824,12 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
-        evidence = collect_goal_evidence(evidence_session_id or self.session_id, since=state.created_at)
+        evidence = collect_goal_evidence(evidence_session_id or self.session_id, since=state.created_at, max_entries=None)
         turn_evidence = _evidence_for_turn(evidence, previous_turn_at)
+        evidence_scan_truncated_for_turn = _evidence_scan_truncated_for_turn(evidence, previous_turn_at)
+        # Keep the judge-facing ledger bounded even though progress classification needs the
+        # complete current-turn slice. A bounded scan that omitted rows fails closed below.
+        evidence = evidence[-_EVIDENCE_MAX_ENTRIES:]
         # Gates that just passed are deterministic evidence too, but their timestamp is a
         # presentation detail and must not affect no-progress identity.
         now = time.time()
@@ -2819,7 +2859,11 @@ class GoalManager:
         # wording or changing command output; a write/actionable result resets the streak.
         if progress_fingerprint:
             state.last_progress_fingerprint = progress_fingerprint
-        automatic_read_only = not user_initiated and _evidence_only_read_only_status(turn_evidence)
+        automatic_read_only = (
+            not user_initiated
+            and not evidence_scan_truncated_for_turn
+            and _evidence_only_read_only_status(turn_evidence)
+        )
         if automatic_read_only:
             # WAIT and CONTINUE share one durable no-progress streak. Changing status output,
             # judge wording, and a repeated parked turn are not actionable progress.
