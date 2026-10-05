@@ -2837,6 +2837,14 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    async def delete_messages(self, chat_id: str, message_ids: List[str]) -> Dict[str, bool]:
+        """Delete several sent messages; ``{message_id: deleted}``. The default deletes one by one;
+        platforms with a batch API override it so cleanup spends one request instead of N."""
+        results: Dict[str, bool] = {}
+        for message_id in message_ids:
+            results[str(message_id)] = await self.delete_message(chat_id, message_id)
+        return results
+
     def _get_ephemeral_system_ttl_default(self) -> int:
         """Default :class:`EphemeralReply` TTL from ``display.ephemeral_system_ttl``
         (``0`` = no auto-delete); non-fatal if config is unreadable."""

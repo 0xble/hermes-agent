@@ -68,14 +68,17 @@ _TELEGRAM_TRANSIENT_MARKERS = ("bad gateway", "502", "too many requests", "429",
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
-    """Retry delay in seconds, or None when final: honours ``retry_after``; timeouts are
-    never retried (the send may have gone through); 5xx/429 back off exponentially."""
+    """Retry delay in seconds, or None when final: honours a short ``retry_after`` (a long one is a
+    server penalty the durable flood store enforces, never slept off inline); timeouts are never
+    retried (the send may have gone through); 5xx/429 back off exponentially."""
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
         try:
-            return max(float(retry_after), 0.0)
+            wait = retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
         except (TypeError, ValueError):
             return 1.0
+        from plugins.platforms.telegram.adapter import _FLOOD_INLINE_WAIT_CAP_SECS
+        return max(wait, 0.0) if wait <= _FLOOD_INLINE_WAIT_CAP_SECS else None
     text = str(exc).lower()
     if "timed out" in text or "timeout" in text:
         return None
@@ -105,21 +108,48 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
+def _standalone_telegram_rate_limiter():
+    """Per-chat budget for the standalone lane, tied to the profile's durable flood store: a chat
+    under a known server penalty is refused locally and a new ``retry_after`` is persisted, so this
+    lane (cron fallback, out-of-gateway sends) cannot extend a ban the gateway is waiting out."""
+    from hermes_constants import get_hermes_home
+    from plugins.platforms.telegram import flood_state
+    from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget
+    profile_dir = get_hermes_home()
+
+    def penalty_remaining(key: str) -> float | None:
+        try:
+            remaining = max(flood_state.remaining_seconds(profile_dir, key),
+                            flood_state.fallback_remaining_seconds(profile_dir, key))
+        except Exception:
+            logger.warning("send_message: could not read Telegram flood deadline for chat %s", key, exc_info=True)
+            return 60.0  # an unreadable deadline is not evidence the penalty expired
+        return remaining if remaining > 0 else None
+
+    def on_retry_after(key: str, wait: float) -> None:
+        flood_state.record_deadline(profile_dir, key, wait)
+
+    return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining, on_retry_after=on_retry_after)
+
+
 def _telegram_bot(token):
-    """Bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
+    """Metered bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
     blocked); falls back to a direct connection."""
     from telegram import Bot
+    from plugins.platforms.telegram.chat_budget import MeteredBot
+    limiter = _standalone_telegram_rate_limiter()
     try:
         from gateway.platforms.base import resolve_proxy_url
         proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         if not proxy:
-            return Bot(token=token)
+            return MeteredBot(Bot(token=token), limiter)
         from telegram.request import HTTPXRequest
         logger.info("send_message: standalone Telegram send routed through proxy %s", proxy)
-        return Bot(token=token, request=HTTPXRequest(proxy=proxy), get_updates_request=HTTPXRequest(proxy=proxy))
+        return MeteredBot(Bot(token=token, request=HTTPXRequest(proxy=proxy),
+                              get_updates_request=HTTPXRequest(proxy=proxy)), limiter)
     except Exception as proxy_err:
         logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", proxy_err)
-    return Bot(token=token)
+    return MeteredBot(Bot(token=token), limiter)
 
 
 def _telegram_thread_kwargs(thread_id):
