@@ -180,6 +180,8 @@ gateway:
     label_normal: "NORMAAL"
     status_fast: "vinnig"
     status_normal: "normaal"
+    status_expiring: "\n\n⏱ Verval oor: {remaining}"
+    expired: "⚡ Vinnige modus is na {duration} afgeskakel."
     picker_title: "⚡ **Priority Processing**\\n\\nHuidige modus: `{mode}`\\n\\nKies \\'n opsie:"
     choice_fast: "fast — Priority Processing aan"
     choice_normal: "normal — standaardverwerking"
