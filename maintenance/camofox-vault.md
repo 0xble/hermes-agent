@@ -32,10 +32,16 @@ the browser vault fill tool, or the 1Password backends.
   it was already stopped. Successful release invalidates only Hermes's local tab ID,
   retaining the task's account binding. Busy (409) leaves it intact for retry; neither
   action exposes userId.
-- Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are
-  minted from Connect one-time-password fields, automatic 2FA is announced only when a code
-  can really be minted, an unusable OTP field never hides a usable one, and upstream
-  multi-origin metadata is preserved for Connect.
+- Login origin aliases are an agent-writable, exact-origin registry under `vault.origin_aliases`.
+  On `origin_mismatch`, the agent may run `hermes config set vault.origin_aliases.<item-id> '["https://origin.example"]'`;
+  `set` replaces that item's full alias list, so existing entries must be included. The active config is read on each
+  vault list/fill call, so this does not require a restart. Alias-only login fills prompt once per session with the
+  full origin and item label; cross-registrable-domain aliases warn with both domains. Declines and unanswered prompts
+  remain fail-closed for retries in the same session. Never rewrite a 1Password item to add a URL because template
+  rewrites can delete passkeys.
+- Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are minted from Connect
+  one-time-password fields, automatic 2FA is announced only when a code can really be minted, an unusable OTP field
+  never hides a usable one, and upstream multi-origin metadata is preserved for Connect.
 - Login forms inside open shadow roots (web-component inputs) are discovered and filled.
 - Service-account `op item get` passes `--vault`; the Connect read path stays ahead of the
   CLI selector.

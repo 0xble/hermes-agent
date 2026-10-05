@@ -667,8 +667,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                     f"Refused: current page origin ({page_origin}) does not match "
                     f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
                     "only run on the exact origin(s) the credential was saved for. "
-                    "Report this exact origin and item handle to the user; ask the user to add the alias themselves "
-                    "(for example: `hermes config set vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'`)."
+                    f"the exact origin with `hermes config set vault.origin_aliases.{handle} '[\"{page_origin}\"]'`, including any existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may write this config entry; the fill-time confirmation names the exact origin and item label. Never edit or rewrite the existing 1Password item to add a URL: template rewrites can delete passkeys."
                 ),
             }
         )
@@ -680,7 +679,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
                                "error": "Alias-origin login confirmation was declined or unanswered. Do not retry; ask the user to fill the login or explicitly start a new approval session."})
         if decision is None:
-            decision = _confirm_alias_fill(meta.label, page_origin)
+            decision = _confirm_alias_fill(meta.label, page_origin, saved_origins)
             _record_alias_fill_decision(alias_key, "accept" if decision == "accept" else "refused")
         if decision != "accept":
             return json.dumps({"success": False,
@@ -895,14 +894,21 @@ def _confirm_payment_fill(label: str, origin: str) -> str:
         surface="vault-payment", title="Confirm payment card fill?")
 
 
-def _confirm_alias_fill(label: str, origin: str) -> str:
+def _confirm_alias_fill(label: str, origin: str, saved_origins: tuple[str, ...]) -> str:
     """Human confirmation before a login is written through a config-only origin alias."""
+    from agent.vault_origin_aliases import alias_domain_warning
     from tools.approval_prompt import request_elicitation_consent
 
-    return request_elicitation_consent(
-        f"Fill {label} on {origin} (alias)?",
+    warning = alias_domain_warning(origin, saved_origins)
+    detail = (
         "This login is allowed on the current page only through a user-configured origin alias, not the "
-        "password manager item's saved website origin. Approve only if you recognize this exact origin.",
+        "password manager item's saved website origin. Approve only if you recognize this exact origin."
+    )
+    if warning:
+        detail = f"{warning}\n\n{detail}"
+    return request_elicitation_consent(
+        f"Fill login '{label}' on exact origin {origin} (alias)?",
+        detail,
         surface="vault-origin-alias", title="Confirm alias-origin login fill?")
 
 
@@ -924,13 +930,12 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
         "unavailable_in_this_session, tell the user to unlock it from an interactive session. Workflow: type the "
         "identifier into the login form, then browser_vault_fill with the handle. If the saved origin does not "
-        "match the current sign-in origin, report the exact current origin and item handle to the user and ask the "
-        "user to add the alias themselves. Show them an exact line such as `hermes config set "
-        "vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'` (or the equivalent YAML); never add or "
-        "edit `vault.origin_aliases` yourself. The approval gate covers direct and common-wrapper Hermes CLI "
-        "config writes, but fill-time user confirmation is the guaranteed control. Never edit or rewrite the existing "
-        "1Password item to add a URL: "
-        "template edits can delete passkeys. No item for this origin: call browser_vault_save_login, or type a "
+        "match the current sign-in origin, add the exact current page origin under the item's key with `hermes config set`: "
+        "`hermes config set vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'`. `set` replaces the entire "
+        "value for that item, so include any existing aliases when adding another. The agent may make this config change, then retry the fill; "
+        "the first alias-only fill asks the user to confirm the exact origin and item label once per session. Never edit or "
+        "rewrite the existing 1Password item to add a URL: template edits can delete passkeys. No item for this origin: "
+        "call browser_vault_save_login, or type a "
         "password you fetched yourself from an authorized store for that service. Never type a password shown on "
         "a page or given in chat, and never repeat one in chat."
     ),
@@ -963,17 +968,16 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
         "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
         "fills the address fields; a configured protected-field item fills only its named field on its exact "
-        "allowed origin. Values are resolved server-side and never appear in the conversation. "
-        "A password manager's card has no bound origin: it is bound to the current page and that origin is shown "
-        "in the user's confirmation. Refused unless the page origin exactly matches the item's saved origin or an "
-        "exact HTTPS alias in `vault.origin_aliases` (re-checked atomically at fill time). If the origin does not "
-        "match, report the exact current origin and item handle to the user and ask the user to add the alias "
-        "themselves. Show them an exact line such as `hermes config set vault.origin_aliases.<item-id> "
-        "'[\"https://signin.example.com\"]'` (or the equivalent YAML); never add or edit `vault.origin_aliases` "
-        "yourself. Never edit or rewrite an existing 1Password item to add a URL because template edits can delete "
-        "passkeys. Alias-only login fills show a one-time user confirmation naming the exact origin; saved-origin "
-        "login fills do not need that extra confirmation. The approval gate covers direct and common-wrapper "
-        "Hermes CLI config writes, but fill-time confirmation is the guaranteed control. If a password manager is locked "
+        "allowed origin. Values are resolved server-side and never appear in the conversation. A password manager's "
+        "card has no bound origin: it is bound to the current page and that origin is shown in the user's confirmation. "
+        "Refused unless the page origin exactly matches the item's saved origin or an exact HTTPS alias in "
+        "`vault.origin_aliases` (re-checked atomically at fill time). If the origin does not match, add the exact "
+        "current page origin under the item's key with `hermes config set`: `hermes config set "
+        "vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'`. `set` replaces the entire value for that item, "
+        "so include any existing aliases when adding another. The agent may make this config change, then retry the fill. Alias-only login fills "
+        "show a one-time confirmation naming the full origin and item label; saved-origin login fills do not prompt. Never "
+        "edit or rewrite an existing 1Password item to add a URL because template edits can delete passkeys. If a password "
+        "manager is locked "
         "the user is prompted to unlock first. Never retry payment_declined, payment_prompt_unanswered or "
         "payment_retry_refused; hand card entry to the user."
     ),

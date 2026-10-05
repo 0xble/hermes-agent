@@ -146,28 +146,24 @@ raw CDP (both target and frame routing) is refused while any protected browser r
 ### Login origin aliases
 
 A 1Password Login can be bound to more than one exact sign-in origin without
-rewriting the item. Add a handle or raw 1Password item ID under
-`vault.origin_aliases` in the active profile's Hermes config (normally
-`~/.hermes/config.yaml`):
+rewriting the item. When a fill returns `origin_mismatch`, the agent may add the
+exact page origin under the item handle or raw 1Password item ID with
+`hermes config set`:
 
-```yaml
-vault:
-  origin_aliases:
-    example-item-id:
-      - https://signin.example.com
-    another-example-item-id:
-      - https://accounts.example.com
-      - https://signin.example.net
+```shell
+hermes config set vault.origin_aliases.<item-id> '["https://signin.example.com"]'
 ```
 
-Aliases are HTTPS-only, exact-origin matches. Entries with a path, an `http` scheme,
-or a wildcard are ignored. Hermes does not infer parent or subdomain origins and
-applies an alias only to the named login. When a login needs another origin, add an alias here. An
-alias-only fill asks the user to confirm the exact origin once per session;
-saved-origin fills do not need that extra prompt. Never
-edit an existing shared 1Password item to add a website URL, because template
-rewrites can remove passkeys. If an item genuinely needs a credential change,
-hand the user its private 1Password link.
+`set` replaces the entire value for that item, so include existing aliases when
+adding another origin. The config is reread for each vault list/fill call; no
+restart is required. Aliases are HTTPS-only, exact-origin matches. Entries with
+a path, an `http` scheme, or a wildcard are ignored. Hermes does not infer
+parent or subdomain origins and applies an alias only to the named login. After
+adding an alias, retry the fill. The first alias-only fill asks the user to
+confirm the full origin and item label once per session; a cross-registrable-domain
+alias also warns with the saved and alias domains. Saved-origin fills do not need
+that extra prompt. Never edit or rewrite an existing shared 1Password item to
+add a website URL, because template rewrites can remove passkeys.
 
 ## Headless sessions
 

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 from agent.vault_origin_aliases import _configured_aliases
@@ -66,7 +69,8 @@ def test_saved_origin_refuses_extra_signin_origin_without_alias(monkeypatch):
         result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="synthetic"))
     assert result["success"] is False
     assert result["error_type"] == "origin_mismatch"
-
+    assert "hermes config set vault.origin_aliases.op:gusto-id" in result["error"]
+    assert "https://login.gusto.com" in result["error"]
 
 def test_origin_alias_allows_exact_https_signin_origin(monkeypatch):
     backend = _Backend(_meta())
@@ -137,14 +141,14 @@ def test_alias_only_login_fill_confirms_once_and_saved_origin_does_not(monkeypat
     backend = _Backend(_meta(handle="op:confirm-id"))
     _fill_patches(monkeypatch, backend, page_origin="https://login.gusto.com")
     prompts = []
-    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda label, origin: prompts.append((label, origin)) or "accept")
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda label, origin, saved: prompts.append((label, origin, saved)) or "accept")
     with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
         "origin_aliases": {"op:confirm-id": ["https://login.gusto.com"]},
     }}):
         first = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="confirm"))
         second = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="confirm"))
     assert first["success"] and second["success"]
-    assert prompts == [("Synthetic login", "https://login.gusto.com")]
+    assert prompts == [("Synthetic login", "https://login.gusto.com", ("https://gusto.com",))]
 
     prompts.clear()
     _fill_patches(monkeypatch, backend, page_origin="https://gusto.com")
@@ -207,4 +211,57 @@ def test_browser_vault_list_uses_aliases_for_origin_filter(monkeypatch):
         result = json.loads(vault.browser_vault_list(kind="login", origin="https://login.gusto.com"))
     assert result["success"] is True
     assert result["items"][0]["allowed_origins"] == ["https://gusto.com", "https://login.gusto.com"]
+
+
+def test_alias_confirmation_prompt_names_full_origin_and_cross_domain_warning(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(
+        "tools.approval_prompt.request_elicitation_consent",
+        lambda *args, **kwargs: prompts.append((args[0], args[1], kwargs)) or "accept",
+    )
+    assert vault._confirm_alias_fill("Synthetic login", "https://login.example.com:8443", ("https://gusto.com",)) == "accept"
+    title, detail, kwargs = prompts[-1]
+    assert "Synthetic login" in title
+    assert "https://login.example.com:8443" in title
+    assert "registrable domain differs" in detail
+    assert "login.example.com" in detail and "gusto.com" in detail
+    assert kwargs["surface"] == "vault-origin-alias"
+
+
+def test_alias_confirmation_prompt_omits_warning_for_matching_registrable_domain(monkeypatch):
+    details = []
+    monkeypatch.setattr(
+        "tools.approval_prompt.request_elicitation_consent",
+        lambda *args, **kwargs: details.append((args[0], args[1])) or "accept",
+    )
+    vault._confirm_alias_fill("Synthetic login", "https://app.gusto.com", ("https://login.gusto.com",))
+    assert "registrable domain differs" not in details[-1][1]
+
+
+def test_alias_confirmation_handles_multipart_public_suffix():
+    from agent.vault_origin_aliases import alias_domain_warning, registrable_domain
+    assert registrable_domain("https://login.example.co.uk") == "example.co.uk"
+    assert registrable_domain("https://app.example.co.uk") == "example.co.uk"
+    assert alias_domain_warning("https://login.example.co.uk", ("https://app.example.co.uk",)) is None
+    assert alias_domain_warning("https://login.other.co.uk", ("https://app.example.co.uk",)) is not None
+
+
+def test_agent_written_config_set_form_is_honored_without_restart(tmp_path, monkeypatch):
+    home = tmp_path / "hermes-home"
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    repo = Path(__file__).resolve().parents[2]
+    command = [
+        "uv", "run", "python", "hermes", "config", "set",
+        "vault.origin_aliases.example-item", '["https://signin.example.com"]',
+    ]
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert _configured_aliases() == {}
+    completed = subprocess.run(command, cwd=repo, env=env, capture_output=True, text=True, check=True)
+    assert "Set vault.origin_aliases.example-item" in completed.stdout
+    assert _configured_aliases()["example-item"] == ("https://signin.example.com",)
+    backend = _Backend(_meta(handle="example-item"))
+    _fill_patches(monkeypatch, backend, page_origin="https://signin.example.com")
+    result = json.loads(vault.browser_vault_fill("example-item", task_id="config-set"))
+    assert result["success"] is True
 

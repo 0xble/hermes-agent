@@ -4,7 +4,6 @@ Pure command classification for :mod:`tools.approval` — no approval state, con
 prompting live here.
 """
 
-import ast
 import functools
 import logging
 import os
@@ -395,13 +394,6 @@ DANGEROUS_PATTERNS = [
     # with auto-approve. Same unpaired-door rationale as #14639 / the sed-tee-redirect pairing on these
     # targets. `authorized_keys` after the `~/.ssh/` fragment).
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc path"),
-    # The origin-alias registry changes where credentials may be written, so even the supported
-    # `hermes config` mutator requires the normal user approval gate. The structural CLI check below
-    # handles direct and common-wrapper forms without matching quoted prose or unrelated arguments.
-    # yq's in-place flag bypasses the generic redirection/tee rules; keep this scoped to the
-    # Hermes config rather than gating ordinary project YAML edits.
-    (rf'\byq\b[^;|&\n]*(?:\s-i(?:\s|$)|\s--inplace\b)[^;|&\n]*{_HERMES_CONFIG_PATH}', "in-place edit of Hermes config with yq"),
-    (rf'\byq\b(?=[^;|&\n]*{_HERMES_CONFIG_PATH})(?=[^;|&\n]*(?:\s-i(?:\s|$)|\s--inplace\b))[^;|&\n]*', "in-place edit of Hermes config with yq"),
     # In-place edits mutate the file directly, bypassing redirection/tee/cp coverage; gate the same
     # startup/credential files.
     (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
@@ -865,173 +857,6 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
         return list(lexer)
     except ValueError:
         return None
-
-
-_VAULT_ALIAS_WRITE_DESCRIPTION = "modify vault.origin_aliases security policy via direct/common-wrapper Hermes CLI"
-_PYTHON_OPTIONS_WITH_ARG = frozenset({"-X", "--check-hash-based-pycs"})
-
-
-def _is_vault_alias_config_key(token: str) -> bool:
-    return token == "vault" or token.startswith("vault.")
-
-
-def _is_vault_alias_config_write_argv(argv: list[str]) -> bool:
-    """Conservatively recognize Hermes config writes without emulating argparse.
-
-    Scan every remaining token rather than interpreting global options. This intentionally accepts
-    harmless false positives such as ``hermes skills config set vault.x`` or an option value that
-    happens to be ``config``; an approval prompt is safer than allowing a bypass when the CLI grows.
-    """
-    if not argv or os.path.basename(argv[0]).lower() not in {"hermes", "hermes.py"}:
-        return False
-
-    # Option values (e.g. ``-p work``, which Hermes strips from argv anywhere before ``--``) can sit
-    # between ``config``, ``set|unset`` and the key, so no positional reading is trusted: once
-    # ``config`` appears, any later ``set``/``unset`` followed anywhere by a vault key is a write.
-    for index, token in enumerate(argv):
-        if token != "config":
-            continue
-        remaining = argv[index + 1:]
-        for sub_index, candidate in enumerate(remaining):
-            if candidate not in {"set", "unset"}:
-                continue
-            for key_token in remaining[sub_index + 1:]:
-                if key_token == "--" or key_token.startswith("-"):
-                    continue
-                key = key_token.split("=", 1)[0].strip("'\"")
-                if _is_vault_alias_config_key(key):
-                    return True
-    return False
-
-
-def _hermes_wrapper_argv(tokens: list[str]) -> list[str] | None:
-    """Return the Hermes argv for direct and common wrapper CLI forms."""
-    if not tokens:
-        return None
-    first = os.path.basename(tokens[0]).lower()
-    if first in {"hermes", "hermes.py"}:
-        return tokens
-    if first in {"uv", "uvx", "xargs"}:
-        for index, token in enumerate(tokens[1:], start=1):
-            if os.path.basename(token).lower() in {"hermes", "hermes.py"}:
-                return tokens[index:]
-        return None
-    if _interpreter_family(tokens[0]) == "python":
-        for index, token in enumerate(tokens[1:], start=1):
-            if os.path.basename(token).lower() in {"hermes", "hermes.py"}:
-                return tokens[index:]
-    return None
-
-
-def _python_module_argv_start(tokens: list[str]) -> int | None:
-    index = 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "-m":
-            return index + 1 if index + 1 < len(tokens) else None
-        if token == "--":
-            return None
-        if token in _PYTHON_OPTIONS_WITH_ARG:
-            index += 2
-        elif token.startswith("-"):
-            index += 1
-        else:
-            return None
-    return None
-
-
-def _hermes_config_write_finding(command: str) -> str | None:
-    """Return the alias-registry gate description for direct and common-wrapper CLI forms."""
-    for segment in _iter_top_level_shell_segments(command):
-        for start, _, word in _iter_shell_command_word_spans(segment):
-            executable = _deobfuscate_shell_word_for_detection(word)
-            tokens = _shell_segment_tokens(segment, start)
-            if not tokens:
-                continue
-            wrapper_argv = _hermes_wrapper_argv(tokens)
-            if wrapper_argv is not None and _is_vault_alias_config_write_argv(wrapper_argv):
-                return _VAULT_ALIAS_WRITE_DESCRIPTION
-            if _interpreter_family(executable) == "python" and len(tokens) >= 3:
-                module_index = _python_module_argv_start(tokens)
-                if module_index is not None and tokens[module_index] == "hermes_cli.main":
-                    module_argv = ["hermes", *tokens[module_index + 1:]]
-                    if _is_vault_alias_config_write_argv(module_argv):
-                        return _VAULT_ALIAS_WRITE_DESCRIPTION
-    return None
-
-
-def _is_hermes_config_path_token(token: str) -> bool:
-    normalized = _normalize_command_for_detection(token)
-    candidates = [normalized]
-    if "=" in normalized:
-        candidates.append(normalized.split("=", 1)[1])
-    return any(re.fullmatch(_HERMES_CONFIG_PATH, candidate, re.IGNORECASE) is not None
-               for candidate in candidates)
-
-
-def _python_source_writes_hermes_config(source: str) -> bool:
-    """Inspect Python source structurally; comments and unrelated argument text do not count."""
-    try:
-        tree = ast.parse(source)
-    except (MemoryError, RecursionError, SyntaxError, ValueError, TypeError):
-        return False
-
-    def string_values(node: ast.AST):
-        return [child.value for child in ast.walk(node)
-                if isinstance(child, ast.Constant) and isinstance(child.value, str)]
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        function = node.func
-        if isinstance(function, ast.Name) and function.id == "open":
-            modes = string_values(node.args[1]) if len(node.args) > 1 else []
-            if any(any(flag in mode for flag in ("w", "a", "x", "+")) for mode in modes):
-                if any(_is_hermes_config_path_token(value) for value in string_values(node.args[0])):
-                    return True
-        if isinstance(function, ast.Attribute) and function.attr in {"write_text", "write_bytes"}:
-            if any(_is_hermes_config_path_token(value) for value in string_values(function.value)):
-                return True
-    return False
-
-
-def _is_python_write_marker(token: str) -> bool:
-    if token in {"--write", "--in-place", "--inplace", "-i"}:
-        return True
-    if token.startswith(("--write=", "--write-", "--in-place=", "--inplace=")):
-        return True
-    return token.startswith("-i") and len(token) > 2 and not token[2].isalpha()
-
-
-def _python_config_write_finding(command: str) -> str | None:
-    """Gate explicit Python config writers without matching comments or prose arguments.
-
-    Inline ``-c`` and heredoc execution already receive the generic interpreter approval. This
-    supplement covers ordinary script invocations only when an argv token is the Hermes config path
-    and a separate explicit write operation is present, preserving the existing script regression.
-    """
-    code_markers = ("open(", "write_text", "write_bytes", "yaml.dump", "safe_dump")
-    for segment in _iter_top_level_shell_segments(command):
-        for start, _, word in _iter_shell_command_word_spans(segment):
-            executable = _deobfuscate_shell_word_for_detection(word)
-            if _interpreter_family(executable) != "python":
-                continue
-            tokens = _shell_segment_tokens(segment, start)
-            if not tokens:
-                continue
-            for index, token in enumerate(tokens[1:], start=1):
-                if token in {"-c", "--command"} and index + 1 < len(tokens):
-                    if _python_source_writes_hermes_config(tokens[index + 1]):
-                        return "in-place edit of Hermes config with Python"
-                    break
-            has_write_marker = any(
-                _is_python_write_marker(token) or any(marker in token for marker in code_markers)
-                for token in tokens[1:]
-            )
-            if (any(_is_hermes_config_path_token(token) for token in tokens[1:])
-                    and has_write_marker):
-                return "in-place edit of Hermes config with Python"
-    return None
 
 
 def _iter_top_level_shell_segments(command: str):
@@ -1720,13 +1545,4 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, description, description)
     if _is_shell_token_spliced_gateway_lifecycle(command):
         return (True, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION)
-    # These structural supplements intentionally run last. Any established pattern, execution flag,
-    # or gateway finding must remain the primary approval key for compound commands; otherwise approving
-    # the alias/config key could silently approve a chained dangerous operation.
-    python_finding = _python_config_write_finding(command)
-    if python_finding is not None:
-        return (True, python_finding, python_finding)
-    alias_finding = _hermes_config_write_finding(command)
-    if alias_finding is not None:
-        return (True, alias_finding, alias_finding)
     return (False, None, None)

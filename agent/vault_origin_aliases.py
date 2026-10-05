@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from dataclasses import replace
 from typing import Any, Dict, Iterable
@@ -11,6 +12,54 @@ from agent.vault_store import VaultError, VaultItemMeta, normalize_origin
 
 logger = logging.getLogger(__name__)
 _invalid_alias_warnings: set[tuple[str, str]] = set()
+
+# The project has no public-suffix dependency. Keep this small fallback explicit and conservative:
+# these common multi-label suffixes prevent `login.example.co.uk` from being treated as a different
+# registrable domain from `app.example.co.uk`. Unknown suffixes fall back to the final label.
+_MULTI_LABEL_PUBLIC_SUFFIXES = frozenset({
+    "ac.uk", "co.au", "co.in", "co.jp", "co.nz", "co.uk", "co.za",
+    "com.au", "com.br", "com.cn", "com.hk", "com.mx", "com.sg", "com.tr",
+    "com.tw", "gov.uk", "net.au", "org.au", "org.uk",
+})
+
+
+def registrable_domain(origin: str) -> str:
+    """Return a conservative eTLD+1 approximation for an HTTPS origin.
+
+    This is used only to explain a confirmation warning, never to authorize a fill. It is
+    intentionally a documented fallback because no public-suffix package is installed; add a
+    maintained PSL dependency before expanding this list if broader coverage is required.
+    """
+    host = (urlsplit(origin).hostname or "").lower().rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    labels = [label for label in host.split(".") if label]
+    if len(labels) < 2:
+        return host
+    suffix = ".".join(labels[-2:])
+    suffix_labels = 2 if suffix in _MULTI_LABEL_PUBLIC_SUFFIXES else 1
+    if len(labels) <= suffix_labels:
+        return host
+    return ".".join(labels[-(suffix_labels + 1):])
+
+
+def alias_domain_warning(origin: str, saved_origins: Iterable[str]) -> str | None:
+    """Describe a registrable-domain mismatch for an alias confirmation, if any."""
+    alias_domain = registrable_domain(origin)
+    saved = []
+    for saved_origin in saved_origins:
+        domain = registrable_domain(saved_origin)
+        if domain and domain not in saved:
+            saved.append(domain)
+    if not alias_domain or not saved or alias_domain in saved:
+        return None
+    return (
+        "WARNING: this alias origin's registrable domain differs from the saved login domain: "
+        f"{alias_domain} (alias {origin}) vs {', '.join(saved)} (saved origin(s))."
+    )
 
 
 def _warn_invalid_alias_once(key: str, value: Any) -> None:
