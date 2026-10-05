@@ -3820,12 +3820,29 @@ class GatewayTurnMixin:
                 return bool(_text_delivered)
         return True
 
+    def _register_interrupt_depth_cap_drain(self, adapter: Any, session_key: str) -> None:
+        """Hand a depth-capped FIFO head to the adapter after the current reply is delivered."""
+        register = getattr(adapter, "register_post_delivery_callback", None)
+        finish = getattr(adapter, "_finish_session_task", None)
+        active_sessions = getattr(adapter, "_active_sessions", None)
+        guard = active_sessions.get(session_key) if isinstance(active_sessions, dict) else None
+        if not callable(register) or not callable(finish) or guard is None:
+            return
+
+        def _drain() -> None:
+            finish(session_key, guard)
+
+        generation = getattr(guard, "_hermes_run_generation", None)
+        try:
+            register(session_key, _drain, generation=generation)
+        except Exception:
+            logger.debug("Failed to register depth-cap FIFO drain for %s", session_key, exc_info=True)
+
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3849,7 +3866,8 @@ class GatewayTurnMixin:
             )
             adapter = self._delivery_adapter_for(source)
             if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                if session_key and self._queue_or_replace_pending_event(session_key, pending_event):
+                    self._register_interrupt_depth_cap_drain(adapter, session_key)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
