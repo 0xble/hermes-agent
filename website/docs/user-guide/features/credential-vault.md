@@ -156,13 +156,13 @@ vault:
     example-item-id:
       - https://signin.example.com
     another-example-item-id:
-      - https://signin.example.com/quo
-      - https://signin.example.com/openphone
+      - https://accounts.example.com
+      - https://signin.example.net
 ```
 
-Aliases are HTTPS-only, exact-origin matches. Hermes rejects HTTP and wildcard
-entries, does not infer parent or subdomain origins, and applies an alias only
-to the named login. When a login needs another origin, add an alias here. An
+Aliases are HTTPS-only, exact-origin matches. Entries with a path, an `http` scheme,
+or a wildcard are ignored. Hermes does not infer parent or subdomain origins and
+applies an alias only to the named login. When a login needs another origin, add an alias here. An
 alias-only fill asks the user to confirm the exact origin once per session;
 saved-origin fills do not need that extra prompt. Never
 edit an existing shared 1Password item to add a website URL, because template

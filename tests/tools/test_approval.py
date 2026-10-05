@@ -495,6 +495,26 @@ class TestHermesConfigWriteProtection:
             assert dangerous is False, cmd
 
 
+    def test_alias_registry_cli_forms_require_approval(self):
+        for command in (
+            "hermes config set --force vault.origin_aliases.x '[\"https://signin.example.com\"]'",
+            "hermes -p default config set vault.origin_aliases.x '[\"https://signin.example.com\"]'",
+            'hermes config set "vault.origin_aliases.x" "[\\"https://signin.example.com\\"]"',
+            "hermes config set vault '{origin_aliases: {...}}' --force",
+            "python -m hermes_cli.main config set vault.origin_aliases.x '[\"https://signin.example.com\"]'",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True, (command, desc)
+            assert key is not None
+
+    def test_alias_registry_cli_non_writes_are_safe(self):
+        for command in (
+            "hermes config get vault.origin_aliases",
+            "hermes config set display.theme x",
+        ):
+            assert detect_dangerous_command(command) == (False, None, None), command
+
+
 class TestFindExecFullPathRm:
     """Detect find -exec with full-path rm bypasses."""
 

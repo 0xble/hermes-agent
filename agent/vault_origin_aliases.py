@@ -10,6 +10,15 @@ from urllib.parse import urlsplit
 from agent.vault_store import VaultError, VaultItemMeta, normalize_origin
 
 logger = logging.getLogger(__name__)
+_invalid_alias_warnings: set[tuple[str, str]] = set()
+
+
+def _warn_invalid_alias_once(key: str, value: Any) -> None:
+    marker = (key, repr(value))
+    if marker in _invalid_alias_warnings:
+        return
+    _invalid_alias_warnings.add(marker)
+    logger.warning("Ignoring invalid vault.origin_aliases entry for %r: %r; use a path-free HTTPS origin without wildcards", key, value)
 
 
 def _normalize_alias_origin(value: Any) -> str | None:
@@ -51,12 +60,15 @@ def _configured_aliases() -> Dict[str, tuple[str, ...]]:
             continue
         values: Iterable[Any] = [raw_origins] if isinstance(raw_origins, str) else raw_origins
         if not isinstance(values, (list, tuple)):
+            _warn_invalid_alias_once(key, raw_origins)
             continue
         normalized: list[str] = []
         for value in values:
             origin = _normalize_alias_origin(value)
             if origin and origin not in normalized:
                 normalized.append(origin)
+            elif origin is None:
+                _warn_invalid_alias_once(key, value)
         if normalized:
             aliases[key] = tuple(normalized)
     return aliases

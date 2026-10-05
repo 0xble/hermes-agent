@@ -4,6 +4,7 @@ Pure command classification for :mod:`tools.approval` — no approval state, con
 prompting live here.
 """
 
+import ast
 import functools
 import logging
 import os
@@ -395,17 +396,12 @@ DANGEROUS_PATTERNS = [
     # targets. `authorized_keys` after the `~/.ssh/` fragment).
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc path"),
     # The origin-alias registry changes where credentials may be written, so even the supported
-    # `hermes config` mutator requires the normal user approval gate. Do not let a model widen
-    # exact-origin bindings silently.
-    (r'\bhermes(?:\.py)?\s+config\s+(?:set|unset)\s+vault\.origin_aliases(?:\b|[.\[])', "modify vault.origin_aliases security policy"),
+    # `hermes config` mutator requires the normal user approval gate. The structural CLI check below
+    # handles direct and common-wrapper forms without matching quoted prose or unrelated arguments.
     # yq's in-place flag bypasses the generic redirection/tee rules; keep this scoped to the
     # Hermes config rather than gating ordinary project YAML edits.
     (rf'\byq\b[^;|&\n]*(?:\s-i(?:\s|$)|\s--inplace\b)[^;|&\n]*{_HERMES_CONFIG_PATH}', "in-place edit of Hermes config with yq"),
     (rf'\byq\b(?=[^;|&\n]*{_HERMES_CONFIG_PATH})(?=[^;|&\n]*(?:\s-i(?:\s|$)|\s--inplace\b))[^;|&\n]*', "in-place edit of Hermes config with yq"),
-    # Python -c is already covered by the interpreter execution gate. This supplements it for a
-    # script invocation that names the Hermes config and performs an obvious write operation.
-    (rf'\bpython(?:3)?\b(?=[^;|&\n]*{_HERMES_CONFIG_PATH})(?=[^;|&\n]*(?:write_text|open\s*\(|safe_dump|yaml\.dump))[^;|&\n]*', "in-place edit of Hermes config with Python"),
-    (rf'\bpython(?:3)?\b(?=[^;|&\n]*(?:write_text|open\s*\(|safe_dump|yaml\.dump))(?=[^;|&\n]*{_HERMES_CONFIG_PATH})[^;|&\n]*', "in-place edit of Hermes config with Python"),
     # In-place edits mutate the file directly, bypassing redirection/tee/cp coverage; gate the same
     # startup/credential files.
     (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
@@ -869,6 +865,139 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
         return list(lexer)
     except ValueError:
         return None
+
+
+_VAULT_ALIAS_WRITE_DESCRIPTION = "modify vault.origin_aliases security policy via direct/common-wrapper Hermes CLI"
+_HERMES_CLI_OPTIONS_WITH_ARG = frozenset({
+    "-p", "--profile", "--home", "--config", "--model", "--provider", "--reasoning", "--reasoning-effort",
+})
+_PYTHON_OPTIONS_WITH_ARG = frozenset({"-X", "--check-hash-based-pycs"})
+
+
+def _is_vault_alias_config_key(token: str) -> bool:
+    return token == "vault" or token == "vault.origin_aliases" or token.startswith("vault.origin_aliases.")
+
+
+def _option_consumes_next(tokens: list[str], index: int, options_with_arg: frozenset[str]) -> bool:
+    token = tokens[index]
+    return "=" not in token and token in options_with_arg and index + 1 < len(tokens)
+
+
+def _is_vault_alias_config_write_argv(argv: list[str], start: int = 1) -> bool:
+    """Recognize Hermes config writes from tokenized argv, not regex text.
+
+    Global and subcommand options are skipped by their known argument grammar. The key may be the
+    whole ``vault`` mapping (a replacement can contain ``origin_aliases``) or the exact registry path.
+    """
+    try:
+        config_index = next(index for index in range(start, len(argv)) if argv[index] == "config")
+    except StopIteration:
+        return False
+    index = config_index + 1
+    while index < len(argv) and argv[index].startswith("-"):
+        index += 2 if _option_consumes_next(argv, index, _HERMES_CLI_OPTIONS_WITH_ARG) else 1
+    if index >= len(argv) or argv[index] not in {"set", "unset"}:
+        return False
+    index += 1
+    while index < len(argv):
+        if _is_vault_alias_config_key(argv[index]):
+            return True
+        index += 2 if _option_consumes_next(argv, index, frozenset()) else 1
+    return False
+
+
+def _python_module_argv_start(tokens: list[str]) -> int | None:
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            return index + 1 if index + 1 < len(tokens) else None
+        if token == "--":
+            return None
+        if token in _PYTHON_OPTIONS_WITH_ARG:
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            return None
+    return None
+
+
+def _hermes_config_write_finding(command: str) -> str | None:
+    """Return the alias-registry gate description for direct and common-wrapper CLI forms."""
+    for segment in _iter_top_level_shell_segments(command):
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            executable = _deobfuscate_shell_word_for_detection(word)
+            name = os.path.basename(executable).lower()
+            tokens = _shell_segment_tokens(segment, start)
+            if not tokens:
+                continue
+            if name in {"hermes", "hermes.py"} and _is_vault_alias_config_write_argv(tokens):
+                return _VAULT_ALIAS_WRITE_DESCRIPTION
+            if _interpreter_family(executable) == "python" and len(tokens) >= 3:
+                module_index = _python_module_argv_start(tokens)
+                if module_index is not None and tokens[module_index] == "hermes_cli.main":
+                    if _is_vault_alias_config_write_argv(tokens, module_index + 1):
+                        return _VAULT_ALIAS_WRITE_DESCRIPTION
+    return None
+
+
+def _is_hermes_config_path_token(token: str) -> bool:
+    normalized = _normalize_command_for_detection(token)
+    return re.fullmatch(_HERMES_CONFIG_PATH, normalized, re.IGNORECASE) is not None
+
+
+def _python_source_writes_hermes_config(source: str) -> bool:
+    """Inspect Python source structurally; comments and unrelated argument text do not count."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+
+    def string_values(node: ast.AST):
+        return [child.value for child in ast.walk(node)
+                if isinstance(child, ast.Constant) and isinstance(child.value, str)]
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if isinstance(function, ast.Name) and function.id == "open":
+            modes = string_values(node.args[1]) if len(node.args) > 1 else []
+            if any(any(flag in mode for flag in ("w", "a", "x", "+")) for mode in modes):
+                if any(_is_hermes_config_path_token(value) for value in string_values(node.args[0])):
+                    return True
+        if isinstance(function, ast.Attribute) and function.attr in {"write_text", "write_bytes"}:
+            if any(_is_hermes_config_path_token(value) for value in string_values(function.value)):
+                return True
+    return False
+
+
+def _python_config_write_finding(command: str) -> str | None:
+    """Gate explicit Python config writers without matching comments or prose arguments.
+
+    Inline ``-c`` and heredoc execution already receive the generic interpreter approval. This
+    supplement covers ordinary script invocations only when an argv token is the Hermes config path
+    and a separate explicit write operation is present, preserving the existing script regression.
+    """
+    write_markers = {"write_text", "write_bytes", "--write", "--write_text", "--write-bytes"}
+    for segment in _iter_top_level_shell_segments(command):
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            executable = _deobfuscate_shell_word_for_detection(word)
+            if _interpreter_family(executable) != "python":
+                continue
+            tokens = _shell_segment_tokens(segment, start)
+            if not tokens:
+                continue
+            for index, token in enumerate(tokens[1:], start=1):
+                if token in {"-c", "--command"} and index + 1 < len(tokens):
+                    if _python_source_writes_hermes_config(tokens[index + 1]):
+                        return "in-place edit of Hermes config with Python"
+                    break
+            if (any(_is_hermes_config_path_token(token) for token in tokens[1:])
+                    and any(token in write_markers for token in tokens[1:])):
+                return "in-place edit of Hermes config with Python"
+    return None
 
 
 def _iter_top_level_shell_segments(command: str):
@@ -1539,6 +1668,10 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    if (finding := _hermes_config_write_finding(command)) is not None:
+        return (True, finding, finding)
+    if (finding := _python_config_write_finding(command)) is not None:
+        return (True, finding, finding)
     for command_variant in _command_detection_variants(command):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None

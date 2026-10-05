@@ -50,6 +50,7 @@ _payment_retry_until: dict[tuple[str, str, str], float] = {}
 # active profile and approval session, and refusals remain fail-closed for the process lifetime.
 _alias_fill_lock = threading.Lock()
 _alias_fill_decisions: dict[tuple[str, str, str, str], str] = {}
+_alias_fill_refused: set[tuple[str, str, str, str]] = set()
 _ALIAS_FILL_CACHE_CAP = 256
 
 
@@ -63,12 +64,20 @@ def _alias_fill_key(task_id: str, handle: str, origin: str) -> tuple[str, str, s
 
 def _alias_fill_decision(key: tuple[str, str, str, str]) -> str | None:
     with _alias_fill_lock:
+        if key in _alias_fill_refused:
+            return "refused"
         return _alias_fill_decisions.get(key)
 
 
 def _record_alias_fill_decision(key: tuple[str, str, str, str], decision: str) -> None:
     with _alias_fill_lock:
+        if decision == "refused":
+            _alias_fill_refused.add(key)
+            _alias_fill_decisions.pop(key, None)
+            return
         if len(_alias_fill_decisions) >= _ALIAS_FILL_CACHE_CAP and key not in _alias_fill_decisions:
+            # Refusals live in the separate process-lifetime set above. Only approvals are bounded
+            # and eligible for eviction, so a declined origin can never become retryable by churn.
             _alias_fill_decisions.pop(next(iter(_alias_fill_decisions)))
         _alias_fill_decisions[key] = decision
 
@@ -918,7 +927,9 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "match the current sign-in origin, report the exact current origin and item handle to the user and ask the "
         "user to add the alias themselves. Show them an exact line such as `hermes config set "
         "vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'` (or the equivalent YAML); never add or "
-        "edit `vault.origin_aliases` yourself. Never edit or rewrite the existing 1Password item to add a URL: "
+        "edit `vault.origin_aliases` yourself. The approval gate covers direct and common-wrapper Hermes CLI "
+        "config writes, but fill-time user confirmation is the guaranteed control. Never edit or rewrite the existing "
+        "1Password item to add a URL: "
         "template edits can delete passkeys. No item for this origin: call browser_vault_save_login, or type a "
         "password you fetched yourself from an authorized store for that service. Never type a password shown on "
         "a page or given in chat, and never repeat one in chat."
@@ -961,7 +972,8 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "'[\"https://signin.example.com\"]'` (or the equivalent YAML); never add or edit `vault.origin_aliases` "
         "yourself. Never edit or rewrite an existing 1Password item to add a URL because template edits can delete "
         "passkeys. Alias-only login fills show a one-time user confirmation naming the exact origin; saved-origin "
-        "login fills do not need that extra confirmation. If a password manager is locked "
+        "login fills do not need that extra confirmation. The approval gate covers direct and common-wrapper "
+        "Hermes CLI config writes, but fill-time confirmation is the guaranteed control. If a password manager is locked "
         "the user is prompted to unlock first. Never retry payment_declined, payment_prompt_unanswered or "
         "payment_retry_refused; hand card entry to the user."
     ),

@@ -106,6 +106,22 @@ def test_origin_alias_rejects_http_and_wildcards(monkeypatch):
     assert result.allowed_origins == ("https://gusto.com", "https://login.gusto.com")
 
 
+def test_invalid_aliases_are_logged_once(monkeypatch, caplog):
+    from agent import vault_origin_aliases
+
+    vault_origin_aliases._invalid_alias_warnings.clear()
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "origin_aliases": {"op:gusto-id": [
+            "http://login.gusto.com", "https://login.gusto.com/path", "https://*.gusto.com",
+        ]},
+    }}):
+        with caplog.at_level("WARNING", logger="agent.vault_origin_aliases"):
+            vault_origin_aliases._configured_aliases()
+            vault_origin_aliases._configured_aliases()
+    warnings = [record for record in caplog.records if "Ignoring invalid vault.origin_aliases" in record.message]
+    assert len(warnings) == 3
+
+
 def test_raw_onepassword_item_id_alias_does_not_match_another_item(monkeypatch):
     backend = _Backend(_meta(handle="op:other-id"))
     _fill_patches(monkeypatch, backend, page_origin="https://login.gusto.com")
@@ -165,6 +181,21 @@ def test_raw_item_id_alias_matches_multi_account_onepassword_handles(monkeypatch
         }}):
             result = json.loads(vault.browser_vault_fill(handle, task_id="synthetic"))
         assert result["success"] is True, (handle, result)
+
+
+def test_alias_fill_cache_never_evicts_refusals(monkeypatch):
+    vault._alias_fill_decisions.clear()
+    vault._alias_fill_refused.clear()
+    monkeypatch.setattr(vault, "_ALIAS_FILL_CACHE_CAP", 1)
+    refused = ("home", "session", "refused", "https://refused.example")
+    first_approval = ("home", "session", "approved-1", "https://one.example")
+    second_approval = ("home", "session", "approved-2", "https://two.example")
+    vault._record_alias_fill_decision(refused, "refused")
+    vault._record_alias_fill_decision(first_approval, "accept")
+    vault._record_alias_fill_decision(second_approval, "accept")
+    assert vault._alias_fill_decision(refused) == "refused"
+    assert vault._alias_fill_decision(second_approval) == "accept"
+    assert vault._alias_fill_decision(first_approval) is None
 
 
 def test_browser_vault_list_uses_aliases_for_origin_filter(monkeypatch):
