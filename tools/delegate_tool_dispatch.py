@@ -351,7 +351,9 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]], *, inclu
         "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
     }
     if len(units) == 1:
-        payload["delegation_id"] = batch.live_deleg_id or units[0][1]
+        # The accepted unit id is authoritative when a multi-unit call is only
+        # partially accepted.  The bare call id is not a runnable delegation.
+        payload["delegation_id"] = units[0][1]
     else:
         payload["units"] = [
             {"delegation_id": uid, "group": unit.group, "task_indexes": [i for (i, _, _) in unit.children]}

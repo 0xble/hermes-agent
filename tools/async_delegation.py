@@ -40,7 +40,11 @@ _records_lock = threading.Lock()
 _records: Dict[str, Dict[str, Any]] = {}
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
-_DEFAULT_MAX_QUEUED_DELEGATIONS = 8
+# Low-level callers retain the historical reject-at-capacity contract.  The
+# delegate_task background path explicitly opts into bounded queueing via
+# ``_get_max_queued_delegations()``; cron and other direct callers must never
+# queue work that they may execute inline after a rejection.
+_DEFAULT_MAX_QUEUED_DELEGATIONS = 0
 # Completed records retained (in memory and in the ledger) for status queries.
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -900,7 +904,9 @@ def _admit_pending() -> None:
         if not selected:
             return
         for index, item in enumerate(selected):
-            item_context = item.get("_context") or contextvars.copy_context()
+            item_context = item.get("_context")
+            if item_context is None:
+                item_context = contextvars.copy_context()
 
             def admit_and_submit() -> Optional[str]:
                 try:
@@ -928,7 +934,9 @@ def _admit_pending() -> None:
                         live["queued_at"] = time.time()
                         _PENDING_QUEUE.appendleft(pending["delegation_id"])
                 for pending in selected[index:]:
-                    pending_context = pending.get("_context") or contextvars.copy_context()
+                    pending_context = pending.get("_context")
+                    if pending_context is None:
+                        pending_context = contextvars.copy_context()
 
                     def requeue_pending() -> None:
                         try:
@@ -939,6 +947,10 @@ def _admit_pending() -> None:
                             logger.exception("Could not requeue retiring delegation %s", pending["delegation_id"])
 
                     pending_context.copy().run(requeue_pending)
+                # The monitor may be the only actor that retries admission.  A
+                # retirement fence reopening must therefore wake it explicitly,
+                # even when this pass was the one that was about to exit.
+                _ensure_stale_monitor()
                 return
             item_context.copy().run(
                 _finalize, item["delegation_id"], item["crash_result"](error, 0.0), "error")
@@ -1138,6 +1150,10 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             if record is None or record.get("status") not in _FINALIZABLE_STATES:
                 return
             was_queued = record.get("status") == "queued"
+            # Admission changes queued -> running before executor.submit(). If
+            # submit then fails, the runner never started, but the unit still
+            # owns child/writer resources that cancel_fn must release.
+            was_admitted_unstarted = record.get("status") == "running" and not record.get("_started")
             record["status"] = "finalizing"
             record["completed_at"] = time.time()
             record["interrupt_fn"] = None  # drop the closure; child is done
@@ -1146,7 +1162,8 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
     else:
         snapshot = _claimed_snapshot
         was_queued = True
-    if was_queued and snapshot.get("cancel_fn") is not None:
+        was_admitted_unstarted = False
+    if (was_queued or was_admitted_unstarted) and snapshot.get("cancel_fn") is not None:
         try:
             snapshot["cancel_fn"]("queued delegation cancelled")
         except Exception:
@@ -1286,6 +1303,12 @@ def _sweep_stale_locked(now: float):
             if now - (record.get("_interrupted_at") or now) >= _STALL_GRACE_SECONDS:
                 expired.append(record["delegation_id"])
             continue
+        if status == "running" and not record.get("_started"):
+            # An admitted unit can sit between retirement admission and
+            # executor.submit(). Keep the monitor alive across that window so
+            # a submit failure or fence requeue cannot strand it.
+            any_monitorable = True
+            continue
         progress_fn = record.get("progress_fn")
         if status != "running" or progress_fn is None:
             continue
@@ -1365,10 +1388,29 @@ def _stale_monitor_loop() -> None:
             )
         for delegation_id in expired:
             with _records_lock:
-                ctx = (_records.get(delegation_id) or {}).get("_context") or contextvars.copy_context()
+                ctx = (_records.get(delegation_id) or {}).get("_context")
+                if ctx is None:
+                    ctx = contextvars.copy_context()
             ctx.copy().run(_finalize, delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
         if not any_monitorable:
-            return
+            # Make the exit decision atomic with _ensure_stale_monitor().  A
+            # dispatch racing this check either observes a live monitor, or
+            # waits for this lock until _monitor_thread is cleared and starts a
+            # replacement.  This closes the lost-wakeup window where a queued
+            # record could otherwise remain unadmitted forever.
+            with _monitor_lock:
+                with _records_lock:
+                    still_monitorable = any(
+                        r.get("status") == "queued"
+                        or (r.get("status") == "running" and not r.get("_started"))
+                        or (r.get("status") == "running" and r.get("progress_fn") is not None)
+                        or r.get("status") == "stalling"
+                        for r in _records.values()
+                    )
+                if not still_monitorable:
+                    global _monitor_thread
+                    _monitor_thread = None
+                    return
 
 
 def _stalled_error_text(event_record: Dict[str, Any]) -> str:
@@ -1493,7 +1535,9 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
                 interrupt_fn = live.get("interrupt_fn")
         if queued_snapshot is not None:
             count += 1
-            queued_context = queued_snapshot.get("_context") or contextvars.copy_context()
+            queued_context = queued_snapshot.get("_context")
+            if queued_context is None:
+                queued_context = contextvars.copy_context()
 
             def finalize_queued() -> None:
                 _call_interrupt(

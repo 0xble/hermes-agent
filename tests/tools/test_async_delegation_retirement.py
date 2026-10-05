@@ -41,13 +41,15 @@ def test_queued_admission_requeues_when_retirement_fence_closes(monkeypatch):
     fence = Fence()
     monkeypatch.setattr(backend_retirement, "retirement", fence)
     release = threading.Event()
+    queued_started = threading.Event()
     first = async_delegation.dispatch_async_delegation(
         goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
         runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
     )
     queued = async_delegation.dispatch_async_delegation(
         goal="stay queued", context=None, toolsets=None, role="leaf", model="m", session_key="",
-        runner=lambda: {"status": "completed"}, max_async_children=1,
+        runner=lambda: (queued_started.set(), {"status": "completed"})[1], max_async_children=1,
+        max_queued_delegations=1,
     )
     assert first["status"] == "dispatched"
     assert queued["status"] == "queued"
@@ -69,9 +71,59 @@ def test_queued_admission_requeues_when_retirement_fence_closes(monkeypatch):
     # The existing stale monitor retries pending admission after the transient
     # retirement fence reopens. No later completion is required to retrigger it.
     deadline = time.monotonic() + 5
+    while not queued_started.is_set() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert queued_started.is_set(), "queued runner was never admitted and started"
+    deadline = time.monotonic() + 5
     while async_delegation.active_count() and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert async_delegation.list_async_delegations()
+    record = next(r for r in async_delegation.list_async_delegations()
+                  if r["delegation_id"] == queued["delegation_id"])
+    assert record["status"] in {"completed", "success", "error"}
+    assert async_delegation.active_count() == 0
+    async_delegation._reset_for_tests()
+
+
+def test_monitor_exit_race_wakes_for_queue_admitted_during_final_sweep(monkeypatch):
+    """A queue arriving while the monitor decides to exit must not strand."""
+    from tools import async_delegation
+
+    monkeypatch.setattr(async_delegation, "_STALE_CHECK_INTERVAL", 0.001)
+    sweep_entered = threading.Event()
+    release_sweep = threading.Event()
+    first_sweep = threading.Event()
+
+    def empty_sweep(_now):
+        if first_sweep.is_set():
+            return [], [], False
+        first_sweep.set()
+        sweep_entered.set()
+        release_sweep.wait(5)
+        return [], [], False
+
+    monkeypatch.setattr(async_delegation, "_sweep_stale_locked", empty_sweep)
+    first_release = threading.Event()
+    first = async_delegation.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (first_release.wait(10), {"status": "completed"})[1], max_async_children=1,
+        progress_fn=lambda: (0, False),
+    )
+    assert first["status"] == "dispatched"
+    assert sweep_entered.wait(5)
+    queued_started = threading.Event()
+    queued = async_delegation.dispatch_async_delegation(
+        goal="race queue", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (queued_started.set(), {"status": "completed"})[1], max_async_children=1,
+        max_queued_delegations=1,
+    )
+    assert queued["status"] == "queued"
+    release_sweep.set()
+    first_release.set()
+    assert queued_started.wait(5), "monitor exited with queued work pending"
+    deadline = time.monotonic() + 5
+    while async_delegation.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert async_delegation.active_count() == 0
     async_delegation._reset_for_tests()
 
 

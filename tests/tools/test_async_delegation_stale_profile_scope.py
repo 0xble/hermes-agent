@@ -137,7 +137,7 @@ def test_pending_admission_uses_queued_profile_context(tmp_path, monkeypatch):
         queued = ad.dispatch_async_delegation(
             goal="profile B queued", context=None, toolsets=None, role="leaf", model="m",
             session_key="b", runner=lambda: (started_b.set(), {"status": "completed"})[1],
-            max_async_children=1,
+            max_async_children=1, max_queued_delegations=1,
         )
     finally:
         reset_hermes_home_override(token)
@@ -175,7 +175,8 @@ def test_interrupt_all_finalizes_queued_unit_in_owner_profile(tmp_path, monkeypa
     try:
         queued = ad.dispatch_async_delegation(
             goal="profile B queued", context=None, toolsets=None, role="leaf", model="m",
-            session_key="b", runner=lambda: {"status": "completed"}, max_async_children=1,
+            session_key="b", runner=lambda: {"status": "completed"},
+            max_async_children=1, max_queued_delegations=1,
         )
     finally:
         reset_hermes_home_override(token)

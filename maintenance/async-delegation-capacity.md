@@ -30,6 +30,13 @@ handling, pending work visibility, cancellation, or completion routing.
 - The existing stale-delegation monitor also retries pending admission, so a
   transient retirement prepare fence reopening retriggers the queue without
   requiring another completion.
+- The low-level async registry defaults to `max_queued_delegations=0`, preserving
+  reject-at-capacity behavior for direct callers. Only the `delegate_task`
+  background path opts into bounded queueing through
+  `_get_max_queued_delegations()`.
+- Queued and admitted-but-unstarted records keep the stale monitor alive.
+  Retirement requeue wakes the monitor, and its exit decision is atomic with
+  monitor startup so admission cannot lose a wakeup.
 
 ## Independent hypothesis (frozen 2026-10-04T19:14:32Z, before upstream search)
 

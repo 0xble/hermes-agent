@@ -214,7 +214,7 @@ def test_dispatch_queues_at_capacity_and_admits_after_slot_release():
     queued = ad.dispatch_async_delegation(
         goal="task1", context=None, toolsets=None, role="leaf", model="m", session_key="owned",
         runner=lambda: (started.set(), {"status": "completed", "summary": "queued result"})[1],
-        max_async_children=1,
+        max_async_children=1, max_queued_delegations=1,
     )
     assert first["status"] == "dispatched"
     assert queued["status"] == "queued"
@@ -241,7 +241,7 @@ def test_queued_delegation_is_visible_to_action_list_and_routes_to_owner():
     queued = ad.dispatch_async_delegation(
         goal="visible queued goal", context=None, toolsets=None, role="leaf", model="m",
         session_key="owner", parent_session_id="list-owner",
-        runner=lambda: {"status": "completed"}, max_async_children=1,
+        runner=lambda: {"status": "completed"}, max_async_children=1, max_queued_delegations=1,
     )
     try:
         assert first["status"] == "dispatched"
@@ -332,7 +332,8 @@ def test_queued_worker_preserves_parent_prompt_callbacks(monkeypatch):
     observed = []
     queued = ad.dispatch_async_delegation(
         goal="callback", context=None, toolsets=None, role="leaf", model="m", session_key="",
-        runner=lambda: (observed.append(slot.value), {"status": "completed"})[1], max_async_children=1,
+        runner=lambda: (observed.append(slot.value), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
     )
     assert queued["status"] == "queued"
     release.set()
@@ -371,7 +372,8 @@ def test_queued_cancel_claims_before_admission_can_race(monkeypatch):
     started = threading.Event()
     queued = ad.dispatch_async_delegation(
         goal="cancel", context=None, toolsets=None, role="leaf", model="m", session_key="",
-        runner=lambda: (started.set(), {"status": "completed"})[1], max_async_children=1,
+        runner=lambda: (started.set(), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
     )
     callback_entered = threading.Event()
     allow_callback = threading.Event()
@@ -407,7 +409,7 @@ def test_queued_cancel_claims_before_admission_can_race(monkeypatch):
     queued = ad.dispatch_async_delegation(
         goal="task1", context=None, toolsets=None, role="leaf", model="m", session_key="owned",
         runner=lambda: (started.set(), {})[1], interrupt_fn=lambda reason=None: interrupted.append(reason),
-        max_async_children=1,
+        max_async_children=1, max_queued_delegations=1,
     )
     assert queued["status"] == "queued"
     assert ad.interrupt_delegation(queued["delegation_id"], reason="stop")
@@ -1265,6 +1267,22 @@ def test_multi_unit_background_payload_uses_per_unit_handles():
     payload = _dispatched_payload(batch, [(units[0], "call-id-1"), (units[1], "call-id-2")])
     assert "delegation_id" not in payload
     assert [unit["delegation_id"] for unit in payload["units"]] == ["call-id-1", "call-id-2"]
+
+
+def test_partial_multi_unit_payload_uses_accepted_unit_handle():
+    """A partial multi-unit response must identify the runnable unit, not the bare call."""
+    from tools.delegate_tool_dispatch import _Batch, _dispatched_payload
+
+    tasks = [{"goal": "one"}, {"goal": "two"}]
+    batch = _Batch(
+        task_list=tasks, children=[], parent_agent=object(), creds={"model": "m"}, context=None,
+        top_role="leaf", max_children=2, live_deleg_id="call-id", live_writers=[], live_paths=[],
+        origin_wake_sid="", origin_ui_session_id="", origin_owner_transport=None,
+        origin_owner_session_record=None, origin_session_history_delivery=False, overall_start=time.monotonic(),
+    )
+    unit = replace(batch, children=[(1, tasks[1], object())])
+    payload = _dispatched_payload(batch, [(unit, "call-id-2")])
+    assert payload["delegation_id"] == "call-id-2"
 
 
 def test_units_of_one_call_share_a_single_capacity_slot():
