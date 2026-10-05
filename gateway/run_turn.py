@@ -3821,7 +3821,9 @@ class GatewayTurnMixin:
         return True
 
     def _register_interrupt_depth_cap_drain(self, adapter: Any, session_key: str) -> None:
-        """Hand a depth-capped FIFO head to the adapter after the current reply is delivered."""
+        """Backstop drain for a depth-capped head: the in-band drain in ``_process_message_background``
+        usually picks it up first, but paths that skip it (drain-deferred heads) would otherwise
+        leave the queue waiting for an unrelated inbound message."""
         register = getattr(adapter, "register_post_delivery_callback", None)
         finish = getattr(adapter, "_finish_session_task", None)
         active_sessions = getattr(adapter, "_active_sessions", None)
@@ -3865,9 +3867,15 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
-                if session_key and self._queue_or_replace_pending_event(session_key, pending_event):
-                    self._register_interrupt_depth_cap_drain(adapter, session_key)
+            if adapter and pending_event and session_key and hasattr(adapter, "_pending_messages"):
+                # The drain already dequeued this event and promoted the next one into the slot, so
+                # it is the OLDEST waiting message: put it back at the head, never behind newer ones.
+                existing = adapter._pending_messages.get(session_key)
+                if existing is not None and existing is not pending_event:
+                    self._session_state(session_key).conversation.queued_events.insert(0, existing)
+                adapter._pending_messages[session_key] = pending_event
+                pending_event._gateway_accepted = True
+                self._register_interrupt_depth_cap_drain(adapter, session_key)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
