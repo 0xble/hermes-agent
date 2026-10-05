@@ -3,6 +3,8 @@
 Load this unit when changing named Camofox browser accounts, vault login classification,
 the browser vault fill tool, or the 1Password backends.
 
+- Fork patch identity: `vault-origin-aliases`.
+
 ## Required behavior
 
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.

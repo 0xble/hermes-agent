@@ -140,8 +140,33 @@ That includes unrelated values such as `{"bookings": 4}`. This registry is in me
 and does not infer provenance from page structure or JavaScript source text.
 Screenshots and CDP pixel captures are unavailable in that session; do not
 handoff a protected page into a shared browser. The registry clears only after
+
 a confirmed browser close. If close fails, reads stay masked and pixels blocked;
 raw CDP (both target and frame routing) is refused while any protected browser remains open.
+
+### Login origin aliases
+
+A 1Password Login can be bound to more than one exact sign-in origin without
+rewriting the item. Add a handle or raw 1Password item ID under
+`vault.origin_aliases` in the active profile's Hermes config (normally
+`~/.hermes/config.yaml`):
+
+```yaml
+vault:
+  origin_aliases:
+    zys56ajg4voda76332p3mfjwr4:
+      - https://login.gusto.com
+    qejjac5ggmslclvgztlyjuml24:
+      - https://my.quo.com
+      - https://signin.openphone.com
+```
+
+Aliases are HTTPS-only, exact-origin matches. Hermes rejects HTTP and wildcard
+entries, does not infer parent or subdomain origins, and applies an alias only
+to the named login. When a login needs another origin, add an alias here. Never
+edit an existing shared 1Password item to add a website URL, because template
+rewrites can remove passkeys. If an item genuinely needs a credential change,
+hand the user its private 1Password link.
 
 ## Headless sessions
 
