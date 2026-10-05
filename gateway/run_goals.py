@@ -657,8 +657,7 @@ class GatewayGoalsMixin:
         entry = store.lookup_by_session_id(sid) if store is not None else None
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
-        if getattr(entry, "resume_pending", False):
-            return  # restart auto-resume owns this chat; its turn's judge re-evaluates the barrier
+        assert store is not None
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source) if source is not None else None
         if adapter is None or not getattr(adapter, "_message_handler", None):
@@ -667,6 +666,27 @@ class GatewayGoalsMixin:
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
                 or self._queue_depth(key, adapter=adapter) > 0):
             return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
+
+        resume_marker = None
+        if getattr(entry, "resume_pending", False):
+            # Startup auto-resume owns a fresh restart marker. Once its bounded freshness window
+            # expires, it will no longer schedule this session; do not let that stale marker wedge
+            # an otherwise eligible parked goal forever. Snapshot + CAS-clear so a successor that
+            # refreshed the marker wins rather than being stolen by the idle ticker. Legacy entries
+            # without last_resume_marked_at use updated_at, matching startup recovery.
+            from gateway.run import (
+                _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+                _resume_pending_marker_timestamp,
+            )
+
+            resume_marker = store.get_resume_pending_marker(key)
+            if resume_marker is None:
+                return  # marker disappeared or the session was replaced; retry on the next scan
+            marked_at = _resume_pending_marker_timestamp(entry, resume_marker)
+            if _is_fresh_gateway_interruption(
+                    marked_at, window_secs=_auto_continue_freshness_window()):
+                return  # restart auto-resume still owns this chat
+
         max_turns = self._goal_max_turns_from_config()
 
         def _check():
@@ -676,11 +696,34 @@ class GatewayGoalsMixin:
         mgr, prompt = await self._run_in_executor_with_context(_check)
         if not prompt:
             return
+        # A marker absent from the initial snapshot may be created while the barrier check runs.
+        # The live SessionEntry is the generation fence for that narrow race: defer to the next
+        # scan without clearing the fresh marker or admitting a continuation under stale fences.
+        if resume_marker is None and getattr(entry, "resume_pending", False):
+            return
+        # The barrier check ran off-loop; a turn, adapter guard, or queued event may have appeared
+        # while it was running. Re-check every admission fence before clearing or injecting.
+        if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
+                or self._queue_depth(key, adapter=adapter) > 0):
+            return
         since = mgr.state.waiting_since
         logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
         event = self._synthetic_prompt_event(source, prompt)
         event.metadata["gateway_session_key"] = key
+        if resume_marker is not None:
+            cleared = await self.async_session_store.clear_resume_pending(
+                key, expected_marker=resume_marker,
+            )
+        else:
+            cleared = True
+        if not cleared:
+            return  # marker changed or the session disappeared; retry on the next scan
+        if resume_marker is not None:
+            logger.info(
+                "goal wakeup: stale resume_pending cleared for session %s; idle ticker owns continuation",
+                sid,
+            )
         from gateway.wake import WakeNotAccepted, admit_internal_event
 
         try:
