@@ -10,12 +10,13 @@ the old process; the process ran without `notify_on_complete`; or a timed wait e
 idle chat. Each one left the goal parked until an unrelated user message arrived. One observed
 case stayed parked for 14.5 hours.
 
-- `GoalManager.lifted_barrier_prompt()` is the single shared check. It is pure, applies the
-  existing 30-minute cap, and appends one factual line about the awaited process. The line is
-  built from the live registry or, after a restart, the durable `logs/process-results` receipt:
-  killed by a restart or shutdown, killed explicitly, finished with its exit code, still running
-  at the cap, or no longer tracked (outcome unknown). The note never asks for a rerun, because
-  interrupted work may have side effects.
+- `GoalManager.lifted_barrier_prompt()` is the single shared pure check and appends one factual line
+  about an awaited process. Live pid/session barriers are refreshed separately with escalating
+  backoff after 30 minutes, using `barrier_recheck_at` rather than `waiting_until` so target
+  presentation remains unchanged. The first age notice is deduped through `last_wait_notice_key`;
+  a still-live target pauses with a named blocker after six hours. The line is built from the live
+  registry or, after a restart, the durable `logs/process-results` receipt: killed by a restart or
+  shutdown, killed explicitly, finished with its exit code, or no longer tracked (outcome unknown).
 - Surfaces clear the barrier only after the continuation was admitted, through
   `clear_lifted_wait(waiting_since)`. A failed or refused injection is retried on the next scan,
   and a resumed turn that has already re-parked keeps its newer barrier.
@@ -48,11 +49,7 @@ barrier", or "goal parked forever" as of 2026-09-26.
 
 ## Verification
 
-`scripts/run_tests.sh tests/hermes_cli/test_goal_parked_idle_wake.py
-tests/gateway/test_goal_parked_idle_wake.py tests/tui_gateway/test_goal_parked_idle_wake.py
-tests/hermes_cli/test_cli_goal_parked_resume.py`. The gateway test reproduces the live wedge
-(a goal parked on a restart-killed process) and fails without the patch. Also run the goal, loop,
-and heartbeat suites listed in [goal lifecycle](goal-lifecycle.md).
+Focused verification uses one-file pytest commands for the goal, gateway, TUI, and CLI surfaces listed in the patch record; the repository-wide `scripts/run_tests.sh` wrapper is intentionally not used here.
 
 ## Retirement and rollback
 

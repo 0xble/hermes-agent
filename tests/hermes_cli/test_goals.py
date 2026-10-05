@@ -560,11 +560,13 @@ class TestWaitBarrier:
             mgr.wait_on(proc.pid, reason="poller")
             assert mgr.is_waiting() is True
             mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+            mgr.state.barrier_recheck_at = 0.0
             mgr._save()
             before = time.time()
             assert mgr.is_waiting() is True
             assert mgr.state.waiting_on_pid == proc.pid
-            assert mgr.state.waiting_until > before
+            assert mgr.state.barrier_recheck_at > before
+            assert mgr.state.waiting_until == 0.0
             assert mgr.state.barrier_rearms == 1
         finally:
             proc.terminate()

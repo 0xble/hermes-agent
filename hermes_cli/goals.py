@@ -123,13 +123,14 @@ _DISPUTED_PAUSE_PREFIX = "judge disputed completion: "
 # on concrete evidence instead of a vibe check.
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
-# Longest a pid/session wait barrier may hold the loop before judging resumes. Timed barriers
+# A live pid/session barrier emits its first age notice after this interval. Timed barriers
 # (``waiting_until``) carry their own deadline and are exempt.
 _MAX_BARRIER_WAIT_S = 30 * 60
-# A live pid/session barrier is re-checked on an escalating schedule after the
-# probe window. Each interval remains bounded by _MAX_BARRIER_WAIT_S so the
-# process can still be observed promptly when it exits or emits its trigger.
-_BARRIER_REARM_BACKOFF_S = (5 * 60, 15 * 60, _MAX_BARRIER_WAIT_S)
+# A live target cannot hold a goal forever. After this ceiling the goal pauses with a named blocker.
+_MAX_LIVE_BARRIER_S = 6 * 60 * 60
+# Liveness is re-checked on an escalating schedule after the age notice. The deadline is stored
+# separately from ``waiting_until`` so pid/session readers retain their target semantics.
+_BARRIER_REARM_BACKOFF_S = (5 * 60, 15 * 60, 30 * 60)
 # A judge-selected timed wait must be long enough to avoid another immediate poke, but cannot
 # strand a goal indefinitely when the model guesses a distant deadline.
 _MIN_JUDGE_WAIT_S = 60
@@ -253,7 +254,7 @@ JUDGE_SYSTEM_PROMPT = (
     "- The agent has delegated subagents still running (stated below as "
     "active delegations) and the response says it is waiting on them with "
     "nothing else dispatchable — return ``wait_for_seconds`` between 600 and "
-    "their results wake the agent on their own; re-poking it now only "
+    "1800. Their results wake the agent on their own; re-poking it now only "
     "produces a status recap.\n"
     "- Progress is gated on work outside this session that is running or scheduled "
     "on its own — for example an external service, cron/watchdog, a stated next "
@@ -626,6 +627,9 @@ class GoalState:
     # durable so a gateway restart does not reset a long-running poller to a
     # tight wake cadence.
     barrier_rearms: int = 0
+    # Next liveness probe deadline for a live pid/session barrier. Kept separate
+    # from waiting_until so pid/session readers continue to present the target.
+    barrier_recheck_at: float = 0.0
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: List[GoalGate] = field(default_factory=list)
@@ -680,6 +684,7 @@ class GoalState:
             last_progress_fingerprint=(str(data["last_progress_fingerprint"])
                                        if data.get("last_progress_fingerprint") else None),
             barrier_rearms=int(data.get("barrier_rearms") or 0),
+            barrier_recheck_at=float(data.get("barrier_recheck_at") or 0.0),
             **ints, **floats,
         )
 
@@ -727,6 +732,7 @@ class GoalState:
         if not preserve_notice_key:
             self.last_wait_notice_key = None
         self.barrier_rearms = 0
+        self.barrier_recheck_at = 0.0
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
@@ -929,6 +935,70 @@ def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[boo
         return db._execute_write(_txn)
     except Exception as exc:
         logger.warning("GoalManager: conditional wait clear failed for %s: %s", session_id, exc)
+        return False, None
+
+
+def rearm_goal_barrier_if_since(
+    session_id: str, waiting_since: float, *, recheck_at: float, rearm_count: int,
+    notice_key: Optional[str] = None,
+) -> Tuple[bool, Optional[GoalState]]:
+    """CAS-update a live barrier without overwriting a concurrent pause, clear, or re-park."""
+    db = _get_session_db()
+    if not session_id or db is None:
+        return False, None
+    key = _meta_key(session_id)
+
+    def _txn(conn) -> Tuple[bool, Optional[GoalState]]:
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None or not row[0]:
+            return False, None
+        state = GoalState.from_json(row[0])
+        live_wait = state.waiting_on_pid is not None or state.waiting_on_session is not None
+        if state.status != "active" or not live_wait or state.waiting_since != waiting_since:
+            return False, state
+        state.barrier_recheck_at = recheck_at
+        state.barrier_rearms = rearm_count
+        if notice_key:
+            state.last_wait_notice_key = notice_key
+        state.mutation_id = uuid.uuid4().hex
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
+        return True, state
+
+    try:
+        return db._execute_write(_txn)
+    except Exception as exc:
+        logger.warning("GoalManager: conditional barrier re-arm failed for %s: %s", session_id, exc)
+        return False, None
+
+
+def pause_goal_barrier_if_since(
+    session_id: str, waiting_since: float, *, reason: str,
+) -> Tuple[bool, Optional[GoalState]]:
+    """CAS-pause a still-live barrier after its hard lifetime ceiling."""
+    db = _get_session_db()
+    if not session_id or db is None:
+        return False, None
+    key = _meta_key(session_id)
+
+    def _txn(conn) -> Tuple[bool, Optional[GoalState]]:
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None or not row[0]:
+            return False, None
+        state = GoalState.from_json(row[0])
+        live_wait = state.waiting_on_pid is not None or state.waiting_on_session is not None
+        if state.status != "active" or not live_wait or state.waiting_since != waiting_since:
+            return False, state
+        state.status = "paused"
+        state.paused_reason = reason
+        state.clear_wait(preserve_notice_key=True)
+        state.mutation_id = uuid.uuid4().hex
+        conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
+        return True, state
+
+    try:
+        return db._execute_write(_txn)
+    except Exception as exc:
+        logger.warning("GoalManager: conditional barrier pause failed for %s: %s", session_id, exc)
         return False, None
 
 
@@ -1341,9 +1411,9 @@ def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Opti
     """
     rows = []
     for item in evidence or []:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or str(item.get("tool") or "").strip().lower() == "quality gate":
             continue
-        rows.append({k: item.get(k) for k in ("tool", "call", "output", "timestamp")})
+        rows.append({k: item.get(k) for k in ("tool", "call", "output")})
     if not rows:
         return None
     payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -1352,8 +1422,10 @@ def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Opti
 
 _READ_ONLY_STATUS_CALL_RE = re.compile(
     r"^(?:gh\s+(?:pr|run)\s+(?:view|checks|status|list)|"
-    r"git\s+(?:status|diff|log|show|branch|rev-parse)|"
-    r"(?:ls|pwd|find|rg|grep|cat|head|tail)\b)",
+    r"git\s+(?:status|diff|log|show|rev-parse)(?:\s|$)|"
+    r"git\s+branch(?:\s+(?:--show-current|--list|-a|--all))?\s*$|"
+    r"(?:ls|pwd|rg|grep|cat|head|tail)\b(?!.*(?:-delete|--delete))|"
+    r"find\b(?!.*(?:\s-delete\b|\s--delete\b)))",
     re.I,
 )
 _READ_ONLY_STATUS_TOOLS = frozenset({
@@ -1362,8 +1434,23 @@ _READ_ONLY_STATUS_TOOLS = frozenset({
 })
 
 
+def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_at: float) -> List[Dict[str, Any]]:
+    """Keep only evidence recorded since the previous completed turn."""
+    rows = []
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            timestamp = float(item.get("timestamp") or 0.0)
+        except (TypeError, ValueError):
+            timestamp = 0.0
+        if previous_turn_at <= 0.0 or timestamp > previous_turn_at:
+            rows.append(item)
+    return rows
+
+
 def _evidence_only_read_only_status(evidence: Optional[List[Dict[str, Any]]]) -> bool:
-    """Whether recorded evidence consists only of bounded status/read operations."""
+    """Whether current-turn evidence consists only of bounded status/read operations."""
     rows = [item for item in (evidence or []) if isinstance(item, dict)]
     if not rows:
         return True
@@ -2256,6 +2343,8 @@ class GoalManager:
             setattr(state, k, v)
         state.waiting_reason = (reason or "").strip() or None
         state.waiting_since = time.time()
+        if state.waiting_on_pid is not None or state.waiting_on_session is not None:
+            state.barrier_recheck_at = state.waiting_since + _MAX_BARRIER_WAIT_S
         return self._save()
 
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
@@ -2337,67 +2426,84 @@ class GoalManager:
             return False
         return still
 
-    def _rearm_running_barrier(self) -> bool:
-        """Re-arm an aged live pid/session barrier instead of waking the goal into polling.
+    def rearm_live_barrier(self) -> Optional[str]:
+        """Refresh a due live barrier with a CAS write and return a new user notice, if any.
 
-        ``waiting_until`` is used as the next liveness probe deadline while the
-        pid/session identity remains the authoritative wake condition. A real
-        exit or watch-pattern match still makes ``_barrier_holds`` false; this
-        method only extends the observation interval when the target is alive.
+        This is the mutating companion to ``lifted_barrier_prompt``. Idle surfaces
+        call it before the pure prompt check; a concurrent writer that changed the
+        original ``waiting_since`` wins and this manager adopts that row.
         """
         s = self._state
-        if s is None or s.waiting_since <= 0.0 or not (s.waiting_on_pid is not None or s.waiting_on_session is not None):
-            return False
+        if s is None or s.status != "active" or s.waiting_since <= 0.0:
+            return None
+        if not (s.waiting_on_pid is not None or s.waiting_on_session is not None):
+            return None
         now = time.time()
-        if now - s.waiting_since <= _MAX_BARRIER_WAIT_S:
-            return False
-        if s.waiting_until and now < s.waiting_until:
-            return False
         if s.waiting_on_session is not None:
             still = _session_waiting(s.waiting_on_session)
+            target = f"session {s.waiting_on_session}"
         else:
             still = s.waiting_on_pid is not None and _pid_alive(s.waiting_on_pid)
+            target = f"pid {s.waiting_on_pid}"
         if not still:
-            return False
+            return None
+        age = now - s.waiting_since
+        if age >= _MAX_LIVE_BARRIER_S:
+            reason = (
+                f"live wait target {target} exceeded the {_MAX_LIVE_BARRIER_S // 3600}h lifetime ceiling; "
+                "the target is still alive and needs inspection"
+            )
+            changed, current = pause_goal_barrier_if_since(self.session_id, s.waiting_since, reason=reason)
+            if current is not None:
+                self._state = current
+            if changed:
+                return f"⏸ Goal paused — blocker: {reason}. Use /goal resume after checking the target."
+            return None
+        if s.barrier_recheck_at and now < s.barrier_recheck_at:
+            return None
         index = min(max(0, s.barrier_rearms), len(_BARRIER_REARM_BACKOFF_S) - 1)
         delay = _BARRIER_REARM_BACKOFF_S[index]
-        s.barrier_rearms += 1
-        s.waiting_until = now + delay
-        self._save()
-        logger.info(
-            "goal %s: live wait barrier on %s exceeded %ds; rearming liveness check in %ds (rearm %d)",
-            self.session_id, s.waiting_on_session or s.waiting_on_pid,
-            _MAX_BARRIER_WAIT_S, delay, s.barrier_rearms,
+        notice_key = f"live-barrier:{target}|reason:{s.waiting_reason or ''}"
+        notice = None
+        if age >= _MAX_BARRIER_WAIT_S and s.last_wait_notice_key != notice_key:
+            notice = f"⏳ Goal still waiting on {target} after 30 minutes; checking again with backoff."
+        changed, current = rearm_goal_barrier_if_since(
+            self.session_id, s.waiting_since, recheck_at=now + delay,
+            rearm_count=s.barrier_rearms + 1, notice_key=notice_key if notice else None,
         )
-        return True
+        if current is not None:
+            self._state = current
+        self._last_live_barrier_notice = notice if changed else None
+        return self._last_live_barrier_notice
+
+    def _rearm_running_barrier(self) -> bool:
+        return self.rearm_live_barrier() is not None or bool(
+            self._state is not None and self._state.status == "active"
+            and (self._state.waiting_on_pid is not None or self._state.waiting_on_session is not None)
+            and self._state.barrier_recheck_at > time.time()
+        )
 
     def is_waiting(self) -> bool:
-        """True iff a barrier is set AND not yet satisfied.
-
-        A live pid/session barrier is re-armed with bounded backoff after
-        ``_MAX_BARRIER_WAIT_S`` rather than waking the goal into busy-work.
-        """
+        """True iff a barrier is set AND not yet satisfied."""
         s = self._state
         if s is None or not (s.waiting_on_pid is not None or s.waiting_on_session is not None or s.waiting_until):
             return False
         self._rearm_running_barrier()
+        if self._state is None or self._state.status != "active":
+            return False
         still = self._barrier_holds()
         if not still:
             self.stop_waiting()
         return still
 
     def lifted_barrier_prompt(self) -> Optional[str]:
-        """Continuation prompt for a parked goal whose barrier has lifted, else None. Pure: the
-        caller clears the barrier (``stop_waiting``) only after the prompt was admitted, so a failed
-        injection is retried instead of leaving an active goal with nothing left to drive it.
+        """Pure prompt check for a parked goal whose barrier has lifted.
 
-        Idle surfaces (CLI idle hook, gateway wakeup ticker) call this because the post-turn judge
-        only runs after a turn: a barrier whose completion notice never arrives (a gateway restart
-        killed the process, notify_on_complete was off, a timed wait elapsed) otherwise parks the
-        goal until an unrelated message happens to arrive."""
+        Re-arming and hard-ceiling writes are performed by ``rearm_live_barrier``
+        before idle surfaces call this method; this method never persists state.
+        """
         if not self.is_parked():
             return None
-        self._rearm_running_barrier()
         if self._barrier_holds():
             return None
         if self._state.waiting_on_session and _completion_notice_pending(self._state.waiting_on_session):
@@ -2445,9 +2551,11 @@ class GoalManager:
     def _waiting_decision(self, state: GoalState) -> Dict[str, Any]:
         tgt = self._waiting_target(state)
         reason = state.waiting_reason or tgt
+        notice = getattr(self, "_last_live_barrier_notice", None)
+        self._last_live_barrier_notice = None
         return self._wait_notice_decision(
             state, verdict="waiting",
-            message=f"⏳ Goal parked — waiting on {tgt}: {reason}",
+            message=notice or f"⏳ Goal parked — waiting on {tgt}: {reason}",
         )
 
     def _apply_wait_directive(
@@ -2544,6 +2652,7 @@ class GoalManager:
             return self._waiting_decision(state)
 
         state.turns_used += 1
+        previous_turn_at = state.last_turn_at
         state.last_turn_at = time.time()
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,
@@ -2555,7 +2664,9 @@ class GoalManager:
             return gate_decision
 
         evidence = collect_goal_evidence(evidence_session_id or self.session_id, since=state.created_at)
-        # Gates that just passed are deterministic evidence too; before this they only vetoed DONE.
+        turn_evidence = _evidence_for_turn(evidence, previous_turn_at)
+        # Gates that just passed are deterministic evidence too, but their timestamp is a
+        # presentation detail and must not affect no-progress identity.
         now = time.time()
         evidence += [
             {"tool": "quality gate", "call": f"$ {g.command}", "timestamp": now,
@@ -2565,7 +2676,7 @@ class GoalManager:
         citations = resolve_cited_evidence(evidence_session_id or self.session_id, last_response,
                                            since=state.created_at)
         previous_reason = state.last_reason
-        progress_fingerprint = _goal_progress_fingerprint(evidence)
+        progress_fingerprint = _goal_progress_fingerprint(turn_evidence)
         new_progress = bool(progress_fingerprint and progress_fingerprint != state.last_progress_fingerprint)
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
@@ -2658,7 +2769,7 @@ class GoalManager:
         # A live delegation is an explicit external wake source. If an automatic turn produced no
         # actionable evidence, park immediately instead of trusting a flaky CONTINUE verdict to keep polling.
         if verdict == "continue" and not user_initiated and active_delegations > 0 and (
-            not new_progress or _evidence_only_read_only_status(evidence)
+            not new_progress or _evidence_only_read_only_status(turn_evidence)
         ):
             return self._delegation_no_progress_wait(state, reason, active_delegations)
 

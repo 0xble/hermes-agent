@@ -92,12 +92,14 @@ def test_live_session_barrier_rearms_after_age_cap(hermes_home):
     state = mgr.state
     assert state is not None
     state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+    state.barrier_recheck_at = 0.0
     mgr._save()
     with patch.object(goals, "_session_waiting", return_value=True):
         assert mgr.is_waiting() is True
-    assert state.waiting_on_session == "watcher-1"
-    assert state.waiting_until > time.time()
-    assert state.barrier_rearms == 1
+    assert mgr.state.waiting_on_session == "watcher-1"
+    assert mgr.state.barrier_recheck_at > time.time()
+    assert mgr.state.waiting_until == 0.0
+    assert mgr.state.barrier_rearms == 1
 
 
 def test_three_qualifying_no_progress_turns_back_off_and_persist(hermes_home):
@@ -180,7 +182,7 @@ def test_progress_and_real_user_turn_reset_no_progress_streak(hermes_home):
     mgr = GoalManager("no-progress-reset", default_max_turns=20)
     mgr.set("wait for external consolidation", max_turns=20)
     evidence = [
-        {"tool": "terminal", "call": "echo progress", "output": "progress", "timestamp": 1.0},
+        {"tool": "terminal", "call": "echo progress", "output": "progress", "timestamp": time.time() + 60},
     ]
     with patch.object(
         goals, "collect_goal_evidence", side_effect=[[], [], evidence, evidence, evidence, evidence]
@@ -216,6 +218,88 @@ def test_unchanged_continuation_reason_is_not_reposted(hermes_home):
     assert mgr.state.last_wait_notice_key == "continuation|reason:nothing actionable until the watchdog"
 
 
+def test_live_barrier_emits_one_age_notice(hermes_home):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("age-notice")
+    mgr.set("wait for watcher")
+    mgr.wait_on_session("watcher-age", reason="external watcher")
+    mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+    mgr.state.barrier_recheck_at = 0.0
+    mgr._save()
+    with patch.object(goals, "_session_waiting", return_value=True):
+        first = mgr.rearm_live_barrier()
+        second = mgr.rearm_live_barrier()
+
+    assert first and "30 minutes" in first
+    assert second is None
+    assert mgr.state.last_wait_notice_key.startswith("live-barrier:session watcher-age")
+    assert mgr.state.waiting_until == 0.0
+
+
+def test_live_barrier_pauses_at_hard_ceiling(hermes_home):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("hard-cap")
+    mgr.set("wait for watcher")
+    mgr.wait_on_session("watcher-hard-cap", reason="external watcher")
+    mgr.state.waiting_since = time.time() - goals._MAX_LIVE_BARRIER_S - 1
+    mgr.state.barrier_recheck_at = 0.0
+    mgr._save()
+    with patch.object(goals, "_session_waiting", return_value=True):
+        notice = mgr.rearm_live_barrier()
+
+    assert notice and "watcher-hard-cap" in notice and "6h" in notice
+    assert mgr.state.status == "paused"
+    assert "watcher-hard-cap" in mgr.state.paused_reason
+
+
+def test_live_barrier_rearm_respects_cas_loss(hermes_home, monkeypatch):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("rearm-cas")
+    mgr.set("wait for watcher")
+    mgr.wait_on_session("watcher-cas", reason="external watcher")
+    since = mgr.state.waiting_since
+    mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+    mgr.state.barrier_recheck_at = 0.0
+    mgr._save()
+    since = mgr.state.waiting_since
+    concurrent = goals.load_goal("rearm-cas")
+    concurrent.waiting_on_session = "newer-watcher"
+    concurrent.waiting_since = since + 10
+    goals.save_goal("rearm-cas", concurrent)
+    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: True)
+
+    assert mgr.rearm_live_barrier() is None
+    assert mgr.state.waiting_on_session == "newer-watcher"
+    assert mgr.state.waiting_since == since + 10
+
+
+def test_quality_gate_rows_do_not_reset_no_progress(hermes_home):
+    from hermes_cli import goals
+
+    first = goals._goal_progress_fingerprint([
+        {"tool": "quality gate", "call": "$ true", "timestamp": 1.0, "output": "exit 0 (passed)"},
+    ])
+    second = goals._goal_progress_fingerprint([
+        {"tool": "quality gate", "call": "$ true", "timestamp": 9999.0, "output": "exit 0 (passed)"},
+    ])
+    assert first is None and second is None
+
+
+def test_read_only_status_regex_rejects_destructive_variants(hermes_home):
+    from hermes_cli import goals
+
+    assert goals._READ_ONLY_STATUS_CALL_RE.match("git branch")
+    assert goals._READ_ONLY_STATUS_CALL_RE.match("find . -name '*.tmp'")
+    assert not goals._READ_ONLY_STATUS_CALL_RE.match("git branch -D old")
+    assert not goals._READ_ONLY_STATUS_CALL_RE.match("find . -delete")
+
+
 def test_legacy_goal_row_defaults_new_backoff_fields():
     from hermes_cli.goals import GoalState
 
@@ -224,3 +308,4 @@ def test_legacy_goal_row_defaults_new_backoff_fields():
     assert state.last_progress_fingerprint is None
     assert state.last_wait_notice_key is None
     assert state.barrier_rearms == 0
+    assert state.barrier_recheck_at == 0.0
