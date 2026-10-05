@@ -182,6 +182,8 @@ def _set_gateway_fast_config(monkeypatch, tmp_path, *, service_tier="", expiry=0
         lambda: {"agent": {"service_tier": service_tier, "fast_expiry_seconds": expiry}},
     )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-6-astra")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("default_tier", ["", "auto", "fast"])
 async def test_session_fast_override_expires_to_explicit_normal(monkeypatch, tmp_path, default_tier):
@@ -324,6 +326,11 @@ async def test_prepare_turn_stages_expiry_notice_once_before_run_sync(monkeypatc
 
     # Open-session's second value is the session entry in production.
     runner._hmwa_open_session = AsyncMock(return_value=(False, session_entry))
+    # Production order: handle_message claims the turn with the pending sentinel before preparing,
+    # and an idle agent from the previous turn is still cached.
+    runner._running_agents[session_key] = gateway_run._AGENT_PENDING_SENTINEL
+    cached_agent = SimpleNamespace(request_overrides={"service_tier": "priority"}, service_tier="priority")
+    runner._agent_cache[session_key] = (cached_agent, "sig", 0)
     prepared, _ = await runner._hmwa_prepare_turn(
         event, source, session_entry, session_key, "quick", 1,
     )
@@ -333,6 +340,10 @@ async def test_prepare_turn_stages_expiry_notice_once_before_run_sync(monkeypatc
         "⚡ Fast mode switched off after 10s.",
     ]
     assert runner._consume_pending_turn_sidecar_notes(session_key) == []
+    # Expiry behaved like /fast off: the stale cached agent is gone and the claim is untouched.
+    assert session_key not in runner._agent_cache
+    assert runner._running_agents[session_key] is gateway_run._AGENT_PENDING_SENTINEL
+    assert not hasattr(gateway_run._AGENT_PENDING_SENTINEL, "_gateway_base_request_overrides")
 
 
 @pytest.mark.asyncio
@@ -385,6 +396,7 @@ async def test_fast_status_after_expiry_shows_normal_and_notice_once(monkeypatch
     assert "normal" in reply.lower()
     assert reply.count("Fast mode switched off") == 1
     assert runner._resolve_session_service_tier(session_key=session_key, report_transition=True) == (None, None)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["not-a-number", "", None, -1, "inf", "nan", True, False])

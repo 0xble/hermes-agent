@@ -667,8 +667,14 @@ class GatewayModelCommandsMixin:
             return False
 
     def _live_agent_for_session_control(self, session_key: str):
-        """Return this session's running agent without touching its cached prompt or transcript."""
-        return (getattr(self, "_running_agents", None) or {}).get(session_key)
+        """Return this session's running agent without touching its cached prompt or transcript.
+
+        A turn claimed but not yet built holds the pending sentinel; it has no request state, so
+        it counts as no live agent (the idle cached agent is evicted instead)."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        agent = (getattr(self, "_running_agents", None) or {}).get(session_key)
+        return None if agent is _AGENT_PENDING_SENTINEL else agent
 
     def _evict_idle_agent_after_session_control(self, session_key: str) -> None:
         if self._live_agent_for_session_control(session_key) is None:
@@ -820,11 +826,13 @@ class GatewayModelCommandsMixin:
             baseline = dict(getattr(agent, "request_overrides", None) or {})
             agent._gateway_base_request_overrides = dict(baseline)
         overrides = dict(baseline)
+        fast_overlay: dict = {}
         if tier == "priority":
-            overrides.update(resolve_fast_mode_overrides(
+            fast_overlay = dict(resolve_fast_mode_overrides(
                 agent.model, provider=getattr(agent, "provider", None),
                 base_url=getattr(agent, "base_url", None),
             ) or {})
+            overrides.update(fast_overlay)
         agent.request_overrides = overrides
         agent.service_tier = tier
         expiry_loader = getattr(self, "_session_service_tier_expiry", None)
@@ -833,7 +841,7 @@ class GatewayModelCommandsMixin:
         except (AttributeError, TypeError, ValueError):
             expiry_at = 0.0
         from agent.fast_mode import set_gateway_fast_expiry_state
-        set_gateway_fast_expiry_state(agent, expiry_at, tier)
+        set_gateway_fast_expiry_state(agent, expiry_at, tier, overlay=fast_overlay)
         agent._fast_until = (time.monotonic() + getattr(agent, "fast_auto_seconds", DEFAULT_WINDOW_SECONDS)
                              if tier == "auto" else 0.0)
 

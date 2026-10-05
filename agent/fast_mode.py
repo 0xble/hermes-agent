@@ -100,12 +100,19 @@ def _gateway_fast_overlay(agent: Any, tier: str | None) -> dict[str, Any]:
     ) or {})
 
 
-def set_gateway_fast_expiry_state(agent: Any, expiry_at: Any, tier: str | None) -> None:
-    """Record gateway expiry metadata used by the non-mutating wire-time filter."""
+def set_gateway_fast_expiry_state(
+    agent: Any, expiry_at: Any, tier: str | None, overlay: dict[str, Any] | None = None,
+) -> None:
+    """Record gateway expiry metadata used by the non-mutating wire-time filter.
+
+    ``overlay`` is the exact Fast mapping the caller added; without it the overlay is resolved
+    from the agent's route the same way the turn route resolves it."""
     agent._gateway_fast_expiry_at = (
         expiry_at if isinstance(expiry_at, (int, float)) and not isinstance(expiry_at, bool) else 0.0
     )
-    agent._gateway_session_fast_overlay = _gateway_fast_overlay(agent, tier)
+    agent._gateway_session_fast_overlay = (
+        dict(overlay) if isinstance(overlay, dict) else _gateway_fast_overlay(agent, tier)
+    )
 
 
 def effective_request_overrides(agent: Any) -> dict[str, Any]:
