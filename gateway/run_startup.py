@@ -603,8 +603,11 @@ class GatewayStartupMixin:
 
     def _auto_resume_ready(self, entry, *, require_adapter=True) -> tuple | None:
         """Shared admission for deferred follow-ups and synthetic resume turns."""
-        from gateway.run import _auto_continue_freshness_window, _is_fresh_gateway_interruption
-        marker = entry.last_resume_marked_at or entry.updated_at
+        from gateway.run import (
+            _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+            _resume_pending_marker_timestamp,
+        )
+        marker = _resume_pending_marker_timestamp(entry)
         if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
             return None
         if self._is_session_running(entry.session_key):
