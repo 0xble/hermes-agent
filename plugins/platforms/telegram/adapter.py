@@ -152,7 +152,7 @@ from agent.i18n import get_language, t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
-    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, in_ingress_consumer,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -799,6 +799,10 @@ _POLLING_STALL_TIMEOUT = 150.0
 # that PTB's dispatcher ever handed the fetched updates to a handler. Two heartbeats (180s) with a
 # backlog and no dispatch progress: diagnostic only, never drives recovery (#71240 owns that).
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 2
+# A reconnect can start while the failed generation's in-process poller is still stopping (its stop
+# waits for the outstanding long poll, up to the poll timeout plus one second). Waiting for that
+# release costs seconds; refusing costs the reconnect ladder's 30s backoff.
+_POLLER_RELEASE_WAIT_SECONDS = 25.0
 # sendVideo transcodes before answering, outlasting the 20s read timeout; also how long a user waits
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
@@ -2167,6 +2171,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # update_queue, so old dispatches can briefly exceed received; the check treats that as no backlog.
         self._updates_received_total = self._updates_dispatched_total = 0
         self._ingress_dispatched_seen = self._ingress_stalled_heartbeats = 0
+        self._polling_pending_dispatched_seen = None
         return self._polling_generation, self._polling_progress_event
 
     def _record_polling_progress(self, generation: int) -> bool:
@@ -2927,8 +2932,21 @@ class TelegramAdapter(BasePlatformAdapter):
         except (asyncio.TimeoutError, OSError):
             return  # connectivity symptom for the get_me() path, not a stuck-queue signal
         pending = int(getattr(info, "pending_update_count", 0) or 0)
+        dispatched = getattr(self, "_updates_dispatched_total", 0)
+        seen = getattr(self, "_polling_pending_dispatched_seen", None)
+        progressed = seen is not None and dispatched != seen
+        self._polling_pending_dispatched_seen = dispatched
         if pending <= 0:
             self._polling_pending_stuck_count = 0
+            return
+        if progressed:
+            # Telegram counts the batch being handled as pending until the next getUpdates confirms its
+            # offset, and the controlled poller does not poll again until that batch drains. So a probe
+            # landing while any handler runs sees a backlog. Only a backlog with no update dispatched
+            # since the previous probe is a stuck consumer: start a new window at this probe.
+            self._polling_pending_stuck_count = 1
+            logger.debug("[%s] Telegram polling heartbeat: %d update(s) pending while dispatch progresses",
+                         self.name, pending)
             return
         self._polling_pending_stuck_count += 1
         logger.warning(
@@ -3948,7 +3966,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             from gateway.config import load_gateway_config
             from gateway.generation import GenerationCoordinator, overlap_handover_enabled
-            from plugins.platforms.telegram.polling_transfer import PollingJournal, token_has_active_poller
+            from plugins.platforms.telegram.polling_transfer import PollingJournal, wait_for_poller_release
             from hermes_constants import get_routing_process_hermes_home
             overlap_enabled = overlap_handover_enabled(load_gateway_config())
             webhook_url = (_get_scoped_secret("TELEGRAM_WEBHOOK_URL") or "").strip()
@@ -3960,7 +3978,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 PollingJournal, GenerationCoordinator(get_routing_process_hermes_home()), self.config.token)
                 if overlap_enabled and not webhook_url else None)
             if (not polling_standby and self._controlled_journal is not None
-                    and token_has_active_poller(self._controlled_journal.token_hash)):
+                    and not await wait_for_poller_release(self._controlled_journal.token_hash,
+                                                          _POLLER_RELEASE_WAIT_SECONDS)):
                 raise RuntimeError("old Telegram poller still owns this token")
             if not polling_standby and not await self._acquire_polling_token_lock():
                 return False
@@ -7507,11 +7526,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 kind=t(_MEDIA_KIND_KEYS[kind]) if kind in _MEDIA_KIND_KEYS else kind,
                 name=named, error=exc.__class__.__name__))
             if notice:
-                try:
-                    self._accept_update()
-                    await msg.reply_text(notice)
-                except Exception as reply_err:
-                    logger.warning("[Telegram] Failed to notify user about %s cache failure: %s", kind, reply_err, exc_info=True)
+                self._accept_update()
+
+                async def notify() -> None:
+                    try:
+                        await msg.reply_text(notice)
+                    except Exception as reply_err:
+                        logger.warning("[Telegram] Failed to notify user about %s cache failure: %s", kind, reply_err,
+                                       exc_info=True)
+
+                if in_ingress_consumer():
+                    self.spawn_ingress_reply(notify(), label="media retry notice")
+                else:
+                    await notify()
             # The agent-visible note is execution evidence, not a channel diagnostic; it stays in both modes.
             event.text = self._append_observed_note(
                 event.text,
