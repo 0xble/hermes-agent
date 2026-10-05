@@ -2128,6 +2128,15 @@ class GatewayTurnMixin:
             self._hmwa_apply_message_timestamp(event, message_text)
         )
 
+        # Resolve once after preparation so expiry behaves like /fast off and its notice rides this turn.
+        if session_key:
+            transition = self._resolve_session_service_tier(
+                session_key=session_key, report_transition=True,
+            )
+            expiry_notice = transition[1] if isinstance(transition, tuple) else None
+            if expiry_notice:
+                turn_sidecar_notes.append(expiry_notice)
+
         # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
         # cannot leak them into the next turn.
         if turn_sidecar_notes and session_key:
