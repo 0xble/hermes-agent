@@ -89,6 +89,20 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     assert any("not a native" in p for p in mod.check_receipt(tmp_path))
 
 
+def test_check_receipt_ignores_pm_latest_for_the_newest_update(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})  # nothing running
+    _receipt(tmp_path)
+    directory = tmp_path / "logs" / "update_receipts"
+    native = directory / "update_20261005_045152_65780_a276f85a563a4f74983a41e34995844a.json"
+    native.write_text((directory / "latest.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (directory / "latest.json").write_text(json.dumps({"kind": "sync", "outcome": "ok", "steps": []}), encoding="utf-8")
+
+    assert mod.check_receipt(tmp_path) == []
+
+
 @pytest.mark.parametrize("kind", ["directory", "file"])
 def test_non_symlink_current_fails_closed(tmp_path, monkeypatch, kind):
     mod = _load("check_fork_patches")

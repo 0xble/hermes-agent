@@ -263,6 +263,23 @@ def check_config(home: Path) -> list[str]:
     return failures
 
 
+def _newest_update_receipt(home: Path) -> Path | None:
+    """Choose the newest updater receipt without trusting the shared latest pointer.
+
+    PM syncs rotate ``latest.json`` in this directory too, so an updater receipt
+    named ``update_*.json`` is authoritative whenever one exists. The updater's
+    filename starts with its UTC timestamp, making name order the same as update
+    order. A lone ``latest.json`` remains supported for older installations, but
+    its native schema is still validated by ``check_receipt`` below.
+    """
+    directory = home / "logs" / "update_receipts"
+    update_receipts = sorted(path for path in directory.glob("update_*.json") if path.is_file())
+    if update_receipts:
+        return update_receipts[-1]
+    latest = directory / "latest.json"
+    return latest if latest.is_file() else None
+
+
 def check_receipt(home: Path) -> list[str]:
     """Compare the last native ``hermes update`` receipt with the checkout and the running fleet.
 
@@ -271,8 +288,8 @@ def check_receipt(home: Path) -> list[str]:
     whose rows record each running profile's ``code_sha`` and a ``state`` of current/stale/unknown.
     A receipt with none of those is not a native receipt and is reported, not ignored.
     """
-    latest = home / "logs" / "update_receipts" / "latest.json"
-    if not latest.is_file():
+    latest = _newest_update_receipt(home)
+    if latest is None:
         return []  # no promotion has happened through hermes update yet; nothing to compare
     try:
         receipt = json.loads(latest.read_text(encoding="utf-8-sig"))
