@@ -280,6 +280,10 @@ async def test_live_agent_read_time_filter_is_non_mutating_until_resolution(monk
     before = dict(agent.request_overrides)
     assert effective_request_overrides(agent) == {"extra_body": {"keep": True}}
     assert agent.request_overrides == before
+    tier, notice = runner._resolve_session_service_tier(session_key=key, report_transition=True)
+    assert (tier, notice) == (None, "⚡ Fast mode switched off after 10s.")
+    assert agent.service_tier is None
+    assert agent.request_overrides == {"extra_body": {"keep": True}}
 
 
 @pytest.mark.asyncio
