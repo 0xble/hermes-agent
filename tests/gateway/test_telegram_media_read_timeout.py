@@ -26,11 +26,7 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 @pytest.fixture
 def adapter(monkeypatch):
-    def resolve(host, port, *args, **kwargs):
-        assert host == "example.com"
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda *a, **k: True)
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
     a._metadata_thread_id = lambda metadata: None

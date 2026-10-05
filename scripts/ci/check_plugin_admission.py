@@ -17,7 +17,8 @@ import subprocess
 import sys
 import tempfile
 
-import yaml
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import hermes_yaml as yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from validate_plugin_catalog import validate_entry  # noqa: E402
@@ -115,7 +116,7 @@ def check_self_updater(plugin: Path) -> None:
     for source in plugin.rglob("*"):
         if source.suffix not in {".js", ".mjs", ".cjs", ".ts"} or not source.is_file():
             continue
-        content = source.read_text(encoding="utf-8", errors="replace")
+        content = source.read_text(encoding="utf-8-sig", errors="replace")
         if re.search(r"releases/latest|raw\.githubusercontent\.com", content) and re.search(
             r"writeTextFile|renamePath|writeFile\(", content,
         ):
@@ -156,7 +157,7 @@ def check(root: Path, base: str, head: str | None, *, validator: list[str] | Non
                 path = (root / name).resolve()
                 if not path.is_relative_to(root.resolve()):
                     raise ValueError("catalog entry escapes the working tree")
-                content = path.read_text(encoding="utf-8")
+                content = path.read_text(encoding="utf-8-sig")
             else:
                 content = run(["git", "show", f"{head_sha}:{name}"], cwd=root)
             admit(yaml.safe_load(content), validator=validator or [sys.executable, "-m", "hermes_cli.main"])

@@ -41,7 +41,7 @@ jobs:
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
           python3 ci/install-linux-tools.py amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
-          uv python install 3.11.16
+          uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Exact-SHA static and Node gate
         shell: bash
@@ -83,7 +83,7 @@ jobs:
           apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
           python3 ci/install-linux-tools.py amd64
           echo /opt/ci/rust/bin >> "$GITHUB_PATH"
-          uv python install 3.11.16
+          uv python install 3.14.7
           npm install --global npm@12.0.0
       - name: Exact-SHA Python shard
         shell: bash
@@ -99,10 +99,18 @@ jobs:
       - name: Require every gate job
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          DRAFT_PR: ${{ github.event.pull_request.draft }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
           print(results)
-          sys.exit(0 if results and all(result == 'success' for result in results.values()) else 1)
+          if results and all(result == 'success' for result in results.values()):
+              sys.exit(0)
+          not_run = [name for name, result in results.items() if result != 'success']
+          only_skipped = bool(not_run) and all(results[name] == 'skipped' for name in not_run)
+          draft_skip = os.environ.get('DRAFT_PR') == 'true' and only_skipped
+          message = 'draft: gate not run' if draft_skip else 'gate not qualified'
+          print(message, file=sys.stderr)
+          sys.exit(1)
           PY

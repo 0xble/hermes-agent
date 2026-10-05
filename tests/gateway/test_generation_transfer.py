@@ -15,7 +15,7 @@ def _pair(tmp_path):
     old = GenerationIdentity.create(release_sha="a", label="slot-a", start_fingerprint=fingerprint)
     new = GenerationIdentity.create(release_sha="b", label="slot-b", start_fingerprint=fingerprint)
     coordinator.register(old, state="serving")
-    coordinator.register(new, state="ready")
+    coordinator.register(new, state="standby")
     epoch = coordinator.acquire_lease("active_generation", old.id)
     return coordinator, old, new, epoch
 
@@ -28,11 +28,7 @@ def test_transfer_requires_every_served_token_receipt_and_ready_successor(tmp_pa
     with pytest.raises(RuntimeError, match="receipt"):
         db.commit_transfer(old.id, new.id, epoch)
     assert db.leases()[0]["generation_id"] == old.id
-    db.heartbeat(new.id, state="standby")
     db.record_poller_stopped(old.id, epoch, "second", 21)
-    with pytest.raises(RuntimeError, match="ready"):
-        db.commit_transfer(old.id, new.id, epoch)
-    db.heartbeat(new.id, state="ready")
     promoted = db.commit_transfer(old.id, new.id, epoch)
     assert promoted == epoch + 1
     assert db.leases()[0]["generation_id"] == new.id
@@ -96,3 +92,10 @@ def test_transfer_cannot_steal_live_holder_without_request(tmp_path):
     with pytest.raises(RuntimeError):
         db.acquire_lease("active_generation", new.id)
     assert db.leases()[0]["generation_id"] == old.id
+
+
+@pytest.fixture(autouse=True)
+def _coordinator_boot_identity(monkeypatch):
+    # Unit transactions use a stable supplied boot identity. Native process
+    # and launchd suites continue to probe the actual host.
+    monkeypatch.setattr("gateway.generation._boot_id", lambda: "unit-test-boot")

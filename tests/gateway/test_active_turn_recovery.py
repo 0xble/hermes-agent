@@ -583,10 +583,11 @@ async def test_overlap_clean_receipt_cannot_clear_a_living_owners_newer_marker(t
     old = GenerationIdentity.create(release_sha="old", label="old",
         start_fingerprint=f"{os.getpid()}:{started}")
     # Terminal metadata and stale heartbeats must not authorize recovery either.
-    db.register(old, state="failed")
+    db.register(old, state="exited")
     assert db.claim_session(str(tmp_path), "discord", entry.session_key, old.id, 1, outstanding_work=1)
     with db.connect() as conn:
-        conn.execute("UPDATE generations SET heartbeat_at=0 WHERE id=?", (old.id,))
+        conn.execute("UPDATE generations SET heartbeat_at=0,verdict='failed',"
+                     "verdict_at=0,verdict_evidence='fixture_terminal_metadata' WHERE id=?", (old.id,))
     runner, store = _db_runner(tmp_path)
     runner.config = config
     stale_token = _entry_for(store, source).active_turn_token
@@ -633,11 +634,13 @@ _WAKE = {"display_kind": "internal_notification"}
     ("disk is 91% full", {**_WAKE, "display_metadata": {"notification_category": "diagnostic"}}, []),
     ("NO_REPLY", {}, ["⚠️ The model returned only a silence marker for a message that needed a reply. "
                       "Try again or rephrase."]),
+    ("NO_REPLY", {"display_metadata": {"reply_expected": False}}, []),
 ])
 async def test_unclean_restart_never_redelivers_a_reply_live_delivery_suppressed(tmp_path, reply, prompt, owed):
     """A crash-left reply is owed exactly what live delivery would have sent: nothing for a silence
-    marker on a machinery turn or a muted diagnostic wake (and the finished turn is not resumed), the
-    unexpected-silence notice for a human turn, never the raw marker."""
+    marker on a machinery turn, a muted diagnostic wake or a message the adapter reported as not
+    addressed to the bot (and the finished turn is not resumed), the unexpected-silence notice for
+    any other human turn, never the raw marker."""
     from gateway.delivery_ledger import sweep_recoverable
 
     (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text("display: {suppress_warning_notifications: true}\n", encoding="utf-8")
@@ -747,7 +750,11 @@ async def test_recovery_fence_matches_current_claim_scope_and_cut_evidence(tmp_p
     coordinator = GenerationCoordinator(tmp_path)
     owner = GenerationIdentity.create(release_sha="owner", label="owner",
         start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
-    coordinator.register(owner, state="failed" if claim == "dead-unfinished" else "serving")
+    coordinator.register(owner, state="exited" if claim == "dead-unfinished" else "serving")
+    if claim == "dead-unfinished":
+        with coordinator.connect() as db:
+            db.execute("UPDATE generations SET verdict='failed',verdict_at=heartbeat_at,"
+                       "verdict_evidence='fixture_dead_unfinished' WHERE id=?", (owner.id,))
     home = str(tmp_path / "other") if claim == "other-home" else str(tmp_path)
     transport = "telegram" if claim == "other-transport" else "discord"
     coordinator.claim_session(home, transport, entry.session_key, owner.id, 1, outstanding_work=1)
@@ -760,7 +767,10 @@ async def test_recovery_fence_matches_current_claim_scope_and_cut_evidence(tmp_p
     if claim == "dead-ambiguous":
         with coordinator.connect() as db:
             db.execute("UPDATE sessions SET outstanding_work=0")
+            # A previous-release writer still publishes its legacy retirement state.
             db.execute("UPDATE generations SET state='failed'")
+            retired = db.execute("SELECT state,verdict FROM generations WHERE id=?", (owner.id,)).fetchone()
+            assert (retired["state"], retired["verdict"]) == ("exited", "failed")
     if claim == "dead-pending":
         epoch = coordinator.acquire_lease("active_generation", owner.id)
         coordinator.enqueue(home, transport, entry.session_key, "pending", "message",

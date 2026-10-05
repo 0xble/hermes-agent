@@ -522,6 +522,28 @@ class GoalGate:
         )
 
 
+def _gate_workspace() -> Tuple[Optional[str], Optional[str]]:
+    """``(cwd, refusal)`` for this check's gates. A multi-session backend's process directory is not
+    the session's project, so gates run in the scoped session workspace (#125369). A declared
+    workspace that is not a directory on this host (deleted, remote, container) is a refusal: a
+    relative gate run anywhere else would check a different project and could pass a failing goal,
+    and no agent turn can fix it, so the caller pauses instead of retrying.
+    No declared workspace keeps the classic resolution (TERMINAL_CWD, else the launch directory)."""
+    from agent.runtime_cwd import resolve_agent_cwd, scoped_session_cwd
+
+    declared = scoped_session_cwd()
+    if declared:
+        path = Path(declared).expanduser()
+        if path.is_dir():
+            return str(path), None
+        return None, (f"the session workspace {declared} is not a directory on this host, "
+                      "and running gates anywhere else would check a different project")
+    try:
+        return str(resolve_agent_cwd()), None
+    except OSError:
+        return None, None  # deleted launch directory: subprocess reports it per gate
+
+
 def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
     """Run one gate through the shell. Returns ``(passed, exit_code, output_tail)``; a timeout kills
     the process and counts as exit code -1."""
@@ -576,6 +598,9 @@ class GoalState:
     # Live delegation batches when a timed WAIT was set because of them; the barrier lifts as soon
     # as that count drops (a batch returned), not only when the timer runs out.
     waiting_on_delegations: int = 0
+    # Requested timed-wait duration, kept stable across judge re-parks so notice dedupe does not
+    # depend on the new absolute deadline. Old rows default to zero and remain readable.
+    waiting_seconds: int = 0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
     contract: GoalContract = field(default_factory=GoalContract)
@@ -589,6 +614,9 @@ class GoalState:
     # Comma-joined ids of recorded results cited during the current dispute streak; a dispute that
     # cites none beyond these counts toward the stall breaker.
     last_dispute_evidence: str = ""
+    # Stable identity of the last parked state announced to the user. This is durable so repeated
+    # internal wakes and gateway restarts do not replay an unchanged wait notice.
+    last_wait_notice_key: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -599,7 +627,7 @@ class GoalState:
         raw_subgoals = data.get("subgoals") or []
         ints = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_disputes",
-            "waiting_on_delegations")}
+            "waiting_on_delegations", "waiting_seconds")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -621,6 +649,7 @@ class GoalState:
             revisions=[r for r in (data.get("revisions") or []) if isinstance(r, dict)]
             if isinstance(data.get("revisions"), list) else [],
             last_dispute_evidence=str(data.get("last_dispute_evidence") or ""),
+            last_wait_notice_key=(str(data["last_wait_notice_key"]) if data.get("last_wait_notice_key") else None),
             **ints, **floats,
         )
 
@@ -657,13 +686,16 @@ class GoalState:
                         lines.append("    dropped criteria: " + "; ".join(str(s) for s in dropped))
         return "\n".join(lines)
 
-    def clear_wait(self) -> None:
+    def clear_wait(self, *, preserve_notice_key: bool = False) -> None:
         self.waiting_on_pid = None
         self.waiting_on_session = None
         self.waiting_until = 0.0
         self.waiting_on_delegations = 0
+        self.waiting_seconds = 0
         self.waiting_reason = None
         self.waiting_since = 0.0
+        if not preserve_notice_key:
+            self.last_wait_notice_key = None
 
 
 # ── Persistence (SessionDB state_meta) ────────────────────────────────
@@ -966,7 +998,7 @@ def _process_outcome(session_id: str) -> Optional[Dict[str, Any]]:
         from hermes_constants import get_hermes_home
 
         path = get_hermes_home() / "logs" / "process-results" / f"{session_id}.json"
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
         return {k: record.get(k) for k in ("exit_code", "completion_reason", "termination_source")}
     except Exception:
         return None
@@ -1847,6 +1879,7 @@ class GoalManager:
         return self._state
 
     def _pause_state(self, reason: str) -> None:
+        self._state.clear_wait()
         self._state.status = "paused"
         self._state.paused_reason = reason
         self._save()
@@ -1920,6 +1953,7 @@ class GoalManager:
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
+        self._state.clear_wait()
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
@@ -2092,8 +2126,15 @@ class GoalManager:
         if state is None or not state.gates:
             return None
 
+        gate_cwd, refusal = _gate_workspace()
+        if refusal:
+            return self._pause_decision(
+                f"quality gates not run: {refusal}", "gate_failed", f"gates not run: {refusal}",
+                f"⏸ Goal paused — quality gates not run: {refusal}. Fix the workspace or "
+                f"/goal gate remove the gates, then /goal resume.",
+            )
         for gate in state.gates:
-            passed, exit_code, tail = run_gate(gate)
+            passed, exit_code, tail = run_gate(gate, cwd=gate_cwd)
             gate.last_exit_code = exit_code
             gate.last_output_tail = tail
             if passed:
@@ -2131,7 +2172,9 @@ class GoalManager:
 
     def _park(self, reason: str, **barrier) -> GoalState:
         state = self._require_active()
-        state.clear_wait()
+        # Re-parking is not progress: keep the last notice key so an unchanged judge WAIT
+        # remains silent, while clearing barrier fields before applying the new target.
+        state.clear_wait(preserve_notice_key=True)
         for k, v in barrier.items():
             setattr(state, k, v)
         state.waiting_reason = (reason or "").strip() or None
@@ -2168,7 +2211,10 @@ class GoalManager:
         seconds = int(seconds)
         if seconds <= 0:
             raise ValueError("seconds must be a positive integer")
-        return self._park(reason, waiting_until=time.time() + seconds, waiting_on_delegations=max(0, int(on_delegations)))
+        return self._park(
+            reason, waiting_until=time.time() + seconds,
+            waiting_on_delegations=max(0, int(on_delegations)), waiting_seconds=seconds,
+        )
 
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
@@ -2253,20 +2299,53 @@ class GoalManager:
 
     # --- the main entry point called after every turn -----------------
 
-    def _waiting_decision(self, state: GoalState) -> Dict[str, Any]:
+    def _wait_notice_key(self, state: GoalState) -> str:
+        """Stable identity for the current wait barrier, excluding elapsed presentation text."""
+        reason = state.waiting_reason or ""
         if state.waiting_on_session is not None:
-            tgt = f"session {state.waiting_on_session}"
+            target = f"session:{state.waiting_on_session}"
         elif state.waiting_on_pid is not None:
-            tgt = f"pid {state.waiting_on_pid}"
+            target = f"pid:{state.waiting_on_pid}"
         else:
-            tgt = f"{max(0, int(state.waiting_until - time.time()))}s remaining"
-        reason = state.waiting_reason or tgt
-        return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked — waiting on {tgt}: {reason}")
+            target = f"seconds:{state.waiting_seconds}:delegations:{state.waiting_on_delegations}"
+        return f"{target}|reason:{reason}"
 
-    def _apply_wait_directive(self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _waiting_target(state: GoalState) -> str:
+        if state.waiting_on_session is not None:
+            return f"session {state.waiting_on_session}"
+        if state.waiting_on_pid is not None:
+            return f"pid {state.waiting_on_pid}"
+        return f"{max(0, int(state.waiting_until - time.time()))}s remaining"
+
+    def _wait_notice_decision(
+        self, state: GoalState, *, verdict: str, message: str, notify: bool = True,
+    ) -> Dict[str, Any]:
+        key = self._wait_notice_key(state)
+        if not notify:
+            message = ""
+        elif state.last_wait_notice_key == key:
+            message = ""
+        else:
+            state.last_wait_notice_key = key
+            self._save()
+        return _decision("active", False, None, verdict, state.waiting_reason or self._waiting_target(state), message)
+
+    def _waiting_decision(self, state: GoalState) -> Dict[str, Any]:
+        tgt = self._waiting_target(state)
+        reason = state.waiting_reason or tgt
+        return self._wait_notice_decision(
+            state, verdict="waiting",
+            message=f"⏳ Goal parked — waiting on {tgt}: {reason}",
+        )
+
+    def _apply_wait_directive(
+        self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0,
+    ) -> Optional[Dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
         unobservable here, so the caller continues instead."""
+        state = self._require_active()
         if wait_directive.get("session_id"):
             tgt = f"session {self.wait_on_session(str(wait_directive['session_id']), reason=reason).waiting_on_session}"
         elif wait_directive.get("pid"):
@@ -2283,7 +2362,10 @@ class GoalManager:
         else:
             self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
             tgt = f"{wait_directive['seconds']}s"
-        return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
+        return self._wait_notice_decision(
+            state, verdict="wait",
+            message=f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
+        )
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
         return self._pause_decision(
@@ -2373,7 +2455,9 @@ class GoalManager:
             state.last_dispute_evidence = ",".join(sorted(seen | current, key=_evidence_id_order)[-_DISPUTE_SEEN_MAX:])
 
         if verdict == "wait" and wait_directive:
-            parked = self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
+            parked = self._apply_wait_directive(
+                wait_directive, reason, active_delegations=active_delegations,
+            )
             if parked is not None:
                 return parked
 

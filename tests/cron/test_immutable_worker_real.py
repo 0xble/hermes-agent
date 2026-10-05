@@ -12,7 +12,7 @@ import pytest
 from hermes_cli.immutable_releases import promote, stage_release
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path, monkeypatch):
     from cron import executions
@@ -142,15 +142,16 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
 
     try:
         initial = [dispatch("A-default", a, "default"), dispatch("A-profile", a, "p")]
+        delayed = dispatch("A-delayed", a, "default")
         for profile_home, _ in initial:
             name = "A-default" if profile_home == home else "A-profile"
             (profile_home / f"dispatch-{name}").touch()
             await_file(profile_home / f"started-{name}")
         promote(home, b)
-        later = [dispatch("B-default", b, "default"), dispatch("B-profile", b, "p")]
+        later = [delayed, dispatch("B-default", b, "default"), dispatch("B-profile", b, "p")]
         for (profile_home, parent), name in zip(initial + later,
-                                                 ("A-default", "A-profile", "B-default", "B-profile")):
-            if name.startswith("B-"):
+                                                 ("A-default", "A-profile", "A-delayed", "B-default", "B-profile")):
+            if name.startswith("B-") or name == "A-delayed":
                 (profile_home / f"dispatch-{name}").touch()
                 await_file(profile_home / f"started-{name}")
             (profile_home / f"probe-{name}").touch()

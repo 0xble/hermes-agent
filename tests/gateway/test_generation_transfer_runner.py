@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -29,6 +30,40 @@ class PollingAdapter:
 
 
 @pytest.mark.asyncio
+async def test_transfer_drain_uses_a_clean_context_after_request_deadline(tmp_path):
+    db = GenerationCoordinator(tmp_path)
+    old = GenerationIdentity.create(release_sha="a", label="a")
+    new = GenerationIdentity.create(release_sha="b", label="b")
+    db.register(old, state="serving")
+    db.register(new, state="standby")
+    epoch = db.acquire_lease("active_generation", old.id)
+    adapter = PollingAdapter("clean-context")
+    active = ActiveGeneration(tmp_path, db, old, epoch)
+    active.bind_runner(Mock(adapters={"telegram": adapter}, _overlap_draining=False,
+                            _pending_approvals={}, _active_work_count=lambda: 0))
+    db.request_transfer(old.id, new.id, epoch, {adapter._controlled_journal.token_hash})
+    await active.transfer_requested(new.id, deadline=asyncio.get_running_loop().time() + 0.5)
+    assert active._drain_task is not None
+    try:
+        # Force the pending-transfer watchdog immediately, after the request scope
+        # has expired. The watchdog must open its own reserve scope.
+        await asyncio.sleep(0.55)
+        _, nonce, _ = active._pending_transfer
+        active._pending_transfer = (new.id, nonce, time.monotonic() - 1)
+        # Re-arm resumes the adapter, then re-checks ownership before it clears
+        # the pending transfer; wait for both rather than racing the second await.
+        for _ in range(40):
+            if adapter.resumed and active._pending_transfer is None:
+                break
+            await asyncio.sleep(0.05)
+        assert adapter.resumed
+        assert active._pending_transfer is None
+    finally:
+        active._drain_task.cancel()
+        await asyncio.gather(active._drain_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_split_text_batch_buffered_at_handover_flushes_on_old_owner(tmp_path):
     from gateway.config import Platform
     from gateway.owned_routing import OwnedRouting
@@ -38,7 +73,7 @@ async def test_split_text_batch_buffered_at_handover_flushes_on_old_owner(tmp_pa
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -92,7 +127,7 @@ async def test_media_buffered_at_handover_flushes_on_old_owner(tmp_path, buffer_
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -140,7 +175,7 @@ async def test_old_runner_retains_work_after_polling_stops(tmp_path):
     old = GenerationIdentity.create(release_sha="a", label="a", start_fingerprint=fingerprint)
     new = GenerationIdentity.create(release_sha="b", label="b", start_fingerprint=fingerprint)
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -165,7 +200,7 @@ async def test_abandoned_transfer_rearms_old_generation_and_allows_retry(tmp_pat
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -175,7 +210,8 @@ async def test_abandoned_transfer_rearms_old_generation_and_allows_retry(tmp_pat
     await active.transfer_requested(new.id)
     try:
         deadline = asyncio.get_running_loop().time() + 3
-        while not adapter.resumed and asyncio.get_running_loop().time() < deadline:
+        # The wire resumes before the final asynchronous owner check reopens dispatch.
+        while (not adapter.resumed or runner._overlap_draining) and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(.05)
         assert adapter.resumed
         assert runner._overlap_draining is False
@@ -197,7 +233,7 @@ async def test_driver_aborts_without_ack_and_old_generation_rearms(tmp_path, mon
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -230,7 +266,7 @@ async def test_committed_transfer_cannot_be_aborted_by_old_deadline(tmp_path, mo
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -261,7 +297,7 @@ async def test_transfer_nonce_lookup_does_not_block_event_loop(tmp_path, monkeyp
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     active.bind_runner(Mock(adapters={}, _overlap_draining=False))
@@ -293,7 +329,7 @@ async def test_old_generation_waits_for_real_work_then_exits(tmp_path):
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     work = {"turn": object()}
@@ -321,7 +357,7 @@ async def test_unscoped_background_process_and_watcher_hold_generation_until_del
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, set())
     db.commit_transfer(old.id, new.id, epoch)
@@ -353,7 +389,7 @@ async def test_session_keyed_process_without_claim_keeps_draining_owner_until_no
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, set())
     db.commit_transfer(old.id, new.id, epoch)
@@ -385,7 +421,7 @@ async def test_registry_process_and_pending_notice_each_wait_until_deadline(tmp_
     db = GenerationCoordinator(tmp_path)
     old, new = GenerationIdentity.create(release_sha="a", label="a"), GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, set())
     db.commit_transfer(old.id, new.id, epoch)
@@ -417,7 +453,7 @@ async def test_deadline_exit_releases_outstanding_claim_for_successor(tmp_path):
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     async def stop():
@@ -442,7 +478,7 @@ async def test_cap_fences_queued_work_before_stopping_busy_runner(tmp_path):
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.claim_session(str(tmp_path), "telegram", "agent:main:busy", old.id, epoch, outstanding_work=1)
     db.enqueue(str(tmp_path), "telegram", "agent:main:busy", "queued", "message",
@@ -491,7 +527,7 @@ async def test_polling_stop_failure_keeps_old_lease(tmp_path):
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -514,7 +550,7 @@ async def test_partial_rearm_failure_keeps_dispatch_fenced_and_recovers_other_po
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     first, second, third = (PollingAdapter(name) for name in ("first", "second", "third"))
@@ -558,7 +594,7 @@ async def test_transfer_abort_failure_surfaces_attention_status(tmp_path, monkey
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -596,7 +632,7 @@ async def test_draining_coordinator_io_does_not_block_event_loop(tmp_path, monke
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, set())
     db.commit_transfer(old.id, new.id, epoch)
@@ -653,7 +689,7 @@ async def test_transfer_fences_cron_and_goal_before_poller_stops(tmp_path, monke
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     adapter = PollingAdapter("fake-token")
     entered = asyncio.Event()
@@ -721,7 +757,7 @@ async def test_concurrent_drain_inspections_stop_runner_once(tmp_path, monkeypat
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, set())
     db.commit_transfer(old.id, new.id, epoch)
@@ -762,7 +798,7 @@ async def test_missing_drain_deadline_uses_local_cap_without_repeated_warning(tm
     old = GenerationIdentity.create(release_sha="a", label="a")
     new = GenerationIdentity.create(release_sha="b", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     stopped = []
@@ -903,7 +939,7 @@ async def test_invalid_live_key_retains_polling_and_cron_after_transfer_abort(tm
     old = GenerationIdentity.create(release_sha="old", label="old")
     new = GenerationIdentity.create(release_sha="new", label="new")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     adapter = PollingAdapter("fake-token")
@@ -938,3 +974,42 @@ async def test_invalid_live_key_retains_polling_and_cron_after_transfer_abort(tm
     assert not active._external_cron_stopped
     assert db.leases()[0]["generation_id"] == old.id
     assert active._drain_task is None
+
+
+@pytest.fixture(autouse=True)
+def _coordinator_boot_identity(monkeypatch):
+    # Unit transactions use a stable supplied boot identity. Native process
+    # and launchd suites continue to probe the actual host.
+    monkeypatch.setattr("gateway.generation._boot_id", lambda: "unit-test-boot")
+
+
+def test_cold_activation_honours_an_expired_enclosing_deadline(tmp_path):
+    from gateway import deadline as gd
+    from gateway.run_generation import _activate_cold_generation
+    db = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    db.register(identity, state="standby")
+    with gd.deadline_scope(gd.now() - 1):
+        with pytest.raises(TimeoutError):
+            _activate_cold_generation(db, identity)
+    assert not [row for row in db.leases() if row["resource"] == "active_generation"
+                and row["generation_id"] == identity.id and row["state"] == "active"]
+
+
+def test_cold_activation_without_scope_gets_a_concrete_bound(tmp_path, monkeypatch):
+    from gateway import deadline as gd
+    from gateway import run_generation
+    db = GenerationCoordinator(tmp_path)
+    identity = GenerationIdentity.create(release_sha="a", label="a")
+    db.register(identity, state="standby")
+    seen = {}
+    acquire = db.acquire_lease
+    def spy(*args, **kwargs):
+        seen["deadline"] = kwargs.get("deadline")
+        seen["scope"] = gd.current()
+        return acquire(*args, **kwargs)
+    monkeypatch.setattr(db, "acquire_lease", spy)
+    assert gd.current() is None
+    run_generation._activate_cold_generation(db, identity)
+    assert seen["deadline"] is not None and seen["scope"] == seen["deadline"]
+    assert seen["deadline"] <= gd.now() + run_generation.COLD_ACTIVATION_SECONDS

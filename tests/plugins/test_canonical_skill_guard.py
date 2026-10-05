@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 PLUGIN = Path(__file__).parents[2] / "plugins" / "canonical-skill-guard" / "__init__.py"
 
@@ -51,7 +53,7 @@ def test_non_skill_tools_are_ignored(monkeypatch):
 
 
 def test_manifest_declares_every_registered_hook():
-    import yaml
+    import hermes_yaml as yaml
 
     plugin = _load_plugin()
     registered: list[str] = []
@@ -65,3 +67,48 @@ def test_manifest_declares_every_registered_hook():
 
     assert registered
     assert set(registered) <= set(manifest.get("provides_hooks") or [])
+
+
+@pytest.mark.parametrize("name", ["../skills/hermes-agent/SKILL", "../../Documents/notes", "absolute", r"..\notes", "bad:name", "valid"])
+def test_failed_owner_lookup_cannot_write_outside_observation_inbox(monkeypatch, tmp_path, name):
+    plugin = _load_plugin()
+    home = tmp_path / "home"
+    home.mkdir()
+    target = tmp_path / "Documents" / "notes.md"
+    target.parent.mkdir()
+    target.write_text("original")
+    if name == "absolute":
+        name = str(target.with_suffix(""))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    def unavailable():
+        raise OSError("external roots unavailable")
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", unavailable)
+    result = plugin._on_pre_tool_call(tool_name="skill_manage", args={"name": name, "action": "patch"})
+    assert result and result["action"] == "block"
+    assert target.read_text() == "original"
+    observations = list((home / "observations").glob("*.md"))
+    assert bool(observations) == (name == "valid")
+    if observations:
+        assert '"name": "valid"' in observations[0].read_text()
+
+
+@pytest.mark.parametrize("symlink", ["leaf", "directory"])
+def test_observation_symlinks_cannot_redirect_a_blocked_write(monkeypatch, tmp_path, symlink):
+    plugin = _load_plugin()
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "deploy.md"
+    target.write_text("original")
+    root = home / "observations"
+    if symlink == "directory":
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        root.mkdir()
+        (root / "deploy.md").symlink_to(target)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(plugin, "_external_skill_names", lambda: {"deploy"})
+    result = plugin._on_pre_tool_call(tool_name="skill_manage", args={"name": "deploy", "action": "patch"})
+    assert result and result["action"] == "block"
+    assert target.read_text() == "original"

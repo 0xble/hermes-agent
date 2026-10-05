@@ -15,6 +15,28 @@ from gateway.shutdown_flush import flush_overflow_to_file, flush_pending_to_file
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_startup_recovery_spool_requires_native_adapter_admission(tmp_path, accepted):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    adapter.set_message_handler(AsyncMock(return_value=None))
+    spool = tmp_path / "pending.json"
+    spool.write_text('{"text":"preserve this follow-up"}', encoding="utf-8")
+    event = MessageEvent(text="preserve this follow-up", source=source, user_id="u1",
+                         metadata={} if accepted else {"gateway_session_key": "another-session"})
+    event._hermes_recovered_followup = True
+    event._hermes_recovery_spool = spool
+    runner._startup_restore_queue = [event]
+    try:
+        drained = await runner._drain_startup_restore_queue()
+        assert event._gateway_accepted is accepted
+        assert spool.exists() is not accepted
+        assert drained == int(accepted)
+    finally:
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+
+
 def _recover(tmp_path, monkeypatch, runner, adapter, key, expected):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     slot = dict(adapter._pending_messages)

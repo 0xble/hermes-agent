@@ -44,7 +44,6 @@ _NEEDS_UNIX_SOCKETS = pytest.mark.skipif(
     "(socket.AF_UNIX / asyncio.start_unix_server), unavailable on native Windows",
 )
 
-
 @pytest.fixture()
 def tmp_path():
     """Short-path override for this module (macOS AF_UNIX ~104-byte limit).
@@ -62,7 +61,6 @@ def tmp_path():
     finally:
         shutil.rmtree(path, ignore_errors=True)
 
-
 def _write_heartbeat(home, pid, age_s=0.0):
     """Write a heartbeat file for ``pid`` whose mtime is ``age_s`` old."""
     path = get_loop_heartbeat_path(home)
@@ -71,7 +69,6 @@ def _write_heartbeat(home, pid, age_s=0.0):
         stamp = time.time() - age_s
         os.utime(path, (stamp, stamp))
     return path
-
 
 def _mark_witness_flag(home, armed, age_s=0.0):
     """Set ``loop_tick_socket`` on the heartbeat payload; re-stamp mtime."""
@@ -83,7 +80,6 @@ def _mark_witness_flag(home, armed, age_s=0.0):
         stamp = time.time() - age_s
         os.utime(path, (stamp, stamp))
     return path
-
 
 def _silent_socket_node(path):
     """Create a socket node at ``path`` that never answers.
@@ -99,7 +95,6 @@ def _silent_socket_node(path):
         srv.listen(1)
     finally:
         srv.close()
-
 
 def _start_freezeable_producer(tmp_path, block_s, errors, write_stall_s=1.5):
     """Run the real heartbeat producer on a loop that can be frozen on demand.
@@ -170,7 +165,6 @@ def _start_freezeable_producer(tmp_path, block_s, errors, write_stall_s=1.5):
     state["thread"] = thread
     return state, ready
 
-
 def _wait_heartbeat_stale(tmp_path, stale_after, timeout_s=5.0):
     """Block until the heartbeat file is older than ``stale_after``."""
     hb_path = get_loop_heartbeat_path(tmp_path)
@@ -186,7 +180,6 @@ def _wait_heartbeat_stale(tmp_path, stale_after, timeout_s=5.0):
             return
         assert time.monotonic() < deadline, "heartbeat never went stale"
         time.sleep(0.02)
-
 
 def _launchd_harness(monkeypatch, tmp_path, pid):
     """Patch the launchd_restart path so the REAL probe drives it.
@@ -253,7 +246,6 @@ def _launchd_harness(monkeypatch, tmp_path, pid):
     )
     return events
 
-
 class TestProbeGatewayLoopLiveness:
     def test_fresh_heartbeat_is_alive(self, tmp_path):
         """A gateway that refreshed its heartbeat recently is busy, not wedged."""
@@ -314,7 +306,6 @@ class TestProbeGatewayLoopLiveness:
             == gateway_cli.GATEWAY_LOOP_UNKNOWN
         )
 
-
     def test_probe_never_raises_on_unreadable_path(self, monkeypatch):
         monkeypatch.setattr(
             "gateway.shutdown_watchdog.get_loop_heartbeat_path",
@@ -324,7 +315,6 @@ class TestProbeGatewayLoopLiveness:
             gateway_cli.probe_gateway_loop_liveness(4242)
             == gateway_cli.GATEWAY_LOOP_UNKNOWN
         )
-
 
 class TestEscalateWedgedGateway:
     def test_sigterm_grace_suffices_without_sigkill(self, monkeypatch):
@@ -400,7 +390,6 @@ class TestEscalateWedgedGateway:
 
         assert gateway_cli._escalate_wedged_gateway(4242) is False
         assert calls == [False, True]
-
 
 class TestLaunchdRestartWedgedIntegration:
     """launchd_restart must skip the 180s drain only for a wedged loop."""
@@ -479,7 +468,6 @@ class TestLaunchdRestartWedgedIntegration:
         assert "escalate" not in events
         assert ("drain", 4242, 195.0) in events
 
-
 class TestLoopTickWitness:
     """Two-witness liveness (#90502 review).
 
@@ -488,7 +476,6 @@ class TestLoopTickWitness:
     answers a UNIX socket instead; the probe only escalates when BOTH
     witnesses agree the loop stopped scheduling.
     """
-
 
     @_NEEDS_UNIX_SOCKETS
     def test_off_loop_completion_cannot_manufacture_fresh_liveness(self, tmp_path):
@@ -566,7 +553,6 @@ class TestLoopTickWitness:
             )
             == gateway_cli.GATEWAY_LOOP_ALIVE
         )
-
 
     def test_witness_vanishing_mid_window_is_unknown(self, tmp_path, monkeypatch):
         """A witness that disappears mid-window is ambiguity, not a wedge.
@@ -802,7 +788,6 @@ class TestLoopTickWitness:
             state["thread"].join(timeout=5.0)
             assert not errors, errors
 
-
 class TestLoopTickTcpWitness:
     """Non-POSIX arm: the producer publishes ``loop_tick_tcp_port`` and the
     consumer probes 127.0.0.1:<port> instead of the AF_UNIX node. The
@@ -910,3 +895,81 @@ class TestLoopTickTcpWitness:
         )
 
 
+
+
+def test_review2_start_time_drift_is_not_proof_the_wedged_process_is_gone(monkeypatch):
+    """macOS start-time readings drift ~1 s; drift must still escalate to SIGKILL, not report 'gone'."""
+    signals, waits = [], []
+    monkeypatch.setattr(gateway_cli, "terminate_pid",
+                        lambda pid, force=False, **kwargs: signals.append("kill" if force else "term"))
+    monkeypatch.setattr(gateway_cli, "_wait_for_pid_exit", lambda pid, timeout, **_: waits.append(timeout) or len(waits) > 1)
+    readings = iter([1000, 1050, 1080, 1090, 1100])  # same incarnation, drifting within tolerance
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: next(readings))
+    assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000) is True
+    assert signals == ["term", "kill"]
+
+
+def test_review2_replaced_incarnation_is_gone_without_signals(monkeypatch):
+    signals = []
+    monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False, **kwargs: signals.append(force))
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: 99999)
+    assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000) is True
+    assert signals == []
+
+
+def test_review3_drifted_live_process_still_receives_guarded_signals(monkeypatch):
+    """Drift within tolerance must not make terminate_pid's strict guard refuse both signals."""
+    from gateway import status
+    sent = []
+    readings = iter([1000, 1050, 1050, 1050, 1050, 1050, 1050])
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: next(readings))
+    monkeypatch.setattr(status.os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(gateway_cli, "_wait_for_pid_exit", lambda pid, timeout, **_: len(sent) > 1)
+    assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000, term_grace=0, kill_wait=0) is True
+    assert len(sent) == 2
+
+
+@_NEEDS_UNIX_SOCKETS
+def test_review5_successor_proof_survives_draining_writer_of_shared_heartbeat(tmp_path):
+    """A draining generation keeps the shared file; the successor's per-PID copy is the evidence."""
+    write_loop_heartbeat(pid=5001, home=tmp_path, extra={"loop_tick_socket": True})
+    write_loop_heartbeat(pid=4242, home=tmp_path, extra={"loop_tick_socket": True})
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path, get_pid_loop_heartbeat_path
+    own = get_pid_loop_heartbeat_path(tmp_path, 5001)
+    stamp = time.time() - 40
+    os.utime(own, (stamp, stamp))
+    _silent_socket_node(get_loop_tick_socket_path(tmp_path, 5001))
+    assert json.loads(get_loop_heartbeat_path(tmp_path).read_text(encoding="utf-8"))["pid"] == 4242
+    assert gateway_cli.probe_gateway_loop_liveness(
+        5001, home=tmp_path, stale_after=35, tick_timeout=0.2, tick_gap_s=0.05) == gateway_cli.GATEWAY_LOOP_WEDGED
+    # The default 90 s threshold stays unchanged for every other caller.
+    assert gateway_cli.probe_gateway_loop_liveness(
+        5001, home=tmp_path, tick_timeout=0.2, tick_gap_s=0.05) == gateway_cli.GATEWAY_LOOP_UNKNOWN
+
+
+@_NEEDS_UNIX_SOCKETS
+def test_review5_answering_successor_is_never_wedged_by_its_own_stale_copy(tmp_path):
+    write_loop_heartbeat(pid=5002, home=tmp_path, extra={"loop_tick_socket": True})
+    write_loop_heartbeat(pid=4242, home=tmp_path, extra={"loop_tick_socket": True})
+    from gateway.shutdown_watchdog import get_loop_tick_socket_path, get_pid_loop_heartbeat_path
+    own = get_pid_loop_heartbeat_path(tmp_path, 5002)
+    stamp = time.time() - 600
+    os.utime(own, (stamp, stamp))
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    path = get_loop_tick_socket_path(tmp_path, 5002)
+    srv.bind(str(path)); srv.listen(4); srv.settimeout(0.1)
+    stop = threading.Event()
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            with conn:
+                conn.sendall(b"1")
+    thread = threading.Thread(target=serve, daemon=True); thread.start()
+    try:
+        assert gateway_cli.probe_gateway_loop_liveness(
+            5002, home=tmp_path, stale_after=35) == gateway_cli.GATEWAY_LOOP_ALIVE
+    finally:
+        stop.set(); srv.close(); thread.join(2)

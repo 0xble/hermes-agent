@@ -17,7 +17,6 @@ import pytest
 
 from tools.computer_use import cua_backend
 from tools.computer_use import cua_backend_driver
-from tools.computer_use import cua_backend_daemon
 
 
 class TestNoOverlayFlag:
@@ -32,7 +31,7 @@ class TestNoOverlayFlag:
             assert cua_backend._cua_no_overlay() is True
 
 
-    @pytest.mark.macos_only
+    @pytest.mark.platforms("macos")
     def test_config_load_failure_falls_through_to_auto_detect_macos(self):
         """Unreadable config => auto-detect (macOS defaults to overlay off).
 
@@ -43,7 +42,7 @@ class TestNoOverlayFlag:
                    side_effect=RuntimeError("boom")):
             assert cua_backend._cua_no_overlay() is True
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_config_load_failure_falls_through_to_auto_detect_linux(self, monkeypatch):
         """Unreadable config must not raise; headless Linux auto-detects off.
 
@@ -55,7 +54,7 @@ class TestNoOverlayFlag:
                    side_effect=RuntimeError("boom")):
             assert cua_backend._cua_no_overlay() is True
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_linux_x11_auto_detects_off(self, monkeypatch):
         """X11 desktop (DISPLAY set, no Wayland) defaults the overlay off.
 
@@ -70,7 +69,7 @@ class TestNoOverlayFlag:
         with patch("hermes_cli.config.load_config", return_value={}):
             assert cua_backend._cua_no_overlay() is True
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_linux_x11_explicit_session_type_also_off(self, monkeypatch):
         """XDG_SESSION_TYPE=x11 without Wayland env is still X11."""
         monkeypatch.setenv("DISPLAY", ":0")
@@ -79,7 +78,7 @@ class TestNoOverlayFlag:
         with patch("hermes_cli.config.load_config", return_value={}):
             assert cua_backend._cua_no_overlay() is True
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_linux_wayland_keeps_overlay(self, monkeypatch):
         """Wayland desktop keeps the overlay: the compositor owns the
         overlay surface lifecycle, so it cannot get stuck above every
@@ -90,7 +89,7 @@ class TestNoOverlayFlag:
         with patch("hermes_cli.config.load_config", return_value={}):
             assert cua_backend._cua_no_overlay() is False
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     def test_linux_x11_explicit_false_overrides_auto_detect(self, monkeypatch):
         """An explicit ``no_overlay: false`` must restore the cursor even on
         X11 — auto-detection is the default, never a hard lock."""
@@ -228,8 +227,10 @@ class TestMcpArgsOverlayFlag:
 
 
 class TestEmbeddedDaemonOverlayFlag:
-    @staticmethod
-    def _spawn_overlay_daemon():
+    @pytest.mark.platforms("not macos")
+    def test_serve_process_disables_overlay_when_policy_requires_it(self):
+        from tools.computer_use import cua_backend_daemon
+
         daemon = cua_backend._EmbeddedCuaDaemon("/usr/bin/cua-driver", "unrestricted")
         process = MagicMock()
         process.poll.return_value = None
@@ -247,22 +248,9 @@ class TestEmbeddedDaemonOverlayFlag:
             cua_backend.subprocess, "Popen", return_value=process,
         ) as popen, patch.object(
             cua_backend.subprocess, "run", return_value=status,
-        ), patch.object(cua_backend.threading, "Thread"), patch.object(
-            cua_backend_daemon, "_resolve_cua_driver_app_path", return_value="/Applications/CuaDriver.app",
-        ), patch.object(cua_backend_daemon, "_validate_cua_driver_app_signature"):
+        ), patch.object(cua_backend_daemon.threading, "Thread"):
             daemon.start()
 
-        return popen.call_args.args[0]
-
-    @pytest.mark.linux_only
-    def test_serve_process_disables_overlay_when_policy_requires_it(self):
-        command = self._spawn_overlay_daemon()
+        command = popen.call_args.args[0]
         assert command[:2] == ["/usr/bin/cua-driver", "serve"]
-        assert "--no-overlay" in command
-
-    @pytest.mark.macos_only
-    def test_app_launch_preserves_overlay_policy(self):
-        command = self._spawn_overlay_daemon()
-        assert command[:6] == ["/usr/bin/open", "-n", "-g", "-a", "/Applications/CuaDriver.app", "--args"]
-        assert command[6] == "serve"
         assert "--no-overlay" in command

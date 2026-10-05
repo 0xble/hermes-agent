@@ -693,6 +693,10 @@ def hermes_setup(fake: FakeVertex, *, model: str = MODEL, extra_config: dict[str
         block["context_length"] = context_length
     cfg: dict[str, Any] = {"vertex": {"project_id": fake.project, "region": fake.region}}
     cfg.update(extra_config or {})
+    from agent.vertex_adapter import build_vertex_base_url
+    cfg.setdefault("providers", {})["vertex-test-tls"] = {
+        "base_url": build_vertex_base_url(fake.project, fake.region), "ssl_ca_cert": str(fake.ca_pem),
+    }
     return {"model": block, "env_file": {"VERTEX_CREDENTIALS_PATH": str(fake.sa.path)}, "extra_config": cfg}
 
 

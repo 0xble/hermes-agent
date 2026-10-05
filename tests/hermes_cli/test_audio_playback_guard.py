@@ -32,9 +32,7 @@ import os
 import sys
 import types
 
-
 from tui_gateway import server
-
 
 def test_voice_toggle_still_leaks_the_env_var_but_speech_is_stubbed(monkeypatch):
     """The dangerous primitive is neutralised even when the flag IS set.
@@ -91,7 +89,6 @@ def test_voice_toggle_still_leaks_the_env_var_but_speech_is_stubbed(monkeypatch)
         "unguarded run this is real synthesis through the keyless 'edge' "
         "provider, played through the speakers"
     )
-
 
 def test_voice_env_does_not_leak_into_the_next_test():
     """Second defence: the flag the previous test set must not have survived.

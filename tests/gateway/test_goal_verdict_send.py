@@ -70,7 +70,17 @@ class _RecordingAdapter:
         return _R()
 
 
-def _make_runner_with_adapter(session_id: str = None):
+class _CallbackRecordingAdapter(_RecordingAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.callback_registrations: list = []
+        self._active_sessions: dict = {}
+
+    def register_post_delivery_callback(self, session_key, callback, *, generation=None):
+        self.callback_registrations.append((session_key, generation, callback))
+
+
+def _make_runner_with_adapter(session_id: str = None, *, callbacks: bool = False):
     from gateway.run import GatewayRunner
     import uuid
 
@@ -84,7 +94,7 @@ def _make_runner_with_adapter(session_id: str = None):
     runner._queued_events = {}
 
     src = _make_source()
-    # Default to a unique session_id so xdist parallel runs on the same worker
+    # Default to a unique session_id so parallel runs
     # don't see each other's GoalManager state (DEFAULT_DB_PATH gets frozen at
     # module-import time, defeating per-test HERMES_HOME monkeypatches).
     session_entry = SessionEntry(
@@ -100,7 +110,7 @@ def _make_runner_with_adapter(session_id: str = None):
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store._generate_session_key.return_value = build_session_key(src)
 
-    adapter = _RecordingAdapter()
+    adapter = _CallbackRecordingAdapter() if callbacks else _RecordingAdapter()
     runner.adapters[Platform.TELEGRAM] = adapter
     return runner, adapter, session_entry, src
 
@@ -315,3 +325,30 @@ async def test_gateway_non_user_or_rejected_input_cannot_revive(hermes_home, mon
     assert after.paused_reason == before.paused_reason
     assert after.turns_used == before.turns_used
     judge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_parked_goal_notice_is_deduplicated_and_persisted(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter(callbacks=True)
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("finish the task")
+    mgr.wait_for_seconds(600, reason="waiting for build")
+
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry, source=src, final_response="new result",
+    )
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry, source=src, final_response="same result",
+    )
+
+    assert len(adapter.callback_registrations) == 1
+    restored = GoalManager(session_entry.session_id)
+    assert restored.state.last_wait_notice_key
+
+    restored.wait_for_seconds(600, reason="waiting for tests")
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry, source=src, final_response="changed wait",
+    )
+    assert len(adapter.callback_registrations) == 2

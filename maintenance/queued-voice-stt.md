@@ -16,6 +16,15 @@ transcript echo, or queued follow-up drain.
   ledger prevents a second echo.
 - STT failure falls back to the existing drain behavior: transcription is retried
   at drain time and the audio placeholder is used if it still fails.
+- At most two queued-voice transcriptions run at once per runner. Prefetch runs
+  on every FIFO enqueue, including `/queue`. The shielded inner STT task is
+  tracked for shutdown, and completion or cancellation clears its handle while a
+  finished result stays reusable after the outer awaiter is cancelled.
+- Preserve queue admission receipts when integrating the shared FIFO prefetch:
+  `_queue_or_replace_pending_event` returns true only for an admitted event and
+  false for a missing adapter or a full queue. Refused voice events start no STT;
+  admitted events retain their FIFO slot and start prefetch from `_enqueue_fifo`.
+  Do not restore the redundant prefetch call in the admission wrapper.
 
 ## Provenance and patches
 
@@ -26,7 +35,8 @@ transcript echo, or queued follow-up drain.
   and [PR 73518](https://github.com/NousResearch/hermes-agent/pull/73518) fixed
   steer-path STT. Queue mode still transcribes only at drain time upstream. Own
   [PR #121063](https://github.com/NousResearch/hermes-agent/pull/121063) contributes
-  eager queued transcription and remains open on 2026-09-26.
+  eager queued transcription; its 2026-09-28 head `9e557990617d7138e7f05cf53107f1db8f4f8700`
+  adds the concurrency bound, `/queue` path, and cancellation tracking after review.
 
 ## Verification
 

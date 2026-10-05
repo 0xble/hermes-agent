@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from uuid import uuid4
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -11,6 +12,30 @@ from typing import Any, Callable
 MAX_AGENT_UPDATE_REASON = 240
 _UPDATE_HANDOFF = "Update accepted. End this turn now; the native updater owns completion."
 _MAX_PARENT_DEPTH = 32
+_MAX_PREVIOUS_OUTCOME_DETAIL = 240
+_MAX_PREVIOUS_OUTCOME_COUNT = 10000
+
+
+def _bounded_previous_detail(value: object) -> str:
+    detail = str(value or "").strip()
+    if len(detail) <= _MAX_PREVIOUS_OUTCOME_DETAIL:
+        return detail
+    return detail[:_MAX_PREVIOUS_OUTCOME_DETAIL - 1].rstrip() + "…"
+
+
+def _previous_outcome_older_count(old: dict[str, Any]) -> int:
+    """Count outcomes older than the immediate prior result without retaining their payloads."""
+    previous = old.get("previous_outcome")
+    if not isinstance(previous, dict):
+        return 0
+    declared = old.get("previous_outcome_older_count")
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 0:
+        return min(_MAX_PREVIOUS_OUTCOME_COUNT, declared + 1)
+    count = 0
+    while isinstance(previous, dict) and count < _MAX_PREVIOUS_OUTCOME_COUNT:
+        count += 1
+        previous = previous.get("previous_outcome")
+    return count
 
 
 def validate_agent_update_reason(reason: object) -> str:
@@ -35,36 +60,92 @@ def launch_native_update(
     A claimed marker is still an active admission marker: it is the pending file
     after the updater atomically takes ownership.  Do not overwrite its reason.
     """
+    from gateway.update_notifications import final_outcome, locked_update_marker, read_pending
+
     home = Path(home)
     pending_path = home / ".update_pending.json"
     claimed_path = home / ".update_pending.claimed.json"
     output_path = home / ".update_output.txt"
     exit_code_path = home / ".update_exit_code"
-    if claimed_path.exists():
-        return {"started": False, "pending": True}
-    pending = {**pending, "notification_version": 2}
-    encoded = json.dumps(pending).encode("utf-8")
-    try:
-        fd = os.open(str(pending_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return {"started": False, "pending": True}
-    try:
-        with os.fdopen(fd, "wb") as marker:
-            marker.write(encoded)
-            marker.flush()
-            os.fsync(marker.fileno())
-        # A prior updater may have claimed between the first check and our O_EXCL.
-        # Remove only our new pending marker; preserve the claimed request verbatim.
+    with locked_update_marker(home):
         if claimed_path.exists():
-            pending_path.unlink(missing_ok=True)
             return {"started": False, "pending": True}
-        exit_code_path.unlink(missing_ok=True)
-        (home / ".update_process_exit_code").unlink(missing_ok=True)
-        spawn(hermes_cmd, output_path, exit_code_path)
-    except Exception:
-        pending_path.unlink(missing_ok=True)
-        exit_code_path.unlink(missing_ok=True)
-        raise
+        previous = None
+        previous_outcome_older_count = 0
+        old_bytes = None
+        old_process_exit = None
+        lifecycle_paths = (
+            output_path,
+            home / ".update_prompt.json",
+            home / ".update_response",
+        )
+        lifecycle_artifacts: dict[Path, bytes | None] = {}
+        if pending_path.exists():
+            old = read_pending(home)
+            if not old or old[0] != pending_path or old[1].get("notification_version") != 2:
+                return {"started": False, "pending": True}
+            outcome = final_outcome(home, old[1])
+            # Only the actual process-exit sentinel permits reuse; a pre-restart exit
+            # receipt or stale receipt alone never releases an active admission.
+            if outcome is None or not (home / ".update_process_exit_code").exists() or claimed_path.exists():
+                return {"started": False, "pending": True}
+            previous = {"success": outcome[0], "detail": _bounded_previous_detail(outcome[1]),
+                        "reason": old[1].get("reason"), "timestamp": old[1].get("timestamp")}
+            previous_outcome_older_count = _previous_outcome_older_count(old[1])
+            old_bytes = pending_path.read_bytes()
+            old_process_exit = (home / ".update_process_exit_code").read_bytes()
+        pending = {**pending, "notification_version": 2, "request_id": uuid4().hex}
+        pending.pop("output_offset", None)
+        if previous is not None:
+            pending["previous_outcome"] = previous
+            if previous_outcome_older_count:
+                pending["previous_outcome_older_count"] = previous_outcome_older_count
+        encoded = json.dumps(pending).encode("utf-8")
+        temporary = home / f".update_pending.{uuid4().hex}.tmp" if old_bytes is not None else pending_path
+        for path in lifecycle_paths:
+            lifecycle_artifacts[path] = path.read_bytes() if path.exists() else None
+        try:
+            fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return {"started": False, "pending": True}
+        try:
+            with os.fdopen(fd, "wb") as marker:
+                marker.write(encoded)
+                marker.flush()
+                os.fsync(marker.fileno())
+            if old_bytes is not None:
+                if claimed_path.exists():
+                    return {"started": False, "pending": True}
+                os.replace(temporary, pending_path)
+            # A prior updater may claim after the first check; never supersede its claim.
+            if claimed_path.exists():
+                pending_path.unlink(missing_ok=True)
+                return {"started": False, "pending": True}
+            exit_code_path.unlink(missing_ok=True)
+            (home / ".update_process_exit_code").unlink(missing_ok=True)
+            # The marker is durable and the watcher is armed as soon as spawn returns;
+            # stale lifecycle files must not be attributed to this request.
+            for path in lifecycle_paths:
+                path.unlink(missing_ok=True)
+            spawn(hermes_cmd, output_path, exit_code_path)
+        except Exception:
+            if old_bytes is not None and not claimed_path.exists():
+                temporary.write_bytes(old_bytes)
+                os.replace(temporary, pending_path)
+                if old_process_exit is not None:
+                    (home / ".update_process_exit_code").write_bytes(old_process_exit)
+            else:
+                pending_path.unlink(missing_ok=True)
+            for path, content in lifecycle_artifacts.items():
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(content)
+            exit_code_path.unlink(missing_ok=True)
+            raise
+        finally:
+            if temporary != pending_path:
+                temporary.unlink(missing_ok=True)
     return {"started": True, "pending": False}
 
 

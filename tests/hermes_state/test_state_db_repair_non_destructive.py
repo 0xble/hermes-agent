@@ -72,6 +72,9 @@ from hermes_state_repair import repair_state_db_schema
 PAGE_SIZE = 4096
 
 
+pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
+
+
 def _writer_after_stage(
     db_path: str,
     ready: "multiprocessing.synchronize.Event",

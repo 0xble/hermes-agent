@@ -10,7 +10,7 @@ from hermes_cli import gateway, immutable_releases
 from gateway import status
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_supervised_gateway_ack_retries_after_long_boot_without_blocking_loop(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: tmp_path)
@@ -32,7 +32,7 @@ def test_supervised_gateway_ack_retries_after_long_boot_without_blocking_loop(mo
     assert len(checks) > 120
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_supervised_gateway_ack_retries_later_running_state(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_SUPERVISED_CHILD", "1")
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: tmp_path)

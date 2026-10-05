@@ -13,7 +13,7 @@ import pytest
 
 from hermes_cli import gateway, gateway_launchd
 from hermes_cli.immutable_releases import promote
-from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions
+from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions, install_probe_process_dependency
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -43,7 +43,7 @@ def _ack_observed_probe(releases, home, plist_path, output, *, gateway_pid=None)
                 if (supervisor in ancestors or supervisor == proc.pid) and (
                     gateway_pid is None or gateway_pid == proc.pid
                 ) and Path(proc.cwd()).resolve() == expected and (
-                    Path(proc.exe()).resolve() == Path(row["exe"]).resolve()
+                    Path(proc.exe()).resolve() == releases._interpreter_process_executable(Path(row["exe"]))
                 ):
                     releases._verify_transaction(paths, record)
                     body = plist_path.read_bytes()
@@ -64,7 +64,7 @@ def _ack_observed_probe(releases, home, plist_path, output, *, gateway_pid=None)
     return False
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch, request):
     home = tmp_path / "profile"
     label = f"ai.hermes.s2spike.{uuid.uuid4().hex}"
@@ -80,9 +80,14 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
     # Both commits contain the real S2 tree. A pre-S2 fixture would be refused by
     # the candidate smoke check and would not prove an installable release.
     source = tmp_path / "source-revisions"
-    subprocess.run(["git", "clone", "--shared", "--quiet", "--no-local",
+    # Borrow local objects instead of negotiating the entire partial-clone
+    # history through upload-pack. Only these two disposable revisions matter.
+    subprocess.run(["git", "clone", "--shared", "--quiet",
                     str(Path(__file__).resolve().parents[2]), str(source)],
                    check=True, timeout=60)
+    # This source install has no optional features. A real source-owned Python
+    # prevents staging from inheriting every extra installed in the test runner.
+    venv.EnvBuilder(with_pip=False).create(source / ".venv")
     (source / "probe.py").write_text(
         "import hermes_cli,json,os,pathlib,sys,time\n"
         "p=pathlib.Path(os.environ['S2_PROBE_OUTPUT'])\n"
@@ -98,17 +103,17 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
                         "-c", "commit.gpgsign=false", "commit", "--no-verify", "-qm", name], check=True)
         revisions[name] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     sha_a, sha_b = revisions["B"], revisions["B-prime"]
-    monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
     for name, sha in revisions.items():
         release, status = releases.stage_release(source, home, sha=sha)
         assert status == "staged" and release == home / "releases" / sha
 
     promote(home, home / "releases" / sha_a)
-    plist = plistlib.loads(gateway.generate_launchd_plist().encode())
+    plist = plistlib.loads(gateway.generate_launchd_plist(
+        release_target=home / "releases" / sha_a).encode())
     assert plist["Label"] == label
     assert plist["WorkingDirectory"] == str(home / "current")
     assert str(home / "current" / ".venv" / "bin" / "python") in " ".join(plist["ProgramArguments"])
-    assert plist["EnvironmentVariables"]["VIRTUAL_ENV"] == str(home / "current" / ".venv")
+    assert plist["EnvironmentVariables"]["PATH"].split(":")[0] == str(home / "current" / ".venv" / "bin")
     # Preserve generated interpreter/cwd/environment and launchd wrapper; replace
     # only the gateway payload with a bounded, no-credential process probe.
     python = str(home / "current" / ".venv" / "bin" / "python")
@@ -238,7 +243,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_path, monkeypatch, request):
     """Updater promotion and reversal reload one throwaway job, never the live label."""
     from hermes_cli import gateway_launchd, immutable_releases as releases, update_cmd, update_receipt
@@ -285,6 +290,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         (metadata / "METADATA").write_text(f"Metadata-Version: 2.1\nName: demo-dep\nVersion: {'1.0' if api == 'old_api' else '2.0'}\n", encoding="utf-8")
     source_python = source / ".venv/bin/python"
     venv.EnvBuilder(with_pip=False).create(source / ".venv")
+    install_probe_process_dependency(source / ".venv")
     install_demo(source_python, "old_api")
     distributions = lambda python: json.loads(subprocess.check_output([
         str(python), "-c", "import importlib.metadata as m,json;print(json.dumps(sorted((d.metadata['Name'],d.version) for d in m.distributions())))"], text=True))
@@ -293,6 +299,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
     b = home / "releases" / sha_b
     b.mkdir(parents=True)
     venv.EnvBuilder(with_pip=False).create(b / ".venv")
+    install_probe_process_dependency(b / ".venv")
     install_demo(b / ".venv/bin/python", "new_api")
     (b / "probe.py").write_bytes(subprocess.check_output(["git", "-C", str(source), "show", f"{sha_b}:probe.py"]))
     (b / ".release-ready").write_text(sha_b + "\n", encoding="utf-8")

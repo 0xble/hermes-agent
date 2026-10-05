@@ -6,6 +6,10 @@ description: "Connect Hermes Agent to external tool servers via MCP — and cont
 
 # MCP (Model Context Protocol)
 
+Python dependency commands on this page use a
+[PM-prepared source checkout](../../reference/package-management.md#developer-workflow).
+After a dependency change, reactivate the checkout and restart Hermes.
+
 MCP lets Hermes Agent connect to external tool servers so the agent can use tools that live outside Hermes itself — GitHub, databases, file systems, browser stacks, internal APIs, and more.
 
 If you have ever wanted Hermes to use a tool that already exists somewhere else, MCP is usually the cleanest way to do it.
@@ -496,6 +500,7 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
 | `max_lifetime_seconds` | number | Recycle a stdio server after this total age (`0` = never, default). Restarts transparently on next use. |
 | `enabled` | bool | If `false`, Hermes skips the server entirely |
 | `supports_parallel_tool_calls` | bool | If `true`, tools from this server may run concurrently |
+| `caller_identity` | bool | If `true`, every tool call to this server carries the calling session's identity as request `_meta` (default `false`). See [Caller Identity](#caller-identity) |
 | `tools` | mapping | Per-server tool filtering and utility policy |
 
 ### Minimal stdio example
@@ -866,7 +871,7 @@ Check:
 
 ```bash
 # Verify MCP deps are installed (already included in standard install)
-cd ~/.hermes/hermes-agent && uv pip install -e ".[mcp]"
+cd ~/.hermes/hermes-agent && python -c "import pm; pm.sync_venv(['mcp'], explicit=True)"
 
 node --version
 npx --version
@@ -935,6 +940,36 @@ When `supports_parallel_tool_calls` is `true`, Hermes may execute multiple tools
 :::caution
 Only enable parallel calls for MCP servers whose tools are safe to run at the same time. If tools read and write shared state, files, databases, or external resources, review the read/write race conditions before enabling this setting.
 :::
+
+## Caller Identity
+
+A single long-lived MCP server can serve every session of a gateway. Its process inherits the gateway's environment, so it cannot tell which session made a given call. Servers that need to attribute calls can opt in:
+
+```yaml
+mcp_servers:
+  relay:
+    command: "relay"
+    args: ["mcp"]
+    caller_identity: true
+```
+
+Each `tools/call` to that server then carries request `_meta`:
+
+```json
+{
+  "hermes/caller": {
+    "profile": "default",
+    "session_id": "20261005_104818_d14c0645",
+    "topic_session_id": "20261005_104818_d14c0645"
+  }
+}
+```
+
+- `session_id` is the session of the turn that made the call. A delegated subagent sends its own session id.
+- `topic_session_id` is the nearest session in the parent chain that is not a subagent, so a subagent's call names the conversation that spawned it. It is `null` when Hermes cannot resolve the chain. A server that relies on it should refuse the call rather than guess.
+- `profile` is the Hermes profile the session runs under.
+
+Hermes takes this identity from the calling turn, never from the model or from process environment variables. A tool argument named `_meta` is an ordinary argument and is never merged into the request `_meta`. Calls made outside any session carry no `_meta`. Servers without `caller_identity: true` receive exactly the requests they did before.
 
 ## MCP Sampling Support
 

@@ -44,7 +44,7 @@ def _load_receipts(adapter, bot_id) -> None:
     adapter._update_receipts_loaded.add(bot_id)
     path = _receipt_path(adapter, bot_id)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return
     except (OSError, ValueError):
@@ -242,6 +242,14 @@ class TelegramApplication(Application):
         return stopped or (claim is not None and not claim.accepted)
 
     async def process_update(self, update):
+        from gateway.platforms.base import ingress_consumer_scope, leave_ingress_consumer
+        consumer = ingress_consumer_scope()
+        try:
+            return await self._process_update_on_consumer(update)
+        finally:
+            leave_ingress_consumer(consumer)
+
+    async def _process_update_on_consumer(self, update):
         if not isinstance(update, Update):
             return await super().process_update(update)
         bot_id = self.bot.id

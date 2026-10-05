@@ -60,9 +60,9 @@ def receipt_home(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.get_hermes_home", lambda: home, raising=False
     )
-    ur._current = None
+    ur._current.set(None)
     yield home
-    ur._current = None
+    ur._current.set(None)
 
 
 def _receipt_files(home):
@@ -126,7 +126,7 @@ class TestReceiptAlwaysFinalized:
         ur.record_step("git_pull", True)
         ur.record_step("pip_install", True)
         # Crash: module singleton is gone, finalize never ran.
-        ur._current = None
+        ur._current.set(None)
 
         assert _receipt_files(receipt_home) == []
         latest = ur.read_latest_receipt()
@@ -157,8 +157,8 @@ class TestSuccessImpliesAccounting:
         outcomes = match_runtime_outcomes(plan, **bookkeeping)
         incomplete = report_unaccounted_runtimes(outcomes)
         record_plan_in_receipt(plan)
-        if ur._current is not None:
-            ur._current.data["runtime_outcomes"] = outcomes
+        if ur._current.get() is not None:
+            ur._current.get().data["runtime_outcomes"] = outcomes
         # Exact outcome-selection expression from update_cmd.py ~8360.
         path = ur.finalize_update_receipt(
             "partial" if incomplete else "success"
@@ -293,7 +293,7 @@ class TestPreUpdateBackupIsHonest:
         monkeypatch.setattr(maint, "_run_quick_snapshots", snapshot)
         ur.begin_update_receipt()
         result = maint._run_pre_update_backup(object())
-        return result, ur._current.data
+        return result, ur._current.get().data
 
     def test_failed_snapshot_records_the_real_reason(self, receipt_home, monkeypatch):
         from hermes_cli.backup import BackupInProgressError
@@ -317,7 +317,7 @@ class TestPreUpdateBackupIsHonest:
         ur.begin_update_receipt()
 
         assert maint._run_pre_update_backup(object()) is None
-        data = ur._current.data
+        data = ur._current.get().data
         assert not any(s["name"] == "pre_update_backup" for s in data["steps"])
         skip = next(s for s in data["skips"] if s["name"] == "pre_update_backup")
         assert "disabled by" in skip["reason"]
@@ -350,7 +350,7 @@ def test_full_mode_still_takes_the_zip_when_the_snapshot_fails(monkeypatch, rece
 
     assert maint._run_pre_update_backup(object()) is None
     assert ran["zip"] is True, "a failed snapshot must not cancel the full backup"
-    step = next(s for s in ur._current.data["steps"] if s["name"] == "pre_update_backup")
+    step = next(s for s in ur._current.get().data["steps"] if s["name"] == "pre_update_backup")
     assert step["ok"] is False and "OSError" in step["detail"]
 
 
@@ -378,7 +378,7 @@ def test_no_sibling_profiles_is_not_a_sibling_failure(
 
     maint._run_quick_snapshots()
 
-    recorded = [s for s in ur._current.data["steps"] if s["name"] == "sibling_profile_snapshots"]
+    recorded = [s for s in ur._current.get().data["steps"] if s["name"] == "sibling_profile_snapshots"]
     assert bool(recorded) is expect_failure_recorded
 
 

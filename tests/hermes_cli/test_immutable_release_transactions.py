@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import plistlib
+import shlex
 import stat
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_cli import immutable_releases as releases
-from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions
+from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions, install_probe_process_dependency
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -130,6 +131,7 @@ def _release(path: Path, *, real: bool = False) -> None:
     python = path / ".venv/bin/python"
     if real:
         venv.EnvBuilder(with_pip=False).create(path / ".venv")
+        install_probe_process_dependency(path / ".venv")
         package = path / "hermes_cli"
         package.mkdir()
         (package / "__init__.py").write_text("")
@@ -207,6 +209,7 @@ def _fixture(tmp_path: Path, scenario: str, *, real: bool = False):
     source_sha = _source(source, real=real)
     if real:
         venv.EnvBuilder(with_pip=False).create(source / ".venv")
+        install_probe_process_dependency(source / ".venv")
     label = f"ai.hermes.s2crash.{uuid.uuid4().hex}" if real else "ai.hermes.disposable"
     plist = tmp_path / f"{label}.plist"
     first = scenario.startswith("migration")
@@ -299,7 +302,7 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
         assert releases.release_sha(source) == source_sha
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("scenario,checkpoint", [(name, step) for name, steps in _STEPS.items() for step in steps])
 def test_crash_after_each_durable_mutation(tmp_path, monkeypatch, scenario, checkpoint):
     home, source, plist, a, b, source_sha, original, intended = _fixture(tmp_path, scenario)
@@ -335,7 +338,7 @@ def test_crash_after_each_durable_mutation(tmp_path, monkeypatch, scenario, chec
            checkpoint=checkpoint)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("scenario,checkpoint", [("migration", "plist"), ("migration", "loaded"),
                                                  ("migration_rollback", "plist"),
                                                  ("migration_rollback", "loaded")])
@@ -371,7 +374,7 @@ def test_disposable_launchd_first_migration_and_rollback(tmp_path, monkeypatch, 
         assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15).returncode != 0
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("failure", ["submit", "bootstrap"])
 def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_starts(
     tmp_path, monkeypatch, request, failure
@@ -436,7 +439,7 @@ def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_sta
         assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("phase", ["before-bootout", "after-bootout", "after-bootstrap"])
 def test_deferred_helper_crash_phases_never_acknowledge_transaction(tmp_path, monkeypatch, phase):
     """Kill the real generated bash helper at each handoff phase; WAL remains."""
@@ -490,7 +493,7 @@ def test_deferred_helper_crash_phases_never_acknowledge_transaction(tmp_path, mo
     assert plist.read_bytes() == intended
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("reason", ["failed-submit", "unobserved"])
 def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reason):
     from hermes_cli import gateway_launchd
@@ -508,7 +511,7 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
             raise subprocess.CalledProcessError(1, args)
         return subprocess.CompletedProcess(args, 0)
     monkeypatch.setattr(gateway_launchd.subprocess, "run", submit)
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _: None)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: None)
     def reload():
         submitted = gateway_launchd._spawn_deferred_launchd_reload(
             domain=f"gui/{os.getuid()}", label=plist.stem,
@@ -547,7 +550,7 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
     assert not txn.exists()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("scenario", ["promote", "rollback", "migration_rollback"])
 def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeypatch, scenario):
     from hermes_cli import gateway, gateway_launchd, update_cmd
@@ -581,7 +584,7 @@ def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeyp
     assert calls == [1]
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
     from hermes_cli import gateway, gateway_launchd, update_cmd
     home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote")
@@ -590,10 +593,10 @@ def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
     assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
                                      reload_callback=lambda: calls.append(1) or "deferred")["reload_pending"]
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {
+        "immutable_releases": True, "release_acknowledgement_timeout_seconds": 0})
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
-    monkeypatch.setattr(update_cmd.sys, "platform", "darwin")
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
     monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda **kw: True)
     monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist", lambda _: calls.append(1) or "deferred")
@@ -602,7 +605,7 @@ def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
     assert calls == [1]
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.spawns_gateway_lookalike
 def test_updater_waits_for_deferred_gateway_ack_without_second_reload(tmp_path, monkeypatch):
     import threading
@@ -649,7 +652,7 @@ def test_updater_waits_for_deferred_gateway_ack_without_second_reload(tmp_path, 
             process.wait(timeout=5)
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_updater_ack_timeout_preserves_pending_without_new_reload(tmp_path, monkeypatch):
     from hermes_cli import update_cmd
     home, _, plist, _, candidate, _, _, intended = _fixture(tmp_path, "promote")
@@ -662,7 +665,7 @@ def test_updater_ack_timeout_preserves_pending_without_new_reload(tmp_path, monk
     assert calls == [1]
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("wrong", ["release", "pid", "wrapper"])
 def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong):
     import psutil
@@ -671,7 +674,7 @@ def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong)
     home, _, plist, _, b, _, _, intended = _fixture(tmp_path, "promote")
     assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
                                      reload_callback=lambda: "deferred")["reload_pending"]
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _: 31415)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: 31415)
     gateway = SimpleNamespace(
         pid=31416 if wrong == "pid" else 31415,
         cmdline=lambda: (["python", "-m", "hermes_cli.stderr_timestamp", "--", "python",
@@ -686,7 +689,44 @@ def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong)
     assert not record.get("reload_done") and "reload_ack" not in record
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("launcher", ["generated", "other-release", "foreign-code"])
+def test_generated_launchd_gateway_acknowledges_only_its_release(tmp_path, monkeypatch, launcher):
+    """The gateway launchd starts from the generated plist acknowledges its own release only."""
+    import psutil
+    from hermes_cli import gateway as gateway_cli, gateway_launchd
+    from hermes_cli._launchers import runtime_command
+
+    home, _, plist, a, b, _, _, intended = _fixture(tmp_path, "promote")
+    assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
+                                     reload_callback=lambda: "deferred")["reload_pending"]
+    monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+    target = releases.read_pointer(home / "current")
+    definition = plistlib.loads(gateway_cli.generate_launchd_plist(release_target=target).encode())
+    shell, _ = json.JSONDecoder().raw_decode(definition["ProgramArguments"][-1].split("$.system(", 1)[1])
+    wrapper = shlex.split(shell.removeprefix("exec ").split(" >> ", 1)[0])
+    argv = wrapper[wrapper.index("--") + 1:]
+    assert argv[-3:] == ["gateway", "run", "--external-supervisor"]
+    if launcher == "other-release":
+        argv = [argv[0], *runtime_command(a, (), module="hermes_cli.main")[1:4], *argv[4:]]
+    elif launcher == "foreign-code":
+        argv = [argv[0], "-I", "-c", "import time; time.sleep(60)", *argv[4:]]
+
+    interpreter = tmp_path / "interpreter"
+    monkeypatch.setattr(releases, "_interpreter_process_executable", lambda _: interpreter)
+    process = lambda pid, cmd: SimpleNamespace(  # noqa: E731
+        pid=pid, cmdline=lambda: cmd, exe=lambda: str(interpreter), cwd=lambda: str(target),
+        environ=lambda: {}, children=lambda **_: [])
+    supervisor = process(31415, definition["ProgramArguments"])
+    supervisor.children = lambda **_: [process(31416, wrapper), process(31417, argv)]
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: supervisor.pid)
+    monkeypatch.setattr(psutil, "Process", lambda _: supervisor)
+
+    assert releases.acknowledge_running_release(home) is (launcher == "generated")
+    assert (home / "release-txn.json").exists() is (launcher != "generated")
+
+
+@pytest.mark.platforms("macos")
 def test_no_gateway_restart_pending_txn_has_no_launchctl_or_pointer_writes(tmp_path, monkeypatch):
     from hermes_cli import update_cmd
 
@@ -719,7 +759,7 @@ def test_no_gateway_restart_pending_txn_has_no_launchctl_or_pointer_writes(tmp_p
                       releases.read_pointer(home / "previous"))
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_release_manager_wait_observes_delayed_ack_without_reloading(tmp_path, monkeypatch):
     pending = tmp_path / "release-txn.json"
     pending.write_text("{}", encoding="utf-8")

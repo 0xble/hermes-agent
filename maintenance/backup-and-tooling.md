@@ -5,6 +5,15 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
 
 ## Required behavior
 
+- Fork patch identity: `slice-18-archive`. Legacy archive bundles include reflog-only
+  stash commits as well as every ref. Restore qualification verifies HEAD, each
+  original ref's exact SHA, and every stash commit. It fails closed if any are
+  missing, and the source checkout and stash list remain unchanged. Verify the
+  real three-stash restore and damaged-mirror invariant in
+  `tests/scripts/test_archive_legacy_fork.py`. Retire after the legacy migration's
+  recovery obligation ends. Rollback retains existing bundles but weakens future
+  archive verification.
+
 - New quick snapshots have version-2 manifests containing SHA-256 digests of captured
   payloads. Retention verifies digests before counting a recovery copy. Restore verifies
   every versioned payload before writing any destination. Legacy size-only manifests
@@ -14,6 +23,12 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   addition when a selected release preserves the same same-size-alteration and restore
   rejection behavior. Verify `tests/hermes_cli/test_quick_snapshot_digests.py` alongside
   the existing backup/retention suite. Rollback keeps the additive manifests readable.
+- Retention verifies one complete recovery anchor and one usable anchor per database
+  path, then seeks verified anchors for recorded omissions. It caches successful
+  and failed payload checks within each prune call, so generations being discarded do
+  not multiply full-file hashing under the shared backup lock. A size match alone never
+  qualifies a version-2 recovery payload. The lazy-verification invariants live in
+  `tests/hermes_cli/test_quick_snapshot_retention.py`.
 - Incomplete backup archives are reported as failures; complete archives survive
   retention; SQLite snapshot members are verified before a quick snapshot is trusted.
 - `scripts/schema_rehearsal.py` proves a copied legacy database opens, migrates, and keeps
@@ -226,6 +241,12 @@ desktop fixture portability fix and local CI declaration are owned by
 including after a release rebase. It does not advance the trailer floor.
 
 Fork-Patch-Backfill: f0a3bb8be8b611d30a990bb83db46aeaed37c39a; maintenance-tooling
+
+Published commit `a776676f5e12` (PR #285) also omitted its trailer during squash
+merge. Its PM and source-driver fixture portability fix for macOS is owned by
+`maintenance-tooling` on the same terms.
+
+Fork-Patch-Backfill: a18e5fe814c5f53d7ea1b79c1c99cbf6e1fd229d; maintenance-tooling
 
 `scripts/run_tests.sh` on `tests/hermes_cli/test_backup.py`,
 `tests/hermes_cli/test_backup_stability.py`, `tests/scripts/test_candidate_scripts.py`,

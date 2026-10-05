@@ -3,9 +3,11 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 
@@ -147,6 +149,50 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class MatrixStreamingProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Records whether Matrix edits are progressive or finalizing."""
+
+    initial_send_seen = threading.Event()
+    progressive_edit_seen = threading.Event()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        self.initial_send_seen.set()
+        return result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": finalize,
+            }
+        )
+        if not finalize:
+            self.progressive_edit_seen.set()
+        return SendResult(success=True, message_id=message_id)
+
+
+class UnsupportedEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    """Chat adapter whose message edits fail (e.g. edit unsupported or rejected)."""
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=False, error="Not supported")
+
+
 class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
     """Fail the first split edit transiently, then keep editing."""
 
@@ -170,6 +216,46 @@ class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
                 retryable=True,
                 error_kind="transient",
             )
+        return await super().edit_message(chat_id, message_id, content)
+
+
+class FloodOverflowEditProgressAdapter(SmallLimitProgressAdapter):
+    """Refuse the first edit for flood control, as Telegram does inside a penalty window."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.flood_refusals = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        if self.flood_refusals == 0:
+            self.flood_refusals += 1
+            self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content})
+            return SendResult(success=False, error="flood_control:1.0", retry_after=1.0)
+        return await super().edit_message(chat_id, message_id, content)
+
+
+class PersistentFloodProgressAdapter(SmallLimitProgressAdapter):
+    """Every edit is refused for a long flood window; records when each attempt happened."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.edit_times = []
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edit_times.append(time.monotonic())
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            self.oversized_edits.append(content)
+        self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content})
+        return SendResult(success=False, error="flood_control:30.0", retry_after=30.0)
+
+
+class DeadBubbleProgressAdapter(SmallLimitProgressAdapter):
+    """The first progress bubble becomes uneditable (deleted, or too old to edit)."""
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        if message_id == "progress-1":
+            self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content})
+            return SendResult(success=False, error="Message to edit not found")
         return await super().edit_message(chat_id, message_id, content)
 
 
@@ -350,6 +436,9 @@ class DelayedProgressAgent:
         }
 
 
+_ACTIVE_ADAPTER: dict = {}  # the adapter of the run in flight, for agents that pace on its sends
+
+
 class ManyProgressLinesAgent:
     """Emits enough tool-progress lines to exceed a single platform bubble."""
 
@@ -364,7 +453,14 @@ class ManyProgressLinesAgent:
         # Let the progress task create the first editable bubble, then enqueue
         # the rest quickly.  The cancellation drain must roll them into fresh
         # editable bubbles instead of trying to edit the first one past limit.
-        time.sleep(0.35)
+        # Wait for the bubble itself, not a fixed interval: on a loaded CI runner
+        # 0.35s is not always enough and every line then lands before the first
+        # send, so nothing is ever edited.
+        adapter = _ACTIVE_ADAPTER.get("adapter")
+        deadline = time.monotonic() + 5.0
+        while adapter is not None and not adapter.sent and time.monotonic() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.05)
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
         time.sleep(0.1)
@@ -373,6 +469,18 @@ class ManyProgressLinesAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class ManyProgressLinesOutlastFloodAgent(ManyProgressLinesAgent):
+    """Keeps the turn alive past a short flood window so the deferred edit can land."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        result = super().run_conversation(message, conversation_history, task_id, **kwargs)
+        # Outlast the refusal's deferral (never shorter than the production edit interval) plus one
+        # more interval for the resumed edit, so retuning the interval cannot silently starve it.
+        from gateway.run_turn_runner import TurnRunner
+        time.sleep(2 * TurnRunner._PROGRESS_EDIT_INTERVAL + 1.0)
+        return result
 
 
 class DelayedInterimAgent:
@@ -488,9 +596,9 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     # Since PR #8006, Slack's built-in display tier sets tool_progress="off"
     # by default. Override via config so this test still exercises the
     # progress-callback path the Slack DM event_message_id threading depends on.
-    import yaml
+    import hermes_yaml as yaml
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"platforms": {"slack": {"tool_progress": "all"}}}}),
+        yaml.safe_dump({"display": {"platforms": {"slack": {"tool_progress": "all"}}}}),
         encoding="utf-8",
     )
 
@@ -580,9 +688,9 @@ async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch
     SAME auto-thread as the final reply — otherwise the search-status updates
     leak into the parent channel (staging repro 2026-08-02)."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-    import yaml
+    import hermes_yaml as yaml
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
+        yaml.safe_dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
         encoding="utf-8",
     )
 
@@ -639,9 +747,9 @@ async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, t
     auto-thread lane) must NOT get the synthetic prospective anchor — it already
     routes by its real thread. Guards against over-broadening the relay fix."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
-    import yaml
+    import hermes_yaml as yaml
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
+        yaml.safe_dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
         encoding="utf-8",
     )
 
@@ -722,7 +830,7 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
     that _run_agent reads — so the gateway picks it up the same way production does.
     """
     import asyncio
-    import yaml
+    import hermes_yaml as yaml
 
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
@@ -736,7 +844,7 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
 
     # Write config.yaml so _run_agent picks up tool_preview_length
     config = {"display": {"tool_preview_length": preview_length}}
-    (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
 
     adapter = ProgressCaptureAdapter()
     runner = _make_runner(adapter)
@@ -781,7 +889,7 @@ def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
 
 def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
     """The real gateway path must retain the URL beyond its visible cap."""
-    import yaml
+    import hermes_yaml as yaml
 
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
@@ -794,7 +902,7 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_preview_length": 0}}),
+        yaml.safe_dump({"display": {"tool_preview_length": 0}}),
         encoding="utf-8",
     )
 
@@ -865,6 +973,26 @@ class FinalAsInterimAgent:
             self.interim_assistant_callback(final, already_streamed=False)
         return {
             "final_response": final,
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class StreamingRefineAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        if self.stream_delta_callback:
+            self.stream_delta_callback("Continuing to refine:")
+        MatrixStreamingProgressCaptureAdapter.initial_send_seen.wait(timeout=2.0)
+        if self.stream_delta_callback:
+            self.stream_delta_callback(" Final answer.")
+        MatrixStreamingProgressCaptureAdapter.progressive_edit_seen.wait(timeout=2.0)
+        return {
+            "final_response": "Continuing to refine: Final answer.",
             "response_previewed": True,
             "messages": [],
             "api_calls": 1,
@@ -1011,9 +1139,9 @@ async def _run_with_agent(
     scope_id=None,
 ):
     if config_data:
-        import yaml
+        import hermes_yaml as yaml
 
-        (tmp_path / "config.yaml").write_text(yaml.dump(config_data), encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(config_data), encoding="utf-8")
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -1024,6 +1152,7 @@ async def _run_with_agent(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = adapter_cls(platform=platform)
+    _ACTIVE_ADAPTER["adapter"] = adapter
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
@@ -1324,6 +1453,63 @@ async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatc
     assert adapter.oversized_edits == []
 
 
+async def _run_many_progress_lines(monkeypatch, tmp_path, adapter_cls, session_id, agent_cls=ManyProgressLinesAgent):
+    return await _run_with_agent(
+        monkeypatch, tmp_path, agent_cls, session_id=session_id,
+        config_data={"display": {"tool_progress": "all", "interim_assistant_messages": False}},
+        platform=Platform.SLACK, chat_id="C123", chat_type="direct", thread_id="1700000000.000100",
+        adapter_cls=adapter_cls,
+    )
+
+
+@pytest.mark.asyncio
+async def test_flood_refused_overflow_edit_keeps_progress_in_bubbles(monkeypatch, tmp_path):
+    """A flood refusal is "not now": editing must resume, never one message per later tool line."""
+    adapter, result = await _run_many_progress_lines(
+        monkeypatch, tmp_path, FloodOverflowEditProgressAdapter, "sess-progress-flood-overflow",
+        agent_cls=ManyProgressLinesOutlastFloodAgent)
+
+    assert result["final_response"] == "done"
+    assert adapter.flood_refusals == 1
+    # Resumed edits after the refusal: proof editing was not switched off for the turn.
+    assert len(adapter.edits) > adapter.flood_refusals
+    # Every overflow-line-N lands in a bubble that holds several lines, never a bubble of its own.
+    single_line_sends = [s["content"] for s in adapter.sent if "\n" not in s["content"]]
+    assert all(not text.startswith("overflow-line-") for text in single_line_sends), single_line_sends
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+
+
+@pytest.mark.asyncio
+async def test_uneditable_progress_bubble_continues_in_a_fresh_bubble(monkeypatch, tmp_path):
+    """One dead bubble moves progress to a fresh editable bubble instead of disabling edits."""
+    adapter, result = await _run_many_progress_lines(
+        monkeypatch, tmp_path, DeadBubbleProgressAdapter, "sess-progress-dead-bubble")
+
+    assert result["final_response"] == "done"
+    assert any(e["message_id"] == "progress-1" for e in adapter.edits)
+    # Later edits target a fresh bubble, so editing survived the dead one.
+    assert any(e["message_id"] != "progress-1" for e in adapter.edits)
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+
+
+@pytest.mark.asyncio
+async def test_persistent_flood_does_not_retry_per_line_or_flush_oversized(monkeypatch, tmp_path):
+    """Inside a long flood window the refused bubble is not re-edited for each incoming tool line,
+    and turn cleanup never sends the unsplit over-limit buffer as a single edit."""
+    adapter, result = await _run_many_progress_lines(
+        monkeypatch, tmp_path, PersistentFloodProgressAdapter, "sess-progress-persistent-flood")
+
+    assert result["final_response"] == "done"
+    # The 30s refusal arrives mid-turn; no further edit may follow inside that window.
+    assert len(adapter.edit_times) == 1, adapter.edits
+    assert adapter.oversized_edits == []
+    assert adapter.oversized_sends == []
+    # Lines that arrived during the refusal were never sent as messages of their own.
+    assert all(not s["content"].startswith("overflow-line-") for s in adapter.sent if "\n" not in s["content"])
+
+
 @pytest.mark.asyncio
 async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, tmp_path):
     adapter, result = await _run_with_agent(
@@ -1362,6 +1548,36 @@ async def test_non_editable_interim_final_is_recorded_for_final_send_dedup(monke
     assert result["already_sent"] is True
     assert [call["content"] for call in adapter.sent] == [result["final_response"]]
     assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
+    MatrixStreamingProgressCaptureAdapter.initial_send_seen.clear()
+    MatrixStreamingProgressCaptureAdapter.progressive_edit_seen.clear()
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamingRefineAgent,
+        session_id="sess-matrix-streaming",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.MATRIX,
+        chat_id="!room:matrix.example.org",
+        chat_type="group",
+        thread_id="$thread",
+        adapter_cls=MatrixStreamingProgressCaptureAdapter,
+    )
+
+    assert result.get("already_sent") is True
+    all_text = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
+    assert all_text, "expected streamed Matrix content to be sent or edited"
+    assert any(not call["finalize"] for call in adapter.edits), (
+        "Matrix should progressively edit the active message before finalization"
+    )
+    assert all("▉" not in text for text in all_text)
+    assert any("Continuing to refine:" in text for text in all_text)
 
 
 class TransformedStreamAgent:
@@ -1421,6 +1637,30 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_transformed_final_is_not_marked_sent_when_edit_fails(monkeypatch, tmp_path):
+    """#119323: when the in-place edit carrying a transformed final fails on a chat platform,
+    the response must not be marked already_sent, or the transformed text is never delivered."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedStreamAgent,
+        session_id="sess-transformed-edit-fails",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=UnsupportedEditProgressCaptureAdapter,
+    )
+
+    assert result["final_response"].endswith("[plugin appended this]")
+    assert result.get("already_sent") is not True
+    assert len(adapter.edits) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path):
     QueuedCommentaryAgent.calls = 0
     adapter, result = await _run_with_agent(
@@ -1469,7 +1709,7 @@ async def test_run_agent_queued_message_delivers_first_response_media(monkeypatc
         "image_batches": [
             {
                 "chat_id": "discord-thread",
-                "images": [(media_path.as_uri(), "")],
+                "images": [(f"file://{quote(str(media_path))}", "")],
                 "metadata": {"thread_id": "discord-thread"},
             }
         ],
@@ -1510,7 +1750,7 @@ async def test_run_agent_queued_message_delivers_streamed_first_response_media(
     assert adapter.image_batches == [
         {
             "chat_id": "discord-thread",
-            "images": [(media_path.as_uri(), "")],
+            "images": [(f"file://{quote(str(media_path))}", "")],
             "metadata": {"thread_id": "discord-thread"},
         }
     ]
@@ -1682,10 +1922,10 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
 
 @pytest.mark.asyncio
 async def test_run_agent_drops_tool_progress_after_generation_invalidation(monkeypatch, tmp_path):
-    import yaml
+    import hermes_yaml as yaml
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_progress": "all"}}),
+        yaml.safe_dump({"display": {"tool_progress": "all"}}),
         encoding="utf-8",
     )
 
@@ -1744,10 +1984,10 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
 @pytest.mark.asyncio
 async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path):
-    import yaml
+    import hermes_yaml as yaml
 
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_progress": "off", "interim_assistant_messages": True}}),
+        yaml.safe_dump({"display": {"tool_progress": "off", "interim_assistant_messages": True}}),
         encoding="utf-8",
     )
 
@@ -1979,6 +2219,46 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     # Full command body present — verbose is uncapped.
     assert "npm install -g hyperframes@latest" in all_content
     assert "node --version" in all_content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["turn_runner", "proxy"])
+async def test_per_platform_streaming_does_not_override_global_disabled(monkeypatch, tmp_path, path):
+    """Regression for #53697: display.platforms.telegram.streaming=True must not
+    re-enable gateway streaming when streaming.enabled=False (global master switch).
+
+    Covers both gate sites: TurnRunner.want_stream_deltas (normal agent path) and
+    GatewayTurnMixin._proxy_stream_consumer (proxy / native-streaming path)."""
+    config_data = {
+        "display": {
+            "platforms": {
+                "telegram": {"streaming": True},
+            },
+            "interim_assistant_messages": False,
+        },
+        "streaming": {"enabled": False},
+    }
+    if path == "proxy":
+        adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+        runner = _make_runner(adapter)
+        runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
+        gateway_run = importlib.import_module("gateway.run")
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config_data)
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="dm")
+        assert runner._proxy_stream_consumer(source, None, None, lambda: True) is None
+        return
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-per-platform-streaming-global-off",
+        config_data=config_data,
+        platform=Platform.TELEGRAM,
+    )
+
+    assert result.get("already_sent") is not True
+    assert adapter.edits == []
 
 
 class TestSlackReplyInThreadProgressRouting:

@@ -3,6 +3,7 @@ from contextlib import ExitStack, nullcontext
 import importlib.util
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -26,11 +27,11 @@ class PortableGateTests(unittest.TestCase):
         from scripts.run_tests_parallel import _discover_files
 
         ordinary = {p.relative_to(ci.ROOT).as_posix()
-                    for p in _discover_files([ci.ROOT / 'tests'])}
+                    for p in _discover_files([ci.ROOT / 'tests'])
+                    if not ci.is_nightly_only(p)}
         e2e = {p.relative_to(ci.ROOT).as_posix()
                for p in _discover_files([ci.ROOT / 'tests/e2e'])
-               if not p.is_relative_to(ci.ROOT / ci.NIGHTLY_ONLY_E2E[0])
-               and p != ci.ROOT / ci.NIGHTLY_ONLY_E2E[1]}
+               if not ci.is_nightly_only(p)}
         expected = ordinary | e2e
         buckets = ci.shard_files(ci.ROOT, 10)
         self.assertEqual(set().union(*(set(bucket) for bucket in buckets)), expected)
@@ -41,12 +42,12 @@ class PortableGateTests(unittest.TestCase):
             ci.shard_files(ci.ROOT, 0)
 
     def test_container_jobs_install_git_and_configure_safe_directory_before_checkout(self):
-        import yaml
+        import hermes_yaml as yaml
 
         workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
         for workflow_name in ('gate.yml', 'nightly.yml'):
             with self.subTest(workflow=workflow_name):
-                document = yaml.safe_load((workflows / workflow_name).read_text(encoding='utf-8'))
+                document = yaml.safe_load((workflows / workflow_name).read_text(encoding='utf-8-sig'))
                 for job_name, job in document['jobs'].items():
                     if 'container' not in job:
                         continue
@@ -74,16 +75,47 @@ class PortableGateTests(unittest.TestCase):
                     )
 
     def test_nightly_reaps_orphans_and_runs_python_suite_as_nonroot(self):
-        import yaml
+        import hermes_yaml as yaml
 
         workflow = Path(__file__).resolve().parents[3] / '.github/workflows/nightly.yml'
-        linux = yaml.safe_load(workflow.read_text(encoding='utf-8'))['jobs']['linux']
+        linux = yaml.safe_load(workflow.read_text(encoding='utf-8-sig'))['jobs']['linux']
         self.assertIn('--init', linux['container']['options'].split())
         install = next(step for step in linux['steps'] if step.get('name') == 'Install pinned Linux toolchain and platform libraries')
         self.assertIn(' ffmpeg ', install['run'])
         profile = next(step for step in linux['steps'] if step.get('name') == 'Broad exact-SHA source profile')
         self.assertIn('runuser -u ci -- env HOME="$HOME" ./bin/ci nightly', profile['run'])
+        self.assertNotIn('GITHUB_ACTIONS=true', profile['run'])
         self.assertIn('chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"', profile['run'])
+
+    def test_local_toolchain_preserves_argv0_dispatching_node_shim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            uv = tools / 'uv'
+            uv.write_text(
+                f'#!{sys.executable}\n'
+                'import sys\n'
+                f'print("uv {ci.PINS["uv"]}")\n',
+                encoding='utf-8',
+            )
+            uv.chmod(0o755)
+            node_real = tools / 'node-real'
+            node_real.write_text(
+                f'#!{sys.executable}\n'
+                'from pathlib import Path\n'
+                'import sys\n'
+                f'version = {ci.PINS["node"]!r} if Path(sys.argv[0]).name == "node" else "0.0.0"\n'
+                'print(f"v{version}")\n',
+                encoding='utf-8',
+            )
+            node_real.chmod(0o755)
+            (tools / 'node').symlink_to(node_real)
+            env = {'PATH': str(tools)}
+            resolved = ci.resolve_local_toolchain(env)
+            node = resolved['HERMES_CI_PINNED_NODE']
+            self.assertEqual(
+                subprocess.check_output([node, '--version'], env=resolved, text=True, encoding='utf-8').strip(),
+                f'v{ci.PINS["node"]}',
+            )
 
     def test_exact_checkout_rejects_malformed_wrong_and_mutated_sha(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,7 +199,7 @@ class PortableGateTests(unittest.TestCase):
             self.assertEqual(env['UV_PROJECT_ENVIRONMENT'], str(ci.ROOT / '.venv'))
             config = Path(env['GIT_CONFIG_GLOBAL'])
             self.assertEqual(config, (state / 'isolated' / 'gitconfig').resolve())
-            self.assertEqual(config.read_text(encoding='utf-8'),
+            self.assertEqual(config.read_text(encoding='utf-8-sig'),
                              f'[safe]\n\tdirectory = {ci.ROOT.resolve().as_posix()}\n')
             self.assertEqual(env['GIT_CONFIG_NOSYSTEM'], '1')
             directories = subprocess.check_output(
@@ -315,24 +347,24 @@ try {
 
     def test_workflows_install_the_pinned_python(self):
         for name in ('gate.yml', 'nightly.yml'):
-            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8-sig')
             self.assertIn(f"uv python install {ci.PINS['python']}", text, name)
         self.assertNotEqual(ci.PINS['python'], '3.11.14', '3.11.14 links WAL-reset-vulnerable SQLite 3.50.4')
 
     def test_uv_pin_is_consistent_across_installers(self):
         # uv's bundled download manifest decides which CPython patches install; a stale uv cannot
         # provision a newer pinned interpreter on a fresh runner.
-        artifacts = (ci.ROOT / 'ci/linux-artifacts.json').read_text(encoding='utf-8')
+        artifacts = (ci.ROOT / 'ci/linux-artifacts.json').read_text(encoding='utf-8-sig')
         self.assertIn(f"/uv/releases/download/{ci.PINS['uv']}/", artifacts)
         self.assertNotRegex(artifacts, r'/uv/releases/download/(?!' + re.escape(ci.PINS['uv']) + r'/)')
         for name in ('e2e-desktop-core.yml', 'live-providers.yml'):
-            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
+            text = (ci.ROOT / '.github/workflows' / name).read_text(encoding='utf-8-sig')
             self.assertRegex(text, r"version: ['\"]" + re.escape(ci.PINS['uv']) + r"['\"]", name)
 
     def test_every_reusable_only_workflow_has_a_caller(self):
-        import yaml
+        import hermes_yaml as yaml
         workflows = ci.ROOT / '.github/workflows'
-        texts = {path.name: path.read_text(encoding='utf-8') for path in workflows.glob('*.y*ml')}
+        texts = {path.name: path.read_text(encoding='utf-8-sig') for path in workflows.glob('*.y*ml')}
         for name, text in texts.items():
             triggers = yaml.safe_load(text).get(True) or yaml.safe_load(text).get('on') or {}
             if isinstance(triggers, dict) and set(triggers) <= {'workflow_call', 'workflow_dispatch'} and 'workflow_call' in triggers:
@@ -344,7 +376,7 @@ try {
         import re
         missing = []
         for path in sorted((ci.ROOT / '.github/workflows').glob('*.y*ml')):
-            for ref in re.findall(r'uses:\s*(\./[^\s#]+)', path.read_text(encoding='utf-8')):
+            for ref in re.findall(r'uses:\s*(\./[^\s#]+)', path.read_text(encoding='utf-8-sig')):
                 target = ci.ROOT / ref
                 if not (target.is_file() or any((target / name).is_file() for name in ('action.yml', 'action.yaml', 'Dockerfile'))):
                     missing.append(f'{path.name}: {ref}')
@@ -362,7 +394,7 @@ try {
                 with self.assertRaisesRegex(RuntimeError, 'source.txt'):
                     with ci.source_unchanged():
                         source.write_text('unexpected generated output', encoding='utf-8')
-            self.assertEqual(source.read_text(encoding='utf-8'), 'unexpected generated output')
+            self.assertEqual(source.read_text(encoding='utf-8-sig'), 'unexpected generated output')
 
     def test_source_guard_detects_source_created_during_ci(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -380,6 +412,79 @@ try {
         with patch.object(ci.subprocess, 'check_output', return_value='v0.0.0\n'):
             with self.assertRaisesRegex(RuntimeError, 'require'):
                 ci.require_tools(('node',), {})
+
+    def test_local_environment_resolves_pinned_uv_and_node_from_mise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mise = Path(directory) / 'mise'
+            toolchain = Path(directory) / 'toolchain'
+            executables = {}
+            for name in ('uv', 'node'):
+                relative = Path('uv-native') / name if name == 'uv' else Path('bin') / name
+                executable = mise / 'installs' / name / ci.PINS[name] / relative
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                version = ci.PINS[name]
+                executable.write_text(
+                    f'#!/bin/sh\nprintf "%s\\n" "{("uv " if name == "uv" else "v") + version}"\n',
+                    encoding='utf-8',
+                )
+                executable.chmod(0o755)
+                executables[name] = executable
+            isolated = Path(directory) / 'isolated-home'
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': '', 'HOME': directory, 'MISE_DATA_DIR': str(mise), 'PATH': '/host/bin'}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'), \
+                    patch.object(ci, 'TOOLCHAIN', toolchain):
+                env = ci.resolve_local_toolchain(ci.environment(isolated))
+            parts = env['PATH'].split(os.pathsep)
+            self.assertEqual(parts[:3], [
+                str(ci.ROOT / '.venv' / 'bin'),
+                str(toolchain / 'bin'),
+                str(toolchain / 'node_modules' / '.bin'),
+            ])
+            self.assertEqual(parts[3:5], [str(executables['uv'].parent.resolve()), str(executables['node'].parent.resolve())])
+            self.assertEqual(ci.windows_command('uv', env), str(executables['uv'].resolve()))
+            self.assertEqual(ci.windows_command('node', env), str(executables['node'].resolve()))
+            self.assertLess(parts.index(str(toolchain / 'node_modules' / '.bin')), parts.index(str(executables['uv'].parent.resolve())))
+            self.assertLess(parts.index(str(toolchain / 'node_modules' / '.bin')), parts.index(str(executables['node'].parent.resolve())))
+            self.assertLess(parts.index(str(executables['uv'].parent.resolve())), parts.index('/host/bin'))
+            self.assertLess(parts.index(str(executables['node'].parent.resolve())), parts.index('/host/bin'))
+            ci.require_tools(('uv', 'node'), env)
+
+    def test_local_environment_accepts_exact_path_tools_without_mise_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tool_dir = Path(directory) / 'path-tools'
+            tool_dir.mkdir()
+            for name in ('uv', 'node'):
+                executable = tool_dir / name
+                version = ci.PINS[name]
+                executable.write_text(
+                    f'#!/bin/sh\nprintf "%s\\n" "{("uv " if name == "uv" else "v") + version}"\n',
+                    encoding='utf-8',
+                )
+                executable.chmod(0o755)
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': '', 'HOME': directory, 'MISE_DATA_DIR': str(Path(directory) / 'missing-mise'), 'PATH': str(tool_dir)}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'), \
+                    patch.object(ci, 'resolve_pinned_mise_tool', side_effect=AssertionError('mise should not be consulted')):
+                env = ci.resolve_local_toolchain(ci.environment(Path(directory) / 'isolated-home'))
+            self.assertEqual(ci.windows_command('uv', env), os.path.abspath(tool_dir / 'uv'))
+            self.assertEqual(ci.windows_command('node', env), os.path.abspath(tool_dir / 'node'))
+            ci.require_tools(('uv', 'node'), env)
+
+    def test_local_environment_fails_with_install_hint_when_pinned_mise_tool_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': '', 'HOME': directory, 'MISE_DATA_DIR': str(Path(directory) / 'mise'), 'PATH': '/host/bin'}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'):
+                with self.assertRaisesRegex(RuntimeError, r'Missing pinned uv ' + re.escape(ci.PINS['uv']) + r'.*mise install uv@' + re.escape(ci.PINS['uv'])):
+                    ci.resolve_local_toolchain(ci.environment(Path(directory) / 'isolated-home'))
+
+    def test_github_environment_keeps_host_toolchain_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'GITHUB_ACTIONS': 'true', 'HOME': directory, 'MISE_DATA_DIR': str(Path(directory) / 'mise'), 'PATH': '/host/bin'}, clear=False), \
+                    patch.object(ci, 'STATE', Path(directory) / '.ci'):
+                env = ci.resolve_local_toolchain(ci.environment(Path(directory) / 'isolated-home'))
+            self.assertNotIn('GITHUB_ACTIONS', env)
+            self.assertNotIn('mise/installs/uv', env['PATH'])
+            self.assertNotIn('mise/installs/node', env['PATH'])
+            self.assertIn('/host/bin', env['PATH'])
 
     def test_windows_npm_cmd_is_resolved_for_version_check_and_execution(self):
         with patch.object(ci.os, 'name', 'nt'), \
@@ -402,6 +507,62 @@ try {
             self.assertEqual(which.call_args_list[0].args, ('rg',))
             self.assertEqual(which.call_args_list[1].args, ('rg.exe',))
             self.assertEqual(check.call_args.args[0][0], 'D:\\checkout\\.ci\\toolchain\\bin\\rg.exe')
+
+    def test_setup_re_resolves_pinned_npm_after_provisioning(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            mise = root / 'mise'
+            uv_bin = mise / 'installs' / 'uv' / ci.PINS['uv'] / 'uv-native'
+            node_bin = mise / 'installs' / 'node' / ci.PINS['node'] / 'bin'
+            host_bin = root / 'host-bin'
+            toolchain = root / 'toolchain'
+            uv_bin.mkdir(parents=True)
+            node_bin.mkdir(parents=True)
+            host_bin.mkdir()
+
+            def write_executable(path, output):
+                path.write_text(f'#!/bin/sh\nprintf "%s\\n" "{output}"\n', encoding='utf-8')
+                path.chmod(0o755)
+
+            write_executable(node_bin / 'node', 'v' + ci.PINS['node'])
+            write_executable(node_bin / 'npm', '11.19.1')
+            write_executable(uv_bin / 'uv', 'uv ' + ci.PINS['uv'])
+            write_executable(host_bin / 'uv', 'uv 0.12.23')
+            rg = toolchain / 'bin' / 'rg'
+            rg.parent.mkdir(parents=True)
+            write_executable(rg, 'ripgrep ' + ci.PINS['rg'])
+
+            stack.enter_context(patch.object(ci, 'STATE', root / '.ci'))
+            stack.enter_context(patch.object(ci, 'TOOLCHAIN', toolchain))
+            stack.enter_context(patch.dict(os.environ, {
+                'GITHUB_ACTIONS': '', 'HOME': str(root), 'MISE_DATA_DIR': str(mise),
+                'PATH': os.pathsep.join((str(node_bin), str(host_bin))),
+            }, clear=False))
+            env = ci.resolve_local_toolchain(ci.environment(root / 'isolated-home'))
+            self.assertNotIn('HERMES_CI_PINNED_NPM', env)
+            commands = []
+
+            def install(argv, **kwargs):
+                commands.append(argv)
+                if argv[:2] == ['npm', 'install']:
+                    npm_package = toolchain / 'node_modules' / 'npm' / 'package.json'
+                    npm_package.parent.mkdir(parents=True, exist_ok=True)
+                    npm_package.write_text('{"version": "%s"}' % ci.PINS['npm'], encoding='utf-8')
+                    npm_bin = toolchain / 'node_modules' / '.bin' / 'npm'
+                    npm_bin.parent.mkdir(parents=True, exist_ok=True)
+                    write_executable(npm_bin, ci.PINS['npm'])
+
+            stack.enter_context(patch.object(ci, 'run', side_effect=install))
+            stack.enter_context(patch.object(ci, 'provision_rg'))
+            ci.setup(env)
+
+            npm = toolchain / 'node_modules' / '.bin' / 'npm'
+            self.assertEqual(ci.windows_command('npm', env), str(npm.resolve()))
+            found = shutil.which('npm', path=env['PATH'])
+            self.assertIsNotNone(found)
+            self.assertEqual(Path(found or '').resolve(), npm.resolve())
+            ci.require_tools(('npm',), env)
+            self.assertEqual(commands[0][:2], ['npm', 'install'])
 
     def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -495,7 +656,7 @@ try {
                 'from pathlib import Path\n'
                 'def test_fail_once():\n'
                 f'    attempts = Path({str(attempts)!r})\n'
-                '    count = int(attempts.read_text(encoding="utf-8")) + 1 if attempts.exists() else 1\n'
+                '    count = int(attempts.read_text(encoding="utf-8-sig")) + 1 if attempts.exists() else 1\n'
                 '    attempts.write_text(str(count), encoding="utf-8")\n'
                 '    assert count > 1, "first attempt fails"\n', encoding='utf-8')
             stack.enter_context(patch.object(ci, 'STATE', root / 'state'))
@@ -509,7 +670,7 @@ try {
             stack.enter_context(patch.object(ci, 'python_tests', side_effect=
                 lambda env, roots, workers: python_tests(env, [str(test_file)], workers)))
             self.assertEqual(ci.main(), 1)
-            self.assertEqual(attempts.read_text(encoding='utf-8'), '1')
+            self.assertEqual(attempts.read_text(encoding='utf-8-sig'), '1')
 
             attempts.unlink()
             interactive_env = ci.environment(root / 'interactive')
@@ -521,7 +682,7 @@ try {
                                     cwd=ci.ROOT, env=interactive_env,
                                     capture_output=True, text=True, encoding='utf-8', errors='replace')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(attempts.read_text(encoding='utf-8'), '2')
+            self.assertEqual(attempts.read_text(encoding='utf-8-sig'), '2')
 
     def test_checkout_lock_releases_when_owner_is_killed(self):
         with tempfile.TemporaryDirectory() as directory:

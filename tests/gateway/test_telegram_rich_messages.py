@@ -971,7 +971,7 @@ async def test_rich_mode_from_yaml_agrees_with_prompt_and_delivery(
     tmp_path, monkeypatch, mode, ordinary_rich, table_rich,
 ):
     """Real YAML resolution must agree across gateway, prompt, and final send."""
-    import yaml
+    import hermes_yaml as yaml
     from gateway.config import load_gateway_config, Platform
     from hermes_cli import config as config_module
     from agent.system_prompt import _telegram_rich_messages_enabled

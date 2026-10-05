@@ -14,6 +14,9 @@ MAX_ENVELOPE = 16 * 1024
 MAX_PAYLOAD = 1024 * 1024
 
 
+from gateway.deadline import begin_immediate
+
+
 class OwnedAdmissionMixin:
     def _transaction(self):
         return closing(self.connect())
@@ -23,7 +26,7 @@ class OwnedAdmissionMixin:
         if outstanding_work < 0:
             raise ValueError("negative outstanding work")
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             if db.execute("SELECT 1 FROM generations WHERE id=?", (owner,)).fetchone() is None:
                 raise RuntimeError("unknown session owner")
             changed = db.execute(
@@ -36,7 +39,7 @@ class OwnedAdmissionMixin:
     def freeze_session(self, home: str, transport: str, key: str, owner: str, epoch: int) -> bool:
         """Freeze an existing live claim (or create it) before transferring the lease."""
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             lease = db.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             if lease is None or tuple(lease) != (owner, epoch, "active"):
                 raise RuntimeError("cannot freeze a session after the lease moves")
@@ -56,7 +59,7 @@ class OwnedAdmissionMixin:
         if count < 0:
             raise ValueError("negative outstanding work")
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             return bool(db.execute(
                 "UPDATE sessions SET outstanding_work=? WHERE profile_home=? AND transport=? "
                 "AND session_key=? AND generation_id=? AND epoch=?",
@@ -100,7 +103,7 @@ class OwnedAdmissionMixin:
         # Probe only the owner observed under the write fence. A pre-lock probe
         # cannot authorize release and would duplicate the PID/start-time lookup.
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             duplicate = db.execute(
                 "SELECT * FROM inbox WHERE profile_home=? AND transport=? AND source_event_id=? AND kind=?",
                 (home, transport, event_id, kind),
@@ -142,7 +145,10 @@ class OwnedAdmissionMixin:
                 if generation is not None and (generation["state"] in ("exited", "failed") or
                                                self._owner_is_dead(generation)):
                     if generation["state"] != "exited":
-                        db.execute("UPDATE generations SET state='failed' WHERE id=?", (owner,))
+                        self._retire_in_transaction(
+                            db, owner, evidence="admission_owner_dead",
+                            expected_pid=generation["pid"],
+                            expected_start_fingerprint=generation["start_fingerprint"])
                     self._release_abandoned(db, owner)
                     owner, epoch = active_owner, active_epoch
                     session = db.execute("SELECT * FROM sessions WHERE profile_home=? AND transport=? AND session_key=?",
@@ -173,7 +179,7 @@ class OwnedAdmissionMixin:
                 owner, epoch = active_owner, active_epoch
             elif owner != active_owner:
                 generation = db.execute("SELECT state FROM generations WHERE id=?", (owner,)).fetchone()
-                if generation is None or generation["state"] not in ("draining", "quiescing", "serving", "ready"):
+                if generation is None or generation["state"] not in ("draining", "serving"):
                     raise RuntimeError("session owner is unavailable; event remains unacknowledged")
             local_placeholder = callable(payload) and owner == active_owner and pending is None
             if callable(payload):
@@ -202,7 +208,7 @@ class OwnedAdmissionMixin:
         bounds write-lock work without putting database I/O on the event loop.
         """
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             tables = {row[0] for row in db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('telegram_updates','polling_cursors')")}
             if tables != {"telegram_updates", "polling_cursors"}:
@@ -237,7 +243,7 @@ class OwnedAdmissionMixin:
         if state not in ("accepted", "refused"):
             raise ValueError("terminal disposition must be accepted or refused")
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             row = db.execute("SELECT * FROM inbox WHERE id=?", (row_id,)).fetchone()
             if row is None or row["state"] != "pending" or row["owner_id"] != owner or row["owner_epoch"] != epoch:
                 return False
@@ -260,31 +266,33 @@ class OwnedAdmissionMixin:
     def interrupt_row(self, row_id: int, owner: str, epoch: int) -> bool:
         """Fence a cut or failed dispatch; duplicate updates must never replay it."""
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             return bool(db.execute("UPDATE inbox SET state='interrupted' WHERE id=? AND owner_id=? "
                                    "AND owner_epoch=? AND state='pending'", (row_id, owner, epoch)).rowcount)
 
     @staticmethod
     def _owner_is_dead(record) -> bool:
         from gateway.status import _get_process_start_time, _pid_exists
-        from gateway.generation import _boot_id
+        from gateway.generation import _boot_id, generation_start_fingerprint_matches
         pid = int(record["pid"])
         alive = _pid_exists(pid)
         start = _get_process_start_time(pid) if alive else None
         return (record["boot_id"] != _boot_id() or not alive or
-                (start is not None and record["start_fingerprint"] != f"{pid}:{start}"))
+                generation_start_fingerprint_matches(record, start) is False)
 
     def hold_dead_owner(self, owner: str) -> int:
         """Interrupt pending rows only with PID/start-fingerprint death proof."""
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             record = db.execute("SELECT pid,boot_id,start_fingerprint FROM generations WHERE id=?",
                                 (owner,)).fetchone()
             if record is None:
                 raise RuntimeError("unknown owner; cannot prove death")
             if not self._owner_is_dead(record):
                 return 0
-            db.execute("UPDATE generations SET state='failed' WHERE id=?", (owner,))
+            self._retire_in_transaction(
+                db, owner, evidence="admission_owner_dead", expected_pid=record["pid"],
+                expected_start_fingerprint=record["start_fingerprint"])
             return self._release_abandoned(db, owner)
 
     @staticmethod
@@ -309,7 +317,7 @@ class OwnedAdmissionMixin:
 
     def release_exited_owner(self, owner: str) -> int:
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             record = db.execute("SELECT state FROM generations WHERE id=?", (owner,)).fetchone()
             if record is None or record["state"] != "exited":
                 raise RuntimeError("owner has not exited")
@@ -318,7 +326,7 @@ class OwnedAdmissionMixin:
     def transfer_session(self, home: str, transport: str, key: str, old: str,
                          old_epoch: int, new: str, new_epoch: int) -> bool:
         with self._transaction() as db, db:
-            db.execute("BEGIN IMMEDIATE")
+            begin_immediate(db)
             lease = db.execute("SELECT generation_id,epoch,state FROM leases WHERE resource='active_generation'").fetchone()
             if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (new, new_epoch, "active"):
                 return False

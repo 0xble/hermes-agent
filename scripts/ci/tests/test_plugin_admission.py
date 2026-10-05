@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import yaml
+import hermes_yaml as yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check_plugin_admission.py"
 spec = importlib.util.spec_from_file_location("plugin_admission", SCRIPT)
@@ -52,7 +52,7 @@ class PluginAdmissionTests(unittest.TestCase):
             "import json, pathlib, subprocess, sys\n"
             "plugin = pathlib.Path(sys.argv[-1])\n"
             "record = {'args': sys.argv[2:], 'path': str(plugin), "
-            "'version': (plugin / 'version.txt').read_text(encoding='utf-8'), "
+            "'version': (plugin / 'version.txt').read_text(encoding='utf-8-sig'), "
             "'sha': subprocess.check_output(['git', '-C', str(plugin), 'rev-parse', 'HEAD'], text=True, encoding='utf-8', errors='replace').strip()}\n"
             "pathlib.Path(sys.argv[1]).write_text(json.dumps(record), encoding='utf-8')\n",
             encoding="utf-8",
@@ -92,7 +92,7 @@ class PluginAdmissionTests(unittest.TestCase):
         actual, files = admission.changed_entries(self.catalog, base, head)
         self.assertEqual((actual, files), (head, ["plugin-catalog/added.yaml"]))
         self.assertEqual(admission.check(self.catalog, base, head, validator=self.command), 0)
-        record = json.loads(self.record.read_text(encoding="utf-8"))
+        record = json.loads(self.record.read_text(encoding="utf-8-sig"))
         self.assertEqual(record["sha"], self.pin)
         self.assertEqual(record["version"], "pinned")
         self.assertEqual(record["args"][:-1], ["plugins", "validate", "--install-deps"])
@@ -108,7 +108,7 @@ class PluginAdmissionTests(unittest.TestCase):
         (nested / "version.txt").write_text("nested plugin", encoding="utf-8")
         nested_pin = self.commit(self.source)
         self.admit(self.entry(sha=nested_pin, subdir="plugins/with space"))
-        self.assertEqual(json.loads(self.record.read_text(encoding="utf-8"))["version"], "nested plugin")
+        self.assertEqual(json.loads(self.record.read_text(encoding="utf-8-sig"))["version"], "nested plugin")
         self.assertEqual(list(self.clones.iterdir()), [])
         for overrides, error in [
             ({"sha": "main"}, "40 lowercase"),

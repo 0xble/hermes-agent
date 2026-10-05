@@ -6,6 +6,16 @@ fork baseline and publication.
 
 Fork patch identity: `profile-plugin-source-migration` (the local ownership transfer).
 
+Fork patch identity: `canonical-skill-observation-intake` (legacy bundled guard).
+The retained `canonical-skill-guard` validates observation leaf names, opens the
+inbox and files without following symlinks, and binds writes to directory handles.
+An unsafe name, unavailable safe filesystem operation, or unsafe destination still
+blocks the skill update and reports that the observation was not recorded.
+Valid names remain recordable when external ownership discovery fails. Verify
+`tests/plugins/test_canonical_skill_guard.py`. This intake remains a plugin
+candidate for removal when the canonical profile source-guard replaces it across
+every supported consumer. Reverting restores the older unsafe observation writer.
+
 ## Current ownership
 
 The six authored profile plugins are maintained in the separate `agents`

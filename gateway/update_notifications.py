@@ -2,15 +2,57 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+_MARKER_LOCK = threading.RLock()
+
+
+@contextmanager
+def locked_update_marker(home: Path):
+    """Serialize admissions and marker writes across threads/processes; lock a stable sibling inode."""
+    with _MARKER_LOCK:
+        with (home / ".update_pending.lock").open("a+b") as handle:
+            if os.name == "nt":  # pragma: no cover - Windows CI
+                import msvcrt
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":  # pragma: no cover - Windows CI
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def same_update(path: Path, pending: dict) -> bool:
+    """A watcher may finish after a new admission replaced the marker."""
+    try:
+        current = json.loads(path.read_text(encoding="utf-8-sig"))
+        if pending.get("request_id") or current.get("request_id"):
+            return bool(pending.get("request_id") and current.get("request_id") == pending["request_id"])
+        current.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
+        return current.get("timestamp") == pending.get("timestamp") and current.get("reason") == pending.get("reason")
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def read_pending(home: Path) -> tuple[Path, dict] | None:
     for name in (".update_pending.claimed.json", ".update_pending.json"):
         path = home / name
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(data, dict):
                 data.setdefault("timestamp", datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())
                 return path, data
@@ -26,9 +68,15 @@ def notice(heading: str, pending: dict, detail: str) -> str:
 
 
 def save_pending(path: Path, pending: dict) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(pending), encoding="utf-8")
-    temporary.replace(path)
+    with locked_update_marker(path.parent):
+        if not same_update(path, pending):
+            return
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            temporary.write_text(json.dumps(pending), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _timestamp(value: str) -> float:
@@ -75,7 +123,7 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
         exit_path = process_exit if pending.get("notification_version") == 2 else home / ".update_exit_code"
         if not exit_path.exists():
             return None
-        exit_code = int(exit_path.read_text(encoding="utf-8").strip())
+        exit_code = int(exit_path.read_text(encoding="utf-8-sig").strip())
         if exit_code:
             return False, f"The updater exited with code {exit_code}. Runtime state is unverified; see the update output."
         receipt_path = home / "logs" / "update_receipts" / "latest.json"
@@ -83,7 +131,7 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
             # Legacy gateway markers predate runtime receipts. Preserve their terminal
             # notification contract while v2 markers remain fail-closed.
             return True, "Hermes update finished successfully."
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
         started = _timestamp(receipt["started_at"])
         finished = _timestamp(receipt["finished_at"])
         requested = _timestamp(pending["timestamp"]) if pending.get("timestamp") else exit_path.stat().st_mtime

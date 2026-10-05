@@ -34,7 +34,6 @@ LABEL = "ai.hermes.gateway"
 _REAL_WAIT_FOR_SUPERVISION = gateway_cli.wait_for_launchd_gateway_supervision
 _REAL_LAUNCHCTL_SUPERVISED_PID = gateway_cli._launchctl_supervised_pid
 
-
 class _FakeClock:
     """Monotonic clock that only advances when the code under test sleeps.
 
@@ -54,7 +53,6 @@ class _FakeClock:
         self.slept.append(seconds)
         self.now += seconds
 
-
 @pytest.fixture
 def clock(monkeypatch):
     fake = _FakeClock()
@@ -62,14 +60,12 @@ def clock(monkeypatch):
     monkeypatch.setattr(gateway_cli.time, "sleep", fake.sleep)
     return fake
 
-
 @pytest.fixture(autouse=True)
 def _no_detached_fallback(monkeypatch):
     """Default every test to "launchd can manage this domain"."""
     monkeypatch.setattr(
         gateway_cli, "_launchd_unsupported_marker_exists", lambda: False
     )
-
 
 def _supervision_returning(*results):
     """Fake ``_launchctl_supervised_pid`` yielding ``results`` in order.
@@ -87,7 +83,6 @@ def _supervision_returning(*results):
 
     probe.calls = calls
     return probe
-
 
 class TestWaitForLaunchdGatewaySupervision:
     def test_returns_true_when_already_supervised(self, monkeypatch, clock):
@@ -192,7 +187,6 @@ class TestWaitForLaunchdGatewaySupervision:
         ) is False
         assert sum(clock.slept) == pytest.approx(60.0 + 20.0, abs=0.6)
 
-
 def _patch_launchd_env(
     monkeypatch,
     *,
@@ -223,7 +217,7 @@ def _patch_launchd_env(
     )
     # Hermetic supervision and ancestry: the host's real LaunchAgent pid is an ancestor of pytest
     # when the suite runs under the gateway, which takes the in-gateway self-restart branch.
-    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label: 4242)
+    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label, **kwargs: 4242)
     monkeypatch.setattr(
         gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: ancestor
     )
@@ -247,14 +241,12 @@ def _patch_launchd_env(
     )
     return calls
 
-
 def _run_fleet_restart():
     """Run the real update-path helper and return its two accounting lists."""
     restarted: list = []
     failed_or_stale: list = []
     update_cmd._restart_macos_launchd_gateways(restarted, failed_or_stale, 5.0)
     return restarted, failed_or_stale
-
 
 class TestInvokingProfileIsVerifiedLikeItsSiblings:
     """The sibling loop already polls for a fresh supervised pid before
@@ -414,5 +406,3 @@ class TestInvokingProfileIsVerifiedLikeItsSiblings:
         assert _run_fleet_restart() == ([LABEL], [])
         assert calls["restart"] == 1
         assert calls["verify"] == 1
-
-

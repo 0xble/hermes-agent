@@ -315,7 +315,7 @@ def _protected_tabs_on_disk() -> set[str] | None:
         path = _protected_tabs_path()
         if not path.exists():
             return set()
-        return {record.read_text(encoding="utf-8") for record in path.iterdir()
+        return {record.read_text(encoding="utf-8-sig") for record in path.iterdir()
                 if not record.name.startswith(".")}
     except (OSError, ValueError):
         return None

@@ -544,6 +544,28 @@ def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
             holders.append((-1, f"open-file scan failed: {exc}"))
         return holders
 
+    if sys.platform == "darwin":
+        # Match kernel identities without stat-ing unrelated descriptor paths,
+        # including hardlink aliases and a retired SQLite generation.
+        try:
+            from hermes_state_dbfile import _iter_darwin_fd_targets
+
+            for pid, _fd, target, identity in _iter_darwin_fd_targets():
+                if pid == os.getpid():
+                    continue
+                if identity in watched_ids or (
+                    canonical_sqlite_path(target) in watched
+                    and db_dev is not None and identity[0] == db_dev
+                ):
+                    holders.append((pid, target))
+        except Exception as exc:
+            logger.warning(
+                "Could not prove state.db has no foreign holders; "
+                "deferring structural maintenance: %s", exc,
+            )
+            holders.append((-1, f"open-file scan failed: {exc}"))
+        return holders
+
     if psutil is None:
         return [(-1, "open-file scan unavailable")]
     try:

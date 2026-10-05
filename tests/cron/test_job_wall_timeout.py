@@ -72,7 +72,7 @@ def test_operator_deadline_round_trip_preserves_other_jobs_and_model_dispatch(pr
     assert hard_wall_timeout_seconds(jobs.get_job(sibling["id"])) == 30
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_detached_script_uses_job_deadline_and_kills_owned_child(profile, tmp_path):
     """Real payload adoption, script subprocess, watchdog, SQLite failure and teardown."""
     child_pid = tmp_path / "child.pid"

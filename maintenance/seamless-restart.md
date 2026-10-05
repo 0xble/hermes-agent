@@ -2,6 +2,36 @@
 
 Patch identity: `seamless-restart`.
 
+## Shutdown Notice Routing
+
+Use upstream's `_delivery_target_key` for active chats, served home channels,
+restart requesters, and already delivered update notices. Derive its profile
+from the resolved adapter's native `_owning_profile`, including shared-bot
+satellites. Positive Telegram IDs remain separate conversations for separate
+bots. Shared groups receive one notice, and private-topic parent suppression
+remains bound to the actual adapter. Native routing invariants live in
+`tests/gateway/test_multiplex_notice_egress_profile_adapter.py`.
+
+## Resume Marker Freshness
+
+Startup resume admission and pending follow-up recovery use upstream's
+`_is_fresh_gateway_interruption` helper. Its epoch comparison handles local
+markers across DST and timezone-aware markers without changing the configured
+freshness window. Keep the existing DST invariants in
+`tests/gateway/test_restart_resume_pending.py` and queued-replay coverage in
+`tests/gateway/test_resume_queued_followup.py`.
+
+## Local Admission Replay
+
+An already admitted event may revisit the native adapter during startup, restore,
+or deferred execution. Its local admission is reusable only for the same event
+object, runner, owning home/profile, transport identity, and routed session. A new
+transport event remains a durable duplicate. Startup and restore gates retain
+the local owned-admission marker until actual dispatch. Verify the native adapter
+and runner path with `tests/gateway/test_durable_outbox.py` and
+`tests/gateway/test_owned_routing.py`, including profile A to B to A.
+
+
 > **Status (2026-09-28):** S1–S3, H1, S4.1 durable outbox and G1 guardian shipped on fork `main`; the live gateway still restarts drain-first. The S4.2 router/executor split stopped after two failed spikes and was not built. [Overlap Handover](#overlap-handover) is a replacement **design**, not implemented or enabled. Later changes follow repository policy, verification, review and separate runtime-activation authority.
 
 **Goal:** Promote a new Hermes gateway release without interrupting active cron executions or in-flight conversations, while making failure and rollback observable.
@@ -19,6 +49,20 @@ This was written as a **fork plan** before implementation; [Shipped Status](#shi
 The profile-local `cron/executions.py` ledger records attempt owner PID/start fingerprint and immutable terminal states; it is **not a retry queue**. The current cron inactivity watchdog is idle-based, not a hard wall-clock cap. Scheduler tick locking, `pending_slot`/`scheduled_instant` deduplication, profile scope, and delivery ownership remain authoritative ([cron contract](../cron/AGENTS.md)). Current restart/delegation policy can wait or offer explicit parent-driven recovery, but does not provide uninterrupted overlapping execution ([delegation restart](delegation-restart.md)). The gateway's control socket presently supports identity/status/pause-for-update; it is a candidate coordination seam, not yet a handoff protocol. Upstream's open [structured safe restart PR #71876](https://github.com/NousResearch/hermes-agent/pull/71876) addresses agent-request coordination, not evidence that release pinning or two-generation handoff already exists. Recheck upstream and fork source before each implementation slice.
 
 **Global invariants:** Never automatically retry an interrupted execution, chat turn, or delegation. Preserve one admitted owner per event/occurrence and one active Telegram poller per token; require a receipt from the owning process before acknowledging forwarded input. Preserve both gateway busy-message guards, identity/authorization and per-profile secret scope, prompt-cache stability, turn alternation, and existing durable delivery semantics. Shared databases and `~/.hermes/plugins` must remain readable and writable by both `current` and `previous` during overlap or rollback; use additive/backward-compatible migrations and dual-version contract tests, never a destructive migration during promotion. Do not infer a live runtime revision from source `HEAD`.
+
+## Deadline contract
+
+Every bounded startup, handover, takeover, rollback, guardian-repair, wedge-proof, poll-proof, and bootout operation follows these rules:
+
+1. Give every blocking subprocess, socket, psutil wait, and SQLite busy wait no more than the remaining budget.
+2. Reject success observed at or after expiry.
+3. Re-check the deadline inside each irreversible transaction after its write lock is acquired; roll back when expired.
+4. After lease/pointer commit, lateness is a typed committed outcome or commit-clocked poll, never a plain failure or rollback of a healthy successor.
+5. Exception-path recovery uses the remaining budget or a named short reserve, never a fresh full interval. The one named exception is `recover_forward(late=True)` after the original rollback bound has expired: it records the missed original bound (`late_rollback.bound_missed=true`) and receives a fresh `ROLLBACK_SECONDS` operating budget, with an alert.
+6. The old owner's cooperative wire stop during `transfer_requested` is bounded by the poller's own long-poll limit (`timeout+1`), not the driver's window. The driver's window is protected by its socket timeout, and the owner self-rearms under the same lease and nonce.
+7. Re-observing an already-committed holder after its durable proof window is gone (expired, other boot, or never recorded) uses the named `POLL_SECONDS` observation reserve, min-ed with any enclosing scope, and is marked `proof_window=reobservation`; it never counts as proof inside the original bound.
+
+**Scope.** The contract covers the forward-only overlap paths (`gateway_forward_update`, `run_generation`, `generation`, guardian, controlled poller). Inside them, `activate_release` runs only within a `_flip_scope` and after an explicit expiry check; it is a local fsync'd pointer transaction with no wait in that path. The legacy non-overlap update and `repair-service` callers of `activate_release` (`update_cmd.py`, `immutable_releases.promote`/`rollback`) predate this design, are unchanged here and are not covered; bounding them is a follow-up, not a precondition of the forward-only flag.
 
 ## S1 — macOS cron run survives gateway restart
 
@@ -70,16 +114,34 @@ The lease moves in exactly two ways:
 
    If a respawn is still live under the retired label when bootout is due, it holds no lease and no token, so booting it out is safe.
 
-The one allowed resume is before commit. A serving generation that paused for a handover that never committed resumes. It never set `draining` and never lost the lease. The pre-commit pause fences three things: the `getUpdates` poller, new cron and kanban dispatch, and internal autonomous wakeups. The abort re-enables all three in one step, then reads each back as armed before it counts as resumed. User-facing admission of already-polled updates was never fenced. This is the existing 45-second pre-commit abort. Its native test checks that a fresh message, a fresh cron tick, a kanban claim and a goal wakeup each run after the abort.
+The one allowed resume is before commit. A serving generation that paused for a handover that never committed resumes. It never set `draining` and never lost the lease. The pre-commit pause fences three things: the `getUpdates` poller, new cron and kanban dispatch, and internal autonomous wakeups. The abort re-enables all three in one step, then reads each back as armed before it counts as resumed. User-facing admission of already-polled updates was never fenced. This is the existing 45-second pre-commit abort. The caller reserves up to 2 seconds (one fifth for shorter budgets) inside its unchanged deadline for the abort notification; stopping the wire cannot spend that reserve. Rollback still caps cooperative handover at 10 seconds inside the original 60-second bound. A normal outstanding Telegram long poll can outlive that cap. If the caller aborts while stop is outstanding, the still-serving owner self-rearms as soon as stop completes, after a fresh read proves its process identity, active lease epoch and exact aborted nonce. A stale nonce, replacement or committed/draining owner cannot re-arm. Its native test checks that a fresh message, a fresh cron tick, a kanban claim and a goal wakeup each run after the abort.
 
 **Rollback is a handover.** Rolling back means starting a fresh standby on the previous release, which then takes the lease by cooperative handover (unhealthy but responsive successor) or takeover (dead successor). The draining generation, if any, keeps draining and exits on its own schedule. Three generations can therefore coexist briefly: the original draining A, the failed B (draining or dead), and the fresh A′ on A's release. `previous → current` changes only after A′ acknowledges from its release. Never re-arm the draining A.
 
-**Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<uuid>`, carrying the full 32-hex generation UUID. The generation row, with that label unique in the coordinator (`label ... UNIQUE` in the schema below), is inserted before any launchd action, so a colliding reservation fails the insert and never reaches launchd. The process writes its PID and start fingerprint into that row at its first coordinator check, before it can claim anything, so bootstrap, bootout and respawn fencing always address exactly one generation. The label pins its release path and is booted out only after the coordinator records `exited` for that generation, whether by clean drain or by the retire step of takeover. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
+**Labels.** The alternating `-a` and `-b` labels cannot hold three generations. Each generation gets its own label, `ai.hermes.gateway.g-<uuid>`, carrying the full 32-hex generation UUID. The generation row, with that label unique among non-exited rows in the coordinator (the partial unique index in the schema below), is inserted before any launchd action, so a colliding live reservation fails the insert and never reaches launchd. Exited rows stay as history and never block their label. The process writes its PID and start fingerprint into that row at its first coordinator check, before it can claim anything, so bootstrap, bootout and respawn fencing always address exactly one generation. The label pins its release path and is booted out only after the coordinator records `exited` for that generation, whether by clean drain or by the retire step of takeover. The legacy `ai.hermes.gateway` label remains the first A during migration and keeps its name until it exits.
 
-**Claim.** The row is inserted with `pid` and `start_fingerprint` null, `state='standby'` and no verdict. The first process launched under the label claims it with one compare-and-swap: `UPDATE generations SET pid=?, start_fingerprint=? WHERE id=? AND pid IS NULL AND state='standby' AND verdict IS NULL`. Exactly one process can win. Every process that loses, because the row is already claimed, exited or has a verdict, exits 0 before touching any lease, token or transport.
+**Claim.** The row is inserted with `pid` and `start_fingerprint` null, `state='standby'` and no verdict. The first process launched under the label claims it with one compare-and-swap: `UPDATE generations SET pid=?, start_fingerprint=?, boot_id=?, scope_nonce=? WHERE id=? AND pid IS NULL AND state='standby' AND verdict IS NULL`. Exactly one process can win. Every process that loses exits 0 before touching any lease, token or transport, unless the claim-scope rules below let it replace a dead claimant from an earlier scope.
 - **Crash before claim:** nothing has been claimed, so a respawn that wins the claim is simply the generation's first process. It starts standby from the beginning and must still pass the startup gate.
 - **Crash after claim:** a respawn loses the claim and exits 0. The recorded PID and fingerprint belong only to the claimant, so the takeover death proof tests the right process.
 - **Never claimed:** if no process claims the row before the standby's 45-second startup deadline, the updater sets `verdict='failed'` with the evidence `unclaimed` and `state='exited'`, then boots the label out. An unclaimed generation holds no lease, so this is always safe.
+
+**Cold start (2026-09-30 addendum).** A cold start has no live generation to hand over from: after a reboot, after a crash that nothing replaced, or after `hermes gateway stop` then `start`. It needs no new state and no third lease move. It is a takeover from a holder that is proven dead or that exited cleanly.
+
+- **Claim scope.** A claim is valid for one supervisor bootstrap, not for the label's lifetime. The scope is the pair (boot ID, bootstrap nonce). Each time the launcher (updater, guardian or `hermes gateway start`) bootstraps the label, it generates a fresh random nonce and writes it into the plist environment as `HERMES_GENERATION_SCOPE`. launchd passes the same environment to every KeepAlive respawn of that bootstrap. After a reboot launchd reloads the same plist, so the nonce repeats but the boot ID differs, which makes it a new scope. The claim stores the scope durably: the claim compare-and-swap also sets `scope_nonce=?` and `boot_id=?` from the claiming process. A scope is single-use. Once any row for a label, live or exited, records a scope, that scope can never claim or reserve again for that label.
+- **Service label.** Only one label may create a generation row for itself: the label of the generation named by the `active_generation` lease row, whether the lease is held or released. When no lease row exists yet, it is the legacy `ai.hermes.gateway` label. Any other label, such as a completed drainer, a retired standby or a failed successor, never reserves a row for itself. Its only path to running is a row the updater reserved before bootstrapping it.
+- **Rules.** A starting process reads its own boot ID and `HERMES_GENERATION_SCOPE` and applies the first matching rule:
+  1. **Consumed scope.** Any row for this label, live or exited, has the same `boot_id` and `scope_nonce`. This is a KeepAlive respawn of a bootstrap that has already claimed. It exits 0, whether the claimant is alive, dead or retired. This rule closes the window in which takeover has retired a dead claimant but has not yet booted its label out.
+  2. **Unclaimed row** (`pid IS NULL`, not exited). Claim it with the compare-and-swap above, recording this scope. This covers an updater-reserved standby and the crash-before-claim case.
+  3. **Claimed row, different scope.** If the claimant is alive by PID plus start fingerprint, exit 0 without changing anything. If the claimant is dead and this is the service label, retire the row with `verdict='failed'` and evidence `boot_changed` or `dead`. In the same transaction, reserve and claim a fresh row with this scope. If the claimant is dead and this is not the service label, retire the row and exit 0.
+  4. **No non-exited row.** If this is the service label, reserve and claim a fresh row with this scope. This covers a first start, a reboot and a start after a clean stop. Otherwise, exit 0.
+
+  The partial unique index never sees two live rows for one label. A scoped forward-only `gateway run` bypasses the generic host-attach guard so a consumed KeepAlive respawn reaches this coordinator claim and exits 0. Otherwise a live successor's host record would cause exit 75 and an endless respawn loop. Unscoped and flag-off launches retain host attachment.
+
+  A process with no `HERMES_GENERATION_SCOPE` (a direct CLI launch, or a plist written before this addendum) uses a per-process random nonce, so it is always a new scope and can only replace a dead claimant. A row whose `scope_nonce` is null was claimed before scopes existed and is treated as a different scope. A fresh row from rule 3 or 4 starts in `standby` like any other generation. It must pass the startup gate, and it gains the lease only by the two lease moves, so replacing a dead claimant never by itself makes a poller.
+- **Lease.** The fresh generation passes its startup gate, then takes the lease by takeover. If the holder exited cleanly, the lease is already released and the takeover needs no retire step. If the holder is dead, the takeover retires it first. If the dead holder ran under the taker's own label, the bootout step is skipped, because that label's only process is the taker itself. Takeover is never allowed from a live generation, a suspect one, or a generation that neither exited nor is proven dead.
+- **Recovery inside one boot.** A crash leaves the label parked: launchd keeps the job loaded, but its respawn lost the claim and exited 0, so no process runs. Today's guardian cannot see this, because `_launch_state` reports any job that `launchctl print` finds as `loaded`, and `_run` returns `waiting` for a loaded, unhealthy job with no pending switch. The guardian therefore gains one repair, built in the runtime slice. It reads the job's `launchctl print` state and PID, and treats a loaded job with no running PID and a last exit status of 0 as parked. It repairs only the service label defined above. Another generation must not be serving. The one exception is a generation that is this label's own claimant and is proven dead by PID plus start fingerprint, or by a changed boot ID. A crashed holder is exactly this case: its row still says `serving` and its lease is still held, because nothing ran after the SIGKILL. In that case the guardian first retires the dead claimant under the coordinator's transaction lock, with `verdict='failed'`, evidence `dead` or `boot_changed`, and `state='exited'`. The lease row stays as it is, held by an exited and proven-dead generation, which is exactly what takeover requires. If any other generation is serving, or the holder is alive, or its identity cannot be established, the guardian does nothing and reports `waiting`. Any other parked label, such as a completed drainer, a retired standby or a failed successor, is never re-bootstrapped. Once its row is `exited` the guardian only boots it out as cleanup, and that cleanup does not count as a repair. For the service label, once the claimant is retired or has exited cleanly, the guardian boots the label out and reads it back as unloaded. Finally it bootstraps the label again with a fresh nonce, which opens a new scope. The new generation passes its startup gate and takes the lease by takeover. A loaded job with a running PID is never treated as parked. The repair counts against the existing three-repairs-per-hour cap. During an update, the updater starts A′ instead.
+
+**Flag and previous release.** Forward-only handover is enabled by its own key, `gateway.forward_only_handover.enabled`, default off. Releases from before this amendment, including `738c502c`, read only `gateway.overlap_handover.enabled`. That key stays false for as long as any pre-amendment release can run on the profile, including as `previous`. A forward-only release refuses to start with its key on while `gateway.overlap_handover.enabled` is true, and the updater refuses to activate or stage one in that configuration. With the legacy key false, pre-amendment releases take their flag-off path, which does not write the `generations` table, so they never run their in-place overlap code against a forward-only coordinator. The updater uses the overlap path only when both the serving release and the target release are forward-only-capable. Otherwise it uses the existing single-gateway path. So the first forward-only release is installed by one ordinary restart, and A′ is always a forward-only release.
 
 **Startup gate.** Before a standby may be named ready, it runs one loopback turn. This is the single, explicit exception to standby's no-admission rule. A synthetic message from a reserved loopback identity enters the same admission code on an isolated loopback transport, goes through both busy guards and the runner, and produces a reply row in the outbox with a loopback destination. It runs in a reserved loopback session that no user session, cron job or goal can route to. The turn runs with an empty toolset, so the model can only answer in text and cannot call tools, spawn delegations or processes, or write memory or shared state beyond the session and outbox rows. The loopback transport has no network egress. Its reply row is created already terminal with a `synthetic` disposition in the same transaction, so outbox recovery and retry never select it, and no adapter can send it after promotion. The turn uses the configured model with a fixed short prompt, which costs one small model call per update. A standby that fails the gate or exceeds its 45-second deadline never takes the poller. Its own process exits, or the updater stops it after proving it holds no lease. The coordinator then sets the durable `verdict='failed'` and `state='exited'`, and only after that is its label booted out. This check would have caught the 2026-09-30 failure class: a gateway that polls and accepts input but never reaches the runner.
 
@@ -89,7 +151,7 @@ The one allowed resume is before commit. A serving generation that paused for a 
 - **Updater dies after commit.** The new generation serves. The updater is observer-only on recovery, and the receipt is completed from the coordinator.
 - **New generation fails its startup gate.** It never polls. The old generation keeps serving and is never paused.
 - **New generation dies after takeover or handover.** The guardian or updater starts A′ on the previous release, which passes its startup gate and takes the lease from the dead generation through the ordered death proof, retire, bootout and takeover steps. A KeepAlive respawn of the dead label exits 0 at its coordinator check. The target is a fresh message answered within 60 seconds of death. Work in the dead generation is marked interrupted once and never replayed.
-- **New generation is live but unhealthy after commit.** A′ is started. If the unhealthy generation still responds, it hands over cooperatively and drains or hits its cap. If its event loop is provably wedged by the existing liveness probe (`probe_gateway_loop_liveness`), the updater or guardian terminates it with the existing bounded SIGTERM then SIGKILL path, and the dead-generation case above applies. A live generation that neither acknowledges handover nor proves wedged keeps the lease and its poller. The outcome is recorded as blocked with an alert, never a second poller and never a forced lease move. This case has its own native test.
+- **New generation is live but unhealthy after commit.** A′ is started. If the unhealthy generation still responds, it hands over cooperatively and drains or hits its cap. If its event loop is provably wedged by the existing liveness probe (`probe_gateway_loop_liveness`), the updater or guardian terminates it with the existing bounded SIGTERM then SIGKILL path, and the dead-generation case above applies. The rollback path reads the successor's own per-PID heartbeat copy, because the draining generation keeps rewriting the shared file. It requires a heartbeat older than 35 s plus the sustained silent tick-socket witness. A wedge that begins soon after commit can therefore be proved and replaced inside the 60 s bound. A later wedge cannot age into proof in time: the update records blocked, and guardian recovery replaces the proven-wedged generation after the bound, recording the miss and alerting. Other callers keep the 90 s default. A KeepAlive respawn of a dead generation label reaches its coordinator claim before any host-attach check, so a consumed scope exits 0 and parks. A live generation that neither acknowledges handover nor proves wedged keeps the lease and its poller. The outcome is recorded as blocked with an alert, never a second poller and never a forced lease move. This case has its own native test.
 - **Old draining generation is SIGKILLed.** Its in-process work is marked interrupted once after death proof. The serving generation is unaffected.
 - **Guardian dies.** The next scheduled run recomputes from the coordinator. No action depends on the guardian's in-memory state.
 
@@ -110,6 +172,7 @@ If A′ cannot start and pass its gate within 60 seconds on the live profile, st
 - the startup gate calling no tool and leaving its reply row terminal and unsent through a later promotion and outbox recovery;
 - a release dying after commit, with its KeepAlive respawn losing the claim compare-and-swap and exiting 0, and A′ answering a fresh message within 60 seconds;
 - a standby crashing before its claim (the respawn claims and must pass the gate) and a standby that never claims (retired as `unclaimed`);
+- cold start after a clean stop, after a crash inside one boot (guardian bootstraps a new scope) and after a reboot, each answering a fresh message, with the stale row retired and one poller;
 - a live release with a provably wedged event loop being terminated and replaced by A′, and a live release that neither hands over nor proves wedged being reported blocked with one poller;
 - a pre-commit abort re-arming the poller, cron, kanban and autonomous wakeups, each proved by fresh work;
 - SIGKILL of the old generation, the new generation and the updater.
@@ -124,11 +187,14 @@ Suggested minimal schema (additive and versioned; timestamps UTC):
 
 ```sql
 CREATE TABLE generations (
-  id TEXT PRIMARY KEY, release_sha TEXT NOT NULL, label TEXT NOT NULL UNIQUE,
+  id TEXT PRIMARY KEY, release_sha TEXT NOT NULL, label TEXT NOT NULL,
   pid INTEGER, start_fingerprint TEXT, started_at REAL NOT NULL, boot_id TEXT NOT NULL,
+  scope_nonce TEXT,
   state TEXT NOT NULL, heartbeat_at REAL NOT NULL, drain_deadline REAL,
   verdict TEXT, verdict_at REAL, verdict_evidence TEXT
 );
+-- One live reservation per label; exited rows stay as history.
+CREATE UNIQUE INDEX generations_live_label ON generations(label) WHERE state <> 'exited';
 CREATE TABLE leases (
   resource TEXT PRIMARY KEY, epoch INTEGER NOT NULL, generation_id TEXT NOT NULL,
   state TEXT NOT NULL, FOREIGN KEY(generation_id) REFERENCES generations(id)
@@ -194,7 +260,7 @@ Crash outcomes by boundary:
 
 The shared session/cron/outbox databases and shared `~/.hermes/plugins` must work concurrently in releases A and B. Every coordinator schema change is additive; both sides negotiate a fixed envelope version during staging, and incompatible major versions block promotion. Run `scripts/schema_rehearsal.py` against a consistent copy in both release interpreters, and a read/write/up/down compatibility rehearsal of enabled plugins and each shared DB. Never run a destructive migration during overlap or rollback. A stale reader writing an old whole-file snapshot must be identified and either made concurrency-safe or promotion blocked. A and B keep distinct in-memory caches; only idle session claims change owners and rebuild on B at the next turn, without retroactive prompt edits.
 
-Each slice is a separate PR, behind `gateway.overlap_handover.enabled: false` by default, with the old drain-first route unchanged when off:
+Each slice is a separate PR, behind `gateway.forward_only_handover.enabled: false` by default, with the old drain-first route unchanged when off. `gateway.overlap_handover.enabled` is the pre-amendment key and stays false (see Flag and previous release):
 
 1. **Generation isolation:** two disposable launchd labels, pinned paths, noncolliding PID/control/status/host records and accurate fleet/guardian/status readback. Proof: live A and standby B coexist without affecting the normal gateway or one another.
 2. **Lossless polling transfer:** raw-update journal, cursor/offset interposition, token lock and no-poller standby; real stub Bot API proves one poller and no lost or double-admitted update across every kill boundary. If PTB ordering cannot be controlled, stop here.
@@ -249,6 +315,10 @@ Every row merged with an independent `review_candidate` approval on its exact he
 | H1: update config errors | [#220](https://github.com/0xble/hermes-agent/pull/220) | `b633a3532c` |
 | H1: resumed turn reply attribution | [#214](https://github.com/0xble/hermes-agent/pull/214) | `96f6a8eb2f` |
 | Part 2 review follow-ups | [#228](https://github.com/0xble/hermes-agent/pull/228) | `f7d27da20d` |
+| Forward-only amendment | [#269](https://github.com/0xble/hermes-agent/pull/269) | `4f40197eba` |
+| Forward-only cold start | [#275](https://github.com/0xble/hermes-agent/pull/275) | `8841a62478` |
+| Forward-only promotion, rollback | [#276](https://github.com/0xble/hermes-agent/pull/276) | `942ffd6f28` |
+| Native forward-only acceptance | [#282](https://github.com/0xble/hermes-agent/pull/282) | `60d389afb3` |
 
 Drafts [#215](https://github.com/0xble/hermes-agent/pull/215) (S4.2 spike) and [#224](https://github.com/0xble/hermes-agent/pull/224) (S4.2 rerun spike) were closed unmerged.
 
@@ -278,6 +348,20 @@ S3 landed before S2 (its code-SHA ledger column works without releases). S2 is *
   - Receipt ordering and resumed-reply attribution were observed live.
   - The pointer and config validation were reproduced in a disposable `HERMES_HOME` with the release interpreter.
   - The error-surface, manual-cron, double-fork and commit/enqueue-gap items are covered by named regression tests: 30 passed at `96f6a8eb2f`. No live trigger occurred for them.
+
+**Forward-only bootstrap on this Mac (2026-10-05).**
+
+- **Starting point:** `current` and `previous` were both capable releases containing #282 (`d0251975` and `cada7e8f`), with no `gateway-coordinator.db`, `forward-update.json` or `release-txn.json`. `main` equalled `current`, so there was no update to install.
+- **Step 1, 05:02 PT:** `hermes config set gateway.forward_only_handover.enabled true`, read back with `gateway.overlap_handover.enabled` unset, then one native restart. The new process created the coordinator and took epoch 1, but it ran from the installed flag-off plist, so its generation recorded `release_sha='unknown'`. `promote_forward` refuses such a holder (`serving release identity is unproved`).
+- **Step 2, 05:13 PT:** `hermes gateway install` rewrote `ai.hermes.gateway.plist` as the forward-only service definition: pinned release root, `HERMES_RELEASE_SHA`, `HERMES_LAUNCHD_LABEL` and a fresh `HERMES_GENERATION_SCOPE`. Its deferred reload stopped epoch 1, and the next generation took over at 05:14:07. The coordinator records one `takeover` lease move from epoch 1 to 2, the holder serving `d0251975` under `ai.hermes.gateway`, and no startup-gate failure. Telegram polling was healthy at 05:14:31.
+- **Poller evidence:** six journal events, both epoch-1 intervals closed, only the live epoch-2 holder open, and no overlap. The cold takeover left a 9.6 s zero-poller gap, which is a restart gap, not a handover interval.
+- **Cost:** both steps were ordinary drain-first restarts, so each cut its in-flight turns, delegations and tool processes once, with restart notices suppressed. They are excluded from the post-promotion measurement.
+
+**Bootstrap rules learned.**
+
+- After turning the flag on, render the forward-only service definition before the first cold start: run `hermes gateway install` (or let an update activation render it). A native restart alone reuses the flag-off plist and produces an unpromotable `unknown` holder.
+- A live holder's lock and poller intervals are always open. Offline `check_poller_journal()` therefore reports `unclosed_intervals` while the gateway runs. A healthy live reading has no other violation, and every open interval belongs to the current lease holder and epoch.
+- `polling_cursors.confirmed_offset` advances only when a `getUpdates` response carries updates, to the highest `update_id` + 1. Internal injections (background-process notices, delegation completions, goal continuations and relays) never pass through Telegram, so a stationary cursor during internal traffic is expected. Cursor continuity across a handover is proved from `telegram_updates`: contiguous ids through the window, each admitted once, ending one below the confirmed offset.
 
 **Remaining risks.**
 

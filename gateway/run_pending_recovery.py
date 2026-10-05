@@ -3,7 +3,6 @@
 import logging
 from pathlib import Path
 from functools import partial
-from datetime import datetime
 
 from hermes_constants import get_routing_process_hermes_home
 from gateway.session_recovery import SessionRecoveryMixin
@@ -60,10 +59,13 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         elif not (entry and entry is eligible.get(key) and entry.resume_pending
                   and entry.session_id == session_id and entry.origin):
             return False
-    from gateway.run import _auto_continue_freshness_window
+    from gateway.run import (
+        _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+        _resume_pending_marker_timestamp,
+    )
     if not drain_deferred:
-        marker = entry.last_resume_marked_at or entry.updated_at
-        if marker is not None and (datetime.now() - marker).total_seconds() > _auto_continue_freshness_window():
+        marker = _resume_pending_marker_timestamp(entry)
+        if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
             return False
     if runner._is_session_running(key):
         return None if drain_deferred else False

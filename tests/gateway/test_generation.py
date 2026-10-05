@@ -42,7 +42,7 @@ def test_concurrent_generation_record_writers_do_not_share_temporary_path(tmp_pa
         second = pool.submit(write_many)
         first.result()
         second.result()
-    assert json.loads(record.read_text())["id"] == identity.id
+    assert json.loads(record.read_text(encoding="utf-8"))["id"] == identity.id
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -73,9 +73,9 @@ def test_generation_socket_root_cleanup_removes_owned_stale_siblings(tmp_path):
     stale = path.parent.parent / f"{path.parent.name}-stale"
     stale.mkdir(mode=0o700)
     stale_socket = stale / "old.sock"
-    stale_socket.write_text("stale")
+    stale_socket.write_text("stale", encoding="utf-8")
     stale_socket.with_name(f".{stale_socket.name}.owner.json").write_text(
-        json.dumps({"pid": 999999999, "start_time": 1}))
+        json.dumps({"pid": 999999999, "start_time": 1}), encoding="utf-8")
     old = time.time() - 11 * 60
     os.utime(stale, (old, old))
     _ensure_generation_socket_parent(path)
@@ -103,11 +103,11 @@ def test_generation_socket_root_cleanup_preserves_live_siblings(tmp_path):
         server.close()
 
 
+@pytest.mark.platforms("macos")
 def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
     from gateway import generation
     import platform
 
-    monkeypatch.setattr(generation.sys, "platform", "darwin")
     monkeypatch.setattr(platform, "node", lambda: "first-host")
     result = MagicMock(stdout="boot-session\n")
     calls = []
@@ -125,7 +125,7 @@ def test_macos_boot_id_does_not_change_when_hostname_changes(monkeypatch):
         generation._boot_id.cache_clear()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_macos_boot_id_fallback_is_host_independent(monkeypatch):
     import platform
     import psutil
@@ -165,7 +165,7 @@ def test_two_hundred_heartbeats_do_not_leak_descriptors(tmp_path):
     assert psutil.Process().num_fds() <= before + 2
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_live_lease_is_not_stolen_after_hostname_change(tmp_path, monkeypatch):
     import platform
     from gateway import generation
@@ -186,7 +186,7 @@ def test_live_lease_is_not_stolen_after_hostname_change(tmp_path, monkeypatch):
         with pytest.raises(RuntimeError, match="held by another"):
             coordinator.acquire_lease("active_generation", contender.id)
         assert coordinator.leases()[0]["epoch"] == epoch
-        assert next(row for row in coordinator.generations() if row["id"] == holder.id)["state"] != "failed"
+        assert next(row for row in coordinator.generations() if row["id"] == holder.id)["verdict"] is None
     finally:
         generation._boot_id.cache_clear()
 
@@ -205,7 +205,8 @@ async def test_standby_bind_failure_does_not_register_generation(tmp_path, monke
     with pytest.raises(OSError, match="bind failed"):
         await run_generation.serve_standby_generation(config)
 
-    assert GenerationCoordinator(tmp_path).generations() == []
+    row = GenerationCoordinator(tmp_path).generations()[0]
+    assert (row["state"], row["verdict"]) == ("exited", "failed")
 
 
 @pytest.mark.asyncio
@@ -220,7 +221,8 @@ async def test_standby_chmod_failure_closes_socket_without_registration(tmp_path
     config = GatewayConfig.from_dict({"gateway": {"overlap_handover": {"enabled": True}}})
     with pytest.raises(OSError, match="chmod failed"):
         await run_generation.serve_standby_generation(config)
-    assert GenerationCoordinator(tmp_path).generations() == []
+    row = GenerationCoordinator(tmp_path).generations()[0]
+    assert (row["state"], row["verdict"]) == ("exited", "failed")
     assert not list(tmp_path.glob("gateway.*.sock"))
 
 
@@ -236,7 +238,7 @@ async def test_standby_record_failure_is_terminal(tmp_path, monkeypatch):
     config = GatewayConfig.from_dict({"gateway": {"overlap_handover": {"enabled": True}}})
     with pytest.raises(OSError, match="record failed"):
         await run_generation.serve_standby_generation(config)
-    assert GenerationCoordinator(tmp_path).generations()[0]["state"] == "failed"
+    assert GenerationCoordinator(tmp_path).generations()[0]["verdict"] == "failed"
     assert not list(tmp_path.glob("gateway.*.sock"))
 
 
@@ -263,11 +265,11 @@ def test_coordinator_registers_heartbeats_and_exposes_leased_generations(tmp_pat
 
     coordinator.register(identity)
     epoch = coordinator.acquire_lease("telegram:token", identity.id)
-    coordinator.heartbeat(identity.id, state="ready")
+    coordinator.heartbeat(identity.id, state="standby")
 
     rows = coordinator.generations()
     assert rows[0]["id"] == identity.id
-    assert rows[0]["state"] == "ready"
+    assert rows[0]["state"] == "standby"
     assert coordinator.leases() == [{
         "resource": "telegram:token", "epoch": epoch,
         "generation_id": identity.id, "state": "active",
@@ -279,7 +281,7 @@ def test_generation_files_are_scoped_and_cleanup_is_fenced(tmp_path: Path):
                                          start_fingerprint="456:one")
     paths = generation_paths(tmp_path, identity)
     write_generation_record(paths["state"], identity, state="standby")
-    assert json.loads(paths["state"].read_text())["id"] == identity.id
+    assert json.loads(paths["state"].read_text(encoding="utf-8"))["id"] == identity.id
 
     other = GenerationIdentity.create(release_sha="def", label="ai.hermes.gateway-a", pid=456,
                                       start_fingerprint="456:two")
@@ -302,14 +304,14 @@ async def test_old_exit_preserves_successor_legacy_pid_projection(tmp_path):
     epoch = db.acquire_lease("active_generation", old.id)
     active = ActiveGeneration(tmp_path, db, old, epoch)
     await active.start()
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     db.request_transfer(old.id, new.id, epoch, set())
     promoted = db.commit_transfer(old.id, new.id, epoch)
     assert db.project_active_summary(new, promoted, {})
-    projected = json.loads((tmp_path / "gateway.pid").read_text())
+    projected = json.loads((tmp_path / "gateway.pid").read_text(encoding="utf-8"))
     assert projected["id"] == new.id
     await active.close()
-    assert json.loads((tmp_path / "gateway.pid").read_text()) == projected
+    assert json.loads((tmp_path / "gateway.pid").read_text(encoding="utf-8")) == projected
 
 
 @pytest.mark.asyncio
@@ -361,13 +363,14 @@ def test_lease_cannot_be_stolen_and_release_is_fenced(tmp_path):
     assert not coordinator.release_lease("active_generation", second.id, epoch)
     assert not coordinator.release_lease("active_generation", first.id, epoch + 1)
     assert coordinator.release_lease("active_generation", first.id, epoch)
-    assert coordinator.acquire_lease("active_generation", second.id) > epoch
+    with pytest.raises(RuntimeError, match="explicit takeover"):
+        coordinator.acquire_lease("active_generation", second.id)
 
 
 @pytest.mark.parametrize("death", ["missing_pid", "reused_pid", "different_boot"])
 def test_dead_lease_holder_fails_and_new_generation_takes_higher_epoch(tmp_path, monkeypatch, death):
     from gateway import generation
-    from gateway.status import _get_process_start_time
+    from gateway.status import _get_process_start_time, START_TIME_DRIFT_TOLERANCE
     coordinator = GenerationCoordinator(tmp_path)
     current_start = _get_process_start_time(os.getpid())
     assert current_start is not None
@@ -381,11 +384,15 @@ def test_dead_lease_holder_fails_and_new_generation_takes_higher_epoch(tmp_path,
     if death == "missing_pid":
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
     elif death == "reused_pid":
-        monkeypatch.setattr("gateway.status._get_process_start_time", lambda pid: current_start + 1)
+        # Fingerprints are centiseconds, not seconds: +1 is tolerated drift,
+        # not proof of a reused PID. Exercise the canonical mismatch boundary.
+        monkeypatch.setattr("gateway.status._get_process_start_time",
+                            lambda pid: current_start + START_TIME_DRIFT_TOLERANCE + 1)
     else:
         monkeypatch.setattr(generation, "_boot_id", lambda: "new-boot")
-    assert coordinator.acquire_lease("active_generation", second.id) == epoch + 1
-    assert coordinator.generations()[0]["state"] == "failed"
+    assert coordinator.takeover_dead_generation("active_generation", first.id, second.id,
+        bootout=lambda label: True) == epoch + 1
+    assert coordinator.generations()[0]["verdict"] == "failed"
     assert not coordinator.release_lease("active_generation", first.id, epoch)
 
 
@@ -402,7 +409,8 @@ def test_stale_live_holder_becomes_suspect_without_losing_lease(tmp_path):
         conn.execute("UPDATE generations SET heartbeat_at=? WHERE id=?", (time.time() - 30, first.id))
     with pytest.raises(RuntimeError, match="suspect.*alive"):
         coordinator.acquire_lease("active_generation", second.id)
-    assert coordinator.generations()[0]["state"] == "suspect"
+    assert coordinator.generations()[0]["state"] == "standby"
+    assert coordinator.generations()[0]["suspect_at"] is not None
     assert coordinator.leases()[0]["epoch"] == epoch
 
 
@@ -481,7 +489,7 @@ async def test_active_heartbeat_io_does_not_block_event_loop(tmp_path, monkeypat
         await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_overlap_flag_rejected_on_windows():
     from gateway.config import GatewayConfig
     with pytest.raises(ValueError, match="overlap_handover.*Windows"):
@@ -506,7 +514,7 @@ def test_overlap_gate_defaults_off_and_reads_nested_config(tmp_path, monkeypatch
     assert not load_gateway_config().overlap_handover_enabled
     assert not overlap_handover_enabled({})
     assert not overlap_handover_enabled({"gateway": None})
-    (tmp_path / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n")
+    (tmp_path / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: true\n", encoding="utf-8")
     assert load_gateway_config().overlap_handover_enabled
     assert overlap_handover_enabled({"gateway": {"overlap_handover": {"enabled": True}}})
     assert not overlap_handover_enabled(object())
@@ -521,7 +529,7 @@ def test_overlap_status_names_old_draining_pid(tmp_path, monkeypatch, capsys):
     old = GenerationIdentity.create(release_sha="a", label="slot-a", pid=12345)
     new = GenerationIdentity.create(release_sha="b", label="slot-b", pid=12346)
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, set())
     db.commit_transfer(old.id, new.id, epoch)
@@ -530,24 +538,20 @@ def test_overlap_status_names_old_draining_pid(tmp_path, monkeypatch, capsys):
     assert f"old generation draining pid={old.pid}" in capsys.readouterr().out.lower()
 
 
-def test_terminal_generations_are_bounded_and_status_is_compact(tmp_path):
+def test_terminal_generations_preserve_verdicts_labels_and_status(tmp_path):
     from hermes_cli.gateway_generation_status import read_generation_status
     coordinator = GenerationCoordinator(tmp_path)
-    active = GenerationIdentity.create(release_sha="active", label="slot-a")
-    coordinator.register(active, state="ready")
-    old = GenerationIdentity.create(release_sha="old", label="slot-b",
-                                    started_at=time.time() - 9 * 86400)
-    coordinator.register(old, state="failed")
-    for n in range(50):
-        identity = GenerationIdentity.create(release_sha=str(n), label="slot-a" if n % 2 else "slot-b")
-        coordinator.register(identity, state="exited" if n % 2 else "failed")
-    rows = coordinator.generations()
-    assert active.id in {row["id"] for row in rows}
-    assert old.id not in {row["id"] for row in rows}
-    assert len([row for row in rows if row["state"] in {"exited", "failed"}]) <= 20
-    visible = read_generation_status(tmp_path)
-    assert {row["label"] for row in visible} == {"slot-a", "slot-b"}
-    assert len(visible) == 3  # live active plus the latest terminal per label
+    old = coordinator.reserve_generation(release_sha="old", label="reserved",
+        started_at=time.time() - 9 * 86400)
+    assert coordinator.retire_unclaimed(old.id)
+    for n in range(25):
+        coordinator.register(GenerationIdentity.create(release_sha=str(n), label=f"unique-{n}"), state="exited")
+    assert next(row for row in read_generation_status(tmp_path) if row["id"] == old.id)["verdict"] == "failed"
+    replacement = coordinator.reserve_generation(release_sha="new", label=old.label)
+    assert replacement.id != old.id
+    assert next(row for row in coordinator.generations() if row["id"] == old.id)["verdict"] == "failed"
+    with pytest.raises(sqlite3.IntegrityError):
+        coordinator.reserve_generation(release_sha="collision", label=old.label)
 
 
 def test_terminal_transfer_audit_survives_while_successor_is_live(tmp_path):
@@ -555,7 +559,7 @@ def test_terminal_transfer_audit_survives_while_successor_is_live(tmp_path):
     old = GenerationIdentity.create(release_sha="old", label="a", started_at=time.time() - 8 * 86400)
     new = GenerationIdentity.create(release_sha="new", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, set())
     db.commit_transfer(old.id, new.id, epoch)
@@ -567,12 +571,12 @@ def test_terminal_transfer_audit_survives_while_successor_is_live(tmp_path):
 
 
 @pytest.mark.parametrize("count,backdate", [(2, True), (25, False)])
-def test_terminal_transfer_history_can_be_pruned_without_foreign_key_failure(tmp_path, count, backdate):
+def test_terminal_transfer_history_is_retained_without_foreign_key_failure(tmp_path, count, backdate):
     db = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="old", label="a")
     new = GenerationIdentity.create(release_sha="new", label="b")
     db.register(old, state="serving")
-    db.register(new, state="ready")
+    db.register(new, state="standby")
     epoch = db.acquire_lease("active_generation", old.id)
     db.request_transfer(old.id, new.id, epoch, {"token"})
     db.record_poller_stopped(old.id, epoch, "token", 1)
@@ -585,19 +589,19 @@ def test_terminal_transfer_history_can_be_pruned_without_foreign_key_failure(tmp
             conn.execute("UPDATE generations SET started_at=? WHERE id IN (?,?)",
                          (time.time() - 8 * 86400, old.id, new.id))
     for index in range(count):
-        db.register(GenerationIdentity.create(release_sha=str(index), label="other"), state="exited")
+        db.register(GenerationIdentity.create(release_sha=str(index), label=f"other-{index}"), state="exited")
     with db.connect() as conn:
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert conn.execute("SELECT count(*) FROM generation_transfers WHERE old_id=?", (old.id,)).fetchone()[0] == 0
-        assert conn.execute("SELECT count(*) FROM transfer_tokens WHERE old_id=?", (old.id,)).fetchone()[0] == 0
-    assert old.id not in {row["id"] for row in db.generations()}
+        assert conn.execute("SELECT count(*) FROM generation_transfers WHERE old_id=?", (old.id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM transfer_tokens WHERE old_id=?", (old.id,)).fetchone()[0] == 1
+    assert old.id in {row["id"] for row in db.generations()}
 
 
-def test_terminal_prune_removes_released_lease_and_upgrades_existing_schema(tmp_path):
+def test_terminal_history_preserves_released_lease_and_upgrades_existing_schema(tmp_path):
     coordinator = GenerationCoordinator(tmp_path)
     old = GenerationIdentity.create(release_sha="old", label="slot-a",
                                     started_at=time.time() - 9 * 86400)
-    coordinator.register(old, state="ready")
+    coordinator.register(old, state="standby")
     epoch = coordinator.acquire_lease("old-slot", old.id)
     coordinator.release_lease("old-slot", old.id, epoch)
     coordinator.heartbeat(old.id, state="exited")
@@ -605,8 +609,8 @@ def test_terminal_prune_removes_released_lease_and_upgrades_existing_schema(tmp_
         conn.execute("ALTER TABLE generations DROP COLUMN suspect_from_state")
     coordinator = GenerationCoordinator(tmp_path)
     coordinator.register(GenerationIdentity.create(release_sha="new", label="slot-b"))
-    assert old.id not in {row["id"] for row in coordinator.generations()}
-    assert coordinator.leases() == []
+    assert old.id in {row["id"] for row in coordinator.generations()}
+    assert coordinator.leases()[0]["state"] == "released"
 
 
 def test_suspect_heartbeat_restores_prior_live_state(tmp_path):
@@ -614,7 +618,7 @@ def test_suspect_heartbeat_restores_prior_live_state(tmp_path):
     coordinator = GenerationCoordinator(tmp_path)
     contender = GenerationIdentity.create(release_sha="next", label="next")
     coordinator.register(contender)
-    for initial in ("ready", "starting"):
+    for initial in ("standby", "serving"):
         holder = GenerationIdentity.create(release_sha="held", label=initial,
             start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
         coordinator.register(holder, state=initial)
@@ -683,7 +687,7 @@ async def test_standby_heartbeat_recovers_and_socket_is_private(tmp_path, monkey
             await asyncio.sleep(.02)
         records = list(tmp_path.glob("gateway_state.*.json"))
         assert records
-        socket = Path(json.loads(records[0].read_text())["socket_path"])
+        socket = Path(json.loads(records[0].read_text(encoding="utf-8"))["socket_path"])
         assert stat.S_IMODE(socket.stat().st_mode) == 0o600
         assert await asyncio.to_thread(recovered.wait, 4)
         assert attempts >= 2 and not task.done()
@@ -707,3 +711,12 @@ def test_runtime_status_refreshes_only_when_changed_or_stale(tmp_path, monkeypat
     active._last_status_write -= 31
     active._sync_runtime_status()
     assert active.paths["state"].stat().st_mtime_ns != first
+
+
+
+@pytest.fixture(autouse=True)
+def _coordinator_boot_identity(monkeypatch, request):
+    if "macos_boot_id" in request.node.name or "hostname_change" in request.node.name:
+        return
+    from functools import lru_cache
+    monkeypatch.setattr("gateway.generation._boot_id", lru_cache(maxsize=1)(lambda: "unit-test-boot"))

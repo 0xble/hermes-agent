@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from tools import browser_tool_install as bt_install
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -24,31 +23,23 @@ def _reset_caches():
     if hasattr(bt_install._discover_homebrew_node_dirs, "cache_clear"):
         bt_install._discover_homebrew_node_dirs.cache_clear()
 
-
 @pytest.fixture(autouse=True)
 def _clean_caches():
     _reset_caches()
     yield
     _reset_caches()
 
-
 # ---------------------------------------------------------------------------
 # Dead code removal
 # ---------------------------------------------------------------------------
-
-
 
 # ---------------------------------------------------------------------------
 # Caching: _find_agent_browser
 # ---------------------------------------------------------------------------
 
-
-
 # ---------------------------------------------------------------------------
 # Caching: _get_command_timeout
 # ---------------------------------------------------------------------------
-
-
 
 class TestSessionInactivityTimeout:
 
@@ -59,7 +50,6 @@ class TestSessionInactivityTimeout:
         with patch("hermes_cli.config.read_raw_config", return_value={}):
             assert _get_session_inactivity_timeout() == DEFAULT_CONFIG["browser"]["inactivity_timeout"]
 
-
     def test_invalid_config_preserves_env_fallback(self, monkeypatch):
         from tools.browser_tool import _get_session_inactivity_timeout
         monkeypatch.setenv("BROWSER_INACTIVITY_TIMEOUT", "240")
@@ -67,12 +57,9 @@ class TestSessionInactivityTimeout:
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
             assert _get_session_inactivity_timeout() == 240
 
-
 # ---------------------------------------------------------------------------
 # Caching: _discover_homebrew_node_dirs
 # ---------------------------------------------------------------------------
-
-
 
 # ---------------------------------------------------------------------------
 # Security: URL-decoded secret check
@@ -95,12 +82,9 @@ class TestUrlDecodedSecretCheck:
         assert result["success"] is False
         assert "API key" in result["error"] or "Blocked" in result["error"]
 
-
 # ---------------------------------------------------------------------------
 # Thread safety: _recording_sessions
 # ---------------------------------------------------------------------------
-
-
 
 # ---------------------------------------------------------------------------
 # Structure-aware _truncate_snapshot
@@ -127,7 +111,6 @@ class TestTruncateSnapshot:
         for line in result.split("\n"):
             if line.strip() and "truncated" not in line.lower():
                 assert line.startswith("- item") or line == ""
-
 
     def test_stored_snapshot_is_secret_redacted(self):
         """Page-rendered secrets must not land unmasked on disk."""
@@ -186,19 +169,13 @@ class TestTruncateSnapshot:
         assert "truncated" in result.lower()
         assert "read_file" in result
 
-
-
 # ---------------------------------------------------------------------------
 # Scroll optimization
 # ---------------------------------------------------------------------------
 
-
-
 # ---------------------------------------------------------------------------
 # Empty stdout = failure
 # ---------------------------------------------------------------------------
-
-
 
 # ---------------------------------------------------------------------------
 # _camofox_eval bug fix

@@ -493,6 +493,33 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   2026-09-25 10:09 receipt: the old code reports failure, the patched code reports success
   (`b6fb36d94a21`).
 
+## Finished update notice retained past the watcher deadline
+
+- Fork patch identity: `update-lifecycle`.
+- A finished v2 marker whose final send was flood-refused once blocked new requests forever:
+  the watcher expired, boot was the only retry, and `O_EXCL` refused admission.
+  `launch_native_update` now atomically replaces only an unclaimed marker with a matching
+  finalized outcome and real process-exit sentinel. The old result and reason ride in
+  `previous_outcome` and appear in the next request's final notice; claimed or unfinished
+  updaters still block. Marker writes and clears compare identity under the admission lock.
+  Phases, output checkpoints, and final sends retain the starting identity across awaited
+  adapter sends, so an in-flight old notice cannot adopt, announce, or alter the new request.
+  Housekeeping retries post-deadline notices with persisted exponential backoff honoring
+  the platform's `retry_after`; raised delivery errors in phase acknowledgements,
+  output chunks and final notices use the same backoff as failed send results.
+  A never-connected adapter retains its existing expiry. No profile state or
+  updater process is restarted by these retries.
+- Guards: `tests/gateway/test_agent_update_launcher.py` (finished, unfinished, claimed,
+  concurrent and failed-spawn admission) and
+  `tests/gateway/test_update_lifecycle_notifications.py` (post-deadline retry, flood
+  delay, stream/final retry, adapter expiry,
+  `test_post_deadline_delivery_exception_persists_retry_backoff` for output,
+  final notice and phase acknowledgement, and
+  `test_inflight_old_notice_cannot_mutate_superseding_request` for final notice,
+  final output, phase acknowledgement and watcher checkpoint).
+- Related upstream [#42191](https://github.com/NousResearch/hermes-agent/pull/42191) preserves state after a soft send failure but does not admit a subsequent request or schedule post-deadline retries; [#111307](https://github.com/NousResearch/hermes-agent/pull/111307) addresses a distinct `fleet_restart_pending` warning. Both were open at qualification, neither is an equivalent released replacement.
+- Retire only when an upstream *released tag* has equivalent finished-marker admission with old-outcome delivery, race-safe claim protection and periodic flood-aware retry after watcher expiry. Roll back this patch as a unit; do not delete an existing pending notice to work around admission.
+
 ## Restart notices hid the reason from other interrupted chats
 
 - Fork patch identity: `update-lifecycle`.
@@ -565,3 +592,23 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `gpt-61-sol-support`.
 - The maintained runtime did not recognize `gpt-6.1-sol`, so model metadata fell back to 256K and triggered compaction at 192K on the Codex route. The support correction registers the direct 1.05M context, the 272K Codex context, the model's reasoning and pricing metadata, and the static catalogs. It preserves the later Portal catalog behavior and does not claim an unverified 900K Codex variant.
 - Guard: `tests/hermes_cli/test_gpt6_tiers_registration.py` (`test_gpt61_sol_takes_astra_ladder_without_astra_gating`, `test_openrouter_omits_disable_the_openai_ladder_rejects`, `test_gpt61_sol_resolves_context_and_pricing_like_its_tier`).
+
+## Native Checkpoint Update Admission
+
+- Fork patch identity: `update-lifecycle`.
+- The checkpoint adaptation had lost upstream's active Git-operation refusal even though its native helper and regression tests remained. Restore the guard before any release recovery, snapshot, fetch or checkout mutation. Immutable rollback remains exempt because it restores the release transaction without changing the source Git checkout. This preserves the behavior introduced by upstream commit `353ac62b316c7b420858a708489cf009ebf918f4` by JoaoMarcos44.
+- Historical source fleet catch-up now enters the native `_old_updater.stop_for_relaunch` completion route. The selected fresh interpreter owns dependency installation and fleet verification. The removed duplicate process scan/restart implementation must not return. Immutable catch-up retains its transaction acknowledgement path.
+- Existing invariants: `tests/hermes_cli/test_update_parked_branch_guard.py`, `test_update_fleet_restart_pending.py` and `test_update_head_moved_gate.py`. The HEAD fixture advances only after the actual fast-forward merge and observes the current `_complete_source_update` owner.
+
+## Darwin State-Database Holder Admission
+
+- Fork patch identity: `sqlite-darwin-holder-scan`.
+- The macOS foreign-holder scan used psutil path metadata for every process's open files, then resolved every path. An unrelated protected or unreachable file could therefore refuse or stall structural maintenance of a healthy isolated database. Match the existing libproc descriptor identities against the watched SQLite family instead. Current hardlink aliases and retired generations remain holders. A failed or interrupted enumeration retains the unknown-holder sentinel alongside any known holders. The real-home I/O tripwire remains enabled.
+- Current checkpoint owner: `hermes_state_holders.foreign_state_db_holders` and the existing `hermes_state_dbfile._iter_darwin_fd_targets`. Related upstream [issue 130610](https://github.com/NousResearch/hermes-agent/issues/130610) and [PR 130616](https://github.com/NousResearch/hermes-agent/pull/130616), commit `d4a9f5ee12c90686dffd6582df29b7abe74cad51` by Yuan Li, independently choose the same native scanner. The fork adaptation also preserves retired-path detection and propagates scan exceptions to the existing fail-closed authority. It does not import the proposed timeout constant absent at this checkpoint or add a parallel scanner.
+- Two native invariant functions in `tests/hermes_state/test_state_db_holders.py` reproduce the failure before the change and exercise real foreign descriptors plus interrupted enumeration. Existing repair, FTS, vacuum and deleted-WAL suites verify sibling admission paths. Retire this patch when a selected upstream revision uses the native scanner with equivalent descriptor and uncertainty contracts.
+
+## Inline Launcher Relaunch Replayed Consumed Arguments
+
+- Fork patch identity: `update-lifecycle`.
+- A release-origin `hermes update` re-enters the source checkout with `python -c "...sys.argv.pop(1)..." <source> update ...`. `hermes_bootstrap` then relaunched that `-c` program under the managed interpreter with the already-popped `sys.argv`, so the replayed code popped again and consumed `update`. `hermes update --check` and `--plan` exited 2 with "unrecognized arguments", which made the gateway `request_update` tool fail with `update_check_failed`. `relaunch_command` now rebuilds a `-c` relaunch's argv from the original command line.
+- Guard: `tests/hermes_cli/test_venv_sync_relaunch.py`.

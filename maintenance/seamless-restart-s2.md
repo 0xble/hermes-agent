@@ -4,6 +4,21 @@ Patch identity: `seamless-restart-s2`.
 
 ## Contract and current gate
 
+Detached cron dispatch freezes both the physical tree and immutable-release module
+when the scheduler loads. A module first imported through a lexical package path
+after `current` moves can otherwise launch the new release from the old scheduler.
+The worker's interpreter, cwd, environment, and import path all retain the loaded
+installation. The real worker test holds an A dispatcher across promotion to B,
+then proves its delayed worker still uses A while new B dispatchers use B.
+
+After first-migration rollback removes `current` and `previous`, service rendering
+resolves the recorded source interpreter while `updates.immutable_releases` remains
+enabled. This fallback requires the completed `rolled-back` journal state, absent
+pointers, the recorded source commit, and an interpreter that imports that checkout.
+Broken pointers, unfinished journals, changed source commits, and unavailable source
+interpreters remain hard failures. `test_gateway_source_interpreter_after_migration_rollback`
+drives the real rollback and plist-rendering boundary against a disposable home.
+
 This is the fork's core update/launchd/cron release boundary, not a plugin: atomic pointer changes, update receipts, supervisor definitions and child executable pinning must agree. **S2 is macOS launchd-only**: `updates.immutable_releases: true` fails before staging or migration on Linux/Windows and any non-launchd manager. The source checkout remains `$HERMES_HOME/hermes-agent`; release directories are `$HERMES_HOME/releases/<exact-git-sha>`, each built and smoke-tested in a unique sibling `.staging-<sha>-<uuid>` directory, with venv paths relocated before atomic publication. Shared profile state and plugins stay outside releases. Revert this unit only when upstream demonstrates the same process pinning, transactional migration and reversible fleet promotion.
 
 **NOT ACTIVATION-READY while PR #192 is draft or any S2 acceptance item/required exact-SHA check is open.** Publishing or merging the source never authorizes running `hermes update` on the personal install or restarting its live gateway. Only the parent owner may authorize activation separately.
@@ -91,3 +106,26 @@ Unreachable rows without a pending transaction: absent pointer with a `current` 
 ## Qualification before this runbook may be used
 
 Use a **throwaway launchd label and disposable HERMES_HOME**, never `ai.hermes.gateway` or a prefix enumerated by the updater's real fleet. Prove bootout/re-bootstrap and cleanup of the exact throwaway label; A-worker loaded paths across A→B; B gateway loaded SHA; failed submit/bootstrap and a crash after pointer/plist mutation leave a durable pending transaction; the intended gateway's startup acknowledgement, not a helper return or marker, consumes it after checking loaded plist hash, supervised PID, physical code root/SHA, executable and cwd. Prove that retry while unacknowledged does not re-bootout, and that `--no-gateway-restart` fails before service mutation with a partial receipt. Also prove hard-exit after every pointer, plist, journal, reload-ack and transaction-cleanup mutation for promote, rollback, first migration and first-migration rollback; A→B→A with receipt and fleet verification; first-migration reversal; and retention of real PID/cwd/exe and receipt pins. Run `scripts/run_tests.sh` focused files, `mise x uv@0.12.13 node@26.8.2 -- ./bin/ci preflight`, and the hosted Linux/qualification checks at the **same head SHA**. An ordinary process-group SIGTERM test does not substitute for actual `launchctl bootout` coalition behavior.
+
+
+## Native PM Checkpoint Migration
+
+The pre-tip checkpoint uses native PM tools to build archived web assets in a build-owned tool store. Staging preserves directly installed optional features and all plugin entry points. Incidental transitive packages from obsolete environments cannot enable an unrelated feature. `hindsight` selects the client SDK, while `hindsight-embedded` explicitly selects the embedded server. Candidate staging uses the active runtime interpreter as the source distribution authority. Real archived staging and plugin import smoke must pass before promotion.
+
+The upstream compression default remains ratio-based. Brian's prior 256000-token cap must be set through supported `compression.threshold_tokens` profile configuration before activation, preserving his effective behavior while retiring the personal core default.
+
+## Native Interpreter Acknowledgement
+
+Homebrew Framework Python launches a kernel image under `Python.app`, which differs from the virtual environment launcher's resolved symlink. Release acknowledgement now observes the selected interpreter's kernel executable through an isolated process probe, then compares that trusted result with the supervised process. The bounded probe cache includes the launcher path and file identity. Probe failure leaves the transaction pending. It does not relax the loaded-root, supervisor, cwd, plist, SHA or profile checks. Immutable subprocess text boundaries decode UTF-8 explicitly.
+
+The real disposable launchd tests exercise Framework Python and standalone Python without changing the live label. Minimal fixture environments include the actual process-observer dependency. Candidate plist tests select the native `release_target` interface and verify its interpreter PATH. They do not require upstream's removed `VIRTUAL_ENV` export. The refusal-only recovery fixture sets the supported acknowledgement observation window to zero while retaining the assertion that no reload callback executes. Full exact-candidate qualification and independent review remain required.
+
+The two-release native fixture owns a real minimal source `.venv`, so optional-feature inference does not inherit unrelated cloud, browser and messaging dependencies from the suite interpreter. It retains the full tracked source tree, real archive and web builds, native PM core installation, plugin smoke, unmocked distribution preservation, rollback, retention and supervisor acknowledgement. The ordinary per-file timeout remains unchanged.
+
+## Selected Release Launchers
+
+Native PM source services persist the installation launcher, which intentionally follows the source install's current Python tool. Reusing that launcher for an immutable release discarded the release interpreter and loaded the source checkout in both the stderr wrapper and gateway. Release plist generation now binds both runtime commands to the explicitly selected release root and interpreter, while ordinary source services retain their installation launcher. The generated-plist invariant executes the source service and A→B→A release commands with disposable payloads, checking imported roots, bootstrap roots, interpreter identity and external supervision. It fails on the unchanged renderer because the source payload runs instead of the selected release. Upstream PR #130125 addresses a related managed-workspace canonical-root defect, not this fork-owned immutable selection. Retire this adaptation only when upstream's native release renderer demonstrates the same selected-tree and interpreter contract.
+
+## Generated Launcher Acknowledgement
+
+The supervised acknowledgement accepted only `python -m hermes_cli.main`, but the release plist this unit generates starts the gateway as `python -I -c <bootstrap> gateway run --external-supervisor`. Every immutable update therefore activated the intended release, then timed out waiting for an acknowledgement it could never observe, leaving `release-txn.json` pending and the receipt `partial`. The acknowledgement now also accepts that launcher, but only when its `-c` code equals the bootstrap `runtime_command` renders for the intended release root. An arbitrary `-c` program or another release's launcher is rejected, and the interpreter image, cwd and `PYTHONPATH` checks are unchanged. Guard: `test_generated_launchd_gateway_acknowledges_only_its_release` in `tests/hermes_cli/test_immutable_release_transactions.py`, driven by the real generated plist. It fails on the unchanged matcher.

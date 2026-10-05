@@ -59,7 +59,7 @@ LEGACY_FIELD_MEANING = {
 
 
 def _load(path: Path) -> list[dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
     jobs = data.get("jobs") if isinstance(data, dict) else data
     if not isinstance(jobs, list):
         raise SystemExit(f"{path}: expected a jobs list")
@@ -70,10 +70,10 @@ def _presets(config_path: Path | None) -> dict[str, dict[str, Any]]:
     if not config_path or not config_path.exists():
         return {}
     try:
-        import yaml
+        import hermes_yaml as yaml
     except ImportError:
         return {}
-    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
     presets = cfg.get("model_presets") or {}
     return presets if isinstance(presets, dict) else {}
 
@@ -82,8 +82,8 @@ def _profile_timezone(config_path: Path | None) -> str | None:
     if not config_path or not config_path.exists():
         return None
     try:
-        import yaml
-        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        import hermes_yaml as yaml
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
     except Exception:
         return None
     return cfg.get("timezone")

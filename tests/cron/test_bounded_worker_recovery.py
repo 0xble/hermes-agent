@@ -270,7 +270,7 @@ sys.exit(0 if result else 1)
             process.wait()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_hard_wall_watchdog_kills_setsid_grandchild_once(tmp_path):
     home = tmp_path / "profile"
     home.mkdir()

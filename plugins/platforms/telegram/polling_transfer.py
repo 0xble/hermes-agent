@@ -16,9 +16,13 @@ from contextlib import contextmanager
 
 from telegram import Update
 
+from gateway.deadline import deadline_scope, now as gateway_deadline_now, remaining as gateway_deadline_remaining
+from gateway.deadline import detached_context
 from gateway.generation import GenerationCoordinator
 
 _RETENTION_SECONDS = 24 * 60 * 60
+# Bound for one poller lifecycle evidence write (lock wait + commit).
+POLLER_EVIDENCE_WRITE_SECONDS = 5
 _IDLE_RESET_SECONDS = 7 * 24 * 60 * 60
 _MAX_RAW_UPDATE = 1024 * 1024
 
@@ -52,6 +56,32 @@ class PollingJournal:
                 yield db
         finally:
             db.close()
+
+    def lifecycle_owner(self) -> tuple[str, int] | None:
+        """Bind polling evidence to this process's current generation lease."""
+        import os
+        with self._connect() as db:
+            row = db.execute("SELECT g.id,l.epoch,g.pid,g.start_fingerprint,g.state,g.verdict FROM leases l JOIN generations g "
+                             "ON g.id=l.generation_id WHERE l.resource='active_generation' "
+                             "AND l.state='active'").fetchone()
+            if row is None or row["pid"] != os.getpid():
+                if db.execute("SELECT 1 FROM generations LIMIT 1").fetchone():
+                    raise RuntimeError("polling generation identity is not serving")
+                return None  # Standalone controlled polling has no generation identity.
+        from gateway.status import _get_process_start_time
+        started = _get_process_start_time(os.getpid())
+        if (started is None or row["start_fingerprint"] != f"{os.getpid()}:{started}"
+                or row["state"] != "serving" or row["verdict"] is not None):
+            raise RuntimeError("polling generation identity is not serving")
+        return row["id"], row["epoch"]
+
+    def record_lifecycle(self, owner: tuple[str, int], event: str, *,
+                         monotonic_at: float, wall_at: float) -> None:
+        # Each evidence write gets its own named bound so a held coordinator lock
+        # cannot stall it; an enclosing (earlier) deadline still wins.
+        with deadline_scope(gateway_deadline_now() + POLLER_EVIDENCE_WRITE_SECONDS):
+            self.coordinator.record_poller_event(self.token_hash, owner[0], owner[1], event,
+                                                 monotonic_at=monotonic_at, wall_at=wall_at)
 
     def record_response(self, payload: bytes) -> None:
         envelope = json.loads(payload)
@@ -199,19 +229,39 @@ def token_has_active_poller(token_hash: str) -> bool:
     return _active_pollers.get(token_hash) is not None
 
 
+async def wait_for_poller_release(token_hash: str, timeout: float) -> bool:
+    """Wait up to ``timeout`` for this process's previous poller on the token to finish and release
+    it; True once no in-process poller owns the token. A poller that never stops still refuses."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        task = _active_pollers.get(token_hash)
+        if task is None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if not task.done():
+            await asyncio.wait({task}, timeout=remaining)
+        else:
+            await asyncio.sleep(0)  # the release is scheduled with call_soon after completion
+
+
 class ControlledPoller:
     """One serial request at a time; stopping never abandons an outstanding request."""
 
     def __init__(self, app, journal: PollingJournal, *, timeout: float = 20,
-                 on_error=None, on_failure=None, on_progress=None):
+                 on_error=None, on_failure=None, on_progress=None, lifecycle_predecessor=None):
         self.app = app
         self.journal = journal
         self.timeout = timeout
         self.on_error = on_error
         self.on_failure = on_failure
         self.on_progress = on_progress
+        self._lifecycle_predecessor = lifecycle_predecessor
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self._lifecycle_owner: tuple[str, int] | None = None
+        self._lifecycle_task: asyncio.Task | None = None
 
     @property
     def running(self) -> bool:
@@ -220,6 +270,7 @@ class ControlledPoller:
     async def start(self):
         if self.running or token_has_active_poller(self.journal.token_hash):
             raise RuntimeError("poller already running for token")
+        self._lifecycle_owner = await self._check_lifecycle_owner()
         self._stop.clear()
         # Rows in processing may have crossed a handler's external-effect boundary.
         # Only explicitly failed pre-handoff claims reopen; do not replay ambiguous crashes.
@@ -234,12 +285,41 @@ class ControlledPoller:
                 continue
             await self.app.update_queue.put(update)
         await self._join_queue("replayed update")
-        self._task = asyncio.create_task(self._run(), name="telegram-controlled-poller")
+        # Queue drain can outlive this lease. Revalidate at the wire boundary.
+        self._lifecycle_owner = await self._check_lifecycle_owner()
+        if self._lifecycle_owner is not None:
+            # Evidence I/O must not gate the live wire. Preserve occurrence times
+            # and flush this task before stop evidence and token-lock release.
+            self._lifecycle_task = asyncio.create_task(self._record_lifecycle(
+                self._lifecycle_owner, "poller_started", time.monotonic(), time.time()), context=detached_context())
+        self._task = asyncio.create_task(self._run(), name="telegram-controlled-poller", context=detached_context())
         _active_pollers[self.journal.token_hash] = self._task
         self._task.add_done_callback(self._observe_task)
         await asyncio.sleep(0)
         if self._task.done():
             await self._task
+
+    async def _check_lifecycle_owner(self) -> tuple[str, int] | None:
+        try:
+            return await asyncio.to_thread(self.journal.lifecycle_owner)
+        except Exception as exc:
+            logger.exception("Controlled Telegram poller identity check failed before startup")
+            if self.on_failure is not None:
+                self.on_failure(exc)
+            if self.on_error is not None:
+                self.on_error(exc)
+            raise
+
+    async def _record_lifecycle(self, owner, event, monotonic_at, wall_at) -> None:
+        try:
+            if event == "poller_started" and self._lifecycle_predecessor is not None:
+                await self._lifecycle_predecessor
+            await asyncio.to_thread(self.journal.record_lifecycle, owner, event,
+                                    monotonic_at=monotonic_at, wall_at=wall_at)
+        except Exception:
+            # Missing evidence remains a failed journal check, never a clean
+            # interval. It must not strand an otherwise healthy polling owner.
+            logger.exception("Telegram polling lifecycle evidence could not be recorded: %s", event)
 
     async def _join_queue(self, batch: str) -> None:
         """Backpressure until dispatch catches up; a slow handler is not a poll failure."""
@@ -320,4 +400,11 @@ class ControlledPoller:
                 return {"stopped": False, "error": "CancelledError"}
             except Exception as exc:
                 return {"stopped": False, "error": type(exc).__name__}
+        if self._lifecycle_owner is not None:
+            stopped_at, wall_at = time.monotonic(), time.time()
+            if self._lifecycle_task is not None:
+                await self._lifecycle_task
+                self._lifecycle_task = None
+            await self._record_lifecycle(self._lifecycle_owner, "poller_stopped", stopped_at, wall_at)
+            self._lifecycle_owner = None
         return {"stopped": True}

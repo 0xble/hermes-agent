@@ -163,6 +163,9 @@ def _mark_exited_quietly(exit_code: int, reason: str) -> None:
     with contextlib.suppress(Exception):
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason=reason)
+    with contextlib.suppress(Exception):  # os._exit skips atexit: stamp the exit-metrics marker now
+        from hermes_cli.observability.shared_metrics_process import stamp_exit
+        stamp_exit("watchdog")
     with contextlib.suppress(Exception):
         from gateway.status import write_runtime_status
         # Only the supervisor-restart code asserts a restart; other codes leave the recorded
@@ -183,6 +186,16 @@ def _home(home: Optional[Path]) -> Path:
 
 def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
+
+
+def get_pid_loop_heartbeat_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
+    """``<HERMES_HOME>/state/gateway.heartbeat.<pid>``: this process's own heartbeat copy.
+
+    Overlapping generations share one home. A draining generation keeps rewriting the shared
+    file with its own PID, so the shared file alone can never describe its successor.
+    """
+    pid = int(pid if pid is not None else os.getpid())
+    return _home(home) / "state" / f"gateway.heartbeat.{pid}"
 
 
 def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
@@ -219,10 +232,11 @@ def write_loop_heartbeat(
             payload["mem"] = mem
     if extra:
         payload.update(extra)
-    try:
-        atomic_json_write(path, payload, indent=None)
-    except Exception:
-        logger.debug("Failed to write gateway loop heartbeat", exc_info=True)
+    for target in (path, get_pid_loop_heartbeat_path(home, payload["pid"])):
+        try:
+            atomic_json_write(target, payload, indent=None)
+        except Exception:
+            logger.debug("Failed to write gateway loop heartbeat %s", target, exc_info=True)
     return path
 
 
@@ -324,6 +338,18 @@ async def _tick_socket_handler(reader: asyncio.StreamReader, writer: asyncio.Str
             writer.close()
 
 
+def _sweep_stale_pid_heartbeats(home: Optional[Path]) -> None:
+    """Unlink per-PID heartbeat copies left by dead PIDs (POSIX only; never raises)."""
+    try:
+        for stale in get_loop_heartbeat_path(home).parent.glob("gateway.heartbeat.*"):
+            try:
+                os.kill(int(stale.name.rsplit(".", 1)[1]), 0)  # windows-footgun: ok — POSIX-only
+            except (ValueError, IndexError, OSError):
+                stale.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("stale per-PID heartbeat sweep failed", exc_info=True)
+
+
 def _sweep_stale_tick_sockets(own_path: Path) -> None:
     """Unlink loop-tick socket nodes left by dead PIDs (POSIX only; never raises).
     create_unix_server removes a leftover node at OUR path (os._exit / SIGKILL skip the
@@ -362,6 +388,7 @@ async def loop_heartbeat_forever(
             tick_socket_path = get_loop_tick_socket_path(home)
             tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
             _sweep_stale_tick_sockets(tick_socket_path)
+            _sweep_stale_pid_heartbeats(home)
             tick_server = await asyncio.start_unix_server(_tick_socket_handler,
                                                           path=str(tick_socket_path))
         else:
@@ -397,3 +424,5 @@ async def loop_heartbeat_forever(
             if tick_socket_path is not None:
                 with contextlib.suppress(Exception):
                     tick_socket_path.unlink(missing_ok=True)
+        with contextlib.suppress(Exception):
+            get_pid_loop_heartbeat_path(home).unlink(missing_ok=True)

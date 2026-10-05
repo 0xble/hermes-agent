@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from contextlib import suppress
@@ -80,7 +81,7 @@ class GatewayConfigLoadersMixin:
             logger.warning("Prefill messages file not found: %s", path)
             return []
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if not isinstance(data, list):
                 logger.warning("Prefill messages file must contain a JSON array: %s", path)
@@ -205,41 +206,80 @@ class GatewayConfigLoadersMixin:
             None if reasoning_config is None else dict(reasoning_config)
         )
 
-    def _resolve_session_service_tier(self, source=None, session_key: Optional[str] = None) -> Optional[str]:
-        """Effective service tier: a session-scoped /fast override beats the config default.
-
-        The override stores "priority" or None (explicit normal), so presence — not truthiness — decides.
-        """
+    def _resolve_session_service_tier(
+        self, source=None, session_key: Optional[str] = None, *, report_transition: bool = False,
+    ) -> Optional[str] | tuple[Optional[str], Optional[str]]:
+        """Resolve the session tier, lazily expiring static Fast as explicit normal."""
         resolved_session_key = self._resolve_session_key_or_none(source, session_key)
+        transition_notice = None
         if resolved_session_key:
             _t_state = self._peek_session_state(resolved_session_key)
             if _t_state is not None and _t_state.conversation.service_tier_override is not _SERVICE_TIER_UNSET:
-                return _t_state.conversation.service_tier_override
-        return self._load_service_tier()
+                conversation = _t_state.conversation
+                expires_at = conversation.service_tier_override_expires_at
+                if expires_at and time.time() >= expires_at:
+                    duration = conversation.service_tier_override_expiry_seconds
+                    conversation.service_tier_override = None
+                    conversation.service_tier_override_expires_at = 0.0
+                    conversation.service_tier_override_expiry_seconds = 0.0
+                    self._apply_live_service_tier(resolved_session_key, None)
+                    from agent.fast_mode import format_expiry_duration
+                    from agent.i18n import t
+                    transition_notice = t(
+                        "gateway.fast.expired", duration=format_expiry_duration(duration),
+                    )
+                result = conversation.service_tier_override
+                return (result, transition_notice) if report_transition else result
+        result = self._load_service_tier()
+        return (result, None) if report_transition else result
 
-    def _set_session_service_tier_override(self, session_key: str, service_tier, clear: bool = False) -> None:
-        """Set ("priority" / None = explicit normal) or ``clear`` the session-scoped /fast override."""
+    def _set_session_service_tier_override(
+        self, session_key: str, service_tier, clear: bool = False, expiry_seconds: float | None = None,
+    ) -> None:
+        """Set or clear a session tier and start a static Fast deadline when enabled."""
         if not session_key:
             return
-        # Presence-sensitive: "priority" or None (explicit normal) both count as an override; the
-        # sentinel means "no override". Per-session field write: a lazy dict replace races sessions.
-        self._session_state(session_key).conversation.service_tier_override = (
-            _SERVICE_TIER_UNSET if clear else service_tier
-        )
+        conversation = self._session_state(session_key).conversation
+        conversation.service_tier_override = _SERVICE_TIER_UNSET if clear else service_tier
+        conversation.service_tier_override_expires_at = 0.0
+        conversation.service_tier_override_expiry_seconds = 0.0
+        from agent.fast_mode import STATIC_TIERS
+        if not clear and service_tier in STATIC_TIERS:
+            seconds = self._load_fast_expiry_seconds() if expiry_seconds is None else expiry_seconds
+            if seconds > 0:
+                conversation.service_tier_override_expires_at = time.time() + seconds
+                conversation.service_tier_override_expiry_seconds = seconds
+
+    @classmethod
+    def _load_fast_expiry_seconds(cls) -> float:
+        """Read the gateway-only Fast expiry; invalid values warn and disable it."""
+        from gateway.run import _load_gateway_config
+        raw = cfg_get(_load_gateway_config(), "agent", "fast_expiry_seconds", default=0)
+        try:
+            if isinstance(raw, bool):
+                raise ValueError(raw)
+            value = float(raw)
+            if value < 0 or not math.isfinite(value):
+                raise ValueError(raw)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("agent.fast_expiry_seconds=%r is not a non-negative finite number; using 0", raw)
+            return 0.0
+        return value
+
+    def _session_service_tier_expiry(self, session_key: Optional[str]) -> tuple[float, float]:
+        """Return the active session deadline and configured duration."""
+        state = self._peek_session_state(session_key) if session_key else None
+        if state is None:
+            return 0.0, 0.0
+        conversation = state.conversation
+        return conversation.service_tier_override_expires_at, conversation.service_tier_override_expiry_seconds
 
     @classmethod
     def _load_service_tier(cls) -> str | None:
-        """``agent.service_tier``: fast/priority/on => "priority"; normal/off => None; None when unset/unknown."""
-        raw = cls._cfg_str("agent", "service_tier")
-        value = raw.lower()
-        if not value or value in {"normal", "default", "standard", "off", "none"}:
-            return None
-        if value in {"fast", "priority", "on"}:
-            return "priority"
-        if value in {"auto", "cold"}:
-            return value
-        logger.warning("Unknown service_tier '%s', ignoring", raw)
-        return None
+        """``agent.service_tier`` parsed like the CLI (``hermes_cli.cli_config_load``); None when unset/unknown."""
+        from hermes_cli.cli_config_load import _parse_service_tier_config
+
+        return _parse_service_tier_config(cls._cfg_str("agent", "service_tier"))
 
     @staticmethod
     def _load_show_reasoning() -> bool:

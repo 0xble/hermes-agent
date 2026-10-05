@@ -1,5 +1,6 @@
 """Standalone per-platform senders and error helpers for send_message."""
 
+from pm import install_hint
 import asyncio
 import contextlib
 import logging
@@ -67,14 +68,17 @@ _TELEGRAM_TRANSIENT_MARKERS = ("bad gateway", "502", "too many requests", "429",
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
-    """Retry delay in seconds, or None when final: honours ``retry_after``; timeouts are
-    never retried (the send may have gone through); 5xx/429 back off exponentially."""
+    """Retry delay in seconds, or None when final: honours a short ``retry_after`` (a long one is a
+    server penalty the durable flood store enforces, never slept off inline); timeouts are never
+    retried (the send may have gone through); 5xx/429 back off exponentially."""
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
         try:
-            return max(float(retry_after), 0.0)
+            wait = retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
         except (TypeError, ValueError):
             return 1.0
+        from plugins.platforms.telegram.adapter import _FLOOD_INLINE_WAIT_CAP_SECS
+        return max(wait, 0.0) if wait <= _FLOOD_INLINE_WAIT_CAP_SECS else None
     text = str(exc).lower()
     if "timed out" in text or "timeout" in text:
         return None
@@ -104,21 +108,48 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
+def _standalone_telegram_rate_limiter():
+    """Per-chat budget for the standalone lane, tied to the profile's durable flood store: a chat
+    under a known server penalty is refused locally and a new ``retry_after`` is persisted, so this
+    lane (cron fallback, out-of-gateway sends) cannot extend a ban the gateway is waiting out."""
+    from hermes_constants import get_hermes_home
+    from plugins.platforms.telegram import flood_state
+    from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget
+    profile_dir = get_hermes_home()
+
+    def penalty_remaining(key: str) -> float | None:
+        try:
+            remaining = max(flood_state.remaining_seconds(profile_dir, key),
+                            flood_state.fallback_remaining_seconds(profile_dir, key))
+        except Exception:
+            logger.warning("send_message: could not read Telegram flood deadline for chat %s", key, exc_info=True)
+            return 60.0  # an unreadable deadline is not evidence the penalty expired
+        return remaining if remaining > 0 else None
+
+    def on_retry_after(key: str, wait: float) -> None:
+        flood_state.record_deadline(profile_dir, key, wait)
+
+    return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining, on_retry_after=on_retry_after)
+
+
 def _telegram_bot(token):
-    """Bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
+    """Metered bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
     blocked); falls back to a direct connection."""
     from telegram import Bot
+    from plugins.platforms.telegram.chat_budget import MeteredBot
+    limiter = _standalone_telegram_rate_limiter()
     try:
         from gateway.platforms.base import resolve_proxy_url
         proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         if not proxy:
-            return Bot(token=token)
+            return MeteredBot(Bot(token=token), limiter)
         from telegram.request import HTTPXRequest
         logger.info("send_message: standalone Telegram send routed through proxy %s", proxy)
-        return Bot(token=token, request=HTTPXRequest(proxy=proxy), get_updates_request=HTTPXRequest(proxy=proxy))
+        return MeteredBot(Bot(token=token, request=HTTPXRequest(proxy=proxy),
+                              get_updates_request=HTTPXRequest(proxy=proxy)), limiter)
     except Exception as proxy_err:
         logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", proxy_err)
-    return Bot(token=token)
+    return MeteredBot(Bot(token=token), limiter)
 
 
 def _telegram_thread_kwargs(thread_id):
@@ -276,7 +307,16 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
         # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
-        for chunk in BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else ():
+        chunks = BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else []
+        if len(chunks) > 1 and not _has_html:
+            # truncate_message appends a raw " (1/2)" suffix after format_message escaped the text;
+            # escape the MarkdownV2-special parentheses, as the live adapter does (#74004).
+            from plugins.platforms.telegram.adapter import _separate_chunk_indicator_from_fence
+            chunks = [
+                _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
+                for chunk in chunks
+            ]
+        for chunk in chunks:
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
@@ -303,7 +343,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
         return _success("telegram", chat_id, warnings, message_id=str(last_msg.message_id))
     except ImportError:
-        return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
+        return {"error": "python-telegram-bot not installed. Run: "
+                f"{install_hint('telegram')}"}
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
 
@@ -365,7 +406,8 @@ async def _resolve_slack_user_target(token, chat_id):
     try:
         import aiohttp
     except ImportError:
-        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
+        return None, {"error": "aiohttp not installed. Run: "
+                      f"{install_hint('messaging')}"}
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(resolve_proxy_url())
@@ -537,7 +579,8 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     try:
         from plugins.platforms.matrix.adapter import MatrixAdapter
     except ImportError:
-        return {"error": "Matrix dependencies not installed. Run: pip install 'mautrix[encryption]'"}
+        return {"error": "Matrix dependencies not installed. Run: "
+                f"{install_hint('matrix')}"}
     adapter = MatrixAdapter(pconfig)
     try:
         if not await adapter.connect():
@@ -618,7 +661,7 @@ async def _send_qqbot(pconfig, chat_id, message):
     try:
         import httpx
     except ImportError:
-        return _error("QQBot direct send requires httpx. Run: pip install httpx")
+        return _error("QQBot direct send requires httpx. Run: hermes pm repair")
 
     # Profile-scoped lookup so a multiplex profile never borrows another's QQ credentials.
     from gateway.config import _getenv

@@ -78,22 +78,86 @@ earlier flood-coherence routes intact; the additive deadline DB can remain unuse
 
 ## Rate Boundary
 
-The proactive text/interim-edit slot remains 1 second (up to 60 calls/minute).
-The base typing loop has a separate default 2-second interval (up to 30/minute
-per active loop), and final/overflow edits, drafts, media, control, deletion and
-other direct Bot API paths are not all charged to one proactive slot. The sum is
-therefore not bounded by this implementation, even before concurrent topic turns.
-The 2026-09-27 follow-up adds no requests, retries, or producer frequency. It
-closes known-window bypasses and removes duplicate helper definitions. It does
-not claim a universal Telegram quota or a complete per-chat proactive budget.
-Do not retire the broader scheduling work in #107612 on this evidence, or change
-streaming/typing/icon preferences as a substitute for delivery correctness.
-The 2026-09-28 correction also adds no requests and suppresses known-window
-traffic. Outside a penalty, the configured 1-second send/edit slot permits up
-to 60/minute and the independent 2-second typing loop permits 30/minute per
-active loop: 90/minute with one loop, above the roughly 60/minute private and
-20/minute group envelopes. More concurrent loops increase that sum. The wider
-budget in #107612 remains necessary to prevent the first rate-limit event.
+**Patch identity:** `telegram-chat-budget` (re-expresses archived-fork HERMES-137, HERMES-084,
+the HERMES-004 coverage gaps and HERMES-005's producer rule on this fork's adapter).
+
+**Incident (2026-10-04).** The personal DM took a 5464s ban at 01:10 and a 24237s ban at
+20:14:48 (an `editMessageText` refused through `flood_guard`, which recorded the deadline
+without logging it). The chat carried ~28-56 concurrent topic sessions a day, double the
+prior days. The old limiters were a 1.0s send+interim-edit slot (60/min, the whole private
+ceiling by itself) beside one 2.0s typing loop per active session (30/min each, skipped only
+while a send held the lock), with final edits, drafts, deletions, topic edits and reactions
+unmetered. With 5-10 concurrent turns the typing loops alone could reach 150-300/min
+(estimate from turn durations: successes log only at debug).
+
+**Independent hypothesis (frozen before upstream search).** Every Bot API call to a chat
+spends one Telegram allowance, but the fork metered a subset with a limiter sized at the full
+ceiling. Fan-out multiplies the unmetered per-session typing loops. The correction belongs at
+the one point every request crosses, PTB's request layer (`ExtBot._do_post` passes every
+endpoint except `getUpdates`, raw `do_api_request` included, through `rate_limiter`), with one
+per-chat clock sized below the class ceiling and cosmetic traffic shed rather than queued.
+Weaker alternatives: per-path throttles (the sum stays unbounded, the original defect); PTB's
+`AIORateLimiter` (queues instead of shedding, needs `aiolimiter`, and has no notion of
+superseded previews or the durable deadline); config changes such as disabling typing or
+progress (degrade the product without bounding the sum).
+
+**Upstream (2026-10-04).** #107612 (open) tracks the missing shared budget. #99643 (open) and
+its unreviewed PR #99676 cover only typing and keep a `min()` floor that collapses to 1s.
+#107133 (open) is same-chat session fan-out, mitigated here but not fixed: N concurrent finals
+still share one chat's budget. All-state PR searches for `rate limiter telegram` and
+`per-chat budget telegram` found no implementation. Fork PR #304 (open) adds goal-notice
+retries after short flood windows. Those retries now spend the same slot, so it cannot exceed
+the budget. Checked and already native, so not ported: HERMES-085 (`delivery_ledger.py`
+and `outbox.py` treat `flood_control:<s>` as a timed deferral) and HERMES-109 (merged as #152,
+see `telegram-internal-delivery-recovery.md`).
+
+**Contract.** `plugins/platforms/telegram/chat_budget.py` owns one clock per chat.
+`ChatBudgetRateLimiter` is installed on the gateway Application, and `MeteredBot` wraps the
+standalone sender's bot. Each metered request (any non-`get*` endpoint carrying `chat_id`) takes
+the chat's next slot. Deliveries (sends, final and over-cap edits, overflow continuations,
+media, controls, deletions, topic edits, reactions) wait FIFO and are never dropped. Typing and
+drafts are shed when no slot is free. Interim edits are skipped by the adapter inside the
+3.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
+never eats a transport deadline. A request inside a durably recorded server penalty is refused
+locally with `RetryAfter` for every path. Any published `retry_after` widens that chat's gap
+2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
+floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
+`TurnRunner._PROGRESS_EDIT_INTERVAL` is 3.0s, the transport edit floor.
+
+| Path | Private worst case | Group worst case |
+| --- | --- | --- |
+| All metered calls to one chat (one shared slot) | 45/min (1.33s gap) | 15/min (4.0s gap) |
+| of which typing, at most | 15/min (4.0s) | 5/min (12.0s) |
+| of which interim edits and drafts, at most | 20/min (3.0s) | 15/min (4.0s) |
+| After a published `retry_after` (10 min) | 22.5/min | 7.5/min |
+| Ceiling (community envelope) | ~60/min | ~20/min |
+
+The sum is bounded by construction, because every path takes the same slot: 75% of each class
+ceiling regardless of concurrent sessions or topics. Not shared across processes: the slot
+clock (each process meters itself). Shared across processes: the durable penalty deadline,
+which the standalone lane now honours, so cron's standalone fallback can no longer spend
+requests or sleep for hours inside a ban. Reads (`get*`) and chat-less calls such as
+`answerCallbackQuery` are unmetered. Visible effect: with many topics active at once, typing
+indicators refresh chat-wide at most every 4s, so not every topic shows "typing" continuously,
+and progress bubbles update at most every 3s.
+
+**Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
+pins the summed per-chat rate against each class ceiling with every path saturated at once,
+classification by id, widening on the real error path plus its scope and expiry, the
+long-penalty refusal for every endpoint, the inline-cap floor, concurrent deliveries sharing
+the slot, the edit floor and metered finals, the producer interval against the imported floor,
+batched cleanup and its flood retention, and the standalone lane. The 30-session typing case
+fails on the pre-patch base (30 chat actions instead of 1).
+
+**Rollback:** Revert the `fix(telegram): one outbound budget per chat` commit. It removes
+`chat_budget.py`, the builder `rate_limiter`, `MeteredBot` in `tools/send_message_senders.py`,
+`delete_messages` (base, Telegram, cleanup grouping), the inline-cap helper and the 3.0s
+producer interval, and restores the 1.0s slot helpers. No state, schema or configuration
+migration is involved.
+
+**Retirement:** Retire when released upstream meters one per-chat budget across every Bot API
+call, sized by chat class, shedding cosmetic traffic and widening on `retry_after`, and passes
+the regression above.
 
 ## Provenance and patches
 
@@ -109,7 +173,96 @@ budget in #107612 remains necessary to prevent the first rate-limit event.
 - Emphasis is an own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906),
   open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19.
 
-## Verification
+## Reconnect Teardown During Text Sends
+
+**Patch identity:** `telegram-send-teardown`. A text send can pass admission,
+then wait for its chat lock, pacing slot, or retry while disconnect fences the
+adapter and clears its bot. Recheck before starting each Markdown/plain request
+and after lock/pacing waits. Return the existing retryable, pre-send refusal so
+the delivery owner keeps the reply. Preserve delivered split chunks and their
+certain remainder. If a previous transport request had an uncertain outcome,
+preserve its error instead of converting it into a certain pre-send refusal.
+
+Source: `plugins/platforms/telegram/adapter.py`. Proof:
+`tests/gateway/test_telegram_send_teardown.py`, plus reconnect, split-send and
+send-path health tests. No new calls, retries, shorter pacing, or longer turns
+are introduced. The inherited shared-rate limitations in Rate Boundary remain
+unresolved. Retire after an accepted upstream release passes these behavioral
+tests without this patch. Roll back this patch's adapter and tests together.
+There are no configuration or persistent-state changes.
+
+## Standalone Chunk Indicators
+
+**Patch identity:** `telegram-standalone-chunk-indicator`. When cron delivery
+falls back from the live adapter to the standalone sender (flood control,
+timeout, `send_path_degraded`), a long message is split and each chunk ends with
+a ` (n/m)` indicator. Those parentheses are reserved in MarkdownV2, so Telegram
+rejected every chunk with `Can't parse entities` and each one arrived as plain
+text. The live adapter already escapes the indicator, but the standalone sender
+did not. On 2026-10-01 standalone fallbacks rose from about 2 a day to 41, which
+made the problem visible across many crons.
+
+The adopted fix is upstream salvage PR
+[#126100](https://github.com/NousResearch/hermes-agent/pull/126100), for issue
+[#74004](https://github.com/NousResearch/hermes-agent/issues/74004). It is
+cherry-picked with original authorship. It escapes the indicator and separates
+it from a closing code fence, reusing `_separate_chunk_indicator_from_fence`.
+Source: `tools/send_message_senders.py`. Proof:
+`tests/tools/test_telegram_send_message_chunk_mdv2.py`, which fails on the
+unpatched sender. The standalone lane still sends MarkdownV2, never Rich
+Messages. That gap is unchanged.
+
+Retire after an accepted upstream release contains #126100, or an equivalent,
+and the proof test passes without this patch. Roll back by reverting the two
+commits. There are no configuration or persistent-state changes.
+
+## Cron Short Flood Wait
+
+**Patch identity:** `cron-short-flood-wait`. The standalone lane sends legacy
+MarkdownV2 only, so a cron that falls back there loses Rich Message features:
+`[^n]` footnotes arrive as literal text, and tables and `<details>` flatten. On
+2026-10-03 a personal-alerts delivery fell back because the live adapter refused
+it locally with `flood_control:3.59` while four alert monitors and active chats
+shared one DM. The standalone sender then sent 0.8s later, inside the window.
+
+The live lane now sits out a `flood_control:<seconds>` refusal and retries on the
+live adapter, as long as the cumulative wait for that target stays within
+`_LIVE_FLOOD_WAIT_BUDGET_SECS` (15s). Longer penalties, repeated refusals past the
+budget, and every other error still fall back to standalone, as before. Source:
+`cron/scheduler_delivery.py` (`_short_flood_wait`, `_live_send_text`). Proof:
+`TestShortFloodWaitStaysOnTheLiveLane` in
+`tests/cron/test_cron_live_delivery_confirmation.py`, which fails without the patch.
+
+Rate budget: no new calls. A refused live attempt during a known window makes
+no API call. The retry replaces the standalone send that would otherwise have
+followed, and moves it after the published window instead of inside it. The
+worker thread blocks for at most 15s per target. Cron output is not
+latency-sensitive. No upstream issue or PR covered this on 2026-10-03. Retire
+when the standalone lane can send Rich Messages, or upstream retries short live
+floods equivalently. Roll back by reverting the commit. There are no
+configuration or persistent-state changes.
+
+## Replacement Adapter Egress
+
+**Patch identity:** `telegram-replacement-adapter-egress`. When polling recovery
+rebuilds the adapter, a turn already in flight keeps the retired instance, whose
+`_bot` is gone. `send()` already forwards to the live adapter in `runner.adapters`.
+`edit_message()`, `delete_message()` and `send_typing()` did not. Their refusal was
+not retryable, so the progress loop stopped editing and sent every later tool line
+as its own reply. Observed 2026-10-03 in the Booking Analytics topic after the
+12:33 PDT adapter rebuild. These three calls now forward to the live adapter. With
+no live adapter, an edit returns a retryable `Not connected` unless the failure is
+permanently fatal.
+
+Source: `plugins/platforms/telegram/adapter.py`. Proof:
+`tests/gateway/test_telegram_replacement_adapter_egress.py`, red on the base. No new
+request types: a forwarded call replaces one that would otherwise have been a
+fresh send. Media sends (`send_image`, `send_voice`, `send_multiple_images`, local
+files) still refuse on a retired instance and remain a follow-up. Upstream has the
+same gap at `343500b354`. Retire when an upstream release forwards these calls.
+Roll back by reverting this patch's adapter and test changes. No state changes.
+
+## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,
 `tests/gateway/test_telegram_split_send_flood.py`,

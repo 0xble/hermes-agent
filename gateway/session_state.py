@@ -46,11 +46,19 @@ class ConversationState:
     one_turn_restore: Optional[Dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[Dict[str, Any]] = None  # /reasoning override
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent
+    service_tier_override_expires_at: float = 0.0  # wall-clock deadline; 0 = no expiry
+    service_tier_override_expiry_seconds: float = 0.0  # duration used in the one-shot notice
     last_resolved_model: str = ""  # last successfully-resolved non-empty model
     queued_events: List[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)
     sidecar_notes: List[str] = field(default_factory=list)  # one-shot must-deliver notes
-    ephemeral_pin: Optional[Tuple[Any, ...]] = None  # pinned session-context (change_key, text)
+    ephemeral_pin: Optional[Tuple[Any, ...]] = None  # pinned session-context (change_key, text, redact_pii)
+    # (channel_prompt, parent_chat_id) of the last non-internal turn; internal events reuse it
+    channel_pin: Optional[Tuple[Optional[str], Optional[str]]] = None
     vc_last: Optional[str] = None  # last voice-channel context delivered
+    # Set by /stop, cleared when the next non-internal turn is admitted. While set, background
+    # completions (delegations, processes, watch patterns) stay queued instead of waking the
+    # session, so a stop is not immediately undone by the completions the stop itself produced.
+    stop_latched: bool = False
 
     def clear(self) -> None:
         """Reset every field to its default, so new fields are cleared automatically."""

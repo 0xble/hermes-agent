@@ -17,6 +17,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +325,17 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
 
 
 @pytest.mark.asyncio
-async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
+async def test_inject_watch_notification_drops_stale_trigger_reply_anchor(monkeypatch, tmp_path):
+    """Regression for #52694: the synthetic watch event must not reuse the triggering
+    message id as its reply anchor.
+
+    The id names the message that STARTED the process; by the time the process exits the
+    user has often moved on, and a reply quoting that id answers a stale message (a finished
+    background job visibly replying to an old Discord DM message from another topic).
+    Routing stays on the persisted origin — Telegram DM-topic lanes route anchor-less
+    synthetic sends through the topic's message_thread_id (#87051) — and the original id
+    survives only as event metadata for debugging.
+    """
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
@@ -337,6 +348,7 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
             thread_id="24296",
             user_id="1",
             user_name="Fabio",
+            message_id="777",  # persisted origin: an equally stale triggering id
         )
     )
 
@@ -350,8 +362,21 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
 
     adapter.handle_message.assert_awaited_once()
     synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.message_id == "777"
+    assert synth_event.internal is True
+    # No stale anchor on the event OR the restored origin it routes through.
+    assert synth_event.message_id is None
+    assert synth_event.source.message_id is None
+    # Routing provenance is untouched: the notification still lands in the origin topic.
     assert synth_event.source.thread_id == "24296"
+    # The derived final-reply anchor is empty on every platform branch.
+    from gateway.platforms.base import _reply_anchor_for_event
+    assert _reply_anchor_for_event(synth_event) is None
+    # The original id survives for debugging only.
+    assert synth_event.metadata["original_trigger_message_id"] == "777"
+    # Unambiguous machine provenance: SYSTEM prefix still leads, footer appended, origin tagged.
+    assert synth_event.text.startswith("[SYSTEM: ")
+    assert synth_event.text.rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
+    assert synth_event.metadata["notification_origin"] == "process_registry_synthetic"
 
 
 @pytest.mark.asyncio
@@ -582,9 +607,75 @@ def test_build_process_event_source_named_profile_key(monkeypatch, tmp_path):
     assert source.profile == "work"
 
 
+
+
+@pytest.mark.asyncio
+async def test_coalesced_process_completion_wake_carries_footer(monkeypatch, tmp_path):
+    """The coalesced completion text still receives the model-only footer at wake time."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:dm:123:42"
+    runner.session_store._entries[session_key] = SimpleNamespace(
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="42")
+    )
+    events = [
+        ("ignored", {"session_id": "proc-1", "output": "one", "exit_code": 0}, None),
+        ("ignored", {"session_id": "proc-2", "output": "two", "exit_code": 0}, None),
+    ]
+    text = runner._format_coalesced_process_completions(events)
+
+    result = await runner._inject_watch_notification(text, {"session_key": session_key})
+
+    assert result is True
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text.rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_batch_wake_carries_footer(monkeypatch, tmp_path):
+    """An async-delegation completion that wakes a push adapter carries the footer."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:dm:123:43"
+    runner.session_store._entries[session_key] = SimpleNamespace(
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="43")
+    )
+    import gateway.run as gateway_run
+    import tools.async_delegation as async_delegation
+
+    group = [
+        {"type": "async_delegation", "session_key": session_key, "delegation_id": "deleg-push-1"},
+        {"type": "async_delegation", "session_key": session_key, "delegation_id": "deleg-push-2"},
+    ]
+    monkeypatch.setattr(
+        gateway_run, "_format_gateway_process_notification",
+        lambda evt: f"[ASYNC DELEGATION BATCH COMPLETE — {evt['delegation_id']}]",
+    )
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda evt, owner: "sibling-claim")
+    monkeypatch.setattr(runner, "_completion_delivery_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        runner, "_preflight_completion_delivery", AsyncMock(return_value=runner._CompletionClaim()),
+    )
+    monkeypatch.setattr(runner, "_settle_durable_claim", lambda *args: None)
+
+    result = await runner._deliver_async_delegation_group(group)
+
+    assert result is True
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    assert "2 background subagent delegations" in text
+    assert all(evt["delegation_id"] in text for evt in group)
+    assert text.rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
+
+
 # ---------------------------------------------------------------------------
 # api_server (stateless) wake routing — gateway/wake.py self-post path
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch, tmp_path):
@@ -616,9 +707,11 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     assert result is True
     api_adapter.handle_message.assert_not_awaited()
-    assert posts == [
-        {"text": "[SYSTEM: subagent finished]", "session_id": "raw-hq-session-id"}
-    ]
+    # A raw api_server self-post wakes a model turn, so it receives the footer.
+    assert len(posts) == 1
+    assert posts[0]["session_id"] == "raw-hq-session-id"
+    assert posts[0]["text"].startswith("[SYSTEM: subagent finished]")
+    assert posts[0]["text"].rstrip().endswith(INTERNAL_NOTIFICATION_FOOTER)
 
 
 @pytest.mark.asyncio
@@ -699,6 +792,9 @@ async def test_async_delegation_apiserver_persists_delivery_not_self_post(
     assert len(persisted) == 1
     assert persisted[0]["session_id"] == "raw-hq-session-id"
     assert persisted[0]["evt"]["delegation_id"] == "deleg_85957"
+    # Persist-only API delivery must remain verbatim: no model turn runs here.
+    assert persisted[0]["text"] == "[ASYNC DELEGATION BATCH COMPLETE — deleg_85957]"
+    assert INTERNAL_NOTIFICATION_FOOTER not in persisted[0]["text"]
 
 
 @pytest.mark.asyncio

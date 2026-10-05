@@ -4,11 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import closing
 from contextvars import ContextVar
 from dataclasses import fields
 from datetime import datetime
+from pathlib import Path
 
 from gateway.config import Platform
+from gateway.deadline import connect_sqlite
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.session_identity import identity_of
@@ -96,9 +99,47 @@ class OwnedRouting:
         return keys
 
     def validate_live(self):
-        keys = self._live_keys()
+        keys = self._live_keys() | self._delegation_keys()
         if any(not key.startswith("agent:") for key in keys):
             raise RuntimeError("unscoped session obligation during transfer")
+        return keys
+
+    def _delegation_keys(self):
+        # A child finishing is not its result being admitted. Keep the spawning
+        # session on A through durable completion delivery, including that gap.
+        from gateway.status import get_process_start_time, start_time_fingerprints_match
+        pid = self.generation.identity.pid
+        try:
+            started = get_process_start_time(pid)
+        except Exception:
+            started = None
+        served = getattr(self.generation.runner, '_served_profile_homes', None)
+        homes = {self.generation.coordinator.home,
+                 *(served.values() if isinstance(served, dict) else ())}
+        keys = set()
+        for home in homes:
+            path = Path(home) / 'state.db'
+            if not path.exists():
+                continue
+            with closing(connect_sqlite(f'file:{path}?mode=ro', uri=True)) as conn:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name='async_delegations'").fetchone():
+                    rows = conn.execute(
+                        "SELECT origin_session, owner_started_at FROM async_delegations "
+                        "WHERE owner_pid=? AND delivery_state='pending'", (pid,))
+                    for origin, recorded in rows:
+                        if not origin:
+                            continue
+                        # Unknown ownership metadata must stay with this process. Only a
+                        # clearly mismatched fingerprint proves PID reuse.
+                        if recorded is None or started is None:
+                            keys.add(origin)
+                            continue
+                        try:
+                            matches = start_time_fingerprints_match(recorded, started)
+                        except Exception:
+                            matches = True
+                        if matches:
+                            keys.add(origin)
         return keys
 
     def claim_live(self):
@@ -138,12 +179,17 @@ class OwnedRouting:
             str(event.platform_update_id), "message", envelope, payload,
             self.generation.identity.id, self.generation.epoch)
         if row["owner_id"] == self.generation.identity.id:
+            scope = (self.generation.identity.id, home, identity.runtime_profile,
+                     identity.transport_profile, key, event.platform_update_id,
+                     event.source.user_id, event.source.chat_id, event.source.thread_id)
             if not fresh:
                 return not (row["payload"] == b"{}" and
+                            getattr(event, "_owned_local_scope", None) == scope and
                             getattr(event, "_owned_local_pending", None) == row["id"])
             if row["payload"] != b"{}":
                 return True  # An earlier replay row owns this lane; drain in sequence.
             event._owned_local_pending = row["id"]
+            event._owned_local_scope = scope
             return False
         return True
 
@@ -197,7 +243,9 @@ class OwnedRouting:
                 rows = [dict(row) for row in db.execute(
                     "SELECT * FROM inbox WHERE owner_id=? AND state='pending' ORDER BY id", (owner,))]
                 foreign = [row[0] for row in db.execute(
-                    "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending'", (owner,))]
+                    "SELECT DISTINCT owner_id FROM inbox WHERE owner_id!=? AND state='pending' "
+                    "UNION SELECT generation_id FROM sessions WHERE generation_id!=? AND outstanding_work>0",
+                    (owner, owner))]
             return rows, foreign
 
         rows, foreign = await asyncio.to_thread(read_inbox)
@@ -267,7 +315,7 @@ class OwnedRouting:
                         "SELECT * FROM sessions WHERE generation_id=?", (owner,))]
 
             claims = await asyncio.to_thread(read_claims)
-            live = self._live_keys()
+            live = self._live_keys() | await asyncio.to_thread(self._delegation_keys)
             from tools.process_registry import process_registry
             # A claim is retained only for work belonging to its own session.
             lease_rows = await asyncio.to_thread(store.leases)

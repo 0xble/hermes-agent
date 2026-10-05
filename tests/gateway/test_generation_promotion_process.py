@@ -31,6 +31,34 @@ from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
 TOKEN = "123456:LOCAL_STUB_ONLY"
 
 
+def _handover_with_diagnostics(home, successor_id, processes, stderr_paths=(), **kwargs):
+    try:
+        return handover_to_generation(home, successor_id, **kwargs)
+    except Exception as exc:
+        diagnostics = []
+        for path in stderr_paths:
+            diagnostics.append(f"{path.name}:\n{path.read_text()[-12000:]}")
+        for proc in processes:
+            if proc.stderr is not None:
+                os.set_blocking(proc.stderr.fileno(), False)
+                chunks = []
+                while True:
+                    try:
+                        chunk = os.read(proc.stderr.fileno(), 65536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                diagnostics.append(f"pid={proc.pid} exit={proc.poll()} stderr:\n" +
+                                   b"".join(chunks).decode(errors="replace")[-12000:])
+        log = home / "logs" / "gateway.log"
+        diagnostics.append("gateway.log tail:\n" + (log.read_text()[-24000:] if log.exists() else "missing"))
+        coordinator = GenerationCoordinator(home)
+        diagnostics.append(f"generations={coordinator.generations()!r}\nleases={coordinator.leases()!r}")
+        raise AssertionError(f"handover failed: {exc!r}\n" + "\n".join(diagnostics)) from exc
+
+
 def _worker(standby: bool):
     from gateway.config import load_gateway_config
     from gateway.run import start_gateway
@@ -39,7 +67,7 @@ def _worker(standby: bool):
         run_generation.HANDOVER_REQUEST_TIMEOUT = 2
     if not standby and os.environ.get("TEST_PAUSE_TRANSFER"):
         from gateway.run_generation import ActiveGeneration
-        async def paused_transfer(self, new_id: str) -> dict:
+        async def paused_transfer(self, new_id: str, **kwargs) -> dict:
             Path(os.environ["TEST_PAUSE_TRANSFER"]).touch()
             await asyncio.Event().wait()
             return {}
@@ -48,7 +76,7 @@ def _worker(standby: bool):
         from gateway.run_generation import ActiveGeneration
         from gateway.platforms.event import MessageEvent, MessageType
         original_transfer = ActiveGeneration.transfer_requested
-        async def transfer_with_photo(self, new_id):
+        async def transfer_with_photo(self, new_id, **kwargs):
             for adapter in self._telegram_adapters().values():
                 adapter._media_batch_delay_seconds = 120
                 source = adapter.build_source(chat_id="1", chat_type="dm", user_id="1")
@@ -58,7 +86,7 @@ def _worker(standby: bool):
                 batch_key = adapter._photo_batch_key(event, SimpleNamespace(media_group_id=None))
                 adapter._pending_photo_batches[batch_key] = event
                 adapter._pending_photo_batch_tasks[batch_key] = asyncio.create_task(adapter._flush_photo_batch(batch_key))
-            return await original_transfer(self, new_id)
+            return await original_transfer(self, new_id, **kwargs)
         from types import SimpleNamespace
         ActiveGeneration.transfer_requested = transfer_with_photo
     print(f"WORKER:{'B' if standby else 'A'}", flush=True)
@@ -135,10 +163,10 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                     raise AssertionError(f"gateway exit {proc.returncode}: {stderr_paths[-1].read_text()}")
                 if len(GenerationCoordinator(home).generations()) >= expected:
                     rows = GenerationCoordinator(home).generations()
-                    if standby and any(row["state"] == "ready" and row["label"] == "ai.hermes.gateway-b"
+                    if standby and any(row["state"] == "standby" and row["label"] == "ai.hermes.gateway-b"
                                        for row in rows):
                         break
-                    if not standby and any(row["state"] in {"ready", "serving"} and
+                    if not standby and any(row["state"] in {"standby", "serving"} and
                                            row["label"] == "ai.hermes.gateway" for row in rows):
                         break
                 await asyncio.sleep(.1)
@@ -167,7 +195,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
                 with api.lock:
                     assert not any("old-turn-complete" in item["text"] for item in api.sent)
         db = GenerationCoordinator(home)
-        successor = next(row for row in db.generations() if row["state"] == "ready" and row["label"] == "ai.hermes.gateway-b")
+        successor = next(row for row in db.generations() if row["state"] == "standby" and row["label"] == "ai.hermes.gateway-b")
         with api.lock:
             before = len(api.offsets)
             assert before > 0, "A never entered a real getUpdates loop"
@@ -182,7 +210,7 @@ async def test_two_gateway_processes_promote_without_overlapping_pollers(tmp_pat
             f"A exited before handover: code={processes[0].returncode}, "
             f"stderr={stderr_paths[0].read_text() if processes[0].returncode is not None else ''}")
         try:
-            result = await asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=35)
+            result = await asyncio.to_thread(_handover_with_diagnostics, home, successor["id"], processes, stderr_paths, timeout=35)
         except Exception as exc:
             from gateway.run_generation import _generation_request
             successor_socket = generation_paths(home, GenerationIdentity(**{key: successor[key] for key in
@@ -439,7 +467,7 @@ async def test_split_text_batch_flushed_by_old_process_during_promotion(tmp_path
             while time.monotonic() < deadline:
                 rows = GenerationCoordinator(home).generations()
                 if any(row["label"] == ("ai.hermes.gateway-b" if standby else "ai.hermes.gateway")
-                       and row["state"] in ({"ready"} if standby else {"serving"}) for row in rows):
+                       and row["state"] in ({"standby"} if standby else {"serving"}) for row in rows):
                     break
                 if process.poll() is not None:
                     raise AssertionError(error_path.read_text())
@@ -486,7 +514,7 @@ async def test_split_text_batch_flushed_by_old_process_during_promotion(tmp_path
             raise AssertionError("split chunk did not reach old poller")
         with api.lock:
             assert not any("split-batch-complete" in row["text"] for row in api.sent)
-        await asyncio.to_thread(handover_to_generation, home, new["id"], timeout=35)
+        await asyncio.to_thread(_handover_with_diagnostics, home, new["id"], processes, stderr_paths, timeout=35)
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
             with api.lock:
@@ -557,7 +585,7 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, 
             deadline = time.monotonic() + 25
             while time.monotonic() < deadline:
                 rows = GenerationCoordinator(home).generations()
-                if len(rows) == len(processes) and rows[-1]["state"] in ({"ready"} if standby else {"serving", "ready"}):
+                if len(rows) == len(processes) and rows[-1]["state"] in ({"standby"} if standby else {"serving", "standby"}):
                     break
                 assert proc.poll() is None, f"gateway died {proc.returncode}"
                 await asyncio.sleep(.1)
@@ -582,7 +610,7 @@ async def test_killing_old_before_stop_receipt_never_promotes_standby(tmp_path, 
         with pytest.raises(RuntimeError):
             await request
         assert db.leases()[0]["generation_id"] != successor["id"]
-        assert next(row for row in db.generations() if row["id"] == successor["id"])["state"] == "ready"
+        assert next(row for row in db.generations() if row["id"] == successor["id"])["state"] == "standby"
         with api.lock:
             assert api.maximum <= 1
     finally:
@@ -636,7 +664,7 @@ async def test_driver_killed_after_stop_receipt_rearms_old_and_retry_succeeds(tm
             while time.monotonic() < end:
                 rows = db.generations()
                 if len(rows) == len(processes) and rows[-1]["state"] in (
-                        {"ready"} if standby else {"serving", "ready"}):
+                        {"standby"} if standby else {"serving", "standby"}):
                     break
                 assert proc.poll() is None, f"gateway exited {proc.returncode}: {proc.stderr.read()}"
                 await asyncio.sleep(.1)
@@ -688,8 +716,8 @@ async def test_driver_killed_after_stop_receipt_rearms_old_and_retry_succeeds(tm
             state = conn.execute("SELECT state FROM generation_transfers").fetchone()[0]
         assert state == "aborted"
         assert db.leases()[0]["generation_id"] != successor["id"]
-        assert next(row for row in db.generations() if row["id"] == successor["id"])["state"] == "ready"
-        assert await asyncio.to_thread(handover_to_generation, home, successor["id"], timeout=15) > 1
+        assert next(row for row in db.generations() if row["id"] == successor["id"])["state"] == "standby"
+        assert await asyncio.to_thread(_handover_with_diagnostics, home, successor["id"], processes, timeout=15) > 1
         with api.lock:
             assert api.maximum == 1 and not api.errors
     finally:

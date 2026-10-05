@@ -5,7 +5,7 @@ from copy import deepcopy
 from unittest.mock import Mock
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from cron import scheduler
 from cron.scheduler_preflight import _preflight_check_provider_key

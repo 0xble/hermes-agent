@@ -21,10 +21,8 @@ from tools.cronjob_tools import (
     cronjob,
 )
 
-
 _JOB = {"id": "job-bg-1", "name": "bg run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
-
 
 def _job(job_id):
     """Per-test job dict with a UNIQUE id.
@@ -36,7 +34,6 @@ def _job(job_id):
     """
     return {"id": job_id, "name": f"bg run {job_id}", "prompt": "hi",
             "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
-
 
 def _bound_session_key(key="agent:main:telegram:dm:123"):
     """Context manager binding the approval session key contextvar."""
@@ -53,7 +50,6 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
             _approval_session_key.reset(token)
 
     return _cm()
-
 
 class TestBackgroundDispatch:
     def test_dispatches_and_returns_handle_immediately(self):
@@ -164,7 +160,6 @@ class TestBackgroundDispatch:
         assert res["claimed"] is False
         assert "paused/disabled" in res["error"]
         m_disp.assert_not_called()
-
 
 class TestSyncFallbacks:
     def test_no_session_key_falls_back_to_sync(self):
@@ -326,8 +321,6 @@ class TestInFlightDedupe:
         finally:
             sched.release_running_job("job-bg-10")
 
-
-
 class TestCronjobRunToolIntegration:
     def test_run_action_returns_background_note(self):
         """cronjob(action='run') surfaces the handle + do-not-wait note."""
@@ -344,4 +337,3 @@ class TestCronjobRunToolIntegration:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_mode"] == "background"
         assert out["job"]["delegation_id"]
-

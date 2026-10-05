@@ -17,12 +17,24 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
+
+from gateway.delivery_ledger import (
+    SHORT_FLOOD_WAIT_BUDGET_SECONDS as _LIVE_FLOOD_WAIT_BUDGET_SECS,
+    short_flood_wait as _short_flood_wait,
+)
+
+# A live-lane send refused with a short ``flood_control:<seconds>`` penalty is retried on the live
+# lane after the wait instead of falling back to the standalone sender, which cannot send Telegram
+# Rich Messages. Keep the shared budget and parser beside the call site so cron and goal notices
+# use the same bounded recovery contract. Longer penalties, or repeated refusals past the budget,
+# still fall back.
 
 
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
@@ -910,6 +922,13 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                      f"profile's environment ({type(exc).__name__}: {exc}); do not resend")
     if home.parent.name != "profiles":
         argv += ["-p", "default"]
+    if argv[1:3] == ["-m", "hermes_cli.main"]:
+        # served_profile_child_env strips Hermes-owned PYTHONPATH entries; under a store-python
+        # shim the bare interpreter then cannot import the package find_spec just proved (#122487).
+        from pathlib import Path
+
+        from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+        pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
 
     query_file = None
     try:
@@ -1271,7 +1290,7 @@ def _cron_delivery_notify_enabled(cfg: Optional[dict]) -> bool:
 
 
 def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
-    """Persist ``last_delivery_unverified``: list of ``platform:chat_id`` targets acked with no
+    """Persist ``last_delivery_unverified``: list of ``platform:chat_id[:thread_id]`` targets acked with no
     evidence, or None, alongside queued Bot Chat receipts. Never raises (bookkeeping must not fail a
     delivery)."""
     new_value = list(unverified_targets) or None
@@ -1317,6 +1336,7 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
 
     @property
     def is_relay(self) -> bool:
@@ -1324,7 +1344,9 @@ class _TargetDelivery:
 
     @property
     def where(self) -> str:
-        return f"{self.platform_name}:{self.chat_id}"
+        # A topic-routed target without its thread id names the wrong lane in failure reports.
+        base = f"{self.platform_name}:{self.chat_id}"
+        return f"{base}:{self.thread_id}" if self.thread_id else base
 
 
 def _note_target_error(job: dict, msg: str, errors: list) -> None:
@@ -1477,34 +1499,49 @@ def _live_send_text(
     # Send through the already-authorized transport: re-resolving from the plain target_adapters
     # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
     # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
-    future = safe_schedule_threadsafe(
-        router._deliver_to_platform(
-            route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
-    if future is None:
-        target_errors.append("live adapter event loop scheduling failed")
-        return False, False, None
-    try:
-        send_result = future.result(timeout=60)
-    except TimeoutError:
-        # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
-        # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
-        # started (loop wedged): MUST fall through to standalone or it is silently dropped.
-        if future.cancel():
-            msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
-            logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
-            target_errors.append(msg)
+    flood_waited = 0.0
+    while True:
+        future = safe_schedule_threadsafe(
+            router._deliver_to_platform(
+                route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
+        if future is None:
+            target_errors.append("live adapter event loop scheduling failed")
             return False, False, None
-        logger.warning(
-            "Job '%s': live adapter send to %s:%s timed out "
-            "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
-            "to avoid duplicate)",
-            job["id"], t.platform_name, t.chat_id)
-        return True, True, None
-    except Exception as ex:
-        # Real send error (not a slow confirmation): fall through to standalone.
-        target_errors.append(f"live adapter send failed: {ex}")
-        raise
+        try:
+            send_result = future.result(timeout=60)
+        except TimeoutError:
+            # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
+            # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
+            # started (loop wedged): MUST fall through to standalone or it is silently dropped.
+            if future.cancel():
+                msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
+                logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
+                target_errors.append(msg)
+                return False, False, None
+            logger.warning(
+                "Job '%s': live adapter send to %s:%s timed out "
+                "after 60s; already dispatched (in flight), "
+                "assuming delivered (skipping standalone fallback "
+                "to avoid duplicate)",
+                job["id"], t.platform_name, t.chat_id)
+            return True, True, None
+        except Exception as ex:
+            # A short flood window is cheaper to sit out than the standalone lane, which cannot send
+            # Telegram Rich Messages and degrades footnotes, tables and <details> to legacy markup.
+            wait = _short_flood_wait(ex, flood_waited)
+            if wait is not None:
+                logger.info(
+                    "Job '%s': live adapter send to %s hit %s; waiting %.1fs before retrying",
+                    job["id"], t.where, ex, wait)
+                time.sleep(wait)
+                flood_waited += wait
+                continue
+            # Real send error (not a slow confirmation): fall through to standalone. The router raises
+            # a failed SendResult's error string, so this is where send_path_degraded arrives.
+            t.live_error = str(ex)
+            target_errors.append(f"live adapter send failed: {ex}")
+            raise
+        break
 
     # _deliver_to_platform returns a SendResult, or a plain dict {"success": True, "delivered":
     # False, ...} when the silence-narration filter drops the message.
@@ -1525,6 +1562,7 @@ def _live_send_text(
         else:
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
+        t.live_error = str(err) if err else None
         _warn_live_lane_failure(job, msg, t.is_relay)
         target_errors.append(msg)
         return False, False, None
@@ -1740,6 +1778,35 @@ def _standalone_send(
         return _failed(e)
 
 
+def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: list, delivery_errors: list) -> None:
+    """Hand a payload the live lane rejected as reconnect-only (``send_path_degraded``) and the
+    standalone lane then failed to send to the delivery ledger, as a failed reconnect-only row
+    owned by the adapter that rejected it: the post-reconnect sweep redelivers it (#125363). Only
+    reached after standalone failed, so nothing was sent and a replay cannot duplicate. The ledger
+    carries text only; dropped attachments are reported."""
+    try:
+        from gateway.delivery_ledger import (
+            compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
+        if not is_reconnect_only(t.live_error) or not ledger_enabled():
+            return
+        session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
+        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", content)
+        record_obligation(
+            obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
+            chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
+            adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
+        mark_failed(obligation_id, str(t.live_error))
+    except Exception:
+        logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
+                       t.job.get("id"), t.where, exc_info=True)
+        return
+    note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
+    if media_files:
+        note += f" ({len(media_files)} attachment(s) not queued)"
+    logger.warning("Job '%s': %s", t.job.get("id"), note)
+    delivery_errors.append(note)
+
+
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
 ) -> None:
@@ -1759,6 +1826,9 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
+        # A satellite profile's worker has no platform token, so standalone cannot stand in for a
+        # live adapter that is only waiting to reconnect: keep the payload for that adapter.
+        _queue_for_live_reconnect(t, content, media_files, delivery_errors)
         return
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.

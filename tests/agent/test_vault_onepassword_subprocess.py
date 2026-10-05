@@ -127,8 +127,8 @@ def assert_no_secret_diagnostics(capfd, caplog, *diagnostics):
 
 
 @pytest.mark.parametrize("fake_op", [
-    pytest.param(None, marks=pytest.mark.linux_only, id="linux"),
-    pytest.param(None, marks=pytest.mark.macos_only, id="macos"),
+    pytest.param(None, marks=pytest.mark.platforms("linux"), id="linux"),
+    pytest.param(None, marks=pytest.mark.platforms("macos"), id="macos"),
 ], indirect=True)
 def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, capfd, caplog):
     profile, calls, state = fake_op
@@ -171,8 +171,8 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
 
 
 @pytest.mark.parametrize("fake_op", [
-    pytest.param(None, marks=pytest.mark.linux_only, id="linux"),
-    pytest.param(None, marks=pytest.mark.macos_only, id="macos"),
+    pytest.param(None, marks=pytest.mark.platforms("linux"), id="linux"),
+    pytest.param(None, marks=pytest.mark.platforms("macos"), id="macos"),
 ], indirect=True)
 def test_real_subprocess_auth_is_scoped_and_empty_profile_fails_closed(fake_op, capfd, caplog):
     profile, calls, _ = fake_op

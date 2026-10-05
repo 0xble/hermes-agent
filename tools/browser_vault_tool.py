@@ -714,7 +714,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     # human-readable card metadata uses the existing tab/origin component registry.
     from agent.redact import (
         mark_vault_protected_tab, register_vault_card_component,
-        register_vault_date_component, register_vault_redaction_value,
+        register_vault_date_component,
     )
     protected_tab = browser_key if meta.kind in ("payment", "protected_field") else effective_task_id
     if meta.kind == "payment":

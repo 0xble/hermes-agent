@@ -23,7 +23,6 @@ from pathlib import Path
 
 import pytest
 
-
 @pytest.fixture(autouse=True)
 def _isolate_env(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
@@ -33,14 +32,12 @@ def _isolate_env(tmp_path, monkeypatch):
     monkeypatch.delenv("SECURITY_GUIDANCE_DISABLE", raising=False)
     yield hermes_home
 
-
 # ---------------------------------------------------------------------------
 # Module loading
 # ---------------------------------------------------------------------------
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
-
 
 def _load_patterns():
     """Import patterns.py in isolation (no plugin glue)."""
@@ -51,7 +48,6 @@ def _load_patterns():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
-
 
 def _load_plugin_init():
     """Import the plugin __init__.py with patterns.py as a sibling."""
@@ -71,7 +67,6 @@ def _load_plugin_init():
     sys.modules["hermes_plugins.security_guidance"] = mod
     spec.loader.exec_module(mod)
     return mod
-
 
 # ---------------------------------------------------------------------------
 # patterns.py data integrity
@@ -93,7 +88,6 @@ class TestPatternsData:
         names = [r["ruleName"] for r in p.SECURITY_PATTERNS]
         assert len(names) == len(set(names))
 
-
 # ---------------------------------------------------------------------------
 # _scan_content
 # ---------------------------------------------------------------------------
@@ -106,7 +100,6 @@ class TestScanContent:
         )
         names = [n for n, _ in findings]
         assert "pickle_deserialization" in names
-
 
     def test_method_call_eval_does_not_trip(self):
         """model.eval() / redis.eval() / spec.eval() must not match eval_injection."""
@@ -183,7 +176,6 @@ class TestScanContent:
         big = "x" * (1024 * 1024) + "\npickle.load(open('p.pkl', 'rb'))\n"
         assert mod._scan_content("/tmp/foo.py", big) == []
 
-
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
@@ -215,7 +207,6 @@ class TestTransformToolResultHook:
             )
             is None
         )
-
 
     def test_patch_tool_new_string_scanned(self):
         mod = _load_plugin_init()
@@ -266,7 +257,6 @@ class TestTransformToolResultHook:
             is None
         )
 
-
 class TestPreToolCallHook:
 
     def test_blocks_in_block_mode_on_dangerous_pattern(self, monkeypatch):
@@ -279,7 +269,6 @@ class TestPreToolCallHook:
         assert "pickle_deserialization" in out["message"]
         assert "SECURITY_GUIDANCE_BLOCK" in out["message"]  # tells user how to disable
 
-
 # ---------------------------------------------------------------------------
 # Bundled-plugin discovery
 # ---------------------------------------------------------------------------
@@ -287,7 +276,7 @@ class TestPreToolCallHook:
 class TestPluginDiscovery:
     def test_manifest_declares_registered_hooks(self):
         """Manifest metadata must use the field consumed by plugin discovery."""
-        import yaml
+        import hermes_yaml as yaml
 
         plugin_dir = _repo_root() / "plugins" / "security-guidance"
         manifest = yaml.safe_load(
@@ -303,4 +292,3 @@ class TestPluginDiscovery:
         mod.register(HookContext())
         assert set(manifest["provides_hooks"]) == set(registered)
         assert "hooks" not in manifest
-

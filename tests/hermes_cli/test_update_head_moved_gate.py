@@ -22,23 +22,22 @@ from hermes_cli import update_cmd
 
 def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
-    calls = {"n": 0}
+    state = {"merged": False}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+        if "merge" in cmd and "--ff-only" in cmd:
+            state["merged"] = True
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
         if joined.endswith("rev-parse HEAD"):
-            if calls["n"] == 0:
-                calls["n"] += 1
-                return SimpleNamespace(returncode=0, stdout=f"{pre_sha}\n", stderr="")
-            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+            sha = post_sha if state["merged"] else pre_sha
+            return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect
-
 
 def _make_head_pinned_side_effect(sha="abc123"):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
@@ -59,7 +58,6 @@ def _make_head_pinned_side_effect(sha="abc123"):
 
     return side_effect
 
-
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Patch the hermes_cli.main helpers ``_cmd_update_impl`` touches.
 
@@ -69,6 +67,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate
     monkeypatch.setattr(
         hermes_main, "_resolve_update_branch", lambda args: "main"
@@ -99,10 +98,10 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
     )
-    # This gate precedes the fresh-interpreter handoff. Stop at that boundary,
-    # rather than mocking helpers removed by the post-swap updater refactor.
+    # This gate precedes completion in the selected interpreter. Stop at the
+    # current completion boundary rather than the frozen historical shim.
     handoff = Mock()
-    monkeypatch.setattr(update_cmd, "_hand_off_post_swap", handoff)
+    monkeypatch.setattr(update_cmd, "_complete_source_update", handoff)
     return handoff
 
 
@@ -116,8 +115,9 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Code did not move" not in out
     handoff.assert_called_once()
-    assert handoff.call_args.kwargs["swap"] == "git"
-    assert handoff.call_args.kwargs["pre_pull_sha"] == "abc123"
+    request = handoff.call_args.args[0]
+    assert request.get("apply_mode", "git") == "git"
+    assert request["expected_sha"] == "def456"
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
@@ -133,4 +133,3 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     handoff.assert_not_called()
     out = capsys.readouterr().out
     assert "✓ Code updated!" not in out
-

@@ -6,17 +6,17 @@ print and issue strings to append. No printing inside workers — the caller pri
 
 from __future__ import annotations
 
+from pm import install_hint
 import concurrent.futures
 import errno
 import functools
 import os
 import socket
-import sys
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
 from hermes_cli.colors import Colors, color
-from hermes_cli.models import _HERMES_USER_AGENT
+from hermes_cli.models import _hermes_user_agent
 from hermes_constants import OPENROUTER_MODELS_URL
 from utils import base_url_host_matches
 
@@ -211,7 +211,7 @@ def _anthropic_messages_probe(base: str, key: str):
     from agent.anthropic_endpoints import _requires_bearer_auth
     normalized, kwargs = _base_client_kwargs(base, None)
     auth = {"Authorization": f"Bearer {key}"} if _requires_bearer_auth(normalized) else {"x-api-key": key}
-    headers = {"anthropic-version": "2023-06-01", "User-Agent": _HERMES_USER_AGENT, **auth}
+    headers = {"anthropic-version": "2023-06-01", "User-Agent": _hermes_user_agent(), **auth}
     model = str(_model_cfg().get("default") or "").strip() or "claude-sonnet-4-5"
     body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
     return httpx.post(normalized + "/v1/messages", headers=headers, params=kwargs.get("default_query"), json=body, timeout=10)
@@ -242,7 +242,7 @@ def _apikey_request(key: str, base_env, default_url) -> tuple:
     if base_url_host_matches(base, "api.kimi.com") and base.rstrip("/").endswith("/coding"):
         base = base.rstrip("/") + "/v1"
     url = (base.rstrip("/") + "/models") if base else default_url
-    headers = {"Authorization": f"Bearer {key}", "User-Agent": _HERMES_USER_AGENT}
+    headers = {"Authorization": f"Bearer {key}", "User-Agent": _hermes_user_agent()}
     if base_url_host_matches(base, "api.kimi.com"):
         headers["User-Agent"] = "claude-code/0.1.0"
     # Google's Generative Language API rejects ``Authorization: Bearer <api-key>`` with 401
@@ -279,8 +279,10 @@ def _probe_bedrock() -> ProbeResult:
         n = len(client.list_foundation_models().get("modelSummaries", []))
         return _row(name, "ok", f"({auth_var}, {region}, {n} models)", label=label)
     except ImportError:
-        pip = f"{sys.executable} -m pip install boto3"
-        return _row(name, "warn", f"(boto3 not installed — {pip})", [f"Install boto3 for Bedrock: {pip}"], label=label)
+        hint = ("From the Hermes environment, run: "
+                f"{install_hint('bedrock')}. "
+                "Then restart Hermes.")
+        return _row(name, "warn", "(boto3 not installed)", [hint], label=label)
     except Exception as e:
         err_name = type(e).__name__
         return _row(name, "warn", f"({err_name}: {e})", [f"AWS Bedrock: {err_name} — check IAM permissions for bedrock:ListFoundationModels"], label=label)
@@ -311,7 +313,9 @@ def _probe_azure_entra() -> ProbeResult:
     except Exception as exc:
         return _row(name, "warn", f"(adapter import failed: {exc})", [f"Azure Foundry adapter import failed: {exc}"], label=label)
     if not has_azure_identity_installed():
-        return _row(name, "warn", "(azure-identity not installed)", [f"Install azure-identity: {sys.executable} -m pip install azure-identity"], label=label)
+        return _row(name, "warn", "(azure-identity not installed)", ["From the Hermes environment, run: "
+                     f"{install_hint('azure-identity')}. "
+                     "Then restart Hermes."], label=label)
     entra_cfg = model_cfg.get("entra") or {}
     scope = (str(entra_cfg.get("scope") or "").strip() if isinstance(entra_cfg, dict) else "") or SCOPE_AI_AZURE_DEFAULT
     info = describe_active_credential(config=EntraIdentityConfig(scope=scope), timeout_seconds=10.0)
@@ -391,7 +395,7 @@ def _probe_github_token() -> ProbeResult:
     try:
         import httpx
         r = httpx.get(GITHUB_API_PROBE_URL, timeout=10, headers={
-            "Authorization": f"Bearer {get_env_value(var)}", "User-Agent": _HERMES_USER_AGENT,
+            "Authorization": f"Bearer {get_env_value(var)}", "User-Agent": _hermes_user_agent(),
             "Accept": "application/vnd.github+json"})
     except Exception as e:
         return _row(name, "fail", f"({e})", ["Check network connectivity"])

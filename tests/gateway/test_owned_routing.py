@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -23,18 +24,114 @@ def _identity(release_sha, label):
         start_fingerprint=f"{os.getpid()}:{_get_process_start_time(os.getpid())}")
 
 
+def _pending_delegation(home, *, owner_pid, owner_started_at):
+    conn = sqlite3.connect(home / "state.db")
+    try:
+        conn.execute("""CREATE TABLE async_delegations (
+            delegation_id TEXT PRIMARY KEY,
+            origin_session TEXT NOT NULL,
+            delivery_state TEXT NOT NULL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER
+        )""")
+        conn.execute(
+            "INSERT INTO async_delegations VALUES (?, ?, 'pending', ?, ?)",
+            ("delegation-1", "agent:default:telegram:chat-1", owner_pid, owner_started_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _routing_for_delegation(tmp_path, pid):
+    coordinator = SimpleNamespace(home=tmp_path)
+    generation = SimpleNamespace(
+        coordinator=coordinator,
+        identity=SimpleNamespace(pid=pid),
+        runner=SimpleNamespace(adapters={}),
+    )
+    return OwnedRouting(generation)
+
+
+def test_delegation_with_unknown_start_time_is_retained(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: 1000)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=None)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == {
+        "agent:default:telegram:chat-1"
+    }
+
+
+def test_delegation_with_drifting_start_time_is_retained(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: 1000)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=1199)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == {
+        "agent:default:telegram:chat-1"
+    }
+
+
+def test_delegation_is_retained_when_process_start_time_is_unavailable(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: None)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=1000)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == {
+        "agent:default:telegram:chat-1"
+    }
+
+
+def test_delegation_with_reused_pid_is_excluded(tmp_path, monkeypatch):
+    pid = os.getpid()
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda value: 1000)
+    _pending_delegation(tmp_path, owner_pid=pid, owner_started_at=2001)
+    assert _routing_for_delegation(tmp_path, pid)._delegation_keys() == set()
+
+
+@pytest.mark.asyncio
+async def test_native_restore_replays_local_event_but_deduplicates_new_transport_object(tmp_path):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    store = GenerationCoordinator(tmp_path)
+    owner = _identity("a", "owner")
+    store.register(owner, state="serving")
+    epoch = store.acquire_lease("active_generation", owner.id)
+    runner = SimpleNamespace(_resolve_profile_home_for_source=lambda s: tmp_path)
+    routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
+    adapter = object.__new__(TelegramAdapter)
+    BasePlatformAdapter.__init__(adapter, PlatformConfig(enabled=True), Platform.TELEGRAM)
+    adapter.gateway_runner = runner
+    adapter._owned_routing = routing
+    adapter._is_sender_authorized = lambda *a, **kw: True
+    adapter.set_message_handler(lambda event: None)
+    dispatched = []
+    adapter._start_session_processing = lambda event, key: dispatched.append((event, key)) or True
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
+    setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
+    event = MessageEvent(text="during restore", source=source, platform_update_id=1)
+    await adapter.handle_message(event)
+    event._hermes_startup_restore_replay = True
+    await adapter.handle_message(event)
+    assert [item[0] for item in dispatched] == [event, event]
+    await adapter.handle_message(MessageEvent(text=event.text, source=source, platform_update_id=1))
+    assert len(dispatched) == 2
+    with store.connect() as db:
+        rows = db.execute("SELECT owner_id,state,payload FROM inbox").fetchall()
+    assert [(row["owner_id"], row["state"], row["payload"]) for row in rows] == [(owner.id, "accepted", b"{}")]
+
+
 @pytest.mark.asyncio
 async def test_session_claim_releases_only_after_dependent_work_drains(tmp_path, monkeypatch):
     store = GenerationCoordinator(tmp_path)
     old = _identity("a", "slot-a")
     new = _identity("b", "slot-b")
-    store.register(old, state="draining")
-    store.register(new, state="serving")
+    store.register(old, state="serving")
+    store.register(new, state="standby")
     old_epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:chat-1"
     store.claim_session(str(tmp_path), "telegram", key, old.id, old_epoch, outstanding_work=1)
-    assert store.release_lease("active_generation", old.id, old_epoch)
-    new_epoch = store.acquire_lease("active_generation", new.id)
+    store.request_transfer(old.id, new.id, old_epoch, set())
+    new_epoch = store.commit_transfer(old.id, new.id, old_epoch)
     live = {key: object()}
     adapter = SimpleNamespace(platform=Platform.TELEGRAM, _active_sessions=live, _pending_messages={})
     runner = SimpleNamespace(adapters={"telegram": adapter}, _overlap_draining=True, _pending_approvals={},
@@ -63,8 +160,8 @@ async def test_live_existing_claim_is_frozen_before_successor_admission(tmp_path
     store = GenerationCoordinator(tmp_path)
     old = _identity("a", "slot-a")
     new = _identity("b", "slot-b")
-    store.register(old, state="draining")
-    store.register(new, state="serving")
+    store.register(old, state="serving")
+    store.register(new, state="standby")
     epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:chat-1"
     store.claim_session(str(tmp_path), "telegram", key, old.id, epoch)
@@ -73,8 +170,8 @@ async def test_live_existing_claim_is_frozen_before_successor_admission(tmp_path
     routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=old, epoch=epoch,
                                            runner=runner, home=tmp_path))
     routing.claim_live()
-    assert store.release_lease("active_generation", old.id, epoch)
-    new_epoch = store.acquire_lease("active_generation", new.id)
+    store.request_transfer(old.id, new.id, epoch, set())
+    new_epoch = store.commit_transfer(old.id, new.id, epoch)
     row, fresh = store.enqueue(str(tmp_path), "telegram", key, "next", "message",
                                json.dumps({"version": 1, "authorized": True, "sender": "1"}).encode(),
                                b"next", new.id, new_epoch)
@@ -88,7 +185,7 @@ async def test_media_admission_locally_and_across_overlap(tmp_path, kind):
     old = _identity("a", "slot-a")
     new = _identity("b", "slot-b")
     store.register(old, state="serving")
-    store.register(new, state="serving")
+    store.register(new, state="standby")
     epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:chat-1"
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
@@ -103,9 +200,8 @@ async def test_media_admission_locally_and_across_overlap(tmp_path, kind):
                             platform_update_id=update, media_urls=[str(media)], media_types=["application/octet-stream"])
     assert await old_route.route_message(adapter, event(1), key) is False
     store.freeze_session(str(tmp_path), "telegram", key, old.id, epoch)
-    assert store.release_lease("active_generation", old.id, epoch)
-    store.heartbeat(old.id, state="draining")
-    new_epoch = store.acquire_lease("active_generation", new.id)
+    store.request_transfer(old.id, new.id, epoch, set())
+    new_epoch = store.commit_transfer(old.id, new.id, epoch)
     store.claim_session(str(tmp_path), "telegram", key, old.id, epoch, outstanding_work=1)
     new_route = OwnedRouting(SimpleNamespace(coordinator=store, identity=new, epoch=new_epoch, runner=runner))
     assert await new_route.route_message(adapter, event(2), key) is True
@@ -127,15 +223,15 @@ async def test_unrelated_background_process_does_not_pin_idle_session(tmp_path, 
     store = GenerationCoordinator(tmp_path)
     old = _identity("a", "slot-a")
     new = _identity("b", "slot-b")
-    store.register(old, state="draining")
-    store.register(new, state="serving")
+    store.register(old, state="serving")
+    store.register(new, state="standby")
     epoch = store.acquire_lease("active_generation", old.id)
     idle = "agent:default:telegram:idle"
     busy = "agent:default:telegram:busy"
     for key in (idle, busy):
         store.claim_session(str(tmp_path), "telegram", key, old.id, epoch, outstanding_work=1)
-    assert store.release_lease("active_generation", old.id, epoch)
-    new_epoch = store.acquire_lease("active_generation", new.id)
+    store.request_transfer(old.id, new.id, epoch, set())
+    new_epoch = store.commit_transfer(old.id, new.id, epoch)
     monkeypatch.setattr(process_registry, "has_any_active", lambda: True)
     monkeypatch.setattr(process_registry, "has_active_for_session", lambda key: key == busy)
     monkeypatch.setattr(process_registry, "pending_watchers", [])
@@ -206,7 +302,7 @@ async def test_pending_replay_precedes_new_local_update_without_duplicates(tmp_p
     old = _identity("a", "slot-a")
     owner = _identity("b", "slot-b")
     store.register(old, state="serving")
-    store.register(owner, state="ready")
+    store.register(owner, state="standby")
     old_epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:chat-1"
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="1")
@@ -233,9 +329,8 @@ async def test_pending_replay_precedes_new_local_update_without_duplicates(tmp_p
     from gateway.owned_routing import _event_payload
     store.enqueue(str(tmp_path), "telegram", key, "1", "message", envelope,
         json.dumps({"event": _event_payload(event("replay", 1))}).encode(), old.id, old_epoch)
-    assert store.release_lease("active_generation", old.id, old_epoch)
-    store.heartbeat(old.id, state="draining")
-    epoch = store.acquire_lease("active_generation", owner.id)
+    store.request_transfer(old.id, owner.id, old_epoch, set())
+    epoch = store.commit_transfer(old.id, owner.id, old_epoch)
     assert store.transfer_session(str(tmp_path), "telegram", key, old.id, old_epoch, owner.id, epoch)
     routing = OwnedRouting(SimpleNamespace(coordinator=store, identity=owner, epoch=epoch, runner=runner))
     assert await routing.route_message(adapter, event("new", 2), key) is True
@@ -429,7 +524,7 @@ async def test_observed_group_without_sender_uses_native_owner_or_routes_to_old(
     store = GenerationCoordinator(tmp_path)
     old, new = _identity("a", "old"), _identity("b", "new")
     store.register(old, state="serving")
-    store.register(new, state="ready")
+    store.register(new, state="standby")
     old_epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:group-1"
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="group", user_id=None)
@@ -440,9 +535,8 @@ async def test_observed_group_without_sender_uses_native_owner_or_routes_to_old(
     event = lambda update: MessageEvent(text="observed", source=source, platform_update_id=update)
     assert await old_route.route_message(adapter, event(1), key) is False
     store.freeze_session(str(tmp_path), "telegram", key, old.id, old_epoch)
-    store.release_lease("active_generation", old.id, old_epoch)
-    store.heartbeat(old.id, state="draining")
-    new_epoch = store.acquire_lease("active_generation", new.id)
+    store.request_transfer(old.id, new.id, old_epoch, set())
+    new_epoch = store.commit_transfer(old.id, new.id, old_epoch)
     new_route = OwnedRouting(SimpleNamespace(coordinator=store, identity=new, epoch=new_epoch, runner=runner))
     assert await new_route.route_message(adapter, event(2), key) is True
     with store.connect() as db:
@@ -456,16 +550,15 @@ async def test_bot_authored_allowed_message_retains_identity_on_owner_replay(tmp
     store = GenerationCoordinator(tmp_path)
     old, new = _identity("a", "old"), _identity("b", "new")
     store.register(old, state="serving")
-    store.register(new, state="ready")
+    store.register(new, state="standby")
     old_epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:chat-1"
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", user_id="7", is_bot=True)
     setattr(source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
     event = MessageEvent(text="bot message", source=source, platform_update_id=2)
     store.claim_session(str(tmp_path), "telegram", key, old.id, old_epoch, outstanding_work=1)
-    store.release_lease("active_generation", old.id, old_epoch)
-    store.heartbeat(old.id, state="draining")
-    new_epoch = store.acquire_lease("active_generation", new.id)
+    store.request_transfer(old.id, new.id, old_epoch, set())
+    new_epoch = store.commit_transfer(old.id, new.id, old_epoch)
     adapter = SimpleNamespace(platform=Platform.TELEGRAM, _active_sessions={}, _pending_messages={},
         _owner_transport_profile=lambda: None,
         _is_sender_authorized=lambda *a, **kw: True,
@@ -499,7 +592,7 @@ async def test_late_dispatch_for_frozen_session_stays_native_on_draining_owner(t
     old = _identity("a", "old")
     new = _identity("b", "new")
     store.register(old, state="serving")
-    store.register(new, state="ready")
+    store.register(new, state="standby")
     old_epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:chat-1"
     store.freeze_session(str(tmp_path), "telegram", key, old.id, old_epoch)
@@ -526,7 +619,7 @@ async def test_late_dispatch_for_idle_or_unowned_session_reaches_successor_once(
     old = _identity("a", "old")
     new = _identity("b", "new")
     store.register(old, state="serving")
-    store.register(new, state="ready")
+    store.register(new, state="standby")
     old_epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:new"
     if idle_claim:
@@ -573,7 +666,7 @@ async def test_late_callback_preserves_owned_session_or_forwards_to_successor(tm
     store = GenerationCoordinator(tmp_path)
     old, new = _identity("a", "old"), _identity("b", "new")
     store.register(old, state="serving")
-    store.register(new, state="ready")
+    store.register(new, state="standby")
     epoch = store.acquire_lease("active_generation", old.id)
     key = "agent:default:telegram:chat-1"
     if frozen:
@@ -727,3 +820,10 @@ def test_existing_inbox_gains_retention_clock_without_losing_receipts(tmp_path):
     duplicate, fresh = reopened.enqueue(str(tmp_path), "telegram", "chat", "1", "message",
         json.dumps({"version": 1, "authorized": True, "sender": "1"}).encode(), b"changed", owner.id, epoch)
     assert not fresh and duplicate == pending[0]
+
+
+@pytest.fixture(autouse=True)
+def _coordinator_boot_identity(monkeypatch):
+    # Unit transactions use a stable supplied boot identity. Native process
+    # and launchd suites continue to probe the actual host.
+    monkeypatch.setattr("gateway.generation._boot_id", lambda: "unit-test-boot")

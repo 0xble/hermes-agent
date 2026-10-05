@@ -60,6 +60,7 @@ def run(tmp_path_factory: pytest.TempPathFactory) -> Run:
         Text(ANSWER_2),
     ]
     with GeminiFake(root / "fake", script) as fake:
+        fake.configure_home(home.hermes_home)
         # No asserts here: a failing turn must show up as the specific test assertion (a rejected
         # request, a missing signature), not as a fixture error that hides which contract broke.
         first = nh.run_chat(home, "Read seed.txt and tell me what it says.", env=fake.child_env())

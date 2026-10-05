@@ -16,6 +16,9 @@ from hermes_state import SessionDB
 from hermes_state_repair import _db_opens_cleanly, repair_state_db_schema
 
 
+pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
+
+
 def _build_db_with_trigram(db_path: Path) -> str:
     db = SessionDB(db_path=db_path)
     if not db._trigram_available:
