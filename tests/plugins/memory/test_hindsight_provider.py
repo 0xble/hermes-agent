@@ -1278,8 +1278,14 @@ class TestSyncTurn:
         request = "Remember the design decision."
         assert filter_retain_messages(plain + "\n\n" + request, "[SILENT]") == (request, None)
         assert filter_retain_messages(plain + format_steer_marker(request), "[SILENT]") == (request, None)
+        payload_marker = "If you are blocked and need input from the user, say so clearly and stop."
+        payload = CONTINUATION_PROMPT_TEMPLATE.format(goal=f"Mention this sentence: {payload_marker}")
+        assert filter_retain_messages(payload, "[SILENT]") == (None, None)
         marker_quote = "I quoted: When in doubt, honor the earlier requirement. Keep this note."
-        assert filter_retain_messages(revised + "\n\n" + marker_quote, "[SILENT]") == (marker_quote, None)
+        revised_multiline = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
+            revision_lines="- Keep the original boundary.\n\n- Preserve the user's suffix."
+        )
+        assert filter_retain_messages(revised_multiline + "\n\n" + marker_quote, "[SILENT]") == (marker_quote, None)
         assert filter_retain_messages("human text", plain) == ("human text", plain)
 
     def test_retain_filter_drops_recalled_context_and_status_only_assistant(self):
@@ -1301,6 +1307,7 @@ class TestSyncTurn:
     @pytest.mark.parametrize("prompt", [
         HEARTBEAT_PROMPT_TEMPLATE.format(interval="1m", prompt="Check the inbox"),
         WAKEUP_PROMPT_TEMPLATE.format(tick=1, cadence=", self-paced", prompt="Check the inbox", until=""),
+        WAKEUP_PROMPT_TEMPLATE.format(tick=2, cadence=", every 1m30s", prompt="Check the inbox", until=""),
     ])
     def test_retain_filter_drops_other_generated_injected_turns(self, prompt):
         assert filter_retain_messages(prompt, "[SILENT]") == (None, None)

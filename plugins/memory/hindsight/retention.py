@@ -31,6 +31,22 @@ _LEGACY_MACHINE_NOTICE_PREFIXES = (
 )
 _MACHINE_NOTICE_PREFIXES = (*PROCESS_NOTICE_OPENERS, AUTO_RESUME_NOTICE_OPEN, *_LEGACY_MACHINE_NOTICE_PREFIXES)
 
+_COMPACT_INTERVAL_RE = re.compile(r"(?:\d+h(?:\d+m)?(?:\d+s)?|\d+m(?:\d+s)?|\d+s)")
+
+
+def _is_compact_interval(value: str) -> bool:
+    return bool(_COMPACT_INTERVAL_RE.fullmatch(value))
+
+
+def _is_valid_loop_cadence(value: str) -> bool:
+    if value == "self-paced":
+        return True
+    for prefix in ("self-paced, currently ", "every "):
+        if value.startswith(prefix):
+            return _is_compact_interval(value[len(prefix):])
+    return False
+
+
 # Synthetic turn templates are user-visible prompts but not user-authored durable signal. Keep the
 # exact generated opening and terminal sentence here so a human suffix can survive without ever
 # retaining the injected goal/task/heartbeat payload itself.
@@ -69,11 +85,7 @@ def _user_after_injected_turn(content: str) -> str | None:
         else:
             tick_and_cadence = header[len(WAKEUP_PROMPT_PREFIX):]
             tick, separator_cadence, cadence = tick_and_cadence.partition(", ")
-            valid_cadence = (
-                cadence == "self-paced"
-                or bool(re.fullmatch(r"self-paced, currently \d+[smhd]", cadence))
-                or bool(re.fullmatch(r"every \d+[smhd]", cadence))
-            )
+            valid_cadence = _is_valid_loop_cadence(cadence)
             if not separator or not remainder.startswith("Recurring task:") or not tick.isdigit() or (
                 separator_cadence and not valid_cadence
             ) or (not separator_cadence and cadence):
@@ -86,15 +98,15 @@ def _user_after_injected_turn(content: str) -> str | None:
             revision_end = content.find(_GOAL_REVISIONS_END_MARKER, revisions_start)
             if revision_end >= 0:
                 revisions_end = revision_end + len(_GOAL_REVISIONS_END_MARKER)
-                suffix_boundary = content.find("\n\n", revisions_end)
+                suffix_boundary = content.rfind("\n\n", revisions_end)
                 marker_end = suffix_boundary if suffix_boundary >= 0 else len(content)
     if marker_end < 0:
         marker_positions = [
             (position, marker) for marker in _INJECTED_TURN_END_MARKERS
-            if (position := content.find(marker)) >= 0
+            if (position := content.rfind(marker)) >= 0
         ]
         if marker_positions:
-            marker_start, marker = min(marker_positions)
+            marker_start, marker = max(marker_positions)
             marker_end = marker_start + len(marker)
     if marker_end < 0:
         # A truncated or unrecognized synthetic block has no trustworthy boundary.
