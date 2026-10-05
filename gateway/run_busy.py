@@ -1093,7 +1093,7 @@ class GatewayBusySessionMixin:
                 reply_expected=event.reply_expected,
             )
             self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
-            if is_agent_origin_text(queued_event.text):
+            if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                 return None
         depth = self._queue_depth(quick_key, adapter=adapter)
         return t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
@@ -1118,7 +1118,7 @@ class GatewayBusySessionMixin:
                     channel_context=event.channel_context, reply_expected=event.reply_expected,
                 )
                 self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
-                if is_agent_origin_text(queued_event.text):
+                if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                     return None
             return reply
 
@@ -1135,11 +1135,12 @@ class GatewayBusySessionMixin:
             return t("gateway.steer.rejected_empty")
         # Admission saw "/steer <header>", so mark agent origin on the stripped text before the
         # fold; otherwise absorbing an unknown expectation resets a relay turn's False to None.
-        agent_origin = is_agent_origin_text(steer_text)
-        if agent_origin and event.reply_expected is not True:
+        # An explicitly addressed relay (True) keeps its expectation and its ack.
+        silent_relay = is_agent_origin_text(steer_text) and event.reply_expected is not True
+        if silent_relay:
             event.reply_expected = False
         self._fold_into_running_turn(running_agent, quick_key, event)
-        if agent_origin:
+        if silent_relay:
             return None
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)

@@ -225,6 +225,22 @@ async def test_queued_relay_origin_stays_silent_and_queue_event_keeps_metadata(m
 
 
 @pytest.mark.asyncio
+async def test_addressed_relay_queue_keeps_its_ack():
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    queued = []
+    runner._delivery_adapter_for = lambda source: object()
+    runner._enqueue_fifo = lambda session_key, event, adapter: queued.append(event)
+    event = MessageEvent(
+        text=f"/queue {_relay_text()}", source=_source(), message_id="queue-msg-3", reply_expected=True
+    )
+
+    reply = await runner._busy_queue_command(event, "session", event.source)
+
+    assert reply == "Queued for the next turn."
+    assert queued[0].reply_expected is True
+
+
+@pytest.mark.asyncio
 async def test_typed_queue_keeps_its_ack():
     runner = gateway_run.GatewayRunner(GatewayConfig())
     queued = []
