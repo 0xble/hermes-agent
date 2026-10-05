@@ -883,27 +883,46 @@ def _option_consumes_next(tokens: list[str], index: int, options_with_arg: froze
     return "=" not in token and token in options_with_arg and index + 1 < len(tokens)
 
 
-def _is_vault_alias_config_write_argv(argv: list[str], start: int = 1) -> bool:
-    """Recognize Hermes config writes from tokenized argv, not regex text.
+def _is_vault_alias_config_write_argv(argv: list[str]) -> bool:
+    """Recognize a real ``hermes config set|unset`` invocation from tokenized argv.
 
-    Global and subcommand options are skipped by their known argument grammar. The key may be the
-    whole ``vault`` mapping (a replacement can contain ``origin_aliases``) or the exact registry path.
+    Parse global options before the subcommand, then inspect only the first non-option operand after
+    ``set``/``unset``. This avoids treating a nested ``skills config`` command or a later value as a
+    vault key, while still handling value-taking options such as ``-p config``.
     """
-    try:
-        config_index = next(index for index in range(start, len(argv)) if argv[index] == "config")
-    except StopIteration:
+    if not argv or os.path.basename(argv[0]).lower() not in {"hermes", "hermes.py"}:
         return False
-    index = config_index + 1
+    index = 1
     while index < len(argv) and argv[index].startswith("-"):
         index += 2 if _option_consumes_next(argv, index, _HERMES_CLI_OPTIONS_WITH_ARG) else 1
-    if index >= len(argv) or argv[index] not in {"set", "unset"}:
+    if index >= len(argv) or argv[index] != "config":
         return False
     index += 1
-    while index < len(argv):
-        if _is_vault_alias_config_key(argv[index]):
-            return True
-        index += 2 if _option_consumes_next(argv, index, frozenset()) else 1
+    if index >= len(argv) or argv[index] not in {"set", "unset"}:
+        return False
+    for token in argv[index + 1:]:
+        if not token.startswith("-"):
+            return _is_vault_alias_config_key(token)
     return False
+
+
+def _hermes_wrapper_argv(tokens: list[str]) -> list[str] | None:
+    """Return the Hermes argv for direct and common wrapper CLI forms."""
+    if not tokens:
+        return None
+    first = os.path.basename(tokens[0]).lower()
+    if first in {"hermes", "hermes.py"}:
+        return tokens
+    if first in {"uv", "uvx", "xargs"}:
+        for index, token in enumerate(tokens[1:], start=1):
+            if os.path.basename(token).lower() in {"hermes", "hermes.py"}:
+                return tokens[index:]
+        return None
+    if _interpreter_family(tokens[0]) == "python":
+        for index, token in enumerate(tokens[1:], start=1):
+            if os.path.basename(token).lower() in {"hermes", "hermes.py"}:
+                return tokens[index:]
+    return None
 
 
 def _python_module_argv_start(tokens: list[str]) -> int | None:
@@ -928,16 +947,17 @@ def _hermes_config_write_finding(command: str) -> str | None:
     for segment in _iter_top_level_shell_segments(command):
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = _deobfuscate_shell_word_for_detection(word)
-            name = os.path.basename(executable).lower()
             tokens = _shell_segment_tokens(segment, start)
             if not tokens:
                 continue
-            if name in {"hermes", "hermes.py"} and _is_vault_alias_config_write_argv(tokens):
+            wrapper_argv = _hermes_wrapper_argv(tokens)
+            if wrapper_argv is not None and _is_vault_alias_config_write_argv(wrapper_argv):
                 return _VAULT_ALIAS_WRITE_DESCRIPTION
             if _interpreter_family(executable) == "python" and len(tokens) >= 3:
                 module_index = _python_module_argv_start(tokens)
                 if module_index is not None and tokens[module_index] == "hermes_cli.main":
-                    if _is_vault_alias_config_write_argv(tokens, module_index + 1):
+                    module_argv = ["hermes", *tokens[module_index + 1:]]
+                    if _is_vault_alias_config_write_argv(module_argv):
                         return _VAULT_ALIAS_WRITE_DESCRIPTION
     return None
 
@@ -951,7 +971,7 @@ def _python_source_writes_hermes_config(source: str) -> bool:
     """Inspect Python source structurally; comments and unrelated argument text do not count."""
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError, TypeError):
+    except (MemoryError, RecursionError, SyntaxError, ValueError, TypeError):
         return False
 
     def string_values(node: ast.AST):
@@ -980,7 +1000,7 @@ def _python_config_write_finding(command: str) -> str | None:
     supplement covers ordinary script invocations only when an argv token is the Hermes config path
     and a separate explicit write operation is present, preserving the existing script regression.
     """
-    write_markers = {"write_text", "write_bytes", "--write", "--write_text", "--write-bytes"}
+    write_markers = ("open(", "write_text", "write_bytes", "yaml.dump", "safe_dump", "--write", "-i")
     for segment in _iter_top_level_shell_segments(command):
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = _deobfuscate_shell_word_for_detection(word)
@@ -995,7 +1015,7 @@ def _python_config_write_finding(command: str) -> str | None:
                         return "in-place edit of Hermes config with Python"
                     break
             if (any(_is_hermes_config_path_token(token) for token in tokens[1:])
-                    and any(token in write_markers for token in tokens[1:])):
+                    and any(marker in token for token in tokens[1:] for marker in write_markers)):
                 return "in-place edit of Hermes config with Python"
     return None
 
@@ -1668,10 +1688,6 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
-    if (finding := _hermes_config_write_finding(command)) is not None:
-        return (True, finding, finding)
-    if (finding := _python_config_write_finding(command)) is not None:
-        return (True, finding, finding)
     for command_variant in _command_detection_variants(command):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
@@ -1690,4 +1706,11 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, description, description)
     if _is_shell_token_spliced_gateway_lifecycle(command):
         return (True, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION)
+    # These structural supplements intentionally run last. Any established pattern, execution flag,
+    # or gateway finding must remain the primary approval key for compound commands; otherwise approving
+    # the alias/config key could silently approve a chained dangerous operation.
+    if (finding := _hermes_config_write_finding(command)) is not None:
+        return (True, finding, finding)
+    if (finding := _python_config_write_finding(command)) is not None:
+        return (True, finding, finding)
     return (False, None, None)
