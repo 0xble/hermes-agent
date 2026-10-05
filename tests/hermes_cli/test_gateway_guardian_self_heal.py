@@ -120,7 +120,8 @@ def test_reload_helper_logs_bootstrap_failures_and_clears_its_fence(tmp_path, mo
     monkeypatch.setenv("HERMES_HOME", str(home))
     plist = tmp_path / "ai.hermes.disposable.plist"
     plist.write_bytes(plistlib.dumps({"Label": plist.stem, "EnvironmentVariables": {"HERMES_HOME": str(home)}}))
-    monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 1)
+    # Success needs a second bootstrap pass, so give it a budget no second boundary can cut short.
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 30 if registers else 1)
     captured = {}
     real_run = subprocess.run
     def submit(argv, **kwargs):
