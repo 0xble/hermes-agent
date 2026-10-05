@@ -142,6 +142,9 @@ def preflight() -> None:
 
 
 def windows_command(name: str, env: Mapping[str, str]) -> str:
+    pinned = env.get(f'HERMES_CI_PINNED_{name.upper()}')
+    if pinned:
+        return pinned
     # CreateProcess resolves bare executables against the *parent* PATH, not the
     # isolated child's PATH. Resolve checkout-owned tools explicitly on Windows.
     if os.name == 'nt':
@@ -252,6 +255,80 @@ def environment(home: Path) -> dict[str, str]:
     return env
 
 
+def mise_data_root() -> Path:
+    """Return the host mise data directory before CI isolates ``HOME``."""
+    configured = os.environ.get('MISE_DATA_DIR')
+    if configured:
+        return Path(configured).expanduser()
+    source_home = os.environ.get('HOME') or str(Path.home())
+    return Path(source_home).expanduser() / '.local' / 'share' / 'mise'
+
+
+def resolve_pinned_mise_tool(name: str) -> Path:
+    """Resolve one exact tool pin without consulting the caller's ``PATH``."""
+    version = PINS[name]
+    install_root = mise_data_root() / 'installs' / name / version
+    executable = name + ('.exe' if os.name == 'nt' else '')
+    candidates = [
+        install_root / 'bin' / executable,
+        install_root / executable,
+        *sorted(install_root.glob(f'*/{executable}')),
+    ]
+    for candidate in candidates:
+        if candidate.is_file() and (os.name == 'nt' or os.access(candidate, os.X_OK)):
+            return candidate.resolve()
+    raise RuntimeError(
+        f'Missing pinned {name} {version} under {install_root}. '
+        f'Install it with `mise install {name}@{version}` and rerun bin/ci.'
+    )
+
+
+def exact_path_tool(name: str, env: Mapping[str, str]) -> Path | None:
+    """Return a PATH tool only when it reports the repository's exact pin."""
+    command = windows_command(name, env)
+    try:
+        output = subprocess.check_output(
+            [command, '--version'], env=env, text=True, encoding='utf-8', errors='replace'
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    match = re.search(r'(?<!\d)(\d+\.\d+\.\d+)\b', output)
+    if not match or match.group(1) != PINS[name]:
+        return None
+    resolved = command if os.path.isabs(command) else shutil.which(name, path=env.get('PATH'))
+    # Preserve argv[0] dispatch for PATH shims (for example, mise and volta).
+    return Path(os.path.abspath(resolved)) if resolved else None
+
+
+def resolve_local_toolchain(env: dict[str, str]) -> dict[str, str]:
+    """Use exact PATH tools or replace mismatches with exact local mise pins."""
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        return env
+    resolved = {}
+    mise_paths = []
+    for name in ('uv', 'node'):
+        executable = exact_path_tool(name, env)
+        if executable is None:
+            executable = resolve_pinned_mise_tool(name)
+            mise_paths.append(str(executable.parent))
+        resolved[name] = executable
+        env[f'HERMES_CI_PINNED_{name.upper()}'] = str(executable)
+    npm = TOOLCHAIN / 'node_modules' / '.bin' / ('npm.cmd' if os.name == 'nt' else 'npm')
+    if npm.is_file():
+        env['HERMES_CI_PINNED_NPM'] = str(npm.resolve())
+    existing = [part for part in env.get('PATH', '').split(os.pathsep) if part]
+    # Keep checkout-owned npm and ripgrep ahead of mise's Node directory: the
+    # latter may carry a different bundled npm than the repository pin.
+    checkout_paths = [
+        str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
+        str(TOOLCHAIN / 'bin'),
+        str(TOOLCHAIN / 'node_modules' / '.bin'),
+    ]
+    host_paths = [part for part in existing if part not in checkout_paths and part not in mise_paths]
+    env['PATH'] = os.pathsep.join(dict.fromkeys([*checkout_paths, *mise_paths, *host_paths]))
+    return env
+
+
 def msvc_linker_environment(tools: Path, source: Mapping[str, str]) -> dict[str, str]:
     """Select MSVC rather than Git-for-Windows' unrelated link.exe."""
     linker = tools / 'bin/Hostx64/x64/link.exe'
@@ -316,6 +393,9 @@ def provision_rg(env: dict[str, str]) -> None:
 def setup(env: dict[str, str]) -> None:
     require_tools(('uv', 'node'), env)
     provision_npm(env)
+    # npm is created after the initial resolver pass on a fresh checkout; refresh
+    # its absolute command and PATH ordering before any npm-dependent check.
+    resolve_local_toolchain(env)
     provision_rg(env)
     require_tools(('npm', 'rg'), env)
     run(['uv', 'sync', '--locked', '--python', PINS['python'], '--group', 'dev', '--group', 'test', *[v for extra in EXTRAS for v in ('--extra', extra)]], env=env)
@@ -623,7 +703,7 @@ def main() -> int:
         return 0
     STATE.mkdir(exist_ok=True)
     with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
-        env = environment(home)
+        env = resolve_local_toolchain(environment(home))
         if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)
             if args.command == 'setup':
