@@ -17,9 +17,9 @@ case stayed parked for 14.5 hours.
   persisted at park time, keeping CLI, gateway, and TUI state identical. The first age notice is
   deduped through `last_age_notice_key`; parked notices remain in `last_wait_notice_key`, and
   continuation notices use `last_continuation_notice_key`. A still-live target pauses with a named
-  blocker after six hours.
-  registry or, after a restart, the durable `logs/process-results` receipt: killed by a restart or
-  shutdown, killed explicitly, finished with its exit code, or no longer tracked (outcome unknown).
+  blocker after six hours. Liveness comes from the process registry or, after a restart, the durable
+  `logs/process-results` receipt: a target may be killed by a restart or shutdown, killed explicitly,
+  finished with its exit code, or no longer tracked (outcome unknown).
 - Surfaces clear the barrier only after the continuation was admitted, through
   `clear_lifted_wait(waiting_since)`. A failed or refused injection is retried on the next scan,
   and a resumed turn that has already re-parked keeps its newer barrier.
