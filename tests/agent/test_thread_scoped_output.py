@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 import agent.thread_scoped_output as thread_output
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -165,4 +167,86 @@ def test_silence_survives_redirect_restoring_an_older_proxy(monkeypatch):
         assert "must-stay-silenced" not in redirected.getvalue()
     finally:
         release.set()
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
+
+def _chain_length(stream):
+    """Wrapper layers above the real stream, walked without invoking any ``__getattr__``."""
+    seen = []
+    while id(stream) not in map(id, seen):
+        seen.append(stream)
+        state = getattr(stream, "__dict__", {})
+        if "_passthrough" in state:
+            stream = state["_passthrough"]
+        elif type(stream).__name__ == "_SafeWriter":
+            stream = object.__getattribute__(stream, "_inner")
+        else:
+            return len(seen) - 1
+    raise AssertionError("stdout wrapper chain loops back on itself")
+
+
+def _isolate_routing_state(monkeypatch):
+    monkeypatch.setattr(thread_output, "_installed", {})
+    monkeypatch.setattr(thread_output, "_sinks", {}, raising=False)
+    monkeypatch.setattr(thread_output, "_routing_states", {}, raising=False)
+
+
+def test_agent_builds_and_silenced_workers_never_grow_the_stdio_chain(monkeypatch):
+    """Every agent build re-runs ``_install_safe_stdio`` and every background review re-installs the
+    routing proxy. Interleaved, they stacked two wrapper layers per cycle until attribute lookup
+    through ``sys.stdout`` hit the recursion limit and failed the gateway turn."""
+    from agent.process_bootstrap import _install_safe_stdio
+
+    _isolate_routing_state(monkeypatch)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    real = io.StringIO()
+    sys.stdout, sys.stderr = real, io.StringIO()
+    try:
+        for _ in range(sys.getrecursionlimit()):
+            _install_safe_stdio()
+            with thread_scoped_silence():
+                print("hidden")
+
+        assert _chain_length(sys.stdout) <= 2
+        assert sys.stdout.line_buffering is False  # hermes_logging._line_buffer_piped_stdout's probe
+        with pytest.raises(AttributeError):
+            sys.stdout.attribute_no_stream_has
+        print("visible")
+        assert real.getvalue() == "visible\n"
+    finally:
+        for sink in thread_output._sinks.values():
+            sink.close()
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
+def test_a_wrapper_cycle_fails_attribute_lookup_cleanly_and_is_repaired_on_install(monkeypatch):
+    """A cycle between the two wrappers must raise AttributeError, not RecursionError, and the next
+    install must unwrap it back to a real stream."""
+    from agent.process_bootstrap import _SafeWriter, _install_safe_stdio
+
+    _isolate_routing_state(monkeypatch)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    real = io.StringIO()
+    monkeypatch.setattr(sys, "__stdout__", real)
+    try:
+        proxy = thread_output._ThreadRoutingStream(io.StringIO(), thread_output._RoutingState(io.StringIO()))
+        writer = _SafeWriter(proxy)
+        proxy._passthrough = writer  # close the cycle: proxy -> writer -> proxy
+        sys.stdout = writer
+
+        with pytest.raises(AttributeError):
+            writer.line_buffering
+        with pytest.raises(AttributeError):
+            proxy.line_buffering
+
+        _install_safe_stdio()
+        with thread_scoped_silence():
+            pass
+        _chain_length(sys.stdout)
+        print("repaired")
+        assert real.getvalue() == "repaired\n"
+    finally:
+        for sink in thread_output._sinks.values():
+            sink.close()
         sys.stdout, sys.stderr = original_stdout, original_stderr

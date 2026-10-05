@@ -17,6 +17,7 @@ from typing import Any, Optional
 from hermes_bootstrap import _happy_eyeballs_create_connection
 from utils import base_url_hostname, normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy
+from agent.thread_scoped_output import delegate_getattr, is_stdio_wrapper, resolve_stdio, stdio_install_lock
 
 
 _OPENAI_CLS_CACHE = None
@@ -140,6 +141,9 @@ class _SafeWriter:
     __slots__ = ("_inner",)
 
     def __init__(self, inner):
+        # Collapse a redundant layer: wrapping another _SafeWriter adds nothing and lengthens the chain.
+        while isinstance(inner, _SafeWriter):
+            inner = object.__getattribute__(inner, "_inner")
         object.__setattr__(self, "_inner", inner)
 
     def write(self, data):
@@ -163,8 +167,11 @@ class _SafeWriter:
         except (OSError, ValueError):
             return False
 
+    def _hermes_stdio_next(self):
+        return self._inner
+
     def __getattr__(self, name):
-        return getattr(self._inner, name)
+        return delegate_getattr(self, name, _SafeWriter.__slots__)
 
 
 def _get_proxy_from_env() -> Optional[str]:
@@ -325,11 +332,27 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
 
 
 def _install_safe_stdio() -> None:
-    """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is not None and not isinstance(stream, _SafeWriter):
-            setattr(sys, stream_name, _SafeWriter(stream))
+    """Wrap stdout/stderr so best-effort console output cannot crash the agent.
+
+    Runs on every agent build and every turn, so it must be idempotent over the whole wrapper
+    chain. Any Hermes wrapper already on top (``_SafeWriter`` or the thread-scoped routing
+    proxy, which guards its own writes) is left alone: wrapping the proxy again hid it from
+    ``_ensure_installed``, which then stacked a new proxy generation per agent build until
+    attribute lookup through the chain hit the recursion limit. A chain that never reaches a
+    real stream is replaced with the interpreter's original stream.
+    """
+    with stdio_install_lock:
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(sys, stream_name, None)
+            if stream is None:
+                continue
+            if resolve_stdio(stream) is None:
+                real = getattr(sys, f"__{stream_name}__", None)
+                if real is not None:
+                    setattr(sys, stream_name, _SafeWriter(real))
+                continue
+            if not is_stdio_wrapper(stream):
+                setattr(sys, stream_name, _SafeWriter(stream))
 
 
 # Drop-in for ``openai.OpenAI``.
