@@ -1459,7 +1459,7 @@ def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Opti
 _READ_ONLY_STATUS_CALL_RE = re.compile(
     r"^(?![^\r\n]*[\r\n])(?!.*(?:>>|>|\||&&|\|\||;|`|\$\(|\n|\r|&|<\(|>\())"
     r"(?!.*(?:\s-(?:exec|execdir|ok|fprint|fprint0|fprintf|fls|delete)(?:\s|$)|\s--delete(?:\s|$)))"
-    r"(?!.*(?:--ext-diff|--textconv)(?:\s|$))"
+    r"(?!.*(?:--ext-diff|--textconv)(?:=|\s|$))"
     r"(?!.*(?:--output)(?:=|\s|$))(?!.*(?:--pre)(?:=|\s|$))"
     r"(?:gh\s+(?:pr|run)\s+(?:view|checks|status|list)(?:\s+.*)?|"
     r"git\s+(?:status|diff|log|show|rev-parse)(?:\s+.*)?|"
