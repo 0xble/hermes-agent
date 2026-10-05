@@ -519,12 +519,6 @@ class TestHermesConfigWriteProtection:
         assert dangerous is True, (command, desc)
         assert key is not None
 
-    @pytest.mark.parametrize("command", [
-        "hermes config set model.default vault",
-    ])
-    def test_alias_registry_only_accepts_a_vault_key_as_the_first_write_operand(self, command):
-        assert detect_dangerous_command(command) == (False, None, None), command
-
     @pytest.mark.parametrize(
         ("command", "expected", "alias_key"),
         [
@@ -548,7 +542,13 @@ class TestHermesConfigWriteProtection:
             ("hermes --yol config set vault.origin_aliases.x y", True, True),
             ("hermes --acc x config set vault.origin_aliases.x y", True, True),
             ("hermes config get vault.origin_aliases", False, False),
-            ("hermes config set model.default vault", False, False),
+            # Every operand after set/unset is checked, so a literal `vault` value over-prompts.
+            ("hermes config set model.default vault", True, True),
+            ("hermes config set model.default anthropic", False, False),
+            ("hermes config set --profile default vault.origin_aliases.x y", True, True),
+            ("hermes config set -p work vault.origin_aliases.x y", True, True),
+            ("hermes config -p work set vault.origin_aliases.x y", True, True),
+            ("hermes config unset --profile work vault.origin_aliases.x", True, True),
             ("python -m hermes_cli.main config set vault.origin_aliases.x y", True, True),
             ("uv run hermes config set vault.origin_aliases.x y", True, True),
             ("uvx hermes config set vault.origin_aliases.x y", True, True),
@@ -567,6 +567,8 @@ class TestHermesConfigWriteProtection:
             ("python3 edit.py ~/.hermes/config.yaml --write=1", True, False),
             ("python3 edit.py ~/.hermes/config.yaml --in-place=1", True, False),
             ("python3 edit.py ~/.hermes/config.yaml -i''", True, False),
+            ("python3 edit.py ~/.hermes/config.yaml --inplace", True, False),
+            ("python3 edit.py ~/.hermes/config.yaml --write-config", True, False),
             ("python3 edit.py ~/.hermes/config.yaml --indent", False, False),
             ("python3 edit.py ~/.hermes/config.yaml --input", False, False),
             ("python3 edit.py ~/.hermes/config.yaml --include", False, False),

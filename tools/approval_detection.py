@@ -885,27 +885,22 @@ def _is_vault_alias_config_write_argv(argv: list[str]) -> bool:
     if not argv or os.path.basename(argv[0]).lower() not in {"hermes", "hermes.py"}:
         return False
 
+    # Option values (e.g. ``-p work``, which Hermes strips from argv anywhere before ``--``) can sit
+    # between ``config``, ``set|unset`` and the key, so no positional reading is trusted: once
+    # ``config`` appears, any later ``set``/``unset`` followed anywhere by a vault key is a write.
     for index, token in enumerate(argv):
         if token != "config":
             continue
         remaining = argv[index + 1:]
-        subcommand_index = next(
-            (offset for offset, candidate in enumerate(remaining)
-             if candidate != "--" and not candidate.startswith("-")),
-            None,
-        )
-        if subcommand_index is None or remaining[subcommand_index] not in {"set", "unset"}:
-            continue
-        key_token = next(
-            (candidate for candidate in remaining[subcommand_index + 1:]
-             if candidate != "--" and not candidate.startswith("-")),
-            None,
-        )
-        if key_token is None:
-            continue
-        key = key_token.split("=", 1)[0].strip("'\"")
-        if _is_vault_alias_config_key(key):
-            return True
+        for sub_index, candidate in enumerate(remaining):
+            if candidate not in {"set", "unset"}:
+                continue
+            for key_token in remaining[sub_index + 1:]:
+                if key_token == "--" or key_token.startswith("-"):
+                    continue
+                key = key_token.split("=", 1)[0].strip("'\"")
+                if _is_vault_alias_config_key(key):
+                    return True
     return False
 
 
@@ -1001,9 +996,9 @@ def _python_source_writes_hermes_config(source: str) -> bool:
 
 
 def _is_python_write_marker(token: str) -> bool:
-    if token in {"--write", "--in-place", "-i"}:
+    if token in {"--write", "--in-place", "--inplace", "-i"}:
         return True
-    if token.startswith("--write=") or token.startswith("--in-place="):
+    if token.startswith(("--write=", "--write-", "--in-place=", "--inplace=")):
         return True
     return token.startswith("-i") and len(token) > 2 and not token[2].isalpha()
 
