@@ -84,7 +84,9 @@ def _cli(manager, *, user_initiated: bool):
     return cli
 
 
-def _record_terminal_turn(db, sid: str, command: str, output: str, index: int) -> None:
+def _record_terminal_turn(
+    db, sid: str, command: str, output: str, index: int, *, arguments: str | None = None,
+) -> None:
     """Persist the same assistant tool-call + tool-result rows the runtime writes."""
     call_id = f"real-call-{index}"
     timestamp = time.time()
@@ -97,7 +99,8 @@ def _record_terminal_turn(db, sid: str, command: str, output: str, index: int) -
             {
                 "id": call_id,
                 "type": "function",
-                "function": {"name": "terminal", "arguments": json.dumps({"command": command})},
+                "function": {"name": "terminal", "arguments": arguments if arguments is not None
+                              else json.dumps({"command": command})},
             }
         ],
     )
@@ -151,6 +154,88 @@ def test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice(
     assert waits == sorted(waits)
     assert sum("Goal parked (judge)" in message for message in notices) == 1
     assert manager.state.last_wait_notice_key == "timed|reason:external consolidation"
+
+
+def test_real_timed_wait_expiry_reparks_through_evaluator_with_one_notice(
+    hermes_home, monkeypatch,
+):
+    """B1: evaluator expiry preserves the key while the automatic floor advances."""
+    _sid, _db, manager = _new_goal()
+    _stub_judge(
+        monkeypatch,
+        {"verdict": "wait", "wait_for_seconds": 30, "reason": "external consolidation"},
+    )
+
+    first = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
+    assert first["message"].count("Goal parked") == 1
+    assert manager.state.waiting_seconds == 300
+    manager.state.waiting_until = time.time() - 1
+    manager._save()
+
+    second = manager.evaluate_after_turn("Still waiting on the external result.", user_initiated=False)
+    assert second["message"] == ""
+    assert manager.state.waiting_seconds == 900
+    assert manager.state.last_wait_notice_key == "timed|reason:external consolidation"
+    assert manager.state.backoff_level == 2
+
+
+def test_real_judge_wait_mixed_continue_and_wait_uses_shared_backoff_formula(
+    hermes_home, monkeypatch,
+):
+    """B3: CONTINUE, CONTINUE, WAIT, WAIT shares the 300/900/1800 ladder."""
+    _sid, _db, manager = _new_goal()
+    import agent.auxiliary_client as auxiliary
+
+    responses = iter([
+        {"verdict": "continue", "reason": "still checking"},
+        {"verdict": "continue", "reason": "still checking"},
+        {"verdict": "wait", "wait_for_seconds": 60, "reason": "still checking"},
+        {"verdict": "wait", "wait_for_seconds": 60, "reason": "still checking"},
+    ])
+    monkeypatch.setattr(auxiliary, "call_llm", lambda **_kwargs: _judge_response(next(responses)))
+
+    first = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
+    second = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
+    assert first["verdict"] == second["verdict"] == "continue"
+    for _ in range(2):
+        manager.state.waiting_until = time.time() - 1
+        manager._save()
+        decision = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
+        if manager.state.waiting_seconds == 300:
+            assert decision["verdict"] == "wait"
+    assert manager.state.waiting_seconds == 900
+    assert manager.state.last_wait_notice_key == "timed|reason:still checking"
+
+    # A requested 1200-second wait outranks the first automatic floor.
+    _sid2, _db2, manager2 = _new_goal()
+    monkeypatch.setattr(
+        auxiliary, "call_llm",
+        lambda **_kwargs: _judge_response(
+            {"verdict": "wait", "wait_for_seconds": 1200, "reason": "scheduled check"}
+        ),
+    )
+    manager2.evaluate_after_turn("No actionable work yet.", user_initiated=False)
+    assert manager2.state.waiting_seconds == 1200
+
+
+def test_real_judge_wait_with_active_delegations_uses_delegation_floor_and_key(
+    hermes_home, monkeypatch,
+):
+    """B4: an active delegation raises a timed WAIT to 600 seconds."""
+    from hermes_cli import goals
+
+    _sid, _db, manager = _new_goal()
+    _stub_judge(
+        monkeypatch,
+        {"verdict": "wait", "wait_for_seconds": 60, "reason": "delegated review"},
+    )
+    decision = manager.evaluate_after_turn(
+        "The delegated review is still running.", user_initiated=False, active_delegations=2,
+    )
+    assert decision["verdict"] == "wait"
+    assert manager.state.waiting_seconds == 600
+    assert manager.state.waiting_on_delegations == 2
+    assert manager.state.last_wait_notice_key == "delegations|reason:delegated review"
 
 
 def test_real_actionable_evidence_and_user_turn_reset_shared_wait_streak(hermes_home, monkeypatch):
@@ -229,6 +314,12 @@ def test_real_collector_preserves_json_argument_representation(hermes_home):
         "git status; rm -r build",
         "git status `rm -r build`",
         "git status $(rm -r build)",
+        "git status\nrm -r build",
+        "git status & rm -r build",
+        "git diff <(cat x)",
+        "git diff --output=x",
+        "rg --pre cat x",
+        "find . -fprint x",
         "find . -exec rm {} ;",
         "find . -execdir rm {} ;",
         "find . -ok rm {} ;",
@@ -242,6 +333,26 @@ def test_real_evidence_classifier_rejects_shell_operators(hermes_home, monkeypat
     cli = _cli(manager, user_initiated=False)
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "keep working"})
     _record_terminal_turn(db, sid, command, "command output", 1)
+    cli.conversation_history = [{"role": "assistant", "content": "I ran the command."}]
+    cli._maybe_continue_goal_after_turn()
+
+    state = goals.GoalManager(sid).state
+    assert state is not None
+    assert state.consecutive_no_progress == 0
+    assert state.waiting_until == 0.0
+
+
+def test_real_truncated_terminal_arguments_fail_closed_as_actionable(hermes_home, monkeypatch):
+    """B2: malformed collector JSON never grants a read-only prefix exemption."""
+    from hermes_cli import goals
+
+    sid, db, manager = _new_goal()
+    cli = _cli(manager, user_initiated=False)
+    _stub_judge(monkeypatch, {"verdict": "continue", "reason": "keep working"})
+    _record_terminal_turn(
+        db, sid, "git status", "command output", 1,
+        arguments='{"command": "git status"',
+    )
     cli.conversation_history = [{"role": "assistant", "content": "I ran the command."}]
     cli._maybe_continue_goal_after_turn()
 
