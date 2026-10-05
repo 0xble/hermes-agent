@@ -111,6 +111,23 @@ def test_failed_agent_result_never_counts_as_intentional_silence():
 
 
 
+@pytest.mark.parametrize("command", ["/queue", "/steer"])
+def test_idle_queue_or_steer_relay_payload_is_marked_unaddressed(command):
+    # Relay always sends "/queue <header>" or "/steer <header>". On an idle session, admission
+    # sees the command prefix, so the stripped payload must be judged when the prefix is removed.
+    event = _relay_event(text=f"{command} {_relay_text()}")
+    handled, reply = gateway_run.GatewayRunner._hm_send_payload_as_turn(event, "usage")
+    assert (handled, reply) == (False, None)
+    assert event.text == _relay_text()
+    assert event.reply_expected is False
+
+
+def test_idle_typed_queue_payload_keeps_reply_expected_unknown():
+    event = _relay_event(text="/queue please handle this")
+    gateway_run.GatewayRunner._hm_send_payload_as_turn(event, "usage")
+    assert event.reply_expected is None
+
+
 @pytest.mark.asyncio
 async def test_relay_origin_is_marked_unaddressed_at_shared_admission(monkeypatch):
     runner = object.__new__(gateway_run.GatewayRunner)

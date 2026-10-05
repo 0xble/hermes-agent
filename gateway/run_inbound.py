@@ -1097,6 +1097,10 @@ class GatewayInboundMixin:
             return True, usage
         with suppress(Exception):
             event.text = payload
+        # Admission saw "/queue <header>" and could not match the header; the stripped
+        # payload is what the turn persists, so judge agent origin on it now.
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(event)
         return False, None
 
     async def _hm_cmd_moa(self, event, source, _quick_key):
