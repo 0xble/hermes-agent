@@ -325,7 +325,9 @@ class SchedulerHost:
             try:
                 InProcessCronScheduler().start(gate, interval=60)
             except BaseException as exc:  # pragma: no cover - surfaced by wait_idle
-                self.errors.append(exc)
+                with gate.cv:
+                    self.errors.append(exc)
+                    gate.cv.notify_all()
 
         self.thread = threading.Thread(target=_run, name="c13-ticker", daemon=True)
         self.thread.start()
@@ -338,14 +340,17 @@ class SchedulerHost:
 
     def wait_idle(self) -> None:
         gate = self.gate
-
-        def _idle():
+        deadline = _real_time.monotonic() + DEADLINE_SECONDS
+        with gate.cv:
+            while gate.idle < gate.go + 1 and not self.errors:
+                remaining = deadline - _real_time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"timed out after {DEADLINE_SECONDS:.0f}s waiting for "
+                        "in-process ticker iteration")
+                gate.cv.wait(remaining)
             if self.errors:
                 raise AssertionError(f"ticker thread died: {self.errors[0]!r}")
-            with gate.cv:
-                return gate.idle >= gate.go + 1
-
-        wait_until(_idle, "in-process ticker iteration")
 
     def tick(self) -> None:
         self.release()
