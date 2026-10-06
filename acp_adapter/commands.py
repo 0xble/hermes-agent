@@ -298,13 +298,13 @@ class SlashCommandsMixin:
                 logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
                 return f"⚠️ Steer failed: {exc}"
 
-        return f"No active turn — queued for the next turn. ({_queue_prompt(state, steer_text)} queued)"
+        return f"⏳ No active turn — queued for the next turn. ({_queue_prompt(state, steer_text)} queued)"
 
     def _cmd_queue(self, args: str, state: SessionState) -> str:
         queued_text = args.strip()
         if not queued_text:
             return "Usage: /queue <prompt>"
-        return f"Queued for the next turn. ({_queue_prompt(state, queued_text)} queued)"
+        return f"⏳ Queued for the next turn. ({_queue_prompt(state, queued_text)} queued)"
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
         from hermes_cli.version_info import get_version_info

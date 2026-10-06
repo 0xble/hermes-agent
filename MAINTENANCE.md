@@ -125,9 +125,20 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Manual compression levels | `/compress --level 1-3` escalation and a `here N` head that keeps no extra tail | `/compress` parsing, `here N`, or manual compression budget changes | [Manual compression levels](maintenance/manual-compression-levels.md) |
 | Long request turn split | Split an oversized in-progress turn even when its opening request is long, so goal runs stay compressible | Oversized-turn split gates or in-flight request restatement changes | [Long request turn split](maintenance/long-request-turn-split.md) |
 | Oneshot plugin-hook discovery | Complete background plugin discovery before first-turn lifecycle hook delivery so `pre_llm_call` cannot observe a partial registry | Plugin startup discovery barriers, oneshot hook delivery, or plugin registry readiness | [Oneshot plugin-hook discovery](maintenance/oneshot-plugin-hook-discovery.md) |
+| Plugin and hook dispatch gates | Keep concurrent lifecycle and nested execute_code hook calls on distinct gate keys, let shell hooks own their matcher, timeout and fail_closed policy, avoid disk-cleanup temp-file races, and log default capability denials at DEBUG | Hook gate identity, shell-hook dispatch, execute_code nested tool-call ids, disk-cleanup state writes, or capability-check logging | [Plugin and hook dispatch gates](maintenance/plugin-hook-gates.md) |
 | MCP caller identity | Opted-in MCP servers receive the calling session's ContextVar identity as per-call request `_meta`, never the model's arguments or `os.environ` | MCP tool-call dispatch, per-server opt-ins, or session identity reads for MCP | [MCP caller identity](maintenance/mcp-caller-identity.md) |
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
+
+## Active patch record: relay silence (S1)
+
+- **Patch identity:** `relay-silence`.
+- **Behavior:** Treat registered agent-origin headers, beginning with relay's `[relay from=... receipt=... (task=...)?]`, as unaddressed inbound prompts so a bare `NO_REPLY` remains silent; preserve explicit addressed messages.
+- **Source surfaces:** `gateway/response_filters.py`, `gateway/run_inbound.py`, `gateway/run_busy.py`, locale `gateway.errors.unexpected_silence` strings, and gateway silence/response-filter/busy regression tests.
+- **Upstream status:** NousResearch #117354 covers group chats only; no relay-equivalent DM behavior.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_response_filters.py tests/gateway/test_gateway_silence_tokens.py tests/gateway/test_busy_redirect_anchor.py`.
+- **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
+- **Rollback:** Revert the relay-silence fix commit.
 
 ## Update
 
