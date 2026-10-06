@@ -1813,8 +1813,14 @@ class GatewayNotificationsMixin:
             if callable(_prime):
                 _prime(synth_event)
             if getattr(self, "_draining", False):
-                # A wake started now would race adapter teardown. The drain spool is the durable
-                # route the handler would take anyway; it replays on the next boot.
+                # A wake started now would race adapter teardown. A delegation result already has
+                # a durable ledger row: refuse it so the claim is deferred and the row stays
+                # pending for the next boot's /new-aware replay. A process completion has no other
+                # copy, so it goes to the drain spool the handler would use anyway.
+                if evt.get("type") == "async_delegation":
+                    if raise_not_accepted:
+                        raise WakeNotAccepted("gateway draining; delegation result stays pending")
+                    return False
                 return self._preserve_drain_event(self._session_key_for_source(source), synth_event)
             await admit_internal_event(adapter, synth_event)
             return True
@@ -2161,12 +2167,32 @@ class GatewayNotificationsMixin:
         current_task = asyncio.current_task()
         tasks, releases = self._completion_notification_batch_tasks, self._completion_notification_batch_releases
         entries: list[tuple[str, dict, asyncio.Future]] = []
+        sibling_claims: list = []
         delivered: Optional[bool] = False
         try:
             await self._wait_batch_window(delay, release)
             entries = self._completion_notification_batches.pop(key, [])
             # Detach before delivery so a completion arriving mid-flight can schedule the next flush.
             self._detach_batch_flush(tasks, releases, key, current_task, release)
+            # The agent may have read a held result with process(wait/log) during the window: that
+            # consumed it, so it no longer wakes anyone (the watcher's own pre-enqueue rule).
+            from tools.process_registry import process_registry
+            consumed = [e for e in entries if process_registry.is_completion_consumed(str(e[1].get("session_id") or ""))]
+            if consumed:
+                self._settle_batch_waiters(consumed, None)
+                entries = [e for e in entries if e not in consumed]
+            # Claim every sibling identity inflight before the (slow) delivery so a duplicate copy
+            # arriving meanwhile is deduplicated instead of starting a second turn. The primary
+            # claims its own inside _deliver_completion_notification.
+            for entry in list(entries[1:]):
+                identity = self._completion_delivery_identity(entry[1])
+                if identity is None:
+                    continue
+                if self._completion_identity_seen(identity, claim=True):
+                    self._settle_batch_waiters([entry], None)
+                    entries.remove(entry)
+                else:
+                    sibling_claims.append(identity)
             if not entries:
                 return
             synth_text = entries[0][0] if len(entries) == 1 else self._format_coalesced_process_completions(entries)
@@ -2174,6 +2200,12 @@ class GatewayNotificationsMixin:
             # sibling is never discarded with it.
             delivered = None
             for _text, candidate_evt, _future in entries:
+                candidate_identity = self._completion_delivery_identity(candidate_evt)
+                if candidate_identity in sibling_claims:
+                    # Promoted to primary: it claims its own identity in the delivery seam.
+                    sibling_claims.remove(candidate_identity)
+                    with self._completion_delivery_lock:
+                        self._completion_deliveries_inflight.discard(candidate_identity)
                 delivered = await self._deliver_completion_notification(synth_text, candidate_evt)
                 if delivered is not None:
                     break
@@ -2189,6 +2221,10 @@ class GatewayNotificationsMixin:
             logger.exception("Coalesced process completion delivery failed")
             delivered = False
         finally:
+            if sibling_claims and delivered is not True:
+                with self._completion_delivery_lock:
+                    for identity in sibling_claims:
+                        self._completion_deliveries_inflight.discard(identity)
             # A failure while stopping has no watcher retry left: spool it rather than drop it.
             if delivered is False and self._completion_notification_batches_stopping:
                 self._preserve_undelivered_batch(entries)

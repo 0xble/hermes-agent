@@ -544,3 +544,51 @@ async def test_window_is_read_from_the_owning_profile_config(hermes_home):
     assert await asyncio.wait_for(
         runner._enqueue_process_completion_notification("done", _completion("proc_cfg")), timeout=2.0) is True
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_result_consumed_with_process_tool_while_held_does_not_wake(hermes_home):
+    import tools.process_registry as pr_module
+
+    runner, adapter = _fan_in_runner(window=0.4, last_turn_age=0.0)
+    held = asyncio.create_task(runner._enqueue_process_completion_notification("done", _completion("proc_read")))
+    await asyncio.sleep(0.05)
+    pr_module.process_registry._completion_consumed.add("proc_read")  # agent ran process(wait/log)
+    assert await asyncio.wait_for(held, timeout=2.0) is None
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delegation_result_during_drain_stays_pending_in_its_ledger(hermes_home):
+    from tools import async_delegation
+
+    runner, adapter = _fan_in_runner(window=0, last_turn_age=None)
+    runner._draining = True
+    runner._preserve_drain_event = MagicMock(return_value=True)  # production spool succeeds
+    evt = _persist_pending({**_delegation("deleg_drain"), "parent_session_id": ""})
+    assert await runner._deliver_async_delegation_group([evt]) is False
+    runner._preserve_drain_event.assert_not_called()  # the ledger row, not the spool, is its copy
+    adapter.handle_message.assert_not_awaited()
+    row = async_delegation.get_durable_delegation("deleg_drain")
+    assert row["delivery_state"] == "pending" and not row.get("delivery_claim")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_arriving_during_batch_delivery_is_not_delivered_twice(hermes_home):
+    gate = asyncio.Event()
+    runner, adapter = _fan_in_runner(window=0, last_turn_age=None)
+
+    async def _slow(_event):
+        await gate.wait()
+
+    adapter.handle_message = AdmittingHandler(side_effect=_slow)
+    first = [_completion("proc_x", started_at=1.0), _completion("proc_y", started_at=2.0)]
+    batch = asyncio.gather(*(runner._enqueue_process_completion_notification(e["session_id"], e) for e in first))
+    await _settle(lambda: adapter.handle_message.await_count == 1, timeout=2.0)
+    # A replayed copy of the held sibling arrives while the batch is still being delivered.
+    dup = asyncio.create_task(runner._enqueue_process_completion_notification("proc_y", dict(first[1])))
+    await asyncio.sleep(0.3)
+    gate.set()
+    assert await asyncio.wait_for(batch, timeout=2.0) == [True, True]
+    assert await asyncio.wait_for(dup, timeout=2.0) is None
+    assert adapter.handle_message.await_count == 1
