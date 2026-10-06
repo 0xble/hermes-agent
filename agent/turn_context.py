@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
-from agent.memory_provider import is_trivial_prompt
+from agent.synthetic_prompt import auto_recall_query
 from agent.message_content import flatten_message_text
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
@@ -864,8 +864,9 @@ def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Notify memory providers of the new turn, then prefetch external memory once
-    before the tool loop (skipped on trivial prompts with no semantic signal).
-    Returns the prefetch text (``""`` when nothing was injected)."""
+    before the tool loop (skipped on trivial prompts and Hermes-generated turns; see
+    ``agent.synthetic_prompt.auto_recall_query``). Returns the prefetch text (``""`` when
+    nothing was injected)."""
     if not agent._memory_manager:
         return ""
     _query = _memory_query_text(original_user_message)
@@ -879,8 +880,13 @@ def _memory_turn_start_and_prefetch(
         )
     ext_prefetch_cache = ""
     with suppress(Exception):
-        if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+        _recall_query = auto_recall_query(
+            _query, display_kind=getattr(agent, "_turn_display_kind", None),
+            platform=getattr(agent, "platform", None),
+            include_synthetic=getattr(agent._memory_manager, "recall_synthetic_turns", False) is True,
+        )
+        if _recall_query:
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(_recall_query, session_id=agent.session_id) or ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
@@ -1012,6 +1018,9 @@ def build_turn_context(
     # Reset first: a cached gateway agent must never carry the previous turn's bot author into a human turn.
     turn_author = parse_turn_author(turn_author)
     agent._turn_author = turn_author
+    # This turn's user-row provenance for the memory gates (auto-recall and retention). Reset with
+    # the author so a cached agent never carries an internal turn's kind into a human turn.
+    agent._turn_display_kind = persist_user_display_kind
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.

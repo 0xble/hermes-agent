@@ -1137,8 +1137,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # -- retain ------------------------------------------------------------------
 
-    def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        user_content, assistant_content = filter_retain_messages(user_content, assistant_content)
+    def _build_turn_messages(self, user_content: str, assistant_content: str, *,
+                             display_kind: Optional[str] = None, platform: Optional[str] = None) -> List[Dict[str, str]]:
+        user_content, assistant_content = filter_retain_messages(
+            user_content, assistant_content, display_kind=display_kind, platform=platform)
         if not user_content and not assistant_content:
             return []
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
@@ -1254,7 +1256,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         return _job
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  display_kind: Optional[str] = None, platform: Optional[str] = None) -> None:
         """Enqueue a retain for the current turn (non-blocking; writer thread). Dropped
         once shutdown() fired so post-exit retains never reach aiohttp during teardown."""
         if self._cron_skipped:
@@ -1268,7 +1271,8 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        messages = self._build_turn_messages(user_content, assistant_content)
+        messages = self._build_turn_messages(user_content, assistant_content,
+                                             display_kind=display_kind, platform=platform)
         if not messages:
             logger.debug("sync_turn: skipped (no durable messages after retain filtering)")
             return

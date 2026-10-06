@@ -273,7 +273,15 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
+  recall_synthetic_turns: false  # external provider auto-recall on Hermes-generated turns
 ```
+
+An external provider's automatic recall runs only for text a person wrote. Turns Hermes generates
+itself (background-process and delegation notices, goal continuations, heartbeat and `/loop`
+wakeups, cron preambles, recovery notes) skip it, because their generated text is a poor search
+query and repeats verbatim from turn to turn. If a person's message was merged into such a turn,
+recall runs on that message alone. The provider's explicit recall tools work on every turn. Set
+`recall_synthetic_turns: true` to recall on generated turns as well.
 
 Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the
 built-in stores off completely: the `memory` tool is dropped from the schema and

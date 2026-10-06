@@ -134,9 +134,12 @@ class MemoryProvider(ABC):
         self, user_content: str, assistant_content: str, *,
         session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None,
         turn_author: Optional[Dict[str, Any]] = None,
+        display_kind: Optional[str] = None, platform: Optional[str] = None,
     ) -> None:
         """Persist a completed turn (non-blocking). ``messages`` is the OpenAI-style list so far.
-        ``turn_author`` (``{"id", "name", "is_bot"}``) is who wrote the user side; the manager sends it only to signatures that accept it."""
+        ``turn_author`` (``{"id", "name", "is_bot"}``) is who wrote the user side. ``display_kind`` (the
+        user row's persisted kind) and ``platform`` are the turn's provenance for
+        ``agent.synthetic_prompt.human_prompt_text``. The manager sends each only to signatures that accept it."""
 
     @abstractmethod
     def get_tool_schemas(self) -> List[Dict[str, Any]]:

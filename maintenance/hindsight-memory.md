@@ -29,6 +29,13 @@ strategy and cron-exclusion behavior.
   `_session_turns` once queued), so the writer keeps a failed job in an ordered, bounded
   backlog and retries it instead of discarding it (`TestRetainRetry`). Tag settings
   (`retain_tags`, `recall_tags`) accept comma-separated strings and reach the SDK as lists.
+- Hermes-generated user turns (notices, goal continuations, heartbeat and `/loop` wakeups, cron
+  preambles, recovery notes) neither key automatic recall nor enter retained transcripts. Both
+  gates call `agent.synthetic_prompt.human_prompt_text`, which reads the turn's runtime-owned
+  `display_kind` and platform and each producer's own formatter boundary, keeping any human text
+  merged after that boundary. Add a new generated prompt there, beside its producer constant,
+  rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
+  generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
 
 ## Proof surface
 
@@ -45,7 +52,8 @@ strategy and cron-exclusion behavior.
 
 - Fork patch identities: `HERMES-122`, `hindsight-retain-strategy`,
   `hindsight-cron-retention`, `hindsight-bundled-provider`,
-  `memory-note-not-authoritative`. Local narrow patches on the `v2026.9.14` baseline.
+  `memory-note-not-authoritative`, `synthetic-prompt-memory-gate`. Local narrow patches
+  on the `v2026.9.14` baseline.
 - `HERMES-122` (`6878e95d58`, re-landed `65059fa22d`) defaults `_cron_skipped` in
   `__init__`. Its first landing was reverted hours later by `fc45821e1f`, a backup
   change authored in a worktree created before the fix, whose tree still held the
@@ -59,6 +67,14 @@ strategy and cron-exclusion behavior.
 - `hindsight-cron-retention` (`fdb3f2e49d`) withholds the retain tool on cron
   sessions. This is the commit that introduced the `_cron_skipped` read without the
   matching default.
+- `synthetic-prompt-memory-gate` moves the generated-prompt inventory to
+  `agent/synthetic_prompt.py` and gates the core turn-start and post-turn recall paths on
+  it, plus retention through `sync_all` provenance. It is core because the prefetch call
+  sites and turn provenance live in `agent/turn_context.py` and `run_agent.py`. No
+  upstream issue or PR covered synthetic-turn recall as of 2026-10-05. Retire it when
+  upstream skips provider prefetch for runtime-generated turns. Roll back by reverting
+  its commit, which restores the `hindsight-session-lifecycle` retention-only filter in
+  `plugins/memory/hindsight/retention.py`.
 
 - `memory-note-not-authoritative` changes the note `build_memory_context_block()` puts
   before every provider recall. The upstream note called recalled memory

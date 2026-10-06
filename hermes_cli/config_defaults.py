@@ -1339,6 +1339,12 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
         "provider": "",
+        # Let Hermes-generated turns (process and delegation notices, goal continuations, heartbeat
+        # and /loop wakeups, cron preambles, recovery notes) key the external provider's automatic
+        # recall. Off: their generated text is a poor query and repeats verbatim across turns, while
+        # the session's own context already carries what they need. Text a person merged into such a
+        # turn still recalls. Explicit memory tools are unaffected.
+        "recall_synthetic_turns": False,
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so

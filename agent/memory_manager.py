@@ -340,8 +340,12 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
+                 recall_synthetic_turns: bool = False) -> None:
         self._providers: List[MemoryProvider] = []
+        # Host policy (memory.recall_synthetic_turns): whether Hermes-generated turns may key
+        # automatic recall. Read by the turn-start and post-turn prefetch gates.
+        self.recall_synthetic_turns = recall_synthetic_turns
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
         self._has_external: bool = False
@@ -532,18 +536,21 @@ class MemoryManager:
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[List[Dict[str, Any]]] = None,
-                 turn_author: Optional[Dict[str, Any]] = None) -> None:
+                 turn_author: Optional[Dict[str, Any]] = None,
+                 display_kind: Optional[str] = None, platform: Optional[str] = None) -> None:
         """Sync a completed turn to all providers on the background worker.
 
         Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
         open after the user saw the response. The single worker also serializes writes (turn N before N+1).
-        ``turn_author`` reaches only providers whose ``sync_turn`` accepts it.
+        ``turn_author`` and the turn's provenance (``display_kind``, ``platform``) reach only providers
+        whose ``sync_turn`` accepts them.
         """
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content:
             return
-        optional_kwargs = {"messages": messages, "turn_author": turn_author}
+        optional_kwargs = {"messages": messages, "turn_author": turn_author,
+                           "display_kind": display_kind, "platform": platform}
 
         def _sync(provider: MemoryProvider) -> None:
             kwargs: Dict[str, Any] = {"session_id": session_id}

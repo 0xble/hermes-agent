@@ -1023,6 +1023,12 @@ memory:
   # every N user turns. Set to 0 to disable. Only active when memory is enabled.
   nudge_interval: 10        # Nudge every 10 user turns (0 = disabled)
 
+  # Let Hermes-generated turns (process/delegation notices, goal continuations,
+  # heartbeat and /loop wakeups, cron preambles) key the external provider's
+  # automatic recall. Off by default: text a person merged into such a turn still
+  # recalls, and explicit memory tools are unaffected.
+  recall_synthetic_turns: false
+
 # =============================================================================
 # Session Continuity (Messaging Platforms)
 # =============================================================================
