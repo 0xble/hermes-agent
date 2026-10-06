@@ -222,17 +222,17 @@ async def _raise_marker_cleanup(marker_path):
     raise OSError("state store unavailable")
 
 
-def test_state_db_maintenance_runs_on_first_housekeeping_tick(monkeypatch):
+def test_state_db_maintenance_runs_on_first_and_every_60th_housekeeping_tick(monkeypatch):
     import gateway.run as gateway_run
 
     calls = []
 
-    class OneTickStop:
+    class SixtyOneTickStop:
         def __init__(self):
             self.ticks = 0
 
         def is_set(self):
-            return self.ticks >= 1
+            return self.ticks >= 61
 
         def wait(self, timeout=None):
             del timeout
@@ -245,9 +245,9 @@ def test_state_db_maintenance_runs_on_first_housekeeping_tick(monkeypatch):
         lambda launch=None: calls.append(launch),
     )
     gateway_run._start_gateway_housekeeping(
-        OneTickStop(), interval=0, runner=SimpleNamespace(config=GatewayConfig(), adapters={}),
+        SixtyOneTickStop(), interval=0, runner=SimpleNamespace(config=GatewayConfig(), adapters={}),
     )
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 def test_gateway_constructor_does_not_open_or_maintain_state_db(monkeypatch, tmp_path):

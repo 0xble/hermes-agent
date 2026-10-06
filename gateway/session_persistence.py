@@ -164,7 +164,9 @@ class SessionPersistenceMixin:
                 return self._db
             try:
                 return self._open_session_db_for_active_scope(db_path=routing_home / "state.db")
-            except Exception:
+            except Exception as exc:
+                if _is_live_system_guard(exc):
+                    raise
                 return None
         home = self._profile_home_for_key(session_key)
         if home is None:

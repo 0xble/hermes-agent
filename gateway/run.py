@@ -4879,7 +4879,7 @@ def _start_gateway_housekeeping(
         (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator)),
         (60, "Sync pull tick", profile_scoped_chore(runner, _housekeeping_skill_sync)),
         (60, "Org sync pull tick", profile_scoped_chore(runner, _housekeeping_org_skill_sync)),
-        (1, "state.db maintenance tick", profile_scoped_chore(
+        (60, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
@@ -4906,10 +4906,15 @@ def _start_gateway_housekeeping(
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
+    first_tick_labels = {"state.db maintenance tick"}
     while not stop_event.is_set():
         tick_count += 1
         for every, label, fn in chores:
-            if tick_count % every == 0:
+            if label in first_tick_labels:
+                due = tick_count == 1 or (tick_count > 1 and (tick_count - 1) % every == 0)
+            else:
+                due = tick_count % every == 0
+            if due:
                 _housekeeping_chore(label, fn)
         wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
     logger.info("Gateway housekeeping stopped")
