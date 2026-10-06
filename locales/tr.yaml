@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ Duraklatıldı{suffix}. Yeni cron/kanban/gateway işleri beklemeye alındı; sürmekte olan işler normal şekilde tamamlanır. Devam etmek için `/pause off` kullanın."
   queue:
     usage: "Kullanım: /queue <prompt>"
-    queued: "Sonraki tur için sıraya alındı."
+    queued: "⏳ Sonraki tur için sıraya alındı."
     queued_depth: " ({depth} sırada)"
   steer:
     usage: "Kullanım: /steer <prompt>"

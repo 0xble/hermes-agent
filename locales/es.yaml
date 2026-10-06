@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ Pausado{suffix}. El trabajo nuevo de cron/kanban/gateway queda en espera; el trabajo en curso termina con normalidad. Usa `/pause off` para reanudar."
   queue:
     usage: "Uso: /queue <prompt>"
-    queued: "En cola para el siguiente turno."
+    queued: "⏳ En cola para el siguiente turno."
     queued_depth: " ({depth} en cola)"
   steer:
     usage: "Uso: /steer <prompt>"

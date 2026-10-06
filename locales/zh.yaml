@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ 已暂停{suffix}。新的定时任务/看板/网关任务将被搁置；进行中的任务正常完成。用 `/pause off` 恢复。"
   queue:
     usage: "用法：/queue <提示词>"
-    queued: "已排队至下一回合。"
+    queued: "⏳ 已排队至下一回合。"
     queued_depth: " （已排队 {depth} 条）"
   steer:
     usage: "用法：/steer <提示词>"

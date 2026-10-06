@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ Ar sos{suffix}. Tá obair nua cron/kanban/gateway ar fionraí; críochnaíonn obair atá ar siúl mar is gnách. Úsáid `/pause off` chun atosú."
   queue:
     usage: "Úsáid: /queue <leid>"
-    queued: "Curtha i scuaine don chéad seal eile."
+    queued: "⏳ Curtha i scuaine don chéad seal eile."
     queued_depth: " ({depth} i scuaine)"
   steer:
     usage: "Úsáid: /steer <leid>"
