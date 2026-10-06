@@ -75,7 +75,30 @@ def _load_plugin_init():
 # Library tests
 # ---------------------------------------------------------------------------
 
-class TestIsSafePath:
+class TestConcurrentSaves:
+    def test_concurrent_saves_do_not_share_a_temp_path(self, _isolate_env, monkeypatch):
+        """Concurrent post-tool writers must not race on one tracked.json.tmp path."""
+        import concurrent.futures
+        import threading
+
+        dg = _load_lib()
+        real_replace = Path.replace
+        replace_barrier = threading.Barrier(2)
+
+        def synchronized_replace(self, target):
+            if self.name == "tracked.json.tmp":
+                replace_barrier.wait(timeout=5.0)
+            return real_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", synchronized_replace)
+        payloads = [[{"path": f"/tmp/hermes-race-{i}", "category": "test"}] for i in range(2)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(dg.save_tracked, payload) for payload in payloads]
+            errors = [future.exception() for future in futures]
+
+        assert errors == [None, None]
+        assert isinstance(dg.load_tracked(), list)
+
     def test_accepts_path_under_hermes_home(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "subdir" / "file.txt"
