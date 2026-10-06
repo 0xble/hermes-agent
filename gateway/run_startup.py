@@ -60,9 +60,13 @@ class GatewayStartupMixin:
     # A configured platform failed non-retryably this boot and is parked: every "we are serving"
     # status stamp (startup, drain release, scale-to-zero wake) must say ``degraded``, not ``running``.
     _startup_parked_platforms: bool = False
+    _startup_recovery_degraded: bool = False
 
     def _serving_state(self) -> str:
-        return "degraded" if self._startup_parked_platforms else "running"
+        return "degraded" if (
+            getattr(self, "_startup_parked_platforms", False)
+            or getattr(self, "_startup_recovery_degraded", False)
+        ) else "running"
 
     async def _run_startup_resume_event(
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
@@ -1252,14 +1256,8 @@ class GatewayStartupMixin:
             self._session_db_init_error = str(exc)
 
     async def _start_recover_previous_run(self) -> None:
-        """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
+        """Recover prior processes and sessions after adapters are ready."""
         from gateway.run import _hermes_home
-        self._start_register_plugins_relay_hooks()
-        # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
-        with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
-            from hermes_cli.plugins import get_plugin_manager
-            self._subscribe_plugin_rewire(get_plugin_manager())
-        self.hooks.discover_and_load()
         # Recover background processes from checkpoint (crash recovery). ``_checkpoint_path`` is
         # scope-relative, so a served secondary's turn wrote ITS home's processes.json; recover each
         # served profile's file under its scope or those processes are never re-adopted.
@@ -1274,14 +1272,18 @@ class GatewayStartupMixin:
         _clean_marker = _hermes_home / ".clean_shutdown"
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
+            discarded = 0
             try:
                 discarded = await self._consume_clean_shutdown_marker(_clean_marker)
             except Exception as exc:
+                # Adapters are already connected, so fail open into a serving-but-degraded gateway
+                # rather than leaving live transports and queued inbound work without teardown.
+                self._startup_recovery_degraded = True
                 logger.error(
-                    "Clean-start marker cleanup failed; refusing startup so the "
-                    "clean-exit receipt cannot mask a later unclean exit: %s", exc,
+                    "Clean-start marker cleanup failed after adapters became ready; continuing in "
+                    "degraded mode with session recovery skipped. The marker was retained for retry: %s",
+                    exc,
                 )
-                raise RuntimeError("clean-start recovery cleanup failed") from exc
             if discarded:
                 logger.info("Discarded %d orphan active-turn marker(s) after clean shutdown", discarded)
         else:
@@ -1874,12 +1876,16 @@ class GatewayStartupMixin:
             return True
         if self._start_check_access_policy():
             return True
-        # Session/process recovery is deliberately performed after adapter connections. Its SQLite work
-        # is offloaded below, and the startup-restore gate keeps inbound turns queued until the snapshot
-        # and auto-resume scheduling are complete.
-        # demand-time site (provider resolution, /login, the connector token) is a read that needs the
-        # identity to already exist. Keep the local bootstrap ahead of inbound admission; it does not
-        # touch state.db.
+        # Register plugins, the relay adapter, and hooks before creating platform adapters. Relay
+        # self-provisioning may disable direct platforms, leaving Platform.RELAY as the only ingress.
+        self._start_register_plugins_relay_hooks()
+        # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
+        with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
+            from hermes_cli.plugins import get_plugin_manager
+            self._subscribe_plugin_rewire(get_plugin_manager())
+        self.hooks.discover_and_load()
+        # The free-tier bootstrap resolves demand-time identity locally before inbound admission; it does
+        # not touch state.db.
         await self._run_free_tier_bootstrap()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
@@ -1893,6 +1899,7 @@ class GatewayStartupMixin:
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         self._startup_parked_platforms = False  # fresh boot: no platform has failed yet
+        self._startup_recovery_degraded = False
         (
             _aborted, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
         ) = await self._start_prefilter_platforms()

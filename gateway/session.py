@@ -847,8 +847,9 @@ class SessionStore(
             self._routing_home: Optional[Path] = Path(get_hermes_home())
         except Exception:
             self._routing_home = None
-        # Probe the handle now, but keep all state.db table scans and maintenance off the readiness path.
-        self._open_session_db_for_active_scope()
+        # Do not probe state.db during construction: another Hermes process may hold its writer lock.
+        # First use resolves the active profile lazily, and async callers cross the thread boundary
+        # before invoking blocking SQLite work.
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via
