@@ -6,6 +6,7 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any, Optional
 
@@ -146,3 +147,72 @@ def is_partial_silence_marker(text: Any) -> bool:
         c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
         for c in _canonical_silence_candidates(text)
     )
+
+
+_FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})(?:.*)?$")
+_LOOP_COMPLETE_LINE_RE = re.compile(r"^\s*LOOP_COMPLETE\s*[.!]?\s*$", re.IGNORECASE)
+_LOOP_COMPLETE_MARKER = "LOOP_COMPLETE"
+
+
+def _fenced_line_states(lines: list[str]) -> list[bool]:
+    states: list[bool] = []
+    fence_char = None
+    fence_len = 0
+    for line in lines:
+        states.append(fence_char is not None)
+        match = _FENCE_LINE_RE.match(line.rstrip("\r\n"))
+        if not match:
+            continue
+        fence = match.group(1)
+        if fence_char is not None:
+            if fence[0] == fence_char and len(fence) >= fence_len:
+                fence_char = None
+                fence_len = 0
+        else:
+            fence_char, fence_len = fence[0], len(fence)
+    return states
+
+
+def is_loop_complete_marker(text: Any) -> bool:
+    return isinstance(text, str) and _LOOP_COMPLETE_LINE_RE.fullmatch(text) is not None
+
+
+def strip_trailing_loop_complete_marker(text: Any) -> Any:
+    """Strip only trailing top-level LOOP_COMPLETE lines for display."""
+    if not isinstance(text, str):
+        return text
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    fenced = _fenced_line_states(lines)
+    end = len(lines)
+    while end:
+        while end and not lines[end - 1].strip():
+            end -= 1
+        if not end or fenced[end - 1] or not is_loop_complete_marker(lines[end - 1]):
+            break
+        end -= 1
+    return "".join(lines[:end]).rstrip() if end < len(lines) else text
+
+
+def ends_with_partial_loop_complete_marker(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    lines = text.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end or _fenced_line_states(lines)[end - 1]:
+        return False
+    candidate = lines[end - 1].strip().upper()
+    return bool(candidate) and _LOOP_COMPLETE_MARKER.startswith(candidate)
+
+
+def split_trailing_loop_complete_marker(text: Any) -> tuple[Any, str]:
+    if not isinstance(text, str) or not ends_with_partial_loop_complete_marker(text):
+        return text, ""
+    lines = text.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    return "".join(lines[:end - 1]), "".join(lines[end - 1:])

@@ -1917,12 +1917,15 @@ class GatewayTurnMixin:
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
+        raw_response=None,
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         if diagnostic_wake_muted(event):
             return None
-        # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
+        raw_response = response if raw_response is None else raw_response
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        response = strip_trailing_loop_complete_marker(response)
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
@@ -1953,7 +1956,7 @@ class GatewayTurnMixin:
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
-                event._streamed_final_response = str(response or "")
+                event._streamed_final_response = str(raw_response or "")
             return None
 
         return response
@@ -2239,6 +2242,9 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
+            raw_response_for_delivery = response
+            from gateway.response_filters import strip_trailing_loop_complete_marker
+            response = strip_trailing_loop_complete_marker(response)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
@@ -2263,6 +2269,7 @@ class GatewayTurnMixin:
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
+                raw_response=raw_response_for_delivery,
             )
 
         except Exception as e:
