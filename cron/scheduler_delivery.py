@@ -1359,12 +1359,25 @@ def _note_target_error(job: dict, msg: str, errors: list) -> None:
     errors.append(msg)
 
 
-def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool) -> None:
-    """Relay targets have no standalone fallback, so the log line must not promise one."""
-    if is_relay:
+def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool, *, flood_held: bool = False) -> None:
+    """Log a live-lane failure without promising an unsafe Telegram fallback."""
+    if is_relay or flood_held:
         logger.warning("Job '%s': %s", job["id"], msg)
     else:
         logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
+
+
+def _live_flood_held(t: _TargetDelivery) -> bool:
+    """Return whether the live rejection is a Telegram flood refusal.
+
+    The standalone lane has its own durable flood guard, but entering it after a live
+    rejection still creates a misleading fallback attempt and can bypass richer delivery
+    semantics. Keep the scheduler fail-closed at the same boundary.
+    """
+    if str(t.platform_name).lower() != "telegram":
+        return False
+    from gateway.delivery_ledger import is_flood_error
+    return is_flood_error(t.live_error)
 
 
 def _resolve_target_transport(
@@ -1597,7 +1610,7 @@ def _live_send_text(
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
         t.live_error = str(err) if err else None
-        _warn_live_lane_failure(job, msg, t.is_relay)
+        _warn_live_lane_failure(job, msg, t.is_relay, flood_held=_live_flood_held(t))
         target_errors.append(msg)
         return False, False, None
     if send_raw_response and t.thread_id and send_raw_response.get("thread_fallback"):
@@ -1741,7 +1754,7 @@ def _deliver_via_live_adapter(
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
         if not any(err_msg in err for err in target_errors):
             target_errors.append(err_msg)
-        _warn_live_lane_failure(job, err_msg, t.is_relay)
+        _warn_live_lane_failure(job, err_msg, t.is_relay, flood_held=_live_flood_held(t))
     return delivered
 
 
@@ -1868,6 +1881,14 @@ def _deliver_standalone(
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
+        return
+    if _live_flood_held(t):
+        # The live adapter already recorded the platform deadline. Do not enter the standalone
+        # sender at all: it cannot improve the outcome and a future fallback implementation must
+        # never get a second chance to issue a request during the same penalty.
+        msg = f"Telegram delivery deferred for {t.where}: flood-control deadline is active"
+        logger.warning("Job '%s': %s", job["id"], msg)
+        delivery_errors.extend([*target_errors, msg])
         return
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
