@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ B'éigean dom stopadh roimh chríochnú{reason}. Úsáid /retry le triail eile a bhaint as, nó /compress má tá an comhrá seo éirithe an-fhada."
     no_response: "⚠️ Críochnaíodh an phróiseáil ach níor gineadh aon fhreagra. Seans gur earráid neamhbhuan í seo — bain triail as do theachtaireacht a sheoladh arís."
     previous_turn_cleanup: "⚠️ Níor próiseáladh do theachtaireacht (bhí an seal roimhe seo fós á ghlanadh). Seol í arís le do thoil."
-    unexpected_silence: "⚠️ Níor chuir an tsamhail ar ais ach marcóir tosta do theachtaireacht a raibh freagra de dhíth uirthi. Bain triail eile as nó athfhoclaigh í."
+    unexpected_silence: "⚠️ Níor scríobhadh aon fhreagra don teachtaireacht seo. Seol arís í má bhí tú ag súil le freagra."
     empty_response_model_label: "An tsamhail"
     hint_auth: " Tá do shíniú isteach i seirbhís na samhla AI imithe in éag nó tá an eochair API mícheart. Úsáid /login anseo, nó rith `{relogin}` ar an óstach."
     hint_quota: " Tá iarmhéid nó cuóta do sheirbhíse samhla AI ídithe. Cuir breis leis ar shuíomh gréasáin na seirbhíse, nó úsáid /model chun samhail eile a roghnú."
