@@ -3825,7 +3825,6 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3848,8 +3847,14 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+            if adapter and pending_event and session_key and hasattr(adapter, "_pending_messages"):
+                # The drain already dequeued this event and promoted the next one into the slot, so
+                # it is the OLDEST waiting message: put it back at the head, never behind newer ones.
+                existing = adapter._pending_messages.get(session_key)
+                if existing is not None and existing is not pending_event:
+                    self._session_state(session_key).conversation.queued_events.insert(0, existing)
+                adapter._pending_messages[session_key] = pending_event
+                pending_event._gateway_accepted = True
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
