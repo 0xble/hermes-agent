@@ -75,14 +75,21 @@ def test_barrier_that_still_holds_yields_no_prompt(hermes_home, monkeypatch):
     assert mgr.lifted_barrier_prompt() is None
 
 
-def test_age_cap_lifts_a_still_running_wait(hermes_home, monkeypatch):
-    mgr = _park_on_session("s-cap", "proc_slow0000000")
+def test_age_cap_rearms_a_still_running_wait(hermes_home, monkeypatch):
+    mgr = _park_on_session("s-cap", "proc_slow000000")
     monkeypatch.setattr(goals, "_session_waiting", lambda sid: True)
     mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 5
+    mgr.state.barrier_recheck_at = 0.0
     mgr._save()
     monkeypatch.setattr(goals, "_process_outcome", lambda sid: {"running": True})
+    mgr.rearm_live_barrier()
     prompt = mgr.lifted_barrier_prompt()
-    assert prompt is not None and "still running" in prompt
+    assert prompt is None
+    assert mgr.is_waiting() is True
+    assert mgr.state is not None
+    assert mgr.state.barrier_recheck_at > time.time()
+    assert mgr.state.waiting_until == 0.0
+    assert mgr.state.barrier_rearms == 1
 
 
 def test_elapsed_timed_wait_lifts_without_a_note(hermes_home):
@@ -164,7 +171,7 @@ def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch)
     outcomes = []
     real_clear = goals.GoalState.clear_wait
 
-    def clear_with_competitor(self):
+    def clear_with_competitor(self, *args, **kwargs):
         other = sqlite3.connect(str(db_path), timeout=0)
         try:
             other.execute("UPDATE state_meta SET value = value WHERE key = ?", (goals._meta_key("s-lock"),))
@@ -174,7 +181,7 @@ def test_competing_writer_cannot_land_inside_the_clear(hermes_home, monkeypatch)
             outcomes.append(str(exc))
         finally:
             other.close()
-        return real_clear(self)
+        return real_clear(self, *args, **kwargs)
 
     monkeypatch.setattr(goals.GoalState, "clear_wait", clear_with_competitor)
     assert mgr.clear_lifted_wait(since) is True
