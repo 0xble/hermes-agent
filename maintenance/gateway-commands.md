@@ -27,8 +27,14 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   make them reachable. Regression exercises `_handle_message` with an active agent
   and verifies handler invocation without interruption or queueing.
 
+- Patch identity: `queue-ack-emoji`. `/queue` replies lead with ⏳ like the other
+  busy-input acknowledgments (⏩ steer, ↪ redirect, ⏳ busy queue): `gateway.queue.queued`
+  in every locale, plus the ACP queue, steer-fallback and busy-queue replies. Upstream
+  still renders the bare text. Retire by upstreaming the locale change.
+
 ## Verification
 
+`tests/gateway/test_telegram_voice_v0_regressions.py` asserts the ⏳ queue reply.
 `scripts/run_tests.sh` on `tests/gateway/test_command_bypass_active_session.py`,
 `tests/gateway/test_session_race_guard.py`, `tests/gateway/test_busy_command.py`, and
 `tests/gateway/test_running_agent_session_toggles.py`.
