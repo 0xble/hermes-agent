@@ -232,6 +232,23 @@ def test_progress_producer_is_no_faster_than_the_transport_edit_floor():
     assert TurnRunner._PROGRESS_EDIT_INTERVAL >= EDIT_FLOOR_SECS
 
 
+def test_progress_bubble_updates_at_most_every_ten_seconds():
+    """Approved 2026-10-06: progress-bubble edits were the largest share of typed-turn Bot API calls
+    on a chat that hit Telegram's daily volume ban, so interim edits are spaced 10s apart per chat."""
+    from gateway.run_turn_runner import TurnRunner
+    from plugins.platforms.telegram import chat_budget as cb
+
+    assert cb.EDIT_FLOOR_SECS == 10.0
+    assert TurnRunner._PROGRESS_EDIT_INTERVAL == 10.0
+    clock = _Clock()
+    budget = cb.ChatOutboundBudget(clock=clock)
+    budget.note_interim("2027045491")
+    clock.t += 9.9
+    assert budget.interim_blocked("2027045491")
+    clock.t += 0.2
+    assert not budget.interim_blocked("2027045491")
+
+
 @pytest.mark.asyncio
 async def test_bubble_cleanup_uses_one_batch_request_per_hundred_ids():
     adapter = _adapter(delete_messages=AsyncMock(return_value=True))
