@@ -105,11 +105,15 @@ Failed or interrupted model turns do not run completion judging.
     he can veto it). When a valid quote is supplied, the evidence scope check
     does not apply.
     `GoalManager.replace()` replaces an active or paused goal only after the same
-    fresh quote check, resets the new goal active with the configured budget,
-    and records the replaced goal, contract and subgoals in an audit entry that
-    is not binding revision history for the new goal. The replaced goal's gates
-    and earlier revisions are intentionally not carried over: the new goal
-    starts clean. The companion plugin lives in
+    fresh quote check, resets the new goal active with the configured budget, and
+    records the replaced goal, contract and subgoals in an audit entry. That
+    replacement authority (the quote, full source user message and replaced goal)
+    is shown to the new goal's judge, which must return BLOCKED when the full
+    message does not plainly instruct replacing/changing the goal; it is not
+    carried into binding revision or continuation history. The replaced goal's
+    gates and earlier revisions are intentionally not carried over: the new goal
+    starts clean after the judge validates the replacement authority. The companion
+    plugin lives in
     `0xble/agents` at `sources/plugins/goal-lifecycle`; it degrades with
     `unsupported_core` until these primitives are promoted, and remains safe to
     deploy before the core by preserving plain revise/set/status/subgoal_add.

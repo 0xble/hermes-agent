@@ -670,11 +670,12 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
     def render_revisions_block(self) -> str:
-        """Every revision with every requirement it replaced, in full; empty without revisions.
+        """Every non-replacement revision with every requirement it replaced, in full.
 
-        Nothing is windowed or truncated: a replaced requirement stays binding unless a user message
-        instructs the change or the revision records concrete evidence that the requirement is obsolete
-        or impossible; an evidence-backed change is superseded only when recorded tool results support it."""
+        Replacement records are intentionally rendered separately for the judge: they are audit
+        records for a fresh goal, not binding continuation history, but the judge must still see and
+        validate the authority that supposedly authorized the replacement.
+        """
         lines = []
         binding_revisions = [rev for rev in self.revisions if rev.get("kind") != "replace"]
         for i, rev in enumerate(binding_revisions, start=1):
@@ -698,6 +699,38 @@ class GoalState:
                     if dropped:
                         lines.append("    dropped criteria: " + "; ".join(str(s) for s in dropped))
         return "\n".join(lines)
+
+    def render_replacement_authority_block(self) -> str:
+        """Render replacement audit records for the judge's authority check.
+
+        A quote proves only that text occurred in a real user message. The full source message and
+        replaced goal are required so the judge can reject an agent-invented replacement that quoted
+        an incidental phrase such as ``"keep going please"``.
+        """
+        replacements = [rev for rev in self.revisions if rev.get("kind") == "replace"]
+        if not replacements:
+            return ""
+        lines = [
+            "Replacement authority audit (the current goal replaced an earlier goal):",
+            "The quoted text alone is not authorization. Accept this replacement only if the full user "
+            "message plainly instructs replacing, changing, or re-scoping the goal. If it does not, "
+            "return BLOCKED and explain that the replacement is unauthorized; do not silently accept "
+            "the current goal as user-approved.",
+        ]
+        for rev in replacements:
+            before = rev.get("before") or {}
+            lines.extend([
+                f"- Replaced goal: {str(before.get('goal') or '(empty)')}",
+                f"  User quote: {str(rev.get('user_quote') or '(missing)')}",
+                f"  Full source user message: {str(rev.get('user_message') or '(missing)')}",
+            ])
+        return "\n".join(lines)
+
+    def render_judge_revisions_block(self) -> str:
+        """Render all revision context the judge must inspect, including replacement authority."""
+        return "\n\n".join(
+            block for block in (self.render_revisions_block(), self.render_replacement_authority_block()) if block
+        )
 
     def clear_wait(self, *, preserve_notice_key: bool = False) -> None:
         self.waiting_on_pid = None
@@ -2506,7 +2539,7 @@ class GoalManager:
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-            evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
+            evidence=evidence or None, citations=citations, revisions_block=state.render_judge_revisions_block(),
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -2592,7 +2625,7 @@ class GoalManager:
         if not s or s.status != "active":
             return None
         prompt = self._current_continuation_prompt(s)
-        # A replace leaves only an audit record, which renders nothing; skip the notice then.
+        # A replace is judge-only authority context, not binding continuation history; skip the notice.
         revision_lines = s.render_revisions_block() if s.revisions else ""
         if revision_lines.strip():
             prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=revision_lines)

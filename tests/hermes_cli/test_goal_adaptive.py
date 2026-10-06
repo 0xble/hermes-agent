@@ -601,7 +601,7 @@ def test_freshly_replaced_goal_has_no_revision_notice(hermes_home):
     assert revised is not None and "This goal has been revised" in revised
 
 
-def test_replace_starts_new_revision_numbering_and_is_not_binding_history(hermes_home, monkeypatch):
+def test_replace_starts_new_revision_numbering_and_exposes_authority_only_to_judge(hermes_home, monkeypatch):
     mgr = GoalManager(session_id="replace-version")
     mgr.set("Old goal", contract=GoalContract(constraints="never push to main"))
     mgr.replace(reason="new direction", goal="New goal", user_quote="replace with the new goal",
@@ -611,8 +611,52 @@ def test_replace_starts_new_revision_numbering_and_is_not_binding_history(hermes
     assert "Old goal" not in block and "never push to main" not in block
     prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
     mgr.evaluate_after_turn("working")
-    assert "Old goal" not in prompts[0] and "never push to main" not in prompts[0]
+    assert "Old goal" in prompts[0]
+    assert "Replacement authority audit" in prompts[0]
+    assert "Please replace with the new goal now." in prompts[0]
     assert "v2" in prompts[0]
+
+
+def test_unauthorized_replacement_is_flagged_and_pauses(hermes_home, monkeypatch):
+    mgr = GoalManager(session_id="replace-unauthorized")
+    mgr.set("Ship original")
+    result = mgr.replace(
+        reason="agent selected a different objective",
+        goal="Ship unrelated",
+        user_quote="keep going please",
+        user_messages=["Please keep going please with the original goal."],
+    )
+    assert result["ok"]
+
+    prompts = _capture(monkeypatch, ['{"verdict":"blocked","reason":"replacement is not authorized"}'])
+    decision = mgr.evaluate_after_turn("Done with Ship unrelated.")
+
+    assert decision["verdict"] == "blocked"
+    assert load_goal("replace-unauthorized").status == "paused"
+    assert "Replacement authority audit" in prompts[0]
+    assert "Replaced goal: Ship original" in prompts[0]
+    assert "User quote: keep going please" in prompts[0]
+    assert "Full source user message: Please keep going please with the original goal." in prompts[0]
+    assert "return BLOCKED" in prompts[0]
+
+
+def test_explicit_replacement_instruction_remains_actionable(hermes_home, monkeypatch):
+    mgr = GoalManager(session_id="replace-explicit")
+    mgr.set("Ship original")
+    result = mgr.replace(
+        reason="the user explicitly replaced the objective",
+        goal="ship the new thing",
+        user_quote="Replace the goal with: ship the new thing",
+        user_messages=["Replace the goal with: ship the new thing."],
+    )
+    assert result["ok"] and mgr.state.goal == "ship the new thing"
+
+    prompts = _capture(monkeypatch, ['{"verdict":"done","reason":"explicit replacement is authorized"}'])
+    decision = mgr.evaluate_after_turn("The new thing is shipped.")
+
+    assert decision["verdict"] == "done"
+    assert load_goal("replace-explicit").status == "done"
+    assert "Replace the goal with: ship the new thing." in prompts[0]
 
 
 def test_replace_requires_a_real_current_user_quote(hermes_home):
