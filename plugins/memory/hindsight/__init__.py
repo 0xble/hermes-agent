@@ -1107,6 +1107,12 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
+    def discard_prefetch(self) -> None:
+        """Drop the buffered result; a worker still in flight belongs to a superseded generation."""
+        with self._prefetch_lock:
+            self._prefetch_generation += 1
+            self._prefetch_result, self._prefetch_count = "", 0
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
         if self._recall_sync or self._recall_disabled():
@@ -1418,9 +1424,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # 2. Drain the old session's in-flight prefetch and drop its result.
         self._join_prefetch(3.0)
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            self._prefetch_result, self._prefetch_count = "", 0
+        self.discard_prefetch()
 
         # 3. Rotate to the new session.
         # An explicit empty parent on a real switch clears the old lineage (an unrelated resumed

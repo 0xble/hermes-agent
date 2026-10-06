@@ -125,6 +125,12 @@ class MemoryProvider(ABC):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall after each turn; prefetch() consumes it next turn."""
 
+    def discard_prefetch(self) -> None:
+        """Drop any recall buffered by :meth:`queue_prefetch`, including one still in flight, so the
+        next :meth:`prefetch` returns only what it computes for its own query. The manager calls this
+        when the buffer is older than ``memory.prefetch_max_age_seconds``. Providers that recall live
+        in :meth:`prefetch` (or key their buffer on the query) need not override it."""
+
     def recall_status(self) -> Optional[RecallStatus]:
         """What the most recent :meth:`prefetch` injected (``None`` = no indicator). Must reflect
         only the LAST prefetch, never a stale prior count."""

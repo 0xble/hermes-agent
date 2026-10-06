@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
@@ -30,6 +31,28 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+# memory.prefetch_max_age_seconds default: recall buffered by the previous turn's queue_prefetch_all
+# is injected only within this window. Generated and trivial turns neither consume nor replace the
+# buffer, so without a bound the next human turn could inject a result keyed on a message hours old.
+DEFAULT_PREFETCH_MAX_AGE_S = 1800.0
+# Wall clock, not monotonic: macOS's monotonic clock stops while the host sleeps, which would let a
+# buffer survive an overnight sleep as "fresh". Module-level so tests can move time.
+_now = time.time
+
+
+def parse_prefetch_max_age(value: Any) -> Optional[float]:
+    """``memory.prefetch_max_age_seconds`` -> seconds, or None for no bound (``0`` or negative).
+    Unset or unparseable values fall back to the default."""
+    if value is None or value == "" or isinstance(value, bool):
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        logger.warning("memory.prefetch_max_age_seconds=%r is not a number; using %.0f",
+                       value, DEFAULT_PREFETCH_MAX_AGE_S)
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    return seconds if seconds > 0 else None
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -341,11 +364,16 @@ class MemoryManager:
     """
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
-                 recall_synthetic_turns: bool = False) -> None:
+                 recall_synthetic_turns: bool = False,
+                 prefetch_max_age_seconds: Optional[float] = DEFAULT_PREFETCH_MAX_AGE_S) -> None:
         self._providers: List[MemoryProvider] = []
         # Host policy (memory.recall_synthetic_turns): whether Hermes-generated turns may key
         # automatic recall. Read by the turn-start and post-turn prefetch gates.
         self.recall_synthetic_turns = recall_synthetic_turns
+        # memory.prefetch_max_age_seconds (None = unbounded) and when the buffered recall was queued.
+        self._prefetch_max_age = prefetch_max_age_seconds
+        self._prefetch_queued_at: Optional[float] = None
+        self._prefetch_discards = 0  # a queued task that has not reached its providers yet skips after a discard
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
         self._has_external: bool = False
@@ -453,6 +481,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
+        self._discard_stale_prefetch()
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
         )
@@ -517,16 +546,37 @@ class MemoryManager:
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
+    def _discard_stale_prefetch(self) -> None:
+        """Drop provider recall buffered by an earlier ``queue_prefetch_all`` once it is older than
+        ``prefetch_max_age_seconds``. The buffer is keyed on the last turn that queued, which can be a
+        human message many generated or trivial turns back. Within the bound that result is still the
+        latest human intent and is kept; past it, injecting nothing beats injecting an old topic."""
+        queued_at, max_age = self._prefetch_queued_at, self._prefetch_max_age
+        if queued_at is None or max_age is None or _now() - queued_at <= max_age:
+            return
+        self._prefetch_queued_at = None
+        self._prefetch_discards += 1
+        logger.debug("Discarding buffered memory prefetch queued %.0fs ago (limit %.0fs)", _now() - queued_at, max_age)
+        # Duck-typed providers that predate the hook have nothing to call.
+        self._each_provider("discard_prefetch failed (non-fatal)",
+                            lambda p: getattr(p, "discard_prefetch", lambda: None)())
+
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
         providers = list(self._providers)
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query:
             return
-        self._submit_background(lambda: self._each_provider(
-            "queue_prefetch failed (non-fatal)", lambda p: p.queue_prefetch(clean_query, session_id=session_id),
-            providers=providers,
-        ), kind="prefetch")
+        # The result's age is measured from its query's turn, which is now.
+        self._prefetch_queued_at, discards = _now(), self._prefetch_discards
+
+        def _queue() -> None:
+            if discards != self._prefetch_discards:  # expired while waiting behind a slow sync
+                return
+            self._each_provider("queue_prefetch failed (non-fatal)",
+                                lambda p: p.queue_prefetch(clean_query, session_id=session_id), providers=providers)
+
+        self._submit_background(_queue, kind="prefetch")
 
     @staticmethod
     def _provider_sync_accepts(provider: MemoryProvider, keyword: str) -> bool:

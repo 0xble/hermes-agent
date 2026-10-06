@@ -392,6 +392,11 @@ class RetainDBMemoryProvider(MemoryProvider):
     def _reasoning_level(query: str) -> str:
         return "low" if len(query) < 120 else "medium" if len(query) < 400 else "high"
 
+    def discard_prefetch(self) -> None:
+        """Drop results queued for an earlier turn (see ``MemoryProvider.discard_prefetch``)."""
+        with self._lock:
+            self._context_result, self._dialectic_result, self._agent_model = "", "", {}
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Consume prefetched results and return them as a context block."""
         with self._lock:

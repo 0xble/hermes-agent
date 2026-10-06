@@ -1029,6 +1029,11 @@ memory:
   # recalls, and explicit memory tools are unaffected.
   recall_synthetic_turns: false
 
+  # Oldest background-recall result (seconds) the external provider may inject.
+  # Recall is computed after each human turn for the next one; generated turns in
+  # between neither use nor replace it. Older results are dropped. 0 = no limit.
+  prefetch_max_age_seconds: 1800
+
 # =============================================================================
 # Session Continuity (Messaging Platforms)
 # =============================================================================

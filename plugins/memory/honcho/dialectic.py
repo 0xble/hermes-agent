@@ -90,6 +90,11 @@ class DialecticMixin:
         self._prefetch_thread = thread
         return thread
 
+    def discard_prefetch(self) -> None:
+        """Drop a pending dialectic result queued for an earlier turn (``MemoryProvider.discard_prefetch``)."""
+        with self._prefetch_lock:
+            self._prefetch_result, self._prefetch_result_fired_at = "", -999
+
     def _consume_pending_dialectic(self) -> str:
         """Pop the pending dialectic result, or "" when none is ready or it is stale."""
         with self._prefetch_lock:

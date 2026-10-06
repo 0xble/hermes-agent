@@ -349,3 +349,203 @@ def test_hindsight_sync_turn_drops_a_structured_synthetic_turn(monkeypatch):
                       {"display_kind": "internal_notification", "platform": "telegram"})]
     assert HindsightMemoryProvider._build_turn_messages(
         provider, "Reply with exactly HERMES_READY 1", "[SILENT]", display_kind="internal_notification") == []
+
+
+# -- buffered recall across generated turns -------------------------------------------------------
+
+
+class _BufferingProvider:
+    """Hindsight's default async contract: ``queue_prefetch`` buffers a recall keyed on that turn's
+    message, and the next ``prefetch`` returns the buffer whatever its own query is."""
+
+    name = "buffering"
+
+    def __init__(self):
+        self.buffer, self.consumed_by, self.queued = "", [], []
+
+    def queue_prefetch(self, query, *, session_id=""):
+        self.queued.append(query)
+        self.buffer = f"recall for: {query}"
+
+    def prefetch(self, query, *, session_id=""):
+        self.consumed_by.append(query)
+        result, self.buffer = self.buffer, ""
+        return result
+
+    def discard_prefetch(self):
+        self.buffer = ""
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", display_kind=None, platform=None):
+        pass
+
+    def on_turn_start(self, turn_number, message, **kwargs):
+        pass
+
+    def recall_status(self):
+        return None
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    import agent.memory_manager as memory_manager
+
+    now = [1_000_000.0]
+    monkeypatch.setattr(memory_manager, "_now", lambda: now[0])
+    return now
+
+
+def _session_with_buffering_provider(max_age=1800.0):
+    from tests.agent.test_turn_context import _FakeAgent
+
+    agent = _FakeAgent()
+    agent._memory_manager = MemoryManager(prefetch_max_age_seconds=max_age)
+    provider = _BufferingProvider()
+    agent._memory_manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    return agent, provider
+
+
+def _run_turn(agent, message, *, display_kind=None):
+    """One turn in production order: build_turn_context (turn-start recall), then the post-turn
+    sync and queue on the same agent. Returns the recall injected into this turn."""
+    from run_agent import AIAgent
+    from tests.agent.test_turn_context import _build
+
+    ctx = _build(agent, user_message=message, persist_user_display_kind=display_kind)
+    AIAgent._sync_external_memory_for_turn(agent, original_user_message=message, final_response="Done.",
+                                           interrupted=False)
+    assert agent._memory_manager.flush_pending(timeout=5) is True
+    return ctx.ext_prefetch_cache
+
+
+def test_buffered_recall_for_the_last_human_turn_survives_generated_turns_within_the_age_limit(clock):
+    agent, provider = _session_with_buffering_provider()
+    later = "And what about the rollback plan?"
+
+    assert _run_turn(agent, HUMAN) == ""
+    clock[0] += 600
+    assert _run_turn(agent, _delegation_notice(), display_kind="internal_notification") == ""
+    clock[0] += 600
+    assert _run_turn(agent, _goal_prompt()) == ""
+    clock[0] += 300
+
+    assert _run_turn(agent, later) == f"recall for: {HUMAN}"
+    # Generated turns neither consumed nor replaced the buffer.
+    assert provider.consumed_by == [HUMAN, later]
+    assert provider.queued == [HUMAN, later]
+
+
+def test_buffered_recall_older_than_the_age_limit_is_dropped(clock):
+    agent, provider = _session_with_buffering_provider()
+
+    _run_turn(agent, HUMAN)
+    clock[0] += 1200
+    _run_turn(agent, _delegation_notice(), display_kind="internal_notification")
+    clock[0] += 601  # 1801s after HUMAN queued its recall
+
+    assert _run_turn(agent, "And what about the rollback plan?") == ""
+    # The next human turn queued a fresh recall, which the turn after it may use.
+    clock[0] += 60
+    assert _run_turn(agent, "Who owns it?") == "recall for: And what about the rollback plan?"
+
+
+def test_generated_turn_never_consumes_the_buffer_even_when_it_is_stale(clock):
+    agent, provider = _session_with_buffering_provider()
+
+    _run_turn(agent, HUMAN)
+    clock[0] += 7200
+    assert _run_turn(agent, _process_notice(), display_kind="internal_notification") == ""
+    assert provider.consumed_by == [HUMAN]
+    assert provider.buffer == f"recall for: {HUMAN}"  # dropped only when a human turn would use it
+
+
+def test_zero_prefetch_max_age_disables_the_bound(clock):
+    from agent.memory_manager import DEFAULT_PREFETCH_MAX_AGE_S, parse_prefetch_max_age
+
+    assert parse_prefetch_max_age(None) == DEFAULT_PREFETCH_MAX_AGE_S
+    assert parse_prefetch_max_age("not a number") == DEFAULT_PREFETCH_MAX_AGE_S
+    assert parse_prefetch_max_age("600") == 600.0
+    assert parse_prefetch_max_age(0) is None
+
+    agent, _ = _session_with_buffering_provider(max_age=parse_prefetch_max_age(0))
+    _run_turn(agent, HUMAN)
+    clock[0] += 86_400
+    assert _run_turn(agent, "And what about the rollback plan?") == f"recall for: {HUMAN}"
+
+
+def test_agent_init_reads_prefetch_max_age_from_config(monkeypatch):
+    import agent.agent_init as agent_init
+
+    class _Provider(_BufferingProvider):
+        def is_available(self):
+            return True
+
+        def initialize(self, **kwargs):
+            pass
+
+        def get_tool_schemas(self):
+            return []
+
+    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda name: _Provider())
+    monkeypatch.setattr(agent_init, "_memory_provider_init_kwargs", lambda agent, platform: {"session_id": "s"})
+    for configured, expected in ((None, 1800.0), (90, 90.0), (0, None)):
+        memory = {"provider": "buffering", "memory_enabled": False, "user_profile_enabled": False}
+        if configured is not None:
+            memory["prefetch_max_age_seconds"] = configured
+        agent = SimpleNamespace(enabled_toolsets=None, disabled_toolsets=None, tools=None)
+        agent_init._init_memory(agent, {"memory": memory}, False, "cli")
+        assert agent._memory_manager._prefetch_max_age == expected
+
+
+def test_hindsight_discard_prefetch_drops_the_buffer_and_an_in_flight_worker():
+    import threading
+
+    from plugins.memory.hindsight import HindsightMemoryProvider
+
+    provider = HindsightMemoryProvider()
+    provider._mode, provider._auto_recall, provider._prefetch_waits_for_retain = "local_external", True, False
+    release = threading.Event()
+    provider._do_recall = lambda query: (release.wait(5), (f"- {query}", 1))[1]
+
+    provider.queue_prefetch("old topic")
+    provider.discard_prefetch()
+    release.set()
+    provider._prefetch_thread.join(timeout=5)
+    assert provider.prefetch("new topic") == ""
+
+
+def test_retaindb_and_honcho_discard_prefetch_drop_their_buffers():
+    from plugins.memory.honcho import HonchoMemoryProvider
+    from plugins.memory.retaindb import RetainDBMemoryProvider
+
+    retaindb = RetainDBMemoryProvider()
+    retaindb._context_result, retaindb._dialectic_result = "old context", "old synthesis"
+    retaindb._agent_model = {"memory_count": 1}
+    retaindb.discard_prefetch()
+    assert retaindb.prefetch("new topic") == ""
+
+    honcho = HonchoMemoryProvider()
+    honcho._prefetch_result, honcho._prefetch_result_fired_at = "old dialectic", 3
+    honcho.discard_prefetch()
+    assert honcho._consume_pending_dialectic() == ""
+
+
+def test_queued_recall_still_waiting_behind_a_slow_sync_is_dropped_with_the_expired_buffer(clock):
+    import threading
+
+    release = threading.Event()
+
+    class _SlowSync(_BufferingProvider):
+        def sync_turn(self, *args, **kwargs):
+            release.wait(5)
+
+    manager = MemoryManager(prefetch_max_age_seconds=1800.0)
+    provider = _SlowSync()
+    manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    manager.sync_all(HUMAN, "Done.", session_id="s-1")
+    manager.queue_prefetch_all(HUMAN, session_id="s-1")
+    clock[0] += 1801
+    assert manager.prefetch_all("And what about the rollback plan?", session_id="s-1") == ""
+
+    release.set()
+    assert manager.flush_pending(timeout=5) is True
+    assert provider.queued == []  # the expired request never reached the provider

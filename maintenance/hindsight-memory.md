@@ -45,6 +45,26 @@ strategy and cron-exclusion behavior.
   and a message merged into a revised continuation keeps none. The message itself is still
   delivered and answered. Text cannot tell such a quote from a payload copy, and carrying the human
   part as structured metadata through every merge path was judged too wide for this patch.
+- Buffered recall across generated turns. Default (async) Hindsight injects the result the
+  post-turn `queue_prefetch` computed for the PREVIOUS turn. Generated turns neither consume nor
+  queue, so in human A -> generated S -> human B, B injects the recall keyed on A, the latest human
+  intent (before this gate it was keyed on S's generated text). Review raised that A's result can
+  be stale. Discarding it on every suppressed turn was rejected: B would get no automatic recall,
+  and goal-heavy sessions put many generated turns between human ones. Measured on 30 days of
+  state.db top-level sessions, 72% of human -> generated -> human gaps are within 30 minutes
+  (median 11 min), against 90% of direct human -> human gaps. The defect is unbounded age, so
+  `MemoryManager` records when it last queued (`queue_prefetch_all`) and, at the next
+  `prefetch_all`, calls every provider's `discard_prefetch()` once that is older than
+  `memory.prefetch_max_age_seconds` (default 1800, `0` = no limit). The clock is wall time because
+  macOS's monotonic clock stops during sleep. It is manager-level so every buffering provider is
+  covered: Hindsight bumps its generation (also drops an in-flight worker), RetainDB clears its
+  caches, Honcho drops its pending dialectic. Mem0 keys its buffer on the query and OpenViking,
+  ByteRover, Holographic and Supermemory recall live, so they keep the no-op default. The buffer
+  lives on the provider instance owned by one agent's manager (each `load_memory_provider` call
+  builds a new instance), so it does not cross sessions, and Hindsight's `on_session_switch`
+  already drops it on /new, /resume, /branch and compression. In a shared chat it can carry one
+  participant's recall to another's next turn, which every async turn already did before this gate. Proof:
+  `tests/agent/test_synthetic_prompt.py` (`test_buffered_recall_*`).
 
 ## Proof surface
 
