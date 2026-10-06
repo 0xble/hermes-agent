@@ -2634,12 +2634,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
         reaches them, so the user can always stop a persisted process on purpose."""
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
         with self._lock:
-            targets = [
+            candidates = [
                 s for s in self._running.values()
                 if (task_id is None or s.owner_task_id == task_id)
-                and s.id not in exclude_ids and not s.exited
+                and s.id not in exclude_ids
                 and not (lifecycle and s.persist_on_release)
             ]
+            # The reader/waiter can finish a session between this snapshot and
+            # the signal sweep. Preserve the initial state so an already-exited
+            # session is never counted as killed by this invocation.
+            exited_before_sweep = {s.id for s in candidates if s.exited}
+            targets = [s for s in candidates if not s.exited]
         def _fallback_kill_one(session: ProcessSession) -> bool:
             if stop_event is not None and stop_event.is_set():
                 return False
@@ -2738,7 +2743,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         session.termination_source = source
                         if consume_output:
                             self._completion_consumed.add(session.id)
-                if self._move_to_finished(session):
+                self._move_to_finished(session)
+                if session.id not in exited_before_sweep:
                     killed += 1
             # Non-local targets are handled by the same bounded parallel phase, never serially.
             remainder = [session for session in targets if session not in signalable]
