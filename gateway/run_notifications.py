@@ -284,10 +284,14 @@ class GatewayNotificationsMixin:
                 if key and key[0] == session_key:
                     release.set()
 
-    @staticmethod
-    async def _wait_batch_window(delay: float, release: asyncio.Event) -> None:
+    @classmethod
+    async def _wait_batch_window(cls, delay: float, release: asyncio.Event) -> None:
+        """Hold until the window ends or a prompt result releases it; either way keep the
+        same-tick floor so results landing together still share one turn."""
+        floor = cls._COMPLETION_FAN_IN_FLOOR_S
         with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(release.wait(), timeout=delay)
+            await asyncio.wait_for(release.wait(), timeout=max(0.0, delay - floor))
+        await asyncio.sleep(floor)
 
     @staticmethod
     def _detach_batch_flush(tasks: dict, releases: dict, key, task, release) -> None:

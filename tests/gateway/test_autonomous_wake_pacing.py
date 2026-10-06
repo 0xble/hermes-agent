@@ -219,6 +219,7 @@ def _fan_in_runner(*, window=300.0, last_turn_age=10.0):
     runner._completion_delivery_retention = 2048
     runner._background_tasks = set()
     runner._completion_notification_batch_window = window
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value={"ended_at": None}))
     if last_turn_age is not None:
         runner._session_state(ROUTE["session_key"]).conversation.last_turn_started_at = time.time() - last_turn_age
     return runner, adapter
@@ -230,6 +231,18 @@ def _completion(session_id, *, exit_code=0, started_at=1.0):
         "command": f"run {session_id}", "exit_code": exit_code, "completion_reason": "exited",
         "output": f"{session_id} output\n",
     }
+
+
+def _persist_pending(event):
+    from tools import async_delegation
+
+    async_delegation._persist_dispatch({
+        "delegation_id": event["delegation_id"], "session_key": event["session_key"],
+        "origin_ui_session_id": "", "parent_session_id": event.get("parent_session_id"),
+        "dispatched_at": event["dispatched_at"],
+    })
+    async_delegation._persist_completion(event, {"status": event["status"], "summary": event["summary"]})
+    return event
 
 
 def _delegation(delegation_id, *, status="completed"):
@@ -310,14 +323,17 @@ async def test_watcher_holds_routine_delegation_results_and_delivers_one_turn(he
 
     q = queue.Queue()
     monkeypatch.setattr(pr_module.process_registry, "completion_queue", q)
-    runner, adapter = _fan_in_runner(window=0.5, last_turn_age=0.0)
-    q.put(_delegation("deleg_a"))
-    runner._running = True
+    runner, adapter = _fan_in_runner(window=1.0, last_turn_age=None)
 
     async def _drive():
         task = asyncio.create_task(runner._async_delegation_watcher(interval=0.05))
-        await asyncio.sleep(3.2)  # watcher's startup delay is 3s
-        q.put(_delegation("deleg_b"))
+        await asyncio.sleep(3.1)  # watcher's startup delay is 3s
+        # A turn just started; two routine results land a few watcher ticks apart.
+        runner._session_state(ROUTE["session_key"]).conversation.last_turn_started_at = time.time()
+        q.put(_persist_pending(_delegation("deleg_a")))
+        await asyncio.sleep(0.3)
+        assert adapter.handle_message.await_count == 0
+        q.put(_persist_pending(_delegation("deleg_b")))
         await _settle(lambda: adapter.handle_message.await_count >= 1, timeout=3.0)
         runner._running = False
         await asyncio.wait_for(task, timeout=2.0)
@@ -325,7 +341,11 @@ async def test_watcher_holds_routine_delegation_results_and_delivers_one_turn(he
     await _drive()
     adapter.handle_message.assert_awaited_once()
     text = adapter.handle_message.await_args.args[0].text
-    assert "deleg_a" in text and "deleg_b" in text
+    assert "2 background subagent delegations" in text and "deleg_a" in text and "deleg_b" in text
+    from tools import async_delegation
+
+    for delegation_id in ("deleg_a", "deleg_b"):
+        assert async_delegation.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
 
 
 @pytest.mark.asyncio
