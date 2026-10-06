@@ -564,6 +564,24 @@ def tool_row_emoji(tool_name: str, args: dict | None = None, default: str = "⚡
     return labels[0].emoji if labels else get_tool_emoji(tool_name, default)
 
 
+def progress_tool_label(tool_name: str, default: str = "⚡") -> tuple[str, str]:
+    """``(emoji, label)`` naming a tool in a progress line: the friendly ``App · action`` label for
+    MCP and connector tools (``mcp__paper__get_guide`` -> ``Paper · get guide``) when friendly
+    labels are on, else the raw tool name with its registry/skin emoji."""
+    if _friendly_tool_labels:
+        try:
+            from tools.tool_labels import label_for_tool_name
+            label = label_for_tool_name(tool_name)
+        except Exception as exc:  # noqa: BLE001 — display must never abort a turn
+            logger.debug("progress label failed for %s: %s", tool_name, exc)
+            label = None
+        if label is not None and label.kind in ("mcp", "connector"):
+            skin = _get_skin()
+            override = skin.tool_emojis.get(tool_name) if skin and skin.tool_emojis else None
+            return override or label.emoji, label.text
+    return get_tool_emoji(tool_name, default), tool_name
+
+
 def get_tool_verb(tool_name: str) -> str | None:
     """Friendly verb for a built-in tool, or None (labels disabled / no curated verb);
     callers compose ``f"{verb}{tool_verb_connector(tool)}{preview}"`` themselves."""
