@@ -966,6 +966,12 @@ class GatewayAdapterLifecycleMixin:
         if resume_events is None:
             resume_events = self._reconnect_resume_events = {}
         resume_events[platform] = resume_scheduled
+        task_ref = None
+        def cleanup():
+            if resume_events.get(platform) is resume_scheduled:
+                resume_events.pop(platform, None)
+            if pending.get(platform) is task_ref:
+                pending.pop(platform, None)
         async def recover():
             try:
                 # Keep this call single-argument compatible with lightweight test runners and
@@ -978,9 +984,9 @@ class GatewayAdapterLifecycleMixin:
                 # Fail-open for the watcher if candidate snapshotting itself failed before the scheduling
                 # phase; the retained worker has already logged the failure and will not lose the spool.
                 resume_scheduled.set()
-                resume_events.pop(platform, None)
-                pending.pop(platform, None)
-        pending[platform] = self._retain_background_task(asyncio.create_task(recover()))
+                asyncio.get_running_loop().call_soon(cleanup)
+        task_ref = self._retain_background_task(asyncio.create_task(recover()))
+        pending[platform] = task_ref
         return resume_scheduled
 
     async def _cancel_secondary_profile_reconnect_tasks(self) -> None:
