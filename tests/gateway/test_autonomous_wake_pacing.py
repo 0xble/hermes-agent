@@ -396,3 +396,77 @@ async def test_shutdown_requeues_held_delegations(hermes_home, monkeypatch):
 
     runner._deliver_async_delegation_group.assert_awaited_once()
     assert [evt["delegation_id"] for evt in list(q.queue)] == ["deleg_held"]
+
+
+@pytest.mark.asyncio
+async def test_task_failure_notice_releases_held_delegation_results_now(hermes_home):
+    """The diagnostic failure lane keeps its own turn (and mute policy) but never leaves held
+    sibling results waiting out the window."""
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    delivered: list = []
+
+    async def _deliver(group):
+        delivered.append([evt["delegation_id"] for evt in group])
+        return True
+
+    runner._deliver_async_delegation_group = _deliver
+    assert await runner._enqueue_async_delegation_group([_delegation("deleg_ok")]) is True
+    await asyncio.sleep(0.2)
+    assert delivered == []
+
+    notice = {**_delegation("deleg_batch"), "task_failure_notice": True, "status": "running",
+              "results": [{"task_index": 0, "status": "failed"}]}
+    assert await asyncio.wait_for(runner._enqueue_async_delegation_group([notice]), timeout=1.0) is True
+    await _settle(lambda: len(delivered) == 2, timeout=1.0)
+    assert sorted(delivered) == [["deleg_batch"], ["deleg_ok"]]
+
+
+@pytest.mark.asyncio
+async def test_completion_of_goal_awaited_pid_is_prompt(hermes_home):
+    import tools.process_registry as pr_module
+    from tools.process_registry import ProcessSession
+
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    session = ProcessSession(id="proc_pid", command="build", task_id="t", started_at=1.0,
+                             exited=True, exit_code=0, pid=43210)
+    pr_module.process_registry._finished[session.id] = session
+    mgr = goals.GoalManager("parent-session")
+    mgr.set("ship it")
+    with patch.object(goals, "_pid_alive", return_value=True):
+        mgr.wait_on(43210, reason="waiting for the build pid")
+    evt = {**_completion("proc_pid"), "parent_session_id": "parent-session"}
+    assert await asyncio.wait_for(runner._enqueue_process_completion_notification("done", evt), timeout=2.0) is True
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_busy_turn_receipt_is_sent_while_the_wake_is_held(hermes_home, monkeypatch):
+    """#112033: a process finishing during its launching turn gets the chat receipt immediately,
+    even though the agent wake is held for fan-in."""
+    import tools.process_registry as pr_module
+    from tools.process_registry import ProcessSession
+
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    adapter._active_sessions[ROUTE["session_key"]] = asyncio.Event()  # launching turn still running
+    sends: list[str] = []
+
+    async def _send(chat_id, text, **_kwargs):
+        sends.append(text)
+        return SimpleNamespace(success=True)
+
+    adapter.send = _send
+    session = ProcessSession(id="proc_busy", command="make test", task_id="t", started_at=1.0,
+                             output_buffer="ok\n", exited=True, exit_code=0, notify_on_complete=True)
+    pr_module.process_registry._finished[session.id] = session
+    watcher = {"session_id": "proc_busy", "check_interval": 0, **ROUTE, "notify_on_complete": True}
+    task = asyncio.create_task(runner._run_process_watcher(watcher))
+    await _settle(lambda: bool(sends), timeout=2.0)
+    assert len(sends) == 1
+    await _settle(lambda: bool(runner._completion_notification_batches), timeout=2.0)
+    await asyncio.sleep(0.2)
+    adapter.handle_message.assert_not_awaited()  # the wake itself is still held
+    assert not task.done()
+    await runner._cancel_process_completion_batch_tasks()
+    await asyncio.wait_for(task, timeout=2.0)
+    adapter.handle_message.assert_awaited_once()
+    assert len(sends) == 1

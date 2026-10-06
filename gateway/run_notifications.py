@@ -180,7 +180,9 @@ class GatewayNotificationsMixin:
     # within ``gateway.completion_notification_batch_window_seconds`` (default 300), a successful
     # process or delegation result is held so every result that lands in the window reaches the
     # agent as ONE synthetic turn. Failures and results a parked goal explicitly waits on are never
-    # held, and they release whatever is already held for that conversation with them. 0 keeps only
+    # held. A prompt result joins its own route's held batch, and releases the conversation's other
+    # held batches (the other kind, or the diagnostic task-failure notice lane, which keeps its own
+    # turn and mute policy) so nothing waits behind a wake that is happening anyway. 0 keeps only
     # the same-tick fan-in floor. Held results are never dropped: delivery failure retries, and
     # shutdown releases them into the durable drain spool.
     _COMPLETION_FAN_IN_FLOOR_S = 0.1
@@ -221,14 +223,22 @@ class GatewayNotificationsMixin:
 
     @staticmethod
     def _completion_awaited_by_goal(evt: dict) -> bool:
-        """Blocking: whether the session's active goal is explicitly parked on this result."""
+        """Blocking: whether the session's active goal is explicitly parked on this result
+        (``/goal wait`` on its process session or pid, or a wait on live delegations)."""
         from hermes_cli.goals import load_goal
         state = load_goal(str(evt.get("parent_session_id") or "").strip())
         if state is None or state.status != "active":
             return False
-        if evt.get("type") == "completion":
-            return bool(state.waiting_on_session) and state.waiting_on_session == str(evt.get("session_id") or "")
-        return evt.get("type") == "async_delegation" and state.waiting_on_delegations > 0
+        if evt.get("type") == "async_delegation":
+            return state.waiting_on_delegations > 0
+        process_id = str(evt.get("session_id") or "")
+        if state.waiting_on_session:
+            return state.waiting_on_session == process_id
+        if state.waiting_on_pid is not None:
+            from tools.process_registry import process_registry
+            session = process_registry.get(process_id) if process_id else None
+            return session is not None and getattr(session, "pid", None) == state.waiting_on_pid
+        return False
 
     async def _completion_hold_seconds(self, evt: dict, *, session_busy: bool = False) -> float:
         """How long to hold this result before waking its session; 0 means deliver promptly."""
@@ -2674,6 +2684,7 @@ class GatewayNotificationsMixin:
                       session_id, interval, notify_mode, agent_notify)
         silent = notify_mode == "off" and not agent_notify
         last_output_len = 0
+        busy_receipt_sent = False
         while True:
             await asyncio.sleep(interval)
             session = process_registry.get(session_id)
@@ -2698,22 +2709,23 @@ class GatewayNotificationsMixin:
                     # Captured before injection: afterwards the key is busy either way (the injected
                     # turn itself installs the guard).
                     turn_busy = await self._launching_turn_active(platform_name, watcher)
-                    delivered = await self._enqueue_process_completion_notification(
+                    delivery = asyncio.ensure_future(self._enqueue_process_completion_notification(
                         synth_text, completion_evt, session_busy=turn_busy,
-                    )
-                    if delivered is False:
+                    ))
+                    # The agent normally reports the result itself, so the chat gets no separate receipt.
+                    # While the launching turn is still running the agent hears of it only later (a
+                    # queued follow-up, or a held fan-in batch), and the chat would stay mute that long
+                    # (#112033): send the concise receipt now, once, without waiting for the wake.
+                    if turn_busy and not busy_receipt_sent and (notify_mode in {"concise", "all", "result"} or (
+                        notify_mode == "error" and session.exit_code not in {0, None}
+                    )):
+                        busy_receipt_sent = True
+                        message_text = self._format_process_final_message(session_id, session, "concise")
+                        await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
+                    if await delivery is False:
                         # The process remains terminal; retry after failed adapter injection instead
                         # of suppressing the result.
                         continue
-                    # The agent normally reports the result itself, so the chat gets no separate receipt.
-                    # While the launching turn is still running the injection only queues a follow-up, and
-                    # the chat would stay mute for as long as that turn lasts (#112033): send the concise
-                    # receipt now.
-                    if turn_busy and (notify_mode in {"concise", "all", "result"} or (
-                        notify_mode == "error" and session.exit_code not in {0, None}
-                    )):
-                        message_text = self._format_process_final_message(session_id, session, "concise")
-                        await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).
