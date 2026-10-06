@@ -25,6 +25,9 @@ const electronNative: TestProjectConfiguration = {
   test: {
     name: 'electron',
     environment: 'node',
+    // These suites create real Git repositories and cross Node/Python process boundaries.
+    // Keep their finite budget above Vitest's 5s default without raising individual assertions.
+    testTimeout: 30_000,
     // `e2e/**/*.unit.test.ts` is the e2e HELPERS, not the specs: plain node
     // modules that should be provable without booting Electron. Playwright
     // ignores the same pattern so they run in exactly one runner.
