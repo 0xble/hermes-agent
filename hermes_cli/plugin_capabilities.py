@@ -141,7 +141,8 @@ def plugin_capability_granted(plugin_id: str, capability: str, config: Optional[
         allowed, evidence = True, f"legacy key plugins.entries.{plugin_id}.{'.'.join(spec.legacy_path)} (deprecated)"
     else:
         allowed, evidence = False, "not granted"
-    logger.info(  # audit trail for capability gate decisions
+    logger.log(  # audit trail for capability gate decisions
+        logging.DEBUG if not allowed and evidence == "not granted" else logging.INFO,
         "capability_check plugin=%s capability=%s decision=%s checked_by=plugin_capability_granted evidence=%s",
         plugin_id, capability, "allow" if allowed else "deny", evidence)
     return allowed

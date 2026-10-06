@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +72,12 @@ def load_tracked() -> List[Dict[str, Any]]:
 
 
 def save_tracked(tracked: List[Dict[str, Any]]) -> None:
-    """Atomic write: ``.tmp`` → backup old → rename."""
+    """Atomic write with a backup; the shared helper allocates a unique temp file per writer."""
     tf = _state_file("tracked.json")
     tf.parent.mkdir(parents=True, exist_ok=True)
-    tmp = tf.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(tracked, indent=2), encoding="utf-8")
     if tf.exists():
         shutil.copy2(tf, tf.with_suffix(".json.bak"))
-    tmp.replace(tf)
+    atomic_json_write(tf, tracked, indent=2)
 
 
 ALLOWED_CATEGORIES = {
