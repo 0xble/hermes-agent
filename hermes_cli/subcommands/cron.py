@@ -74,6 +74,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "`hermes model` changes never touch it. Ignored when --model is given.")
     cron_create.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').")
+    cron_create.add_argument("--hard-wall-timeout", dest="hard_wall_timeout_seconds", type=float,
+        help="Detached worker total runtime cap in seconds, including scripts and children. "
+             "Positive finite seconds; 0 follows the profile cap (default 7200s).")
     cron_create.add_argument("--reasoning-effort", dest="reasoning_effort",
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
@@ -148,6 +151,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Release the job's model pin so it follows the main agent model again.")
     cron_edit.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.")
+    cron_edit.add_argument("--hard-wall-timeout", dest="hard_wall_timeout_seconds", type=float,
+        help="Detached worker total runtime cap in seconds. Positive finite seconds; "
+             "0 clears the job override and follows the profile cap.")
     cron_edit.add_argument("--reasoning-effort", dest="reasoning_effort",
         help="Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
