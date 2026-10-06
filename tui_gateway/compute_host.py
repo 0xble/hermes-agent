@@ -262,7 +262,8 @@ class ComputeHost:
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 user_turn=bool(frame.get("user_turn")),
                 display_metadata=(frame.get("display_metadata")
-                                  if isinstance(frame.get("display_metadata"), dict) else None))
+                                  if isinstance(frame.get("display_metadata"), dict) else None),
+                queue_token=frame.get("queue_token") or None)
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():

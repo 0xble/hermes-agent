@@ -274,6 +274,7 @@ class CommandDispatchResult(Result):
     name: str | None = None
     status: str | None = None
     queued: bool | None = None  # ``send`` only: the prompt must wait for the next turn
+    moa_token: str | None = None  # deferred one-shot identity, echoed by prompt.submit
 
 
 method("command.dispatch", params=CommandDispatchParams, result=CommandDispatchResult,
@@ -300,6 +301,7 @@ class SlashExecResult(Result):
     name: str | None = None
     status: str | None = None
     queued: bool | None = None  # ``send`` only: the prompt must wait for the next turn
+    moa_token: str | None = None  # deferred one-shot identity, echoed by prompt.submit
 
 
 method("slash.exec", params=SlashExecParams, result=SlashExecResult,

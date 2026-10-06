@@ -950,7 +950,14 @@ describe('createSlashHandler', () => {
           request: vi.fn((method: string) =>
             Promise.resolve(
               method === 'slash.exec'
-                ? { display: '/moa compare', message: 'compare', notice: 'MoA queued', queued: true, type: 'send' }
+                ? {
+                    display: '/moa compare',
+                    message: 'compare',
+                    moa_token: 'token-1',
+                    notice: 'MoA queued',
+                    queued: true,
+                    type: 'send'
+                  }
                 : {}
             )
           )
@@ -960,7 +967,7 @@ describe('createSlashHandler', () => {
     })
 
     expect(createSlashHandler(ctx)('/moa compare')).toBe(true)
-    await vi.waitFor(() => expect(ctx.composer.enqueue).toHaveBeenCalledWith('compare', '/moa compare'))
+    await vi.waitFor(() => expect(ctx.composer.enqueue).toHaveBeenCalledWith('compare', '/moa compare', 'token-1'))
     expect(ctx.transcript.send).not.toHaveBeenCalled()
   })
 

@@ -908,6 +908,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // (client saw idle, server still unwinding) redirects or interrupts
           // the live turn with text the user explicitly queued.
           ...(options?.fromQueue && { queued: true }),
+          ...(options?.moaToken && { moa_token: options.moaToken }),
           ...(titlePreview && { title_preview: titlePreview })
         })
 

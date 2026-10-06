@@ -142,14 +142,14 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string, type
       // projection and goes through unchanged. No client-side fallback here:
       // the TUI spawns its gateway from this same checkout, so the two can't
       // version-skew (unlike the desktop, which can meet an older backend).
-      const sendDispatch = (display: string | undefined, message: string, queued = false) => {
+      const sendDispatch = (display: string | undefined, message: string, queued = false, moaToken?: string) => {
         const shown = display?.trim()
 
         if (queued) {
           // The gateway has already associated the pending MoA state with this
           // prompt. Keep the prompt in the Ink queue so steer/interrupt modes
           // cannot inject it into the still-running turn.
-          return ctx.composer.enqueue(message, shown)
+          return moaToken ? ctx.composer.enqueue(message, shown, moaToken) : ctx.composer.enqueue(message, shown)
         }
 
         return shown ? send(message, true, shown) : send(message)
@@ -167,7 +167,7 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string, type
         }
 
         return d.message?.trim()
-          ? sendDispatch(d.display, d.message, d.queued)
+          ? sendDispatch(d.display, d.message, d.queued, d.moaToken)
           : sys(`/${parsed.name}: empty message`)
       }
 

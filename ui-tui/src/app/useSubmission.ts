@@ -104,7 +104,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { skipDetectDrop?: boolean } = {}
+      submitOpts: { moaToken?: string; skipDetectDrop?: boolean } = {}
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
@@ -179,18 +179,18 @@ export function useSubmission(opts: UseSubmissionOptions) {
   )
 
   const sendQueued = useCallback(
-    (text: string) => {
-      if (text.startsWith('!')) {
-        return shellExec(text.slice(1).trim())
+    (item: QueueItem) => {
+      if (item.text.startsWith('!')) {
+        return shellExec(item.text.slice(1).trim())
       }
 
-      if (hasInterpolation(text)) {
+      if (hasInterpolation(item.text)) {
         patchUiState({ busy: true })
 
-        return interpolate(text, send)
+        return interpolate(item.text, text => send(text, true, undefined, undefined, { moaToken: item.moaToken }))
       }
 
-      send(text)
+      send(item.text, true, undefined, undefined, { moaToken: item.moaToken })
     },
     [interpolate, send, shellExec]
   )
@@ -215,7 +215,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         if (opts.fallbackToFront) {
           composerActions.prependQueue(item)
         } else {
-          composerActions.enqueue(item.text, item.display)
+          composerActions.enqueue(item.text, item.display, item.moaToken)
         }
       }
 
@@ -246,13 +246,13 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // the agent is in model generation, tool execution, or an older runtime.
       // Reuse the normal submit pipeline so the correction gets its user bubble
       // and file-drop interpolation exactly once.
-      send(item.text)
+      send(item.text, true, item.display, undefined, { moaToken: item.moaToken })
     },
     [composerActions, gw, send, sys]
   )
 
   const dispatchSubmission = useCallback(
-    (full: string) => {
+    (full: string, moaToken?: string) => {
       if (!full.trim()) {
         return
       }
@@ -280,7 +280,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         if (queued) {
           // Handled here, before the slash handler, so it is counted here.
           reportSlashCommand(gw, parsed.name, getUiState().sid)
-          composerActions.enqueue(queued.text, queued.display)
+          composerActions.enqueue(queued.text, queued.display, queued.moaToken)
           sys(`queued: "${queued.display.slice(0, 50)}${queued.display.length > 50 ? '…' : ''}"`)
         } else {
           slashRef.current(slash.command)
@@ -329,7 +329,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
           return handleBusyInput(picked, { fallbackToFront: true })
         }
 
-        return sendQueued(picked.text)
+        return sendQueued(picked)
       }
 
       composerActions.pushHistory(toHistory)
@@ -346,7 +346,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         )
       }
 
-      send(submission.text, true, submission.display, value => value)
+      send(submission.text, true, submission.display, value => value, { moaToken })
     },
     [
       appendMessage,
@@ -393,7 +393,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
           if (next) {
             composerActions.setQueueEdit(null)
-            dispatchSubmission(next)
+            dispatchSubmission(next.text, next.moaToken)
           }
         }
 

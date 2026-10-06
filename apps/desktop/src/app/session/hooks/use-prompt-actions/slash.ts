@@ -354,6 +354,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // dispatch and this branch would otherwise queue the kickoff on
           // whichever chat is now in front (#63352).
           const queued = queueKickoffIfSessionBusy({
+            ...(dispatch.type === 'send' && dispatch.moaToken ? { moaToken: dispatch.moaToken } : {}),
             displayText,
             foregroundBusy: busyRef.current,
             sessionId,

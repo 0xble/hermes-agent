@@ -8088,6 +8088,18 @@
             ],
             "default": null,
             "title": "Queued"
+          },
+          "moa_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Moa Token"
           }
         },
         "required": [
@@ -26188,6 +26200,18 @@
             "default": null,
             "title": "Queued"
           },
+          "moa_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Moa Token"
+          },
           "surface": {
             "anyOf": [
               {
@@ -33708,6 +33732,18 @@
             ],
             "default": null,
             "title": "Queued"
+          },
+          "moa_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Moa Token"
           }
         },
         "title": "SlashExecResult",

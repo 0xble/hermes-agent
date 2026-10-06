@@ -2614,6 +2614,7 @@ export interface PromptSubmitParams {
   display_kind?: string | null
   interrupted?: boolean | null
   queued?: boolean | null
+  moa_token?: string | null
   surface?: string | null
   voice_context?: string | null
   title_preview?: string | null
@@ -3679,6 +3680,7 @@ export interface CommandDispatchResult {
   name?: string | null
   status?: string | null
   queued?: boolean | null
+  moa_token?: string | null
 }
 /** ``apps/shared/src/slash.ts::parseCommandDispatch`` branches on this. */
 export type DispatchType = 'exec' | 'alias' | 'plugin' | 'send' | 'skill' | 'prefill'
@@ -3699,6 +3701,7 @@ export interface SlashExecResult {
   name?: string | null
   status?: string | null
   queued?: boolean | null
+  moa_token?: string | null
 }
 export interface InsightsGetParams {
   days?: number | null

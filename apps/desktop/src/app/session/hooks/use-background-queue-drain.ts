@@ -176,6 +176,7 @@ export function useBackgroundQueueDrain({
         const accepted = await Promise.resolve(
           submitTextRef.current(liveEntry.text, {
             attachments: liveEntry.attachments,
+            ...(liveEntry.moaToken ? { moaToken: liveEntry.moaToken } : {}),
             fromQueue: true,
             sessionId: runtimeSessionId,
             storedSessionId: sessionKey

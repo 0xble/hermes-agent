@@ -58,6 +58,7 @@ export interface SkillCommandDispatchResponse {
 }
 
 export interface SendCommandDispatchResponse {
+  moaToken?: string
   /** Set for a skill-bundle send: see SkillCommandDispatchResponse.display. */
   display?: string
   /** Force the resulting prompt through the server's next-turn queue. */
@@ -110,6 +111,7 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
             message: row.message,
             notice: str(row.notice),
             ...(row.queued === true ? { queued: true } : {}),
+            ...(typeof row.moa_token === 'string' ? { moaToken: row.moa_token } : {}),
             type: 'send'
           }
         : null

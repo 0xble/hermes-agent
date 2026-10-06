@@ -7,6 +7,7 @@ Helper names must not collide with server.py's own (``_cmd_`` / ``_toolset_`` / 
 
 import contextlib
 import sys
+import uuid
 from pathlib import Path
 
 from .method_ctx import HandlerRegistry, bind_module
@@ -764,12 +765,22 @@ def _cmd_moa(rid, params, session, name, arg):
         # prompt instead of switching that agent under its worker thread (#moa-busy-defer).
         agent = session.get("agent")
         if session.get("running"):
-            restore = {
+            # A queued item must carry its own identity: matching by prompt text lets an ordinary
+            # same-text follow-up consume this one-shot before the actual /moa item arrives.
+            queue_token = uuid.uuid4().hex
+            active_restore = session.get("moa_one_shot_restore")
+            if not isinstance(active_restore, dict):
+                pending = session.get("pending_moa")
+                if isinstance(pending, list) and pending and isinstance(pending[0], dict):
+                    active_restore = pending[0].get("restore")
+            restore = (dict(active_restore) if isinstance(active_restore, dict) else {
                 "override": session.get("model_override"), "model": getattr(agent, "model", None),
-                "provider": getattr(agent, "provider", None)}
-            session.setdefault("pending_moa", []).append({"prompt": arg, "preset": preset, "restore": restore})
+                "provider": getattr(agent, "provider", None)})
+            session.setdefault("pending_moa", []).append({
+                "queue_token": queue_token, "prompt": arg, "preset": preset, "restore": restore})
             notice = f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn."
-            return _ok(rid, {"type": "send", "display": f"/moa {arg}", "queued": True, "notice": notice, "message": arg})
+            return _ok(rid, {"type": "send", "display": f"/moa {arg}", "queued": True,
+                             "moa_token": queue_token, "notice": notice, "message": arg})
         # Record the live identity for post-turn restore, then swap the agent's client in
         # place: session["model_override"] alone never switches an already-built agent.
         # See #53444.
