@@ -557,13 +557,12 @@ class GatewayGoalsMixin:
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip():
-            metadata = getattr(event, "metadata", {}) or {}
+            # A process or delegation result injected by the completion path is new evidence and
+            # may pierce the continuation gap. Other internal wakes (/loop ticks, goal
+            # continuations, heartbeats) are paced.
+            metadata = getattr(event, "metadata", None) or {}
             external_event = bool(
-                is_internal
-                and (
-                    metadata.get("notification_category") in {"result", "diagnostic"}
-                    or metadata.get("notification_origin") == "process_registry_synthetic"
-                )
+                is_internal and metadata.get("notification_origin") == "process_registry_synthetic"
             )
             hooks.insert(0, (
                 "goal continuation", self._post_turn_goal_continuation,
@@ -786,7 +785,11 @@ class GatewayGoalsMixin:
         except WakeNotAccepted:
             logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
             return
+        from hermes_cli.goals import is_continuation_gap_wait
+        gap_wait = is_continuation_gap_wait(mgr.state)
         await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
+        if gap_wait:
+            return  # the routine pacing hold was never announced, so its end is not either
         with suppress(Exception):
             await self._send_goal_status_notice(source, "▶ Goal wait ended — resuming.", notice_kind="wait-ended")
 

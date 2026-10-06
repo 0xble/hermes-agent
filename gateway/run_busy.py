@@ -508,11 +508,13 @@ class GatewayBusySessionMixin:
             return
         await send
 
-    def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> None:
-        """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing."""
+    def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing.
+
+        Returns whether the event was preserved (FIFO or durable spool)."""
         setattr(event, "_drain_deferred", True)
         if self._queue_or_replace_pending_event(session_key, event):
-            return
+            return True
         # No adapter or a full FIFO: use the same durable shutdown spool rather than lose
         # the turn. Recovery retains the file if its session cannot yet be resolved.
         try:
@@ -522,6 +524,7 @@ class GatewayBusySessionMixin:
             logger.warning("Failed to preserve drain arrival for %s", session_key, exc_info=True)
         if not preserved:
             logger.warning("Drain arrival for %s could not be preserved", session_key)
+        return bool(preserved)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command. English words
     # (and the thumbs) always match; ``approval.inputs.*`` adds the active language's synonyms.

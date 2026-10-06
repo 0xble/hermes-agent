@@ -109,7 +109,29 @@ Failed or interrupted model turns do not run completion judging.
   is recorded in the PR. Rollback reverts the source change. `revisions` and
   `last_dispute_evidence` default empty on old rows, and there is no migration.
 
-- Fork patch identity: `goal-continuation-gap`. Own fork patch, no upstream PR yet. Gateway-created GoalManagers default to a 900-second minimum interval between autonomous continuation turns, configurable with `goals.min_continuation_gap_seconds` (`0` disables it). Real user turns and process/delegation notifications are fresh wake evidence and bypass the interval; live process/delegation wait barriers remain authoritative. The interval is durable as the existing goal wait barrier, so restarts do not reset it and the idle goal wake path resumes it. Regression: `uv run --with pytest --with pytest-asyncio pytest -q tests/hermes_cli/test_goals.py tests/gateway/test_goal_max_turns_config.py tests/gateway/test_goal_continuation_drain.py -k 'continuation_gap or max_turns or finite_budget or unlimited_budget'`. Rollback reverts this identity's manager plumbing, wait guard, config normalization and tests; no schema migration is introduced.
+- Fork patch identity: `goal-continuation-gap`. Own fork patch, no upstream PR yet.
+  Two autonomous-wake controls. (1) Gateway GoalManagers pace autonomous
+  continuations: after a turn with no fresh evidence (continuation, `/loop`,
+  heartbeat), the next continuation waits until `goals.min_continuation_gap_seconds`
+  (default 900, `0` disables) after `GoalState.last_continuation_at`, stamped on
+  every judge CONTINUE and on the idle ticker's CAS clear. The hold is the ordinary
+  durable timed wait with reason `minimum gap between autonomous goal continuations`;
+  it is silent (no parked or wait-ended notice). A user turn or an event with
+  `notification_origin=process_registry_synthetic` (also carried through queued
+  follow-up chains as `queued_terminal_notification_origin`) pierces only this hold;
+  judge waits and pid/session/delegation barriers stay authoritative. CLI/TUI
+  managers keep the gap off. (2) Completion fan-in: a successful process or
+  delegation result for a conversation that is mid-turn or started a turn within
+  `gateway.completion_notification_batch_window_seconds` (default 300, capped 3600,
+  `0` = same-tick 0.1s fan-in only) is held and delivered as one synthetic turn.
+  Failures, non-zero or abnormal exits, failed delegations and results a parked
+  goal waits on are prompt and release held siblings into the same turn. Shutdown
+  releases held batches for delivery; while draining, injection goes to the drain
+  spool, and delegations that cannot finish are requeued (their ledger row stays
+  pending). Regression: `uv run --frozen --group dev pytest -q
+  tests/gateway/test_autonomous_wake_pacing.py tests/hermes_cli/test_goals.py
+  tests/gateway/test_completion_delivery.py`. Rollback reverts this identity; the
+  new `last_continuation_at` field defaults to 0 on old rows and needs no migration.
 
 The initial reproduction established missing criteria and paused state after a
 repair turn. Upstream comparison confirmed both and supplied a matching recovery
