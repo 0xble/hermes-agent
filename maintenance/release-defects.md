@@ -19,15 +19,17 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 ## Relay close-failure abort ordering
 
 - Fork patch identity: `relay-close-failure-test-race`.
-- Relay's managed stream can be aborted by the monitor before the worker
-  observes its interrupt and closes the stream. A Relay close failure can then
-  surface as `RuntimeError: internal error: RuntimeError: close failed` while
-  the worker is advancing the managed iterator, skipping the worker's
-  body-level `interrupt_stream_close_failed` branch. This is safe for request
-  reuse because the monitor's `stream_interrupt_abort` already marks the
-  request-client slot poisoned; a later worker abort is optional and targets
-  the same client. The regression test preserves that invariant with an
-  event-synchronized monitor-first case and asserts every event wait succeeds.
+- Relay's managed stream can observe either deterministic abort ordering. In the
+  worker-first ordering, the worker closes the stream, records
+  `interrupt_stream_close_failed`, and poisons the request-client slot before the
+  monitor enters its interrupt-abort path. In the monitor-first ordering, the
+  monitor records `stream_interrupt_abort` and poisons the slot before Relay
+  closes the stream; the resulting close failure can surface as
+  `RuntimeError: internal error: RuntimeError: close failed` while the worker is
+  advancing the managed iterator, skipping the worker's body-level branch. Both
+  orderings are safe for request reuse because the first abort poisons the real
+  slot, and any later abort targets the same client. The regression tests force
+  each ordering with event synchronization and assert every wait succeeds.
 - Guard: `tests/agent/test_request_client_reuse_abort_races.py`
   (`test_relay_managed_close_failure_poisons_request_client`,
   `test_relay_managed_close_failure_preserves_poison_when_monitor_wins`).
