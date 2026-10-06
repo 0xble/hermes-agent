@@ -78,11 +78,17 @@ _LEGACY_PROCESS_NOTICE_RE = re.compile(
 class _TemplateMatcher:
     """Anchored matcher for one formatter template, built from the template's own literals.
 
-    Equivalent to the regex ``^L0.*L1.*…Ln`` with greedy DOTALL fields, but linear in the input:
-    ``str.find`` places each interior literal at its earliest position (leaving the most room for
-    the rest), then ``str.rfind`` places the terminal literal as late as possible, which is the
-    greedy match end. A regex with one ``.*`` per field backtracks polynomially on crafted input that
-    repeats the interior literals without the terminal one, and this runs on the turn path.
+    Linear in the input: ``str.find`` places each interior literal at its earliest position
+    (leaving the most room for the rest), then the terminal literal is chosen among its copies. A
+    regex with one greedy ``.*`` per field backtracks polynomially on crafted input that repeats the
+    interior literals without the terminal one, and this runs on the turn path.
+
+    When the terminal literal occurs more than once, one copy is generated and the others are
+    quoted, either inside the payload field or inside a human follow-up. The earliest copy is the
+    boundary when a gateway-merged follow-up starts right after it: the pending-slot merge joins
+    with exactly one newline, and a steer arrives as a blank line plus the steer marker. Otherwise
+    the latest copy is the boundary, as a greedy match would choose, so payload prose that copies
+    the terminal can never become a human suffix.
     """
 
     def __init__(self, template: str) -> None:
@@ -99,8 +105,24 @@ class _TemplateMatcher:
             if found < 0:
                 return -1
             position = found + len(literal)
-        found = content.rfind(self.terminal, position)
-        return -1 if found < 0 else found + len(self.terminal)
+        first = content.find(self.terminal, position)
+        if first < 0:
+            return -1
+        first_end = first + len(self.terminal)
+        if _starts_merged_follow_up(content, first_end):
+            return first_end
+        return content.rfind(self.terminal, position) + len(self.terminal)
+
+
+def _starts_merged_follow_up(content: str, position: int) -> bool:
+    """Whether a gateway-merged human follow-up starts at ``position``.
+
+    The pending-slot text merge (``gateway.platforms.base._append_text``) joins with exactly one
+    newline, and a mid-turn steer is appended as a blank line plus the steer marker.
+    """
+    if content.startswith("\n\n" + STEER_MARKER_OPEN, position):
+        return True
+    return content.startswith("\n", position) and position + 1 < len(content) and content[position + 1] != "\n"
 
 
 # Match complete generated prompts from their defining templates. The formatter literals make this

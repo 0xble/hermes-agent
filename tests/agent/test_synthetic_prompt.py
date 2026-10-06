@@ -138,6 +138,35 @@ def test_follow_up_merged_with_a_single_newline_survives(build):
     assert filter_retain_messages(merged, "Answer.")[0] == HUMAN
 
 
+def test_merged_follow_up_quoting_the_template_terminal_is_kept_whole():
+    """A person's follow-up may paste the generated closing paragraph. The merge's single newline
+    marks the real boundary, so the quote and everything after it survive."""
+    from string import Formatter
+
+    from agent.prompt_builder import format_steer_marker
+    from gateway.platforms.base import _append_text
+    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
+
+    terminal = [lit for lit, _f, _s, _c in Formatter().parse(CONTINUATION_PROMPT_TEMPLATE)][-1]
+    follow_up = "I quoted:" + terminal + "\nRemember X"
+
+    assert human_prompt_text(_append_text(_goal_prompt(), follow_up)) == follow_up
+    assert human_prompt_text(_goal_prompt() + format_steer_marker(follow_up)) == follow_up
+
+
+def test_payload_copying_the_terminal_before_a_blank_line_stays_generated():
+    """#320's invariant: a goal that copies the closing paragraph and continues after a blank line
+    is payload, not a human suffix."""
+    from string import Formatter
+
+    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
+
+    terminal = [lit for lit, _f, _s, _c in Formatter().parse(CONTINUATION_PROMPT_TEMPLATE)][-1]
+    payload = CONTINUATION_PROMPT_TEMPLATE.format(goal="Nested copied prompt:" + terminal + "\n\nINNER")
+
+    assert human_prompt_text(payload) is None
+
+
 def test_text_glued_to_the_template_terminal_is_not_a_human_suffix():
     assert human_prompt_text(_goal_prompt() + " and also this") is None
 
