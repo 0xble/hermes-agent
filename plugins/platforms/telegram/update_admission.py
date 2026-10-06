@@ -20,6 +20,7 @@ from telegram import Update
 from telegram.ext import Application, ApplicationHandlerStop, ConversationHandler, SimpleUpdateProcessor
 
 from gateway.platforms._shared import coerce_port
+from gateway.platforms.base import ingress_consumer_scope, leave_ingress_consumer
 from gateway.platforms.helpers import bounded_put
 from utils import atomic_json_write
 
@@ -142,9 +143,16 @@ class PerChatUpdateProcessor(SimpleUpdateProcessor):
         self._tails: dict[int, asyncio.Future] = {}
 
     async def do_process_update(self, update, coroutine) -> None:
+        async def run_ingress() -> None:
+            token = ingress_consumer_scope()
+            try:
+                await coroutine
+            finally:
+                leave_ingress_consumer(token)
+
         chat = getattr(update, "effective_chat", None)
         if chat is None:
-            await coroutine
+            await run_ingress()
             return
         prev = self._tails.get(chat.id)
         done = asyncio.get_running_loop().create_future()
@@ -153,7 +161,7 @@ class PerChatUpdateProcessor(SimpleUpdateProcessor):
             if prev is not None:
                 # shield: cancelling this waiter must not cancel the predecessor's tail future.
                 await asyncio.shield(prev)
-            await coroutine
+            await run_ingress()
         finally:
             def release(_prev=None):
                 done.set_result(None)

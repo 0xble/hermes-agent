@@ -145,6 +145,9 @@ from gateway.platforms.base import (
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
 )
+from plugins.platforms.telegram.chat_budget import (
+    KIND_INTERIM, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget,
+)
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
 _TOAST_LIMIT = 200
@@ -193,14 +196,9 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # — a 97-minute penalty on the boot path froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
 
-# Shared per-chat outbound budget (#116312): Telegram counts an editMessageText against the
-# SAME per-chat allowance as a sendMessage, but streaming previews used to pace only edits at
-# DEFAULT_STREAMING_EDIT_INTERVAL = 0.8s (1.25 msg/s into one chat before any reply was sent)
-# — that was 83% of measured flood penalties.  One shared slot per chat: a SEND waits for its
-# slot (skipping a send would drop a message), an INTERIM edit is skipped (the next tick shows
-# the same text anyway), and the FINAL edit is never gated (the answer itself is never
-# withheld).  Tunable: validated in production by the issue reporter at 0 flood events.
-_TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0
+# Shared per-chat outbound budget (#107612): the actual clock is installed at PTB's request layer so
+# sends, edits, typing, drafts, media, controls, deletions, topic edits and reactions share one allowance.
+# Cosmetic requests are shed by ChatBudgetRateLimiter; durable requests wait for their chat's slot.
 
 
 def _flood_cap_result(wait: float) -> "SendResult":
@@ -608,6 +606,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._rich_send_disabled = self._rich_draft_disabled = False  # latched after a capability failure
         # Transient sendChatAction failures recur on every keep-typing tick; back off per chat.
         self._telegram_typing_cooldown_until: Dict[str, float] = {}
+        # One request-layer budget covers every chat-scoped Bot API call, including raw do_api_request.
+        self._chat_budget = ChatOutboundBudget()
+        self._chat_rate_limiter_installed = False
         self._telegram_typing_cooldown_seconds: float = self._coerce_float_extra(
             "typing_cooldown_seconds", 30.0, min_value=1.0, max_value=300.0)
         # Post-send typing re-arm: scheduled, deduped and rate-limited per chat. Awaiting a
@@ -1575,7 +1576,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         payload.update(self._thread_kwargs_for_draft(chat_id, metadata))
         try:
             return bool(await _await_with_thread_deadline(
-                self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload),
+                self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload,
+                                         rate_limit_args={"kind": KIND_INTERIM}),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
         except Exception as exc:
             if self._is_rich_capability_error(exc):
@@ -3190,6 +3192,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 logger.info("[%s] Using Telegram local_mode (read files from disk)", self.name)
             request, get_updates_request = await self._build_ptb_requests()
             builder = builder.request(request).get_updates_request(get_updates_request)
+            # Test and embedding builders may not expose PTB's optional limiter setter.
+            if hasattr(builder, "rate_limiter"):
+                builder = builder.rate_limiter(self._chat_rate_limiter())
+                self._chat_rate_limiter_installed = True
             # PTB's default processor awaits each update inline, so one slow turn deafens every chat.
             # Concurrent across chats, FIFO within a chat; the builder keeps this instance, so the
             # connect-retry rebuild in _initialize_app_with_retries gets it too.
@@ -3652,15 +3658,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing locally without an API call",
                 self.name, chat_id, cooldown)
             return _flood_cap_result(cooldown)
-        # Shared per-chat budget (#116312): a send WAITS for its slot (a send that waits
-        # is delivered; one that is skipped would drop a message).
-        slot_remaining = self._chat_outbound_slot_remaining(chat_id)
-        if slot_remaining > 0:
-            logger.debug(
-                "[%s] pacing send for chat %s (shared send+edit budget: slot in %.1fs)",
-                self.name, chat_id, slot_remaining)
-            await asyncio.sleep(slot_remaining)
-        self._hold_chat_outbound_slot(chat_id)
+        # The PTB request-layer limiter reserves this slot in production. Keep the old adapter-local
+        # reservation only for lightweight fakes used by tests and embedding callers.
+        if not self._chat_rate_limiter_installed:
+            slot_remaining = self._chat_outbound_slot_remaining(chat_id)
+            if slot_remaining > 0:
+                logger.debug(
+                    "[%s] pacing send for chat %s (shared send+edit budget: slot in %.1fs)",
+                    self.name, chat_id, slot_remaining)
+                await asyncio.sleep(slot_remaining)
+            self._hold_chat_outbound_slot(chat_id)
         error_types = self._telegram_error_types()
         chunks: List[str] = []
         delivered: List[str] = []
@@ -3798,24 +3805,28 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
-    async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None) -> None:
+    async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None,
+                         rate_limit_args: Optional[Dict[str, Any]] = None) -> None:
         """``editMessageText`` with normalized ids; ``parse_mode=None`` sends plain text."""
         kwargs: Dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "message_id": int(message_id), "text": text}
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
+        if rate_limit_args is not None:
+            kwargs["rate_limit_args"] = rate_limit_args
         await _await_with_thread_deadline(
             self._bot.edit_message_text(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
-    async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
+    async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str,
+                                      rate_limit_args: Optional[Dict[str, Any]] = None) -> bool:
         """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
         skip further work); the fallback edit's exceptions propagate."""
         try:
-            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2)
+            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2, rate_limit_args)
         except Exception as fmt_err:
             if "not modified" in str(fmt_err).lower():
                 return True
             logger.warning(warn_fmt, self.name, _redact_telegram_error_text(fmt_err))
-            await self._edit_text(chat_id, message_id, plain)
+            await self._edit_text(chat_id, message_id, plain, rate_limit_args=rate_limit_args)
         return False
 
     async def edit_message(
@@ -3828,24 +3839,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
-        # the text it would show is shown by the next edit anyway, so a burst of edits can't trip flood
-        # control. A final edit is never gated (the completed answer is always delivered). Sends wait for
-        # their slot; edits defer instead. Over-cap interim edits are exempt: the saturated-preview dedup
-        # below already throttles them to one real edit per ~4096-char growth. Consumed only when the
-        # edit actually fires. The skip is flagged in raw_response so the stream consumer does not
-        # record never-shown text as the visible prefix (a later flood fallback would then drop the
-        # tail the user never saw).
+        # Interim previews are cosmetic: shed before entering the request layer when its shared slot is busy.
+        # The rate_limit_args below also makes the request-layer decision race-safe.
         if (
             not finalize
             and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
-            and self._chat_outbound_slot_remaining(chat_id) > 0
+            and self._chat_budget.interim_blocked(chat_id)
         ):
-            logger.debug(
-                "[%s] skipping interim edit for chat %s (shared send+edit budget: slot busy)",
-                self.name, chat_id)
+            logger.debug("[%s] skipping interim edit for chat %s (shared budget busy)", self.name, chat_id)
             return SendResult(success=True, message_id=message_id, raw_response={"skipped": True})
-        self._hold_chat_outbound_slot(chat_id)
+        if not self._chat_rate_limiter_installed:
+            self._hold_chat_outbound_slot(chat_id)
         # Rich finalize (Bot API 10.1): edit the preview IN PLACE via rich_message — no fresh send + delete.
         # Before the 4,096 pre-flight because the rich cap is 32,768; falls back to legacy on rejection.
         # Rich finalize (Bot API 10.1): when the completed content has constructs the legacy MarkdownV2 edit
@@ -3882,15 +3886,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         elif not finalize:
             # Content shrank back under the cap — clear stale saturation state so dedup can't mask an edit.
             self._last_overflow_preview.pop(_preview_key, None)
+        _preview_rate_limit_args = {"kind": KIND_INTERIM} if not finalize else None
         try:
             if not finalize:
-                await self._edit_text(chat_id, message_id, content)
+                await self._edit_text(chat_id, message_id, content, rate_limit_args=_preview_rate_limit_args)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
             await self._edit_markdown_or_plain(
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
-                "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+                "[%s] MarkdownV2 edit failed, falling back to plain text: %s",
+                rate_limit_args=_preview_rate_limit_args)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -3924,7 +3930,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 await asyncio.sleep(wait)
                 try:
-                    await self._edit_text(chat_id, message_id, content)
+                    await self._edit_text(chat_id, message_id, content, rate_limit_args=_preview_rate_limit_args)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
@@ -4064,6 +4070,25 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             logger.debug("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
             return False
 
+    async def delete_messages(self, chat_id: str, message_ids: List[str]) -> Dict[str, bool]:
+        """Delete up to 100 Telegram messages per request, preserving every id on failure."""
+        if not self._bot:
+            return {str(message_id): False for message_id in message_ids}
+        delete_many = getattr(self._bot, "delete_messages", None)
+        if not callable(delete_many):
+            return await super().delete_messages(chat_id, message_ids)
+        outcome: Dict[str, bool] = {}
+        normalized_chat_id = normalize_telegram_chat_id(chat_id)
+        for start in range(0, len(message_ids), 100):
+            batch = [str(message_id) for message_id in message_ids[start:start + 100]]
+            try:
+                await delete_many(chat_id=normalized_chat_id, message_ids=[int(message_id) for message_id in batch])
+                outcome.update({message_id: True for message_id in batch})
+            except Exception as error:
+                logger.debug("[%s] Failed to delete Telegram message batch: %s", self.name, _redact_telegram_error_text(error))
+                outcome.update({message_id: False for message_id in batch})
+        return outcome
+
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """sendMessageDraft works for private chats only (Bot API 9.5) and needs PTB >= 22.6; groups and
         older installs use the edit-based path. ``rich_drafts`` controls draft *format*, not availability."""
@@ -4093,7 +4118,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         for use_markdown in ((False,) if plain_rich_preview else (True, False)):
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text}
+                "text": self.format_message(text) if use_markdown else text,
+                "rate_limit_args": {"kind": KIND_INTERIM},
+            }
             if use_markdown:
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)
@@ -5534,30 +5561,42 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         until.pop(key, None)
         return None
 
-    # --- shared per-chat send+edit pacing budget (#116312) -----------------------------------------
-    # One slot per chat that sendMessage AND editMessageText both draw from (Telegram counts them
-    # against the same per-chat allowance).  ``_telegram_chat_outbound_slot_until`` maps the
-    # normalized chat id to the loop-time when the next outbound call may fire.
+    # --- shared per-chat outbound budget ----------------------------------------------------
+
+    def _chat_rate_limiter(self) -> ChatBudgetRateLimiter:
+        """Build the PTB request-layer limiter, wiring only upstream's local flood cooldown hooks."""
+        def record_cooldown(chat_id: str, wait: float) -> None:
+            self._record_send_flood_cooldown(chat_id, wait)
+
+        return ChatBudgetRateLimiter(
+            self._chat_budget,
+            penalty_remaining=self._send_flood_cooldown_remaining,
+            on_retry_after=record_cooldown,
+        )
 
     def _chat_outbound_slot_remaining(self, chat_id: Any) -> float:
-        """Seconds until this chat's shared send+edit slot is open again (0 = may fire now)."""
-        slot_until: Dict[str, float] = self.__dict__.setdefault("_telegram_chat_outbound_slot_until", {})
-        key = str(normalize_telegram_chat_id(chat_id))
-        deadline = slot_until.get(key)
-        if deadline is None:
+        """Compatibility view for tests and non-PTB fakes; production uses the request-layer limiter."""
+        if not self._chat_rate_limiter_installed and hasattr(self, "_telegram_chat_outbound_slot_secs"):
+            slots: Dict[str, float] = self.__dict__.setdefault("_telegram_chat_outbound_slot_until", {})
+            key = str(normalize_telegram_chat_id(chat_id))
+            remaining = slots.get(key, 0.0) - asyncio.get_running_loop().time()
+            if remaining > 0:
+                return remaining
+            slots.pop(key, None)
             return 0.0
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            slot_until.pop(key, None)  # expired — bounded dict, like the send locks
-            return 0.0
-        return remaining
+        return self._chat_budget.remaining(chat_id)
 
     def _hold_chat_outbound_slot(self, chat_id: Any) -> None:
-        """Arm/re-arm this chat's slot after an actual send/edit API call fires."""
-        slot_until: Dict[str, float] = self.__dict__.setdefault("_telegram_chat_outbound_slot_until", {})
-        budget = getattr(self, "_telegram_chat_outbound_slot_secs", _TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS)
-        slot_until[str(normalize_telegram_chat_id(chat_id))] = (
-            asyncio.get_running_loop().time() + max(0.0, budget))
+        """Reserve one legacy send/edit slot only for adapters whose fake bot has no PTB limiter."""
+        if self._chat_rate_limiter_installed:
+            return
+        legacy_gap = getattr(self, "_telegram_chat_outbound_slot_secs", None)
+        if legacy_gap is not None:
+            slots: Dict[str, float] = self.__dict__.setdefault("_telegram_chat_outbound_slot_until", {})
+            slots[str(normalize_telegram_chat_id(chat_id))] = (
+                asyncio.get_running_loop().time() + max(0.0, float(legacy_gap)))
+            return
+        self._chat_budget.reserve(chat_id)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
@@ -5567,7 +5606,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         message_thread_id: Optional[int] = None
 
         async def _action(**kw) -> None:
-            await self._bot.send_chat_action(chat_id=normalize_telegram_chat_id(chat_id), action="typing", **kw)
+            await self._bot.send_chat_action(
+                chat_id=normalize_telegram_chat_id(chat_id), action="typing", rate_limit_args={"kind": KIND_TYPING}, **kw)
             self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         try:
             _is_dm_topic = self._dm_topic_fallback(metadata)

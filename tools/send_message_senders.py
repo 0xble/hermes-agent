@@ -105,21 +105,25 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
+def _metered_telegram_bot(bot):
+    from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget, MeteredBot
+    return MeteredBot(bot, ChatBudgetRateLimiter(ChatOutboundBudget()))
+
+
 def _telegram_bot(token):
-    """Bot honouring TELEGRAM_PROXY (standalone sends time out where api.telegram.org is
-    blocked); falls back to a direct connection."""
+    """Bot honouring TELEGRAM_PROXY, with one shared budget for this standalone send."""
     from telegram import Bot
     try:
         from gateway.platforms.base import resolve_proxy_url
         proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         if not proxy:
-            return Bot(token=token)
+            return _metered_telegram_bot(Bot(token=token))
         from telegram.request import HTTPXRequest
         logger.info("send_message: standalone Telegram send routed through proxy %s", proxy)
-        return Bot(token=token, request=HTTPXRequest(proxy=proxy), get_updates_request=HTTPXRequest(proxy=proxy))
+        return _metered_telegram_bot(Bot(token=token, request=HTTPXRequest(proxy=proxy), get_updates_request=HTTPXRequest(proxy=proxy)))
     except Exception as proxy_err:
         logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", proxy_err)
-    return Bot(token=token)
+    return _metered_telegram_bot(Bot(token=token))
 
 
 def _telegram_thread_kwargs(thread_id):

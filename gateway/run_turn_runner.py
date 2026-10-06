@@ -726,7 +726,7 @@ class TurnRunner:
             return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
+        EDIT_INTERVAL = 3.0  # Transport edit floor: superseded previews do not need a faster producer.
         while True:
             try:
                 if not ctx._run_still_current():

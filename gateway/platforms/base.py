@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import contextvars
 import inspect
 import ipaddress
 import logging
@@ -26,6 +27,25 @@ from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
 
 logger = logging.getLogger(__name__)
+
+_INGRESS_CONSUMER: "contextvars.ContextVar[asyncio.Task | None]" = contextvars.ContextVar(
+    "gateway_ingress_consumer", default=None)
+
+
+def ingress_consumer_scope() -> "contextvars.Token":
+    """Mark the current task as the serial update-consumer task."""
+    return _INGRESS_CONSUMER.set(asyncio.current_task())
+
+
+def leave_ingress_consumer(token: "contextvars.Token") -> None:
+    _INGRESS_CONSUMER.reset(token)
+
+
+def in_ingress_consumer() -> bool:
+    """True only on the consumer task; spawned tasks inherit context but not the role."""
+    consumer = _INGRESS_CONSUMER.get()
+    return consumer is not None and consumer is asyncio.current_task()
+
 
 
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
@@ -2764,6 +2784,13 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
+    async def delete_messages(self, chat_id: str, message_ids: List[str]) -> Dict[str, bool]:
+        """Delete several sent messages; platforms with a batch API may override this."""
+        return {
+            str(message_id): await self.delete_message(chat_id=chat_id, message_id=message_id)
+            for message_id in message_ids
+        }
+
     def _get_ephemeral_system_ttl_default(self) -> int:
         """Default :class:`EphemeralReply` TTL from ``display.ephemeral_system_ttl``
         (``0`` = no auto-delete); non-fatal if config is unreadable."""
@@ -3600,8 +3627,7 @@ class BasePlatformAdapter(ABC):
         return response.text, int(ttl or 0)
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
-        """Call the handler and send its reply inline, with retry, threading and
-        ephemeral deletion — no session lifecycle (active-session bypass paths)."""
+        """Call the handler and deliver its reply without parking the Telegram update consumer."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
         text, eph_ttl = self._unwrap_ephemeral(response)
@@ -3610,11 +3636,33 @@ class BasePlatformAdapter(ABC):
         if log_cmd is not None:
             logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                         len(text), event.source.chat_id)
-        result = await self._send_with_retry(
-            chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
-        if eph_ttl > 0 and result.success and result.message_id:
-            self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+
+        async def deliver() -> None:
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_meta))
+            if eph_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+
+        if in_ingress_consumer():
+            self.spawn_ingress_reply(deliver(), label="inline reply")
+        else:
+            await deliver()
+
+    def spawn_ingress_reply(self, coro: Awaitable[Any], *, label: str) -> asyncio.Task:
+        """Run a paced ingress reply off the update consumer and track it for shutdown."""
+        async def run() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("[%s] Offloaded %s failed", self.name, label, exc_info=True)
+
+        task = asyncio.create_task(run(), name=f"{self.name}-ingress-{label.replace(' ', '-')}")
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
