@@ -28,6 +28,9 @@ def test_does_not_classify_unrelated_commands():
 
 
 def test_wraps_only_local_commands_and_preserves_nested_slot(monkeypatch):
+    # The focused suite itself runs under heavy-slot, so clear the inherited
+    # marker for the outer-run assertion before checking the wrapper.
+    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
     monkeypatch.setattr(
         "tools.terminal_tool_heavy_slot._heavy_slot_executable",
         lambda _environment: "/Users/brianle/.local/bin/heavy-slot",
