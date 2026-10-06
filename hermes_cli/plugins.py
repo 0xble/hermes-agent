@@ -1912,6 +1912,9 @@ def _discover_synchronously(manager: PluginManager, *, force: bool = False) -> N
 def discover_plugins(force: bool = False) -> None:
     """Discover and load all plugins (idempotent; ``force=True`` rescans). Joins an in-flight
     background discovery instead of racing a second scan."""
+    if in_plugin_load_worker():
+        logger.debug("Plugin discovery skipped from plugin-load worker (force=%s)", force)
+        return
     _join_background_discovery()
     if _discovery_incomplete() or (_discovery_failed() and not force):
         _warn_discovery_closed()
@@ -2042,7 +2045,13 @@ def _delivery_manager() -> Optional[PluginManager]:
         _warn_discovery_closed()
         return None
     if not getattr(manager, "_discovered", True):
-        _discover_synchronously(manager)
+        try:
+            _discover_synchronously(manager)
+        except BaseException:
+            # Lazy delivery must fail closed, while explicit discover_plugins() callers retain the
+            # discovery exception for their existing error handling.
+            _warn_discovery_closed()
+            return None
         if _discovery_failed():
             _warn_discovery_closed()
             return None

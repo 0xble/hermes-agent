@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
@@ -129,6 +130,61 @@ def test_worker_exception_publishes_failed_and_fails_closed_without_retry(monkey
     assert plugins._discovery_outcome == "failed"
     assert manager.calls == 1
     assert caplog.text.count("Plugin hook delivery skipped because plugin discovery failed") == 1
+
+
+def test_lazy_sync_discovery_failure_fails_closed_for_all_delivery_consumers(monkeypatch, caplog):
+    import hermes_cli.plugins as plugins
+
+    class Manager:
+        _discovered = False
+
+        def __init__(self):
+            self.calls = 0
+
+        def discover_and_load(self, force=False):
+            self.calls += 1
+            raise RuntimeError("broken lazy plugin")
+
+    manager = Manager()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+
+    with caplog.at_level("WARNING", logger="hermes_cli.plugins"):
+        assert plugins.invoke_hook("pre_llm_call") == []
+        assert asyncio.run(plugins.ainvoke_hook("pre_llm_call")) == []
+        assert plugins.has_hook("pre_llm_call") is False
+        assert plugins.invoke_middleware("before_tool") == []
+        assert plugins.has_middleware("before_tool") is False
+        assert plugins.render_system_prompt_sections({}) == []
+
+    assert manager.calls == 1
+    assert plugins._discovery_outcome == "failed"
+    assert caplog.text.count("Plugin hook delivery skipped because plugin discovery failed") == 1
+
+    # Explicit discovery retains its existing raise semantics; only lazy delivery swallows the error.
+    with pytest.raises(RuntimeError, match="broken lazy plugin"):
+        plugins.discover_plugins(force=True)
+    assert manager.calls == 2
+
+
+def test_forced_discovery_from_plugin_load_worker_returns_without_blocking(monkeypatch, caplog):
+    import hermes_cli.plugins as plugins
+
+    class Manager:
+        _discovered = True
+
+        def discover_and_load(self, force=False):
+            raise AssertionError("plugin-load worker must not start discovery")
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    monkeypatch.setattr(plugins, "in_plugin_load_worker", lambda: True)
+
+    with caplog.at_level("DEBUG", logger="hermes_cli.plugins"):
+        worker = threading.Thread(target=lambda: plugins.discover_plugins(force=True), name="plugin-load:test")
+        worker.start()
+        worker.join(0.2)
+
+    assert not worker.is_alive()
+    assert "skipped from plugin-load worker (force=True)" in caplog.text
 
 
 def test_timeout_completion_interleaving_leaves_delivery_open(monkeypatch):

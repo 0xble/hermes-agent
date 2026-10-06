@@ -30,11 +30,14 @@ not affect correctness: a late event publication automatically reopens delivery.
 
 If the worker fails, its published `failed` outcome keeps plugin hooks,
 middleware, streaming callback snapshots, and prompt sections closed. Delivery
-logs the fail-closed warning once and never retries discovery implicitly. Every
-consumer routes through `_delivery_manager()`; the execution-middleware chain
-also handles its `None` result by calling the terminal operation without plugin
-middleware. Registration and plugin-load-worker paths retain their existing
-no-op behavior.
+logs the fail-closed warning once and never retries discovery implicitly. Lazy
+synchronous discovery uses the same fail-closed result, while explicit
+`discover_plugins()` callers retain discovery exceptions. Every consumer routes
+through `_delivery_manager()`; the execution-middleware chain also handles its
+`None` result by calling the terminal operation without plugin middleware.
+Registration and plugin-load-worker paths retain their existing no-op behavior.
+A forced `discover_plugins(force=True)` from a plugin-load worker is also a
+no-op, avoiding re-entry into the discovery lock while its parent waits.
 
 The current plugin field is set around each manifest's dependency check,
 configuration validation, and load/register operation, while filesystem scans
