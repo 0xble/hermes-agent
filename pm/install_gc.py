@@ -28,6 +28,8 @@ def _record(state: Path) -> tuple[Path, float] | None:
     metadata = state / INSTALL_METADATA_FILENAME
     try:
         data = json.loads(metadata.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            return None
         value = data.get("project_root")
         if data.get("schema") != INSTALL_METADATA_SCHEMA or not isinstance(value, str):
             return None
@@ -81,24 +83,63 @@ def _install_lock(state: Path):
         os.close(fd)
 
 
-def _leases_held(state: Path) -> bool:
-    from hermes_cli.runtime_state import leases_held
-
+def _generations(state: Path) -> list[Path] | None:
+    """Generation directories below *state*, or None when they cannot be listed."""
+    found: list[Path] = []
     for generations in (state / "environments", state / "pm-runtime" / "generations"):
         try:
             entries = tuple(generations.iterdir())
         except FileNotFoundError:
             continue
         except OSError:
+            return None
+        found.extend(generation for generation in entries
+                     if generation.is_dir() and not generation.is_symlink())
+    return found
+
+
+def _leases_held(state: Path) -> bool:
+    from hermes_cli.runtime_state import leases_held
+
+    generations = _generations(state)
+    if generations is None:
+        return True
+    for generation in generations:
+        try:
+            if leases_held(generation):
+                return True
+        except OSError:
             return True
-        for generation in entries:
-            if generation.is_dir() and not generation.is_symlink():
-                try:
-                    if leases_held(generation):
-                        return True
-                except OSError:
-                    return True
     return False
+
+
+def _has_unleaseable_generation(state: Path) -> bool:
+    """True when a pre-lease generation exists; its readers cannot be observed.
+
+    ``lease_directory`` hands such generations a no-op lease, so an empty lease
+    directory proves nothing about them. Fail closed when listing fails.
+    """
+    generations = _generations(state)
+    if generations is None:
+        return True
+    try:
+        return any(not (generation / ".lease-managed").is_file() for generation in generations)
+    except OSError:
+        return True
+
+
+def _eligible(state: Path, record: tuple[Path, float] | None, known_keys: set[str],
+              now: float, grace_seconds: float, legacy_grace_seconds: float) -> bool:
+    if record is not None:
+        project_root, last_used = record
+        if project_root.is_dir() or now - last_used < grace_seconds:
+            return False
+        # Unleaseable generations fall back to the conservative legacy rule.
+        if _has_unleaseable_generation(state):
+            return not _tree_touched_since(state, now - legacy_grace_seconds)
+        return True
+    return state.name not in known_keys and not _tree_touched_since(
+        state, now - legacy_grace_seconds)
 
 
 def collect_install_orphans(
@@ -134,17 +175,8 @@ def collect_install_orphans(
         if record is not None and record[0].is_dir()
     )
 
-    candidates: list[Path] = []
-    for state, record in records.items():
-        if record is not None:
-            project_root, last_used = record
-            if project_root.is_dir() or now - last_used < grace_seconds:
-                continue
-        else:
-            if state.name in known_keys or _tree_touched_since(
-                    state, now - legacy_grace_seconds):
-                continue
-        candidates.append(state)
+    candidates = [state for state, record in records.items()
+                  if _eligible(state, record, known_keys, now, grace_seconds, legacy_grace_seconds)]
 
     removed: list[Path] = []
     for state in candidates:
@@ -152,13 +184,8 @@ def collect_install_orphans(
             with _install_lock(state) as held:
                 if not held:
                     continue
-                current = _record(state)
-                if current is not None:
-                    project_root, last_used = current
-                    if project_root.is_dir() or now - last_used < grace_seconds:
-                        continue
-                elif state.name in known_keys or _tree_touched_since(
-                        state, now - legacy_grace_seconds):
+                if not _eligible(state, _record(state), known_keys, now,
+                                 grace_seconds, legacy_grace_seconds):
                     continue
                 if _leases_held(state):
                     continue

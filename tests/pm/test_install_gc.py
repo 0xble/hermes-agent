@@ -74,6 +74,49 @@ def test_leased_generation_keeps_orphan_install(monkeypatch, tmp_path):
         release()
 
 
+def test_non_object_metadata_is_treated_as_legacy_not_a_crash(monkeypatch, tmp_path):
+    import time
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = home / "installs" / install_key(checkout)
+    record_install_use(checkout)
+    for payload in ("[]", "null", "3"):
+        (state / "install.json").write_text(payload, encoding="utf-8")
+        _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
+        # Recent tree activity keeps a legacy install; the point is no exception.
+        assert collect_install_orphans(now=time.time()) == []
+        assert state.is_dir()
+
+
+def test_pre_lease_generation_keeps_orphan_install_on_the_legacy_grace(monkeypatch, tmp_path):
+    import time
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = home / "installs" / install_key(checkout)
+    record_install_use(checkout)
+    # No .lease-managed marker: lease_directory() hands its readers a no-op lease.
+    generation = state / "environments" / "legacy-generation"
+    generation.mkdir(parents=True)
+    (generation / "python").write_text("", encoding="utf-8")
+    now = time.time()
+    eight_days = now - 8 * 24 * 60 * 60
+    for path in (*state.rglob("*"), state):
+        _age(path, eight_days)
+    checkout.rmdir()
+
+    assert collect_install_orphans(now=now) == []
+    assert state.is_dir()
+
+    forty_days = now - 40 * 24 * 60 * 60
+    for path in (*state.rglob("*"), state):
+        _age(path, forty_days)
+    assert collect_install_orphans(now=now) == [state]
+
+
 def test_locked_install_keeps_orphan_install(monkeypatch, tmp_path):
     import time
 
