@@ -139,6 +139,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
 - **Rollback:** Revert the relay-silence fix commit.
 
+## Active patch record: resumable delegation retention
+
+- **Patch identity:** `resumable-delegation-retention`.
+- **Behavior:** Keep resume-eligible (`unknown`/`interrupted`/`stalled`, unspent resume claim, parent or origin session) delegations in the durable ledger through terminal-cap and pending-cap pruning while they remain inside the seven-day retention window. Terminal-cap pruning deletes delivered rows first and pending completions last, so a pending child result is dropped only when nothing else is left to remove. A boot notice re-checks eligibility just before injection, which narrows but does not close the race; `claim_resume` remains the authority and refuses a notice that slips through. Retained resumable rows are bounded by age, not by the caps.
+- **Source surfaces:** `tools/async_delegation.py`, `tools/delegation_resume.py`, `gateway/run_notifications.py`, and focused async-delegation recovery tests.
+- **Upstream status:** NousResearch #128623 and PR #128634 retain delivered audit records, but do not preserve resume-eligible interrupted rows or guard the queued boot-notice race; no equivalent upstream fix found.
+- **Focused regression:** `scripts/run_tests.sh tests/tools/test_delegation_resume.py tests/gateway/test_delegation_auto_resume.py`.
+- **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
+- **Rollback:** Revert the resumable-delegation-retention fix commit.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
