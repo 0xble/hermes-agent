@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Collection
 
+from tui_gateway import pending_moa
 from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, _build_sha
 
 
@@ -230,6 +231,11 @@ class ComputeHost:
         try:
             from tui_gateway import server
             session = self._ensure_server_session(server, frame)
+            # Compute-host frames carry a server-resolved record. The child installs it before
+            # prompt dispatch; clients never supply this data.
+            pending_record = frame.get("pending_moa_record")
+            if isinstance(pending_record, dict):
+                pending_moa.install(session, pending_record)
             # #101416: the parent already holds this session's active-session lease (claimed in
             # prompt.submit before routing here). Install the inert borrow BEFORE the turn runs, or
             # _admit_prompt_turn re-claims from this child pid and is fenced out by the parent's own
@@ -325,6 +331,8 @@ class ComputeHost:
         # _apply_pending_model_switch — in the child the live agent exists.
         if frame.get("pending_model_switch"):
             session["pending_model_switch"] = dict(frame["pending_model_switch"])
+        if isinstance(frame.get("pending_moa_record"), dict):
+            pending_moa.install(session, frame["pending_moa_record"])
         return session
 
     def _build_server_session(self, server: Any, frame: dict[str, Any], sid: str) -> dict:
@@ -411,6 +419,8 @@ class ComputeHost:
         # switch crosses the process boundary and applies at this child's turn start.
         if frame.get("pending_model_switch"):
             session["pending_model_switch"] = dict(frame["pending_model_switch"])
+        if isinstance(frame.get("pending_moa_record"), dict):
+            pending_moa.install(session, frame["pending_moa_record"])
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:

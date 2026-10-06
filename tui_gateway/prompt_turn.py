@@ -10,7 +10,9 @@ post-turn follow-ups (queued prompt, goal continuation, notifications).
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
+from . import pending_moa
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -672,42 +674,44 @@ def _stage_first_contact_onboarding_note(session: dict, agent, history_empty: bo
         logger.debug("first-contact onboarding note failed", exc_info=True)
 
 
-def _apply_pending_moa(sid: str, session: dict, prompt: Any, queue_token: str | None = None) -> None:
-    """Apply the MoA one-shot attached to this exact queued item, never by prompt text."""
-    pending = session.get("pending_moa")
-    if not isinstance(pending, list) or not pending or not queue_token:
-        return
-    index = next((i for i, item in enumerate(pending)
-                  if isinstance(item, dict) and item.get("queue_token") == queue_token), None)
-    if index is None:
-        return
-    item = pending.pop(index)
-    if pending:
-        session["pending_moa"] = pending
-    else:
-        session.pop("pending_moa", None)
-    restore = item.get("restore") if isinstance(item, dict) else None
+def _apply_pending_moa(sid: str, session: dict, prompt: Any, queue_token: str | None = None) -> bool:
+    """Claim the session-owned MoA record attached to this exact queued item."""
+    if not queue_token:
+        return True
+    item = pending_moa.claim(session, queue_token)
+    if item is None:
+        _emit("error", sid, {
+            "message": "Deferred MoA request was cancelled or is no longer available; prompt dropped."
+        })
+        return False
+    restore = item.get("restore")
     if not isinstance(restore, dict):
-        restore = {
-            "override": session.get("model_override"),
-            "model": getattr(session.get("agent"), "model", None),
-            "provider": getattr(session.get("agent"), "provider", None),
-        }
-    session["moa_one_shot_restore"] = restore
-    preset = str(item.get("preset") or "") if isinstance(item, dict) else ""
+        pending_moa.cancel(session, queue_token)
+        _emit("error", sid, {"message": "Deferred MoA request is invalid; prompt dropped."})
+        return False
+    session["_active_moa_token"] = queue_token
+    preset = str(item.get("preset") or "")
     try:
         _apply_model_switch(
             sid, session, f"{preset} --provider moa", confirm_expensive_model=False,
             pin_session_override=True, persist_override=False, count_switch=False)
-    except Exception:
-        session.pop("moa_one_shot_restore", None)
-        raise
+    except Exception as exc:
+        pending_moa.cancel(session, queue_token)
+        session.pop("_active_moa_token", None)
+        _emit("error", sid, {"message": f"Deferred MoA could not start; prompt dropped: {exc}"})
+        return False
+    return True
 
 
 def _restore_moa_one_shot(sid: str, session: dict) -> None:
-    """Restore a queued or idle-path MoA one-shot, including a standing model override."""
-    restore = session.pop("moa_one_shot_restore", None)
+    """Restore and consume the session-owned MoA record after its turn."""
+    token = session.pop("_active_moa_token", None)
+    if not token:
+        return
+    record = pending_moa.get(session, token)
+    restore = record.get("restore") if isinstance(record, dict) else None
     if not isinstance(restore, dict):
+        pending_moa.cancel(session, token)
         return
     previous_override = restore.get("override")
     previous_model = restore.get("model")
@@ -725,6 +729,8 @@ def _restore_moa_one_shot(sid: str, session: dict) -> None:
                 persist_override=False, count_switch=False)
         except Exception as exc:
             logger.warning("MoA one-shot model restore failed: %s", exc)
+    if token:
+        pending_moa.consume(session, token)
 
 
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str], queue_token: str | None = None):
@@ -750,13 +756,11 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     # The sudo password callback is thread-local: without re-wiring here, sudo prompts
     # fall through to /dev/tty and hang the headless gateway (re-run is a no-op).
     _wire_callbacks(sid)
-    # A /moa queued while the previous turn ran applies to its own queued prompt only. A failed
-    # switch must not kill the turn thread: run the prompt on the current model instead.
-    try:
-        _apply_pending_moa(sid, session, text, queue_token)
-    except Exception:
-        logger.warning("queued MoA one-shot could not be applied; running on the current model", exc_info=True)
-    if not st.one_turn_restore and not session.get("moa_one_shot_restore"):
+    # A missing/cancelled token is a failed deferred dispatch, never permission to
+    # run the prompt on the ordinary model.
+    if queue_token and not _apply_pending_moa(sid, session, text, queue_token):
+        return None
+    if not st.one_turn_restore and not session.get("_active_moa_token"):
         # Skip the config-model sync while a /model --once override or /moa one-shot is active: the
         # temporary model is intentionally not pinned as a session model_override (it must not persist),
         # so without this guard the sync would clobber it before the turn runs.
@@ -909,7 +913,7 @@ def _absorb_turn_result(
                     if display_metadata:
                         message["display_metadata"] = display_metadata
                     break
-    if session.get("moa_one_shot_restore"):
+    if session.get("_active_moa_token"):
         _restore_moa_one_shot(sid, session)
     status_note = None
     if isinstance(result, dict):
@@ -1110,7 +1114,7 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
             _persist_live_session_system_prompt(session)
         except Exception:
             logger.debug("TUI one-turn model restore failed", exc_info=True)
-    if session.get("moa_one_shot_restore"):
+    if session.get("_active_moa_token"):
         _restore_moa_one_shot(sid, session)
     scopes = st.scopes
     with contextlib.suppress(Exception):

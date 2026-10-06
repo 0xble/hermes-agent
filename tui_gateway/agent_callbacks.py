@@ -9,6 +9,7 @@ import json
 import contextlib
 import threading
 
+from . import pending_moa
 from .method_ctx import bind_module
 
 
@@ -588,7 +589,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # /new is a full conversation boundary: session-scoped runtime overrides (/model,
         # /reasoning, /fast) do NOT carry forward and the pins are cleared so a rebuild can't
         # resurrect them. Global process state is never touched (see _apply_model_switch).
-        for k in ("model_override", "create_reasoning_override", "create_service_tier_override", "one_turn_model_restore", "pending_moa"):
+        pending_moa.cancel_all(session)
+        for k in ("model_override", "create_reasoning_override", "create_service_tier_override", "one_turn_model_restore"):
             session.pop(k, None)
         new_agent = _rebuild_session_agent(
             sid, session, session_id=session["session_key"],
