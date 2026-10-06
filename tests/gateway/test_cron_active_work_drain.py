@@ -34,11 +34,15 @@ def _reset_cron_running_set():
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
     sched._restart_safe_waiter_job_ids.clear()
+    sched._restart_safe_external_worker_job_ids.clear()
+    sched._external_worker_modes.clear()
     yield
     sched._running_job_ids.clear()
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
     sched._restart_safe_waiter_job_ids.clear()
+    sched._restart_safe_external_worker_job_ids.clear()
+    sched._external_worker_modes.clear()
 
 
 def _make_async_noop():
@@ -120,6 +124,26 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
+
+
+
+def test_degraded_external_worker_remains_active_during_shutdown():
+    """External does not imply restart-safe: degraded workers stay in the drain set."""
+    import cron.scheduler as sched
+
+    key = sched._inflight_key("degraded-worker")
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+        sched._running_worker_pids[key] = 4321
+    try:
+        assert sched.get_running_job_ids() == frozenset({"degraded-worker"})
+        assert sched.get_running_job_details() == [
+            {"job_id": "degraded-worker", "elapsed_s": None, "worker_pid": 4321}
+        ]
+    finally:
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+            sched._running_worker_pids.pop(key, None)
 
 
 def test_restart_safe_waiters_are_excluded_from_ids_and_details():

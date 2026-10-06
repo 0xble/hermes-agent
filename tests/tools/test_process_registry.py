@@ -3163,3 +3163,35 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGTERM-ignore regression")
+def test_kill_all_signals_all_targets_before_shared_grace(registry, monkeypatch, tmp_path):
+    """One SIGTERM-ignoring child cannot consume the sweep grace before the next is signalled."""
+    import tools.process_registry as process_registry_module
+
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(
+        ProcessRegistry,
+        "_daemon_term_grace_seconds",
+        staticmethod(lambda: 0.2),
+    )
+    command = [
+        sys.executable,
+        "-c",
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+    ]
+    children = [subprocess.Popen(command) for _ in range(2)]
+    try:
+        for index, child in enumerate(children):
+            session = _make_session(sid=f"proc_ignore_{index}")
+            session.process = child
+            session.pid = child.pid
+            registry._running[session.id] = session
+        assert registry.kill_all(deadline=time.monotonic() + 1.0) == 2
+        assert all(child.poll() is not None for child in children)
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()

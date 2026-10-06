@@ -171,3 +171,45 @@ async def test_notice_budget_cannot_cancel_adapter_flush_or_disconnect(bare_runn
     assert not unwinding.is_set()
 
 
+@pytest.mark.asyncio
+async def test_timed_out_restart_spools_followups_before_slow_cleanup(bare_runner, tmp_path, monkeypatch):
+    """A cancelled finalization task cannot erase queued user input before it is durable."""
+    import json
+    import asyncio
+    import time
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir()
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    monkeypatch.setattr("gateway.run_pending_recovery.get_routing_process_hermes_home", lambda: tmp_path)
+    bare_runner._restart_requested = True
+    bare_runner._restart_detached = False
+    bare_runner.config = type("Config", (), {"multiplex_profiles": False})()
+    bare_runner._primary_profile_name = "default"
+    bare_runner._served_profile_homes = {"default": tmp_path}
+    bare_runner._pending_messages = {}
+    bare_runner._queued_events = {}
+    bare_runner._profile_adapters = {}
+    bare_runner._agent_cache_lock = None
+    bare_runner._agent_cache = None
+    adapter = MagicMock()
+    adapter._pending_messages = {"agent:main:telegram:dm:1": "queued follow-up"}
+    bare_runner.adapters = {Platform.TELEGRAM: adapter}
+
+    async def slow_cleanup(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    bare_runner._finalize_shutdown_agents = slow_cleanup
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=time.monotonic())
+    ctx.timed_out = True
+    task = asyncio.create_task(bare_runner._stop_finalize_agents_and_adapters(ctx))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in flush_dir.glob("*.json")]
+    assert [payload["data"]["text"] for payload in payloads] == ["queued follow-up"]
+    assert adapter._pending_messages == {}
+

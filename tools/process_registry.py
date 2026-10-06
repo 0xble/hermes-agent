@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -1054,7 +1055,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return ProcessRegistry._config_seconds("daemon_term_grace_seconds", 2.0)
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(
+        cls, pid: int, expected_start: Optional[int] = None, *, deadline: Optional[float] = None,
+    ) -> None:
         """Terminate a host-visible PID and its descendants.
         ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
         or dead PID means the number was recycled onto a stranger and we refuse to touch
@@ -1109,8 +1112,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         def _wait_for_exit(targets) -> None:
             if grace <= 0:
                 return
-            deadline = time.monotonic() + grace
-            while time.monotonic() < deadline and any(cls._proc_alive(p) for p in targets):
+            wait_deadline = time.monotonic() + grace
+            if deadline is not None:
+                wait_deadline = min(wait_deadline, deadline)
+            while time.monotonic() < wait_deadline and any(cls._proc_alive(p) for p in targets):
                 time.sleep(0.05)
 
         # Preserve descendants during the parent's configured shutdown window.
@@ -2275,9 +2280,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
                 self._completion_consumed.add(session_id)
+            session._kill_deadline = None
             return result
         try:
-            early = self._signal_kill(session, session_id, consume_output)
+            early = self._signal_kill(session, session_id, consume_output, deadline=deadline)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
@@ -2330,8 +2336,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "termination_source": session.termination_source, **output}
         except Exception as e:
             return {"status": "error", "error": str(e)}
+        finally:
+            # The deadline only fences the reader while this kill is reconciling its result.
+            # Leaving it set makes a later reader callback skip both the completion receipt and
+            # checkpoint forever after the deadline expires.
+            session._kill_deadline = None
 
-    def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
+    def _signal_kill(
+        self, session: ProcessSession, session_id: str, consume_output: bool,
+        *, deadline: Optional[float] = None,
+    ) -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
         PID. Returns a final result dict when the kill cannot proceed (recycled/dead
         recovered PID, or no runtime handle), else None."""
@@ -2344,7 +2358,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         elif session.process:
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
             # leaves Git Bash descendants behind.
-            self._terminate_host_pid(session.process.pid, session.host_start_time)
+            if deadline is None:
+                self._terminate_host_pid(session.process.pid, session.host_start_time)
+            else:
+                self._terminate_host_pid(session.process.pid, session.host_start_time, deadline=deadline)
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:
@@ -2368,7 +2385,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return {"status": "already_exited", "exit_code": session.exit_code, **output}
             # Identity was just proven above. Re-passing the start time would make
             # an unreadable probe refuse the kill and leave the re-adopted child running.
-            self._terminate_host_pid(session.pid)
+            if deadline is None:
+                self._terminate_host_pid(session.pid)
+            else:
+                self._terminate_host_pid(session.pid, deadline=deadline)
         else:
             return {
                 # Reject non-positive timeouts — the schema declares minimum=1, but not every caller
@@ -2620,18 +2640,42 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 and s.id not in exclude_ids and not s.exited
                 and not (lifecycle and s.persist_on_release)
             ]
-        killed = 0
-        for session in targets:
+        def _kill_one(session: ProcessSession, *, target_deadline: Optional[float]) -> bool:
             if stop_event is not None and stop_event.is_set():
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                break
+                return False
+            if target_deadline is not None and time.monotonic() >= target_deadline:
+                return False
             kill_kwargs = {"source": source, "consume_output": consume_output}
-            if deadline is not None:
-                kill_kwargs["deadline"] = deadline
-            # stop_event is a sweep-level cooperative boundary; kill_process() owns
-            # only the per-target deadline and must not receive the event.
-            killed += self.kill_process(session.id, **kill_kwargs).get("status") in {"killed", "already_exited"}
+            if target_deadline is not None:
+                kill_kwargs["deadline"] = target_deadline
+            return self.kill_process(session.id, **kill_kwargs).get("status") in {"killed", "already_exited"}
+
+        killed = 0
+        # A shutdown grace is shared by the whole sweep. Start every local kill in
+        # parallel so a SIGTERM-ignoring first process cannot consume the grace
+        # before later targets receive SIGTERM. Each kill uses the same deadline,
+        # then escalates its owned tree to SIGKILL before that shared deadline.
+        shared_parallel = False
+        if deadline is not None and len(targets) > 1:
+            shared_parallel = max(0.0, deadline - time.monotonic()) > max(
+                0.1, 2.0 * self._daemon_term_grace_seconds(),
+            )
+        if shared_parallel:
+            with ThreadPoolExecutor(max_workers=len(targets), thread_name_prefix="process-kill") as pool:
+                futures = [pool.submit(_kill_one, session, target_deadline=deadline) for session in targets]
+                killed = sum(bool(future.result()) for future in futures)
+        else:
+            for session in targets:
+                if deadline is None:
+                    target_deadline = None
+                else:
+                    target_deadline = deadline
+                if _kill_one(session, target_deadline=target_deadline):
+                    killed += 1
+        # A reader racing the kill can finish after the per-target deadline. One final checkpoint
+        # after the whole sweep makes the durable registry reflect every kill whose result is now
+        # in _finished, without relying on a reader thread that may have skipped its own write.
+        self._write_checkpoint()
         return killed
 
     # ----- Cleanup / Pruning -----

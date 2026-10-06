@@ -1256,6 +1256,7 @@ class GatewayShutdownMixin:
     async def _finalize_shutdown_agents(
         self, active_agents: Dict[str, Any], *, interrupted: bool = False,
         stop_event: Optional[threading.Event] = None,
+        deadline: Optional[float] = None,
     ) -> None:
         if stop_event is None:
             stop_event = getattr(self, "_shutdown_finalize_stop_event", None)
@@ -1267,10 +1268,25 @@ class GatewayShutdownMixin:
             self._flush_agent_transcript_at_shutdown(agent)
             if interrupted:
                 logger.warning(
-                    "Skipping blocking shutdown finalization for interrupted agent %s; "
-                    "the next gateway will recover its durable restart marker",
+                    "Skipping blocking shutdown cleanup for interrupted agent %s; "
+                    "running bounded memory flush/finalize hooks only. The next gateway "
+                    "will recover the transcript, but provider on_session_end/close work "
+                    "may still be lost",
                     session_key,
                 )
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                await self._finalize_session_off_loop(
+                    session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
+                    session_key=session_key, timeout=remaining,
+                )
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                await self._flush_agent_memory_off_loop(agent, session_key=session_key, timeout=remaining)
                 continue
             # Off-loop + bounded: plugin on_session_finalize hooks can do arbitrary synchronous work
             # (e.g. a full-session trace export) — same hang class as the memory provider below.
@@ -1327,8 +1343,46 @@ class GatewayShutdownMixin:
             tasks = self._deferred_agent_cleanup_tasks = set()
         self._track_task_in(tasks, asyncio.create_task(_cleanup_when_done()))
 
+    async def _flush_agent_memory_off_loop(
+        self, agent: Any, *, session_key: Optional[str] = None, timeout: Optional[float] = None,
+    ) -> None:
+        """Flush queued memory writes without running blocking resource teardown.
+
+        Timed-out restarts intentionally skip ``shutdown_memory_provider``/``close``. The
+        memory manager's barrier is still worth attempting because it is the durable handoff
+        for writes already accepted by the turn; anything still queued after this bound may be
+        recovered only from the interrupted transcript (or lost if the provider has no durable
+        queue).
+        """
+        manager = getattr(agent, "_memory_manager", None)
+        flush_pending = getattr(manager, "flush_pending", None)
+        if not callable(flush_pending):
+            return
+        budget = 10.0 if timeout is None else max(0.0, timeout)
+        if budget <= 0:
+            return
+
+        def _flush() -> None:
+            flush_pending(timeout=budget)
+
+        try:
+            await asyncio.wait_for(
+                self._run_housekeeping_in_executor(
+                    self._run_release_in_profile_scope, _flush, (), session_key,
+                ),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Interrupted-agent memory flush exceeded %.2fs; queued provider writes may be lost",
+                budget,
+            )
+        except Exception as flush_exc:
+            logger.debug("Interrupted-agent memory flush failed: %s", flush_exc)
+
     async def _finalize_session_off_loop(
-        self, *, session_id: Any, platform: str, reason: str, session_key: Optional[str] = None, **extra: Any,
+        self, *, session_id: Any, platform: str, reason: str, session_key: Optional[str] = None,
+        timeout: Optional[float] = None, **extra: Any,
     ) -> None:
         """Run hermes_cli.lifecycle.finalize_session off-loop, bounded; on timeout the worker is left alone.
         ``session_key`` lets an unscoped caller (shutdown) enter the owning profile's scope: plugin
@@ -1342,12 +1396,13 @@ class GatewayShutdownMixin:
         try:
             await asyncio.wait_for(
                 self._run_housekeeping_in_executor(self._run_release_in_profile_scope, _call, (), session_key),
-                timeout=self._FINALIZE_TIMEOUT_S,
+                timeout=self._FINALIZE_TIMEOUT_S if timeout is None else max(0.0, timeout),
             )
         except asyncio.TimeoutError:
             logger.warning(
                 "Session finalize hooks (%s, reason=%s) exceeded %ss; proceeding without blocking the event loop "
-                "(the worker thread is left to finish on its own).", session_id, reason, self._FINALIZE_TIMEOUT_S,
+                "(the worker thread is left to finish on its own).", session_id, reason,
+                self._FINALIZE_TIMEOUT_S if timeout is None else timeout,
             )
         except Exception as finalize_exc:
             logger.debug("Session finalize hooks (%s, reason=%s) failed: %s", session_id, reason, finalize_exc)
@@ -2094,8 +2149,12 @@ class GatewayShutdownMixin:
         # Record interrupted cron runs independently of the tool sweep. A blocked registry kill must not
         # turn a truncated cron run into a plausible success or lose its interruption notice.
         from cron.scheduler import mark_running_jobs_interrupted
-        _interrupted_cron_jobs = mark_running_jobs_interrupted(
-            "Gateway shutdown (post-interrupt) interrupted the job before tool cleanup completed."
+        _interrupted_cron_jobs = GatewayRunner._quiet_step(
+            "mark_running_jobs_interrupted (post-interrupt) error",
+            lambda: mark_running_jobs_interrupted(
+                "Gateway shutdown (post-interrupt) interrupted the job before tool cleanup completed."
+            ),
+            level=logging.WARNING,
         ) or []
         _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
             "post-interrupt", timeout=min(2.0, self._restart_shutdown_bound()),
@@ -2125,6 +2184,73 @@ class GatewayShutdownMixin:
                 return flush_overflow_to_file({session_key: value}, reason=reason)
             return flush_pending_to_file({session_key: value}, reason=reason)
 
+    def _persist_shutdown_pending_messages(self) -> int:
+        """Durably spool every queued inbound before cancellable shutdown cleanup starts.
+
+        This is deliberately synchronous and called before the bounded finalization task: a timed-out
+        restart may cancel all best-effort cleanup, but it must not cancel the only copy of a user
+        follow-up. Successfully spooled slots are removed by identity so later fallback phases do not
+        replay them; failed slots remain available to a subsequent best-effort pass.
+        """
+        persisted = 0
+
+        def _slot(mapping, key, value, *, overflow: bool = False) -> None:
+            nonlocal persisted
+            try:
+                if self._flush_owned_pending(
+                    key, value, reason="shutdown", overflow=overflow,
+                ):
+                    if mapping.get(key) is value:
+                        mapping.pop(key, None)
+                    persisted += 1
+            except Exception:
+                logger.exception("Failed to durably spool shutdown-pending message for %s", key)
+
+        pending = getattr(self, "_pending_messages", None)
+        if isinstance(pending, dict):
+            for key, value in list(pending.items()):
+                _slot(pending, key, value)
+
+        queued_events = getattr(self, "_queued_events", None)
+        if isinstance(queued_events, dict):
+            for key, events in list(queued_events.items()):
+                if events:
+                    _slot(queued_events, key, list(events), overflow=True)
+
+        profile_adapters = getattr(self, "_profile_adapters", {})
+        adapters = [*list(getattr(self, "adapters", {}).items())]
+        adapters.extend(
+            (platform, adapter)
+            for amap in profile_adapters.values()
+            for platform, adapter in list(amap.items())
+        )
+        for platform, adapter in adapters:
+            adapter_pending = getattr(adapter, "_pending_messages", None)
+            if not isinstance(adapter_pending, dict):
+                continue
+            for key, value in list(adapter_pending.items()):
+                _slot(adapter_pending, key, value)
+
+        startup_queue = getattr(self, "_startup_restore_queue", None)
+        if isinstance(startup_queue, list):
+            for event in list(startup_queue):
+                spool = getattr(event, "_hermes_recovery_spool", None)
+                if spool is not None and spool.exists():
+                    continue
+                try:
+                    key = self._session_key_for_source(event.source)
+                    if self._flush_owned_pending(key, event, reason="restore_shutdown"):
+                        for index, current in enumerate(startup_queue):
+                            if current is event:
+                                del startup_queue[index]
+                                break
+                        persisted += 1
+                except Exception:
+                    logger.exception("Failed to preserve startup-restore queued event during shutdown")
+        if persisted:
+            logger.info("Shutdown phase: durably spooled %d queued inbound message(s) before cleanup", persisted)
+        return persisted
+
     def _restart_shutdown_bound(self) -> float:
         """Keep restart-only post-interrupt cleanup within a short successor handoff bound."""
         launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
@@ -2135,19 +2261,25 @@ class GatewayShutdownMixin:
     async def _stop_finalize_agents_and_adapters(
         self, ctx: "GatewayShutdownMixin._StopContext",
         *, stop_event: Optional[threading.Event] = None,
+        deadline: Optional[float] = None,
     ) -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
         if stop_event is not None and stop_event.is_set():
             return
+        # Keep direct phase callers safe too. _stop_impl performs the same spool before creating this
+        # cancellable task, so a timed-out restart never relies on this coroutine reaching its first await.
+        self._persist_shutdown_pending_messages()
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
         if stop_event is not None and stop_event.is_set():
             return
         if self._restart_requested and ctx.timed_out:
-            await self._finalize_shutdown_agents(ctx.active_agents, interrupted=True)
+            await self._finalize_shutdown_agents(
+                ctx.active_agents, interrupted=True, stop_event=stop_event, deadline=deadline,
+            )
         else:
-            await self._finalize_shutdown_agents(ctx.active_agents)
+            await self._finalize_shutdown_agents(ctx.active_agents, stop_event=stop_event)
         if stop_event is not None and stop_event.is_set():
             return
         # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
@@ -2462,13 +2594,20 @@ class GatewayShutdownMixin:
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
+            # This spool is intentionally outside the cancellable finalization bound: it is the
+            # successor's only durable copy of queued user follow-ups.
+            GatewayRunner._persist_shutdown_pending_messages(self)
             _finalize_stop_event = threading.Event()
             self._shutdown_finalize_stop_event = _finalize_stop_event
+            _finalize_bound = self._restart_shutdown_bound() if ctx.timed_out and self._restart_requested else None
+            _finalize_deadline = None if _finalize_bound is None else time.monotonic() + _finalize_bound
             _finalize_task = asyncio.create_task(
-                GatewayRunner._stop_finalize_agents_and_adapters(self, ctx, stop_event=_finalize_stop_event)
+                GatewayRunner._stop_finalize_agents_and_adapters(
+                    self, ctx, stop_event=_finalize_stop_event, deadline=_finalize_deadline,
+                )
             )
-            if ctx.timed_out and self._restart_requested:
-                if not await GatewayRunner._wait_or_detach(_finalize_task, self._restart_shutdown_bound()):
+            if _finalize_bound is not None:
+                if not await GatewayRunner._wait_or_detach(_finalize_task, _finalize_bound):
                     # Do not leave finalization touching adapters or profile DBs while the
                     # following phases release/close them. The event stops between-agent
                     # work; cancellation stops the asyncio coordinator immediately.
@@ -2476,16 +2615,10 @@ class GatewayShutdownMixin:
                     _finalize_task.cancel()
                     logger.warning(
                         "Shutdown finalization exceeded %.1fs; cancelling remaining cleanup",
-                        self._restart_shutdown_bound(),
+                        _finalize_bound,
                     )
             else:
                 await _finalize_task
-            if not _finalize_task.done():
-                _finalize_stop_event.set()
-                _finalize_task.cancel()
-                _finalize_task.add_done_callback(
-                    lambda task: task.exception() if not task.cancelled() else None
-                )
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
