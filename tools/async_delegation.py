@@ -1134,6 +1134,8 @@ def _settle_unsubmitted_locked(
     if not unsettled:
         return
 
+    prior_statuses = {item["delegation_id"]: item.get("status") for item in unsettled}
+
     def settle_group(items: List[Dict[str, Any]], target: str) -> List[Dict[str, Any]]:
         """Persist and publish one target for groups split by current state."""
         settled: List[Dict[str, Any]] = []
@@ -1164,6 +1166,7 @@ def _settle_unsubmitted_locked(
             item["interrupt_fn"] = None
             item["progress_fn"] = None
             snapshot = dict(item)
+            snapshot["_claimed_prior_status"] = prior_statuses[item["delegation_id"]]
             _record_context_run(
                 item,
                 lambda item=item, snapshot=snapshot: _finalize(
@@ -1312,6 +1315,21 @@ def _dispatch_admitted(
         "_persisting": True, "_persist_done": threading.Event(),
     }
     with _records_lock:
+        existing = _records.get(delegation_id)
+        if existing is not None:
+            return {"status": "rejected", "accepted": False,
+                    "error": f"Async delegation {delegation_id} already exists in memory; refusing duplicate id."}
+        try:
+            durable = _durable_state(delegation_id)
+        except Exception:
+            # A failed preflight read must not turn a fresh insert failure into
+            # an uncaught dispatch error; _persist_dispatch remains authoritative
+            # for accepting or rejecting the new durable row.
+            durable = None
+        if durable is not None and durable.get("state") not in _TERMINAL_STATES:
+            return {"status": "rejected", "accepted": False,
+                    "error": f"Async delegation {delegation_id} already exists durably in non-terminal state "
+                             f"{durable.get('state')!r}; refusing duplicate id."}
         active_slots = _active_slots_locked()
         slot = record["slot_key"]
         initially_queued = slot not in active_slots and len(active_slots) >= max_async_children
@@ -1338,8 +1356,9 @@ def _dispatch_admitted(
         _persist_dispatch(record)
     except Exception as exc:
         with _records_lock:
-            _records.pop(delegation_id, None)
-            _PENDING_ADMISSION_SLOTS.discard(record["slot_key"])
+            if _records.get(delegation_id) is record:
+                _records.pop(delegation_id, None)
+                _PENDING_ADMISSION_SLOTS.discard(record["slot_key"])
         record["_persist_done"].set()
         logger.error("Failed to persist new async delegation %s", delegation_id, exc_info=True)
         return {"status": "rejected", "accepted": False, "error": f"Failed to persist async delegation{label}: {exc}"}
@@ -1500,9 +1519,9 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             snapshot = dict(record)
     else:
         snapshot = _claimed_snapshot
-        prior_status = snapshot.get("_durable_state") or "queued"
+        prior_status = snapshot.get("_claimed_prior_status") or snapshot.get("_durable_state") or "queued"
         was_queued = prior_status == "queued"
-        was_admitted_unstarted = prior_status == "admitted"
+        was_admitted_unstarted = prior_status == "admitted" or (prior_status == "running" and not snapshot.get("_started"))
     if (was_queued or was_admitted_unstarted) and snapshot.get("cancel_fn") is not None:
         try:
             snapshot["cancel_fn"]("queued delegation cancelled")

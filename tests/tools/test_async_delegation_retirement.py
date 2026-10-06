@@ -114,6 +114,65 @@ def test_retirement_fence_failure_terminally_settles_unsubmitted_siblings(monkey
     async_delegation._reset_for_tests()
 
 
+def test_retirement_cleanup_cancels_only_unsubmitted_siblings(monkeypatch):
+    """Retirement cleanup runs cancel_fn once for each sibling without a Future."""
+    from tools import async_delegation
+
+    release_first = threading.Event()
+    release_sibling = threading.Event()
+    first = async_delegation.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release_first.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    cancel_counts = [0, 0]
+    slot_key = "retiring-cleanup-sibling-group"
+    handles = [
+        async_delegation.dispatch_async_delegation_batch(
+            goals=[f"sibling-{i}"], context=None, toolsets=None, role="leaf", model="m", session_key="",
+            slot_key=slot_key,
+            runner=(lambda: (release_sibling.wait(30), {"results": [{"task_index": 0, "status": "completed"}]})[1])
+            if i == 0 else (lambda: {"results": [{"task_index": 0, "status": "completed"}]}),
+            cancel_fn=lambda _reason, i=i: cancel_counts.__setitem__(i, cancel_counts[i] + 1),
+            max_async_children=1, max_queued_delegations=1,
+        )
+        for i in range(2)
+    ]
+    assert first["status"] == "dispatched"
+    assert [handle["status"] for handle in handles] == ["queued", "queued"]
+
+    original_submit = async_delegation._submit_record
+    submitted = 0
+
+    def submit_one_then_retire(record, max_async_children):
+        nonlocal submitted
+        submitted += 1
+        if submitted == 1:
+            return original_submit(record, max_async_children)
+        return async_delegation._BACKEND_RETIRING
+
+    monkeypatch.setattr(async_delegation, "_submit_record", submit_one_then_retire)
+    release_first.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with async_delegation._records_lock:
+            first_status = async_delegation._records[handles[0]["delegation_id"]]["status"]
+            second_status = async_delegation._records[handles[1]["delegation_id"]]["status"]
+        if first_status == "running" and second_status == "failed":
+            break
+        time.sleep(0.01)
+    with async_delegation._records_lock:
+        assert async_delegation._records[handles[0]["delegation_id"]]["status"] == "running"
+        assert async_delegation._records[handles[1]["delegation_id"]]["status"] == "failed"
+    assert cancel_counts == [0, 1]
+
+    release_sibling.set()
+    deadline = time.monotonic() + 5
+    while async_delegation.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert async_delegation.active_count() == 0
+    async_delegation._reset_for_tests()
+
+
 def test_monitor_exit_race_wakes_for_queue_admitted_during_final_sweep(monkeypatch):
     """A queue arriving while the monitor decides to exit must not strand."""
     from tools import async_delegation

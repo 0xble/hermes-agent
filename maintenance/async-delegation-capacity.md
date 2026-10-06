@@ -56,6 +56,17 @@ from a new persisted record or a slot-release callback and loops to capacity.
 - Admission persistence, submit-failure finalization, and queued cancellation run
   in the queued unit's captured profile context. A process serving multiple
   profiles must never write another profile's `state.db` or completion manifest.
+- Duplicate delegation ids are rejected under `_records_lock` before capacity
+  bookkeeping or in-memory insertion when the id is already present in memory or
+  durably non-terminal. A failed fresh insert removes only the exact record
+  object that attempted it; it cannot delete a replacement under the same key.
+- Every never-started finalization invokes `cancel_fn` once before cleanup is
+  considered complete. The normal worker path finalizes returned runners,
+  `_interrupt_records` finalizes queued/admitted cancellations, the stale monitor
+  finalizes expired stalled runners, and `_settle_unsubmitted_locked` finalizes
+  siblings left without a Future during admission. The sibling path captures the
+  pre-finalize state because its durable state is already `finalizing`; submitted
+  siblings are not passed through that cleanup.
 - The existing stale-delegation monitor also retries pending admission, so a
   transient retirement prepare fence reopening retriggers the queue without
   requiring another completion.

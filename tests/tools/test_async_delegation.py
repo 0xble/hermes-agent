@@ -925,6 +925,7 @@ def test_queued_delegation_can_be_cancelled_before_runner_starts():
     queued = ad.dispatch_async_delegation(
         goal="task1", context=None, toolsets=None, role="leaf", model="m", session_key="owned",
         runner=lambda: (started.set(), {})[1], interrupt_fn=lambda reason=None: interrupted.append(reason),
+        cancel_fn=lambda reason: interrupted.append(f"cleanup:{reason}"),
         max_async_children=1, max_queued_delegations=1,
     )
     assert queued["status"] == "queued"
@@ -933,7 +934,7 @@ def test_queued_delegation_can_be_cancelled_before_runner_starts():
     assert event is not None
     assert event["status"] == "interrupted"
     assert not started.is_set()
-    assert interrupted == ["stop"]
+    assert interrupted == ["stop", "cleanup:queued delegation cancelled"]
     ev.set()
     assert _drain_for(first["delegation_id"]) is not None
 
@@ -2122,6 +2123,61 @@ def test_post_insert_prune_failure_keeps_queued_dispatch_durable(monkeypatch):
     release.set()
     assert _drain_for(first["delegation_id"]) is not None
     assert _drain_for(queued["delegation_id"]) is not None
+
+
+def test_duplicate_delegation_id_rejected_before_mutation():
+    started = threading.Event()
+    release = threading.Event()
+    delegation_id = "duplicate-id-309"
+
+    first = ad.dispatch_async_delegation(
+        goal="original", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (started.set(), release.wait(5), {"status": "completed", "summary": "original"})[2],
+        max_async_children=1, delegation_id=delegation_id,
+    )
+    assert first["status"] == "dispatched"
+    assert started.wait(5)
+    with ad._records_lock:
+        original = ad._records[delegation_id]
+
+    duplicate = ad.dispatch_async_delegation(
+        goal="duplicate", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "must not run"},
+        max_async_children=1, delegation_id=delegation_id,
+    )
+    assert duplicate["status"] == "rejected"
+    assert duplicate["accepted"] is False
+    assert "already exists" in duplicate["error"]
+    with ad._records_lock:
+        assert ad._records[delegation_id] is original
+    assert ad.active_count() == 1
+
+    release.set()
+    assert _drain_for(delegation_id) is not None
+    deadline = time.monotonic() + 2
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ad.active_count() == 0
+
+
+def test_durably_nonterminal_delegation_id_rejected_before_mutation():
+    delegation_id = "durable-duplicate-id-309"
+    ad._persist_dispatch({
+        "delegation_id": delegation_id, "session_key": "", "origin_ui_session_id": "",
+        "parent_session_id": None, "origin_session_id": "", "dispatched_at": time.time(),
+        "goal": "durable original", "role": "leaf", "model": "m",
+    })
+    duplicate = ad.dispatch_async_delegation(
+        goal="duplicate", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed"}, max_async_children=1, delegation_id=delegation_id,
+    )
+    assert duplicate["status"] == "rejected"
+    assert duplicate["accepted"] is False
+    assert "non-terminal" in duplicate["error"]
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?", (delegation_id,)
+        ).fetchone() == ("queued",)
 
 
 def test_pre_insert_failure_leaves_no_durable_dispatch(monkeypatch):
