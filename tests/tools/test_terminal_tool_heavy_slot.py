@@ -240,3 +240,18 @@ def test_background_wrapped_run_is_killable_and_releases_its_slot(tmp_path, monk
     while any(p.stat().st_size for p in slots.glob("slot-*.lock")) and time.monotonic() < deadline:
         time.sleep(0.2)
     assert not any(p.stat().st_size for p in slots.glob("slot-*.lock"))
+
+
+def test_helper_lookup_prefers_terminal_path_then_home_bin(tmp_path, monkeypatch):
+    on_path = tmp_path / "path-bin"
+    home_bin = tmp_path / "home" / ".local" / "bin"
+    for directory in (on_path, home_bin):
+        directory.mkdir(parents=True)
+        helper = directory / "heavy-slot"
+        helper.write_text("#!/bin/sh\n")
+        helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    assert heavy._heavy_slot_executable({"PATH": str(on_path)}) == str(on_path / "heavy-slot")
+    assert heavy._heavy_slot_executable({"PATH": str(tmp_path / "empty")}) == str(home_bin / "heavy-slot")
+    (home_bin / "heavy-slot").unlink()
+    assert heavy._heavy_slot_executable({"PATH": str(tmp_path / "empty")}) is None

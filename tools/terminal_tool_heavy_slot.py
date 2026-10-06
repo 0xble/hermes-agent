@@ -26,7 +26,6 @@ import logging
 import os
 import re
 import shlex
-import shutil
 from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Optional
@@ -260,12 +259,12 @@ def _heavy_positions(command: str) -> list[tuple[int, str]]:
 
 
 def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
-    """Find the host helper without requiring a login-shell PATH."""
-    home_candidate = Path.home() / ".local" / "bin" / "heavy-slot"
-    if home_candidate.is_file() and os.access(home_candidate, os.X_OK):
-        return str(home_candidate)
-    path_candidate = shutil.which("heavy-slot", path=environment.get("PATH"))
-    return path_candidate if path_candidate and os.access(path_candidate, os.X_OK) else None
+    """The host helper: the terminal's PATH first, then ``~/.local/bin`` (absent from minimal service PATHs)."""
+    from hermes_platform.resolver.core import LookupContext, locate_command
+
+    found = locate_command("heavy-slot", LookupContext(path=environment.get("PATH")),
+                           known_dirs=(str(Path.home() / ".local" / "bin"),))
+    return found.command[0] if found.command else None
 
 
 def wrap_heavy_command(command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None) -> str:
