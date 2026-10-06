@@ -20,11 +20,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 - Fork patch identity: `relay-close-failure-test-race`.
 - Relay's managed stream can be aborted by the monitor before the worker
-  observes its interrupt and closes the stream. Both aborts may legitimately
-  target the same request client; the worker close-failure abort must remain
-  observable so the reuse-slot guard still poisons that client. The regression
-  test now asserts that contract without requiring one scheduling order and
-  includes an event-synchronized monitor-first case.
+  observes its interrupt and closes the stream. A Relay close failure can then
+  surface as `RuntimeError: internal error: RuntimeError: close failed` while
+  the worker is advancing the managed iterator, skipping the worker's
+  body-level `interrupt_stream_close_failed` branch. This is safe for request
+  reuse because the monitor's `stream_interrupt_abort` already marks the
+  request-client slot poisoned; a later worker abort is optional and targets
+  the same client. The regression test preserves that invariant with an
+  event-synchronized monitor-first case and asserts every event wait succeeds.
 - Guard: `tests/agent/test_request_client_reuse_abort_races.py`
   (`test_relay_managed_close_failure_poisons_request_client`,
   `test_relay_managed_close_failure_preserves_poison_when_monitor_wins`).
