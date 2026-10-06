@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ Tive que parar antes de concluir{reason}. Use /retry para tentar novamente ou /compress se esta conversa ficou muito longa."
     no_response: "⚠️ O processamento foi concluído, mas nenhuma resposta foi gerada. Pode ser um erro transitório — tente enviar sua mensagem novamente."
     previous_turn_cleanup: "⚠️ Sua mensagem não foi processada (o turno anterior ainda estava sendo finalizado). Envie-a novamente."
-    unexpected_silence: "⚠️ O modelo retornou apenas um marcador de silêncio para uma mensagem que precisava de resposta. Tente novamente ou reformule."
+    unexpected_silence: "⚠️ Nenhuma resposta foi escrita para esta mensagem. Envie-a novamente se esperava uma resposta."
     empty_response_model_label: "O modelo"
     hint_auth: " Seu login no serviço do modelo de IA expirou ou a chave de API está incorreta. Use /login aqui ou execute `{relogin}` no host."
     hint_quota: " O saldo ou a cota do seu serviço do modelo de IA acabou. Recarregue no site do serviço ou use /model para trocar de modelo."
@@ -747,7 +747,7 @@ gateway:
     paused: "⏸️ Pausado{suffix}. Novo trabalho de cron/kanban/gateway está em espera; o trabalho em andamento termina normalmente. Use `/pause off` para retomar."
   queue:
     usage: "Uso: /queue <prompt>"
-    queued: "Enfileirado para o próximo turno."
+    queued: "⏳ Enfileirado para o próximo turno."
     queued_depth: " ({depth} na fila)"
   steer:
     usage: "Uso: /steer <prompt>"

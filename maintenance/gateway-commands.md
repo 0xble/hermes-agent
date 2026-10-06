@@ -10,15 +10,8 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   primary's aliases. Aliases that target `/stop`, `/new`, or `/reset` keep ordinary busy
   semantics. Name-less alias targets are rejected before the busy-path guard.
 - `/fast`, `/reasoning`, `/title`, `/usage`, and `/whoami` run during an active turn.
-  `/compress`, `/undo`, `/retry`, `/save`, `/branch`, and `/moa <prompt>` are acknowledged,
-  keep their command identity, and execute ahead of queued follow-up text once the turn commits.
-- `/moa <prompt>` mid-run never switches the running agent. Gateway: deferred, then replayed
-  through idle `_hm_cmd_moa`; the turn finalizer restores the prior override, including a
-  standing `/model` override. `/stop`, `/new`, `/reset` drop it. Bare `/moa` returns usage.
-  Ink TUI: `_cmd_moa` records `pending_moa` and returns `send` with `queued: true`; Ink always
-  enqueues that prompt (never steer/interrupt), and the matching queued turn applies and restores it.
-- Ordering caveat (`busy_input_mode: queue`): plain text queued while busy drains inside the running
-  turn, before deferred commands, so text sent after `/moa` runs before the MoA turn, on the prior model.
+  `/compress`, `/undo`, `/retry`, `/save`, and `/branch` are acknowledged, keep their
+  command identity, and execute ahead of queued follow-up text once the turn commits.
 
 ## Provenance and patches
 
@@ -38,18 +31,20 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   [upstream PR 132644](https://github.com/NousResearch/hermes-agent/pull/132644); the gateway half
   waits on upstream `defer_until_idle` (PR 116295 / 125345).
 
+- Patch identity: `queue-ack-emoji`. `/queue` replies lead with ⏳ like the other
+  busy-input acknowledgments (⏩ steer, ↪ redirect, ⏳ busy queue): `gateway.queue.queued`
+  in every locale, plus the ACP queue, steer-fallback and busy-queue replies. Upstream
+  still renders the bare text. Retire by upstreaming the locale change.
+
 ## Verification
 
+`tests/gateway/test_telegram_voice_v0_regressions.py` asserts the ⏳ queue reply.
 `scripts/run_tests.sh` on `tests/gateway/test_command_bypass_active_session.py`,
 `tests/gateway/test_session_race_guard.py`, `tests/gateway/test_busy_command.py`, and
-`tests/gateway/test_running_agent_session_toggles.py`; for `moa-busy-defer` also
-`tests/gateway/test_moa_busy_defer.py`, `tests/tui_gateway/test_moa_busy_defer.py`,
-`tests/hermes_cli/test_tui_rapid_enter_paste.py`, and `ui-tui` `createSlashHandler.test.ts`.
+`tests/gateway/test_running_agent_session_toggles.py`.
 
 ## Retirement and rollback
 
-Retire `moa-busy-defer` when PR 132644 (or equivalent) and an upstream `defer_until_idle` that
-lists `/moa` are both in the candidate release.
 Retire alias expansion when upstream expands alias quick commands on the busy path. Retire
 defer-until-idle when PR 116295 or equivalent is in the candidate release. Roll back by
 reverting the logical patch; no persistent data changes.

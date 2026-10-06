@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ 我不得不在完成前停止{reason}。使用 /retry 重试；如果这段对话已经很长，请使用 /compress。"
     no_response: "⚠️ 处理已完成，但未生成响应。这可能是暂时性错误——请重新发送消息试试。"
     previous_turn_cleanup: "⚠️ 你的消息未被处理（上一回合仍在清理中）。请重新发送。"
-    unexpected_silence: "⚠️ 对于一条需要回复的消息，模型只返回了静默标记。请重试或换种说法。"
+    unexpected_silence: "⚠️ 此消息未写入任何回复。如果您期待得到回复，请重新发送。"
     empty_response_model_label: "模型"
     hint_auth: " 你在 AI 模型服务的登录已过期，或 API 密钥有误。请在此使用 /login，或在主机上运行 `{relogin}`。"
     hint_quota: " 你的 AI 模型服务余额或配额已用尽。请到该服务的网站充值，或用 /model 切换模型。"
@@ -747,7 +747,7 @@ gateway:
     paused: "⏸️ 已暂停{suffix}。新的定时任务/看板/网关任务将被搁置；进行中的任务正常完成。用 `/pause off` 恢复。"
   queue:
     usage: "用法：/queue <提示词>"
-    queued: "已排队至下一回合。"
+    queued: "⏳ 已排队至下一回合。"
     queued_depth: " （已排队 {depth} 条）"
   steer:
     usage: "用法：/steer <提示词>"

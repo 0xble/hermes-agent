@@ -687,7 +687,7 @@ gateway:
     stopped_before_finishing: "⚠️ Meg kellett állnom, mielőtt befejeztem volna{reason}. Próbáld újra a /retry paranccsal, vagy használd a /compress parancsot, ha a beszélgetés nagyon hosszúra nyúlt."
     no_response: "⚠️ A feldolgozás befejeződött, de nem született válasz. Ez lehet átmeneti hiba — küldd el újra az üzenetet."
     previous_turn_cleanup: "⚠️ Az üzeneted nem lett feldolgozva (az előző kör lezárása még tartott). Küldd el újra."
-    unexpected_silence: "⚠️ A modell csak csendjelzőt adott vissza egy olyan üzenetre, amely választ igényelt. Próbáld újra, vagy fogalmazd át."
+    unexpected_silence: "⚠️ Nem született válasz erre az üzenetre. Küldd el újra, ha választ vártál."
     empty_response_model_label: "A modell"
     hint_auth: " Az AI-modellszolgáltatásba való bejelentkezésed lejárt, vagy hibás az API-kulcs. Használd itt a /login parancsot, vagy futtasd a `{relogin}` parancsot a gépen."
     hint_quota: " Az AI-modellszolgáltatásnál elfogyott az egyenleged vagy a kereted. Töltsd fel a szolgáltatás weboldalán, vagy válts modellt a /model paranccsal."
@@ -757,7 +757,7 @@ gateway:
     paused: "⏸️ Szüneteltetve{suffix}. Az új cron-/kanban-/átjárómunka várakozik; a folyamatban lévő munka rendesen befejeződik. Folytatás: `/pause off`."
   queue:
     usage: "Használat: /queue <prompt>"
-    queued: "Sorba állítva a következő körre."
+    queued: "⏳ Sorba állítva a következő körre."
     queued_depth: " ({depth} a sorban)"
   steer:
     usage: "Használat: /steer <prompt>"
