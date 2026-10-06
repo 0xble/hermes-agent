@@ -592,3 +592,33 @@ async def test_duplicate_arriving_during_batch_delivery_is_not_delivered_twice(h
     assert await asyncio.wait_for(batch, timeout=2.0) == [True, True]
     assert await asyncio.wait_for(dup, timeout=2.0) is None
     assert adapter.handle_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_raw_api_server_completion_is_never_held(hermes_home):
+    """Raw API-server routes have no drain-spool form, so holding one could lose it at shutdown."""
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    evt = {**_completion("proc_api"), "platform": "", "chat_id": "", "chat_type": ""}
+    runner._build_process_event_source = lambda e: None
+    assert await runner._completion_hold_seconds(evt, session_busy=True) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_unspoolable_completion_after_teardown_starts_is_delivered_directly(hermes_home):
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    runner._completion_notification_batches_stopping = True
+    runner._spool_completion_for_restart = lambda text, evt: False
+    runner._deliver_completion_notification = AsyncMock(return_value=True)
+    assert await runner._enqueue_process_completion_notification("done", _completion("proc_api")) is True
+    runner._deliver_completion_notification.assert_awaited_once()
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("nan"), "inf"])
+def test_non_finite_gap_and_window_fall_back_to_defaults(hermes_home, value):
+    from hermes_cli.goals import normalize_goal_continuation_gap
+
+    assert normalize_goal_continuation_gap(value) == 900
+    (hermes_home / "config.yaml").write_text(
+        f"gateway:\n  completion_notification_batch_window_seconds: {value!s}\n", encoding="utf-8")
+    runner, _adapter = _fan_in_runner(window=None, last_turn_age=None)
+    assert runner._completion_notification_batch_window_from_config() == 300.0

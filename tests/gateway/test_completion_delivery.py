@@ -743,8 +743,10 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
         second = asyncio.create_task(
             runner._enqueue_process_completion_notification("second", second_event)
         )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        for _ in range(200):
+            if len(runner._completion_notification_batch_flush_tasks) == 2:
+                break
+            await asyncio.sleep(0.01)
         flush_tasks = set(runner._completion_notification_batch_flush_tasks)
         assert len(flush_tasks) == 2
 

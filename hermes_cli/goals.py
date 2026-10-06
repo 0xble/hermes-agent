@@ -68,7 +68,7 @@ def normalize_goal_continuation_gap(value: Any, default: float = DEFAULT_MIN_CON
         parsed = float(value)
     except (TypeError, ValueError):
         return float(default)
-    return parsed if parsed >= 0 else float(default)
+    return parsed if math.isfinite(parsed) and parsed >= 0 else float(default)
 
 
 def _goal_budget_label(turns_used: int, max_turns: int) -> str:

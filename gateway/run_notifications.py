@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import math
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -204,7 +205,7 @@ class GatewayNotificationsMixin:
             parsed = float(gateway_cfg.get("completion_notification_batch_window_seconds", default))
         except Exception:
             return default
-        if not parsed >= 0:  # also rejects NaN
+        if not (math.isfinite(parsed) and parsed >= 0):
             return default
         return min(parsed, self._COMPLETION_BATCH_WINDOW_MAX_S)
 
@@ -259,6 +260,10 @@ class GatewayNotificationsMixin:
         Window and goal state are read in the owning profile's scope (multiplexed gateways)."""
         session_key = str(evt.get("session_key") or "").strip()
         if not session_key or self._completion_is_failure(evt):
+            return 0.0
+        if evt.get("type") == "completion" and await asyncio.to_thread(self._build_process_event_source, evt) is None:
+            # Raw API-server routes have no drain-spool form, so a held copy could not survive
+            # shutdown: deliver them as before.
             return 0.0
         try:
             async with self._completion_event_scope(evt):
@@ -2261,6 +2266,17 @@ class GatewayNotificationsMixin:
             logger.warning("Could not spool completion %s for restart", evt.get("session_id"), exc_info=True)
             return False
 
+    async def _deliver_completion_while_stopping(self, synth_text: str, evt: dict) -> Optional[bool]:
+        """Teardown has started and the watcher gets no further retries: spool the completion, or
+        when it has no spool form (raw API-server routes) try direct delivery while adapters live."""
+        if self._spool_completion_for_restart(synth_text, evt):
+            return True
+        try:
+            return await self._deliver_completion_notification(synth_text, evt)
+        except Exception:
+            logger.warning("Completion %s could not be delivered during shutdown", evt.get("session_id"), exc_info=True)
+            return False
+
     def _preserve_undelivered_batch(self, entries) -> None:
         """Stopping: spool each undelivered entry and settle its waiter; True once preserved."""
         for synth_text, evt, future in entries:
@@ -2318,11 +2334,10 @@ class GatewayNotificationsMixin:
         """Fan in one conversation's completions; hold routine successes per the batch window."""
         self._ensure_completion_batch_state()
         if self._completion_notification_batches_stopping:
-            # The watcher will not get another chance once teardown starts: spool, never drop.
-            return self._spool_completion_for_restart(synth_text, evt)
+            return await self._deliver_completion_while_stopping(synth_text, evt)
         hold = await self._completion_hold_seconds(evt, session_busy=session_busy)
         if self._completion_notification_batches_stopping:
-            return self._spool_completion_for_restart(synth_text, evt)
+            return await self._deliver_completion_while_stopping(synth_text, evt)
         if hold <= 0:
             self._release_held_completions(str(evt.get("session_key") or ""))
         key = self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)
