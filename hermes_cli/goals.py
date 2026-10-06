@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 # ── Constants & defaults ──────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+# Autonomous goal continuations are deliberately sparse: a real user message or
+# actionable internal notification is allowed to wake immediately, while a
+# continuation-only chain gets one turn at most per this interval.
+DEFAULT_MIN_CONTINUATION_GAP_SECONDS = 15 * 60
+_MIN_CONTINUATION_GAP_REASON = "minimum gap between autonomous goal continuations"
 
 
 def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> int:
@@ -40,6 +45,19 @@ def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> in
     except (TypeError, ValueError):
         return int(default)
     return parsed if parsed >= 0 else int(default)
+
+
+def normalize_goal_continuation_gap(value: Any, default: float = DEFAULT_MIN_CONTINUATION_GAP_SECONDS) -> float:
+    """Normalize the minimum autonomous-continuation interval in seconds.
+
+    Zero explicitly disables the throttle. Invalid or negative values use the
+    configured default rather than silently turning the guard off.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if parsed >= 0 else float(default)
 
 
 def _goal_budget_label(turns_used: int, max_turns: int) -> str:
@@ -1810,9 +1828,17 @@ class GoalManager:
     canonical user-role message to feed back into ``run_conversation``.
     """
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
+    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS,
+                 min_continuation_gap_seconds: Optional[float] = None):
         self.session_id = session_id
         self.default_max_turns = normalize_goal_max_turns(default_max_turns)
+        if min_continuation_gap_seconds is None:
+            # Callers that own the gateway/config boundary pass the resolved
+            # default explicitly. Keeping the manager's library default disabled
+            # preserves direct CLI/TUI and test callers that intentionally drive
+            # turns synchronously without a wall-clock scheduler.
+            min_continuation_gap_seconds = 0
+        self.min_continuation_gap_seconds = normalize_goal_continuation_gap(min_continuation_gap_seconds)
         self._state: Optional[GoalState] = load_goal(session_id)
 
     # --- introspection ------------------------------------------------
@@ -2376,20 +2402,27 @@ class GoalManager:
 
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
+        external_event: bool = False,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Evaluate an isolated snapshot and atomically commit against its durable state."""
+        """Evaluate an isolated snapshot and atomically commit against its durable state.
+
+        ``external_event`` marks a watched-process/delegation notification. These
+        events are allowed to pierce a timed continuation gap because they carry
+        new evidence; ordinary continuation-only turns are throttled.
+        """
         from hermes_cli.goals_evaluation import evaluate_goal_snapshot
         return evaluate_goal_snapshot(
-            self, last_response, user_initiated=user_initiated,
+            self, last_response, user_initiated=user_initiated, external_event=external_event,
             background_processes=background_processes, active_delegations=active_delegations,
             evidence_session_id=evidence_session_id,
         )
 
     def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
+        external_event: bool = False,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -2405,10 +2438,21 @@ class GoalManager:
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
 
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
+        # A watched-process/delegation notification is fresh evidence and is allowed
+        # to pierce only our own continuation-gap barrier.
         if self.is_waiting():
-            return self._waiting_decision(state)
+            gap_wait = (
+                state.waiting_on_pid is None
+                and state.waiting_on_session is None
+                and state.waiting_on_delegations == 0
+                and state.waiting_reason == _MIN_CONTINUATION_GAP_REASON
+            )
+            if not (gap_wait and (user_initiated or external_event)):
+                return self._waiting_decision(state)
+            state.clear_wait(preserve_notice_key=True)
 
         state.turns_used += 1
+        previous_turn_at = state.last_turn_at
         state.last_turn_at = time.time()
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,
@@ -2506,6 +2550,23 @@ class GoalManager:
 
         if state.max_turns > 0 and state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
+
+        # Keep automatic continuation chains from becoming a tight self-wake loop.
+        # The wait is durable and uses the same idle wake path as other goal waits;
+        # user turns and real process/delegation events bypass it above.
+        if (
+            not user_initiated
+            and not external_event
+            and self.min_continuation_gap_seconds > 0
+            and previous_turn_at > 0
+        ):
+            remaining = self.min_continuation_gap_seconds - (time.time() - previous_turn_at)
+            if remaining > 0:
+                self.wait_for_seconds(
+                    max(1, int(remaining)),
+                    reason=_MIN_CONTINUATION_GAP_REASON,
+                )
+                return self._waiting_decision(state)
 
         self._save()
         return _decision(

@@ -3678,12 +3678,17 @@ class GatewayRunner(
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
         # Agent-triggered terminal completions from one conversation often land in the same scheduler
-        # tick; hold them briefly so the agent gets one synthetic turn instead of one per process.
-        # See #70300.
+        # tick; hold low-priority results while that session is busy/recently woken so the agent gets one
+        # synthetic turn instead of one per process. Failures and explicit diagnostics bypass the window.
         self._completion_notification_batches: dict[tuple[str, ...], list[tuple[str, dict, asyncio.Future]]] = {}
         self._completion_notification_batch_tasks: dict[tuple[str, ...], asyncio.Task] = {}
         self._completion_notification_batch_flush_tasks: set[asyncio.Task] = set()
-        self._completion_notification_batch_window = 0.1
+        self._completion_notification_batch_window = self._completion_notification_batch_window_from_config()
+        self._completion_notification_recent_wakes: dict[tuple[str, ...], float] = {}
+        self._async_delegation_batches: dict[tuple[str, ...], list[dict]] = {}
+        self._async_delegation_batch_tasks: dict[tuple[str, ...], asyncio.Task] = {}
+        self._async_delegation_batch_flush_tasks: set[asyncio.Task] = set()
+        self._async_delegation_batches_stopping = False
         self._completion_notification_batches_stopping = False
 
     def _init_runtime_caches(self) -> None:

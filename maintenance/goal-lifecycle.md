@@ -109,6 +109,8 @@ Failed or interrupted model turns do not run completion judging.
   is recorded in the PR. Rollback reverts the source change. `revisions` and
   `last_dispute_evidence` default empty on old rows, and there is no migration.
 
+- Fork patch identity: `goal-continuation-gap`. Own fork patch, no upstream PR yet. Gateway-created GoalManagers default to a 900-second minimum interval between autonomous continuation turns, configurable with `goals.min_continuation_gap_seconds` (`0` disables it). Real user turns and process/delegation notifications are fresh wake evidence and bypass the interval; live process/delegation wait barriers remain authoritative. The interval is durable as the existing goal wait barrier, so restarts do not reset it and the idle goal wake path resumes it. Regression: `uv run --with pytest --with pytest-asyncio pytest -q tests/hermes_cli/test_goals.py tests/gateway/test_goal_max_turns_config.py tests/gateway/test_goal_continuation_drain.py -k 'continuation_gap or max_turns or finite_budget or unlimited_budget'`. Rollback reverts this identity's manager plumbing, wait guard, config normalization and tests; no schema migration is introduced.
+
 The initial reproduction established missing criteria and paused state after a
 repair turn. Upstream comparison confirmed both and supplied a matching recovery
 implementation. Configuration or plugin changes cannot repair these native judge

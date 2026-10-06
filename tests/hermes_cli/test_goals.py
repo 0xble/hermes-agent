@@ -1234,3 +1234,43 @@ def test_judge_does_not_overwrite_concurrent_goal_mutation(hermes_home, mutation
     assert persisted.status == expected_status
     assert decision["should_continue"] is False
     assert decision["status"] == expected_status
+
+
+def test_automatic_goal_continuations_honor_configured_minimum_gap(hermes_home, monkeypatch):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    clock = [1000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = GoalManager(session_id="continuation-gap", min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+        first = mgr.evaluate_after_turn("started", user_initiated=True)
+        assert first["should_continue"] is True
+        clock[0] += 10
+        parked = mgr.evaluate_after_turn("continued", user_initiated=False)
+
+    assert parked["should_continue"] is False
+    assert parked["verdict"] == "waiting"
+    assert mgr.state.waiting_reason == goals._MIN_CONTINUATION_GAP_REASON
+    assert mgr.state.turns_used == 2
+
+
+def test_external_notification_can_pierce_continuation_gap(hermes_home, monkeypatch):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    clock = [1000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = GoalManager(session_id="continuation-gap-event", min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+        assert mgr.evaluate_after_turn("started", user_initiated=True)["should_continue"]
+        clock[0] += 10
+        assert not mgr.evaluate_after_turn("continued", user_initiated=False)["should_continue"]
+        resumed = mgr.evaluate_after_turn(
+            "build completed", user_initiated=False, external_event=True,
+        )
+
+    assert resumed["should_continue"] is True
+    assert mgr.state.waiting_until == 0

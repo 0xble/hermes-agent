@@ -2134,6 +2134,10 @@ DEFAULT_CONFIG = {
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
+        # Per-session fan-in window for low-priority process/delegation completions while a session
+        # is busy or was woken recently. Failures and explicit diagnostic notifications bypass it.
+        # 0 disables the window; the gateway still never drops a queued notification.
+        "completion_notification_batch_window_seconds": 300,
         # Opt-in, per-profile admission and ordered outbound receipt ledger. Existing delivery
         # behavior remains unchanged until explicitly enabled.
         "durable_outbox": {"enabled": False, "retention_days": 7},

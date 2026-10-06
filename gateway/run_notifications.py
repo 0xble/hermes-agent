@@ -176,6 +176,68 @@ class GatewayNotificationsMixin:
     _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
     _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[1:])
 
+    def _completion_notification_batch_window_from_config(self) -> float:
+        """Resolve the configured per-session fan-in window without making config a delivery dependency."""
+        default = 300.0
+        try:
+            from hermes_cli.config import load_config
+            config = load_config() or {}
+            gateway = config.get("gateway", {}) if isinstance(config, dict) else {}
+            value = gateway.get("completion_notification_batch_window_seconds", default)
+            parsed = float(value)
+            return parsed if parsed >= 0 else default
+        except Exception:
+            return default
+
+    def _completion_notification_window_seconds(self) -> float:
+        value = getattr(self, "_completion_notification_batch_window", None)
+        if value is None:
+            value = self._completion_notification_batch_window_from_config()
+        try:
+            parsed = float(value)
+            return parsed if parsed >= 0 else 300.0
+        except (TypeError, ValueError):
+            return 300.0
+
+    @classmethod
+    def _completion_notification_is_prompt(cls, evt: dict) -> bool:
+        """Failures, diagnostics and explicitly urgent notifications never wait behind fan-in."""
+        if evt.get("notification_priority") in {"urgent", "immediate"}:
+            return True
+        if evt.get("notify_immediately") or evt.get("explicit_notification"):
+            return True
+        if evt.get("task_failure_notice") or evt.get("type") in {
+            "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released",
+        }:
+            return True
+        exit_code = evt.get("exit_code")
+        if evt.get("type") == "completion" and exit_code not in (None, 0):
+            return True
+        status = str(evt.get("status") or evt.get("completion_reason") or "").lower()
+        return any(word in status for word in ("fail", "error", "exception", "timeout", "cancel"))
+
+    def _completion_notification_recently_woken(self, evt: dict, window: float) -> bool:
+        if window <= 0:
+            return False
+        key = self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)
+        timestamp = getattr(self, "_completion_notification_recent_wakes", {}).get(key)
+        return timestamp is not None and time.monotonic() - timestamp <= window
+
+    async def _completion_notification_window_for(
+        self, evt: dict, *, session_busy: Optional[bool] = None,
+    ) -> float:
+        """Use the large window only for an active/recently woken session."""
+        window = self._completion_notification_window_seconds()
+        if window <= 0 or self._completion_notification_is_prompt(evt):
+            return 0.0
+        if session_busy is None:
+            platform = str(evt.get("platform") or "")
+            with suppress(Exception):
+                session_busy = await self._launching_turn_active(platform, evt)
+        if session_busy or self._completion_notification_recently_woken(evt, window):
+            return window
+        return 0.0
+
     @dataclasses.dataclass
     class _UpdatePaths:
         """Marker files ``hermes update --gateway`` and its watcher exchange under HERMES_HOME."""
@@ -1663,6 +1725,12 @@ class GatewayNotificationsMixin:
             if callable(_prime):
                 _prime(synth_event)
             await admit_internal_event(adapter, synth_event)
+            recent_wakes = getattr(self, "_completion_notification_recent_wakes", None)
+            if recent_wakes is not None:
+                recent_wakes[self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)] = time.monotonic()
+                if len(recent_wakes) > 512:
+                    oldest = min(recent_wakes, key=recent_wakes.get)
+                    recent_wakes.pop(oldest, None)
             return True
         except WakeNotAccepted:
             # Durable callers refund the claim; ordinary watch callers just requeue.
@@ -2006,7 +2074,11 @@ class GatewayNotificationsMixin:
         entries: list[tuple[str, dict, asyncio.Future]] = []
         delivered: Optional[bool] = False
         try:
-            await asyncio.sleep(self._completion_notification_batch_window)
+            await asyncio.sleep(
+                getattr(self, "_completion_notification_batch_delays", {}).pop(
+                    key, self._completion_notification_window_seconds(),
+                )
+            )
             entries = self._completion_notification_batches.pop(key, [])
             # Detach before delivery so a completion arriving mid-flight can schedule the next flush.
             if self._completion_notification_batch_tasks.get(key) is current_task:
@@ -2046,11 +2118,15 @@ class GatewayNotificationsMixin:
                 future.set_result(result)
 
     async def _cancel_process_completion_batch_tasks(self) -> None:
-        """Settle pending completion batches before adapter teardown."""
+        """Settle pending completion/delegation batches before adapter teardown."""
         self._completion_notification_batches_stopping = True
+        self._async_delegation_batches_stopping = True
         tasks = {
             task
-            for task in getattr(self, "_completion_notification_batch_flush_tasks", set())
+            for task in (
+                set(getattr(self, "_completion_notification_batch_flush_tasks", set()))
+                | set(getattr(self, "_async_delegation_batch_flush_tasks", set()))
+            )
             if not task.done()
         }
         for task in tasks:
@@ -2063,25 +2139,34 @@ class GatewayNotificationsMixin:
             self._settle_batch_waiters(entries, False)
         batches.clear()
         getattr(self, "_completion_notification_batch_tasks", {}).clear()
+        getattr(self, "_completion_notification_batch_delays", {}).clear()
         getattr(self, "_completion_notification_batch_flush_tasks", set()).clear()
 
-    async def _enqueue_process_completion_notification(self, synth_text: str, evt: dict) -> Optional[bool]:
-        """Fan in concurrent process completions that share one conversation."""
+    async def _enqueue_process_completion_notification(
+        self, synth_text: str, evt: dict, *, session_busy: Optional[bool] = None,
+    ) -> Optional[bool]:
+        """Fan in low-priority completions for one conversation without delaying urgent results."""
         # Lazy defaults: lifecycle tests build GatewayRunner via object.__new__.
+        had_window_attr = hasattr(self, "_completion_notification_batch_window")
         for attr, default in (
             ("_completion_notification_batches", dict), ("_completion_notification_batch_tasks", dict),
+            ("_completion_notification_batch_delays", dict),
             ("_completion_notification_batch_flush_tasks", set),
-            ("_completion_notification_batch_window", lambda: 0.1),
+            ("_completion_notification_batch_window", lambda: 300.0),
             ("_completion_notification_batches_stopping", lambda: False), ("_background_tasks", set),
         ):
             if not hasattr(self, attr):
                 setattr(self, attr, default())
         if self._completion_notification_batches_stopping:
             return False
+        window = await self._completion_notification_window_for(evt, session_busy=session_busy)
+        if window <= 0 and not (session_busy is None and had_window_attr):
+            return await self._deliver_completion_notification(synth_text, evt)
         key = self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)
         future = asyncio.get_running_loop().create_future()
         self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
         if key not in self._completion_notification_batch_tasks:
+            self._completion_notification_batch_delays[key] = window
             task = asyncio.create_task(self._flush_process_completion_batch(key))
             self._completion_notification_batch_tasks[key] = task
             # Keep the flush alive under the gateway's normal lifecycle accounting.
@@ -2106,6 +2191,67 @@ class GatewayNotificationsMixin:
         evt["chat_id"] = parsed.get("chat_id", "")
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
+
+    async def _flush_async_delegation_batch(self, key: tuple[str, ...], delay: float) -> None:
+        """Deliver one delayed per-session async batch, returning every failed row to the queue."""
+        current_task = asyncio.current_task()
+        group: list[dict] = []
+        try:
+            await asyncio.sleep(delay)
+            group = getattr(self, "_async_delegation_batches", {}).pop(key, [])
+            if self._async_delegation_batch_tasks.get(key) is current_task:
+                self._async_delegation_batch_tasks.pop(key, None)
+            if group:
+                delivered = await self._deliver_async_delegation_group(group)
+                if delivered is False:
+                    from tools.process_registry import process_registry
+                    for evt in group:
+                        process_registry.completion_queue.put(evt)
+        except asyncio.CancelledError:
+            if not group:
+                group = getattr(self, "_async_delegation_batches", {}).pop(key, [])
+            if group:
+                from tools.process_registry import process_registry
+                for evt in group:
+                    process_registry.completion_queue.put(evt)
+            raise
+        except Exception:
+            logger.exception("Coalesced async delegation delivery failed")
+            from tools.process_registry import process_registry
+            for evt in group or getattr(self, "_async_delegation_batches", {}).pop(key, []):
+                process_registry.completion_queue.put(evt)
+        finally:
+            if self._async_delegation_batch_tasks.get(key) is current_task:
+                self._async_delegation_batch_tasks.pop(key, None)
+
+    async def _enqueue_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
+        """Hold low-priority same-session delegation results for the configured fan-in window."""
+        for attr, default in (
+            ("_async_delegation_batches", dict), ("_async_delegation_batch_tasks", dict),
+            ("_async_delegation_batch_flush_tasks", set),
+            ("_async_delegation_batches_stopping", lambda: False), ("_background_tasks", set),
+        ):
+            if not hasattr(self, attr):
+                setattr(self, attr, default())
+        if self._async_delegation_batches_stopping:
+            return False
+        window = await self._completion_notification_window_for(
+            group[0],
+            session_busy=any(self._completion_notification_is_prompt(evt) for evt in group)
+            if any(self._completion_notification_is_prompt(evt) for evt in group) else None,
+        )
+        if any(self._completion_notification_is_prompt(evt) for evt in group):
+            window = 0.0
+        if window <= 0:
+            return await self._deliver_async_delegation_group(group)
+        key = self._event_route_key(group[0], self._ASYNC_GROUP_KEY_FIELDS)
+        self._async_delegation_batches.setdefault(key, []).extend(group)
+        if key not in self._async_delegation_batch_tasks:
+            task = asyncio.create_task(self._flush_async_delegation_batch(key, window))
+            self._async_delegation_batch_tasks[key] = task
+            self._retain_background_task(task)
+            self._track_task_in(self._async_delegation_batch_flush_tasks, task)
+        return True
 
     async def _deliver_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
         """Deliver a same-session batch of async completions as ONE turn: the primary carries the
@@ -2328,7 +2474,7 @@ class GatewayNotificationsMixin:
                     groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
                 for group in groups.values():
                     try:
-                        delivered = await self._deliver_async_delegation_group(group)
+                        delivered = await self._enqueue_async_delegation_group(group)
                         if delivered is False:
                             for evt in group:
                                 _pr.completion_queue.put(evt)
@@ -2509,7 +2655,9 @@ class GatewayNotificationsMixin:
                     # Captured before injection: afterwards the key is busy either way (the injected
                     # turn itself installs the guard).
                     turn_busy = await self._launching_turn_active(platform_name, watcher)
-                    delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
+                    delivered = await self._enqueue_process_completion_notification(
+                        synth_text, completion_evt, session_busy=turn_busy,
+                    )
                     if delivered is False:
                         # The process remains terminal; retry after failed adapter injection instead
                         # of suppressing the result.
