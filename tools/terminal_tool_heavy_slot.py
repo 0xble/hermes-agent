@@ -37,8 +37,10 @@ _OPT_OUT_VALUES = {"0", "off", "false", "no"}
 # dispatcher is redefined by each rewritten command and never persists.
 _DISPATCH = "_hermes_heavy_slot"
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# Words that put the NEXT word in command position.
-_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "command", "exec", "nohup"}
+# Words that put the NEXT word in command position and work with shell functions.
+_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"}
+# External prefix utilities: they exec their argument, so the dispatcher goes before them.
+_EXEC_PREFIXES = {"env", "nice", "timeout", "gtimeout", "nohup"}
 # Cheap prefilter: every heavy form contains one of these, so most commands skip parsing.
 _CANDIDATE = re.compile(r"test|jest|bin/ci|tox|nox")
 _SHELLS = {"bash", "sh", "zsh"}
@@ -199,12 +201,23 @@ def classify_words(words: list[str]) -> Optional[str]:
     return None
 
 
-def _command_start(words: list[str]) -> int:
-    """Index of the word in command position, after assignments, keywords and prefix commands."""
+def _command_start(words: list[str]) -> tuple[int, Optional[int]]:
+    """``(runner, insert)``: index of the word that names the program, and where the dispatcher
+    goes. ``insert`` is the first exec-style prefix utility (``env``, ``nice``, ``timeout``,
+    ``nohup``), which can only exec a program, never a shell function, so the dispatcher must
+    run them. ``None`` means the command must not be wrapped: ``command`` deliberately
+    bypasses shell functions and ``exec`` replaces the session shell."""
     index = 0
+    insert: Optional[int] = None
     while index < len(words):
         word = words[index]
+        if word in {"command", "exec"}:
+            return index, None
+        if insert is None and word in _EXEC_PREFIXES:
+            insert = index
         if _ASSIGNMENT.match(word) or word in _KEYWORDS:
+            index += 1
+        elif word == "nohup":
             index += 1
         elif word == "env":
             index += 1
@@ -217,8 +230,8 @@ def _command_start(words: list[str]) -> int:
             if word != "nice" and index < len(words):
                 index += 1  # the duration
         else:
-            return index
-    return index
+            break
+    return index, (index if insert is None else insert)
 
 
 def _simple_commands(command: str) -> list[list[tuple[int, str]]]:
@@ -249,12 +262,12 @@ def _heavy_positions(command: str) -> list[tuple[int, str]]:
     found: list[tuple[int, str]] = []
     for segment in _simple_commands(command):
         words = [_unquote(raw) for _, raw in segment]
-        start = _command_start([w or "" for w in words])
+        start, insert = _command_start([w or "" for w in words])
         if start >= len(words) or any(w is None for w in words[start:]):
             continue  # unparseable word in the command itself: leave it alone
         label = classify_words(words[start:])  # type: ignore[arg-type]
-        if label:
-            found.append((segment[start][0], label))
+        if label and insert is not None:
+            found.append((segment[insert][0], label))
     return found
 
 

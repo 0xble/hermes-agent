@@ -87,6 +87,8 @@ def test_recognizes_heavy_commands(command, label):
     "scripts/run_tests.sh tests/agent/test_foo.py -k test_x",  # targeted
     "vitest run src/a.test.ts",  # targeted
     "pytest -q -x --tb=short -k smoke tests/tools/test_a.py::test_b",  # targeted with single-run options
+    "command pytest tests",  # `command` deliberately bypasses shell functions: left alone
+    "exec pytest tests",  # would replace the session shell: left alone
 ])
 def test_leaves_light_commands_alone(command):
     assert classify_command(command) is None
@@ -97,6 +99,18 @@ def test_routes_only_the_heavy_simple_command(helper):
     dispatcher, body = wrapped.split("\n", 1)
     assert dispatcher.startswith("_hermes_heavy_slot() {") and HELPER in dispatcher
     assert body == "cd repo && export X=1 && _hermes_heavy_slot 'hermes pytest' pytest -q tests; echo done"
+
+
+@pytest.mark.parametrize(("command", "expected"), [
+    ("env -u FOO PYTHONPATH=. timeout 600 pytest tests",
+     "_hermes_heavy_slot 'hermes pytest' env -u FOO PYTHONPATH=. timeout 600 pytest tests"),
+    ("FOO=1 nice -n 5 pytest", "FOO=1 _hermes_heavy_slot 'hermes pytest' nice -n 5 pytest"),
+    ("nohup pnpm test", "_hermes_heavy_slot 'hermes test' nohup pnpm test"),
+    ("time pytest tests", "time _hermes_heavy_slot 'hermes pytest' pytest tests"),
+])
+def test_exec_prefix_utilities_run_inside_the_dispatcher(helper, command, expected):
+    """env/nice/timeout/nohup exec their argument and cannot run a shell function."""
+    assert wrap_heavy_command(command, env_type="local").split("\n", 1)[1] == expected
 
 
 def test_routes_each_heavy_command_once(helper):
@@ -157,15 +171,17 @@ def test_dispatcher_leaves_shell_functions_and_aliases_to_the_shell(tmp_path, mo
     runner.write_text("#!/bin/sh\necho \"external $* held=$HEAVY_SLOT_HELD\"\n")
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
     command = wrap_heavy_command(
-        f"pytest -q 'a b' && FOO=1 tox -e x && {runner} run 'c d'", env_type="local")
+        f"pytest -q 'a b' && FOO=1 tox -e x && {runner} run 'c d' && env BAR=2 timeout 30 {runner} --all",
+        env_type="local")
     setup = ("pytest() { echo \"function $* FOO=$FOO\"; }\n"
              "tox() { echo \"tox-fn FOO=$FOO\"; }\n")
     if shell == "bash":
         setup = "shopt -s expand_aliases\n" + setup
     out = subprocess.run([shell, "-c", setup + command], capture_output=True, text=True, cwd=tmp_path)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.splitlines() == ["function -q a b FOO=", "tox-fn FOO=1", "external run c d held=1"]
-    assert (tmp_path / "helper.log").read_text().count("--label") == 1
+    assert out.stdout.splitlines() == [
+        "function -q a b FOO=", "tox-fn FOO=1", "external run c d held=1", "external --all held=1"]
+    assert (tmp_path / "helper.log").read_text().count("--label") == 2
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")
