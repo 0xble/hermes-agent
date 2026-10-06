@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -106,6 +106,19 @@ class TestFinalizeShutdownFlushesInflightTranscript:
         agent._flush_messages_to_session_db.assert_called_once_with(inflight)
         # Cleanup still happens after the flush.
         agent.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timed_out_agent_flushes_transcript_but_skips_blocking_finalize(self):
+        runner = _make_runner()
+        agent = _FakeAgent(session_messages=[{"role": "tool", "content": "partial"}])
+        runner._finalize_session_off_loop = AsyncMock()
+        runner._cleanup_agent_resources_off_loop = AsyncMock()
+
+        await runner._finalize_shutdown_agents({"session:interrupted": agent}, interrupted=True)
+
+        agent._flush_messages_to_session_db.assert_called_once_with(agent._session_messages)
+        runner._finalize_session_off_loop.assert_not_awaited()
+        runner._cleanup_agent_resources_off_loop.assert_not_awaited()
 
 
 # ─────────────────────────────────────────────────────────────────────────

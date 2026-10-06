@@ -89,3 +89,34 @@ async def test_post_interrupt_kill_preserves_phase_order(monkeypatch):
     probe = asyncio.Event()
     asyncio.get_running_loop().call_soon(probe.set)
     await asyncio.wait_for(probe.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_blocking_kill_sweep_is_detached_without_late_registry_cleanup(monkeypatch):
+    """A stuck kill worker cannot hold restart or mutate the registry after its deadline."""
+    events: list[tuple[str, float]] = []
+    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    import tools.process_registry as _pr
+
+    def _blocking_kill_all(**kwargs):
+        deadline = kwargs["deadline"]
+        stop_event = kwargs["stop_event"]
+        events.append(("kill_started", time.monotonic()))
+        # Model a kill_all implementation blocked in registry/systemd I/O. It is
+        # cooperative at the shutdown boundary, so no later target/checkpoint can run.
+        while time.monotonic() < deadline + 30:
+            if stop_event.is_set():
+                events.append(("kill_stopped", time.monotonic()))
+                return 0
+            time.sleep(0.01)
+        events.append(("late_kill", time.monotonic()))
+        return 0
+
+    monkeypatch.setattr(_pr.process_registry, "kill_all", _blocking_kill_all)
+    started = time.monotonic()
+    await runner._stop_kill_tool_subprocesses_off_loop("post-interrupt", timeout=0.1)
+    elapsed = time.monotonic() - started
+    await asyncio.sleep(0.05)  # let the detached worker observe stop_event
+
+    assert elapsed < 0.5
+    assert [name for name, _when in events] == ["kill_started", "kill_stopped"]

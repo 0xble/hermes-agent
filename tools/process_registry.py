@@ -591,6 +591,7 @@ class ProcessSession:
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_selectable: bool = field(default=False, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
+    _kill_deadline: Optional[float] = field(default=None, repr=False)
 
     def __post_init__(self):
         # A session built without an explicit owner is owned by its own task, so ownership checks compare
@@ -1707,13 +1708,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates.
         Returns True when this call is the one that persisted the session."""
+        persist = session._kill_deadline is None or time.monotonic() < session._kill_deadline
         with self._lock:
             was_running = session.id in self._running
             if was_running:
                 session.exited_at = time.time()
                 # Keep the session tracked until its result is durable. A finite
                 # parent must not observe completion and exit during this write.
-                save_completed_result(session)
+                if persist:
+                    save_completed_result(session)
                 self._running.pop(session.id)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
@@ -1726,7 +1729,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # that was just killed. poll()/wait()/read_log() serve from the
         # buffered ``output_buffer``, never from the pipe.
         self._release_finished_handles(session)
-        self._write_checkpoint()
+        if persist:
+            self._write_checkpoint()
         if was_running and session.notify_on_complete:
             notification = {
                 "type": "completion",
@@ -2241,6 +2245,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def kill_process(
         self, session_id: str, *, source: str = "process.kill", consume_output: bool = True,
+        deadline: Optional[float] = None,
     ) -> dict:
         """Kill a background process and return its output snapshot.
         ``consume_output`` is true for explicit tool/RPC kills (the caller sees the
@@ -2250,6 +2255,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        if deadline is not None and time.monotonic() >= deadline:
+            return {"status": "deadline", "session_id": session_id}
+        session._kill_deadline = deadline
         if session.exited:
             # A double-forked descendant may still be alive in the systemd scope even
             # though the main process exited — stop the scope to reap survivors.
@@ -2259,7 +2267,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
             # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
             # above already handled the main process; this catches stragglers.
-            if session.systemd_unit:
+            if session.systemd_unit and (deadline is None or time.monotonic() < deadline):
                 _stop_systemd_unit(session.systemd_unit)
             with session._lock:
                 result = self._exit_snapshot(session, "already_exited")
@@ -2274,7 +2282,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
-            if session.systemd_unit:
+            if session.systemd_unit and (deadline is None or time.monotonic() < deadline):
                 _stop_systemd_unit(session.systemd_unit)
             # Post-kill verification (#115490): the signals above can leave
             # survivors (SIGTERM-ignoring daemons, scope escapees). A kill that
@@ -2313,8 +2321,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # then persists this kill as a plain ``exited``. Re-write the receipt
             # so the durable record matches what the caller was told.
             if not self._move_to_finished(session):
-                save_completed_result(session)
-            self._write_checkpoint()
+                if deadline is None or time.monotonic() < deadline:
+                    save_completed_result(session)
             return {
                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, **output}
@@ -2591,7 +2599,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def kill_all(
         self, task_id: Optional[str] = None, *, exclude_ids: frozenset = frozenset(),
-        source: str = "kill_all", consume_output: bool = False) -> int:
+        source: str = "kill_all", consume_output: bool = False,
+        deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None) -> int:
         """Kill all running processes, optionally only those ``task_id`` spawned (its ``owner_task_id``).
         Returns count killed.
 
@@ -2609,10 +2618,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 and s.id not in exclude_ids and not s.exited
                 and not (lifecycle and s.persist_on_release)
             ]
-        return sum(
-            self.kill_process(s.id, source=source, consume_output=consume_output).get("status")
-            in {"killed", "already_exited"}
-            for s in targets)
+        killed = 0
+        for session in targets:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            kill_kwargs = {"source": source, "consume_output": consume_output}
+            if deadline is not None:
+                kill_kwargs["deadline"] = deadline
+            if stop_event is not None:
+                kill_kwargs["stop_event"] = stop_event
+            killed += self.kill_process(session.id, **kill_kwargs).get("status") in {"killed", "already_exited"}
+        return killed
 
     # ----- Cleanup / Pruning -----
 

@@ -108,6 +108,29 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
     ]
 
 
+def test_kill_all_deadline_stops_followup_targets_and_checkpoint_writes(registry):
+    first = _make_session(sid="proc_first")
+    second = _make_session(sid="proc_second")
+    registry._running[first.id] = first
+    registry._running[second.id] = second
+    calls = []
+
+    def fake_kill(session_id, **kwargs):
+        calls.append(session_id)
+        time.sleep(0.03)
+        return {"status": "killed"}
+
+    registry.kill_process = fake_kill
+    deadline = time.monotonic() + 0.01
+    assert registry.kill_all(deadline=deadline) == 1
+    assert calls == [first.id]
+
+    finished = _make_session(sid="proc_expired")
+    finished._kill_deadline = time.monotonic() - 1
+    registry._running[finished.id] = finished
+    with patch.object(registry, "_write_checkpoint") as checkpoint:
+        registry._move_to_finished(finished)
+    checkpoint.assert_not_called()
 
 
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:

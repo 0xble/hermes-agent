@@ -33,10 +33,12 @@ def _reset_cron_running_set():
     sched._running_job_ids.clear()
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
+    sched._restart_safe_waiter_job_ids.clear()
     yield
     sched._running_job_ids.clear()
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
+    sched._restart_safe_waiter_job_ids.clear()
 
 
 def _make_async_noop():
@@ -85,6 +87,7 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         runner, adapter = make_restart_runner()
         runner._restart_drain_timeout = 0.01  # force the timeout path
         runner._cron_drain_timeout = 0.01  # ...past the cron floor too (#82161)
+        runner._restart_shutdown_bound = lambda: 0.05
         adapter.disconnect = _make_async_noop()
 
         sched._running_job_ids.add(sched._inflight_key("job-1"))
@@ -92,7 +95,11 @@ class TestKillToolSubprocessesMarksCronInterrupted:
             object(): ("owner-1", sched._get_hermes_home().resolve())
         }
 
-        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
+        def _blocking_kill_all(task_id=None, **kwargs):
+            kwargs["stop_event"].wait(30)
+            return 1
+
+        monkeypatch.setattr(_pr.process_registry, "kill_all", _blocking_kill_all)
         monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
         monkeypatch.setattr(terminal_tool_lifecycle, "cleanup_all_environments", lambda: None)
         monkeypatch.setattr(bt_lifecycle, "cleanup_all_browsers", lambda: None)
@@ -113,3 +120,19 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
+
+
+def test_restart_safe_waiters_are_excluded_from_ids_and_details():
+    import cron.scheduler as sched
+
+    key = sched._inflight_key("restart-safe")
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+        sched._restart_safe_waiter_job_ids.add(key)
+    try:
+        assert sched.get_running_job_ids() == frozenset()
+        assert sched.get_running_job_details() == []
+    finally:
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+            sched._restart_safe_waiter_job_ids.discard(key)
