@@ -12,6 +12,7 @@ the new release was serving.
 from __future__ import annotations
 
 import plistlib
+import re
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,3 +63,32 @@ def test_supervision_window_outlasts_the_generated_throttle_interval(monkeypatch
 
     assert body["ThrottleInterval"] == gateway_launchd.LAUNCHD_THROTTLE_INTERVAL_S
     assert gateway_launchd.LAUNCHD_SUPERVISION_VERIFY_TIMEOUT > body["ThrottleInterval"]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("listing, matches", [
+    ('{\n\t"Label" = "ai.hermes.gateway";\n\t"LastExitStatus" = 256;\n\t"PID" = 21305;\n};\n', True),
+    ('{\n\t"Label" = "ai.hermes.gateway";\n\t"LastExitStatus" = 256;\n};\n', False),
+])
+def test_helper_supervision_probe_matches_real_launchctl_output(tmp_path, monkeypatch, listing, matches):
+    """The helper only stops retrying bootstrap once this probe sees a positive PID."""
+    real_run = subprocess.run
+    submitted = []
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 30.0)
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_log_path", lambda: tmp_path / "reload.log")
+    monkeypatch.setattr(gateway_launchd, "_forward_only_plist", lambda _: False)
+    monkeypatch.setattr(gateway_launchd, "_gw", lambda: SimpleNamespace(_append_launchd_reload_log=lambda *_: None))
+    monkeypatch.setattr(gateway_launchd.subprocess, "run",
+                        lambda args, **_: submitted.append(args) or subprocess.CompletedProcess(args, 0))
+    gateway_launchd._spawn_deferred_launchd_reload(
+        domain="gui/501", label="ai.hermes.gateway", target="gui/501/ai.hermes.gateway",
+        plist_path=tmp_path / "ai.hermes.gateway.plist", gateway_pid=4242,
+    )
+    probe = re.search(r"if (launchctl list .*?); then break", submitted[0][-1]).group(1)
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "launchctl").write_text(f"#!/bin/sh\ncat <<'OUT'\n{listing}OUT\n", encoding="utf-8")
+    (fake / "launchctl").chmod(0o755)
+    result = real_run(["/bin/bash", "-c", f"if {probe}; then echo MATCH; fi"],
+                            capture_output=True, text=True, env={"PATH": f"{fake}:/usr/bin:/bin"})
+    assert (result.stdout.strip() == "MATCH") is matches
