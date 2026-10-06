@@ -172,9 +172,13 @@ def _raw_process_event_session_id(evt: dict) -> str:
 class GatewayNotificationsMixin:
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
-    # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
-    _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
-    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[1:])
+    # Coalescing keys. Both partition by the spawning session (``parent_session_id``): a batch is
+    # formatted into one message before per-event /new boundary validation, so a held result from a
+    # closed session must never share a batch with its replacement's. Delegations also split the
+    # diagnostic task-failure lane. ``session_key`` stays first (``_release_held_completions``).
+    _COMPLETION_BATCH_KEY_FIELDS = (
+        "session_key", "parent_session_id", "platform", "chat_type", "chat_id", "thread_id", "user_id")
+    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[2:])
 
     # Fan-in for routine completion wakes (#70300). While a session is mid-turn or started a turn
     # within ``gateway.completion_notification_batch_window_seconds`` (default 300), a successful

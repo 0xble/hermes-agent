@@ -470,3 +470,24 @@ async def test_busy_turn_receipt_is_sent_while_the_wake_is_held(hermes_home, mon
     await asyncio.wait_for(task, timeout=2.0)
     adapter.handle_message.assert_awaited_once()
     assert len(sends) == 1
+
+
+@pytest.mark.asyncio
+async def test_held_completions_never_mix_across_a_new_session_boundary(hermes_home):
+    """After /new, a held result from the closed session must not ride the replacement's turn."""
+    runner, adapter = _fan_in_runner(window=0.4, last_turn_age=0.0)
+
+    async def _get_session(session_id):
+        return {"ended_at": 1.0, "end_reason": "new_session"} if session_id == "old" else {"ended_at": None}
+
+    runner._session_db = SimpleNamespace(get_session=_get_session)
+    old = {**_completion("proc_old", started_at=1.0), "parent_session_id": "old", "output": "OLD-SECRET\n"}
+    new = {**_completion("proc_new", started_at=2.0), "parent_session_id": "new"}
+    results = await asyncio.gather(
+        runner._enqueue_process_completion_notification("old text OLD-SECRET", old),
+        runner._enqueue_process_completion_notification("new text", new),
+    )
+    assert results == [None, True]
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    assert "OLD-SECRET" not in text and "proc_old" not in text
