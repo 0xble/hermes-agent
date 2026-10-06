@@ -117,18 +117,22 @@ standalone sender's bot. Each metered request (any non-`get*` endpoint carrying 
 the chat's next slot. Deliveries (sends, final and over-cap edits, overflow continuations,
 media, controls, deletions, topic edits, reactions) wait FIFO and are never dropped. Typing and
 drafts are shed when no slot is free. Interim edits are skipped by the adapter inside the
-3.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
+10.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
 never eats a transport deadline. A request inside a durably recorded server penalty is refused
 locally with `RetryAfter` for every path. Any published `retry_after` widens that chat's gap
 2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
 floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
-`TurnRunner._PROGRESS_EDIT_INTERVAL` is 3.0s, the transport edit floor.
+`TelegramAdapter.PROGRESS_EDIT_INTERVAL` is 10.0s, the transport edit floor, and
+`TurnRunner._progress_edit_interval` uses it for Telegram progress bubbles. Other platforms keep
+the runner default (`TurnRunner._PROGRESS_EDIT_INTERVAL`, 3.0s). Telegram used 3.0s until
+2026-10-06, when the daily call counter showed progress-bubble edits were the largest share of
+typed-turn calls on a chat that hit a daily volume ban; Brian approved slower bubble updates.
 
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |
 | All metered calls to one chat (one shared slot) | 45/min (1.33s gap) | 15/min (4.0s gap) |
 | of which typing, at most | 15/min (4.0s) | 5/min (12.0s) |
-| of which interim edits and drafts, at most | 20/min (3.0s) | 15/min (4.0s) |
+| of which interim edits and drafts, at most | 6/min (10.0s) | 6/min (10.0s) |
 | After a published `retry_after` (10 min) | 22.5/min | 7.5/min |
 | Ceiling (community envelope) | ~60/min | ~20/min |
 
@@ -139,7 +143,7 @@ which the standalone lane now honours, so cron's standalone fallback can no long
 requests or sleep for hours inside a ban. Reads (`get*`) and chat-less calls such as
 `answerCallbackQuery` are unmetered. Visible effect: with many topics active at once, typing
 indicators refresh chat-wide at most every 4s, so not every topic shows "typing" continuously,
-and progress bubbles update at most every 3s.
+and progress bubbles update at most every 10s.
 
 **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
 pins the summed per-chat rate against each class ceiling with every path saturated at once,
