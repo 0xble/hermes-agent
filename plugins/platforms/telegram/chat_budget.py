@@ -17,7 +17,7 @@ private   ~60          45/min   1.33s       4.0s (<=15/min of the 45)
 group     ~20          15/min   4.0s        12.0s (<=5/min of the 15)
 ========  ===========  =======  ==========  ===========================
 
-Interim edits and drafts are additionally floored at ``EDIT_FLOOR_SECS`` (3.0s) per chat.
+Interim edits and drafts are additionally floored at ``EDIT_FLOOR_SECS`` (10.0s) per chat.
 Every metered call takes the same slot, so the per-chat SUM across all paths is bounded by
 ``60 / base_gap`` per minute, 75% of the class ceiling. A published ``retry_after`` widens
 that chat's gap by ``PENALTY_FACTOR`` for ``PENALTY_WINDOW_SECS``, then expires on its own.
@@ -56,7 +56,9 @@ PRIVATE_TYPING_GAP_SECS = 4.0
 GROUP_TYPING_GAP_SECS = 12.0
 # An interim edit or draft carries only the latest state, so spacing it costs a reader nothing:
 # superseded previews never fire faster than this per chat. Progress producers are tuned to it.
-EDIT_FLOOR_SECS = 3.0
+# 10s (was 3s, 2026-10-06): progress-bubble edits were the largest share of typed-turn calls on a
+# chat that hit Telegram's daily volume ban; Brian approved fewer bubble updates to cut them.
+EDIT_FLOOR_SECS = 10.0
 PENALTY_FACTOR = 2.0
 PENALTY_WINDOW_SECS = 600.0
 
