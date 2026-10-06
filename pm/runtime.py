@@ -134,11 +134,13 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
     from pm.filesystem import lock_fd
     from pm.lock import _write
     from pm.runtime_stage import stage_runtime
+    from pm.environments import record_install_use
 
     project = project or Path(__file__).resolve().parent
     identity = _inputs(project, python)
     env = runtime_environment()
     root.mkdir(parents=True, exist_ok=True)
+    record_install_use(project)
     with (root / ".prepare.lock").open("a+b") as lock:
         lock_fd(lock.fileno(), wait=True)
         selected = root / "selected.json"

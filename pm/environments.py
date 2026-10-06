@@ -46,8 +46,35 @@ def install_state_permission_message(project_root: Path, exc: PermissionError) -
             "run as the install owner or grant write access")
 
 
+INSTALL_METADATA_FILENAME = "install.json"
+INSTALL_METADATA_SCHEMA = 1
+
+
 def runtime_facts_path(project_root: Path) -> Path:
     return install_state_dir(project_root) / "facts.json"
+
+
+def install_metadata_path(project_root: Path) -> Path:
+    return install_state_dir(project_root) / INSTALL_METADATA_FILENAME
+
+
+def record_install_use(project_root: Path) -> Path:
+    """Record the canonical checkout for this install and refresh its last-use time.
+
+    Callers hold the per-install lock while provisioning or selecting an environment.
+    The small sidecar keeps orphan collection independent from the package facts schema,
+    whose read-modify-write paths must remain compatible with shipped payloads.
+    """
+    root = Path(project_root).resolve()
+    path = install_metadata_path(root)
+    from pm.filesystem import durable_write_bytes
+
+    durable_write_bytes(
+        path,
+        (json.dumps({"schema": INSTALL_METADATA_SCHEMA, "project_root": str(root)},
+                    sort_keys=True) + "\n").encode("utf-8"),
+    )
+    return path
 
 
 # The files that decide the dependency set. `scripts/_hermes-python` re-activates
@@ -318,6 +345,7 @@ def activate_dependencies(project_root: Path) -> None:
         # than leaving the backend unbound (see runtime_lock).
         with runtime_lock(project_root) as held:
             if held:
+                record_install_use(project_root)
                 recover_publication(project_root)
             environment = committed_venv(project_root)
             if environment is None:
