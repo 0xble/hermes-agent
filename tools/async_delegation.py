@@ -43,6 +43,16 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
+# Rows delegation_resume would still accept for an explicit resume (owner present,
+# not yet claimed). Pruning skips them inside the retention window, so a restart
+# can't make an interrupted child unrecoverable. Keep in step with
+# delegation_resume._eligibility's state and owner checks. One ? is the cutoff.
+_RESUMABLE_RETENTION_SQL = """(
+    state IN ('unknown','interrupted','stalled')
+    AND resume_state='none'
+    AND (COALESCE(parent_session_id, '') != '' OR COALESCE(origin_session_id, '') != '')
+    AND updated_at >= ?
+)"""
 # Cap retried deliveries so an unroutable row converges to terminal 'dropped'.
 _MAX_DELIVERY_ATTEMPTS = 8
 # Pending completions older than this are dropped on restart replay instead of
@@ -180,7 +190,11 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history without deleting rows still eligible for recovery."""
+    """Bound terminal history without deleting rows still eligible for recovery.
+
+    Delivered rows go first, then unsuccessful ones; an undelivered (pending)
+    completion is the parent's only copy of a child result, so it goes last.
+    """
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -188,30 +202,20 @@ def _prune_durable_records() -> None:
         terminal_count = conn.execute(
             "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
-            conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
+            conn.execute(f"""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                       AND NOT (
-                           state IN ('unknown','interrupted','stalled')
-                           AND resume_state='none'
-                           AND parent_session_id IS NOT NULL AND parent_session_id != ''
-                           AND updated_at >= ?
-                       )
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 1 ELSE 0 END,
+                       AND NOT {_RESUMABLE_RETENTION_SQL}
+                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (cutoff, terminal_count - _MAX_RETAINED_COMPLETED))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
-            conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
+            conn.execute(f"""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                       AND NOT (
-                           state IN ('unknown','interrupted','stalled')
-                           AND resume_state='none'
-                           AND parent_session_id IS NOT NULL AND parent_session_id != ''
-                           AND updated_at >= ?
-                       )
+                       AND NOT {_RESUMABLE_RETENTION_SQL}
                      ORDER BY updated_at ASC LIMIT ?
                    )""", (cutoff, pending_count - _MAX_DURABLE_PENDING))
 

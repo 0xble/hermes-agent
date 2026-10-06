@@ -107,6 +107,59 @@ def test_pruning_preserves_delivered_interrupted_delegation_for_resume(monkeypat
     assert record["state"] == "interrupted"
 
 
+def test_pruning_deletes_delivered_rows_before_an_undelivered_completion(monkeypatch):
+    """A pending completion is the parent's only copy of a child result: delivered
+    audit rows must be pruned first, never the undelivered one."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 3)
+    base = time.time() - 120.0
+    delivered = []
+    for index in range(3):
+        did = _dispatch_row(f"deleg_prune_delivered_{index}")
+        _mark(did, "completed")
+        delivered.append(did)
+    pending = _dispatch_row("deleg_prune_pending")
+    _mark(pending, "completed")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        for offset, did in enumerate(delivered):
+            conn.execute(
+                "UPDATE async_delegations SET delivery_state='delivered', updated_at=? WHERE delegation_id=?",
+                (base + offset, did),
+            )
+        # Oldest of all, so an updated_at-first ordering would delete it.
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='pending', updated_at=? WHERE delegation_id=?",
+            (base - 60.0, pending),
+        )
+
+    _dispatch_row("deleg_prune_trigger")
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        remaining = {row[0] for row in conn.execute("SELECT delegation_id FROM async_delegations")}
+    assert pending in remaining
+    assert delivered[0] not in remaining
+
+
+def test_pruning_preserves_origin_only_interrupted_delegation_for_resume(monkeypatch):
+    """Retention matches explicit-resume eligibility: an origin session alone owns it."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
+    resumable = _dispatch_row("deleg_prune_origin_only")
+    _mark(resumable, "interrupted")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET parent_session_id=NULL, origin_session_id='origin-1', "
+            "delivery_state='delivered', updated_at=? WHERE delegation_id=?",
+            (time.time() - 60.0, resumable),
+        )
+    filler = _dispatch_row("deleg_prune_origin_filler")
+    _mark(filler, "completed")
+
+    _dispatch_row("deleg_prune_origin_trigger")
+
+    record, reason = dr.inspect_resumable(resumable)
+    assert reason is None
+    assert record["state"] == "interrupted"
+
+
 # ---------------------------------------------------------------------------
 # Eligibility
 # ---------------------------------------------------------------------------

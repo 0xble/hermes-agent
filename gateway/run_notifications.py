@@ -2266,9 +2266,9 @@ class GatewayNotificationsMixin:
                 # already owning/finishing the boot notice.
                 return True
             claim_id = str(record.get("auto_resume_claim") or "")
-            # The row may have been pruned or explicitly resumed after the boot
-            # candidate was queued/claimed. Re-check immediately before injection;
-            # a stale notice must be consumed without reaching the parent turn.
+            # Cheap guard for a row resumed or pruned between the claim above and
+            # injection. It narrows that window but cannot close it; a notice that
+            # still slips through is refused safely by claim_resume.
             _, eligibility_reason = inspect_resumable(str(evt.get("delegation_id") or ""))
             if eligibility_reason is not None:
                 release_auto_resume_trigger(str(evt.get("delegation_id") or ""), claim_id)
