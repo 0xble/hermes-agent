@@ -17,7 +17,7 @@ from typing import Any, Optional
 from hermes_bootstrap import _happy_eyeballs_create_connection
 from utils import base_url_hostname, normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy
-from agent.thread_scoped_output import delegate_getattr, is_stdio_wrapper, resolve_stdio, stdio_install_lock
+from agent.thread_scoped_output import adopt_routing_proxy, delegate_getattr, resolve_stdio, stdio_install_lock
 
 
 _OPENAI_CLS_CACHE = None
@@ -334,25 +334,26 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
 def _install_safe_stdio() -> None:
     """Wrap stdout/stderr so best-effort console output cannot crash the agent.
 
-    Runs on every agent build and every turn, so it must be idempotent over the whole wrapper
-    chain. Any Hermes wrapper already on top (``_SafeWriter`` or the thread-scoped routing
-    proxy, which guards its own writes) is left alone: wrapping the proxy again hid it from
-    ``_ensure_installed``, which then stacked a new proxy generation per agent build until
-    attribute lookup through the chain hit the recursion limit. A chain that never reaches a
-    real stream is replaced with the interpreter's original stream.
+    Runs on every agent build and every turn, so it must keep the stream at one Hermes layer.
+    A thread-scoped routing proxy anywhere in the chain is put back on top unwrapped (it guards
+    its own writes): wrapping it hid it from ``_ensure_installed``, which then stacked a new
+    proxy generation per agent build until lookups through the chain hit the recursion limit.
+    Otherwise the stream becomes one ``_SafeWriter`` over the resolved real stream, falling back
+    to the interpreter's original stream when the chain never reaches one.
     """
     with stdio_install_lock:
         for stream_name in ("stdout", "stderr"):
             stream = getattr(sys, stream_name, None)
-            if stream is None:
+            if stream is None or adopt_routing_proxy(stream_name, stream) is not None:
                 continue
-            if resolve_stdio(stream) is None:
+            real = resolve_stdio(stream)
+            if real is None:
                 real = getattr(sys, f"__{stream_name}__", None)
-                if real is not None:
-                    setattr(sys, stream_name, _SafeWriter(real))
+                if real is None:
+                    continue
+            if isinstance(stream, _SafeWriter) and object.__getattribute__(stream, "_inner") is real:
                 continue
-            if not is_stdio_wrapper(stream):
-                setattr(sys, stream_name, _SafeWriter(stream))
+            setattr(sys, stream_name, _SafeWriter(real))
 
 
 # Drop-in for ``openai.OpenAI``.

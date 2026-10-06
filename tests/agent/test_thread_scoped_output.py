@@ -250,3 +250,45 @@ def test_a_wrapper_cycle_fails_attribute_lookup_cleanly_and_is_repaired_on_insta
         for sink in thread_output._sinks.values():
             sink.close()
         sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
+def _legacy_chain(real, depth):
+    """Alternating proxy/_SafeWriter layers as a long-running gateway accumulated them before the
+    fix: built without the constructors, which now refuse to wrap another wrapper."""
+    from agent.process_bootstrap import _SafeWriter
+
+    state = thread_output._RoutingState(io.StringIO())
+    stream = real
+    for _ in range(depth):
+        proxy = object.__new__(thread_output._ThreadRoutingStream)
+        proxy.__dict__.update(_passthrough=stream, _state=state)
+        writer = object.__new__(_SafeWriter)
+        object.__setattr__(writer, "_inner", proxy)
+        stream = writer
+    return stream
+
+
+@pytest.mark.parametrize("installer", ["agent_build", "silence"])
+def test_an_existing_long_chain_collapses_on_the_next_install(monkeypatch, installer):
+    """A process that already holds a chain deeper than the recursion limit must be repaired by
+    the next install, not just stop growing: writes through it recursed and were silently lost."""
+    from agent.process_bootstrap import _install_safe_stdio
+
+    _isolate_routing_state(monkeypatch)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    real = io.StringIO()
+    try:
+        sys.stdout = _legacy_chain(real, sys.getrecursionlimit())
+        if installer == "agent_build":
+            _install_safe_stdio()
+        else:
+            with thread_scoped_silence():
+                pass
+
+        assert _chain_length(sys.stdout) <= 1
+        print("after-repair")
+        assert real.getvalue() == "after-repair\n"
+    finally:
+        for sink in thread_output._sinks.values():
+            sink.close()
+        sys.stdout, sys.stderr = original_stdout, original_stderr

@@ -11,11 +11,13 @@ the process.
 - Hermes stdio wrappers expose `_hermes_stdio_next` and resolve attributes with
   `delegate_getattr`, which walks the chain iteratively with a seen set. A deep or cyclic chain
   raises `AttributeError`, never `RecursionError`.
-- `_install_safe_stdio` leaves any Hermes wrapper on top alone (the routing proxy guards its own
-  writes). It replaces a chain that never reaches a real stream with `sys.__stdout__`/`__stderr__`.
-- `_ensure_installed` adopts a routing proxy found anywhere in the current chain and puts it back
-  on top, instead of installing a new generation over it. New proxies and `_SafeWriter`s bind the
-  resolved real stream, never another wrapper of the same kind.
+- Both installers collapse the current chain through `adopt_routing_proxy`: a routing proxy found
+  anywhere in it goes back on top unwrapped (it guards its own writes), with its passthrough
+  rebound to the resolved real stream. Without a proxy, `_install_safe_stdio` leaves exactly one
+  `_SafeWriter` over the real stream, falling back to `sys.__stdout__`/`__stderr__` when the chain
+  never reaches one. An existing long or cyclic chain is repaired, not just kept from growing.
+- New proxies and `_SafeWriter`s bind the resolved real stream, never another wrapper. A proxy
+  resolves its chain through its thread-independent passthrough, never a silenced thread's sink.
 - Both installers hold `thread_scoped_output.stdio_install_lock`.
 
 ## 2026-10-05 Incident
@@ -45,12 +47,14 @@ tests/agent/test_run_agent.py -k "thread_scoped or SafeWriter or cycle"`. It cov
 
 - 1000 interleaved agent-build and silence cycles keeping the chain at two layers or fewer, with
   `line_buffering` still resolving and output still reaching the real stream;
+- an existing alternating chain deeper than the recursion limit collapsing to one layer on the
+  next agent build or silence install, with output arriving;
 - a constructed `_ThreadRoutingStream` ↔ `_SafeWriter` cycle raising `AttributeError` and being
   unwrapped to the real stream by the next install;
 - a real `AIAgent` build and `run_conversation` turn succeeding with that cycle installed as
   `sys.stdout`.
 
-All three fail on the base with `RecursionError`.
+All of them fail on the base with `RecursionError`.
 
 **Retire when:** upstream ships a release where repeated `_install_safe_stdio` plus
 `thread_scoped_silence` keeps the chain bounded and stdio `__getattr__` cannot recurse unboundedly.

@@ -16,7 +16,7 @@ import threading
 from typing import Any, Iterator, TextIO
 
 __all__ = [
-    "thread_scoped_silence", "delegate_getattr", "is_stdio_wrapper", "resolve_stdio", "stdio_chain", "stdio_install_lock",
+    "thread_scoped_silence", "adopt_routing_proxy", "delegate_getattr", "is_stdio_wrapper", "resolve_stdio", "stdio_chain", "stdio_install_lock",
 ]
 
 _install_lock = threading.Lock()
@@ -140,31 +140,47 @@ class _ThreadRoutingStream:
         return self._target().fileno()
 
     def _hermes_stdio_next(self):  # type: ignore[no-untyped-def]
-        try:
-            return self._target()
-        except AttributeError:
-            return None
+        # The thread-independent stream underneath, never the calling thread's sink, so chain
+        # resolution from a silenced thread cannot bind devnull as a passthrough.
+        return self.__dict__.get("_passthrough")
 
     def __getattr__(self, name):  # type: ignore[no-untyped-def]
-        return delegate_getattr(self, name, ("_passthrough", "_state"))
+        if name in ("_passthrough", "_state"):
+            raise AttributeError(name)
+        state = self.__dict__.get("_state")
+        if state is not None and state.silenced.get(threading.get_ident(), 0) > 0:
+            return getattr(state.sink, name)
+        return delegate_getattr(self, name, ())
+
+
+def adopt_routing_proxy(attr: str, current: object, fallback: object = None) -> "_ThreadRoutingStream | None":
+    """Collapse ``current``'s chain onto the routing proxy in it, if any, and return that proxy.
+
+    The proxy goes back on top as ``sys.<attr>`` and its passthrough is rebound to the resolved
+    real stream, so a long chain left by earlier generations (or a cycle) shrinks to one layer.
+    Callers hold ``stdio_install_lock``.
+    """
+    for layer in stdio_chain(current):
+        if isinstance(layer, _ThreadRoutingStream):
+            real = resolve_stdio(layer.__dict__.get("_passthrough"))
+            layer._passthrough = real if real is not None else _real_stream(attr, fallback)
+            if current is not layer:
+                setattr(sys, attr, layer)  # the proxy guards its own writes; drop wrappers above it
+            _installed[attr] = layer
+            _routing_states[attr] = layer._state
+            return layer
+    return None
 
 
 def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
     """Install (idempotently) a routing proxy as ``sys.<attr>`` and return it."""
     with _install_lock:
         current = getattr(sys, attr, None)
-        # Adopt a live proxy anywhere in the current chain, e.g. one an agent build wrapped in a
-        # ``_SafeWriter``, or one a redirect context restored. Installing over it instead would
-        # stack a new generation per call until attribute lookup exceeds the recursion limit.
-        for layer in stdio_chain(current):
-            if isinstance(layer, _ThreadRoutingStream):
-                if resolve_stdio(layer._passthrough) is None:
-                    layer._passthrough = _real_stream(attr, passthrough)  # never route into a cycle
-                if current is not layer:
-                    setattr(sys, attr, layer)  # the proxy guards its own writes; drop wrappers above it
-                _installed[attr] = layer
-                _routing_states[attr] = layer._state
-                return layer
+        # Adopting a proxy already in the chain (one an agent build wrapped, or a redirect
+        # restored) instead of installing over it keeps the chain from growing per call.
+        adopted = adopt_routing_proxy(attr, current, passthrough)
+        if adopted is not None:
+            return adopted
         # Route non-silenced threads to whatever is currently bound (an active global redirect
         # keeps its old behavior), unwrapped to the real stream.
         passthrough = _real_stream(attr, current if current is not None else passthrough)
