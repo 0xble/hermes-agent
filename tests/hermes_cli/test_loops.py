@@ -24,10 +24,16 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     from hermes_cli import goals
+    from hermes_state_registry import close_all_under
 
+    # These tests own fresh temporary DB files, never live process-held generations.
+    # Enumerating every host FD on each open/close dominates the loop tests on macOS;
+    # native retired-WAL detection is exercised by the hermes_state tests instead.
+    monkeypatch.setattr("hermes_state_dbfile._iter_darwin_fd_targets", lambda: iter(()))
     goals._DB_CACHE.clear()
     yield home
     goals._DB_CACHE.clear()
+    close_all_under(home)
 
 
 # ──────────────────────────────────────────────────────────────────────

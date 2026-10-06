@@ -7,6 +7,7 @@ and backward compatibility with the legacy ``allow_*`` gates.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,25 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
     return tmp_path
+
+
+def test_default_capability_denial_is_debug_but_grants_remain_info(hermes_home, caplog):
+    """Expected ungranted defaults are quiet; meaningful authorization remains visible."""
+    logger_name = "hermes_cli.plugin_capabilities"
+    caplog.set_level(logging.DEBUG, logger=logger_name)
+
+    assert plugin_capability_granted("quiet-plugin", "tools.override") is False
+    [denial] = [r for r in caplog.records if r.name == logger_name]
+    assert denial.levelno == logging.DEBUG
+    assert "decision=deny" in denial.getMessage()
+
+    caplog.clear()
+    record_consent("quiet-plugin", ["tools.override"], ["tools.override"])
+    caplog.clear()
+    assert plugin_capability_granted("quiet-plugin", "tools.override") is True
+    [grant] = [r for r in caplog.records if r.name == logger_name]
+    assert grant.levelno == logging.INFO
+    assert "decision=allow" in grant.getMessage()
 
 
 def _read_cfg(home):
