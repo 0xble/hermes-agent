@@ -6674,7 +6674,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("[%s] Telegram flood deadline has no durable copy for chat %s", self.name, key, exc_info=True)
         platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
         platform[key] = max(platform.get(key, 0.0), until[key])
-        return _flood_cap_result(max(wait, until[key] - now))
+        remaining = max(wait, until[key] - now)
+        # Keep the typed contract stable when the deadline was created from this same wait: subtracting
+        # two monotonic timestamps can otherwise turn an exact 30.0-second refusal into 30.0000000000057.
+        if math.isclose(remaining, wait, rel_tol=0.0, abs_tol=1e-6):
+            remaining = wait
+        return _flood_cap_result(remaining)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
         """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
