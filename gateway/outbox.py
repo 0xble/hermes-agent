@@ -882,7 +882,9 @@ class Outbox:
             return [dict(r) for r in db.execute(
                 "SELECT turn_id, sequence, type, idempotency_key, state, created_at, "
                 "retry_at, attempts, send_status, edit_status FROM outbox "
+                # Legacy databases may still contain synthetic continuation rows.
                 "WHERE state IN ('sending','ambiguous','expired_ambiguous','pending','failed_unsent') "
+                "AND COALESCE(send_status, '') != 'synthetic' "
                 "ORDER BY created_at DESC")]
 
     def begin_send(self, row: OutboxRow) -> bool:

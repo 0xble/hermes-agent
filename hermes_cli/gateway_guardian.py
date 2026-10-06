@@ -138,9 +138,18 @@ def healthy(home: Path, label: str, expected: Path) -> bool:
         return False
 
 
-def _launch_state(domain: str, label: str) -> str:
+def _bounded_timeout(requested: float, deadline: float | None) -> float:
+    if deadline is None:
+        return requested
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("guardian overall deadline expired")
+    return max(0.01, min(requested, remaining))
+
+
+def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> str:
     result = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
-                            capture_output=True, text=True, encoding="utf-8", timeout=5)
+                            capture_output=True, text=True, encoding="utf-8", timeout=_bounded_timeout(5, deadline))
     if result.returncode == 0:
         return "loaded"
     if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
@@ -148,7 +157,8 @@ def _launch_state(domain: str, label: str) -> str:
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 
 
-def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None) -> bool:
+def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: str | None = None,
+                    deadline: float | None = None) -> bool:
     """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
     from hermes_cli import gateway
     from hermes_cli.immutable_releases import wait_for_release_acknowledgement
@@ -170,20 +180,21 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
         old_pid = _launchctl_supervised_pid(label)
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=15)
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
+                       timeout=_bounded_timeout(15, deadline))
         if old_pid is not None:
             try:
-                psutil.Process(old_pid).wait(timeout=30)
+                psutil.Process(old_pid).wait(timeout=_bounded_timeout(30, deadline))
             except psutil.NoSuchProcess:
                 pass
-        _launchctl_bootstrap(domain, plist, label, timeout=30)
+        _launchctl_bootstrap(domain, plist, label, timeout=max(1, int(_bounded_timeout(30, deadline))))
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
     if result.get("reload_pending"):
         # The S2 acknowledgement may arrive after this one-shot invocation; live
         # process identity below is the independent health proof for this action.
-        wait_for_release_acknowledgement(home, timeout_seconds=5)
-    deadline = time.monotonic() + 12
+        wait_for_release_acknowledgement(home, timeout_seconds=_bounded_timeout(5, deadline))
+    deadline = deadline or time.monotonic() + 12
     while time.monotonic() < deadline:
         if healthy(home, label, old):
             return True
@@ -191,7 +202,8 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
-def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None) -> str:
+def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
+         deadline: float | None = None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
     if intent_path(home).exists():
         return "stopped"
@@ -216,7 +228,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     if switch_state == "waiting":
         return "waiting"
     domain = _gateway_domain(label, domain)
-    state = _launch_state(domain, label)
+    state = _launch_state(domain, label, deadline=deadline)
     if state == "loaded" and healthy(home, label, current):
         pending = home / "release-txn.json"
         if pending.exists():
@@ -237,7 +249,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             receipt(home, "rollback", "capped", candidate=str(current))
             return "capped"
         receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
-        ok = rollback_switch(home, plist, label, old, domain=domain)
+        ok = rollback_switch(home, plist, label, old, domain=domain, deadline=deadline)
         receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
         return "rolled_back" if ok else "failed"
     if state == "loaded":
@@ -246,10 +258,11 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         receipt(home, "bootstrap", "capped", label=label)
         return "capped"
     receipt(home, "bootstrap", "attempt", label=label)
-    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, timeout=10)
-    deadline = time.monotonic() + 12
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True,
+                   timeout=_bounded_timeout(10, deadline))
+    deadline = deadline or time.monotonic() + 12
     while time.monotonic() < deadline:
-        if _launch_state(domain, label) == "loaded" and healthy(home, label, current):
+        if _launch_state(domain, label, deadline=deadline) == "loaded" and healthy(home, label, current):
             receipt(home, "bootstrap", "repaired", label=label, release=str(current))
             return "repaired"
         time.sleep(.25)
@@ -282,6 +295,11 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         except BlockingIOError:
             return "locked"
         try:
+            # Stopped intent is authoritative and must short-circuit config loading: a
+            # deliberately parked gateway stays parked even if config is now malformed.
+            if intent_path(home).exists():
+                return "stopped"
+            deadline = time.monotonic() + 30.0
             from hermes_cli.config import _validate_updates
             if grace is None:
                 from hermes_cli.config_effective import load_user_config_effective
@@ -301,7 +319,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 grace = (config.get("updates") or {}).get(
                     "release_acknowledgement_timeout_seconds", 180.0)
             assert grace is not None
-            return _run(home, Path(plist), label, grace=float(grace), domain=domain)
+            return _run(home, Path(plist), label, grace=float(grace), domain=domain, deadline=deadline)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, yaml.YAMLError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"

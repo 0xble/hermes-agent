@@ -123,6 +123,16 @@ def test_stop_marker_never_fights_unloaded_service(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("macos")
+def test_stop_intent_short_circuits_malformed_config(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    guardian.set_intent(home, stopped=True)
+    (home / "config.yaml").write_text("updates: [unclosed\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective",
+                        lambda *args, **kwargs: pytest.fail("stopped intent loaded config"))
+    assert guardian.run_once(home, plist, label) == "stopped"
+
+
+@pytest.mark.platforms("macos")
 def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)

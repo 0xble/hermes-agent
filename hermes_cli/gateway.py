@@ -5523,7 +5523,18 @@ def _print_unfolded_gateway_note(owner) -> None:
     print("  They were left running; fold them in with: hermes gateway migrate --multiplex")
 
 
+def _refuse_forward_only_leftovers() -> None:
+    """Block legacy gateway lifecycle actions until withdrawn handover state is inspected."""
+    from hermes_cli.forward_only_guard import refuse_if_forward_only_leftovers
+    try:
+        refuse_if_forward_only_leftovers(get_hermes_home())
+    except RuntimeError as exc:
+        print_error(str(exc))
+        raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE) from exc
+
+
 def _cmd_start(args):
+    _refuse_forward_only_leftovers()
     from hermes_cli.gateway_profile_lifecycle import host_scope_for_all_verb, profile_lifecycle
     if profile_lifecycle("start", args):
         return
@@ -5707,6 +5718,7 @@ def _restart_all_as_host(owner, system: bool) -> None:
 
 
 def _cmd_restart(args):
+    _refuse_forward_only_leftovers()
     _refuse_from_inside_gateway("restart", "restart loops")
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):

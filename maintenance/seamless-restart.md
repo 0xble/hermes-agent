@@ -65,6 +65,8 @@ The legacy single-gateway launchd `KeepAlive` path is canonical. Restarts remain
 
 The former overlap design, generation coordinator, polling transfer, owned routing/admission, startup gate, and forward-only updater are withdrawn rather than partially supported. The shipped Phase 0, S1–S3, durable outbox, immutable-release, and G1 guardian behavior remains subject to the legacy single-gateway path.
 
+The Telegram review findings about losing the durable `getUpdates` journal and releasing the token lock before `updater.stop()` apply only to the flag-on controlled poller. That poller created `_controlled_journal` and used token-lock fencing only when `overlap_handover_enabled(...)` was true. With the flag off—the shipped default—the legacy PTB updater path is unchanged: its offset-confirmation window is pre-existing upstream behavior, and the legacy updater releases the token lock early for bounded teardown. No live legacy-path behavior was removed here.
+
 ### Leftovers after withdrawal
 
 Profiles where forward-only handover ran may retain `gateway-coordinator.db`, `ai.hermes.gateway.g-<uuid>` LaunchAgents/labels, `forward-update.json`, `gateway_runtime.<gen>.json`, and per-PID heartbeat files. Check for generation labels manually with:

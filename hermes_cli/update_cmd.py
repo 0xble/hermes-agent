@@ -30,6 +30,9 @@ from hermes_cli import update_receipt as _completion_receipt, update_cmd_config 
 from hermes_cli._old_updater import stop_for_relaunch
 from hermes_cli._early_recovery import git_operation_in_progress, interrupted_pull_marker
 from hermes_cli import update_cmd_check as _check
+from hermes_cli.forward_only_guard import (  # noqa: F401
+    leftover_forward_only_state, refuse_if_forward_only_leftovers,
+)
 
 # Re-exports: every split-module name stays reachable (and monkeypatchable) as update_cmd.<name>.
 from hermes_cli.update_abort_recovery import (  # noqa: F401
@@ -273,6 +276,14 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
     if not _immutable_release_enabled(paths):
         _record_update_step("immutable_release", True, "skipped: release layout not opted in")
         return True
+    # The overlap/forward-only handover was withdrawn. Refuse to activate an immutable
+    # release while its launchd label or durable intent can still own traffic.
+    try:
+        refuse_if_forward_only_leftovers(home)
+    except Exception as exc:
+        _record_update_step("immutable_release", False, str(exc))
+        logger.error("Immutable release activation refused: %s", exc)
+        return False
     source = source or _m().PROJECT_ROOT
     try:
         sha = sha or release_sha(source)
