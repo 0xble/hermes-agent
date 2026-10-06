@@ -758,7 +758,7 @@ gateway:
     paused: "⏸️ Szüneteltetve{suffix}. Az új cron-/kanban-/átjárómunka várakozik; a folyamatban lévő munka rendesen befejeződik. Folytatás: `/pause off`."
   queue:
     usage: "Használat: /queue <prompt>"
-    queued: "Sorba állítva a következő körre."
+    queued: "⏳ Sorba állítva a következő körre."
     queued_depth: " ({depth} a sorban)"
   steer:
     usage: "Használat: /steer <prompt>"
