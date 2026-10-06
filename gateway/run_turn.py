@@ -1526,6 +1526,12 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
+        # Webhook delivery is an autonomous lane with a looser first/last-line silence rule;
+        # leave its marker semantics unchanged. Interactive replies drop a trailing standalone
+        # marker from substantive text before the silence verdict, so a marker-only run that
+        # collapses to one marker still goes through the silence guard below.
+        if source.platform != Platform.WEBHOOK:
+            response = strip_trailing_silence_marker(response)
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
@@ -1544,12 +1550,6 @@ class GatewayTurnMixin:
                 "silence marker suppressed on an unaddressed turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
             )
-
-        # Webhook delivery is an autonomous lane with a looser first/last-line silence rule;
-        # leave its marker semantics unchanged. Interactive gateway replies strip only a trailing
-        # standalone marker from otherwise substantive text.
-        if not _intentional_silence and source.platform != Platform.WEBHOOK:
-            response = strip_trailing_silence_marker(response)
 
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user

@@ -123,11 +123,13 @@ def _fenced_line_states(lines: list[str]) -> list[bool]:
 
 
 def strip_trailing_silence_marker(text: Any) -> Any:
-    """Remove top-level standalone silence-marker lines from substantive text.
+    """Remove the run of top-level standalone silence-marker lines ending substantive text.
 
-    The exact interactive silence rule remains authoritative for a bare marker,
-    so an all-marker response is returned unchanged for the existing suppression
-    path. Marker-looking lines inside fenced code are content, not control text.
+    One or more consecutive trailing marker lines are removed. The exact interactive
+    silence rule remains authoritative for a bare marker, so a bare marker is returned
+    unchanged, and a response made only of marker lines collapses to its last marker so
+    it still reaches the intentional-silence path rather than the empty-response one.
+    Marker-looking lines inside fenced code are content, not control text.
     """
     if not isinstance(text, str) or is_intentional_silence_response(text):
         return text
@@ -136,7 +138,7 @@ def strip_trailing_silence_marker(text: Any) -> Any:
         return text
     fenced = _fenced_line_states(lines)
     end = len(lines)
-    removed = False
+    last_marker = ""
     while end:
         while end and not lines[end - 1].strip():
             end -= 1
@@ -144,9 +146,12 @@ def strip_trailing_silence_marker(text: Any) -> Any:
             break
         if not is_intentional_silence_response(lines[end - 1]):
             break
-        removed = True
+        last_marker = last_marker or lines[end - 1].strip()
         end -= 1
-    return "".join(lines[:end]).rstrip() if removed else text
+    if not last_marker:
+        return text
+    kept = "".join(lines[:end]).rstrip()
+    return kept if kept.strip() else last_marker
 
 
 def is_autonomous_silence_response(response: Any) -> bool:

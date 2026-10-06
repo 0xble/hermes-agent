@@ -4,6 +4,7 @@ import sys
 
 import pytest
 
+from agent.agent_runtime_helpers import strip_think_blocks as _real_strip_think_blocks
 from agent.turn_final_response import finish_text_response
 from gateway.run_turn import GatewayTurnMixin
 
@@ -132,3 +133,70 @@ def test_bare_marker_is_preserved_for_existing_silence_filter():
     assert strip_trailing_silence_marker("NO_REPLY") == "NO_REPLY"
     assert strip_trailing_silence_marker("[SILENT]") == "[SILENT]"
     assert strip_trailing_silence_marker("no reply") == "no reply"
+
+
+def test_marker_only_runs_collapse_to_one_marker_not_empty():
+    from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+
+    for text in ("NO_REPLY\n\nNO_REPLY", "[SILENT]\nNO_REPLY", "\n\nNO_REPLY\n"):
+        result = strip_trailing_silence_marker(text)
+        assert is_intentional_silence_response(result), (text, result)
+
+
+def test_consecutive_trailing_marker_lines_are_all_removed():
+    from gateway.response_filters import strip_trailing_silence_marker
+
+    assert strip_trailing_silence_marker("Done.\n\nNO_REPLY\n[SILENT]") == "Done."
+
+
+def _run_finish(monkeypatch, agent, content):
+    _stub_conversation_loop(monkeypatch)
+    _stub_runtime_helpers(monkeypatch)
+    assistant_message = SimpleNamespace(
+        content=content, tool_calls=[], reasoning_content=None, reasoning_details=None,
+    )
+    with patch("agent.turn_finalizer.apply_llm_output_transform", side_effect=lambda _agent, text, **_kwargs: (text, False, None)), \
+            patch("agent.turn_final_response.recover_empty_response", side_effect=AssertionError("empty-response recovery")):
+        return finish_text_response(
+            agent,
+            assistant_message=assistant_message, response="", finish_reason="stop",
+            messages=[], api_messages=[], conversation_history=[], api_call_count=1,
+            user_message="FYI", active_system_prompt="", final_response=None,
+            _turn_exit_reason=None, _preflight_compression_blocked=None,
+            codex_ack_continuations=0, truncated_response_parts=[], length_continue_retries=0,
+            _pending_verification_response=None, _pending_verification_response_previewed=False,
+            effective_task_id=None,
+        )
+
+
+class _RealThinkAgent(_PersistenceAgent):
+    """Uses the production think-block stripper rather than an identity stub."""
+
+    def _strip_think_blocks(self, text):
+        return _real_strip_think_blocks(self, text)
+
+    def _has_content_after_think_block(self, text):
+        return bool(text) and bool(self._strip_think_blocks(text).strip())
+
+
+@pytest.mark.parametrize("content", [
+    "<think>Nothing to add here.</think>\nNO_REPLY",
+    "<think>FYI only.</think>\n\nNO_REPLY\n\nNO_REPLY",
+])
+def test_inline_think_then_bare_marker_stays_intentional_silence(monkeypatch, content):
+    """Reasoning plus a bare marker is silence, not an empty response to retry."""
+    from gateway.response_filters import is_intentional_silence_response
+
+    verdict = _run_finish(monkeypatch, _RealThinkAgent(), content)
+
+    assert verdict.action == "break"
+    assert is_intentional_silence_response(verdict.final_response)
+
+
+def test_inline_think_then_prose_then_marker_strips_only_the_marker(monkeypatch):
+    agent = _RealThinkAgent()
+    verdict = _run_finish(monkeypatch, agent, "<think>Report it.</think>\nDone.\n\nNO_REPLY")
+
+    assert verdict.action == "break"
+    assert verdict.final_response == "Done."
+    assert "NO_REPLY" not in agent.persisted_messages[-1]["content"]
