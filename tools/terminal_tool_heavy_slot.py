@@ -42,6 +42,11 @@ _JS_RUNNERS = {"vitest", "jest"}
 # Package-script runners: `test` / `test:*` scripts are heavy, package management is not.
 _PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
 _PACKAGE_VALUE_OPTIONS = {"--filter", "-F", "--dir", "-C", "--prefix", "--cwd", "--workspace", "-w"}
+# Subcommands whose positional words are package names, never script names.
+_PACKAGE_MANAGEMENT = {"add", "install", "i", "remove", "rm", "uninstall", "un", "update", "up", "upgrade",
+                       "link", "unlink", "info", "view", "why", "outdated", "publish", "pack", "init", "create"}
+# Task runners that fan a script out across a monorepo: `turbo run test`, `nx run-many -t test`, `lerna run test`.
+_MONOREPO_RUNNERS = {"turbo", "nx", "lerna"}
 _ENV_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
 _EXEC_RUNNERS = {"npx", "bunx", "uvx", "pnpx"}
 _SUITE_RUNNERS = {"tox", "nox"}
@@ -121,6 +126,19 @@ def _is_test_script(word: Optional[str]) -> bool:
     return word is not None and (word == "test" or word.startswith("test:"))
 
 
+def _has_test_script(args: list[str]) -> bool:
+    """Whether any positional word (not an option or its value) is a `test` / `test:*` script."""
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in _PACKAGE_VALUE_OPTIONS:
+            skip = True  # `pnpm --filter test build`: `test` names a package
+        elif not arg.startswith("-") and _is_test_script(arg):
+            return True
+    return False
+
+
 def classify_words(words: list[str]) -> Optional[str]:
     """Label for a heavy simple command given its unquoted words (command first), else ``None``."""
     if not words:
@@ -158,20 +176,16 @@ def classify_words(words: list[str]) -> Optional[str]:
         return classify_words([inner, *rest]) if inner else None
     if name in _PACKAGE_MANAGERS:
         sub, rest = _first_positional(args, _PACKAGE_VALUE_OPTIONS)
-        if _is_test_script(sub):
-            return "test"
-        if sub in {"run", "run-script"}:
-            script, _ = _first_positional(rest, _PACKAGE_VALUE_OPTIONS)
-            return "test" if _is_test_script(script) else None
+        if any(word in _PACKAGE_MANAGEMENT for word in [sub, *rest][:3] if word):
+            return None  # `pnpm add -D vitest`, `yarn workspace app add test`: the words name packages
         if sub in {"exec", "dlx"}:
             inner, inner_rest = _first_positional(rest)
             return classify_words([inner, *inner_rest]) if inner else None
-        return None
-    if name == "turbo":
-        sub, rest = _first_positional(args)
-        if sub == "run":
-            sub, _ = _first_positional(rest)
-        return "test" if _is_test_script(sub) else None
+        # Script runs in every spelling (`pnpm test`, `npm run test`, `yarn workspace app test`,
+        # `yarn workspaces foreach run test`, `pnpm -r test:unit`): any positional test script.
+        return "test" if _has_test_script(args) else None
+    if name in _MONOREPO_RUNNERS:
+        return "test" if _has_test_script(args) else None
     if executable.endswith("bin/ci") and _basename(executable) == "ci":
         profile = args[0] if args else "full"
         return None if profile in _LIGHT_CI_PROFILES else f"ci-{profile}"

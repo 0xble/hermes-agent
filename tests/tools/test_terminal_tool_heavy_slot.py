@@ -38,6 +38,12 @@ def helper(monkeypatch):
     ("pnpm --filter app test:unit", "test"),
     ("npm run test", "test"),
     ("turbo run test --filter=app", "test"),
+    ("yarn workspace app test", "test"),
+    ("yarn workspaces foreach run test", "test"),
+    ("npm -w packages/app run test:unit", "test"),
+    ("pnpm -r test", "test"),
+    ("nx run-many -t test", "test"),
+    ("lerna run test", "test"),
     ("tox -e py311", "tox"),
     ("CI_EXPECTED_SHA=abc ./bin/ci gate deadbeef", "ci-gate"),
     ("./bin/ci", "ci-full"),
@@ -70,6 +76,10 @@ def test_recognizes_heavy_commands(command, label):
     "uv pip install pytest",
     "pnpm add -D vitest",
     "pnpm build",
+    "npm install test",
+    "yarn workspace app add -D test",
+    "turbo run build",
+    "pnpm --filter test build",
     "./bin/ci preflight",
     "~/.hermes/plugins/git-guard/bin/ci-gate deadbeef",  # ci-gate takes its own slot
     "pytest tests/tools/test_a.py tests/tools/test_b.py -q",  # targeted
