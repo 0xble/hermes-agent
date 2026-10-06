@@ -298,8 +298,7 @@ class GatewayInboundMixin:
         if reconnect_keys and not is_internal:
             reconnect_key = self._session_key_for_source(self._normalize_source_for_session_key(source))
         if (
-            (getattr(self, "_startup_restore_in_progress", False)
-             or (reconnect_keys and reconnect_keys.get(reconnect_key, 0)))
+            reconnect_keys and reconnect_keys.get(reconnect_key, 0)
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):

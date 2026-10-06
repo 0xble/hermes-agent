@@ -45,6 +45,7 @@ from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.deadline import detached_context
 from gateway.turn_executor import _UnboundedThreadExecutor
+from gateway.replay_scheduler import ReplayHandle, ReplayScheduler
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -3556,10 +3557,52 @@ class GatewayRunner(
         self._init_runtime_settings()
         self._init_session_store()
         self._init_lifecycle_state()
+        self._init_replay_scheduler()
         self._init_runtime_caches()
         self._init_startup_checks()
         self._init_session_db()
         self._init_registries_and_clocks()
+
+    def _get_replay_scheduler(self) -> ReplayScheduler:
+        """Return the one gateway-wide replay admission scheduler.
+
+        Bare test runners are often built with ``object.__new__``; retain a lazy
+        fallback there while normal construction creates this before adapters start.
+        """
+        scheduler = self.__dict__.get("_replay_scheduler")
+        if scheduler is None:
+            scheduler = ReplayScheduler(getattr(self.config, "restart_replay_concurrency", 2))
+            self.__dict__["_replay_scheduler"] = scheduler
+        return scheduler
+
+    def _enqueue_replay(
+        self, *, priority: int, kind: str, session_key: Optional[str],
+        dispatch: Callable[[], Any], profile_home: Any = None,
+    ) -> ReplayHandle:
+        """Queue one replay with its owning profile captured at enqueue time."""
+        captured_home = profile_home
+        scheduler = self._get_replay_scheduler()
+
+        async def _scoped_dispatch() -> Any:
+            if captured_home is not None and getattr(self.config, "multiplex_profiles", False):
+                from gateway.run import _async_profile_runtime_scope
+                async with _async_profile_runtime_scope(captured_home):
+                    return await dispatch()
+            return await dispatch()
+
+        return scheduler.enqueue(
+            priority=priority,
+            kind=kind,
+            session_key=session_key,
+            profile_home=captured_home,
+            dispatch=_scoped_dispatch,
+        )
+
+    def _init_replay_scheduler(self) -> None:
+        """Construct replay admission before any adapter can deliver an event."""
+        self._replay_scheduler = ReplayScheduler(
+            getattr(self.config, "restart_replay_concurrency", 2)
+        )
 
     def _init_runtime_settings(self) -> None:
         """Load ephemeral per-call config (prefill, reasoning, busy modes, timeouts, routing)."""
