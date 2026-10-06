@@ -147,6 +147,52 @@ def test_unresolvable_async_event_is_consumed_once_and_dropped(
     assert len(warnings) == 1
 
 
+def test_slow_terminal_drop_does_not_block_the_event_loop(monkeypatch, isolated_registry):
+    """A slow durable drop must not pause gateway liveness ticks."""
+    import time
+
+    from tools import async_delegation
+
+    event = _async_event("deleg_slow_drop")
+    event["session_key"] = ""
+    _persist_pending_completion(event)
+    real_drop = async_delegation.drop_completion_delivery
+    drop_calls = []
+
+    def _slow_drop(delegation_id, claim_id):
+        drop_calls.append((delegation_id, claim_id))
+        time.sleep(0.5)
+        return real_drop(delegation_id, claim_id)
+
+    monkeypatch.setattr(async_delegation, "drop_completion_delivery", _slow_drop)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+
+    async def _exercise():
+        ticks = []
+        finished = asyncio.Event()
+
+        async def _heartbeat():
+            while not finished.is_set():
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.02)
+
+        heartbeat = asyncio.create_task(_heartbeat())
+        try:
+            result = await runner._deliver_completion_notification("completion", event)
+        finally:
+            finished.set()
+            await heartbeat
+        return result, ticks
+
+    result, ticks = asyncio.run(_exercise())
+
+    assert result is None
+    assert len(drop_calls) == 1
+    assert async_delegation.get_durable_delegation("deleg_slow_drop")["delivery_state"] == "dropped"
+    assert len(ticks) >= 3
+    assert max(b - a for a, b in zip(ticks, ticks[1:])) < 0.25
+
+
 def test_resolvable_async_event_without_adapter_remains_retryable(
     monkeypatch, isolated_registry,
 ):

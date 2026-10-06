@@ -1867,7 +1867,9 @@ class GatewayNotificationsMixin:
                 try:
                     from tools.async_delegation import claim_completion_delivery
                     claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(claim.delegation_id, claim.claim_id):
+                    if not await asyncio.to_thread(
+                        claim_completion_delivery, claim.delegation_id, claim.claim_id,
+                    ):
                         claim.proceed = False
                         return claim
                 except Exception as exc:
@@ -1881,7 +1883,9 @@ class GatewayNotificationsMixin:
                         claim.delegation_id or "<missing>",
                     )
                 if claim.claim_id:
-                    self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id)
+                    await asyncio.to_thread(
+                        self._settle_durable_claim, "drop", claim.delegation_id, claim.claim_id,
+                    )
                     claim.claim_id = ""
                 claim.proceed, claim.early_result = False, None
                 return claim
