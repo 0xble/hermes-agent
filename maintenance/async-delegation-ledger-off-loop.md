@@ -38,7 +38,7 @@ the fork.
 ## Patch
 
 **Patch identity:** `async-delegation-ledger-off-loop`. Source surfaces:
-`gateway/run_notifications.py` (`_settle_durable_claims`,
+`gateway/run_notifications_ledger.py` (`settle_durable_claims`), `gateway/run_notifications.py` (
 `_preflight_completion_delivery`, `_deliver_completion_notification_scoped`,
 `_deliver_async_delegation_group_scoped`, `_deliver_auto_resume_notice`),
 `gateway/run_startup.py` (`_start_secondary_profiles`, the auto-resume scheduling call),
