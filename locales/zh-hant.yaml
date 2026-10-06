@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ 已暫停{suffix}。新的排程／kanban／閘道工作將暫緩；進行中的工作會正常完成。使用 `/pause off` 恢復。"
   queue:
     usage: "用法：/queue <prompt>"
-    queued: "已排入下一輪佇列。"
+    queued: "⏳ 已排入下一輪佇列。"
     queued_depth: " （{depth} 則排隊中）"
   steer:
     usage: "用法：/steer <prompt>"

@@ -236,7 +236,7 @@ async def test_addressed_relay_queue_keeps_its_ack():
 
     reply = await runner._busy_queue_command(event, "session", event.source)
 
-    assert reply == "Queued for the next turn."
+    assert reply == "⏳ Queued for the next turn."
     assert queued[0].reply_expected is True
 
 
@@ -250,7 +250,7 @@ async def test_typed_queue_keeps_its_ack():
 
     reply = await runner._busy_queue_command(event, "session", event.source)
 
-    assert reply == "Queued for the next turn."
+    assert reply == "⏳ Queued for the next turn."
     assert len(queued) == 1
     assert queued[0].reply_expected is None
 
