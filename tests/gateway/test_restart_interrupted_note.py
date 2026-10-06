@@ -287,6 +287,38 @@ async def test_new_interruption_replaces_stale_note_before_posting_one(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_non_deleting_adapter_posts_each_consecutive_interruption_note(tmp_path):
+    """Adapters without delete support keep old notes visible but never suppress a new turn's note."""
+    adapter = NoteAdapter(delete_result=False)
+    store = _store(tmp_path)
+    source = _source("non-deleting-thread")
+    entry = store.get_or_create_session(source)
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner.async_session_store = runner._async_session_store
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None)
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+
+    store.mark_resume_pending(entry.session_key, turn_id="turn-1", human=True)
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert adapter.sent[0][0] == source.chat_id
+    assert store.clear_resume_pending(entry.session_key)
+
+    store.mark_resume_pending(entry.session_key, turn_id="turn-2", human=True)
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+
+    assert len(adapter.sent) == 2
+    assert adapter.deleted == [(source.chat_id, "m1")]
+    assert store.get_restart_note(entry.session_key)[3] == "m2"
+
+
+@pytest.mark.asyncio
 async def test_sent_no_id_note_is_cleared_at_final_delivery(tmp_path):
     adapter = NoteAdapter(no_message_id=True)
     store, entry, _ = _pending_store(tmp_path, adapter)
@@ -339,11 +371,11 @@ async def test_resumed_answer_delete_send_fallback_has_no_orphan(tmp_path):
     adapter = NoteAdapter(edit_result=False, delete_result=True)
     store, entry, event = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-8")
+    _configure_real_final_delivery(adapter, store)
 
-    await adapter._reconcile_restart_note(event, entry.session_key)
-    sent = await adapter.send("chat", "replacement")
+    await adapter._send_final_text(event, entry.session_key, "replacement", {}, False, 0, lambda _r: None)
 
-    assert sent.success is True
+    assert adapter.sent[-1][1] == "replacement"
     assert adapter.deleted == [("chat", "note-8")]
     assert store.get_restart_note(entry.session_key)[3] is None
 
@@ -474,7 +506,7 @@ async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_shutdown_note_batch_is_bounded_before_interrupting_agents(tmp_path):
+async def test_shutdown_note_batch_is_bounded_before_interrupting_agents(tmp_path, monkeypatch):
     """A wedged transport cannot hold the real interrupt phase beyond the note deadline."""
     from gateway.run import GatewayRunner
     from tests.gateway.restart_test_helpers import make_restart_runner
@@ -502,17 +534,13 @@ async def test_shutdown_note_batch_is_bounded_before_interrupting_agents(tmp_pat
     runner._interrupt_running_agents = Mock()
     runner._active_api_run_count = lambda: 0
     runner._notify_interrupted_cron_jobs = AsyncMock(return_value=0)
-    monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(GatewayRunner, "_post_interrupt_grace_timeout", lambda self: 0.01)
     monkeypatch.setattr(GatewayRunner, "_stop_kill_tool_subprocesses_off_loop", AsyncMock(return_value=[]))
-    try:
-        ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0)
-        ctx.started_at = asyncio.get_running_loop().time()
-        started = asyncio.get_running_loop().time()
-        await runner._stop_interrupt_remaining_work(ctx)
-        elapsed = asyncio.get_running_loop().time() - started
-    finally:
-        monkeypatch.undo()
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0)
+    ctx.started_at = asyncio.get_running_loop().time()
+    started = asyncio.get_running_loop().time()
+    await runner._stop_interrupt_remaining_work(ctx)
+    elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < 2.7
     runner._interrupt_running_agents.assert_called()
@@ -534,24 +562,34 @@ def test_startup_note_candidates_reject_legacy_and_stale_rows():
 
 
 @pytest.mark.asyncio
-async def test_startup_boot_send_path_includes_interrupted_notes_without_blocking_gate():
+async def test_startup_boot_send_path_posts_interrupted_notes_first(monkeypatch):
     from gateway.run_startup import GatewayStartupMixin
+    import gateway.run as run_module
 
     runner = object.__new__(GatewayStartupMixin)
     calls = []
     runner._claim_pending_obligations = AsyncMock(return_value=[])
-    runner._send_restart_notification = AsyncMock()
-    runner._schedule_update_notification_watch = lambda: None
-    runner._redeliver_claimed_obligations = AsyncMock(return_value=0)
-    runner._send_interrupted_turn_notes = AsyncMock(side_effect=lambda keys, **kwargs: calls.append((keys, kwargs)))
+    runner._send_restart_notification = AsyncMock(side_effect=lambda: calls.append("restart"))
+    runner._schedule_update_notification_watch = lambda: calls.append("update-watch")
+    runner._redeliver_claimed_obligations = AsyncMock(side_effect=lambda _rows: calls.append("redeliver"))
+    runner._send_interrupted_turn_notes = AsyncMock(
+        side_effect=lambda keys, **kwargs: calls.append((keys, kwargs)),
+    )
     runner._retain_background_task = lambda task: None
     runner._late_failure_callback = lambda *args, **kwargs: (lambda task: None)
+    monkeypatch.setattr(run_module, "_startup_restore_drain_timeout_secs", lambda: 0)
 
     await runner._await_startup_boot_sends(
         planned_restart_notification_pending=False,
         interrupted_note_keys=["fresh"],
     )
-    assert calls == [(["fresh"], {"reclaim_pending": True})]
+
+    assert calls == [
+        (["fresh"], {"reclaim_pending": True}),
+        "restart",
+        "update-watch",
+        "redeliver",
+    ]
 
 
 @pytest.mark.asyncio
@@ -617,6 +655,52 @@ async def test_startup_claims_ledger_answer_before_resume_snapshot(tmp_path, mon
     assert entry.resume_pending is False
     assert note_calls == []
     assert scheduled == [[]]
+
+
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monkeypatch):
+    from gateway import run_heartbeat_acceptance
+    from gateway.run_turn import GatewayTurnMixin
+
+    store = _store(tmp_path)
+    source = _source("marker-turn")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-marker", human=True)
+    marker = store.get_resume_pending_marker(entry.session_key)
+    runner = object.__new__(GatewayTurnMixin)
+    runner.async_session_store = AsyncSessionStore(store)
+    runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
+    runner._hmwa_prepare_turn = AsyncMock(
+        return_value=(runner._PreparedTurn([], "", "message", True, None, None), []),
+    )
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._revive_blocked_goal_for_user_turn = AsyncMock()
+    runner._persist_prompt_pins = AsyncMock()
+    runner._pinned_channel_inputs = lambda *_args, **_kwargs: (None, source)
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._run_agent = AsyncMock(return_value={"final_response": "done"})
+    runner._hmwa_stop_typing_for_turn = AsyncMock()
+    runner._is_user_turn_event = lambda _event: False
+    runner._is_session_run_current = lambda *_args: True
+    runner._hmwa_shape_agent_response = AsyncMock(return_value=("done", False, []))
+    runner._hmwa_prepend_reasoning = lambda _result, response, *_args: response
+    runner._hmwa_runtime_footer_line = lambda *_args: None
+    runner._hmwa_post_turn_hooks = AsyncMock()
+    runner._hmwa_classify_turn_failure = lambda *_args: (False, False, False)
+    runner._hmwa_compression_exhaustion_reset = AsyncMock(return_value=("done", entry))
+    runner._hmwa_persist_turn_transcript = AsyncMock()
+    runner._hmwa_deliver_turn_response = AsyncMock(return_value="done")
+    runner._clear_session_env = lambda _tokens: None
+    clear_resume_pending = AsyncMock(side_effect=lambda key, **kwargs: store.clear_resume_pending(key, **kwargs))
+    runner.async_session_store.clear_resume_pending = clear_resume_pending
+    monkeypatch.setattr(run_heartbeat_acceptance, "heartbeat_owner_is_current", lambda *_args: True)
+
+    event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+    assert await runner._handle_message_with_agent(event, source, entry.session_key, 1) == "done"
+    clear_resume_pending.assert_awaited_once_with(entry.session_key, expected_marker=marker)
+
 
 
 def test_pending_note_claim_is_atomic_and_recoverable(tmp_path):

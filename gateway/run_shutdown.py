@@ -990,9 +990,15 @@ class GatewayShutdownMixin:
                         except Exception:
                             deleted = False
                     if not deleted:
-                        logger.warning("Unable to replace stale restart note for %s", session_key)
-                        return 0
-                    await self.async_session_store.clear_restart_note(session_key)
+                        # Some adapters cannot delete messages. Keep the old note visible, but clear its
+                        # durable record so every later cut human turn still gets its own new note.
+                        await self.async_session_store.clear_restart_note(session_key)
+                        logger.info(
+                            "Unable to delete stale restart note for %s; old note remains visible",
+                            session_key,
+                        )
+                    else:
+                        await self.async_session_store.clear_restart_note(session_key)
                 if not await self.async_session_store.claim_restart_note(
                     session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
                 ):

@@ -2177,6 +2177,8 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        # Snapshot the interruption marker before preparation/delivery can yield to a successor turn.
+        _resume_pending_marker = await self.async_session_store.get_resume_pending_marker(session_key)
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2293,7 +2295,9 @@ class GatewayTurnMixin:
             event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(agent_result)
             if event._agent_turn_succeeded:
                 try:
-                    await self.async_session_store.clear_resume_pending(session_key)
+                    await self.async_session_store.clear_resume_pending(
+                        session_key, expected_marker=_resume_pending_marker,
+                    )
                 except Exception as _e:
                     logger.debug("clear_resume_pending after delivery failed for %s: %s", session_key, _e)
             return delivered_response

@@ -304,15 +304,18 @@ class GatewayStartupMixin:
         claimed_rows: list = (await self._claim_pending_obligations() if claimed is None else claimed)
 
         async def _boot_sends() -> None:
+            # Post per-turn interruption notes first. If the bounded boot-send task detaches, a resumed
+            # turn must not finish before its note is recorded; later boot broadcasts/redelivery are not
+            # part of the S2 note lifecycle.
+            if interrupted_note_keys:
+                await self._send_interrupted_turn_notes(
+                    interrupted_note_keys, reclaim_pending=True,
+                )
             await self._send_restart_notification()
             self._schedule_update_notification_watch()
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed_rows)
-            if interrupted_note_keys:
-                await self._send_interrupted_turn_notes(
-                    interrupted_note_keys, reclaim_pending=True,
-                )
 
         boot_task = asyncio.create_task(_boot_sends())
         timeout = _startup_restore_drain_timeout_secs()
