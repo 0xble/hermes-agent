@@ -160,8 +160,10 @@ def test_worker_interrupt_break_closes_stream():
 
 
 def test_relay_managed_close_failure_poisons_request_client(tmp_path, monkeypatch):
-    """Relay must preserve close failures needed by the reuse-slot guard."""
+    """A worker-first Relay close failure must poison the real reuse slot."""
     agent = _make_agent()
+    worker_close_failure_recorded = threading.Event()
+    monitor_wait_failed = threading.Event()
 
     def chunks():
         yield _chunk(content="partial ")
@@ -171,15 +173,92 @@ def test_relay_managed_close_failure_poisons_request_client(tmp_path, monkeypatc
     stream = _FakeStream(chunks, close_raises=True)
     request_client = _mock_wire_client(stream)
     abort_reasons = []
+    from agent.chat_completion_helpers import _StreamingCall
+    from agent.client_lifecycle import _OPENAI_SLOT
+
+    # The production create path normally stores this client before the monitor
+    # can abort it. Seed the real slot because the test replaces that factory.
+    slot = agent._request_slot(_OPENAI_SLOT)
+    slot.update(client=request_client, key=("test",), poisoned=False, in_use=True)
+    real_abort = agent._abort_request_openai_client
+    real_monitor_abort = _StreamingCall._abort_for_interrupt
+
+    def worker_first_monitor_abort(call, stale_elapsed):
+        # Hold the monitor's interrupt-abort entry point until the worker has
+        # recorded its own close failure. A timeout makes a broken ordering fail
+        # rather than hanging the test.
+        if not worker_close_failure_recorded.wait(timeout=5.0):
+            monitor_wait_failed.set()
+            return
+        real_monitor_abort(call, stale_elapsed)
+
+    def record_abort(client, *, reason):
+        abort_reasons.append((client, reason))
+        if reason == "interrupt_stream_close_failed":
+            worker_close_failure_recorded.set()
+        real_abort(client, reason=reason)
 
     with _managed_relay_turn(agent, tmp_path, monkeypatch), patch.object(
         agent, "_create_request_openai_client", return_value=request_client
     ), patch.object(agent, "_close_request_openai_client"), patch.object(
-        agent,
-        "_abort_request_openai_client",
-        side_effect=lambda client, *, reason: abort_reasons.append(
-            (client, reason)
-        ),
+        agent, "_abort_request_openai_client", side_effect=record_abort
+    ), patch.object(
+        _StreamingCall, "_abort_for_interrupt", new=worker_first_monitor_abort
+    ):
+        with pytest.raises(InterruptedError):
+            agent._interruptible_streaming_api_call(
+                {
+                    "model": "test/model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+            )
+
+    assert monitor_wait_failed.is_set() is False
+    assert stream.close_calls == 1
+    assert abort_reasons[0] == (request_client, "interrupt_stream_close_failed")
+    assert all(client is request_client for client, _reason in abort_reasons)
+    assert {reason for _client, reason in abort_reasons} <= {
+        "stream_interrupt_abort",
+        "interrupt_stream_close_failed",
+    }
+    assert slot["poisoned"] is True
+    cached, _stale = agent._checkout_request_slot(_OPENAI_SLOT, ("test",))
+    assert cached is None
+
+
+def test_relay_managed_close_failure_preserves_poison_when_monitor_wins(tmp_path, monkeypatch):
+    """A monitor-first interrupt must poison the reuse slot before Relay closes."""
+    agent = _make_agent()
+    monitor_abort_started = threading.Event()
+    abort_reasons = []
+
+    def chunks():
+        yield _chunk(content="partial ")
+        # Hold the worker before its interrupt check until the monitor has
+        # recorded its abort. This fixes the ordering without sleeping.
+        agent._interrupt_requested = True
+        assert monitor_abort_started.wait(timeout=5.0), "monitor abort did not start"
+        yield _chunk(content="never processed")
+
+    stream = _FakeStream(chunks, close_raises=True)
+    request_client = _mock_wire_client(stream)
+    from agent.client_lifecycle import _OPENAI_SLOT
+    # The production create path normally stores this client before the monitor
+    # can abort it. Seed the real slot because the test replaces that factory.
+    slot = agent._request_slot(_OPENAI_SLOT)
+    slot.update(client=request_client, key=("test",), poisoned=False, in_use=True)
+    real_abort = agent._abort_request_openai_client
+
+    def record_abort(client, *, reason):
+        abort_reasons.append((client, reason))
+        if reason == "stream_interrupt_abort":
+            monitor_abort_started.set()
+        real_abort(client, reason=reason)
+
+    with _managed_relay_turn(agent, tmp_path, monkeypatch), patch.object(
+        agent, "_create_request_openai_client", return_value=request_client
+    ), patch.object(agent, "_close_request_openai_client"), patch.object(
+        agent, "_abort_request_openai_client", side_effect=record_abort
     ):
         with pytest.raises(InterruptedError):
             agent._interruptible_streaming_api_call(
@@ -190,7 +269,18 @@ def test_relay_managed_close_failure_poisons_request_client(tmp_path, monkeypatc
             )
 
     assert stream.close_calls == 1
-    assert abort_reasons == [(request_client, "interrupt_stream_close_failed")]
+    # Relay may surface its managed close failure before or after the worker's
+    # body-level close-failure branch. The strict ordering contract is that the
+    # monitor abort lands first; either path poisons the same reuse slot.
+    assert abort_reasons[0] == (request_client, "stream_interrupt_abort")
+    assert all(client is request_client for client, _reason in abort_reasons)
+    assert {reason for _client, reason in abort_reasons} <= {
+        "stream_interrupt_abort",
+        "interrupt_stream_close_failed",
+    }
+    assert slot["poisoned"] is True
+    cached, _stale = agent._checkout_request_slot(_OPENAI_SLOT, ("test",))
+    assert cached is None
 
 
 def test_stale_abort_is_atomic_with_holder_read(monkeypatch):

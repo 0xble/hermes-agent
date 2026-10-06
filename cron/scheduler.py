@@ -3920,7 +3920,7 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 return False
             from cron.scheduler_detached_worker import arm_hard_wall_timeout, hard_wall_timeout_seconds
             watchdog_stop = arm_hard_wall_timeout(
-                execution_id, profile_home, hard_wall_timeout_seconds())
+                execution_id, profile_home, hard_wall_timeout_seconds(job))
             try:
                 ack_path.parent.mkdir(parents=True, exist_ok=True)
                 # Publish via write-to-temp + atomic rename. Writing ack_path in place
