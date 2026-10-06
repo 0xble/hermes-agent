@@ -712,6 +712,20 @@ class TestTerminatePid:
         assert calls == []
 
 
+def test_soft_termination_refuses_a_recycled_pid(monkeypatch):
+    # A provided start-time guard is honoured for SIGTERM too, not only for force kills:
+    # _escalate_wedged_gateway relies on it before its first signal.
+    signals = []
+    monkeypatch.setattr(status, "_IS_WINDOWS", False)
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 2.0)
+    monkeypatch.setattr(status.os, "kill", lambda *args: signals.append(args))
+
+    with pytest.raises(OSError, match="identity changed"):
+        status.terminate_pid(123, expected_start_time=1.0)
+
+    assert signals == []
+
+
 class TestPidExistsZombieProbe:
     """#115578: the psutil ``status()`` zombie probe is POSIX-only. On Windows it costs ~7 ms per
     pid, runs once per registry entry inside the session-registry file lock, and can never

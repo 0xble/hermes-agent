@@ -403,7 +403,7 @@ def terminate_pid(
     process, the kill is refused on every platform — a mismatched fingerprint always means the PID was
     recycled. See #89614.
     """
-    if force and (_IS_WINDOWS or expected_start_time is not None):
+    if (force and _IS_WINDOWS) or expected_start_time is not None:
         if expected_start_time is None:
             raise OSError(f"refusing to force-kill PID {pid} without a process start-time guard")
         current_start_time = _get_process_start_time(pid)
