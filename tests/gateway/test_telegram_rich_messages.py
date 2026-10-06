@@ -344,11 +344,13 @@ async def test_unknown_endpoint_error_falls_back_to_legacy():
 def test_rich_capability_latch_resets_for_new_polling_generation():
     adapter = _make_adapter()
     adapter._rich_send_disabled = True
+    adapter._rich_draft_disabled = True
 
     generation, _ = adapter._begin_polling_generation()
 
     assert generation == 1
     assert adapter._rich_send_disabled is False
+    assert adapter._rich_draft_disabled is False
 
 
 def test_rich_capability_rejection_logs_redacted_warning(caplog):

@@ -141,6 +141,34 @@ def test_formatting_degraded_receipt_is_persisted(monkeypatch):
     assert persisted["last_delivery_formatting_degraded"] == ["telegram:-100:42"]
 
 
+def test_non_telegram_reconnect_rejection_falls_back_without_waiting(monkeypatch, gateway_loop):
+    """Discord also reports send_path_degraded; its cron delivery keeps the immediate fallback."""
+    class Transport:
+        adapter = type("Adapter", (), {"_owner_profile": "satellite"})()
+        is_relay = False
+
+        def __init__(self):
+            self.calls = 0
+
+        async def send(self, platform, chat_id, content, metadata=None):
+            self.calls += 1
+            return SendResult(success=False, error="send_path_degraded", retryable=True)
+
+    transport = Transport()
+    fields = {name: None for name in sd._TargetDelivery.__dataclass_fields__}
+    fields.update(job={"id": "job-discord"}, platform=Platform.DISCORD, platform_name="discord", chat_id="555",
+                  thread_id=None, transport=transport, config=GatewayConfig(), loop=gateway_loop,
+                  target_adapters={}, mirror_text="", origin={})
+    t = sd._TargetDelivery(**fields)
+    sleeps = []
+    monkeypatch.setattr(sd.time, "sleep", sleeps.append)
+
+    assert not sd._deliver_via_live_adapter(
+        t, "the report", [], target_errors=[], delivery_errors=[], unverified_targets=[])
+    assert transport.calls == 1
+    assert sleeps == []
+
+
 def test_reconnect_waits_use_the_whole_budget():
     """The default backoff schedule reaches the full reconnect budget instead of stopping at 63s."""
     waited, attempt = 0.0, 0

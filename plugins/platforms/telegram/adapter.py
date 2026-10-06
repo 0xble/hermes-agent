@@ -2164,12 +2164,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         # Capability failures are generation-scoped: reconnect may restore a previously unavailable
         # rich endpoint, while the latch still prevents a retry storm within this generation.
-        if getattr(self, "_rich_send_disabled", False):
+        if getattr(self, "_rich_send_disabled", False) or getattr(self, "_rich_draft_disabled", False):
             logger.info(
-                "[%s] Resetting rich-message capability latch for polling generation %d",
+                "[%s] Resetting rich-message capability latches for polling generation %d",
                 self.name, self._polling_generation,
             )
-        self._rich_send_disabled = False
+        self._rich_send_disabled = self._rich_draft_disabled = False
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
         self._send_path_degraded = True

@@ -1555,9 +1555,11 @@ def _live_send_text(
                 time.sleep(wait)
                 flood_waited += wait
                 continue
-            # send_path_degraded is a pre-send rejection while polling reconnects. Keep retrying the
-            # live rich adapter with bounded backoff; only exhaustion reaches the standalone fallback.
-            wait = _short_reconnect_wait(ex, reconnect_waited, reconnect_attempt)
+            # send_path_degraded is a pre-send rejection while Telegram polling reconnects. Keep
+            # retrying the live rich adapter with bounded backoff; only exhaustion reaches the
+            # standalone fallback. Other platforms keep their immediate fallback.
+            wait = (_short_reconnect_wait(ex, reconnect_waited, reconnect_attempt)
+                    if str(t.platform_name).lower() == "telegram" else None)
             if wait is not None:
                 logger.warning(
                     "Job '%s': live adapter send to %s is reconnecting (%s); "
