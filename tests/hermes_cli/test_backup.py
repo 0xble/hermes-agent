@@ -1910,6 +1910,21 @@ class TestSafeCopyDb:
         conn.close()
         assert rows == [(42,)]
 
+    def test_skips_snapshot_when_destination_volume_is_too_full(self, tmp_path, monkeypatch):
+        from hermes_cli import backup_sqlite
+
+        src = tmp_path / "large.db"
+        dst = tmp_path / "copy.db"
+        src.write_bytes(b"database image")
+        monkeypatch.setattr(
+            backup_sqlite.shutil,
+            "disk_usage",
+            lambda _path: Namespace(free=0),
+        )
+
+        assert backup_sqlite._safe_copy_db(src, dst) is False
+        assert not dst.exists()
+
     def test_wal_copy_finishes_from_one_snapshot_while_writers_continue(
         self, tmp_path, monkeypatch
     ):

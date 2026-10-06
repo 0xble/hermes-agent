@@ -180,6 +180,8 @@ gateway:
     label_normal: "ЗВИЧАЙНИЙ"
     status_fast: "швидкий"
     status_normal: "звичайний"
+    status_expiring: "\n\n⏱ Завершиться через: {remaining}"
+    expired: "⚡ Швидкий режим вимкнено через {duration}."
     picker_title: "⚡ **Priority Processing**\\n\\nПоточний режим: `{mode}`\\n\\nОберіть варіант:"
     choice_fast: "fast — Priority Processing увімкнено"
     choice_normal: "normal — стандартна обробка"

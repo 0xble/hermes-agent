@@ -476,7 +476,10 @@ class ManyProgressLinesOutlastFloodAgent(ManyProgressLinesAgent):
 
     def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         result = super().run_conversation(message, conversation_history, task_id, **kwargs)
-        time.sleep(4.0)
+        # Outlast the refusal's deferral (never shorter than the production edit interval) plus one
+        # more interval for the resumed edit, so retuning the interval cannot silently starve it.
+        from gateway.run_turn_runner import TurnRunner
+        time.sleep(2 * TurnRunner._PROGRESS_EDIT_INTERVAL + 1.0)
         return result
 
 

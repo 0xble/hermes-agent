@@ -1927,8 +1927,12 @@ def _delivery_manager() -> PluginManager:
     on those surfaces (#50776, #67597, #67890, #50937; tracking #64178 — salvaged from PR #64188).
     """
     manager = get_plugin_manager()
+    # ``PluginManager.discover_and_load`` sets ``_discovered`` before loading any
+    # plugin so recursive discovery cannot re-enter the sweep.  A startup caller
+    # can therefore observe ``_discovered`` while the background worker is still
+    # populating hooks; join the worker before reading the registry.
+    _join_background_discovery()
     if not getattr(manager, "_discovered", True):
-        _join_background_discovery()
         manager.discover_and_load()
     return manager
 
@@ -1990,8 +1994,12 @@ def has_hook(hook_name: str) -> bool:
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
-    """Return a stable snapshot of callbacks registered for a hook."""
-    return get_plugin_manager().iter_hook_callbacks(hook_name)
+    """Return a stable snapshot of callbacks registered for a hook.
+
+    Goes through :func:`_delivery_manager` so streaming hook consumers wait for an in-flight
+    background discovery, like :func:`invoke_hook` and :func:`has_hook`.
+    """
+    return _delivery_manager().iter_hook_callbacks(hook_name)
 
 
 def fire_pre_command_hook(

@@ -46,6 +46,8 @@ class ConversationState:
     one_turn_restore: Optional[Dict[str, Any]] = None  # /model --once snapshot
     reasoning_override: Optional[Dict[str, Any]] = None  # /reasoning override
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent
+    service_tier_override_expires_at: float = 0.0  # wall-clock deadline; 0 = no expiry
+    service_tier_override_expiry_seconds: float = 0.0  # duration used in the one-shot notice
     last_resolved_model: str = ""  # last successfully-resolved non-empty model
     queued_events: List[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)
     sidecar_notes: List[str] = field(default_factory=list)  # one-shot must-deliver notes

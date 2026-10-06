@@ -61,6 +61,7 @@ class _LifecycleBuilder:
     def __init__(self, app):
         self.app = app
         self.polling_request = None
+        self.limiter = None
 
     def token(self, _token):
         return self
@@ -73,6 +74,10 @@ class _LifecycleBuilder:
 
     def get_updates_request(self, request):
         self.polling_request = request
+        return self
+
+    def rate_limiter(self, limiter):
+        self.limiter = limiter
         return self
 
     def build(self):
@@ -239,6 +244,8 @@ async def test_fallback_disabled_skips_doh_discovery_on_connect(monkeypatch):
 
     assert await adapter.connect() is True
     assert builders[0].polling_request is _ControlledRequest.instances[-1]
+    # The live bot meters every chat request through the adapter's one per-chat budget.
+    assert builders[0].limiter is adapter._chat_rate_limiter()
     assert "transport" not in (
         builders[0].polling_request.kwargs.get("httpx_kwargs") or {}
     )
