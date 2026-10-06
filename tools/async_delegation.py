@@ -35,9 +35,37 @@ _executor: Optional[ThreadPoolExecutor] = None
 _executor_lock = threading.Lock()
 _executor_max_workers: int = 0
 
-_records_lock = threading.Lock()
+# One re-entrant lock owns every in-memory lifecycle transition.  A re-entrant
+# lock is required because a Future that is already complete invokes its done
+# callback synchronously from add_done_callback().
+_records_lock = threading.RLock()
 # delegation_id -> record dict; kept for the run plus a short completed tail.
 _records: Dict[str, Dict[str, Any]] = {}
+
+# Durable and in-memory lifecycle states.  ``finalizing`` is an in-memory claim
+# only: the ledger remains in the expected prior state until the conditional
+# terminal UPDATE commits.
+_TERMINAL_STATES = {"completed", "failed", "error", "interrupted", "cancelled", "stalled", "unknown"}
+_LIFECYCLE_STATES = {"new", "queued", "admitted", "running", "stalling", "finalizing", *_TERMINAL_STATES}
+_TRANSITIONS = {
+    "new": {"queued"},
+    "queued": {"admitted", "cancelled", "interrupted", "finalizing"},
+    "admitted": {"running", "queued", "failed", "interrupted", "cancelled", "finalizing"},
+    "running": {"queued", "stalling", "completed", "failed", "error", "interrupted", "stalled", "unknown", "finalizing"},
+    "stalling": {"completed", "failed", "interrupted", "stalled", "unknown", "finalizing"},
+    "finalizing": _TERMINAL_STATES,
+}
+
+
+def _transition_memory_locked(record: Dict[str, Any], new: str, *, expected: Optional[str] = None) -> str:
+    """Apply one in-memory lifecycle transition; caller holds ``_records_lock``."""
+    old = str(record.get("status") or "")
+    if expected is not None and old != expected:
+        raise RuntimeError(f"async delegation {record.get('delegation_id')} expected {expected}, found {old}")
+    if new not in _LIFECYCLE_STATES or new not in _TRANSITIONS.get(old, set()):
+        raise RuntimeError(f"invalid async delegation transition {old!r} -> {new!r}")
+    record["status"] = new
+    return old
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # Low-level callers retain the historical reject-at-capacity contract.  The
@@ -88,11 +116,15 @@ _monitor_lock = threading.Lock()
 _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
 
-_LIVE_STATES = {"queued", "running", "stalling", "finalizing"}
+_LIVE_STATES = {"queued", "admitted", "running", "stalling", "finalizing"}
 _ACTIVE_STATES = ("running", "stalling")
-_FINALIZABLE_STATES = {"queued", "running", "stalling"}
-_INTERRUPTIBLE_STATES = {"queued", "running", "stalling"}
+_FINALIZABLE_STATES = {"queued", "admitted", "running", "stalling"}
+_INTERRUPTIBLE_STATES = {"queued", "admitted", "running", "stalling"}
 _PENDING_QUEUE = deque()
+# Admission is not eligible until persistence commits, but a dispatch whose
+# capacity was free still needs a provisional key so concurrent dispatchers do
+# not all pass the same capacity check while its INSERT is in flight.
+_PENDING_ADMISSION_SLOTS: set = set()
 _BACKEND_RETIRING = "backend is retiring; reconnect to continue"
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
@@ -162,6 +194,13 @@ def _capture_routing_origin() -> Dict[str, Any]:
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
+    """Insert a new record exactly once, in durable ``queued`` state.
+
+    This is intentionally not ``INSERT OR REPLACE``: replacing a row can erase
+    a terminal event written by a racing cancellation.  The caller holds
+    ``_records_lock`` while this commits, so cancellation cannot transition the
+    in-memory record until the row exists.
+    """
     now = time.time()
     try:
         from gateway.status import get_process_start_time
@@ -177,16 +216,48 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     except OSError:
         pass
     with _DB_LOCK, _transaction() as conn:
-        conn.execute("""INSERT OR REPLACE INTO async_delegations
+        changed = conn.execute("""INSERT INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+               SELECT ?, ?, ?, ?, 'queued', ?, ?, 'pending', 0, ?, ?, ?, ?
+               WHERE NOT EXISTS (SELECT 1 FROM async_delegations WHERE delegation_id=?)""",
             (record["delegation_id"], record.get("session_key", ""), record.get("origin_ui_session_id", ""),
-             record.get("parent_session_id"), record.get("status", "running"), record["dispatched_at"], now, os.getpid(), owner_started_at,
-             json.dumps(task_payload), record.get("origin_session_id", "")))
+             record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
+             json.dumps(task_payload), record.get("origin_session_id", ""), record["delegation_id"])).rowcount
+        if changed != 1:
+            raise RuntimeError(f"async delegation {record['delegation_id']} already exists or was not inserted")
     _prune_durable_records()
+
+
+def _persist_transition(delegation_id: str, expected: str, new: str) -> int:
+    """Conditionally persist one lifecycle transition and return rowcount."""
+    if expected not in _LIFECYCLE_STATES or new not in _LIFECYCLE_STATES:
+        raise ValueError(f"invalid async delegation transition {expected!r} -> {new!r}")
+    with _DB_LOCK, _transaction() as conn:
+        return conn.execute(
+            f"UPDATE async_delegations SET state='{new}', updated_at=? "
+            f"WHERE delegation_id=? AND state='{expected}'",
+            (time.time(), delegation_id),
+        ).rowcount
+
+
+def _durable_state(delegation_id: str) -> Optional[Dict[str, Any]]:
+    """Read the authoritative lifecycle row for an explicit reconcile path."""
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state, event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    state, event_json, result_json = row
+    return {
+        "state": state,
+        "event": json.loads(event_json) if event_json else None,
+        "result": json.loads(result_json) if result_json else None,
+    }
 
 
 def _prune_durable_records() -> None:
@@ -196,32 +267,42 @@ def _prune_durable_records() -> None:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?", (cutoff,))
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('queued','running','stalling','finalizing')").fetchone()[0]
+            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('queued','running','stalling','finalizing')
+                     WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('queued','running','stalling','finalizing') AND delivery_state='pending'""").fetchone()[0]
+               WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('queued','running','stalling','finalizing') AND delivery_state='pending'
+                     WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'
                      ORDER BY updated_at ASC LIMIT ?
                    )""", (pending_count - _MAX_DURABLE_PENDING,))
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any], delivery_state: str = "pending") -> None:
+def _persist_completion(
+    event: Dict[str, Any], result: Dict[str, Any], delivery_state: str = "pending",
+    *, expected_state: Optional[str] = None,
+) -> bool:
+    """Conditionally persist a terminal payload without replacing the row."""
     now = time.time()
+    expected_state = expected_state or event.get("expected_state") or "queued"
     with _DB_LOCK, _transaction() as conn:
-        conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+        changed = conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state=?
-               WHERE delegation_id=?""",
+               WHERE delegation_id=? AND state=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), delivery_state, event["delegation_id"]))
+             json.dumps(event), json.dumps(result), delivery_state, event["delegation_id"], expected_state)).rowcount
+    if changed != 1:
+        logger.error("Async delegation %s terminal transition %s -> %s changed %s rows",
+                     event.get("delegation_id"), expected_state, event.get("status"), changed)
+        return False
+    return True
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -279,7 +360,7 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, result_json, state
-               FROM async_delegations WHERE state IN ('queued','running','finalizing')""").fetchall()
+               FROM async_delegations WHERE state IN ('queued','admitted','running','finalizing')""").fetchall()
         for row in rows:
             delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json, last_state = row
             if alive(pid, started):
@@ -343,7 +424,7 @@ def recover_abandoned_delegations() -> int:
                     }
                     conn.execute("""UPDATE async_delegations SET state=?, completed_at=?,
                            updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                           WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                           WHERE delegation_id=? AND state IN ('running','finalizing','admitted')""",
                         (completed["status"], now, now, json.dumps(event),
                          json.dumps(completed), delegation_id))
                     recovered += 1
@@ -459,7 +540,7 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
                       owner_pid, owner_started_at, delivery_attempts
                FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+               WHERE state NOT IN ('admitted','running','finalizing') AND delivery_state='pending'
                  AND event_json IS NOT NULL AND updated_at < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
                ORDER BY completed_at, delegation_id""", (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S)).fetchall()
@@ -670,7 +751,7 @@ def failed_delegations_for_session(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             f"""SELECT delegation_id, state, dispatched_at, completed_at, task_json, result_json FROM async_delegations
-                WHERE ({owner_sql}) AND state NOT IN ('running','finalizing') AND completed_at >= ?
+                WHERE ({owner_sql}) AND state NOT IN ('admitted','running','finalizing') AND completed_at >= ?
                 ORDER BY completed_at DESC LIMIT ?""",
             (*(val for _, val in selectors), cutoff, limit)).fetchall()
     failed: List[Dict[str, Any]] = []
@@ -824,18 +905,29 @@ def _active_slots_locked() -> set:
     # future's done callback runs.  Its terminal status is intentionally still
     # reported to users immediately, so the reservation is separate from the
     # live-state accounting above.
-    return {r.get("slot_key") or r["delegation_id"] for r in _records.values()
-            if r.get("status") in _ACTIVE_STATES or r.get("_slot_reserved")}
+    slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values()
+             if r.get("status") in _ACTIVE_STATES or r.get("_slot_reserved")}
+    return slots | set(_PENDING_ADMISSION_SLOTS)
+
+
+def _record_context_run(record: Dict[str, Any], fn: Callable, *args):
+    ctx = record.get("_context") or contextvars.copy_context()
+    return ctx.copy().run(fn, *args)
 
 
 def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[str]:
-    """Submit an admitted record. The record must already be in ``running`` state."""
+    """Submit an already admitted record; caller owns ``_records_lock``.
+
+    Admission has reserved the slot before this function runs.  The only normal
+    release is ``release_slot``, the Future done callback.  In particular,
+    ``_finalize`` never releases a slot merely because the user-visible state is
+    terminal.
+    """
     delegation_id = record["delegation_id"]
     is_batch = bool(record.get("is_batch"))
     label = " batch" if is_batch else ""
     try:
-        with _records_lock:
-            live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+        live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
         executor = _get_executor(max(max_async_children, live_units))
     except Exception as exc:  # noqa: BLE001 - admission must settle a failed executor lookup
         logger.warning("Async delegation %s could not create an executor: %s", delegation_id, exc)
@@ -846,7 +938,7 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
         status = "error"
         with _records_lock:
             rec = _records.get(delegation_id)
-            if rec is not None:
+            if rec is not None and rec.get("status") == "running":
                 rec.update(_started=True, _progress_ts=time.time())
         try:
             result = record["runner"]() or {}
@@ -863,26 +955,38 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
     if not retirement.acquire():
         return _BACKEND_RETIRING
     try:
-        future = executor.submit(record["_worker_context_runner"], _worker)
-        with _records_lock:
-            live = _records.get(delegation_id)
-            if live is not None:
-                live["_future"] = future
+        # Let a controlled executor complete the worker before submit() returns.
+        # The lifecycle record remains slot-reserved, and the done callback is
+        # attached immediately after the Future is available.
+        is_owned = getattr(_records_lock, "_is_owned", lambda: False)
+        release_save = getattr(_records_lock, "_release_save", lambda: None)
+        acquire_restore = getattr(_records_lock, "_acquire_restore", lambda _: None)
+        lock_state = release_save() if is_owned() else None
+        try:
+            future = executor.submit(record["_worker_context_runner"], _worker)
+        finally:
+            if lock_state is not None:
+                acquire_restore(lock_state)
+        record["_future"] = future
+        record["_slot_release_done"] = False
 
-        def release_slot(_: Any) -> None:
+        def release_slot(done_future: Any) -> None:
+            released = False
             with _records_lock:
                 live = _records.get(delegation_id)
-                if live is not None:
+                if live is not None and not live.get("_slot_release_done"):
+                    live["_slot_release_done"] = True
                     live["_slot_reserved"] = False
-            # A force-finalized runner only becomes capacity-free here.  The
-            # callback also wakes the queue for the normal short window between
-            # worker finalization and its future becoming done.
-            _admit_pending()
+                    released = True
+            if released:
+                # A force-finalized runner only becomes capacity-free here.
+                _admit_pending()
 
         future.add_done_callback(release_slot)
         future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
+        record["_slot_reserved"] = False
         logger.warning("Async delegation %s could not be submitted: %s", delegation_id, exc)
         return f"Failed to schedule async delegation{label}: {exc}"
     if record.get("progress_fn") is not None:
@@ -891,12 +995,11 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
 
 
 def _admit_pending() -> None:
-    """Admit FIFO queued records whenever a running slot becomes available.
+    """Promote durable queued records while capacity is available.
 
-    Units from one delegate call share a slot key, so once that key reaches the
-    front of the queue all of its queued units are admitted together. If the
-    retirement fence closes between units, the units not yet submitted remain
-    queued rather than being reported as started or silently discarded.
+    Selection, slot reservation, cancellation exclusion, durable admission, and
+    submission are one lock-owned transition.  No runner is submitted unless
+    the ledger has first committed ``queued -> admitted -> running``.
     """
     while True:
         with _records_lock:
@@ -912,7 +1015,7 @@ def _admit_pending() -> None:
                         pass
                     continue
                 slot_key = record.get("slot_key") or delegation_id
-                if slot_key in active_slots or len(active_slots) >= record["max_async_children"]:
+                if slot_key not in active_slots and len(active_slots) >= record["max_async_children"]:
                     continue
                 selected_slot = slot_key
                 for sibling_id in list(_PENDING_QUEUE):
@@ -922,88 +1025,99 @@ def _admit_pending() -> None:
                     if (sibling.get("slot_key") or sibling_id) != selected_slot:
                         continue
                     _PENDING_QUEUE.remove(sibling_id)
-                    sibling["status"] = "running"
-                    sibling["_started"] = False
-                    selected.append(dict(sibling))
+                    _transition_memory_locked(sibling, "admitted", expected="queued")
+                    sibling["_slot_reserved"] = True
+                    sibling["_slot_release_done"] = False
+                    sibling["_durable_state"] = "queued"
+                    selected.append(sibling)
                 break
-        if not selected:
-            return
-        for index, item in enumerate(selected):
-            item_context = item.get("_context")
-            if item_context is None:
-                item_context = contextvars.copy_context()
+            if not selected:
+                return
 
-            def admit_and_submit() -> tuple[bool, Optional[str]]:
+            for index, item in enumerate(selected):
+                delegation_id = item["delegation_id"]
                 try:
-                    with _DB_LOCK, _transaction() as conn:
-                        changed = conn.execute(
-                            "UPDATE async_delegations SET state='running', updated_at=? "
-                            "WHERE delegation_id=? AND state='queued'",
-                            (time.time(), item["delegation_id"]),
-                        ).rowcount
+                    changed = _record_context_run(item, _persist_transition, delegation_id, "queued", "admitted")
                 except Exception:
-                    logger.exception("Could not persist admission of queued delegation %s", item["delegation_id"])
-                    return False, None
+                    logger.exception("Could not persist admission of queued delegation %s", delegation_id)
+                    changed = 0
                 if changed != 1:
-                    logger.error("Could not persist admission of queued delegation %s: expected one row, changed %s",
-                                 item["delegation_id"], changed)
-                    return False, None
-                return True, _submit_record(item, item["max_async_children"])
-
-            admitted, error = item_context.copy().run(admit_and_submit)
-            if not admitted:
-                # The durable row is still queued (or the write failed before
-                # its state could change). Restore every not-yet-submitted unit
-                # in memory and leave it for a later admission pass. Most
-                # importantly, never submit a runner while the ledger says
-                # that it is queued: recovery must not report started work as
-                # never started.
-                with _records_lock:
-                    for pending in reversed(selected[index:]):
-                        live = _records.get(pending["delegation_id"])
-                        if live is None or live.get("status") != "running":
-                            continue
-                        live["status"] = "queued"
-                        live["queue_reason"] = "async pool capacity"
-                        live["queued_at"] = time.time()
+                    durable = _record_context_run(item, _durable_state, delegation_id)
+                    if durable and durable["state"] in _TERMINAL_STATES:
+                        item["status"] = durable["state"]
+                        item["_slot_reserved"] = False
+                        item["_slot_release_done"] = True
+                    else:
+                        item["status"] = "queued"
+                        item["_slot_reserved"] = False
+                        item["queue_reason"] = "async pool capacity"
+                        _PENDING_QUEUE.appendleft(delegation_id)
+                    for pending in selected[index + 1:]:
+                        pending["status"] = "queued"
+                        pending["_slot_reserved"] = False
                         _PENDING_QUEUE.appendleft(pending["delegation_id"])
-                return
-            if not error:
-                continue
-            if error == _BACKEND_RETIRING:
-                # The fence can close after the first sibling is admitted. Keep
-                # this and every later sibling queued; their results remain
-                # controllable and durable until a later admission pass.
-                with _records_lock:
-                    for pending in reversed(selected[index:]):
-                        live = _records.get(pending["delegation_id"])
-                        if live is None or live.get("status") != "running":
-                            continue
-                        live["status"] = "queued"
-                        live["queue_reason"] = "async pool capacity"
-                        live["queued_at"] = time.time()
-                        _PENDING_QUEUE.appendleft(pending["delegation_id"])
-                for pending in selected[index:]:
-                    pending_context = pending.get("_context")
-                    if pending_context is None:
-                        pending_context = contextvars.copy_context()
+                    return
+                item["_durable_state"] = "admitted"
 
-                    def requeue_pending() -> None:
+            # Transition every selected record to running before submit.  This
+            # closes the cancellation window while the executor is being called.
+            for index, item in enumerate(selected):
+                delegation_id = item["delegation_id"]
+                try:
+                    changed = _record_context_run(item, _persist_transition, delegation_id, "admitted", "running")
+                except Exception:
+                    logger.exception("Could not persist running admission of %s", delegation_id)
+                    changed = 0
+                if changed != 1:
+                    durable = _record_context_run(item, _durable_state, delegation_id)
+                    item["_slot_reserved"] = False
+                    if durable and durable["state"] in _TERMINAL_STATES:
+                        item["status"] = durable["state"]
+                    else:
+                        # Reconcile a failed/0-row write explicitly.  Do not
+                        # submit while the ledger is not provably running.
+                        item["status"] = "queued"
+                        item["queue_reason"] = "async pool capacity"
+                        _PENDING_QUEUE.appendleft(delegation_id)
                         try:
-                            with _DB_LOCK, _transaction() as conn:
-                                conn.execute("UPDATE async_delegations SET state='queued', updated_at=? WHERE delegation_id=? AND state='running'",
-                                             (time.time(), pending["delegation_id"]))
+                            _record_context_run(item, _persist_transition, delegation_id, "admitted", "queued")
                         except Exception:
-                            logger.exception("Could not requeue retiring delegation %s", pending["delegation_id"])
-
-                    pending_context.copy().run(requeue_pending)
-                # The monitor may be the only actor that retries admission.  A
-                # retirement fence reopening must therefore wake it explicitly,
-                # even when this pass was the one that was about to exit.
-                _ensure_stale_monitor()
-                return
-            item_context.copy().run(
-                _finalize, item["delegation_id"], item["crash_result"](error, 0.0), "error")
+                            logger.exception("Could not reconcile admission of %s back to queued", delegation_id)
+                    for pending in selected[index + 1:]:
+                        pending["status"] = "queued"
+                        pending["_slot_reserved"] = False
+                        _PENDING_QUEUE.appendleft(pending["delegation_id"])
+                    return
+                _transition_memory_locked(item, "running", expected="admitted")
+                item["_durable_state"] = "running"
+                item["_started"] = False
+                error = _record_context_run(item, _submit_record, item, item["max_async_children"])
+                if error:
+                    item["_slot_reserved"] = False
+                    if error == _BACKEND_RETIRING:
+                        # The submission fence closed without creating a
+                        # Future. Keep durable queued work for the fence reopen
+                        # retry; no slot is released before actual Future done.
+                        changed = _record_context_run(item, _persist_transition, delegation_id, "running", "queued")
+                        if changed == 1:
+                            item["status"] = "queued"
+                            item["_durable_state"] = "queued"
+                            item["_slot_reserved"] = False
+                            item["queue_reason"] = "async pool capacity"
+                            _PENDING_QUEUE.appendleft(delegation_id)
+                            _ensure_stale_monitor()
+                            return
+                    item["_schedule_error"] = error
+                    if not item.get("_initially_queued"):
+                        # Direct dispatch callers own the existing synchronous
+                        # fallback and its resources on schedule rejection. Do
+                        # not emit a spurious completion or call cancel_fn.
+                        item["status"] = "failed"
+                        _record_context_run(item, _persist_transition, delegation_id, "running", "failed")
+                    else:
+                        _record_context_run(item, _finalize, item["delegation_id"], item["crash_result"](error, 0.0), "error")
+            # Loop again: a done callback may have released a slot while this
+            # batch was being submitted, and the queue should fill capacity.
 
 
 def _dispatch_admitted(
@@ -1034,7 +1148,8 @@ def _dispatch_admitted(
         "context": context, "toolsets": list(toolsets) if toolsets else None, "role": role, "model": model,
         "session_key": session_key, "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id, "parent_session_id": parent_session_id,
-        **_capture_routing_origin(), "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
+        **_capture_routing_origin(), "status": "queued", "_lifecycle_state": "new", "_durable_state": None,
+        "dispatched_at": dispatched_at, "completed_at": None,
         "interrupt_fn": interrupt_fn, "cancel_fn": cancel_fn, "runner": runner, "classify": classify,
         "crash_result": crash_result, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id, "max_async_children": max_async_children,
@@ -1043,12 +1158,15 @@ def _dispatch_admitted(
         "_context": contextvars.copy_context(),
         "_worker_context_runner": propagate_context_to_thread(lambda worker: worker()), "_progress_token": None,
         "_progress_ts": dispatched_at, "_interrupted_at": None, "_started": False,
-        "_slot_reserved": False,
+        "_slot_reserved": False, "_slot_release_done": True,
+        "_persisting": True, "_persist_done": threading.Event(),
     }
     with _records_lock:
         active_slots = _active_slots_locked()
         slot = record["slot_key"]
-        if slot not in active_slots and len(active_slots) >= max_async_children:
+        initially_queued = slot not in active_slots and len(active_slots) >= max_async_children
+        record["_initially_queued"] = initially_queued
+        if initially_queued:
             queued_same_slot = any(
                 r.get("status") == "queued"
                 and (r.get("slot_key") or r["delegation_id"]) == slot
@@ -1057,44 +1175,50 @@ def _dispatch_admitted(
             if _queued_count_locked() >= max(0, int(max_queued_delegations)) and not queued_same_slot:
                 return {"status": "rejected", "at_capacity": True, "queue_full": True,
                         "error": capacity_error + " The bounded pending queue is also full; nothing was started."}
-            record["status"] = "queued"
             record["queue_reason"] = "async pool capacity"
             record["queued_at"] = time.time()
+        else:
+            _PENDING_ADMISSION_SLOTS.add(slot)
         _records[delegation_id] = record
     try:
-        # Persist before publishing to the in-memory admission queue.  A queued
-        # record may be visible while this write is in flight, but it cannot be
-        # admitted until its durable row exists.
+        # Publish no admission-eligible queue entry until this insert commits.
+        # Cancellation observes ``_persisting`` and waits for this same record
+        # to become durable before taking the terminal transition.
         _persist_dispatch(record)
     except Exception as exc:
         with _records_lock:
             _records.pop(delegation_id, None)
-            try:
-                _PENDING_QUEUE.remove(delegation_id)
-            except ValueError:
-                pass
+            _PENDING_ADMISSION_SLOTS.discard(record["slot_key"])
+        record["_persist_done"].set()
+        logger.error("Failed to persist new async delegation %s", delegation_id, exc_info=True)
         return {"status": "rejected", "error": f"Failed to persist async delegation{label}: {exc}"}
-    if record["status"] == "queued":
-        with _records_lock:
-            live = _records.get(delegation_id)
-            publish = live is record and live.get("status") == "queued"
-            if publish:
-                _PENDING_QUEUE.append(delegation_id)
-        if publish:
-            _ensure_stale_monitor()
+    cancel_after_persist = False
+    with _records_lock:
+        record["_persisting"] = False
+        record["_persist_done"].set()
+        record["_lifecycle_state"] = "persisted"
+        record["_durable_state"] = "queued"
+        _PENDING_ADMISSION_SLOTS.discard(record["slot_key"])
+        if record.get("_cancel_requested"):
+            cancel_after_persist = True
+        else:
+            _PENDING_QUEUE.append(delegation_id)
             _admit_pending()
-            return {"status": "queued", "delegation_id": delegation_id, "queue_reason": record["queue_reason"]}
-        # A concurrent interrupt/finalization won the race during persistence;
-        # do not re-publish a terminal record or report it as queued.
-        return {"status": record.get("status", "interrupted"), "delegation_id": delegation_id}
-    error = _submit_record(record, max_async_children)
-    if error:
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        with _DB_LOCK, _transaction() as conn:
-            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
-        return {"status": "rejected", "error": error}
-    return {"status": "dispatched", "delegation_id": delegation_id}
+        status = record.get("status")
+    if cancel_after_persist:
+        _interrupt_records([record], "interrupt_delegation", record.get("_cancel_reason", "cancelled"),
+                           "Interrupted %d async delegation(s) (%s)")
+        return {"status": "cancelled", "delegation_id": delegation_id}
+    with _records_lock:
+        if record.get("_schedule_error"):
+            return {"status": "rejected", "error": record["_schedule_error"]}
+        if status == "queued" or record.get("_initially_queued"):
+            _ensure_stale_monitor()
+            return {"status": "queued", "delegation_id": delegation_id,
+                    "queue_reason": record.get("queue_reason", "async pool capacity")}
+        if status in _TERMINAL_STATES:
+            return {"status": status, "delegation_id": delegation_id}
+        return {"status": "dispatched", "delegation_id": delegation_id}
 
 
 def dispatch_async_delegation(
@@ -1198,39 +1322,36 @@ def supersede_delegation(delegation_id: str, replacement_id: str, reason: str = 
 
 
 def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot: Optional[Dict[str, Any]] = None) -> None:
-    """Atomically claim terminal delivery, push the completion event, then mark ``status``.
-    ``result`` is a dict or a callable receiving the record snapshot (stall path). The record
-    stays active ("finalizing") until durable persistence and queue publication finish; otherwise
-    process shutdown can kill this daemon worker after status flips but before SQLite commits.
-    A second call for the same id (late runner return after a forced stall) is a no-op.
+    """Claim one terminal transition and publish its result.
 
-    ``_claimed_snapshot`` is used by queued cancellation, which must transition
-    queued -> finalizing under ``_records_lock`` before admission can race it.
+    The user-visible terminal state may precede executor completion, but the
+    capacity reservation remains set until the Future done callback releases it.
     """
     if _claimed_snapshot is None:
         with _records_lock:
             record = _records.get(delegation_id)
             if record is None or record.get("status") not in _FINALIZABLE_STATES:
                 return
-            was_queued = record.get("status") == "queued"
-            # Admission changes queued -> running before executor.submit(). If
-            # submit then fails, the runner never started, but the unit still
-            # owns child/writer resources that cancel_fn must release.
-            was_admitted_unstarted = record.get("status") == "running" and not record.get("_started")
-            record["status"] = "finalizing"
+            prior_status = record.get("status")
+            expected_state = record.get("_durable_state") or prior_status
+            was_queued = prior_status == "queued"
+            was_admitted_unstarted = prior_status == "admitted" or (prior_status == "running" and not record.get("_started"))
+            _transition_memory_locked(record, "finalizing")
+            record["_durable_state"] = expected_state
             record["completed_at"] = time.time()
-            # Keep the capacity slot occupied until the executor future has
-            # actually returned.  A forced stall finalization reports terminal
-            # state immediately, but its runner may still be executing.
-            future = record.get("_future")
-            record["_slot_reserved"] = bool(future is not None and not future.done())
-            record["interrupt_fn"] = None  # drop the closure; child is done
-            record["progress_fn"] = None  # stop stale-monitor sampling
+            # Do not infer reservation from Future.done(): only its callback may
+            # release a submitted slot, and the callback may not have run yet.
+            if record.get("_future") is None and prior_status in {"queued", "admitted"}:
+                record["_slot_reserved"] = False
+                record["_slot_release_done"] = True
+            record["interrupt_fn"] = None
+            record["progress_fn"] = None
             snapshot = dict(record)
     else:
         snapshot = _claimed_snapshot
-        was_queued = True
-        was_admitted_unstarted = False
+        prior_status = snapshot.get("_durable_state") or "queued"
+        was_queued = prior_status == "queued"
+        was_admitted_unstarted = prior_status == "admitted"
     if (was_queued or was_admitted_unstarted) and snapshot.get("cancel_fn") is not None:
         try:
             snapshot["cancel_fn"]("queued delegation cancelled")
@@ -1238,10 +1359,12 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             logger.debug("Queued delegation %s cleanup failed", delegation_id, exc_info=True)
     _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
     with _records_lock:
-        if delegation_id in _records:
-            _records[delegation_id]["status"] = status
+        live = _records.get(delegation_id)
+        if live is not None:
+            _transition_memory_locked(live, status, expected="finalizing")
+            live["_durable_state"] = live.get("_terminal_state") or status
         _prune_completed_locked()
-    _admit_pending()
+    # A terminal event does not free a submitted slot; only release_slot does.
 
 
 def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], status: str) -> None:
@@ -1288,14 +1411,23 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         # outcome. Record the result durably, but never wake the parent for an attempt it no longer waits on.
         evt.update(superseded_by=record["superseded_by"], superseded_reason=record.get("superseded_reason") or "")
         try:
-            _persist_completion(evt, result, delivery_state="superseded")
+            _persist_completion(evt, result, delivery_state="superseded",
+                                expected_state=record.get("_durable_state") or "running")
         except Exception as exc:  # noqa: BLE001 — the replacement still reports; only the audit row is lost
             logger.error("Async delegation %s: superseded completion write failed: %s", record.get("delegation_id"), exc)
         logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
                     label, record.get("delegation_id"), record["superseded_by"])
         return
     try:
-        _persist_completion(evt, result)
+        persist_evt = dict(evt)
+        persist_evt["status"] = record.get("_terminal_state") or status
+        ok = _persist_completion(persist_evt, result, expected_state=record.get("_durable_state") or "running")
+        if not ok:
+            # Explicit reconcile: a competing terminal transition won the
+            # conditional update. Never replace its event/result payload.
+            durable = _record_context_run(record, _durable_state, record["delegation_id"])
+            logger.error("Async delegation %s terminal reconcile found durable state %s",
+                         record.get("delegation_id"), durable.get("state") if durable else None)
     except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
         logger.error(f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
                      "only (a restart may report this unit as unknown): %s", record.get("delegation_id"), exc)
@@ -1363,7 +1495,7 @@ def _sweep_stale_locked(now: float):
     stalled, expired, any_monitorable = [], [], False  # (delegation_id, quiet_for, in_tool) / ids past grace
     for record in _records.values():
         status = record.get("status")
-        if status == "queued":
+        if status in ("queued", "admitted"):
             any_monitorable = True
             continue
         if status == "stalling":
@@ -1438,6 +1570,8 @@ def _stale_monitor_loop() -> None:
     ``stalling`` and calls ``interrupt_fn``; a ``stalling`` record still unreturned after the
     grace window is force-finalized with a terminal ``stalled`` event."""
     while not _monitor_stop.wait(_STALE_CHECK_INTERVAL):
+        # Retirement prepare may reopen without a Future callback. Preserve
+        # the existing bounded retry wake for durable queued records.
         _admit_pending()
         now = time.time()
         with _records_lock:
@@ -1580,6 +1714,7 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
     for record in targets:
         queued_snapshot = None
         queued_interrupt_fn = None
+        persist_wait = None
         delegation_id = record.get("delegation_id")
         if not delegation_id:
             continue
@@ -1588,19 +1723,35 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
             if live is None or live.get("status") not in _INTERRUPTIBLE_STATES:
                 continue
             if live.get("status") == "queued":
-                try:
-                    _PENDING_QUEUE.remove(live["delegation_id"])
-                except ValueError:
-                    pass
-                live["status"] = "finalizing"
-                live["completed_at"] = time.time()
-                queued_interrupt_fn = live.get("interrupt_fn")
-                live["interrupt_fn"] = None
-                live["progress_fn"] = None
-                queued_snapshot = dict(live)
-                interrupt_fn = None
+                if live.get("_persisting"):
+                    # Record the request while the insert owns the lifecycle
+                    # handoff; dispatch will not publish/admit this record.
+                    live["_cancel_requested"] = True
+                    live["_cancel_reason"] = reason
+                    persist_wait = live.get("_persist_done")
+                else:
+                    prior_status = live.get("status")
+                    try:
+                        _PENDING_QUEUE.remove(live["delegation_id"])
+                    except ValueError:
+                        pass
+                    _transition_memory_locked(live, "finalizing")
+                    live["_durable_state"] = prior_status
+                    live["completed_at"] = time.time()
+                    if prior_status == "queued":
+                        live["_slot_reserved"] = False
+                        live["_slot_release_done"] = True
+                    queued_interrupt_fn = live.get("interrupt_fn")
+                    live["interrupt_fn"] = None
+                    live["progress_fn"] = None
+                    queued_snapshot = dict(live)
+                    interrupt_fn = None
             else:
                 interrupt_fn = live.get("interrupt_fn")
+        if persist_wait is not None:
+            persist_wait.wait(30)
+            count += _interrupt_records([record], caller, reason, msg)
+            continue
         if queued_snapshot is not None:
             count += 1
             queued_context = queued_snapshot.get("_context")
@@ -1611,9 +1762,10 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
                 _call_interrupt(
                     queued_interrupt_fn, "%s: %s interrupt failed: %s", caller, delegation_id, reason=reason,
                 )
+                queued_snapshot["_terminal_state"] = "cancelled" if caller == "interrupt_delegation" else "interrupted"
                 _finalize(
                     queued_snapshot["delegation_id"],
-                    {"status": "interrupted", "summary": None, "error": reason, "exit_reason": "interrupted",
+                    {"status": "cancelled", "summary": None, "error": reason, "exit_reason": "cancelled",
                      "results": [] if queued_snapshot.get("is_batch") else None},
                     "interrupted",
                     _claimed_snapshot=queued_snapshot,
@@ -1670,6 +1822,7 @@ def _reset_for_tests() -> None:
     with _records_lock:
         _records.clear()
         _PENDING_QUEUE.clear()
+        _PENDING_ADMISSION_SLOTS.clear()
     with _orphan_lock:
         _offered.clear()
         _last_orphan_sweep.clear()

@@ -3,7 +3,29 @@
 Load this unit when changing background `delegate_task` admission, capacity
 handling, pending work visibility, cancellation, or completion routing.
 
-## Required behavior
+## Lock-owned lifecycle table
+
+`tools/async_delegation.py` treats each record as one state machine under
+`_records_lock` (a re-entrant lock only so an already-complete Future can invoke
+its callback synchronously):
+
+| State | Durable precondition | Allowed next state | Capacity rule |
+| --- | --- | --- | --- |
+| `new` | no ledger row yet | `queued` | no admission eligibility |
+| `queued` (persisted) | durable INSERT committed | `admitted` or `cancelled` | no executor slot |
+| `admitted` | conditional `queued -> admitted` committed | `running` or terminal failure/cancellation | slot reserved before submit |
+| `running` | conditional `admitted -> running` committed | `completed`, `failed`, `interrupted`, `stalled`, or `unknown` | slot held until Future done callback |
+| `terminal` | conditional UPDATE from the expected prior state committed | none | slot remains held if a Future is still running |
+
+Admission reserves the slot while holding the lock, then submits the Future;
+the Future's done callback is the sole normal release authority, including when
+the worker returned before `submit()` returned and when stale/force finalization
+reported a terminal result early. A queued cancellation is serialized with the
+initial INSERT, never submits a runner, and updates an existing row rather than
+using `INSERT OR REPLACE`, preserving `event_json` and `result_json`. Every
+conditional write treats a zero-row result as a reconcile path; it never submits
+or silently advances in-memory state on that result. `_admit_pending` runs only
+from a new persisted record or a slot-release callback and loops to capacity.
 
 - A gateway or other async-capable session must never run a rejected background
   delegation inline merely because the async pool is full. The tool returns a

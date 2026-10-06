@@ -240,6 +240,156 @@ def test_dispatch_queues_at_capacity_and_admits_after_slot_release():
     assert _drain_for(queued["delegation_id"]) is not None
 
 
+def test_worker_finishes_before_submit_returns_keeps_slot_reserved(monkeypatch):
+    """A completed worker cannot free capacity until its Future callback runs."""
+    from concurrent.futures import Future
+
+    class DeferredCallbackFuture(Future):
+        def __init__(self):
+            super().__init__()
+            self._deferred = []
+
+        def add_done_callback(self, fn):
+            if self.done():
+                self._deferred.append(fn)
+            else:
+                super().add_done_callback(fn)
+
+        def fire_callbacks(self):
+            callbacks, self._deferred = self._deferred, []
+            for fn in callbacks:
+                fn(self)
+
+    class FinishBeforeReturnExecutor:
+        def __init__(self):
+            self.futures = []
+
+        def submit(self, fn, arg):
+            future = DeferredCallbackFuture()
+            thread = threading.Thread(target=lambda: (fn(arg), future.set_result(None)), daemon=True)
+            thread.start()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            self.futures.append(future)
+            return future
+
+    executor = FinishBeforeReturnExecutor()
+    monkeypatch.setattr(ad, "_get_executor", lambda _: executor)
+    first = ad.dispatch_async_delegation(
+        goal="fast", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "fast"}, max_async_children=1,
+    )
+    started = threading.Event()
+    second = ad.dispatch_async_delegation(
+        goal="queued", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (started.set(), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
+    )
+    assert first["status"] in {"dispatched", "completed"}
+    assert second["status"] == "queued"
+    assert not started.is_set()
+    with ad._records_lock:
+        assert ad._records[first["delegation_id"]]["_slot_reserved"] is True
+    executor.futures[0].fire_callbacks()
+    assert started.wait(5)
+    assert _drain_for(first["delegation_id"]) is not None
+    assert _drain_for(second["delegation_id"]) is not None
+
+
+def test_cancel_during_persist_never_submits_and_preserves_terminal_payload(monkeypatch):
+    persist_entered = threading.Event()
+    allow_persist = threading.Event()
+    started = threading.Event()
+    dispatch_result = {}
+    original_persist = ad._persist_dispatch
+
+    def delayed_persist(record):
+        persist_entered.set()
+        assert allow_persist.wait(5)
+        original_persist(record)
+
+    monkeypatch.setattr(ad, "_persist_dispatch", delayed_persist)
+    thread = threading.Thread(target=lambda: dispatch_result.update(ad.dispatch_async_delegation(
+        goal="cancel while inserting", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (started.set(), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
+    )), daemon=True)
+    thread.start()
+    assert persist_entered.wait(5)
+    delegation_id = next(iter(ad._records))
+    stopper = threading.Thread(target=lambda: ad.interrupt_delegation(delegation_id, reason="cancel during persist"), daemon=True)
+    stopper.start()
+    with ad._records_lock:
+        assert ad._records[delegation_id].get("_cancel_requested") is True
+    allow_persist.set()
+    thread.join(timeout=5)
+    stopper.join(timeout=5)
+    assert not thread.is_alive()
+    assert not stopper.is_alive()
+    assert not started.is_set()
+    assert dispatch_result["status"] == "cancelled"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT state, event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    assert row[0] == "cancelled"
+    assert row[1] is not None and row[2] is not None
+
+
+def test_randomized_capacity_stress_never_exceeds_slot_cap():
+    import random
+
+    n = 40
+    cap = 3
+    release = threading.Event()
+    started_count = 0
+    current = 0
+    max_current = 0
+    state_lock = threading.Lock()
+    barrier = threading.Barrier(n)
+    handles = []
+    handles_lock = threading.Lock()
+    rng = random.Random(309)
+    cancel_indexes = {i for i in range(n) if rng.random() < 0.45}
+
+    def runner():
+        nonlocal started_count, current, max_current
+        with state_lock:
+            started_count += 1
+            current += 1
+            max_current = max(max_current, current)
+        release.wait(10)
+        with state_lock:
+            current -= 1
+        return {"status": "completed"}
+
+    def submit(i):
+        barrier.wait(timeout=10)
+        handle = ad.dispatch_async_delegation(
+            goal=f"stress-{i}", context=None, toolsets=None, role="leaf", model="m", session_key="",
+            runner=runner, max_async_children=cap, max_queued_delegations=n,
+        )
+        with handles_lock:
+            handles.append((i, handle))
+
+    threads = [threading.Thread(target=submit, args=(i,), daemon=True) for i in range(n)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+    assert all(not thread.is_alive() for thread in threads)
+    for index, handle in list(handles):
+        if index in cancel_indexes and handle["status"] == "queued":
+            ad.interrupt_delegation(handle["delegation_id"], reason="stress cancel")
+    release.set()
+    deadline = time.monotonic() + 10
+    while ad.active_count() and time.monotonic() < deadline:
+        threading.Event().wait(0.01)
+    assert max_current <= cap
+    assert started_count <= n
+
+
 def test_force_finalized_runner_holds_slot_until_future_stops():
     entered = threading.Event()
     release = threading.Event()
