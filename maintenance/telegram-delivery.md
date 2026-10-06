@@ -122,7 +122,9 @@ never eats a transport deadline. A request inside a durably recorded server pena
 locally with `RetryAfter` for every path. Any published `retry_after` widens that chat's gap
 2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
 floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
-`TurnRunner._PROGRESS_EDIT_INTERVAL` is 10.0s, the transport edit floor. It was 3.0s until
+`TelegramAdapter.PROGRESS_EDIT_INTERVAL` is 10.0s, the transport edit floor, and
+`TurnRunner._progress_edit_interval` uses it for Telegram progress bubbles. Other platforms keep
+the runner default (`TurnRunner._PROGRESS_EDIT_INTERVAL`, 3.0s). Telegram used 3.0s until
 2026-10-06, when the daily call counter showed progress-bubble edits were the largest share of
 typed-turn calls on a chat that hit a daily volume ban; Brian approved slower bubble updates.
 

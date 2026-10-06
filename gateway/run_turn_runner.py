@@ -572,10 +572,19 @@ class TurnRunner:
         # no edit, split, or send, so a refused bubble is not retried once per incoming tool line.
         defer_until: float = 0.0
 
-    # Minimum seconds between progress edits. Kept no faster than Telegram's per-chat interim-edit
-    # floor (plugins/platforms/telegram/chat_budget.EDIT_FLOOR_SECS): a producer faster than the
+    # Default minimum seconds between progress edits. An adapter may raise it with
+    # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
+    # plugins/platforms/telegram/chat_budget.EDIT_FLOOR_SECS): a producer faster than the
     # transport delivers no extra updates, it only parks edits inside the chat's send lock.
-    _PROGRESS_EDIT_INTERVAL = 10.0
+    _PROGRESS_EDIT_INTERVAL = 3.0
+
+    @classmethod
+    def _progress_edit_interval(cls, adapter) -> float:
+        try:
+            value = float(getattr(adapter, "PROGRESS_EDIT_INTERVAL", None) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        return max(cls._PROGRESS_EDIT_INTERVAL, value)
 
     def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
@@ -681,7 +690,7 @@ class TurnRunner:
         the platform just said is exhausted.
         """
         if cls._is_flood_refusal(result):
-            wait = max(float(getattr(result, "retry_after", None) or 0.0), cls._PROGRESS_EDIT_INTERVAL)
+            wait = max(float(getattr(result, "retry_after", None) or 0.0), cls._progress_edit_interval(st.adapter))
             st.defer_until = time.monotonic() + wait
             logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
             return True
@@ -799,7 +808,7 @@ class TurnRunner:
             return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = self._PROGRESS_EDIT_INTERVAL
+        EDIT_INTERVAL = self._progress_edit_interval(adapter)
         while True:
             try:
                 if not ctx._run_still_current():
