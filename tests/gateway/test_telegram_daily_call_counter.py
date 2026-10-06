@@ -151,7 +151,42 @@ def test_long_retry_after_logs_the_window_counts(tmp_path, caplog):
     assert recorded == [("2027045491", 34507.0)]
     text = caplog.text
     assert "retry_after=34507.0s (trigger untagged)" in text
-    assert "calls since" in text and "(retry_after=34507s): 2 total" in text
+    assert "(retry_after=34507s on chat 2027045491): 2 total" in text
+
+
+def test_long_retry_after_summary_covers_every_chat(tmp_path, caplog):
+    """Per-chat vs per-bot: the refusal must log every chat's window, not just the offender's."""
+    from telegram.error import RetryAfter
+    wall = _Wall()
+    limiter, counter = _limiter(tmp_path, wall)
+    counter.record("-100777", "sendMessage", "untagged")
+    counter.record("-100777", "sendMessage", "untagged")
+
+    async def run():
+        with pytest.raises(RetryAfter):
+            await _call(limiter, "editMessageText", result=RetryAfter(dt.timedelta(seconds=3600)))
+
+    with caplog.at_level(logging.INFO, logger=chat_budget.__name__):
+        asyncio.run(run())
+        _drain(counter)
+    assert "Telegram chat -100777 calls since" in caplog.text
+    assert "Telegram chat 2027045491 calls since" in caplog.text
+
+
+def test_default_counter_is_bound_to_the_callers_profile(tmp_path, monkeypatch):
+    """Two profiles in one process must not share (or cross-persist) a counter."""
+    import hermes_constants
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: a)
+    counter_a = chat_budget.call_counter()
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: b)
+    counter_b = chat_budget.call_counter()
+    assert counter_a is not counter_b
+    assert counter_a._profile_dir == a and counter_b._profile_dir == b
+    counter_b.record("1", "sendMessage", "typed")
+    counter_b.flush()
+    assert (b / "telegram-flood-state.db").exists() and not (a / "telegram-flood-state.db").exists()
 
 
 def _drain(counter, timeout=5.0):

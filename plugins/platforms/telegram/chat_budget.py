@@ -338,8 +338,10 @@ class ChatBudgetRateLimiter:
                 logger.warning("Telegram chat %s: %s refused with retry_after=%.1fs (trigger %s)",
                                key, endpoint, wait, current_trigger())
                 if wait >= COUNTER_LONG_PENALTY_SECS:
+                    # Every chat's totals, not just this one: comparing them at the refusal is what
+                    # tells a per-chat volume limit from a per-bot one.
                     try:
-                        self.counter.request_summary(key, reason=f"retry_after={wait:.0f}s")
+                        self.counter.request_summary(None, reason=f"retry_after={wait:.0f}s on chat {key}")
                     except Exception:
                         logger.debug("Telegram call counter summary failed", exc_info=True)
                 if self._on_retry_after is not None:
@@ -579,17 +581,24 @@ def _top(counts: Dict[str, int], n: int = 8) -> str:
     return json.dumps(dict(sorted(counts.items(), key=lambda kv: -kv[1])[:n]), separators=(",", ":"))
 
 
-_COUNTERS: Dict[Optional[str], DailyCallCounter] = {}
+_COUNTERS: Dict[str, DailyCallCounter] = {}
 _COUNTERS_LOCK = threading.Lock()
 
 
 def call_counter(profile_dir: Optional[Path] = None) -> DailyCallCounter:
-    """One counter per profile directory, shared by the gateway bot and the standalone lane."""
-    key = str(Path(profile_dir).resolve()) if profile_dir is not None else None
+    """One counter per profile directory, shared by the gateway bot and the standalone lane.
+
+    ``None`` resolves the active profile NOW, on the caller's context, so the counter is bound to
+    a concrete directory before any background worker (which does not inherit the profile
+    ContextVar) touches disk. Two profiles in one process therefore never share a counter."""
+    if profile_dir is None:
+        from hermes_constants import get_hermes_home
+        profile_dir = Path(get_hermes_home())
+    key = str(Path(profile_dir).resolve())
     with _COUNTERS_LOCK:
         counter = _COUNTERS.get(key)
         if counter is None:
-            counter = _COUNTERS[key] = DailyCallCounter(profile_dir)
+            counter = _COUNTERS[key] = DailyCallCounter(Path(profile_dir))
         return counter
 
 
