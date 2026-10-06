@@ -325,7 +325,7 @@ async def test_fifo_voice_from_queue_command_prefetches_before_drain():
         queued = adapter._pending_messages["telegram:dm:12345"]
         await asyncio.wait_for(queued._gateway_pending_stt_prefetch, 3)
         text, _transcripts = await runner._transcribe_pending_audio_event_once(queued)
-    assert reply.startswith("Queued for the next turn")
+    assert reply.startswith("⏳ Queued for the next turn")
     assert text == '"explicit queue"'
     transcribe.assert_called_once()
 
