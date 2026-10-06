@@ -758,7 +758,7 @@ gateway:
 
   queue:
     usage: "Usage: /queue <prompt>"
-    queued: "Queued for the next turn."
+    queued: "⏳ Queued for the next turn."
     queued_depth: " ({depth} queued)"
 
   steer:

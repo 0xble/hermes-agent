@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ Gepouseer{suffix}. Nuwe cron-/kanban-/gateway-werk is opgeskort; werk wat reeds loop, word normaal voltooi. Gebruik `/pause off` om te hervat."
   queue:
     usage: "Gebruik: /queue <prompt>"
-    queued: "In die tou vir die volgende beurt."
+    queued: "⏳ In die tou vir die volgende beurt."
     queued_depth: " ({depth} in die tou)"
   steer:
     usage: "Gebruik: /steer <prompt>"

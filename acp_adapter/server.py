@@ -749,7 +749,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 except Exception:
                     logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
             state.queued_prompts.append(user_text or "[Image attachment]")
-            return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
+            return f"⏳ Queued for the next turn. ({len(state.queued_prompts)} queued)"
 
     def _run_agent_turn(
         self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
