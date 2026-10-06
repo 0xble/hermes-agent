@@ -3664,9 +3664,6 @@ class TelegramAdapter(BasePlatformAdapter):
             claim.failed = True
 
     async def handle_message(self, event: MessageEvent) -> None:
-        # Label this turn's Bot API calls for the daily call counter (chat_budget.py). The turn
-        # task is created inside, so it inherits the label; measurement only.
-        trigger_token = bind_trigger(event)
         if getattr(self, "_owned_routing", None) is None:
             # Without owned admission, native dispatch may hand work off before
             # returning (including a task that outlives a cancelled callback).
@@ -3676,9 +3673,25 @@ class TelegramAdapter(BasePlatformAdapter):
         except BaseException:
             self._fail_update_preparation()
             raise
+        self._accept_update()
+
+    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        # Label this turn's Bot API calls for the daily call counter (chat_budget.py). Bound here,
+        # where every turn runs (including busy-session events drained later from another turn's
+        # task), so a queued goal/relay/process turn is never counted under its predecessor.
+        trigger_token = bind_trigger(event)
+        try:
+            await super()._process_message_background(event, session_key)
         finally:
             reset_trigger(trigger_token)
-        self._accept_update()
+
+    def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
+        # The runner also drains a parked event in-band as the next turn of the SAME task; relabel
+        # the rest of that task so the follow-up's calls are counted under its own trigger.
+        event = super().get_pending_message(session_key)
+        if event is not None:
+            bind_trigger(event)
+        return event
 
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""

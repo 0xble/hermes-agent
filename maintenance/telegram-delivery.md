@@ -343,14 +343,18 @@ Its size, and whether it applies per chat or per bot, were not known because suc
 were only logged at debug level.
 
 **Contract.** `ChatBudgetRateLimiter` counts every metered call that reaches Telegram in
-`DailyCallCounter`, by chat, endpoint and trigger, in hourly buckets. Local penalty refusals and
-shed typing or drafts are not counted. `TelegramAdapter.handle_message` binds the trigger
-(`typed`, `goal`, `loop`, `relay`, `process`, `delegation`, `restart`, `heartbeat`, `internal`)
-in a ContextVar that the turn task inherits. Calls outside a turn (cron delivery, outbox
+`DailyCallCounter`, by chat, endpoint and trigger, in hourly buckets, after the request returns so
+measurement never shifts pacing. Local penalty refusals and shed typing or drafts are not counted.
+`TelegramAdapter._process_message_background` binds the trigger (`typed`, `goal`, `loop`, `relay`,
+`process`, `delegation`, `restart`, `heartbeat`, `internal`) in a ContextVar for the turn task, and
+`get_pending_message` rebinds it when the runner drains a queued event in-band, so a turn queued
+behind a busy session is never counted under its predecessor. Calls outside a turn (cron delivery, outbox
 replay, housekeeping) are `untagged`. Counts flush additively to `call_counts` in the profile's
 `telegram-flood-state.db` at most once a minute, are kept for 30 days, and log a 24h summary hourly
 (whole hourly buckets from the first hour at or after the cutoff, never reaching back before it).
-The first call after an idle period starts the worker, so a quiet profile persists within a minute. Any `retry_after` of 600s or more also logs every chat's window counts for the profile, so per-chat and per-bot limits can be told apart. Each profile directory gets its own counter, resolved on the caller's context, never on the worker thread. The send path
+Each counter starts one long-lived daemon worker when it is created, so a quiet profile persists
+within a minute and no send pays for a thread start. Window reads include counts a locked database
+could not store yet. Any `retry_after` of 600s or more also logs every chat's window counts for the profile, so per-chat and per-bot limits can be told apart. Each profile directory gets its own counter, resolved on the caller's context, never on the worker thread. The send path
 only updates an in-memory dict. Persistence and summaries run on the counter's own daemon thread,
 so a slow or locked database cannot delay a call. The counter never sheds or refuses a call.
 Counter failures are logged at debug level and unflushed counts are kept for the next flush.

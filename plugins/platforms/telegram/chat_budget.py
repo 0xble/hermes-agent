@@ -328,7 +328,6 @@ class ChatBudgetRateLimiter:
                 return True  # sendChatAction and draft endpoints return a bare boolean
         else:
             await self.budget.take(key)
-        self._count(key, endpoint)  # only calls that reach Telegram; local refusals and sheds are free
         try:
             return await callback(*args, **kwargs)
         except Exception as error:
@@ -350,6 +349,10 @@ class ChatBudgetRateLimiter:
                     except Exception:
                         logger.warning("Could not record Telegram flood deadline for chat %s", key, exc_info=True)
             raise
+        finally:
+            # Counted after the request so measurement never shifts pacing. Every call that reached
+            # Telegram counts, refused or not; local penalty refusals and shed calls never get here.
+            self._count(key, endpoint)
 
 
 # --- Daily call counter -------------------------------------------------------------------------
@@ -437,10 +440,11 @@ class DailyCallCounter:
         self._work = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._busy = 0
-        self._db_lock = threading.Lock()
+        self._db_lock = threading.RLock()  # window() holds it across flush+read
         now = wall()
         self._last_flush = now
         self._last_log = now
+        self._ensure_worker()  # started here, never on a send path
 
     def _home(self) -> Optional[Path]:
         if self._profile_dir is None:
@@ -468,8 +472,8 @@ class DailyCallCounter:
             if due_log:
                 self._last_log = now
             self._schedule(log=due_log)
-        elif first:
-            self._ensure_worker()  # a quiet profile still persists within one flush interval
+        elif first and self._worker is None:
+            self._ensure_worker()  # only if the worker died; a quiet profile persists within one interval
 
     def _ensure_worker(self) -> None:
         with self._lock:
@@ -488,12 +492,12 @@ class DailyCallCounter:
         self._ensure_worker()
 
     def _run_worker(self) -> None:
+        # Long-lived: one idle daemon thread per profile, so no send ever pays for a thread start.
         while True:
             if not self._work.wait(timeout=self._flush_interval):
                 with self._lock:
                     if not self._dirty and not self._pending_logs:
-                        self._worker = None
-                        return
+                        continue
                     # Interval elapsed with counts pending and no explicit wake: flush them anyway.
                     self._work.set()
             with self._lock:
@@ -558,6 +562,10 @@ class DailyCallCounter:
         Counts are hourly buckets, so the window starts at the first WHOLE hour at or after
         ``since`` (it never reaches back before the cutoff). ``since`` in the result is that
         actual start, so a reader sees the exact interval covered."""
+        with self._db_lock:  # no concurrent flush can hold counts in flight while we read
+            return self._window_locked(chat, since)
+
+    def _window_locked(self, chat: Optional[str], since: Optional[float]) -> Dict[str, Any]:
         self.flush()
         since = self._wall() - _DAY if since is None else since
         floor = since if since % _HOUR == 0 else since - (since % _HOUR) + _HOUR
@@ -574,7 +582,11 @@ class DailyCallCounter:
             except (OSError, sqlite3.Error):
                 logger.debug("Could not read Telegram call counts", exc_info=True)
         chats: Dict[str, Dict[str, Any]] = {}
-        for chat_id, endpoint, trigger, count in rows:
+        # Counts the flush could not write (locked or unreadable DB) still belong in the window.
+        with self._lock:
+            unflushed = [(c, e, t, n) for (hour, c, e, t), n in self._dirty.items()
+                         if hour >= floor and (chat is None or c == chat)]
+        for chat_id, endpoint, trigger, count in [*rows, *unflushed]:
             entry = chats.setdefault(chat_id, {"total": 0, "endpoints": {}, "triggers": {}})
             entry["total"] += count
             entry["endpoints"][endpoint] = entry["endpoints"].get(endpoint, 0) + count

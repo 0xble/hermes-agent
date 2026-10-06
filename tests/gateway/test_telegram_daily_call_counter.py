@@ -232,8 +232,11 @@ def test_quiet_profile_persists_without_another_call(tmp_path):
     while _time.monotonic() < deadline:
         db = tmp_path / "telegram-flood-state.db"
         if db.exists():
-            with sqlite3.connect(db) as conn:
-                row = conn.execute("SELECT SUM(count) FROM call_counts").fetchone()
+            try:
+                with sqlite3.connect(db) as conn:
+                    row = conn.execute("SELECT SUM(count) FROM call_counts").fetchone()
+            except sqlite3.OperationalError:  # file created, table not committed yet
+                row = None
             if row and row[0] == 1:
                 return
         _time.sleep(0.02)
@@ -251,6 +254,51 @@ def test_window_never_reaches_back_before_its_cutoff(tmp_path):
     window = counter.window("1")
     assert window["chats"]["1"]["total"] == 1
     assert window["since"] == old_hour + 3600 and window["since"] >= wall.t - 86400
+
+
+def test_queued_turn_is_labelled_by_its_own_event(monkeypatch):
+    """Regression: a busy-session event drained later ran under its predecessor's trigger."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    seen = []
+
+    async def fake_process(self, event, session_key):
+        seen.append(("task", current_trigger()))
+        # The runner then drains the parked follow-up in-band on this same task.
+        self._pending_messages[session_key] = SimpleNamespace(
+            text="[ASYNC DELEGATION BATCH COMPLETE — deleg_1]", internal=True)
+        self.get_pending_message(session_key)
+        seen.append(("inband", current_trigger()))
+
+    monkeypatch.setattr(BasePlatformAdapter, "_process_message_background", fake_process)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    typed = bind_trigger(SimpleNamespace(text="hello", internal=False))  # the draining context
+    try:
+        goal = SimpleNamespace(text="[Continuing toward your standing goal] Goal: x", internal=True)
+        asyncio.run(adapter._process_message_background(goal, "k"))
+        assert current_trigger() == "typed"  # restored for the caller
+    finally:
+        reset_trigger(typed)
+    assert seen == [("task", "goal"), ("inband", "delegation")]
+
+
+def test_window_counts_what_a_locked_database_could_not_store(tmp_path):
+    wall = _Wall()
+    counter = DailyCallCounter(tmp_path, wall=wall)
+    counter.record("1", "sendMessage", "typed")
+    counter.flush()
+    counter.record("1", "editMessageText", "goal")
+    blocker = sqlite3.connect(tmp_path / "telegram-flood-state.db", timeout=0)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        assert counter.window("1")["chats"]["1"]["triggers"] == {"goal": 1}  # DB unreadable: dirty only
+    finally:
+        blocker.rollback()
+        blocker.close()
+    window = counter.window("1")
+    assert window["chats"]["1"]["total"] == 2 and window["chats"]["1"]["triggers"] == {"typed": 1, "goal": 1}
 
 
 def test_counter_failure_never_blocks_a_send(tmp_path):
