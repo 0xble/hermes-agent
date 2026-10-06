@@ -16,8 +16,17 @@ import threading
 from typing import Optional
 
 
-def hard_wall_timeout_seconds() -> float:
-    """Finite config.yaml bound, separate from inactivity and script timeouts."""
+def hard_wall_timeout_seconds(job: Optional[dict] = None) -> float:
+    """Job override or finite profile bound, separate from inactivity/script limits."""
+    from cron.jobs import _normalize_hard_wall_timeout
+
+    if job:
+        try:
+            override = _normalize_hard_wall_timeout(job.get("hard_wall_timeout_seconds"))
+            if override is not None:
+                return override
+        except ValueError:
+            pass  # Malformed legacy payloads retain the finite profile safety cap.
     from cron.scheduler import load_config_readonly
     try:
         value = float((load_config_readonly().get("cron") or {}).get("hard_wall_timeout_seconds", 7200))
