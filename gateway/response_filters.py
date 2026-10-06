@@ -122,7 +122,7 @@ def _fenced_line_states(lines: list[str]) -> list[bool]:
     return states
 
 
-def strip_trailing_silence_marker(text: Any) -> Any:
+def strip_trailing_silence_marker(text: Any, *, respect_fences: bool = True) -> Any:
     """Remove the run of top-level standalone silence-marker lines ending substantive text.
 
     One or more consecutive trailing marker lines are removed. The exact interactive
@@ -130,13 +130,15 @@ def strip_trailing_silence_marker(text: Any) -> Any:
     unchanged, and a response made only of marker lines collapses to its last marker so
     it still reaches the intentional-silence path rather than the empty-response one.
     Marker-looking lines inside fenced code are content, not control text.
+    ``respect_fences=False`` is only for raw text whose fence-aware visible form
+    (think blocks removed) already proved the trailing lines are top-level.
     """
     if not isinstance(text, str) or is_intentional_silence_response(text):
         return text
     lines = text.splitlines(keepends=True)
     if not lines:
         return text
-    fenced = _fenced_line_states(lines)
+    fenced = _fenced_line_states(lines) if respect_fences else [False] * len(lines)
     end = len(lines)
     last_marker = ""
     while end:
@@ -152,6 +154,23 @@ def strip_trailing_silence_marker(text: Any) -> Any:
         return text
     kept = "".join(lines[:end]).rstrip()
     return kept if kept.strip() else last_marker
+
+
+def ends_with_partial_silence_marker(text: Any) -> bool:
+    """True while the last top-level line of streamed ``text`` could still be a marker.
+
+    Mid-stream previews hold an edit while this is true, so prose followed by a
+    trailing ``NO_REPLY`` never shows the marker before the final strip removes it.
+    """
+    if not isinstance(text, str):
+        return False
+    lines = text.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end or _fenced_line_states(lines)[end - 1]:
+        return False
+    return is_partial_silence_marker(lines[end - 1])
 
 
 def is_autonomous_silence_response(response: Any) -> bool:

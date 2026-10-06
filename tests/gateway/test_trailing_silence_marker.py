@@ -200,3 +200,13 @@ def test_inline_think_then_prose_then_marker_strips_only_the_marker(monkeypatch)
     assert verdict.action == "break"
     assert verdict.final_response == "Done."
     assert "NO_REPLY" not in agent.persisted_messages[-1]["content"]
+
+
+def test_unclosed_fence_inside_think_block_does_not_hide_trailing_marker(monkeypatch):
+    agent = _RealThinkAgent()
+    verdict = _run_finish(monkeypatch, agent, "<think>Draft:\n```\nNO_REPLY</think>\nDone.\nNO_REPLY")
+
+    assert verdict.action == "break"
+    assert "NO_REPLY" not in verdict.final_response
+    assert verdict.final_response.endswith("Done.")
+    assert "NO_REPLY" not in agent.persisted_messages[-1]["content"].split("</think>")[-1]

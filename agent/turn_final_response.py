@@ -46,7 +46,12 @@ def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
         # Bare marker (with or without reasoning) stays as-is for the silence path; a
         # marker-only run collapses to one marker.
         return text if is_intentional_silence_response(visible) else visible_result
-    return strip_trailing_silence_marker(text)
+    if visible_result == visible:
+        return text
+    # The visible text proved the trailing marker lines are top-level. A fence opened inside
+    # a think block must not hide them in the raw text, so strip the raw text fence-blind.
+    raw_result = strip_trailing_silence_marker(text, respect_fences=False)
+    return raw_result if raw_result != text else visible_result
 
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (

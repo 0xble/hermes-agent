@@ -154,4 +154,56 @@ class TestStreamedSilenceSuppression:
 
         assert any(text == raw for text in _sent_and_edited(adapter))
 
+    @pytest.mark.asyncio
+    async def test_trailing_marker_in_a_later_delta_never_reaches_an_interim_edit(self):
+        """Prose is flushed first; a marker arriving later must not appear mid-stream."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        consumer.on_delta("Done.\n\n")
+        await asyncio.sleep(0.1)
+        for part in ("NO", "_REP", "LY"):
+            consumer.on_delta(part)
+            await asyncio.sleep(0.1)
+        consumer.finish()
+        await runner
+
+        texts = _sent_and_edited(adapter)
+        assert all("NO_REPLY" not in t and not t.rstrip("▉ ").endswith("NO") for t in texts), texts
+        assert consumer.delivered_final_matches("Done.") is True
+
+    @pytest.mark.asyncio
+    async def test_prose_line_resembling_a_marker_prefix_still_streams(self):
+        """Only the last top-level line is held, and only while it could become a marker."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        consumer.on_delta("Done.\n\nNo problem, shipped it.")
+        await asyncio.sleep(0.1)
+        interim = list(_sent_and_edited(adapter))
+        consumer.finish()
+        await runner
+
+        assert any("No problem" in t for t in interim), interim
+
+
+def test_ends_with_partial_silence_marker_scopes_to_last_top_level_line():
+    from gateway.response_filters import ends_with_partial_silence_marker as f
+
+    assert f("Done.\n\nNO")
+    assert f("Done.\n\nNO_REPLY\n")
+    assert not f("Done.\n\nNo problem")
+    assert not f("```\nNO")
+    assert not f("NO_REPLY is a marker.")
+
 
