@@ -139,6 +139,32 @@ def test_pruning_deletes_delivered_rows_before_an_undelivered_completion(monkeyp
     assert delivered[0] not in remaining
 
 
+def test_pruning_deletes_other_undelivered_rows_before_a_pending_completion(monkeypatch):
+    """With no delivered rows left to prune, a pending result still goes last."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
+    base = time.time() - 120.0
+    pending = _dispatch_row("deleg_prune_last_pending")
+    _mark(pending, "completed")
+    dropped = _dispatch_row("deleg_prune_last_dropped")
+    _mark(dropped, "error")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='pending', updated_at=? WHERE delegation_id=?",
+            (base - 60.0, pending),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='dropped', updated_at=? WHERE delegation_id=?",
+            (base, dropped),
+        )
+
+    _dispatch_row("deleg_prune_last_trigger")
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        remaining = {row[0] for row in conn.execute("SELECT delegation_id FROM async_delegations")}
+    assert pending in remaining
+    assert dropped not in remaining
+
+
 def test_pruning_preserves_origin_only_interrupted_delegation_for_resume(monkeypatch):
     """Retention matches explicit-resume eligibility: an origin session alone owns it."""
     monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)

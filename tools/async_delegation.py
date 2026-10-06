@@ -47,6 +47,8 @@ _MAX_DURABLE_PENDING = 1000
 # not yet claimed). Pruning skips them inside the retention window, so a restart
 # can't make an interrupted child unrecoverable. Keep in step with
 # delegation_resume._eligibility's state and owner checks. One ? is the cutoff.
+# Deliberately a superset: batch/partial-result checks live in task/result JSON,
+# so a few ineligible rows are kept too, bounded by the retention window.
 _RESUMABLE_RETENTION_SQL = """(
     state IN ('unknown','interrupted','stalled')
     AND resume_state='none'
@@ -206,7 +208,8 @@ def _prune_durable_records() -> None:
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
                        AND NOT {_RESUMABLE_RETENTION_SQL}
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
+                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0
+                                                  WHEN 'pending' THEN 2 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""", (cutoff, terminal_count - _MAX_RETAINED_COMPLETED))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
