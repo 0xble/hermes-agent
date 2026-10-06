@@ -1084,3 +1084,43 @@ def test_cancelled_sibling_claim_releases_its_lease(monkeypatch, isolated_regist
         return False
 
     assert asyncio.run(_exercise()), "cancelled sibling claim stranded its lease"
+
+
+def test_cancelled_primary_claim_is_refunded_not_released(monkeypatch, isolated_registry):
+    """A shutdown that cancels delivery after the primary claim commits must refund the attempt
+    exactly once; releasing it as a failed delivery would spend the budget on every restart."""
+    import threading
+
+    from tools import async_delegation
+
+    event = _distinct_async_event("deleg_cancel_primary")
+    _persist_pending_completion(event)
+    committed, proceed = threading.Event(), threading.Event()
+    real_claim = async_delegation.claim_completion_delivery
+
+    def _claim_then_stall(delegation_id, claim_id):
+        result = real_claim(delegation_id, claim_id)
+        committed.set()
+        proceed.wait(5)
+        return result
+
+    monkeypatch.setattr(async_delegation, "claim_completion_delivery", _claim_then_stall)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+
+    async def _exercise():
+        task = asyncio.create_task(runner._deliver_async_delegation_group([dict(event)]))
+        while not committed.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        proceed.set()
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if real_claim(event["delegation_id"], "next-consumer"):
+                return True
+        return False
+
+    assert asyncio.run(_exercise()), "cancelled primary claim stranded its lease"
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row["delivery_attempts"] == 1, f"cancellation spent an attempt: {row['delivery_attempts']}"
