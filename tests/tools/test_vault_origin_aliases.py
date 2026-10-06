@@ -69,8 +69,14 @@ def test_saved_origin_refuses_extra_signin_origin_without_alias(monkeypatch):
         result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="synthetic"))
     assert result["success"] is False
     assert result["error_type"] == "origin_mismatch"
-    assert "hermes config set vault.origin_aliases.op:gusto-id" in result["error"]
-    assert "https://login.gusto.com" in result["error"]
+    assert result["error"] == (
+        "Refused: current page origin (https://login.gusto.com) does not match the vault item's bound origin(s) "
+        "(https://gusto.com). Vault fills only run on the exact origin(s) the credential was saved for. Add the exact "
+        "origin with `hermes config set vault.origin_aliases.op:gusto-id '[\"https://login.gusto.com\"]'`, including any "
+        "existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may "
+        "write this config entry; the fill-time confirmation names the exact origin and item label. Never edit or rewrite "
+        "the existing 1Password item to add a URL: template rewrites can delete passkeys."
+    )
 
 def test_origin_alias_allows_exact_https_signin_origin(monkeypatch):
     backend = _Backend(_meta())
@@ -244,6 +250,62 @@ def test_alias_confirmation_handles_multipart_public_suffix():
     assert registrable_domain("https://app.example.co.uk") == "example.co.uk"
     assert alias_domain_warning("https://login.example.co.uk", ("https://app.example.co.uk",)) is None
     assert alias_domain_warning("https://login.other.co.uk", ("https://app.example.co.uk",)) is not None
+
+
+def test_alias_warning_is_advisory_for_unlisted_public_suffixes(monkeypatch):
+    from agent.vault_origin_aliases import alias_domain_warning
+    pairs = [
+        ("https://evil.co.kr", "https://bank.co.kr"),
+        ("https://evil.github.io", "https://brian.github.io"),
+        ("https://evil.com.de", "https://bank.com.de"),
+    ]
+    for alias, saved in pairs:
+        assert alias_domain_warning(alias, (saved,)) is None
+        prompts = []
+        monkeypatch.setattr(
+            "tools.approval_prompt.request_elicitation_consent",
+            lambda *args, **kwargs: prompts.append((args[0], args[1])) or "accept",
+        )
+        vault._confirm_alias_fill("Synthetic login", alias, (saved,))
+        assert alias in prompts[-1][0]
+        assert "registrable domain differs" not in prompts[-1][1]
+
+
+
+
+def test_multi_account_handle_round_trips_and_unions_with_raw_item_id(tmp_path, monkeypatch):
+    handle = "op@hostandhome:zys56ajg4voda76332p3mfjwr4"
+    raw_id = "zys56ajg4voda76332p3mfjwr4"
+    home = tmp_path / "hermes-home"
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    repo = Path(__file__).resolve().parents[2]
+    set_command = [
+        "uv", "run", "python", "hermes", "config", "set",
+        f"vault.origin_aliases.{handle}", '["https://login.planetfitness.com"]',
+    ]
+    get_command = [
+        "uv", "run", "python", "hermes", "config", "get",
+        f"vault.origin_aliases.{handle}", "--json",
+    ]
+    subprocess.run(set_command, cwd=repo, env=env, capture_output=True, text=True, check=True)
+    readback = subprocess.run(get_command, cwd=repo, env=env, capture_output=True, text=True, check=True)
+    assert json.loads(readback.stdout) == ["https://login.planetfitness.com"]
+
+    from agent.vault_origin_aliases import apply_origin_aliases
+    meta = _meta(handle=handle, origin="https://gusto.com")
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "origin_aliases": {
+            handle: ["https://login.planetfitness.com"],
+            raw_id: ["https://accounts.planetfitness.com"],
+        },
+    }}):
+        augmented = apply_origin_aliases([meta])[0]
+    assert augmented.allowed_origins == (
+        "https://gusto.com",
+        "https://login.planetfitness.com",
+        "https://accounts.planetfitness.com",
+    )
 
 
 def test_agent_written_config_set_form_is_honored_without_restart(tmp_path, monkeypatch):

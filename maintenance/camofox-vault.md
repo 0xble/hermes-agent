@@ -36,7 +36,9 @@ the browser vault fill tool, or the 1Password backends.
   On `origin_mismatch`, the agent may run `hermes config set vault.origin_aliases.<item-id> '["https://origin.example"]'`;
   `set` replaces that item's full alias list, so existing entries must be included. The active config is read on each
   vault list/fill call, so this does not require a restart. Alias-only login fills prompt once per session with the
-  full origin and item label; cross-registrable-domain aliases warn with both domains. Declines and unanswered prompts
+  full origin and item label; cross-registrable-domain aliases warn with both domains when the advisory fallback recognizes
+  those suffixes. The warning is advisory, has partial suffix coverage and never authorizes a fill; the full origin is
+  always shown. Declines and unanswered prompts
   remain fail-closed for retries in the same session. Never rewrite a 1Password item to add a URL because template
   rewrites can delete passkeys.
 - Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are minted from Connect

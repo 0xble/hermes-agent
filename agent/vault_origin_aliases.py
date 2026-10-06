@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 _invalid_alias_warnings: set[tuple[str, str]] = set()
 
 # The project has no public-suffix dependency. Keep this small fallback explicit and conservative:
-# these common multi-label suffixes prevent `login.example.co.uk` from being treated as a different
-# registrable domain from `app.example.co.uk`. Unknown suffixes fall back to the final label.
+# known multi-label suffixes prevent `login.example.co.uk` from being treated as a different
+# registrable domain from `app.example.co.uk`. Unknown suffixes use the final two host labels,
+# so warnings are advisory and may miss domains under an unlisted public suffix.
 _MULTI_LABEL_PUBLIC_SUFFIXES = frozenset({
     "ac.uk", "co.au", "co.in", "co.jp", "co.nz", "co.uk", "co.za",
     "com.au", "com.br", "com.cn", "com.hk", "com.mx", "com.sg", "com.tr",
@@ -27,8 +28,9 @@ def registrable_domain(origin: str) -> str:
     """Return a conservative eTLD+1 approximation for an HTTPS origin.
 
     This is used only to explain a confirmation warning, never to authorize a fill. It is
-    intentionally a documented fallback because no public-suffix package is installed; add a
-    maintained PSL dependency before expanding this list if broader coverage is required.
+    intentionally an advisory fallback because no public-suffix package is installed. Known
+    multi-label suffixes are covered; unknown suffixes use the final two host labels and may
+    miss a warning for an unlisted public suffix.
     """
     host = (urlsplit(origin).hostname or "").lower().rstrip(".")
     try:

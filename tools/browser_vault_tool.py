@@ -666,8 +666,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 "error": (
                     f"Refused: current page origin ({page_origin}) does not match "
                     f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
-                    "only run on the exact origin(s) the credential was saved for. "
-                    f"the exact origin with `hermes config set vault.origin_aliases.{handle} '[\"{page_origin}\"]'`, including any existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may write this config entry; the fill-time confirmation names the exact origin and item label. Never edit or rewrite the existing 1Password item to add a URL: template rewrites can delete passkeys."
+                    "only run on the exact origin(s) the credential was saved for. Add the exact origin with `hermes config set "
+                    f"vault.origin_aliases.{handle} '[\"{page_origin}\"]'`, including any existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may write this config entry; the fill-time confirmation names the exact origin and item label. Never edit or rewrite the existing 1Password item to add a URL: template rewrites can delete passkeys."
                 ),
             }
         )
