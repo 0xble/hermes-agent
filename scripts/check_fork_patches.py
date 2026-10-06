@@ -42,7 +42,7 @@ def _resolve_repo() -> Path:
 
 
 REPO = _resolve_repo()
-EXTENSION_TOOLS = ("goal_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
+EXTENSION_TOOLS = ("goal_set", "loop_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
 # key -> (expected, or None meaning "must be set")
 EXPECTED_CONFIG = {
     "memory.write_approval": "false",

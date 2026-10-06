@@ -1749,7 +1749,7 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
 _SYNTHETIC_USER_PREFIXES = (
     "[Continuing toward", "[ASYNC DELEGATION", "[IMPORTANT:", "[System note", "[System:", "[CONTEXT COMPACTION",
     "[PRIOR CONTEXT", "[STILL IN PROGRESS", "[Cron delivery", "[Your active task list", "[Relay from",
-    "[Goal set]",
+    "[Goal set]", "[/loop wakeup",
 )
 
 
