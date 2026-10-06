@@ -766,18 +766,9 @@ def _invoke_agent(
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
-    hold = {"buf": "", "held": ""} if _is_bot_mode_session(session) else None
+    hold = {"buf": "", "held": "", "loop_held": ""} if _is_bot_mode_session(session) else None
 
-    def _stream(delta):
-        if getattr(agent, "_mute_notification_reply", False):
-            return
-        if hold is not None and isinstance(delta, str):
-            from gateway.response_filters import is_partial_silence_marker
-            hold["buf"] += delta
-            if is_partial_silence_marker(hold["buf"]):
-                hold["held"] += delta
-                return
-            delta, hold["held"] = hold["held"] + delta, ""
+    def _deliver_delta(delta):
         with session["history_lock"]:
             _append_inflight_delta(session, delta)
         payload = {"text": delta}
@@ -786,6 +777,32 @@ def _invoke_agent(
         if st.tts_queue is not None and isinstance(delta, str):
             st.tts_queue.put(delta)
         _emit("message.delta", sid, payload)
+
+    def _stream(delta):
+        if getattr(agent, "_mute_notification_reply", False):
+            return
+        if hold is not None and isinstance(delta, str):
+            from gateway.response_filters import (
+                ends_with_partial_loop_complete_marker,
+                is_partial_silence_marker,
+                split_trailing_loop_complete_marker,
+            )
+            hold["buf"] += delta
+            if is_partial_silence_marker(hold["buf"]):
+                hold["held"] += delta
+                return
+            delta, hold["held"] = hold["held"] + delta, ""
+            loop_candidate = hold["loop_held"] + delta
+            if ends_with_partial_loop_complete_marker(loop_candidate):
+                safe, partial = split_trailing_loop_complete_marker(loop_candidate)
+                hold["loop_held"] = partial
+                if safe:
+                    _deliver_delta(safe)
+                return
+            if hold["loop_held"]:
+                delta = hold["loop_held"] + delta
+                hold["loop_held"] = ""
+        _deliver_delta(delta)
 
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
     # by the desktop as its own segment instead of being lost to message.complete.
@@ -959,7 +976,9 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
     if _is_bot_mode_session(session):
         raw = _bot_mode_delivery_text(raw, successful=status == "complete")
-    payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+    from gateway.response_filters import strip_trailing_loop_complete_marker
+    visible_raw = strip_trailing_loop_complete_marker(raw)
+    payload = {"text": visible_raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
     if last_reasoning:
@@ -979,7 +998,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     if _billing_block := result.get("billing_block"):
         payload["billing"] = _billing_block
         payload["failure_reason"] = result.get("failure_reason")
-    if rendered := render_message(raw, cols):
+    if rendered := render_message(visible_raw, cols):
         payload["rendered"] = rendered
     error_value = result.get("error")
     final_text = result.get("final_response")

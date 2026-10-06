@@ -122,6 +122,36 @@ def _fenced_line_states(lines: list[str]) -> list[bool]:
     return states
 
 
+def _strip_trailing_marker_lines(
+    text: Any, is_marker, *, respect_fences: bool = True, preserve_bare: bool = False,
+) -> Any:
+    """Strip consecutive top-level marker lines from the end of *text*.
+
+    ``preserve_bare`` retains the last marker when removing it would otherwise make the
+    whole response empty. Silence uses that behavior so its existing exact-marker path
+    remains authoritative; display-only control markers do not.
+    """
+    if not isinstance(text, str):
+        return text
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    fenced = _fenced_line_states(lines) if respect_fences else [False] * len(lines)
+    end = len(lines)
+    last_marker = ""
+    while end:
+        while end and not lines[end - 1].strip():
+            end -= 1
+        if not end or fenced[end - 1] or not is_marker(lines[end - 1]):
+            break
+        last_marker = last_marker or lines[end - 1].strip()
+        end -= 1
+    if not last_marker:
+        return text
+    kept = "".join(lines[:end]).rstrip()
+    return kept if kept.strip() or not preserve_bare else last_marker
+
+
 def strip_trailing_silence_marker(text: Any, *, respect_fences: bool = True) -> Any:
     """Remove the run of top-level standalone silence-marker lines ending substantive text.
 
@@ -135,25 +165,62 @@ def strip_trailing_silence_marker(text: Any, *, respect_fences: bool = True) -> 
     """
     if not isinstance(text, str) or is_intentional_silence_response(text):
         return text
+    return _strip_trailing_marker_lines(
+        text, is_intentional_silence_response,
+        respect_fences=respect_fences, preserve_bare=True,
+    )
+
+
+_LOOP_COMPLETE_LINE_RE = re.compile(r"^\s*LOOP_COMPLETE\s*[.!]?\s*$", re.IGNORECASE)
+_LOOP_COMPLETE_MARKER = "LOOP_COMPLETE"
+
+
+def is_loop_complete_marker(text: Any) -> bool:
+    """True when a line is the loop completion marker with optional punctuation."""
+    return isinstance(text, str) and _LOOP_COMPLETE_LINE_RE.fullmatch(text) is not None
+
+
+def strip_trailing_loop_complete_marker(text: Any, *, respect_fences: bool = True) -> Any:
+    """Remove trailing top-level ``LOOP_COMPLETE`` lines for display only.
+
+    A marker in a fenced code block or mid-prose is content. A marker-only reply
+    becomes empty; loop detection must use the raw response instead.
+    """
+    return _strip_trailing_marker_lines(
+        text, is_loop_complete_marker,
+        respect_fences=respect_fences, preserve_bare=False,
+    )
+
+
+def split_trailing_loop_complete_marker(text: Any) -> tuple[Any, str]:
+    """Split safe prefix from a trailing top-level marker candidate for streaming."""
+    if not isinstance(text, str) or not ends_with_partial_loop_complete_marker(text):
+        return text, ""
     lines = text.splitlines(keepends=True)
-    if not lines:
-        return text
-    fenced = _fenced_line_states(lines) if respect_fences else [False] * len(lines)
     end = len(lines)
-    last_marker = ""
-    while end:
-        while end and not lines[end - 1].strip():
-            end -= 1
-        if not end or fenced[end - 1]:
-            break
-        if not is_intentional_silence_response(lines[end - 1]):
-            break
-        last_marker = last_marker or lines[end - 1].strip()
+    while end and not lines[end - 1].strip():
         end -= 1
-    if not last_marker:
-        return text
-    kept = "".join(lines[:end]).rstrip()
-    return kept if kept.strip() else last_marker
+    if not end:
+        return text, ""
+    return "".join(lines[:end - 1]), "".join(lines[end - 1:])
+
+
+def ends_with_partial_loop_complete_marker(text: Any) -> bool:
+    """True while the trailing top-level line could still become ``LOOP_COMPLETE``."""
+    if not isinstance(text, str):
+        return False
+    lines = text.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end or _fenced_line_states(lines)[end - 1]:
+        return False
+    candidate = lines[end - 1].strip().upper()
+    if not candidate:
+        return False
+    if candidate == _LOOP_COMPLETE_MARKER or is_loop_complete_marker(lines[end - 1]):
+        return True
+    return _LOOP_COMPLETE_MARKER.startswith(candidate)
 
 
 def ends_with_partial_silence_marker(text: Any) -> bool:

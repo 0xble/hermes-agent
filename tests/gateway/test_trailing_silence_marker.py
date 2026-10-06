@@ -49,6 +49,22 @@ def _stub_runtime_helpers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_gateway_delivery_strips_loop_complete_but_detection_sees_raw(monkeypatch):
+    _stub_gateway_run(monkeypatch)
+    runner = _ShapeRunner()
+    source = SimpleNamespace(chat_id="chat-1", platform=SimpleNamespace(value="telegram"))
+    response, intentional, _ = await runner._hmwa_shape_agent_response(
+        {"final_response": "Done.\nLOOP_COMPLETE", "messages": [], "api_calls": 1},
+        source, history=[], session_entry=SimpleNamespace(session_id="session-1"), session_key=None,
+        _quick_key=None, run_generation=0, _run_start_session_id="session-1",
+        _platform_name="telegram", _msg_start_time=0.0,
+    )
+
+    assert response == "Done.\nLOOP_COMPLETE"
+    assert intentional is False
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_gateway_delivery_strips_trailing_marker(monkeypatch):
     _stub_gateway_run(monkeypatch)
     runner = _ShapeRunner()
@@ -210,3 +226,22 @@ def test_unclosed_fence_inside_think_block_does_not_hide_trailing_marker(monkeyp
     assert "NO_REPLY" not in verdict.final_response
     assert verdict.final_response.endswith("Done.")
     assert "NO_REPLY" not in agent.persisted_messages[-1]["content"].split("</think>")[-1]
+
+
+def test_loop_complete_trailing_marker_is_display_only():
+    from gateway.response_filters import strip_trailing_loop_complete_marker
+
+    assert strip_trailing_loop_complete_marker("Done.\nLOOP_COMPLETE") == "Done."
+    assert strip_trailing_loop_complete_marker("LOOP_COMPLETE") == ""
+    assert strip_trailing_loop_complete_marker("Mention LOOP_COMPLETE in prose") == "Mention LOOP_COMPLETE in prose"
+    assert strip_trailing_loop_complete_marker("```text\nLOOP_COMPLETE\n```") == "```text\nLOOP_COMPLETE\n```"
+    assert strip_trailing_loop_complete_marker("Done.\nLOOP_COMPLETE.") == "Done."
+
+
+def test_loop_complete_partial_marker_is_held_only_at_top_level_tail():
+    from gateway.response_filters import ends_with_partial_loop_complete_marker
+
+    assert ends_with_partial_loop_complete_marker("Done.\nLOOP_COMP")
+    assert ends_with_partial_loop_complete_marker("Done.\nLOOP_COMPLETE")
+    assert not ends_with_partial_loop_complete_marker("```\nLOOP_COMP")
+    assert not ends_with_partial_loop_complete_marker("Mention LOOP_COMP in prose")

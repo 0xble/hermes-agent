@@ -314,11 +314,31 @@ class CLIStreamMixin:
         ``None`` = intermediate turn boundary (tools about to run): flush boxes and reset state.
         """
         if text is None:
+            # An intermediate tool boundary means more assistant text will follow, so a
+            # held marker is content there; only the end-of-turn flush drops it.
+            if getattr(self, "_loop_complete_hold", ""):
+                self._stream_prefilt = getattr(self, "_stream_prefilt", "") + self._loop_complete_hold
+                self._loop_complete_hold = ""
             self._flush_stream()
             self._reset_stream_state()
             return
         if not text:
             return
+        from gateway.response_filters import (
+            ends_with_partial_loop_complete_marker,
+            split_trailing_loop_complete_marker,
+        )
+        held = getattr(self, "_loop_complete_hold", "")
+        candidate = held + text
+        if ends_with_partial_loop_complete_marker(candidate):
+            safe, partial = split_trailing_loop_complete_marker(candidate)
+            if safe:
+                self._stream_delta(safe)
+            self._loop_complete_hold = partial
+            return
+        if held:
+            text = held + text
+            self._loop_complete_hold = ""
         self._stream_started = True
         self._stream_prefilt = getattr(self, "_stream_prefilt", "") + text
 
@@ -505,6 +525,8 @@ class CLIStreamMixin:
             self._emit_stream_text(self._stream_prefilt)
             self._stream_prefilt = ""
         self._close_reasoning_box()  # in case no content tokens arrived
+        # A completion marker held at end-of-turn is control text, not a partial line to emit.
+        self._loop_complete_hold = ""
         # A trailing partial table row joins the table buffer so the whole block is re-aligned
         # together (else the final row prints under-padded).
         if (
@@ -528,6 +550,7 @@ class CLIStreamMixin:
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
         self._stream_buf = ""
+        self._loop_complete_hold = ""
         self._stream_started = False
         self._stream_box_opened = False
         self._stream_text_ansi = ""
