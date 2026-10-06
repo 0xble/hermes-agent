@@ -104,15 +104,16 @@ Failed or interrupted model turns do not run completion judging.
     impossible (Brian's decision: the notice shows each evidence-backed drop so
     he can veto it). When a valid quote is supplied, the evidence scope check
     does not apply.
-    `GoalManager.replace()` replaces an active or paused goal only after the same
-    fresh quote check, resets the new goal active with the configured budget, and
-    records the replaced goal, contract and subgoals in an audit entry. That
-    replacement authority (the quote, full source user message and replaced goal)
-    is shown to the new goal's judge, which must return BLOCKED when the full
-    message does not plainly instruct replacing/changing the goal; it is not
-    carried into binding revision or continuation history. The replaced goal's
-    gates and earlier revisions are intentionally not carried over: the new goal
-    starts clean after the judge validates the replacement authority. The companion
+    `GoalManager.replace()` replaces an active or paused goal only after a deterministic, fail-closed
+    authority check. The quoted text and the new objective's substantive text must both appear (with
+    whitespace, case and punctuation normalized) in the same recorded typed user message of the goal
+    session; a generic replacement verb cannot authorize an agent-invented goal. Negated or preserving
+    instructions are rejected before any state change. The existing quality gates and remaining turn
+    budget carry forward by default. A gate or budget is removed only for an explicit, un-negated user
+    removal instruction in the same clause/sentence; ambiguous wording preserves it. The replacement
+    authority (quote, full source user message, message id and replaced goal) is shown to the new goal's
+    judge, and is not carried into binding revision or continuation history. The replaced goal's earlier
+    contract, subgoals and revisions are intentionally not carried over.
     plugin lives in
     `0xble/agents` at `sources/plugins/goal-lifecycle`; it degrades with
     `unsupported_core` until these primitives are promoted, and remains safe to

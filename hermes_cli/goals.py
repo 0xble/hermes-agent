@@ -16,6 +16,7 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -1834,30 +1835,129 @@ _REVISION_QUOTE_MIN_CHARS = 12
 # Longest user message a revision may cite. The judge decides authority from the complete message,
 # so a longer one is refused rather than excerpted: an excerpt can drop the context that negates it.
 _REVISION_SOURCE_MAX_CHARS = 4000
-# Replacement authority is deliberately narrower than ordinary revision authority. The quote must be
-# a raw substring of the newest typed user message after the goal was created, and that message must
-# explicitly name a goal/objective/scope change. This prevents incidental quoted text from activating
-# a fresh goal before any model is consulted.
+# Replacement authority is deliberately narrower than ordinary revision authority. The requested
+# replacement itself must be present in the recorded user message; a generic "change the scope" is
+# not authorization for an agent-invented objective. Matching is deterministic and punctuation-safe.
 _REPLACEMENT_ACTION_RE = re.compile(
     r"\b(?:replace|replac(?:e|ing|ed)|change|chang(?:e|ing|ed)|re[- ]?scope|switch)\b"
     r".{0,40}\b(?:goal|objective|scope|direction|task)\b",
     re.IGNORECASE | re.DOTALL,
 )
-_REPLACEMENT_NEGATION_RE = re.compile(
-    r"\b(?:do not|don't|dont|never|not)\b.{0,40}\b(?:replace|change|re[- ]?scope|switch)\b",
-    re.IGNORECASE | re.DOTALL,
-)
 _REPLACEMENT_GATE_REMOVE_RE = re.compile(
-    r"(?:\b(?:remove|clear|drop|delete|disable|without|no)\b.{0,60}\b(?:quality )?gates?\b|"
+    r"(?:\b(?:remove|clear|drop|delete|disable)\b.{0,60}\b(?:quality )?gates?\b|"
     r"\b(?:quality )?gates?\b.{0,60}\b(?:remove|clear|drop|delete|disable)\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _REPLACEMENT_BUDGET_REMOVE_RE = re.compile(
-    r"(?:\b(?:remove|clear|drop|delete|disable|without|no|unlimited|infinite)\b.{0,60}"
+    r"(?:\b(?:remove|clear|drop|delete|disable|reset)\b.{0,60}"
     r"\b(?:turn|turns|budget|limit)\b|\b(?:turn|turns|budget|limit)\b.{0,60}"
-    r"\b(?:remove|clear|drop|delete|disable|unlimited|infinite)\b)",
+    r"\b(?:remove|clear|drop|delete|disable|reset)\b|\bturn\s+budget\b)",
     re.IGNORECASE | re.DOTALL,
 )
+_AUTHORITY_PRESERVE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|not|keep|preserve|retain|leave|without\s+removing|"
+    r"without\s+dropping|without\s+clearing)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_authority_text(text: Any) -> str:
+    """Normalize recorded text for safe authority matching, not for semantic inference."""
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    chars = [" " if ch.isspace() or unicodedata.category(ch).startswith("P") else ch
+             for ch in normalized]
+    return " ".join("".join(chars).split())
+
+
+def _authority_units(text: str) -> List[str]:
+    """Return sentence/clause-sized units so cues cannot authorize a neighboring clause."""
+    return [part for part in re.split(r"(?:[.!?;]|\n)+", text or "") if part.strip()]
+
+
+def _explicit_restriction_removals(source: str) -> Tuple[bool, bool]:
+    """Find only un-negated, explicit gate/budget removal instructions.
+
+    A preservation or negation cue anywhere in the same sentence/clause wins. Anything not matching
+    an explicit removal verb is intentionally preserved, including ``no gates`` and ``without gates``.
+    """
+    remove_gates = remove_budget = False
+    for unit in _authority_units(source):
+        if _AUTHORITY_PRESERVE_RE.search(unit):
+            continue
+        remove_gates |= bool(_REPLACEMENT_GATE_REMOVE_RE.search(unit))
+        remove_budget |= bool(_REPLACEMENT_BUDGET_REMOVE_RE.search(unit))
+    return remove_gates, remove_budget
+
+
+def _recorded_text_contains(needle: str, source: str) -> bool:
+    """Match substantive text in recorded content after whitespace/case/punctuation normalization."""
+    needle_norm = _normalize_authority_text(needle)
+    source_norm = _normalize_authority_text(source)
+    return bool(needle_norm and needle_norm in source_norm)
+
+
+def _contains_negated_text(source: str, text: str) -> bool:
+    """Whether a cited phrase is inside a unit with an explicit preservation/negation cue."""
+    target = _normalize_authority_text(text)
+    if not target:
+        return False
+    for unit in _authority_units(source):
+        unit_norm = _normalize_authority_text(unit)
+        target_at = unit_norm.find(target)
+        if target_at < 0:
+            continue
+        target_end = target_at + len(target)
+        for cue in _AUTHORITY_PRESERVE_RE.finditer(unit_norm):
+            # A criterion can legitimately begin with "never" or "not"; that word is part of the
+            # cited text, not a negation of it. Cues outside the cited span still win.
+            if cue.start() >= target_at and cue.end() <= target_end:
+                continue
+            return True
+    return False
+
+
+def _substantive_tokens(text: Any) -> List[str]:
+    """Words useful for binding a short removal instruction to a recorded criterion."""
+    stop = {"the", "a", "an", "and", "or", "to", "of", "for", "with", "this", "that", "must",
+            "should", "will", "also", "keep", "goal", "objective", "rule", "requirement", "criterion",
+            "criteria", "subgoal", "subgoals"}
+    return [token for token in _normalize_authority_text(text).split() if len(token) >= 4 and token not in stop]
+
+
+def _change_text_bound(source: str, field: str, before: Any, after: Any) -> bool:
+    """Require the requested revision text, or its explicit removal target, in the user message."""
+    after_text = str(after or "").strip()
+    if after_text:
+        return _recorded_text_contains(after_text, source) and not _contains_negated_text(source, after_text)
+    old_text = str(before or "").strip()
+    aliases = {
+        "goal": "goal|objective|direction|task",
+        "outcome": "outcome|result",
+        "constraints": "constraint|restriction|rule|limit",
+        "boundaries": "boundary|scope",
+        "stop_when": "stop|condition",
+        "verification": "verification|check|test|proof",
+        "subgoals": "subgoal|criterion|criteria",
+    }
+    removal = re.search(r"\b(?:remove|drop|clear|delete|disable|skip|relax|lift|waive|"
+                        r"no\s+longer\s+appl(?:y|ies)|stop\s+requiring)\b", source, re.IGNORECASE)
+    if not removal:
+        return False
+    target_bound = (_recorded_text_contains(old_text, source) if old_text else False)
+    if not target_bound:
+        target_bound = bool(re.search(rf"\b(?:{aliases.get(field, field)})\b", source, re.IGNORECASE))
+    return target_bound and not (old_text and _contains_negated_text(source, old_text))
+
+
+def _dropped_text_bound(source: str, text: str) -> bool:
+    """Bind a dropped criterion to a user removal instruction without semantic guessing."""
+    if _contains_negated_text(source, text):
+        return False
+    tokens = _substantive_tokens(text)
+    normalized_source = _normalize_authority_text(source)
+    return bool(tokens and any(token in normalized_source for token in tokens) and
+                re.search(r"\b(?:remove|drop|clear|delete|disable|skip|relax|lift|waive|"
+                          r"no\s+longer\s+appl(?:y|ies)|stop\s+requiring)\b", source, re.IGNORECASE))
 
 
 def _typed_user_message_records_since(session_id: Optional[str], since: float = 0.0,
@@ -2078,46 +2178,54 @@ class GoalManager:
         if len(quote) < _REVISION_QUOTE_MIN_CHARS:
             return "", "", {"error_code": "user_quote_too_short",
                               "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
-        pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-        sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
+        rows = _typed_user_message_records_since(self.session_id, state.created_at)
+        sources = [_typed_user_message_text(row) for row in rows if _recorded_text_contains(quote, _typed_user_message_text(row))]
         if not sources:
             return "", "", {"error_code": "user_quote_not_found",
-                              "error": "user_quote does not match any user message sent since the goal was set"}
+                              "error": "user_quote must match a recorded typed user message sent since the goal was set"}
         source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
         if not source:
             return "", "", {"error_code": "user_message_too_long",
                               "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
                                        "long to judge whether it authorizes this change; ask the user to state the "
                                        "change in a short message and quote that"}
+        if _contains_negated_text(source, quote):
+            return "", "", {"error_code": "user_authority_negated",
+                              "error": "the quoted user text is negated or preserves the earlier requirement"}
         return quote, source, None
 
-    def _replacement_quote_source(self, quote: str, state: GoalState) -> Tuple[str, str, Any, Optional[Dict[str, Any]]]:
-        """Deterministically authorize a replacement from the latest recorded typed user turn.
+    def _replacement_quote_source(self, quote: str, goal: str, state: GoalState) -> Tuple[str, str, Any, Optional[Dict[str, Any]]]:
+        """Authorize a replacement only from a recorded, typed user message.
 
-        The quote is matched byte-for-byte (apart from the surrounding trim) against the user's
-        message, never against assistant/tool text or caller-supplied prose. The newest typed user
-        message since this goal was created must contain the quote and plainly pair a replacement
-        verb with ``goal``, ``objective``, ``scope``, ``direction``, or ``task``. Negated requests
-        are rejected. This is intentionally stricter than ``revise`` and runs before any mutation.
+        Both the quoted authority and the new objective must be found in the same recorded message
+        after deterministic whitespace/case/punctuation normalization. A generic replacement verb is
+        not enough to authorize agent-supplied goal text, and negated instructions never authorize it.
         """
         quote = str(quote or "").strip()
-        if len(quote) < _REVISION_QUOTE_MIN_CHARS:
+        if len(_normalize_authority_text(quote)) < _REVISION_QUOTE_MIN_CHARS:
             return "", "", None, {"error_code": "user_quote_too_short",
                                    "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
         rows = _typed_user_message_records_since(self.session_id, state.created_at)
         if not rows:
             return "", "", None, {"error_code": "user_quote_not_found",
-                                   "error": "user_quote must appear in the latest recorded typed user message of this session"}
-        row = rows[0]  # newest-first; stale turns cannot activate a fresh goal
+                                   "error": "quote the user's requested replacement in a recorded typed user message of this session"}
+        # Newest-first: a stale earlier instruction must not activate a replacement after a newer turn.
+        row = rows[0]
         source = _typed_user_message_text(row)
         if len(source) > _REVISION_SOURCE_MAX_CHARS:
             return "", "", None, {"error_code": "user_message_too_long",
                                    "error": f"the latest user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters; "
                                             "state the replacement in a short message and quote that"}
-        if quote not in source:
+        if not _recorded_text_contains(quote, source):
             return "", "", None, {"error_code": "user_quote_not_found",
-                                   "error": "user_quote must be a verbatim substring of the latest recorded typed user message"}
-        if _REPLACEMENT_NEGATION_RE.search(source) or not _REPLACEMENT_ACTION_RE.search(source):
+                                   "error": "user_quote must appear in the latest recorded typed user message"}
+        if not _recorded_text_contains(goal, source):
+            return "", "", None, {"error_code": "replacement_authority_required",
+                                   "error": "quote the user's requested goal text; the new objective must appear in that recorded user message"}
+        if _contains_negated_text(source, quote) or _contains_negated_text(source, goal):
+            return "", "", None, {"error_code": "replacement_authority_required",
+                                   "error": "the recorded user instruction is negated or preserves the existing goal; replacement rejected"}
+        if not _REPLACEMENT_ACTION_RE.search(source):
             return "", "", None, {"error_code": "replacement_authority_required",
                                    "error": "the latest user message must plainly instruct replacing, changing, or re-scoping the goal"}
         return quote, source, row.get("id"), None
@@ -2144,12 +2252,11 @@ class GoalManager:
 
         # This is the complete authority gate. Do not construct, assign, or persist a replacement
         # until it passes; failure therefore leaves the prior object and its serialized bytes intact.
-        quote, source, source_id, quote_error = self._replacement_quote_source(user_quote, state)
+        quote, source, source_id, quote_error = self._replacement_quote_source(user_quote, goal, state)
         if quote_error:
             return {"ok": False, **quote_error}
 
-        remove_gates = bool(_REPLACEMENT_GATE_REMOVE_RE.search(source))
-        remove_budget = bool(_REPLACEMENT_BUDGET_REMOVE_RE.search(source))
+        remove_gates, remove_budget = _explicit_restriction_removals(source)
         prior_remaining = 0 if state.max_turns == 0 else max(0, state.max_turns - state.turns_used)
         carried_gates = [] if remove_gates else [GoalGate.from_dict(asdict(gate)) for gate in state.gates]
         if remove_budget:
@@ -2204,12 +2311,19 @@ class GoalManager:
             reader = getattr(db, "messages_by_role", None)
             if reader is not None:
                 rows = reader(self.session_id, "tool", since=state.created_at, limit=1_000_000)
+                found_negated = False
                 for row in rows:
                     if _evidence_tool_excluded(str(row.get("tool_name") or "")):
                         continue
                     content = str(row.get("content") or "")
                     if raw_evidence in content or normalized_evidence in " ".join(content.split()):
+                        if _contains_negated_text(content, raw_evidence):
+                            found_negated = True
+                            continue
                         return None
+                if found_negated:
+                    return {"error_code": "evidence_negated",
+                            "error": "the recorded evidence is negated or preserves the earlier requirement"}
             else:
                 finder = getattr(db, "find_messages_containing", None)
                 if finder is not None:
@@ -2232,9 +2346,10 @@ class GoalManager:
 
         ``contract`` updates only the named fields (``""`` clears one); ``subgoals`` replaces the list.
         A change to the objective, outcome, constraints, boundaries, stop condition, or a dropped
-        subgoal needs ``user_quote``: a verbatim excerpt (12+ chars) of a real user message in
-        ``user_messages`` (defaults to this session's user messages since the goal was set). A
-        verification change or dropped subgoal may instead carry evidence of at least 12 characters
+        subgoal needs ``user_quote``: a verbatim excerpt (12+ chars) of a real recorded typed user
+        message sent since the goal was set. ``user_messages`` is retained for API compatibility but
+        is not an authority source. The requested new text must appear in the same message; removals
+        need an explicit un-negated removal instruction. A verification change or dropped subgoal may instead carry evidence of at least 12 characters
         when it is obsolete or impossible; evidence must be an exact substring of a tool result
         recorded in this session after the goal started and cannot authorize any other field. Returns
         ``{"ok", "error_code", "error", "revision"}``."""
@@ -2282,6 +2397,15 @@ class GoalManager:
             quote, source, quote_error = self._quote_source(quote, state, user_messages)
             if quote_error:
                 return {"ok": False, **quote_error}
+            bound_fields = [key for key in changed if key != "subgoals"]
+            for key in bound_fields:
+                if not _change_text_bound(source, key, before.get(key), after.get(key)):
+                    return {"ok": False, "error_code": "user_authority_unbound",
+                            "error": f"the user's quoted instruction does not authorize the requested {key} change; "
+                                     "quote the user's requested text or explicit removal instruction"}
+            if dropped and not all(_dropped_text_bound(source, text) for text in dropped):
+                return {"ok": False, "error_code": "user_authority_unbound",
+                        "error": "the user's quoted instruction does not identify every dropped subgoal; quote the user's requested removal"}
             authority = "user_quote"
         elif evidence and evidence_changes and not set(needs_authority) - {"subgoals"}:
             authority = "evidence"

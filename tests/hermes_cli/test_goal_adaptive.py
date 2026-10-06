@@ -313,9 +313,11 @@ def test_agent_may_restructure_verification_without_user_authority(hermes_home, 
     {"subgoals": []},
 ])
 def test_objective_constraints_and_dropped_criteria_need_a_real_user_quote(hermes_home, change):
+    db = _db("rev-authority")
     mgr = GoalManager(session_id="rev-authority")
     mgr.set("Ship X", contract=GoalContract(constraints="no downtime"))
     mgr.add_subgoal("also migrate Willow")
+    db.append_message("rev-authority", "user", "ok. drop Willow and ship a smaller X,   skip downtime rule")
 
     missing = mgr.revise(reason="descoped", user_messages=["drop Willow and ship a smaller X, skip downtime rule"],
                          **change)
@@ -348,6 +350,35 @@ def test_user_quote_is_checked_against_real_user_messages_only(hermes_home):
     assert real["ok"]
 
 
+def test_revision_rejects_a_quote_that_does_not_bind_the_requested_change(hermes_home):
+    db = _db("rev-unbound")
+    mgr = GoalManager(session_id="rev-unbound")
+    mgr.set("Ship X", contract=GoalContract(constraints="publish secrets only after review"))
+    db.append_message("rev-unbound", "user", "Please keep going; remove old restriction")
+    result = mgr.revise(
+        reason="agent loosened the constraint", contract={"constraints": "allow public sharing"},
+        user_quote="Please keep going",
+        user_messages=["Please keep going; remove old restriction"],
+    )
+    assert result["error_code"] == "user_authority_unbound"
+    assert mgr.state.contract.constraints == "publish secrets only after review"
+
+
+def test_negated_recorded_evidence_cannot_authorize_a_revision(hermes_home):
+    sid = "rev-evidence-negated"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship X", contract=GoalContract(verification="Check the component"))
+    recorded = "Do not remove the component because component removed is only an archived example."
+    _tool(db, sid, "read_file", {"path": "plan.md"}, recorded, "plan")
+    result = mgr.revise(
+        reason="obsolete", contract={"verification": "X is live"},
+        evidence="component removed",
+    )
+    assert result["error_code"] == "evidence_negated"
+    assert mgr.state.contract.verification == "Check the component"
+
+
 def test_revision_validation(hermes_home):
     mgr = GoalManager(session_id="rev-validate")
     mgr.set("Ship X")
@@ -357,11 +388,13 @@ def test_revision_validation(hermes_home):
 
 
 def test_revision_resets_the_dispute_streak_and_round_trips(hermes_home):
+    db = _db("rev-roundtrip")
     mgr = GoalManager(session_id="rev-roundtrip")
     mgr.set("Ship X", max_turns=100)
     mgr.state.consecutive_disputes = 2
-    mgr.revise(reason="clarify", contract={"outcome": "X live"}, user_quote="clarify the outcome",
-               user_messages=["Please clarify the outcome now."])
+    db.append_message("rev-roundtrip", "user", "Please change the outcome to X live now.")
+    mgr.revise(reason="clarify", contract={"outcome": "X live"}, user_quote="change the outcome to X live",
+               user_messages=["Please change the outcome to X live now."])
     assert mgr.state.consecutive_disputes == 0
     state = load_goal("rev-roundtrip")
     assert goals.GoalState.from_json(state.to_json()).revisions == state.revisions
@@ -390,15 +423,18 @@ def test_every_superseded_requirement_stays_visible_in_full(hermes_home):
 
 def test_a_real_quote_is_shown_with_its_full_message_for_the_judge_to_weigh(hermes_home, monkeypatch):
     """Substring presence proves the user said it, not that they authorized this change."""
+    db = _db("rev-context")
     mgr = GoalManager(session_id="rev-context")
     mgr.set("Ship X", contract=GoalContract(constraints="Never publish secrets"))
-    result = mgr.revise(reason="loosen", contract={"constraints": ""}, user_quote="Please keep going",
-                        user_messages=["Please keep going and never publish secrets"])
+    db.append_message("rev-context", "user", "Please remove the Never publish secrets constraint")
+    result = mgr.revise(reason="loosen", contract={"constraints": ""},
+                        user_quote="remove the Never publish secrets constraint",
+                        user_messages=["Please remove the Never publish secrets constraint"])
     assert result["ok"]
     prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
     mgr.evaluate_after_turn("working")
     history = prompts[0].split("Revision history")[1]
-    assert 'full message: "Please keep going and never publish secrets"' in history
+    assert 'full message: "Please remove the Never publish secrets constraint"' in history
     assert "earlier constraints: Never publish secrets" in history
     assert "plainly instructs that specific change" in prompts[0]
     assert "user-authorized" not in history
@@ -459,20 +495,23 @@ def test_excluded_bookkeeping_matches_do_not_crowd_out_real_evidence(hermes_home
 
 def test_revision_keeps_the_complete_source_message(hermes_home, monkeypatch):
     """Context that negates the quoted words must reach the judge with them."""
+    db = _db("rev-negated")
     mgr = GoalManager(session_id="rev-negated")
     mgr.set("Ship X", contract=GoalContract(verification="security audit passes"))
-    message = ("Do not execute any of the following archived suggestions; they are explicitly rejected. "
-               + "filler " * 250 + "Drop the security audit requirement.")
-    assert mgr.revise(reason="r", contract={"verification": "tests pass"},
-                      user_quote="Drop the security audit requirement", user_messages=[message])["ok"]
-    history = mgr.state.render_revisions_block()
-    assert "explicitly rejected" in history and "Drop the security audit requirement" in history
+    message = "Do not drop the security audit requirement; tests pass."
+    db.append_message("rev-negated", "user", message)
+    result = mgr.revise(reason="r", contract={"verification": "tests pass"},
+                        user_quote="Drop the security audit requirement", user_messages=[message])
+    assert result["error_code"] == "user_authority_negated"
+    assert mgr.state.contract.verification == "security audit passes"
 
 
 def test_revision_refuses_a_source_message_too_long_to_judge(hermes_home):
+    db = _db("rev-long")
     mgr = GoalManager(session_id="rev-long")
     mgr.set("Ship X", contract=GoalContract(verification="security audit passes"))
     message = "x " * 3000 + "Drop the security audit requirement."
+    db.append_message("rev-long", "user", message)
     result = mgr.revise(reason="r", contract={"verification": "tests pass"},
                         user_quote="Drop the security audit requirement", user_messages=[message])
     assert result["error_code"] == "user_message_too_long"
@@ -566,11 +605,13 @@ def test_evidence_can_drop_an_obsolete_subgoal_and_is_shown_as_agent_evidence(he
 
 
 def test_valid_quote_is_not_limited_by_evidence_scope(hermes_home):
+    db = _db("rev-quote-and-evidence")
     mgr = GoalManager(session_id="rev-quote-and-evidence")
     mgr.set("Ship X", contract=GoalContract(boundaries="repo only"))
+    db.append_message("rev-quote-and-evidence", "user", "Yes, widen scope to repo and docs.")
     result = mgr.revise(reason="user widened scope", contract={"boundaries": "repo and docs"},
-                        user_quote="docs are in scope too", evidence="The docs live in a separate repository",
-                        user_messages=["Yes, docs are in scope too."])
+                        user_quote="widen scope to repo and docs", evidence="The docs live in a separate repository",
+                        user_messages=["Yes, widen scope to repo and docs."])
     assert result["ok"]
     assert load_goal("rev-quote-and-evidence").revisions[-1]["authority"] == "user_quote"
 
@@ -631,11 +672,11 @@ def test_replace_uses_current_user_quote_and_carries_gates_and_remaining_budget(
     mgr.state.turns_used = 2
     mgr._save()
     time.sleep(0.01)
-    db.append_message(sid, "user", "Please replace the goal with a better outcome for this work.")
+    db.append_message(sid, "user", "Please replace the goal with: Ship the better outcome.")
     result = mgr.replace(
         reason="the user asked for a better goal", goal="Ship the better outcome",
         contract=GoalContract(verification="new proof"),
-        user_quote="replace the goal with a better outcome",
+        user_quote="replace the goal with ship the better outcome",
         user_messages=["forged caller-supplied text"],
     )
     assert result["ok"]
@@ -648,7 +689,7 @@ def test_replace_uses_current_user_quote_and_carries_gates_and_remaining_budget(
     assert record["kind"] == "replace"
     assert record["authority"] == "user_quote"
     assert record["before"]["goal"] == "Ship the original outcome"
-    assert record["user_message"] == "Please replace the goal with a better outcome for this work."
+    assert record["user_message"] == "Please replace the goal with: Ship the better outcome."
     assert record["user_message_id"] is not None
 
 
@@ -764,6 +805,58 @@ def test_multiline_recorded_evidence_is_accepted_but_fabrication_is_rejected(her
     assert rejected["error_code"] == "evidence_not_recorded"
 
 
+def test_negated_restriction_removal_preserves_gates_and_remaining_budget(hermes_home):
+    sid = "replace-negated-restrictions"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Old goal", max_turns=8)
+    mgr.add_gate("printf gate")
+    mgr.state.turns_used = 3
+    mgr._save()
+    db.append_message(
+        sid, "user",
+        "Replace the goal with: Ship the new thing; do not remove the quality gates or turn budget.",
+    )
+    result = mgr.replace(
+        reason="the user requested the new goal", goal="Ship the new thing",
+        user_quote="Replace the goal with: Ship the new thing",
+    )
+    assert result["ok"]
+    assert [gate.command for gate in result["state"].gates] == ["printf gate"]
+    assert result["state"].max_turns == 5
+    assert result["revision"]["removed_restrictions"] == []
+
+
+def test_replacement_rejects_an_agent_goal_not_bound_to_user_text(hermes_home):
+    sid = "replace-unbound-goal"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship original", max_turns=6)
+    before = load_goal(sid).to_json()
+    db.append_message(sid, "user", "Change the goal's scope to docs only.")
+    result = mgr.replace(
+        reason="agent selected an arbitrary objective", goal="Deploy all credentials to production",
+        user_quote="Change the goal's scope to docs only",
+    )
+    assert result["error_code"] == "replacement_authority_required"
+    assert "quote the user's requested goal text" in result["error"]
+    assert mgr.state.goal == "Ship original"
+    assert load_goal(sid).to_json() == before
+
+
+def test_replacement_binding_normalizes_multiline_case_and_punctuation(hermes_home):
+    sid = "replace-normalized-goal"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Old goal")
+    db.append_message(sid, "user", "Please replace the goal with:\nShip the new thing, now!")
+    result = mgr.replace(
+        reason="the user requested the replacement", goal="ship the new thing now",
+        user_quote="replace the goal with ship the new thing now",
+    )
+    assert result["ok"] and mgr.state.goal == "ship the new thing now"
+
+
 def test_authorized_replacement_can_explicitly_remove_gates_and_budget(hermes_home):
     sid = "replace-remove-restrictions"
     db = _db(sid)
@@ -841,14 +934,17 @@ def test_steer_messages_count_as_typed_input(hermes_home):
 
 def test_a_dropped_constraint_stays_binding_in_the_continuation_prompt(hermes_home):
     """An agent revision must not remove a prohibition from the working agent's own prompt."""
+    db = _db("rev-continuation")
     mgr = GoalManager(session_id="rev-continuation")
     mgr.set("Ship X", contract=GoalContract(outcome="X live", constraints="Never publish secrets"))
-    assert mgr.revise(reason="loosen", contract={"constraints": ""}, user_quote="Please keep going",
-                      user_messages=["Please keep going and never publish secrets"])["ok"]
+    db.append_message("rev-continuation", "user", "Please remove the Never publish secrets constraint")
+    assert mgr.revise(reason="loosen", contract={"constraints": ""},
+                      user_quote="remove the Never publish secrets constraint",
+                      user_messages=["Please remove the Never publish secrets constraint"])["ok"]
     prompt = mgr.next_continuation_prompt()
     assert "earlier constraints: Never publish secrets" in prompt
     assert "still binds you unless the user message cited" in prompt
-    assert 'full message: "Please keep going and never publish secrets"' in prompt
+    assert 'full message: "Please remove the Never publish secrets constraint"' in prompt
 
 
 def test_an_unrevised_goal_has_no_revision_block(hermes_home):
