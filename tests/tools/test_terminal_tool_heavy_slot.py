@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import shutil
 import subprocess
 import sys
 import time
@@ -91,18 +92,16 @@ def test_leaves_light_commands_alone(command):
     assert classify_command(command) is None
 
 
-def test_prefixes_only_the_heavy_simple_command(helper):
+def test_routes_only_the_heavy_simple_command(helper):
     wrapped = wrap_heavy_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
-    assert wrapped == (
-        "cd repo && export X=1 && "
-        f"{HELPER} --label 'hermes pytest'\" (in $PWD)\" -- pytest -q tests; echo done"
-    )
+    dispatcher, body = wrapped.split("\n", 1)
+    assert dispatcher.startswith("_hermes_heavy_slot() {") and HELPER in dispatcher
+    assert body == "cd repo && export X=1 && _hermes_heavy_slot 'hermes pytest' pytest -q tests; echo done"
 
 
-def test_wraps_each_heavy_command_once(helper):
-    wrapped = wrap_heavy_command("pnpm test && ./bin/ci gate abc", env_type="local")
-    assert wrapped.count(HELPER) == 2
-    assert wrapped.index("pnpm test") < wrapped.index("./bin/ci gate")
+def test_routes_each_heavy_command_once(helper):
+    body = wrap_heavy_command("pnpm test && ./bin/ci gate abc", env_type="local").split("\n", 1)[1]
+    assert body == "_hermes_heavy_slot 'hermes test' pnpm test && _hermes_heavy_slot 'hermes ci-gate' ./bin/ci gate abc"
 
 
 @pytest.mark.parametrize("env_type", ["docker", "ssh", "modal", "managed_modal", "singularity", "daytona"])
@@ -142,6 +141,31 @@ def _fake_helper(tmp_path: Path) -> str:
         "HEAVY_SLOT_HELD=1 exec \"$@\"\n")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return str(script)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_dispatcher_leaves_shell_functions_and_aliases_to_the_shell(tmp_path, monkeypatch, shell):
+    """A user's own pytest function or ./bin/ci alias runs as before; external programs take the slot."""
+    if not shutil.which(shell):
+        pytest.skip(f"{shell} not installed")
+    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
+    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    fake = _fake_helper(tmp_path)
+    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _env: fake)
+    runner = tmp_path / "vitest"
+    runner.write_text("#!/bin/sh\necho \"external $* held=$HEAVY_SLOT_HELD\"\n")
+    runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+    command = wrap_heavy_command(
+        f"pytest -q 'a b' && FOO=1 tox -e x && {runner} run 'c d'", env_type="local")
+    setup = ("pytest() { echo \"function $* FOO=$FOO\"; }\n"
+             "tox() { echo \"tox-fn FOO=$FOO\"; }\n")
+    if shell == "bash":
+        setup = "shopt -s expand_aliases\n" + setup
+    out = subprocess.run([shell, "-c", setup + command], capture_output=True, text=True, cwd=tmp_path)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == ["function -q a b FOO=", "tox-fn FOO=1", "external run c d held=1"]
+    assert (tmp_path / "helper.log").read_text().count("--label") == 1
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")

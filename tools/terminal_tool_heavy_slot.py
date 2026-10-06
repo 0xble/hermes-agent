@@ -1,14 +1,17 @@
 """Machine-wide throttling for local test suites and CI gates.
 
 The host's ``heavy-slot`` executable owns the cross-process semaphore. Hermes only
-decides which simple commands inside a local terminal command are heavy and puts
-the helper in front of each of them::
+decides which simple commands inside a local terminal command are heavy and routes
+each of them through a small dispatcher function defined at the top of the command::
 
-    cd repo && pytest -q        ->  cd repo && heavy-slot --label ... -- pytest -q
+    cd repo && pytest -q   ->   _hermes_heavy_slot() {...}
+                                cd repo && _hermes_heavy_slot 'hermes pytest' pytest -q
 
 The rest of the command still runs in the session shell, so ``cd``, exports,
-functions and background ``&`` behave exactly as before. Only the heavy
-process waits for and holds a slot.
+functions and background ``&`` behave exactly as before. The dispatcher sends an
+external program through the helper and leaves a name the shell resolves itself
+(alias, function, builtin) to the shell, so a user's own wrapper keeps working.
+Only the heavy process waits for and holds a slot.
 
 Not wrapped: non-local backends (Docker, SSH, Modal and other sandboxes),
 commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
@@ -31,6 +34,9 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _OPT_OUT_VALUES = {"0", "off", "false", "no"}
+# One leading underscore: the session snapshot re-dump skips `_x` functions, so the
+# dispatcher is redefined by each rewritten command and never persists.
+_DISPATCH = "_hermes_heavy_slot"
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Words that put the NEXT word in command position.
 _KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "command", "exec", "nohup"}
@@ -287,7 +293,21 @@ def _wrap_local(command: str, environment: Optional[Mapping[str, str]]) -> str:
         return command
     rewritten = command
     for offset, label in reversed(positions):
-        # The cwd is only known when the shell reaches this command, so expand it there.
-        prefix = f"{shlex.quote(executable)} --label {shlex.quote('hermes ' + label)}\" (in $PWD)\" -- "
-        rewritten = rewritten[:offset] + prefix + rewritten[offset:]
-    return rewritten
+        rewritten = rewritten[:offset] + f"{_DISPATCH} {shlex.quote('hermes ' + label)} " + rewritten[offset:]
+    return _dispatcher(executable) + rewritten
+
+
+def _dispatcher(executable: str) -> str:
+    """Shell function the rewritten commands call.
+
+    A name the session shell resolves itself (alias, function, builtin) runs exactly as
+    before: the user's own wrapper decides whether and how to throttle. Only an external
+    program goes through the helper, labelled with the cwd it runs in. Prefix assignments
+    (``FOO=1 pytest``) reach either path because the shell applies them to the call.
+    """
+    resolve = '$(type -t -- "$1" 2>/dev/null || whence -w -- "$1" 2>/dev/null)'  # bash, then zsh
+    shell_owned = 'alias|function|builtin|keyword|*": alias"|*": function"|*": builtin"|*": reserved"'
+    run_in_shell = '_hermes_hs_name=$1; shift; eval "$_hermes_hs_name \\"\\$@\\""'
+    run_in_slot = f'{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- "$@"'
+    return (f'{_DISPATCH}() {{ _hermes_hs_label=$1; shift; case "{resolve}" in '
+            f'{shell_owned}) {run_in_shell} ;; *) {run_in_slot} ;; esac; }}\n')
