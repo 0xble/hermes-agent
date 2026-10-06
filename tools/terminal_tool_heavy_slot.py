@@ -14,7 +14,7 @@ Not wrapped: non-local backends (Docker, SSH, Modal and other sandboxes),
 commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
 ``HERMES_HEAVY_SLOT=off``, hosts without the helper, text that only mentions a
 runner (``grep pytest``, quoted strings, comments, heredoc bodies), and
-targeted runs of 1-10 explicit test files without worker flags.
+targeted runs of 1-10 explicit test files with only single-run options.
 """
 
 from __future__ import annotations
@@ -47,7 +47,14 @@ _EXEC_RUNNERS = {"npx", "bunx", "uvx", "pnpx"}
 _SUITE_RUNNERS = {"tox", "nox"}
 # Repository CI profiles that only run fast local checks (mirrors ~/.config/shell/heavy-slot.sh).
 _LIGHT_CI_PROFILES = {"preflight", "install-hooks", "list", "-h", "--help"}
-_PARALLEL_FLAGS = ("-n", "--numprocesses", "--workers", "-j", "--jobs", "--dist")
+# Options a targeted run may carry and still count as light. This is an allowlist on
+# purpose: any other option (pytest -n/--dist, jest --maxWorkers, vitest --pool, a
+# runner's own --workers or --jobs) may fan out, so it falls back to the slot.
+_TARGETED_FLAGS = {"-q", "-qq", "-v", "-vv", "-vvv", "-x", "-s", "-l", "--quiet", "--verbose", "--exitfirst",
+                   "--no-header", "--lf", "--ff", "--last-failed", "--failed-first", "--sw", "--stepwise",
+                   "--run", "--no-watch", "--bail", "--silent", "--color", "--no-color", "--showlocals"}
+_TARGETED_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-W", "-r", "--tb", "-t", "--testNamePattern",
+                         "--file-timeout", "--file-retries"}
 _TEST_FILE = re.compile(r"(\.py(::.*)?|\.(test|spec)\.[cm]?[jt]sx?)$")
 _MAX_TARGETED_FILES = 10
 
@@ -72,7 +79,7 @@ def _basename(word: str) -> str:
 
 
 def _is_targeted(args: list[str]) -> bool:
-    """1-10 explicit test files, no directories or worker flags: cheap enough to run unslotted."""
+    """1-10 explicit test files with only known single-run options: cheap enough to run unslotted."""
     files = 0
     skip_value = False
     for arg in args:
@@ -81,13 +88,14 @@ def _is_targeted(args: list[str]) -> bool:
             continue
         if arg == "--":
             continue
-        if arg.startswith(_PARALLEL_FLAGS):
-            return False
-        if arg in {"-k", "-m", "-p", "-o", "-c", "-r", "-W", "--tb", "--file-timeout", "--file-retries"}:
+        if arg in _TARGETED_VALUE_FLAGS:
             skip_value = True
             continue
         if arg.startswith("-"):
-            continue
+            name = arg.split("=", 1)[0]
+            if arg in _TARGETED_FLAGS or (name != arg and name in _TARGETED_VALUE_FLAGS | {"--tb", "--color"}):
+                continue
+            return False  # unknown option: may add workers, so keep the slot
         if not _TEST_FILE.search(arg):
             return False  # a directory, `run` subcommand target set, or anything broad
         files += 1

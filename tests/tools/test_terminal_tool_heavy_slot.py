@@ -44,6 +44,13 @@ def helper(monkeypatch):
     ("bash -c 'cd x && pytest'", "pytest"),
     ("if true; then pytest; fi", "pytest"),
     ("env -u FOO PYTHONPATH=. timeout 600 pytest tests", "pytest"),
+    # Targeted file runs that may still fan out keep the slot (unknown options fail toward it).
+    ("pytest -n 8 tests/tools/test_a.py", "pytest"),
+    ("pytest --numprocesses=auto tests/tools/test_a.py", "pytest"),
+    ("jest --maxWorkers=4 src/a.test.js", "jest"),
+    ("vitest --pool=threads src/a.test.ts", "vitest"),
+    ("vitest run --maxWorkers 4 src/a.test.ts", "vitest"),
+    ("scripts/run_tests.sh --workers 8 tests/agent/test_foo.py", "run_tests"),
 ])
 def test_recognizes_heavy_commands(command, label):
     assert classify_command(command) == label
@@ -68,6 +75,7 @@ def test_recognizes_heavy_commands(command, label):
     "pytest tests/tools/test_a.py tests/tools/test_b.py -q",  # targeted
     "scripts/run_tests.sh tests/agent/test_foo.py -k test_x",  # targeted
     "vitest run src/a.test.ts",  # targeted
+    "pytest -q -x --tb=short -k smoke tests/tools/test_a.py::test_b",  # targeted with single-run options
 ])
 def test_leaves_light_commands_alone(command):
     assert classify_command(command) is None
