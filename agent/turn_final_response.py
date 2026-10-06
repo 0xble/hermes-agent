@@ -25,6 +25,34 @@ _REPETITION_STOPPED = repetition_copy(
 )
 logger = logging.getLogger("agent.conversation_loop")
 
+
+def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
+    """Drop a trailing standalone silence marker from an interactive reply.
+
+    Decide on the visible text (inline think blocks removed), because a reply that is
+    only reasoning plus a marker is intended silence: stripping the marker from the raw
+    text would leave a think-only response and send the turn into empty-response
+    recovery. Autonomous cron/webhook lanes keep their own first/last-line semantics.
+    """
+    if not isinstance(text, str) or str(getattr(agent, "platform", "") or "").lower() in {"cron", "webhook"}:
+        return text
+    from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+    try:
+        visible = agent._strip_think_blocks(text)
+    except Exception:
+        visible = text
+    visible_result = strip_trailing_silence_marker(visible)
+    if is_intentional_silence_response(visible_result):
+        # Bare marker (with or without reasoning) stays as-is for the silence path; a
+        # marker-only run collapses to one marker.
+        return text if is_intentional_silence_response(visible) else visible_result
+    if visible_result == visible:
+        return text
+    # The visible text proved the trailing marker lines are top-level. A fence opened inside
+    # a think block must not hide them in the raw text, so strip the raw text fence-blind.
+    raw_result = strip_trailing_silence_marker(text, respect_fences=False)
+    return raw_result if raw_result != text else visible_result
+
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_thinking_prefill", "_empty_recovery_synthetic", "_empty_terminal_sentinel",
@@ -113,6 +141,10 @@ def finish_text_response(
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
     final_response = _promoted or assistant_message.content or ""
+    # Interactive gateway replies may contain a control marker on a final standalone line after
+    # substantive prose. Strip it before the assistant row is flushed; autonomous cron/webhook
+    # lanes keep their existing first/last-line silence semantics.
+    final_response = _strip_interactive_trailing_marker(agent, final_response)
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False
@@ -271,6 +303,13 @@ def finish_text_response(
         ))
 
     final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+    # ``_build_assistant_message`` stores the provider content, while ``final_response`` is
+    # the delivery/persistence-normalized text. Keep the assistant row aligned when the
+    # trailing interactive silence marker was removed (autonomous lanes stay unchanged).
+    if not _promoted:
+        _stored_content = final_msg.get("content")
+        if isinstance(_stored_content, str):
+            final_msg["content"] = _strip_interactive_trailing_marker(agent, _stored_content)
     if _promoted:
         # Replay sidecar only: ``content`` stays empty so the row is never mistaken for a
         # real reply; ``build_api_messages`` substitutes ``api_content`` on the wire.

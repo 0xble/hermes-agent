@@ -278,6 +278,9 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> None:
     mgr = GoalManager(session_id=sid_key)
     if not mgr.is_parked() or _notif_gateway_owns_heartbeat(session, sid_key):
         return
+    barrier_notice = mgr.rearm_live_barrier()
+    if barrier_notice:
+        _notif_loop_status(sid, barrier_notice)
     if not (prompt := mgr.lifted_barrier_prompt()):
         return
     since = mgr.state.waiting_since

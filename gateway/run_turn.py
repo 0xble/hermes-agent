@@ -27,6 +27,7 @@ from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    strip_trailing_silence_marker,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -1525,6 +1526,12 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
+        # Webhook delivery is an autonomous lane with a looser first/last-line silence rule;
+        # leave its marker semantics unchanged. Interactive replies drop a trailing standalone
+        # marker from substantive text before the silence verdict, so a marker-only run that
+        # collapses to one marker still goes through the silence guard below.
+        if source.platform != Platform.WEBHOOK:
+            response = strip_trailing_silence_marker(response)
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
@@ -2733,6 +2740,7 @@ class GatewayTurnMixin:
             cursor=_effective_cursor,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            strip_trailing_silence_markers=(source.platform != Platform.WEBHOOK),
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
