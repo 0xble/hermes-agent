@@ -14,6 +14,7 @@ import pytest
 from agent.interrupt_control import InterruptControlMixin
 from agent.turn_context import _bind_interrupt_scope
 from tools import async_delegation
+from tools import delegate_tool_dispatch as dispatch_module
 from tools.delegate_tool_dispatch import _Batch, _dispatch_background
 from tools.interrupt import is_interrupted, set_interrupt
 from tools.process_registry import process_registry
@@ -121,6 +122,30 @@ def registry_state(tmp_path, monkeypatch):
     if async_delegation._executor is not None:
         async_delegation._executor.shutdown(wait=True)
     async_delegation._reset_for_tests()
+
+
+
+
+def test_early_terminal_unit_is_handled_without_sync_rerun(registry_state, monkeypatch):
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    worker_runs = []
+
+    def early_dispatch(*_args, **_kwargs):
+        worker_runs.append("async")
+        return {"status": "completed", "accepted": True, "delegation_id": "early-unit"}
+
+    def sync_fallback(*_args, **_kwargs):
+        worker_runs.append("sync")
+        return {"results": [{"task_index": 0, "status": "completed"}]}
+
+    monkeypatch.setattr(dispatch_module, "_dispatch_unit", early_dispatch)
+    monkeypatch.setattr(dispatch_module, "_execute_and_aggregate", sync_fallback)
+    result = json.loads(_dispatch_background(batch))
+
+    assert result["status"] == "dispatched"
+    assert worker_runs == ["async"]
+    dispatch_module._restore_parent_cancellation(batch)
 
 
 @pytest.mark.parametrize("rejection", ["schedule_failure", "partial_schedule_failure", "capacity"])

@@ -607,6 +607,65 @@ def test_queued_siblings_share_one_bounded_slot_and_admit_together():
     assert all(_drain_for(unit["delegation_id"]) is not None for unit in units)
 
 
+def test_queued_sibling_admission_rolls_back_as_one_transaction(monkeypatch):
+    release = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    assert first["status"] == "dispatched"
+
+    started = [0, 0, 0]
+    handles = []
+    slot_key = "three-sibling-call"
+    for index in range(3):
+        handles.append(ad.dispatch_async_delegation_batch(
+            goals=[f"sibling {index}"], context=None, toolsets=None, role="leaf", model="m", session_key="",
+            runner=lambda index=index: (
+                started.__setitem__(index, started[index] + 1),
+                {"results": [{"task_index": 0, "status": "completed", "summary": f"sibling {index}"}]},
+            )[1], max_async_children=1, max_queued_delegations=1, slot_key=slot_key,
+        ))
+    assert [handle["status"] for handle in handles] == ["queued", "queued", "queued"]
+
+    attempted = threading.Event()
+    failed = {"once": False}
+    original_group_transition = ad._persist_transition_group
+
+    def fail_second_sibling(ids, expected, new):
+        if expected == "queued" and not failed["once"]:
+            assert len(ids) == 3
+            failed["once"] = True
+            attempted.set()
+            raise RuntimeError("injected conditional failure on sibling 2 of 3")
+        return original_group_transition(ids, expected, new)
+
+    monkeypatch.setattr(ad, "_persist_transition_group", fail_second_sibling)
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert attempted.wait(5)
+    with ad._records_lock:
+        assert all(ad._records[h["delegation_id"]]["status"] == "queued" for h in handles)
+        assert all(not ad._records[h["delegation_id"]].get("_slot_reserved") for h in handles)
+        assert ad._queued_count_locked() == 1
+
+    # A later admission sees the restored FIFO group and runs every sibling
+    # exactly once; no admitted-without-Future record can strand capacity.
+    ad._admit_pending()
+    deadline = time.monotonic() + 5
+    while started != [1, 1, 1] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert started == [1, 1, 1]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with ad._records_lock:
+            if all(ad._records[h["delegation_id"]]["status"] in ad._TERMINAL_STATES for h in handles):
+                break
+        time.sleep(0.02)
+    with ad._records_lock:
+        assert all(ad._records[h["delegation_id"]]["status"] in ad._TERMINAL_STATES for h in handles)
+
+
 def test_queued_worker_preserves_parent_prompt_callbacks(monkeypatch):
     """A queued worker inherits the dispatching thread's approval callback."""
     from tools import thread_context
@@ -1873,6 +1932,58 @@ def test_connect_creates_state_db_0o600_under_permissive_umask(tmp_path, monkeyp
         sidecar = tmp_path / f"state.db{suffix}"
         if sidecar.exists():
             assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+
+
+def test_post_insert_prune_failure_keeps_queued_dispatch_durable(monkeypatch):
+    release = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    assert first["status"] == "dispatched"
+
+    def prune_failure():
+        raise RuntimeError("retention database unavailable")
+
+    monkeypatch.setattr(ad, "_prune_durable_records", prune_failure)
+    queued = ad.dispatch_async_delegation(
+        goal="survive housekeeping failure", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "queued once"},
+        max_async_children=1, max_queued_delegations=1,
+    )
+    assert queued["status"] == "queued"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?", (queued["delegation_id"],)
+        ).fetchone() == ("queued",)
+
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert _drain_for(queued["delegation_id"]) is not None
+
+
+def test_pre_insert_failure_leaves_no_durable_dispatch(monkeypatch):
+    original_connect = ad._connect
+
+    def connect_failure():
+        raise RuntimeError("state database unavailable before insert")
+
+    monkeypatch.setattr(ad, "_new_delegation_id", lambda: "pre-insert-failure")
+    monkeypatch.setattr(ad, "_connect", connect_failure)
+    result = ad.dispatch_async_delegation(
+        goal="must not orphan", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: {"status": "completed"}, max_async_children=1,
+    )
+    assert result["status"] == "rejected"
+    assert result["accepted"] is False
+    delegation_id = next(iter(ad._records), None)
+    assert delegation_id is None
+
+    monkeypatch.setattr(ad, "_connect", original_connect)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM async_delegations WHERE delegation_id=?", ("pre-insert-failure",)
+        ).fetchone() is None
 
 
 def test_persist_failure_still_delivers_result_and_frees_slot(monkeypatch):

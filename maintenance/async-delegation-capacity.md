@@ -46,6 +46,17 @@ from a new persisted record or a slot-release callback and loops to capacity.
 - Pending admission is bounded. Queued state is durable or is surfaced as an
   explicit interrupted/unknown outcome on owner restart; it must not disappear
   silently.
+- Sibling-group admission is all-or-nothing: the queued-to-admitted and
+  admitted-to-running durable transitions update every selected sibling in one
+  transaction before in-memory promotion or submission. A failed group update
+  restores the entire FIFO group to `queued`; an admitted record with no Future
+  past the short pre-submit recovery deadline is requeued by the stale monitor.
+- The durable INSERT commits independently of retention pruning. Post-insert
+  housekeeping failures are logged and do not convert an accepted queued
+  dispatch into a rejected in-memory-only record.
+- Dispatch callers use an explicit accepted result flag. Any accepted unit,
+  including one that reaches a terminal state before dispatch returns, is handled
+  as asynchronous work and is never re-run synchronously.
 - Admission persistence, submit-failure finalization, and queued cancellation run
   in the queued unit's captured profile context. A process serving multiple
   profiles must never write another profile's `state.db` or completion manifest.

@@ -472,12 +472,16 @@ def _dispatch_background(batch: _Batch) -> str:
         for _, _, child in unit.children:
             _detach_child(parent_agent, child)
         dispatch = _dispatch_unit(unit, unit_id, slot_key, routing)
-        if dispatch.get("status") == "dispatched":
-            slot_key = slot_key or dispatch["delegation_id"]
-            dispatched.append((unit, dispatch["delegation_id"]))
-            continue
-        if dispatch.get("status") == "queued":
-            queued.append((unit, dispatch["delegation_id"]))
+        if dispatch.get("accepted") is True:
+            if dispatch.get("status") == "dispatched":
+                slot_key = slot_key or dispatch["delegation_id"]
+                dispatched.append((unit, dispatch["delegation_id"]))
+            else:
+                # A worker may finish before _dispatch_unit returns. Its
+                # terminal status is still an accepted async outcome and must
+                # never trigger the synchronous fallback a second time.
+                accepted_units = queued if dispatch.get("status") == "queued" else dispatched
+                accepted_units.append((unit, dispatch["delegation_id"]))
             continue
         if dispatch.get("at_capacity"):
             logger.warning("delegate_task: async pool at capacity and pending queue unavailable; rejecting without synchronous fallback: %s",
