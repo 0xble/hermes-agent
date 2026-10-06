@@ -1255,8 +1255,15 @@ class GatewayShutdownMixin:
 
     async def _finalize_shutdown_agents(
         self, active_agents: Dict[str, Any], *, interrupted: bool = False,
+        stop_event: Optional[threading.Event] = None,
     ) -> None:
+        if stop_event is None:
+            stop_event = getattr(self, "_shutdown_finalize_stop_event", None)
         for session_key, agent in active_agents.items():
+            # A timed-out restart may detach this phase. Stop before starting another
+            # agent's hooks so the following DB/adaptor teardown has exclusive ownership.
+            if stop_event is not None and stop_event.is_set():
+                return
             self._flush_agent_transcript_at_shutdown(agent)
             if interrupted:
                 logger.warning(
@@ -1271,6 +1278,8 @@ class GatewayShutdownMixin:
                 session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
                 session_key=session_key,
             )
+            if stop_event is not None and stop_event.is_set():
+                return
             # Off-loop + bounded: a wedged memory provider here used to hang the whole shutdown so
             # SIGTERM never completed.
             await self._cleanup_agent_resources_off_loop(agent, context="shutdown finalize", session_key=session_key)
@@ -1852,12 +1861,12 @@ class GatewayShutdownMixin:
     # stop() phases. Invoked as ``GatewayRunner._stop_<phase>(self, ctx)`` so shutdown-path tests
     # can drive them from bare doubles that are not GatewayRunner instances.
     @staticmethod
-    def _quiet_step(label: str, fn: Callable[[], Any]) -> Any:
-        """Run one best-effort teardown step; a failure is debug-logged as ``"<label>: <exc>"``."""
+    def _quiet_step(label: str, fn: Callable[[], Any], *, level: int = logging.DEBUG) -> Any:
+        """Run one best-effort teardown step and log failures at the requested level."""
         try:
             return fn()
         except Exception as _e:
-            logger.debug("%s: %s", label, _e)
+            logger.log(level, "%s: %s", label, _e)
             return None
 
     @staticmethod
@@ -1880,7 +1889,9 @@ class GatewayShutdownMixin:
         def _step(label: str, fn: Callable[[], Any]) -> Any:
             if _expired():
                 return None
-            return GatewayShutdownMixin._quiet_step(f"{label} ({phase}) error", fn)
+            return GatewayShutdownMixin._quiet_step(
+                f"{label} ({phase}) error", fn, level=logging.WARNING,
+            )
 
         def _count_step(fmt: str, fn: Callable[[], int]) -> None:
             n = fn()
@@ -2121,15 +2132,24 @@ class GatewayShutdownMixin:
             return max(1.0, min(3.0, float(launchd_budget) - 1.0))
         return 3.0
 
-    async def _stop_finalize_agents_and_adapters(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    async def _stop_finalize_agents_and_adapters(
+        self, ctx: "GatewayShutdownMixin._StopContext",
+        *, stop_event: Optional[threading.Event] = None,
+    ) -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
+        if stop_event is not None and stop_event.is_set():
+            return
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
-        if ctx.timed_out:
+        if stop_event is not None and stop_event.is_set():
+            return
+        if self._restart_requested and ctx.timed_out:
             await self._finalize_shutdown_agents(ctx.active_agents, interrupted=True)
         else:
             await self._finalize_shutdown_agents(ctx.active_agents)
+        if stop_event is not None and stop_event.is_set():
+            return
         # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         _cache = getattr(self, "_agent_cache", None)
@@ -2138,15 +2158,21 @@ class GatewayShutdownMixin:
                 _idle_agents = list(_cache.items())
                 _cache.clear()
             for _key, _entry in _idle_agents:
+                if stop_event is not None and stop_event.is_set():
+                    return
                 # Bounded + off-loop: a wedged memory provider here once made SIGTERM hang forever.
                 await self._cleanup_agent_resources_off_loop(
                     _entry[0] if isinstance(_entry, tuple) else _entry, context="shutdown idle-cache",
                     session_key=_key,
                 )
+        if stop_event is not None and stop_event.is_set():
+            return
         # Settle completion flush tasks while adapters are alive so every watcher gets a retryable result.
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
+        if stop_event is not None and stop_event.is_set():
+            return
         # Preserve each adapter's queue BEFORE any cancellable background-task cleanup. The
         # adapter normally flushes after its drain loop, but a slow unwind can outlast that
         # loop's timeout and skip the flush. Remove only successfully spooled slots so its
@@ -2157,10 +2183,14 @@ class GatewayShutdownMixin:
                         for profile, amap in list(_profile_adapters.items())
                         for platform, adapter in list(amap.items()))
         for platform, adapter, profile in adapters:
+            if stop_event is not None and stop_event.is_set():
+                return
             pending = getattr(adapter, "_pending_messages", None)
             if not isinstance(pending, dict) or not pending:
                 continue
             for key, value in list(pending.items()):
+                if stop_event is not None and stop_event.is_set():
+                    return
                 try:
                     if self._flush_owned_pending(key, value, reason="adapter_shutdown"):
                         if pending.get(key) is value:
@@ -2169,6 +2199,8 @@ class GatewayShutdownMixin:
                     logger.exception("Failed to preserve %s adapter pending message for %s", platform.value, key)
         # Only network notices share the 3s budget. Adapter teardown has its own bounded
         # per-operation timeouts and must run through disconnect (token-lock release).
+        if stop_event is not None and stop_event.is_set():
+            return
         if adapters:
             await asyncio.gather(*(self._bounded_adapter_teardown(adapter, platform, profile=profile)
                                    for platform, adapter, profile in adapters))
@@ -2430,15 +2462,30 @@ class GatewayShutdownMixin:
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
-            _finalize_task = asyncio.create_task(GatewayRunner._stop_finalize_agents_and_adapters(self, ctx))
+            _finalize_stop_event = threading.Event()
+            self._shutdown_finalize_stop_event = _finalize_stop_event
+            _finalize_task = asyncio.create_task(
+                GatewayRunner._stop_finalize_agents_and_adapters(self, ctx, stop_event=_finalize_stop_event)
+            )
             if ctx.timed_out and self._restart_requested:
                 if not await GatewayRunner._wait_or_detach(_finalize_task, self._restart_shutdown_bound()):
+                    # Do not leave finalization touching adapters or profile DBs while the
+                    # following phases release/close them. The event stops between-agent
+                    # work; cancellation stops the asyncio coordinator immediately.
+                    _finalize_stop_event.set()
+                    _finalize_task.cancel()
                     logger.warning(
-                        "Shutdown finalization exceeded %.1fs; detaching remaining cleanup",
+                        "Shutdown finalization exceeded %.1fs; cancelling remaining cleanup",
                         self._restart_shutdown_bound(),
                     )
             else:
                 await _finalize_task
+            if not _finalize_task.done():
+                _finalize_stop_event.set()
+                _finalize_task.cancel()
+                _finalize_task.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)

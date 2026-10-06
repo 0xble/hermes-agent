@@ -2323,6 +2323,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if not self._move_to_finished(session):
                 if deadline is None or time.monotonic() < deadline:
                     save_completed_result(session)
+            if deadline is None or time.monotonic() < deadline:
+                self._write_checkpoint()
             return {
                 "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, **output}
@@ -2627,8 +2629,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             kill_kwargs = {"source": source, "consume_output": consume_output}
             if deadline is not None:
                 kill_kwargs["deadline"] = deadline
-            if stop_event is not None:
-                kill_kwargs["stop_event"] = stop_event
+            # stop_event is a sweep-level cooperative boundary; kill_process() owns
+            # only the per-target deadline and must not receive the event.
             killed += self.kill_process(session.id, **kill_kwargs).get("status") in {"killed", "already_exited"}
         return killed
 

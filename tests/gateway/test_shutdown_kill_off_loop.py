@@ -8,6 +8,7 @@ tests pin the invariant: the kill sweep runs off-loop, in phase order.
 """
 
 import asyncio
+import os
 import threading
 import time
 
@@ -120,3 +121,48 @@ async def test_blocking_kill_sweep_is_detached_without_late_registry_cleanup(mon
 
     assert elapsed < 0.5
     assert [name for name, _when in events] == ["kill_started", "kill_stopped"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses POSIX sleep")
+def test_real_kill_all_stop_event_kills_spawned_process():
+    """The sweep's stop_event must not leak into kill_process()."""
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    session = registry.spawn_local("exec sleep 30", task_id="shutdown-test", owner_task_id="shutdown-test")
+    try:
+        killed = registry.kill_all(
+            source="gateway_shutdown",
+            deadline=time.monotonic() + 2.0,
+            stop_event=threading.Event(),
+        )
+        assert killed == 1
+        assert session.process is not None
+        assert session.process.returncode is not None
+    finally:
+        registry.kill_all(source="test-cleanup")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="uses POSIX sleep")
+async def test_real_shutdown_kill_sweep_kills_spawned_process(monkeypatch):
+    """The off-loop shutdown path must exercise the real registry kill path."""
+    import tools.process_registry as _pr
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    session = registry.spawn_local("exec sleep 30", task_id="shutdown-test", owner_task_id="shutdown-test")
+    monkeypatch.setattr(_pr, "process_registry", registry)
+    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", lambda *a, **k: [])
+    monkeypatch.setattr("tools.async_delegation.interrupt_all", lambda *a, **k: 0)
+    monkeypatch.setattr("tools.terminal_tool_lifecycle.cleanup_all_environments", lambda: None)
+    monkeypatch.setattr("tools.browser_tool_lifecycle.cleanup_all_browsers", lambda: None)
+    try:
+        await GatewayShutdownMixin._stop_kill_tool_subprocesses_off_loop("test", timeout=2.0)
+        assert session.process is not None
+        deadline = time.monotonic() + 6.0
+        while session.process.returncode is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert session.process.returncode is not None
+    finally:
+        registry.kill_all(source="test-cleanup")
