@@ -632,8 +632,7 @@ _WAKE = {"display_kind": "internal_notification"}
     ("[SILENT]", _WAKE, []),
     ("NO_REPLY", _WAKE, []),
     ("disk is 91% full", {**_WAKE, "display_metadata": {"notification_category": "diagnostic"}}, []),
-    ("NO_REPLY", {}, ["⚠️ The model returned only a silence marker for a message that needed a reply. "
-                      "Try again or rephrase."]),
+    ("NO_REPLY", {}, ["⚠️ No reply was written for this message. Send it again if you expected one."]),
     ("NO_REPLY", {"display_metadata": {"reply_expected": False}}, []),
 ])
 async def test_unclean_restart_never_redelivers_a_reply_live_delivery_suppressed(tmp_path, reply, prompt, owed):
