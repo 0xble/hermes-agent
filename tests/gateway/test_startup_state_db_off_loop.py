@@ -93,6 +93,54 @@ async def _async_return_one_pair(*args, **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_finish_wiring_discovers_mcp_before_restore_gate(monkeypatch):
+    import gateway.run as gateway_run
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner._mcp_discovery_ready = asyncio.Event()
+    runner._startup_restore_in_progress = True
+    order = []
+
+    async def post_connect(_connected_count):
+        order.append("post_connect")
+
+    async def boot_sends(**_kwargs):
+        order.append("boot_sends")
+
+    async def discover(_config):
+        order.append(("mcp", runner._startup_restore_in_progress, runner._mcp_discovery_ready.is_set()))
+
+    async def no_candidates(*_args, **_kwargs):
+        return []
+
+    async def finish_restore():
+        order.append("restore")
+
+    monkeypatch.setattr(gateway_run, "_planned_restart_notification_pending", lambda: False)
+    monkeypatch.setattr(gateway_run, "_restart_notification_pending", lambda: False)
+    monkeypatch.setattr(gateway_run, "_discover_gateway_mcp_tools", discover)
+    monkeypatch.setattr(
+        "gateway.run_pending_recovery.recover_pending_shutdown_flush",
+        lambda *args, **kwargs: 0,
+    )
+    runner._start_post_connect_services = post_connect
+    runner._await_startup_boot_sends = boot_sends
+    runner._resume_pending_candidates_async = no_candidates
+    runner._schedule_resume_pending_sessions = lambda **_kwargs: order.append("schedule")
+    runner._finish_startup_restore = finish_restore
+    runner._schedule_auto_resume_delegations = lambda: order.append("delegations")
+    runner._send_session_db_warning_notifications = no_candidates
+
+    from tools.process_registry import process_registry
+    monkeypatch.setattr(process_registry, "pending_watchers", [])
+    await runner._start_finish_wiring(1)
+
+    assert order.index(("mcp", True, False)) < order.index("restore")
+    assert runner._mcp_discovery_ready.is_set()
+
+
+@pytest.mark.asyncio
 async def test_startup_recovery_snapshot_does_not_block_gateway_loop():
     """A blocking recovery read must run in a worker, not on the event-loop thread."""
     runner = object.__new__(GatewayRunner)
