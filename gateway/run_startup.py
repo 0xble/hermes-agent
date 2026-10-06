@@ -561,12 +561,11 @@ class GatewayStartupMixin:
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
         try:
-            owned = getattr(self, "_startup_owned_recovery_keys", frozenset())
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.session_key not in owned and entry.resume_pending
+                    if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
@@ -797,12 +796,7 @@ class GatewayStartupMixin:
     async def _consume_clean_shutdown_marker(self, marker_path) -> int:
         """Discard orphan turn markers before consuming a clean-exit receipt. Raises (fail closed):
         continuing with the old receipt would let a later unclean exit masquerade as clean."""
-        from gateway.run_startup_recovery import startup_recovery_fences
-        live, owned = await asyncio.to_thread(startup_recovery_fences, self)
-        self._startup_live_recovery_keys = live
-        self._startup_owned_recovery_keys = owned
-        kwargs = {"exclude_session_keys": live} if live else {}
-        discarded = await self.async_session_store.discard_active_turn_markers(**kwargs)
+        discarded = await self.async_session_store.discard_active_turn_markers()
         marker_path.unlink()
         return discarded
 
@@ -813,28 +807,20 @@ class GatewayStartupMixin:
         the old 120 s recency sweep re-answered every recently active chat. Returns (resumed,
         ledgered)."""
         from gateway.run import _float_env
-        from gateway.run_startup_recovery import startup_recovery_fences
-        live, owned = await asyncio.to_thread(startup_recovery_fences, self)
-        self._startup_live_recovery_keys = live
-        self._startup_owned_recovery_keys = owned
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered = await self._ledger_crash_left_replies(max_age, exclude_session_keys=live)
+            ledgered = await self._ledger_crash_left_replies(max_age)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
-            kwargs = {"exclude_session_keys": owned} if owned else {}
-            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age, **kwargs)
+            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
         return resumed, ledgered
 
-    async def _ledger_crash_left_replies(self, max_age_seconds: int, *, exclude_session_keys=None) -> int:
+    async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
         """Settle every marked turn whose final reply was persisted and clear its marker, so
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
-        if exclude_session_keys is None:
-            from gateway.run_startup_recovery import startup_recovery_fences
-            exclude_session_keys, _owned = await asyncio.to_thread(startup_recovery_fences, self)
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -843,8 +829,7 @@ class GatewayStartupMixin:
                 (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
                  e.transport_profile)
                 for e in self.session_store._entries.values()  # noqa: SLF001
-                if e.session_key not in exclude_session_keys
-                and e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
+                if e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
             ]
         ledgered = 0
         for key, session_id, token, started_at, origin, profile in marked:
@@ -1266,11 +1251,7 @@ class GatewayStartupMixin:
         # Stuck-loop detection: a session active across 3+ consecutive restarts is auto-suspended.
         with _log_suppressed(logging.DEBUG, "Stuck-loop detection failed: %s"):
             # Auto-suspend it so the user gets a clean slate on the next message. See #7536.
-            # A's counters and cached routing rows still belong to A while it
-            # drains. Defer this global legacy sweep rather than suspending A
-            # or bulk-saving B's stale snapshot over its living owner's state.
-            stuck = (0 if getattr(self, "_startup_live_recovery_keys", frozenset())
-                     else self._suspend_stuck_loop_sessions())
+            stuck = self._suspend_stuck_loop_sessions()
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
 

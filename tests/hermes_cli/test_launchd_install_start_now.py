@@ -42,7 +42,7 @@ def launchd(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: DOMAIN)
     monkeypatch.setattr(gateway_cli, "_refuse_temp_home_service_write", lambda *a: False)
     monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
-    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label, **kwargs: state.supervised_pid)
+    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label: state.supervised_pid)
     monkeypatch.setattr(gateway_cli, "_launchctl_bootstrap", lambda *a, **k: state.bootstraps.append(a))
     monkeypatch.setattr(gateway_cli, "refresh_launchd_plist_if_needed", lambda: state.refreshes.append(1) or True)
     monkeypatch.setattr(gateway_cli, "_setup_service_action", lambda *a, **k: state.starts.append(a))

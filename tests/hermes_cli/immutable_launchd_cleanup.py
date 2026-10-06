@@ -10,8 +10,7 @@ from pathlib import Path
 
 import psutil
 
-_PREFIXES = ("ai.hermes.s2spike.", "ai.hermes.s2migration.", "ai.hermes.s2crash.",
-             "ai.hermes.p3test-")
+_PREFIXES = ("ai.hermes.s2spike.", "ai.hermes.s2migration.", "ai.hermes.s2crash.")
 _REGISTRY = "immutable-launchd-labels.jsonl"
 
 

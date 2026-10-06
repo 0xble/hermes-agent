@@ -43,7 +43,6 @@ from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
-from gateway.deadline import detached_context
 from gateway.turn_executor import _UnboundedThreadExecutor
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
@@ -3745,7 +3744,7 @@ class GatewayRunner(
         except Exception:
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
-    def _init_session_db(self, *, maintenance: bool = True) -> None:
+    def _init_session_db(self) -> None:
         """Open the session DB for the active scope and run opportunistic state.db / checkpoint maintenance."""
         # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
         # root home under multiplex); priming here keeps startup diagnostics at init.
@@ -3765,9 +3764,6 @@ class GatewayRunner(
             # WARNING (not DEBUG) so it lands in errors.log; else an NFS HERMES_HOME silently loses /resume etc.
             logger.warning("SQLite session store not available: %s", e)
             self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
-
-        if not maintenance:
-            return  # The standby canary must not prune unrelated user sessions.
 
         # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
         # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
@@ -5414,38 +5410,28 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     return shutdown_signal_handler
 
 
-_pid_cleanup_registered = False
-
-
-def _start_gateway_claim_pid_file(force: bool = False, *, projected_identity=None) -> bool:
+def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
     import atexit
     from gateway.status import (
         acquire_gateway_runtime_lock, get_running_pid, release_gateway_runtime_lock,
         remove_pid_file, write_pid_file)
-    if not acquire_gateway_runtime_lock():
-        logger.error("Gateway runtime lock is already held by another instance. Exiting.")
-        return False
     _current_pid = get_running_pid()
     if _current_pid is not None and _current_pid != os.getpid():
-        release_gateway_runtime_lock()
         logger.error("Another gateway instance (PID %d) started during our startup. "
                      "Exiting to avoid double-running.", _current_pid)
         return False
+    if not acquire_gateway_runtime_lock():
+        logger.error("Gateway runtime lock is already held by another instance. Exiting.")
+        return False
     try:
-        if projected_identity is None:
-            write_pid_file()
-        else:
-            write_pid_file(projected_identity=projected_identity)
+        write_pid_file()
     except FileExistsError:
         release_gateway_runtime_lock()
         logger.error("PID file race lost to another gateway instance. Exiting.")
         return False
-    global _pid_cleanup_registered
-    if not _pid_cleanup_registered:
-        atexit.register(remove_pid_file)
-        atexit.register(release_gateway_runtime_lock)
-        _pid_cleanup_registered = True
+    atexit.register(remove_pid_file)
+    atexit.register(release_gateway_runtime_lock)
     _claim_host_gateway_role(force=force)
     return True
 
@@ -5677,7 +5663,7 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
     return None
 
 
-async def _start_gateway_start_control_socket(runner, *, generation_id: str | None = None):
+async def _start_gateway_start_control_socket(runner):
     """Start the gateway control socket (identify/status/pause-for-update); None when unavailable."""
     import atexit
     _control_server = None
@@ -5687,7 +5673,7 @@ async def _start_gateway_start_control_socket(runner, *, generation_id: str | No
         # a truthful liveness/identity query for updater and fleet consumers. Strictly non-fatal: a bind
         # failure only means consumers fall back to the process-scan/state-file layer, exactly as before
         # this feature. See #92091.
-        from gateway.control_socket import GatewayControlServer, build_status_payload
+        from gateway.control_socket import GatewayControlServer
         from gateway.update_launcher import make_agent_update_handler
         from gateway.slash_commands import _spawn_detached_update
         from hermes_cli.config import is_managed
@@ -5758,9 +5744,7 @@ async def _start_gateway_start_control_socket(runner, *, generation_id: str | No
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop),
-                           **({"status": lambda: {**build_status_payload(), "generation_id": generation_id}}
-                              if generation_id is not None else {})})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5813,9 +5797,7 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active or
-            getattr(runner, "_overlap_draining", False))
-    runner._overlap_cron_start_kwargs = cron_start_kwargs
+            runner._draining or runner._external_drain_active)
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
@@ -5901,35 +5883,10 @@ async def _start_gateway_shutdown_tail(
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False,
-                        standby: bool = False, promoted_generation=None) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all."""
-    # Standby must never enter the legacy singleton/adapter path. Its isolated registration
-    # cannot claim a token, unlink a socket, or run an autonomous dispatcher.
-    if standby:
-        from gateway.run_generation import serve_standby_generation
-        return await serve_standby_generation(config)
-    if promoted_generation is not None:
-        from gateway.generation import GenerationCoordinator, overlap_handover_enabled
-        promoted_id, promoted_epoch = promoted_generation
-        if not overlap_handover_enabled(config):
-            raise RuntimeError("promoted generation requires overlap handover")
-        lease = next((row for row in GenerationCoordinator(Path(get_hermes_home())).leases()
-                      if row["resource"] == "active_generation"), None)
-        if not lease or (lease["generation_id"], lease["epoch"], lease["state"]) != (promoted_id.id, promoted_epoch, "active"):
-            raise RuntimeError("standby promotion has no matching admission lease")
-    from gateway.generation import overlap_handover_enabled, forward_only_handover_enabled
-    claimed_generation = None
-    if promoted_generation is None:
-        claim_config = config if config is not None else load_gateway_config()
-        if forward_only_handover_enabled(claim_config):
-            from gateway.run_generation import claim_active_generation
-            claimed_generation = claim_active_generation()
-            from gateway.run_generation import serve_standby_generation
-            return await serve_standby_generation(claim_config, claimed_generation=claimed_generation)
-
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
 
@@ -5958,20 +5915,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
-    _host_decision = await _host_attach_or_none(replace, force) if promoted_generation is None else None
+    _host_decision = await _host_attach_or_none(replace, force)
     if _host_decision is not None:
         return _host_decision
 
     # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
     from gateway.status import get_running_pid
-    existing_pid = get_running_pid() if promoted_generation is None else None
+    existing_pid = get_running_pid()
     if (existing_pid is not None and existing_pid != os.getpid()
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
         return False
 
-    if promoted_generation is not None:
-        from gateway.status import set_generation_runtime_status
-        set_generation_runtime_status(promoted_generation[0].id)
     _start_gateway_configure_logging(verbosity)
 
     runner = GatewayRunner(config)
@@ -6036,55 +5990,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # owner over already freed the lock with that process. Consequence: a live holder this process
     # cannot interrogate (its record never published, or it speaks another HOST_PROTOCOL_VERSION
     # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
-    if promoted_generation is None and not _start_gateway_claim_pid_file(force=force):
+    if not _start_gateway_claim_pid_file(force=force):
         return False
 
-    # A promoted B owns its already-registered identity and lease. It never claims,
-    # unlinks, or replaces A's still-live singleton PID and control socket.
-    _active_generation = None
-    if promoted_generation is not None:
-        from gateway.generation import GenerationCoordinator
-        from gateway.run_generation import ActiveGeneration
-        promoted_id, promoted_epoch = promoted_generation
-        _active_generation = ActiveGeneration(Path(get_hermes_home()),
-            GenerationCoordinator(Path(get_hermes_home())), promoted_id, promoted_epoch)
-        await _active_generation.start()
-    elif overlap_handover_enabled(runner.config):
-        from gateway.run_generation import start_active_generation
-        try:
-            _active_generation = await start_active_generation(runner.config, claimed_generation=claimed_generation)
-        except Exception:
-            logger.exception("Could not register the active overlap generation")
-            return False
-
-    async def _close_active_generation() -> None:
-        if takeover_task is not None:
-            takeover_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await takeover_task
-        if _active_generation is not None:
-            await _active_generation.close()
-
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
-    _control_server = (await _start_gateway_start_control_socket(runner)
-                       if promoted_generation is None else None)
-    takeover_task = None
-    if promoted_generation is not None:
-        promoted_id = promoted_generation[0]
-        async def _take_over_legacy_gateway_resources() -> None:
-            from gateway.run_generation import take_over_legacy_gateway_resources
-            nonlocal _control_server
-            _control_server = await take_over_legacy_gateway_resources(
-                promoted_id,
-                claim=lambda: _start_gateway_claim_pid_file(force=False, projected_identity=promoted_id),
-                start_socket=lambda: _start_gateway_start_control_socket(runner, generation_id=promoted_id.id),
-                refresh=lambda: _refresh_host_gateway_record(runner),
-            )
-
-        takeover_task = asyncio.create_task(_take_over_legacy_gateway_resources(), context=detached_context())
-    # B leaves A's host record alone while A drains.
-    if promoted_generation is None:
-        _refresh_host_gateway_record(runner)
+    _control_server = await _start_gateway_start_control_socket(runner)
+    # Now the attach channel answers: republish the host record with the settled served set.
+    _refresh_host_gateway_record(runner)
     _log_standalone_profiles_at_boot(runner)
 
     def _lifecycle_record_startup() -> None:
@@ -6115,16 +6027,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         success = await runner.start()
     except BaseException:
         _shutdown_gateway_health_export(runner)
-        await _close_active_generation()
         raise
     if not success:
         _shutdown_gateway_health_export(runner)
-        await _close_active_generation()
         return False
 
     if runner.should_exit_cleanly:
         _shutdown_gateway_health_export(runner)
-        await _close_active_generation()
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         # Explicit exit codes (GATEWAY_FATAL_CONFIG_EXIT_CODE) must propagate so s6 finish maps 78 → 125.
@@ -6142,24 +6051,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
         finally:
             _shutdown_gateway_health_export(runner)
-            await _close_active_generation()
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
         _start_gateway_start_cron_and_housekeeping(runner))
 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()
-    if _active_generation is not None:
-        _active_generation.bind_runner(runner, cron_stop=cron_stop, cron_provider=cron_provider)
-        await _active_generation.mark_ready()
 
-    try:
-        await runner.wait_for_shutdown()
-        return await _start_gateway_shutdown_tail(
-            runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
-            _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
-    finally:
-        await _close_active_generation()
+    await runner.wait_for_shutdown()
+
+    return await _start_gateway_shutdown_tail(
+        runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
+        _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
 
 
 def _guard_corrupt_user_config() -> None:

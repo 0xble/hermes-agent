@@ -2121,9 +2121,6 @@ DEFAULT_CONFIG = {
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "guardian": {"enabled": False},
-        # Generation overlap is opt-in. When disabled, the legacy singleton files and lifecycle remain unchanged.
-        "overlap_handover": {"enabled": False},
-        "forward_only_handover": {"enabled": False},
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,

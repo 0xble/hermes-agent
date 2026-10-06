@@ -4307,28 +4307,12 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
-        owned = getattr(self, "_owned_routing", None)
-        if owned is not None and self.platform == Platform.TELEGRAM and not event.internal \
-                and not getattr(event, "_owned_replay", False):
-            if await owned.route_message(self, event, session_key):
-                event._gateway_accepted = True
-                return
-            # Owned admission completed. Any later cancellation belongs to a
-            # handed-off native dispatch, not an unadmitted update to reopen.
-            accept_update = getattr(self, "_accept_update", None)
-            if callable(accept_update):
-                accept_update()
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
-            if getattr(event, "_owned_replay", False):
-                event._gateway_accepted = True
             return
-        if getattr(event.source, "_startup_gate_capability", None) is not None:
-            from gateway.startup_gate import note_gate_guard
-            note_gate_guard(event.source, "adapter_guard")
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
 

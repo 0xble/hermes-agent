@@ -97,7 +97,7 @@ def test_secondary_reads_own_yaml_and_never_the_launch_env(homes, monkeypatch):
         monkeypatch.setenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "true")
         built: list = []
         with patch.object(tg, "HTTPXRequest", lambda **kw: built.append(kw) or types.SimpleNamespace()), \
-                patch.object(t, "_instrument_polling_request", side_effect=lambda r: r):
+                patch.object(t, "_wrap_polling_request", side_effect=lambda r: r):
             asyncio.run(t._build_ptb_requests())
         assert [kw.get("proxy") for kw in built] == ["http://127.0.0.1:18080"] * 2
 
@@ -230,3 +230,18 @@ def test_whatsapp_reply_prefix_isolated_across_profile_scopes(
         load_gateway_config().platforms[Platform.WHATSAPP]
     )
     assert launch_after._bridge_env()["WHATSAPP_REPLY_PREFIX"] == "Launch Bot: "
+
+
+def test_retired_handover_keys_are_ignored(homes):
+    launch, _ = homes
+    (launch / "config.yaml").write_text(
+        "gateway:\n"
+        "  forward_only_handover:\n"
+        "    enabled: false\n"
+        "  overlap_handover:\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+    config = load_gateway_config()
+    assert not hasattr(config, "forward_only_handover_enabled")
+    assert not hasattr(config, "overlap_handover_enabled")
