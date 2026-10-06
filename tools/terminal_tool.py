@@ -887,6 +887,7 @@ from tools.terminal_tool_guards import (
     gateway_lifecycle_block, self_repo_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
+from tools.terminal_tool_heavy_slot import wrap_heavy_command
 from tools.terminal_tool_result import finalize_foreground_result
 
 
@@ -1488,9 +1489,17 @@ def terminal_tool(
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
+        # Keep approval and pre-exec security checks on the user-supplied command, then wrap only
+        # the actual local execution. A slot marker inherited by a nested test command makes the
+        # wrapper a no-op, so a CI profile and the suites it launches consume one slot together.
+        execution_command = wrap_heavy_command(
+            command,
+            env_type=env_type,
+            environment=getattr(env, "env", None),
+        )
         if background:
             result = spawn_background_process(
-                command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
@@ -1504,7 +1513,7 @@ def terminal_tool(
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return _metered(None if _host_local else plan, result)
         return _metered(None if _host_local else plan, _run_foreground(
-            command, env, plan,
+            execution_command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
             metered=not _host_local,
