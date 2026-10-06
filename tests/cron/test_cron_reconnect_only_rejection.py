@@ -141,6 +141,17 @@ def test_formatting_degraded_receipt_is_persisted(monkeypatch):
     assert persisted["last_delivery_formatting_degraded"] == ["telegram:-100:42"]
 
 
+def test_reconnect_waits_use_the_whole_budget():
+    """The default backoff schedule reaches the full reconnect budget instead of stopping at 63s."""
+    waited, attempt = 0.0, 0
+    while (wait := sd._short_reconnect_wait(RuntimeError("send_path_degraded"), waited, attempt)) is not None:
+        assert wait > 0
+        waited += wait
+        attempt += 1
+    assert waited == sd._LIVE_RECONNECT_WAIT_BUDGET_SECS == 120.0
+    assert sd._short_reconnect_wait(RuntimeError("chat not found"), 0.0, 0) is None
+
+
 def test_other_live_failures_still_fall_to_standalone_and_queue_nothing(monkeypatch, gateway_loop):
     standalone_calls, errors = _deliver_through_router(monkeypatch, gateway_loop, live_error="chat not found")
     assert standalone_calls == ["the report"]

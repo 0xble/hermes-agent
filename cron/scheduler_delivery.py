@@ -1494,9 +1494,9 @@ def _short_reconnect_wait(error: BaseException, already_waited: float, attempt: 
     if already_waited >= _LIVE_RECONNECT_WAIT_BUDGET_SECS:
         return None
     backoff = _LIVE_RECONNECT_BACKOFF_SECS[min(attempt, len(_LIVE_RECONNECT_BACKOFF_SECS) - 1)]
-    if already_waited + backoff > _LIVE_RECONNECT_WAIT_BUDGET_SECS:
-        return None
-    return backoff
+    # Clamp the last wait to the remaining budget so a reconnect anywhere inside the budget stays
+    # on the rich path; rejecting an overshooting backoff would fall back up to a minute early.
+    return min(backoff, _LIVE_RECONNECT_WAIT_BUDGET_SECS - already_waited)
 
 
 def _live_send_text(
