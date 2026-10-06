@@ -122,4 +122,36 @@ class TestStreamedSilenceSuppression:
         assert consumer.final_content_delivered is False
         assert consumer.already_sent is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", ("NO_REPLY", "[SILENT]", "no reply"))
+    async def test_substantive_stream_final_edit_removes_trailing_marker(self, marker):
+        """A substantive final never leaves a standalone silence marker visible."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta(f"Done.\n\n{marker}")
+        consumer.finish()
+        await consumer.run()
+
+        assert consumer.delivered_final_matches("Done.") is True
+        assert any(text == "Done." for text in _sent_and_edited(adapter))
+        assert all(marker not in text for text in _sent_and_edited(adapter))
+
+    @pytest.mark.asyncio
+    async def test_autonomous_stream_keeps_trailing_marker_semantics(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1,
+                                 strip_trailing_silence_markers=False),
+        )
+        raw = "Done.\n\nNO_REPLY"
+        consumer.on_delta(raw)
+        consumer.finish()
+        await consumer.run()
+
+        assert any(text == raw for text in _sent_and_edited(adapter))
+
 

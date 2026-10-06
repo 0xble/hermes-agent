@@ -138,6 +138,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
 - **Rollback:** Revert the relay-silence fix commit.
 
+## Active patch record: trailing silence marker (S1)
+
+- **Patch identity:** `trailing-silence-marker`.
+- **Behavior:** Strip a trailing standalone `NO_REPLY`/`[SILENT]`/`no reply` marker from substantive interactive replies before delivery and assistant-transcript persistence; preserve bare-marker suppression, fenced-code content, mid-sentence text, and autonomous-lane semantics.
+- **Source surfaces:** `gateway/response_filters.py`, `agent/turn_final_response.py`, `gateway/run_turn.py`, `gateway/stream_consumer.py`, and gateway response-filter/stream/final-persistence regression tests.
+- **Upstream status:** NousResearch #126581, #126646, and #126827 address bare-marker leaks on failed turns and segment-break previews; none strips a trailing marker line from substantive replies.
+- **Focused regression:** `HERMES_HEAVY_SLOT=off HERMES_HOME=<isolated-home> /Users/brianle/Repos/hermes-agent/.venv/bin/python -m pytest -q tests/gateway/test_trailing_silence_marker.py tests/gateway/test_response_filters.py tests/gateway/test_stream_consumer_silence.py`.
+- **Retirement:** Remove this patch when released upstream behavior strips trailing standalone markers at both persistence and every interactive streaming delivery boundary.
+- **Rollback:** Revert the trailing-silence-marker fix commit.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

@@ -113,6 +113,12 @@ def finish_text_response(
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
     final_response = _promoted or assistant_message.content or ""
+    # Interactive gateway replies may contain a control marker on a final standalone line after
+    # substantive prose. Strip it before the assistant row is flushed; autonomous cron/webhook
+    # lanes keep their existing first/last-line silence semantics.
+    if str(getattr(agent, "platform", "") or "").lower() not in {"cron", "webhook"}:
+        from gateway.response_filters import strip_trailing_silence_marker
+        final_response = strip_trailing_silence_marker(final_response)
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False
@@ -271,6 +277,14 @@ def finish_text_response(
         ))
 
     final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+    # ``_build_assistant_message`` stores the provider content, while ``final_response`` is
+    # the delivery/persistence-normalized text. Keep the assistant row aligned when the
+    # trailing interactive silence marker was removed (autonomous lanes stay unchanged).
+    if not _promoted and str(getattr(agent, "platform", "") or "").lower() not in {"cron", "webhook"}:
+        from gateway.response_filters import strip_trailing_silence_marker
+        _stored_content = final_msg.get("content")
+        if isinstance(_stored_content, str):
+            final_msg["content"] = strip_trailing_silence_marker(_stored_content)
     if _promoted:
         # Replay sidecar only: ``content`` stays empty so the row is never mistaken for a
         # real reply; ``build_api_messages`` substitutes ``api_content`` on the wire.

@@ -60,6 +60,7 @@ MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND})
 
 # Longer than any marker could plausibly be, even with stray punctuation.
 _MARKER_LENGTH_CAP = 64
+_FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})(?:.*)?$")
 
 
 def _canonical_silence_candidate(text: str) -> str:
@@ -98,6 +99,54 @@ def is_intentional_silence_response(response: Any) -> bool:
     response is not silence either — that is the empty-response failure path.
     """
     return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
+
+
+def _fenced_line_states(lines: list[str]) -> list[bool]:
+    """Return whether each line starts inside a Markdown fenced code block."""
+    states: list[bool] = []
+    fence_char: str | None = None
+    fence_len = 0
+    for line in lines:
+        states.append(fence_char is not None)
+        match = _FENCE_LINE_RE.match(line.rstrip("\r\n"))
+        if not match:
+            continue
+        fence = match.group(1)
+        if fence_char is not None:
+            if fence[0] == fence_char and len(fence) >= fence_len:
+                fence_char = None
+                fence_len = 0
+        else:
+            fence_char = fence[0]
+            fence_len = len(fence)
+    return states
+
+
+def strip_trailing_silence_marker(text: Any) -> Any:
+    """Remove top-level standalone silence-marker lines from substantive text.
+
+    The exact interactive silence rule remains authoritative for a bare marker,
+    so an all-marker response is returned unchanged for the existing suppression
+    path. Marker-looking lines inside fenced code are content, not control text.
+    """
+    if not isinstance(text, str) or is_intentional_silence_response(text):
+        return text
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    fenced = _fenced_line_states(lines)
+    end = len(lines)
+    removed = False
+    while end:
+        while end and not lines[end - 1].strip():
+            end -= 1
+        if not end or fenced[end - 1]:
+            break
+        if not is_intentional_silence_response(lines[end - 1]):
+            break
+        removed = True
+        end -= 1
+    return "".join(lines[:end]).rstrip() if removed else text
 
 
 def is_autonomous_silence_response(response: Any) -> bool:

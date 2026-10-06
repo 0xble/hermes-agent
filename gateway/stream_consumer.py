@@ -29,7 +29,8 @@ from gateway.config import (
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR)
 from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
-    is_partial_silence_marker as _is_partial_silence_marker)
+    is_partial_silence_marker as _is_partial_silence_marker,
+    strip_trailing_silence_marker as _strip_trailing_silence_marker)
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
@@ -74,6 +75,9 @@ class StreamConsumerConfig:
     # (progressive editMessageText).  "off" is handled by the gateway.
     transport: str = "edit"
     chat_type: str = ""  # originating chat type; gates platform-specific drafts
+    # Interactive gateway turns strip a trailing standalone silence marker from substantive
+    # final text. Autonomous lanes keep their existing first/last-line silence semantics.
+    strip_trailing_silence_markers: bool = True
 
 
 @dataclass
@@ -564,6 +568,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 if tick.got_done:
                     self._flush_think_buffer()
+                    # Strip a trailing standalone marker only from substantive interactive
+                    # replies. A bare marker remains unchanged for the existing silence path.
+                    self._strip_final_marker_from_state()
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
                     # preview, so retract it here instead of finalizing.
@@ -690,6 +697,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             else:
                 self._filter_and_accumulate(item)
 
+    def _strip_final_silence_marker(self, text: str) -> str:
+        """Apply the interactive trailing-marker filter at the final delivery boundary."""
+        if not self.cfg.strip_trailing_silence_markers:
+            return text
+        return _strip_trailing_silence_marker(text)
+
+    def _strip_final_marker_from_state(self) -> None:
+        """Remove a trailing marker from all final-state buffers before delivery."""
+        self._accumulated = self._strip_final_silence_marker(self._accumulated)
+        self._stream_ledger = self._strip_final_silence_marker(self._stream_ledger)
+
     def _adopt_final_text(self, final_raw: str) -> None:
         """Adopt the authoritative final (see finish()) as the finalize content — only if this
         consumer streamed something (a no-stream turn keeps the gateway's final-send
@@ -698,6 +716,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         strictly prefix-extends the ledger."""
         if not (self._accumulated or self._message_id or self._last_sent_text):
             return
+        final_raw = self._strip_final_silence_marker(final_raw)
         if not self._turn_split_delivery:
             final_payload = self._clean_for_display(final_raw)
             if final_payload and final_payload != self._clean_for_display(self._accumulated):
@@ -941,6 +960,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         platforms apply formatting; is_turn_final=False because this handler owns the flags.
         Only a successful edit confirms delivery — a partial send may be just "Let me
         search…", not the answer."""
+        self._strip_final_marker_from_state()
         best_effort_ok = False
         if self._accumulated and self._message_id:
             with contextlib.suppress(Exception):
