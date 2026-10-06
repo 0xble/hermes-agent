@@ -457,6 +457,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
+        user_initiated: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -485,7 +486,7 @@ class GatewayGoalsMixin:
         # without which aux credential resolution fails under multiplexing.
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
+                final_response or "", user_initiated=user_initiated, background_processes=_bg_procs,
                 active_delegations=_active_deleg,
             ),
         )
@@ -525,7 +526,11 @@ class GatewayGoalsMixin:
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip():
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, {}))
+            turn_is_user = self._is_user_turn_event(event) if event is not None else not is_internal
+            hooks.insert(0, (
+                "goal continuation", self._post_turn_goal_continuation,
+                {"user_initiated": turn_is_user},
+            ))
         for label, hook, hook_kwargs in hooks:
             try:
                 await hook(
@@ -695,9 +700,13 @@ class GatewayGoalsMixin:
 
         def _check():
             mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
-            return mgr, mgr.lifted_barrier_prompt()
+            notice = mgr.rearm_live_barrier()
+            return mgr, notice, mgr.lifted_barrier_prompt()
 
-        mgr, prompt = await self._run_in_executor_with_context(_check)
+        mgr, barrier_notice, prompt = await self._run_in_executor_with_context(_check)
+        if barrier_notice:
+            with suppress(Exception):
+                await self._send_goal_status_notice(source, barrier_notice, notice_kind="wait-age")
         if not prompt:
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.

@@ -548,21 +548,27 @@ class TestWaitBarrier:
             proc.terminate()
             proc.wait(timeout=10)
 
-    def test_barrier_on_a_process_that_never_exits_expires(self, hermes_home):
-        """A poller that outlives the work parked one run for 3h22m; a live barrier ages out."""
+    def test_barrier_on_a_process_that_never_exits_rearms_after_age_cap(self, hermes_home):
+        """A live poller must rearm after the probe window, not wake the agent into busy-work."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         proc = self._spawn_sleeper()
         try:
-            mgr = GoalManager(session_id="wb-expire")
+            mgr = GoalManager(session_id="wb-rearm")
             mgr.set("g")
             mgr.wait_on(proc.pid, reason="poller")
             assert mgr.is_waiting() is True
             mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+            mgr.state.barrier_recheck_at = 0.0
             mgr._save()
-            assert mgr.is_waiting() is False
-            assert mgr.state.waiting_on_pid is None
+            before = time.time()
+            mgr.rearm_live_barrier()
+            assert mgr.is_waiting() is True
+            assert mgr.state.waiting_on_pid == proc.pid
+            assert mgr.state.barrier_recheck_at > before
+            assert mgr.state.waiting_until == 0.0
+            assert mgr.state.barrier_rearms == 1
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -758,6 +764,7 @@ class TestJudgeDrivenWait:
         # Force the deadline into the past → barrier auto-clears.
         mgr.state.waiting_until = time.time() - 1
         assert mgr.is_waiting() is False
+        mgr.stop_waiting()
         assert mgr.state.waiting_until == 0.0
 
     def test_continue_verdict_still_continues_with_background(self, hermes_home):
