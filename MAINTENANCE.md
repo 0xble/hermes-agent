@@ -74,6 +74,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Copilot ACP usage-less compaction | ACP responses report unknown usage, never fabricated zeros, so estimate-driven compaction still fires | Copilot ACP client response or usage accounting changes | [Copilot ACP usage](maintenance/copilot-acp-usage.md) |
 | Nightly concurrency and compaction regressions | Preserve early process output, tolerate concurrent DB quarantine, and exercise actual ACP summarization | Process heartbeat, state DB preflight/quarantine, or ACP compaction E2E changes | [Nightly regression repairs](maintenance/nightly-regression-0926b.md) |
 | Foreground command exit cleanup | Fence graceful exit against spawning foreground commands so no child outlives its host | Foreground spawn publication, terminal environment process-exit cleanup, or live foreground killing changes | [Foreground exit cleanup](maintenance/foreground-exit-cleanup.md) |
+| Terminal heavy-slot | Local terminal test suites and CI gates wait for a machine-wide heavy-work slot instead of piling on | Terminal execution, local spawn, or heavy command classification changes | [Terminal heavy-slot](maintenance/terminal-heavy-slot.md) |
 | Snapshot keeps shell functions | Functions and aliases survive every command of a terminal session, not just the first | Terminal session snapshot bootstrap or per-command re-dump changes | [Snapshot functions](maintenance/snapshot-keep-functions.md) |
 | Explicit topic title receipts | Report the stored alias and actual Bot API rename result | `/title` Telegram topic changes and upstream title sync | [Explicit title receipts](maintenance/telegram-title-receipts.md) |
 | Cron fallback routing | Keep scheduled agents' backup chain independent of interactive routing | Changing cron/provider resolution or evaluating an upstream release | [Cron fallback routing](maintenance/cron-fallback-routing.md) |
@@ -126,6 +127,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | MCP caller identity | Opted-in MCP servers receive the calling session's ContextVar identity as per-call request `_meta`, never the model's arguments or `os.environ` | MCP tool-call dispatch, per-server opt-ins, or session identity reads for MCP | [MCP caller identity](maintenance/mcp-caller-identity.md) |
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
+
+## Active patch record: relay silence (S1)
+
+- **Patch identity:** `relay-silence`.
+- **Behavior:** Treat registered agent-origin headers, beginning with relay's `[relay from=... receipt=... (task=...)?]`, as unaddressed inbound prompts so a bare `NO_REPLY` remains silent; preserve explicit addressed messages.
+- **Source surfaces:** `gateway/response_filters.py`, `gateway/run_inbound.py`, `gateway/run_busy.py`, locale `gateway.errors.unexpected_silence` strings, and gateway silence/response-filter/busy regression tests.
+- **Upstream status:** NousResearch #117354 covers group chats only; no relay-equivalent DM behavior.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_response_filters.py tests/gateway/test_gateway_silence_tokens.py tests/gateway/test_busy_redirect_anchor.py`.
+- **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
+- **Rollback:** Revert the relay-silence fix commit.
 
 ## Update
 
