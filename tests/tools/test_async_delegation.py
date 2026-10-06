@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -255,6 +256,49 @@ def test_queued_delegation_is_visible_to_action_list_and_routes_to_owner():
         assert ad.interrupt_delegation(queued["delegation_id"], reason="test cleanup")
         release.set()
         assert _drain_for(first["delegation_id"]) is not None
+
+
+def test_queued_delegation_controls_follow_compression_lineage(tmp_path):
+    """A rotated parent must still list and cancel queued work before admission."""
+    from hermes_state import SessionDB
+    from tools.delegate_tool_registry import _handle_control_action, _list_payload
+
+    release = threading.Event()
+    started = threading.Event()
+    db = SessionDB(db_path=tmp_path / "lineage.db")
+    db.create_session(session_id="parent-old", source="tui", model="test")
+    db.append_message(session_id="parent-old", role="user", content="before compression")
+    db.end_session("parent-old", end_reason="compression")
+    db.create_session(session_id="parent-new", source="tui", model="test", parent_session_id="parent-old")
+    db.append_message(session_id="parent-new", role="user", content="after compression")
+    parent = SimpleNamespace(session_id="parent-new", _session_db=db)
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", parent_session_id="parent-old",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    queued = ad.dispatch_async_delegation(
+        goal="cancel after rotation", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", parent_session_id="parent-old",
+        runner=lambda: (started.set(), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
+    )
+    try:
+        assert first["status"] == "dispatched"
+        assert queued["status"] == "queued"
+        assert db.resolve_resume_session_id("parent-old") == "parent-new"
+        payload = _list_payload(parent)
+        assert any(item["delegation_id"] == queued["delegation_id"] for item in payload["subagents"])
+        stopped = json.loads(_handle_control_action("stop", queued["delegation_id"], None, parent))
+        assert stopped["status"] == "interrupt_requested"
+        assert not started.wait(0.2)
+        completion = _drain_for(queued["delegation_id"])
+        assert completion is not None
+        assert completion["status"] == "interrupted"
+    finally:
+        release.set()
+        assert _drain_for(first["delegation_id"]) is not None
+        db.close()
 
 
 def test_pending_queue_overflow_rejects_without_starting():

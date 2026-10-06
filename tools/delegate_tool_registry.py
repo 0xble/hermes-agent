@@ -258,9 +258,9 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
         from tools.async_delegation import list_async_delegations
         parent_sid = str(getattr(parent_agent, "session_id", "") or "")
         for r in list_async_delegations():
-            if r.get("status") != "queued" or not parent_sid:
+            if r.get("status") != "queued":
                 continue
-            if str(r.get("parent_session_id") or "") != parent_sid:
+            if not _owns_durable_delegation(r, parent_agent):
                 continue
             entries.append({
                 "subagent_id": r.get("delegation_id"),
@@ -402,11 +402,9 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
     if record is None and action == "stop":
         try:
             from tools.async_delegation import interrupt_delegation, list_async_delegations
-            parent_sid = str(getattr(parent_agent, "session_id", "") or "")
             owned = next((r for r in list_async_delegations()
-                          if parent_sid
-                          and r.get("delegation_id") == sid
-                          and str(r.get("parent_session_id") or "") == parent_sid), None)
+                          if r.get("delegation_id") == sid
+                          and _owns_durable_delegation(r, parent_agent)), None)
             if owned is not None and interrupt_delegation(sid, reason="stopped via delegate_task"):
                 return json.dumps({"action": "stop", "subagent_id": sid, "status": "interrupt_requested",
                                    "note": "Queued background delegation cancelled; no child was started."}, ensure_ascii=False)
