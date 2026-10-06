@@ -4680,10 +4680,17 @@ class BasePlatformAdapter(ABC):
             await self.gateway_runner._clear_durable_active_turn(event)
 
     async def _reconcile_restart_note(
-        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
+        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
+        streamed: bool = False,
     ) -> Optional[SendResult]:
-        """Replace the durable restart note with the resumed answer, falling back to delete+send."""
-        if not getattr(event, "internal", False) or getattr(event, "_restart_note_reconciled", False):
+        """Replace the durable restart note with the resumed answer, or delete it after streaming.
+
+        ``streamed=True`` is used when the answer body is already visible in a separate message: the
+        interruption note cannot be edited into that message, so delete the note before the caller clears
+        ``resume_pending``. A successful send without a platform message id is recorded as ``sent:no-id``;
+        there is no transport handle to edit or delete on those platforms, so the answer is sent normally.
+        """
+        if getattr(event, "_restart_note_reconciled", False):
             return None
         store = getattr(self.gateway_runner, "async_session_store", None)
         get_note = getattr(store, "get_restart_note", None)
@@ -4691,9 +4698,22 @@ class BasePlatformAdapter(ABC):
             return None
         note = await get_note(session_key)
         note_id = note[3] if note else None
-        if not note_id:
+        if not note_id or str(note_id).startswith(("pending:", "sent:")):
+            if note_id and str(note_id).startswith("sent:"):
+                event._restart_note_reconciled = True
             return None
         event._restart_note_reconciled = True
+        if streamed:
+            delete = getattr(self, "delete_message", None)
+            deleted = False
+            if callable(delete):
+                try:
+                    deleted = bool(await delete(event.source.chat_id, str(note_id)))
+                except Exception:
+                    deleted = False
+            if deleted:
+                await store.clear_restart_note(session_key)
+            return None
         edit = getattr(self, "edit_message", None)
         result = None
         if callable(edit):

@@ -20,13 +20,14 @@ def _isolated_home(tmp_path, monkeypatch):
 
 
 class NoteAdapter(BasePlatformAdapter):
-    def __init__(self, *, edit_result=True, delete_result=True):
+    def __init__(self, *, edit_result=True, delete_result=True, no_message_id=False):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
         self.sent = []
         self.edited = []
         self.deleted = []
         self.edit_result = edit_result
         self.delete_result = delete_result
+        self.no_message_id = no_message_id
 
     async def connect(self, *, is_reconnect=False):
         return True
@@ -36,7 +37,7 @@ class NoteAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append((chat_id, content, metadata))
-        return SendResult(success=True, message_id=f"m{len(self.sent)}")
+        return SendResult(success=True, message_id=None if self.no_message_id else f"m{len(self.sent)}")
 
     async def send_typing(self, chat_id, metadata=None):
         return None
@@ -161,6 +162,46 @@ async def test_resumed_answer_delete_send_fallback_has_no_orphan(tmp_path):
     assert store.get_restart_note(entry.session_key)[3] is None
 
 
+@pytest.mark.asyncio
+async def test_user_message_recovery_turn_reconciles_note(tmp_path):
+    adapter = NoteAdapter()
+    store, entry, _ = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-user")
+    event = MessageEvent(text="continue this", message_type=MessageType.TEXT, source=_source(), internal=False)
+
+    result = await adapter._reconcile_restart_note(event, entry.session_key, "answer", {})
+
+    assert result.success is True
+    assert adapter.edited == [("chat", "note-user", "answer", True)]
+    assert store.get_restart_note(entry.session_key)[3] is None
+
+
+@pytest.mark.asyncio
+async def test_streamed_resumed_answer_deletes_note_before_marker_clear(tmp_path, monkeypatch):
+    from gateway import run_turn
+    from gateway.run_turn import GatewayTurnMixin
+
+    adapter = NoteAdapter()
+    store, entry, _ = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-stream")
+    runner = object.__new__(GatewayTurnMixin)
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._should_send_voice_reply = lambda *args, **kwargs: False
+    runner._deliver_media_from_response = AsyncMock()
+    adapter.gateway_runner = SimpleNamespace(async_session_store=AsyncSessionStore(store))
+    event = MessageEvent(text="", message_type=MessageType.TEXT, source=_source(), internal=True)
+    monkeypatch.setattr(run_turn, "diagnostic_wake_muted", lambda _event: False)
+
+    delivered = await runner._hmwa_deliver_turn_response(
+        event, event.source, entry, entry.session_key, 1,
+        {"already_sent": True}, [], "streamed answer", None, False,
+    )
+
+    assert delivered is None
+    assert adapter.deleted == [("chat", "note-stream")]
+    assert store._entries[entry.session_key].resume_pending is True
+    assert store.get_restart_note(entry.session_key)[3] is None
+    assert store.clear_resume_pending(entry.session_key)
 
 
 @pytest.mark.asyncio
@@ -194,6 +235,31 @@ async def test_crash_recovery_reclaims_unposted_note_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_success_without_message_id_uses_sentinel_and_deduplicates(tmp_path):
+    store = _store(tmp_path)
+    source = _source("no-id-thread")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-no-id", human=True)
+    adapter = NoteAdapter(no_message_id=True)
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner.async_session_store = runner._async_session_store
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None)
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert await runner._send_interrupted_turn_notes([entry.session_key], reclaim_pending=True) == 0
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "sent:no-id"
+
+
+@pytest.mark.asyncio
 async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path):
     store = _store(tmp_path)
     source = _source("ask-thread")
@@ -205,6 +271,7 @@ async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path
     runner._async_session_store = AsyncSessionStore(store)
     runner.async_session_store = runner._async_session_store
     runner.config = GatewayConfig(restart_resume_policy="ask")
+    runner._restart_requested = False
     runner._shutdown_notification_target = AsyncMock(
         return_value=(source, "telegram", source.chat_id, source.thread_id, None)
     )
@@ -213,7 +280,7 @@ async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path
     runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
 
     assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
-    assert "Hermes is restarting" in adapter.sent[0][1]
+    assert "Hermes is shutting down" in adapter.sent[0][1]
     assert store.get_restart_note(entry.session_key)[3] == "m1"
     assert store._entries[entry.session_key].resume_pending is True
 

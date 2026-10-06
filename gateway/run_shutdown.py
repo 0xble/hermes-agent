@@ -950,6 +950,7 @@ class GatewayShutdownMixin:
         sent = 0
         for session_key in dict.fromkeys(session_keys or ()):
             marker = None
+            send_succeeded = False
             try:
                 entry = self.session_store._entries.get(session_key)
                 if entry is None or not getattr(entry, "resume_pending", False) or not getattr(entry, "resume_human", True):
@@ -994,26 +995,30 @@ class GatewayShutdownMixin:
                     policy = str(configured) if configured is not None else "ask"
                 text = t(
                     "gateway.shutdown.interrupted_turn" if policy == "continue"
-                    else "gateway.shutdown.notice_restart"
+                    else ("gateway.shutdown.notice_restart" if getattr(self, "_restart_requested", False)
+                          else "gateway.shutdown.notice_shutdown")
                 )
                 result = await adapter.send(
                     chat_id, text,
                     metadata={**(metadata or {}), "_interim_send": True},
                 )
-                if not result or not getattr(result, "success", False) or not getattr(result, "message_id", None):
+                if not result or not getattr(result, "success", False):
                     await release_claim()
                     continue
+                send_succeeded = True
+                note_id = getattr(result, "message_id", None) or "sent:no-id"
                 if await self.async_session_store.set_restart_note_message_id(
-                    session_key, str(result.message_id), expected_marker=marker,
+                    session_key, str(note_id), expected_marker=marker,
                 ):
                     sent += 1
             except Exception:
-                try:
-                    await self.async_session_store.release_restart_note_claim(
-                        session_key, expected_marker=marker,
-                    )
-                except Exception:
-                    pass
+                if not send_succeeded:
+                    try:
+                        await self.async_session_store.release_restart_note_claim(
+                            session_key, expected_marker=marker,
+                        )
+                    except Exception:
+                        pass
                 logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
         if sent:
             logger.info("Shutdown: delivered %d interrupted human-turn note(s)", sent)
