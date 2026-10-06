@@ -477,7 +477,7 @@ class TestShortFloodWaitStaysOnTheLiveLane:
 
     def test_other_errors_fall_back_without_waiting(self):
         _, router_calls, standalone_calls, sleeps = self._run_sequence([
-            RuntimeError("send_path_degraded")])
+            RuntimeError("chat not found")])
 
         assert len(router_calls) == 1
         assert sleeps == []
