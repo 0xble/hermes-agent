@@ -1763,6 +1763,8 @@ class GatewayStartupMixin:
             await _discover_gateway_mcp_tools(self.config)
         except Exception as exc:
             logger.debug("MCP tool discovery failed: %s", exc)
+        finally:
+            self._mcp_discovery_ready.set()
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
@@ -1853,6 +1855,11 @@ class GatewayStartupMixin:
         try:
             return await self._start_impl()
         finally:
+            # Early startup aborts can return before the normal finish-wiring discovery phase; release any
+            # API requests waiting on the readiness barrier when the runner is no longer starting.
+            mcp_ready = getattr(self, "_mcp_discovery_ready", None)
+            if isinstance(mcp_ready, asyncio.Event):
+                mcp_ready.set()
             # Every startup path (early aborts included) ends here: bound startup on the latest
             # diagnostic snapshot once, instead of flushing at each return.
             await self._start_flush_runtime_status()
@@ -1876,6 +1883,7 @@ class GatewayStartupMixin:
         await self._run_free_tier_bootstrap()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
+        self._mcp_discovery_ready = asyncio.Event()
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []

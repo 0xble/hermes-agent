@@ -972,6 +972,10 @@ def _admit_api_agent_request(handler):
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
         try:
+            runner = self.gateway_runner or request.app.get("gateway_runner")
+            mcp_ready = getattr(runner, "_mcp_discovery_ready", None)
+            if isinstance(mcp_ready, asyncio.Event) and not mcp_ready.is_set():
+                await mcp_ready.wait()
             return await handler(self, request, *args, **kwargs)
         finally:
             _release_pending_api_work(self, reservation)
