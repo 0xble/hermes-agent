@@ -762,8 +762,11 @@ def _new_delegation_id() -> str:
 def _prune_completed_locked() -> None:
     """Drop the oldest completed records beyond the cap. Caller holds ``_records_lock``.
     ``stalling``/``finalizing`` are still live: evicting one makes the late runner return hit
-    ``_finalize``'s missing-record path and silently drop a real result."""
-    completed = [(rid, r) for rid, r in _records.items() if r.get("status") not in _LIVE_STATES]
+    ``_finalize``'s missing-record path and silently drop a real result. A terminal record whose
+    executor future is still running is also retained so its slot reservation cannot disappear.
+    """
+    completed = [(rid, r) for rid, r in _records.items()
+                 if r.get("status") not in _LIVE_STATES and not r.get("_slot_reserved")]
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
         _records.pop(rid, None)
@@ -809,14 +812,20 @@ def _dispatch(**kwargs) -> Dict[str, Any]:
 
 
 def _queued_count_locked() -> int:
-    return len({(_records.get(delegation_id) or {}).get("slot_key") or delegation_id
-                for delegation_id in _PENDING_QUEUE
-                if (_records.get(delegation_id) or {}).get("status") == "queued"})
+    # Count queued records, including one whose durable insert succeeded but
+    # whose publication to _PENDING_QUEUE has not happened yet.  The latter
+    # must reserve queue capacity without becoming admission-eligible.
+    return len({r.get("slot_key") or r["delegation_id"] for r in _records.values()
+                if r.get("status") == "queued"})
 
 
 def _active_slots_locked() -> set:
+    # A force-finalized runner remains a capacity occupant until its executor
+    # future's done callback runs.  Its terminal status is intentionally still
+    # reported to users immediately, so the reservation is separate from the
+    # live-state accounting above.
     return {r.get("slot_key") or r["delegation_id"] for r in _records.values()
-            if r.get("status") in _ACTIVE_STATES}
+            if r.get("status") in _ACTIVE_STATES or r.get("_slot_reserved")}
 
 
 def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[str]:
@@ -855,6 +864,22 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
         return _BACKEND_RETIRING
     try:
         future = executor.submit(record["_worker_context_runner"], _worker)
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None:
+                live["_future"] = future
+
+        def release_slot(_: Any) -> None:
+            with _records_lock:
+                live = _records.get(delegation_id)
+                if live is not None:
+                    live["_slot_reserved"] = False
+            # A force-finalized runner only becomes capacity-free here.  The
+            # callback also wakes the queue for the normal short window between
+            # worker finalization and its future becoming done.
+            _admit_pending()
+
+        future.add_done_callback(release_slot)
         future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         retirement.release()
@@ -1018,15 +1043,16 @@ def _dispatch_admitted(
         "_context": contextvars.copy_context(),
         "_worker_context_runner": propagate_context_to_thread(lambda worker: worker()), "_progress_token": None,
         "_progress_ts": dispatched_at, "_interrupted_at": None, "_started": False,
+        "_slot_reserved": False,
     }
     with _records_lock:
         active_slots = _active_slots_locked()
         slot = record["slot_key"]
         if slot not in active_slots and len(active_slots) >= max_async_children:
             queued_same_slot = any(
-                (_records.get(queued_id) or {}).get("status") == "queued"
-                and ((_records.get(queued_id) or {}).get("slot_key") or queued_id) == slot
-                for queued_id in _PENDING_QUEUE
+                r.get("status") == "queued"
+                and (r.get("slot_key") or r["delegation_id"]) == slot
+                for r in _records.values()
             )
             if _queued_count_locked() >= max(0, int(max_queued_delegations)) and not queued_same_slot:
                 return {"status": "rejected", "at_capacity": True, "queue_full": True,
@@ -1034,9 +1060,11 @@ def _dispatch_admitted(
             record["status"] = "queued"
             record["queue_reason"] = "async pool capacity"
             record["queued_at"] = time.time()
-            _PENDING_QUEUE.append(delegation_id)
         _records[delegation_id] = record
     try:
+        # Persist before publishing to the in-memory admission queue.  A queued
+        # record may be visible while this write is in flight, but it cannot be
+        # admitted until its durable row exists.
         _persist_dispatch(record)
     except Exception as exc:
         with _records_lock:
@@ -1047,8 +1075,18 @@ def _dispatch_admitted(
                 pass
         return {"status": "rejected", "error": f"Failed to persist async delegation{label}: {exc}"}
     if record["status"] == "queued":
-        _ensure_stale_monitor()
-        return {"status": "queued", "delegation_id": delegation_id, "queue_reason": record["queue_reason"]}
+        with _records_lock:
+            live = _records.get(delegation_id)
+            publish = live is record and live.get("status") == "queued"
+            if publish:
+                _PENDING_QUEUE.append(delegation_id)
+        if publish:
+            _ensure_stale_monitor()
+            _admit_pending()
+            return {"status": "queued", "delegation_id": delegation_id, "queue_reason": record["queue_reason"]}
+        # A concurrent interrupt/finalization won the race during persistence;
+        # do not re-publish a terminal record or report it as queued.
+        return {"status": record.get("status", "interrupted"), "delegation_id": delegation_id}
     error = _submit_record(record, max_async_children)
     if error:
         with _records_lock:
@@ -1181,6 +1219,11 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             was_admitted_unstarted = record.get("status") == "running" and not record.get("_started")
             record["status"] = "finalizing"
             record["completed_at"] = time.time()
+            # Keep the capacity slot occupied until the executor future has
+            # actually returned.  A forced stall finalization reports terminal
+            # state immediately, but its runner may still be executing.
+            future = record.get("_future")
+            record["_slot_reserved"] = bool(future is not None and not future.done())
             record["interrupt_fn"] = None  # drop the closure; child is done
             record["progress_fn"] = None  # stop stale-monitor sampling
             snapshot = dict(record)

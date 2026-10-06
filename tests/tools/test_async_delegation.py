@@ -240,6 +240,95 @@ def test_dispatch_queues_at_capacity_and_admits_after_slot_release():
     assert _drain_for(queued["delegation_id"]) is not None
 
 
+def test_force_finalized_runner_holds_slot_until_future_stops():
+    entered = threading.Event()
+    release = threading.Event()
+    queued_started = threading.Event()
+
+    def stalled_runner():
+        entered.set()
+        release.wait(30)
+        return {"status": "completed", "summary": "late result"}
+
+    first = ad.dispatch_async_delegation(
+        goal="stalled", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=stalled_runner, max_async_children=1,
+    )
+    assert first["status"] == "dispatched"
+    assert entered.wait(5)
+    queued = ad.dispatch_async_delegation(
+        goal="queued", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (queued_started.set(), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
+    )
+    assert queued["status"] == "queued"
+
+    # The terminal stall event is reported immediately, but the old executor
+    # future still owns the capacity slot until its runner returns.
+    ad._finalize(first["delegation_id"], {"error": "forced stall"}, "stalled")
+    # The queued record remains live accounting, but the force-finalized
+    # runner itself must already be terminal and must not admit the queued work.
+    assert next(item for item in ad.list_async_delegations()
+                if item["delegation_id"] == first["delegation_id"])["status"] == "stalled"
+    assert not queued_started.wait(0.2)
+
+    release.set()
+    assert queued_started.wait(5)
+    assert _drain_for(queued["delegation_id"]) is not None
+
+
+def test_queued_admission_waits_for_durable_insert_before_queue_publish(monkeypatch):
+    release = threading.Event()
+    queued_started = threading.Event()
+    persist_entered = threading.Event()
+    allow_persist = threading.Event()
+    result = {}
+
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    assert first["status"] == "dispatched"
+
+    original_persist = ad._persist_dispatch
+
+    def delayed_persist(record):
+        if record["status"] == "queued":
+            persist_entered.set()
+            assert allow_persist.wait(5)
+        original_persist(record)
+
+    monkeypatch.setattr(ad, "_persist_dispatch", delayed_persist)
+    thread = threading.Thread(
+        target=lambda: result.update(ad.dispatch_async_delegation(
+            goal="queued", context=None, toolsets=None, role="leaf", model="m", session_key="",
+            runner=lambda: (queued_started.set(), {"status": "completed"})[1],
+            max_async_children=1, max_queued_delegations=1,
+        )),
+        daemon=True,
+    )
+    thread.start()
+    assert persist_entered.wait(5)
+    with ad._records_lock:
+        queued_ids = [rid for rid, record in ad._records.items() if record.get("status") == "queued"]
+        assert queued_ids
+        assert not any(rid in ad._PENDING_QUEUE for rid in queued_ids)
+
+    # Even after the active runner releases, admission cannot race a queued
+    # record whose durable INSERT has not completed and whose queue publication
+    # has not happened.
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert not queued_started.wait(0.2)
+
+    allow_persist.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert result["status"] == "queued"
+    assert queued_started.wait(5)
+    assert _drain_for(result["delegation_id"]) is not None
+
+
 def test_queued_delegation_is_visible_to_action_list_and_routes_to_owner():
     from tools.delegate_tool_registry import _list_payload
 
