@@ -91,6 +91,16 @@ class TestLogicalLineStreaming:
         assert "line one" in plain
         assert "line two" in plain
 
+    def test_loop_complete_marker_is_not_streamed(self, cli_stub):
+        cli, emitted = cli_stub
+        cli._stream_delta("Done.\n")
+        cli._stream_delta("LOOP_COM")
+        cli._stream_delta("PLETE")
+        cli._flush_stream()
+        plain = _strip_ansi("\n".join(emitted))
+        assert "Done." in plain
+        assert "LOOP_COMPLETE" not in plain
+
     def test_unbreakable_run_stays_single_line(self, cli_stub):
         cli, emitted = cli_stub
         blob = "x" * 300  # no spaces
