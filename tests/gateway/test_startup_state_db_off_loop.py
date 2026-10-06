@@ -4,6 +4,7 @@ import asyncio
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,9 @@ async def test_relay_registration_precedes_relay_adapter_prefilter(monkeypatch, 
 
     def fake_register():
         order.append("register")
+        runner.config.platforms[Platform.RELAY] = PlatformConfig(
+            enabled=True, extra={"relay_url": "https://relay.example.test"}
+        )
 
     async def fake_prefilter(self):
         assert Platform.RELAY in self.config.platforms
@@ -130,13 +134,51 @@ async def test_clean_marker_failure_keeps_connected_startup_degraded(monkeypatch
 
     assert runner._startup_recovery_degraded is True
     assert runner._serving_state() == "degraded"
-    assert marker.exists()
+    assert not marker.exists()
     assert "continuing in degraded mode" in caplog.text
+
+    recovered = []
+
+    async def recover_unclean():
+        recovered.append(True)
+        return 1, 0
+
+    runner._recover_unclean_sessions = recover_unclean
+    await runner._start_recover_previous_run()
+    assert recovered == [True]
 
 
 async def _raise_marker_cleanup(marker_path):
     del marker_path
     raise OSError("state store unavailable")
+
+
+def test_state_db_maintenance_runs_on_first_housekeeping_tick(monkeypatch):
+    import gateway.run as gateway_run
+
+    calls = []
+
+    class OneTickStop:
+        def __init__(self):
+            self.ticks = 0
+
+        def is_set(self):
+            return self.ticks >= 1
+
+        def wait(self, timeout=None):
+            del timeout
+            self.ticks += 1
+            return False
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_housekeeping_state_db_maintenance",
+        lambda launch=None: calls.append(launch),
+    )
+    gateway_run._start_gateway_housekeeping(
+        OneTickStop(), interval=0, runner=SimpleNamespace(config=GatewayConfig(), adapters={}),
+    )
+    assert len(calls) == 1
 
 
 def test_gateway_constructor_does_not_open_or_maintain_state_db(monkeypatch, tmp_path):

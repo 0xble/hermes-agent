@@ -3745,7 +3745,7 @@ class GatewayRunner(
         except Exception:
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
-    def _init_session_db(self, *, maintenance: bool = True) -> None:
+    def _init_session_db(self) -> None:
         """Initialize lazy state.db handle caches; defer all SQLite I/O until after adapter readiness."""
         # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
         # root home under multiplex); initialize the cache here without opening SQLite. Session search and
@@ -4879,7 +4879,7 @@ def _start_gateway_housekeeping(
         (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator)),
         (60, "Sync pull tick", profile_scoped_chore(runner, _housekeeping_skill_sync)),
         (60, "Org sync pull tick", profile_scoped_chore(runner, _housekeeping_org_skill_sync)),
-        (60, "state.db maintenance tick", profile_scoped_chore(
+        (1, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):

@@ -823,10 +823,9 @@ class SessionStore(
         self._has_active_processes_fn = has_active_processes_fn
         self._write_sessions_json = bool(getattr(config, "write_sessions_json", True))
 
-        # Keep the cheap handle probe at construction: callers and the isolation guard rely on a
-        # SessionStore having an explicit DB/fallback decision. The expensive routing load, stale-row
-        # recovery, archive/prune and VACUUM remain demand-time/off-loop; AsyncSessionStore and startup
-        # recovery offload those operations before admitting restored turns.
+        # Construction only initializes the cache and makes no state.db probe. The expensive routing load,
+        # stale-row recovery, archive/prune and VACUUM remain demand-time/off-loop; AsyncSessionStore and
+        # startup recovery offload those operations before admitting restored turns.
         self._db_pinned = _DB_UNPINNED
         self._db_handles: Dict[Path, Any] = {}
         self._db_handles_lock = threading.Lock()

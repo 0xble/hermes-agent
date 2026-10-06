@@ -490,7 +490,7 @@ def _worker_main(payload: dict) -> dict:
             pass
 
         def _init_session_db(self):
-            super()._init_session_db(maintenance=False)
+            super()._init_session_db()
 
         def _init_registries_and_clocks(self):
             super()._init_registries_and_clocks()

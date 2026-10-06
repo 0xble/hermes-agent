@@ -805,8 +805,12 @@ class GatewayStartupMixin:
                     getattr(guard, method)()
 
     async def _consume_clean_shutdown_marker(self, marker_path) -> int:
-        """Discard orphan turn markers before consuming a clean-exit receipt. Raises (fail closed):
-        continuing with the old receipt would let a later unclean exit masquerade as clean."""
+        """Discard orphan turn markers before consuming a clean-exit receipt.
+
+        The receipt is consumed only after the marker cleanup succeeds. Callers that need to
+        continue serving after a cleanup failure must retire the receipt first, otherwise a
+        later crash could be misclassified as clean.
+        """
         from gateway.run_startup_recovery import startup_recovery_fences
         live, owned = await asyncio.to_thread(startup_recovery_fences, self)
         self._startup_live_recovery_keys = live
@@ -815,6 +819,25 @@ class GatewayStartupMixin:
         discarded = await self.async_session_store.discard_active_turn_markers(**kwargs)
         marker_path.unlink()
         return discarded
+
+    @staticmethod
+    def _retire_failed_clean_shutdown_marker(marker_path) -> bool:
+        """Ensure a receipt whose cleanup failed cannot be honored on a later boot."""
+        try:
+            marker_path.unlink()
+            return True
+        except OSError as unlink_error:
+            try:
+                stale = marker_path.with_name(f"{marker_path.name}.stale-{time.time_ns()}")
+                marker_path.rename(stale)
+                logger.warning("Renamed stale clean-shutdown marker to %s after unlink failed", stale)
+                return True
+            except OSError:
+                logger.error(
+                    "Could not retire stale clean-shutdown marker %s (unlink failed: %s)",
+                    marker_path, unlink_error, exc_info=True,
+                )
+                return False
 
     async def _recover_unclean_sessions(self) -> tuple[int, int]:
         """Recover only the turns the dead process left marked: one whose reply is already in the
@@ -1277,12 +1300,14 @@ class GatewayStartupMixin:
                 discarded = await self._consume_clean_shutdown_marker(_clean_marker)
             except Exception as exc:
                 # Adapters are already connected, so fail open into a serving-but-degraded gateway
-                # rather than leaving live transports and queued inbound work without teardown.
+                # rather than leaving live transports and queued inbound work without teardown. Retire
+                # the receipt before continuing: it must never survive to misclassify a later crash.
                 self._startup_recovery_degraded = True
+                if not self._retire_failed_clean_shutdown_marker(_clean_marker):
+                    self._suppress_clean_shutdown_receipt = True
                 logger.error(
                     "Clean-start marker cleanup failed after adapters became ready; continuing in "
-                    "degraded mode with session recovery skipped. The marker was retained for retry: %s",
-                    exc,
+                    "degraded mode with session recovery skipped: %s", exc,
                 )
             if discarded:
                 logger.info("Discarded %d orphan active-turn marker(s) after clean shutdown", discarded)
@@ -1771,8 +1796,14 @@ class GatewayStartupMixin:
         # interrupted session must wait as a distinct event, not enter that turn's history.
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
         candidates = await self._resume_pending_candidates_async()
+        recovered_events = []
         try:
-            await asyncio.to_thread(recover_pending_shutdown_flush, self, candidates=candidates)
+            await asyncio.to_thread(
+                recover_pending_shutdown_flush,
+                self, candidates=candidates, recovered_events=recovered_events,
+            )
+            for event in recovered_events:
+                self._queue_startup_restore_event(event)
         except Exception:
             logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed

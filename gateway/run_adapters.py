@@ -861,16 +861,20 @@ class GatewayAdapterLifecycleMixin:
         if resume_scheduled is None:
             resume_scheduled = (getattr(self, "_reconnect_resume_events", None) or {}).get(platform)
         candidates = await self._resume_pending_candidates_async(record_boot=False)
-        queued_before = len(getattr(self, "_startup_restore_queue", []))
+        recovered_events = []
         tasks = []
         keys = set()
         try:
             await asyncio.to_thread(
-                recover_pending_shutdown_flush, self, candidates=candidates, platform=platform,
+                recover_pending_shutdown_flush,
+                self, candidates=candidates, platform=platform, recovered_events=recovered_events,
             )
         except Exception:
             logger.warning("Pending follow-up recovery after %s reconnect failed; spools retained", platform.value,
                            exc_info=True)
+        for event in recovered_events:
+            self._queue_startup_restore_event(event)
+            keys.add(self._session_key_for_source(self._normalize_source_for_session_key(event.source)))
         try:
             # Recovery scans all served homes, but only the newly available platform resumes.
             self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
@@ -878,20 +882,18 @@ class GatewayAdapterLifecycleMixin:
         except Exception:
             logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
                            exc_info=True)
-        finally:
-            # The reconnect watcher waits only until resume work has been scheduled; the bounded drain below
-            # remains in the retained worker so reconnects do not wait on resumed turns.
-            if resume_scheduled is not None:
-                resume_scheduled.set()
-        keys.update(self._session_key_for_source(self._normalize_source_for_session_key(event.source))
-                    for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
-        if not keys and not tasks:
-            return
         counts = getattr(self, "_reconnect_restore_keys", None)
         if counts is None:
             counts = self._reconnect_restore_keys = {}
         for key in keys:
             counts[key] = counts.get(key, 0) + 1
+        # The reconnect watcher must not release the adapter until the per-session gate is
+        # installed. Otherwise fresh inbound can overtake a claimed pre-restart follow-up
+        # during the small window between scheduling and publishing _reconnect_restore_keys.
+        if resume_scheduled is not None:
+            resume_scheduled.set()
+        if not keys and not tasks:
+            return
         try:
             if tasks:
                 await self._wait_bounded_or_release(
