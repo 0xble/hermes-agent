@@ -2499,6 +2499,10 @@ DEFAULT_CONFIG = {
     # External password managers are unlocked per session with a masked master-password prompt;
     # headless sessions (cron, webhook, API) never prompt and see them as locked.
     "vault": {
+        # Map an existing login handle or 1Password item ID to extra exact HTTPS origins.
+        # Aliases extend fill authorization without editing the password-manager item; malformed,
+        # HTTP, and wildcard origins are ignored. Example: {"item-id": ["https://signin.example.com"]}.
+        "origin_aliases": {},
         "onepassword": {
             # Detected managers are login sources unless the user opts out (vault.<name>.enabled: false).
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.
