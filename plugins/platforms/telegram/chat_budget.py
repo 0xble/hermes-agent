@@ -458,6 +458,7 @@ class DailyCallCounter:
         bucket = now - (now % _HOUR)
         key = (bucket, chat, endpoint, trigger or current_trigger())
         with self._lock:
+            first = not self._dirty
             self._dirty[key] = self._dirty.get(key, 0) + 1
         due_flush = now - self._last_flush >= self._flush_interval
         due_log = now - self._last_log >= self._log_interval
@@ -467,6 +468,16 @@ class DailyCallCounter:
             if due_log:
                 self._last_log = now
             self._schedule(log=due_log)
+        elif first:
+            self._ensure_worker()  # a quiet profile still persists within one flush interval
+
+    def _ensure_worker(self) -> None:
+        with self._lock:
+            worker = self._worker
+            if worker is None or not worker.is_alive():
+                worker = self._worker = threading.Thread(
+                    target=self._run_worker, name="telegram-call-counter", daemon=True)
+                worker.start()
 
     def _schedule(self, *, log: bool = False, chat: Optional[str] = None, reason: str = "hourly") -> None:
         """Hand persistence (and optionally a summary) to the background worker; never blocks."""
@@ -474,11 +485,7 @@ class DailyCallCounter:
             if log:
                 self._pending_logs.append((chat, reason))
             self._work.set()
-            worker = self._worker
-            if worker is None or not worker.is_alive():
-                worker = self._worker = threading.Thread(
-                    target=self._run_worker, name="telegram-call-counter", daemon=True)
-                worker.start()
+        self._ensure_worker()
 
     def _run_worker(self) -> None:
         while True:
@@ -487,6 +494,8 @@ class DailyCallCounter:
                     if not self._dirty and not self._pending_logs:
                         self._worker = None
                         return
+                    # Interval elapsed with counts pending and no explicit wake: flush them anyway.
+                    self._work.set()
             with self._lock:
                 self._work.clear()
                 self._busy += 1
@@ -544,10 +553,14 @@ class DailyCallCounter:
                         self._dirty[key] = self._dirty.get(key, 0) + count
 
     def window(self, chat: Optional[str] = None, *, since: Optional[float] = None) -> Dict[str, Any]:
-        """Totals since ``since`` (default: the last 24h), flushed and unflushed together."""
+        """Totals from ``since`` (default: 24h ago), flushed and unflushed together.
+
+        Counts are hourly buckets, so the window starts at the first WHOLE hour at or after
+        ``since`` (it never reaches back before the cutoff). ``since`` in the result is that
+        actual start, so a reader sees the exact interval covered."""
         self.flush()
         since = self._wall() - _DAY if since is None else since
-        floor = since - (since % _HOUR)
+        floor = since if since % _HOUR == 0 else since - (since % _HOUR) + _HOUR
         rows = []
         if self._home() is not None:
             try:

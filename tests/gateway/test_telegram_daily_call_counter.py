@@ -223,6 +223,36 @@ def test_record_never_blocks_on_a_locked_database(tmp_path):
     assert counter.window("1")["chats"]["1"]["total"] == 51  # nothing lost while locked
 
 
+def test_quiet_profile_persists_without_another_call(tmp_path):
+    """Regression: a lone call stayed in memory until another call arrived after the interval."""
+    import time as _time
+    counter = DailyCallCounter(tmp_path, wall=_time.time, flush_interval=0.05, log_interval=3600.0)
+    counter.record("1", "sendMessage", "typed")
+    deadline = _time.monotonic() + 5
+    while _time.monotonic() < deadline:
+        db = tmp_path / "telegram-flood-state.db"
+        if db.exists():
+            with sqlite3.connect(db) as conn:
+                row = conn.execute("SELECT SUM(count) FROM call_counts").fetchone()
+            if row and row[0] == 1:
+                return
+        _time.sleep(0.02)
+    raise AssertionError("count was never persisted without a second call")
+
+
+def test_window_never_reaches_back_before_its_cutoff(tmp_path):
+    """Regression: flooring the cutoff to the hour made a 24h window cover up to 25h."""
+    hour0 = 1_791_200_000.0 - (1_791_200_000.0 % 3600)
+    wall = _Wall(hour0 + 1800)  # half past an hour
+    counter = DailyCallCounter(tmp_path, wall=wall)
+    old_hour = hour0 - 86400  # the bucket that holds the 24h cutoff (cutoff = old_hour + 1800)
+    counter.record("1", "sendMessage", "typed")
+    counter._dirty[(old_hour, "1", "sendMessage", "goal")] = 7
+    window = counter.window("1")
+    assert window["chats"]["1"]["total"] == 1
+    assert window["since"] == old_hour + 3600 and window["since"] >= wall.t - 86400
+
+
 def test_counter_failure_never_blocks_a_send(tmp_path):
     class Broken:
         def record(self, *a, **k):

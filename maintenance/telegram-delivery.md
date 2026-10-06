@@ -348,8 +348,9 @@ shed typing or drafts are not counted. `TelegramAdapter.handle_message` binds th
 (`typed`, `goal`, `loop`, `relay`, `process`, `delegation`, `restart`, `heartbeat`, `internal`)
 in a ContextVar that the turn task inherits. Calls outside a turn (cron delivery, outbox
 replay, housekeeping) are `untagged`. Counts flush additively to `call_counts` in the profile's
-`telegram-flood-state.db` at most once a minute, are kept for 30 days, and log a rolling 24h
-summary hourly. Any `retry_after` of 600s or more also logs every chat's window counts for the profile, so per-chat and per-bot limits can be told apart. Each profile directory gets its own counter, resolved on the caller's context, never on the worker thread. The send path
+`telegram-flood-state.db` at most once a minute, are kept for 30 days, and log a 24h summary hourly
+(whole hourly buckets from the first hour at or after the cutoff, never reaching back before it).
+The first call after an idle period starts the worker, so a quiet profile persists within a minute. Any `retry_after` of 600s or more also logs every chat's window counts for the profile, so per-chat and per-bot limits can be told apart. Each profile directory gets its own counter, resolved on the caller's context, never on the worker thread. The send path
 only updates an in-memory dict. Persistence and summaries run on the counter's own daemon thread,
 so a slow or locked database cannot delay a call. The counter never sheds or refuses a call.
 Counter failures are logged at debug level and unflushed counts are kept for the next flush.
