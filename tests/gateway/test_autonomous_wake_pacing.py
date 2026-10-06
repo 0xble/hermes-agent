@@ -151,6 +151,17 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
         await _after_turn(runner, src, "[proc done]", internal=True, origin="process_registry_synthetic")
         assert _queued_continuations(adapter) == 1
         assert goals.load_goal(entry.session_id).waiting_until == 0
+        adapter._pending_messages.clear()
+
+        # Paced again after that continuation...
+        clock[0] += 20
+        await _after_turn(runner, src, continuation, internal=False)
+        assert _queued_continuations(adapter) == 0
+        # ...but a completion drained behind a continuation head (the follow-up chain copies its
+        # origin onto the head event, which is not internal) still counts as fresh evidence.
+        clock[0] += 20
+        await _after_turn(runner, src, continuation, internal=False, origin="process_registry_synthetic")
+        assert _queued_continuations(adapter) == 1
 
     # Nothing about the routine pacing hold reached the chat; only the first continue notice.
     await asyncio.sleep(0)

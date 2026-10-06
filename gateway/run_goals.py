@@ -558,12 +558,12 @@ class GatewayGoalsMixin:
         hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip():
             # A process or delegation result injected by the completion path is new evidence and
-            # may pierce the continuation gap. Other internal wakes (/loop ticks, goal
-            # continuations, heartbeats) are paced.
+            # may pierce the continuation gap, including one drained behind a goal continuation
+            # (the chain's terminal origin is copied onto the head event). Other autonomous wakes
+            # (/loop ticks, goal continuations, heartbeats) are paced. The marker is gateway-set
+            # metadata, never derived from message text.
             metadata = getattr(event, "metadata", None) or {}
-            external_event = bool(
-                is_internal and metadata.get("notification_origin") == "process_registry_synthetic"
-            )
+            external_event = metadata.get("notification_origin") == "process_registry_synthetic"
             hooks.insert(0, (
                 "goal continuation", self._post_turn_goal_continuation,
                 {
