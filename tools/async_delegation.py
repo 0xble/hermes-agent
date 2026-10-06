@@ -908,16 +908,41 @@ def _admit_pending() -> None:
             if item_context is None:
                 item_context = contextvars.copy_context()
 
-            def admit_and_submit() -> Optional[str]:
+            def admit_and_submit() -> tuple[bool, Optional[str]]:
                 try:
                     with _DB_LOCK, _transaction() as conn:
-                        conn.execute("UPDATE async_delegations SET state='running', updated_at=? WHERE delegation_id=? AND state='queued'",
-                                     (time.time(), item["delegation_id"]))
+                        changed = conn.execute(
+                            "UPDATE async_delegations SET state='running', updated_at=? "
+                            "WHERE delegation_id=? AND state='queued'",
+                            (time.time(), item["delegation_id"]),
+                        ).rowcount
                 except Exception:
                     logger.exception("Could not persist admission of queued delegation %s", item["delegation_id"])
-                return _submit_record(item, item["max_async_children"])
+                    return False, None
+                if changed != 1:
+                    logger.error("Could not persist admission of queued delegation %s: expected one row, changed %s",
+                                 item["delegation_id"], changed)
+                    return False, None
+                return True, _submit_record(item, item["max_async_children"])
 
-            error = item_context.copy().run(admit_and_submit)
+            admitted, error = item_context.copy().run(admit_and_submit)
+            if not admitted:
+                # The durable row is still queued (or the write failed before
+                # its state could change). Restore every not-yet-submitted unit
+                # in memory and leave it for a later admission pass. Most
+                # importantly, never submit a runner while the ledger says
+                # that it is queued: recovery must not report started work as
+                # never started.
+                with _records_lock:
+                    for pending in reversed(selected[index:]):
+                        live = _records.get(pending["delegation_id"])
+                        if live is None or live.get("status") != "running":
+                            continue
+                        live["status"] = "queued"
+                        live["queue_reason"] = "async pool capacity"
+                        live["queued_at"] = time.time()
+                        _PENDING_QUEUE.appendleft(pending["delegation_id"])
+                return
             if not error:
                 continue
             if error == _BACKEND_RETIRING:

@@ -69,6 +69,17 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def _wait_for_queued(delegation_id, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        item = next((item for item in ad.list_async_delegations()
+                     if item["delegation_id"] == delegation_id), None)
+        if item is not None and item["status"] == "queued":
+            return
+        time.sleep(0.01)
+    pytest.fail(f"delegation {delegation_id} did not remain queued")
+
+
 def test_schema_init_preserves_shared_state_db_journal_mode(tmp_path):
     """The delegation ledger is a guest in state.db, not its mode owner."""
     conn = sqlite3.connect(tmp_path / "state.db")
@@ -443,6 +454,7 @@ def test_queued_cancel_claims_before_admission_can_race(monkeypatch):
     assert completion["status"] == "interrupted"
 
 
+def test_queued_delegation_can_be_cancelled_before_runner_starts():
     ev = threading.Event()
     started = threading.Event()
     interrupted = []
@@ -464,6 +476,93 @@ def test_queued_cancel_claims_before_admission_can_race(monkeypatch):
     assert interrupted == ["stop"]
     ev.set()
     assert _drain_for(first["delegation_id"]) is not None
+
+
+def test_queued_admission_does_not_submit_when_ledger_write_raises(monkeypatch):
+    from contextlib import contextmanager
+
+    release = threading.Event()
+    started = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="owned",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    queued = ad.dispatch_async_delegation(
+        goal="queued", context=None, toolsets=None, role="leaf", model="m", session_key="owned",
+        runner=lambda: (started.set(), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
+    )
+    assert queued["status"] == "queued"
+    original_transaction = ad._transaction
+
+    class RaisingConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "SET state='running'" in sql:
+                raise RuntimeError("admission write failed")
+            return self._conn.execute(sql, params)
+
+    @contextmanager
+    def transaction():
+        with original_transaction() as conn:
+            yield RaisingConnection(conn)
+
+    monkeypatch.setattr(ad, "_transaction", transaction)
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert not started.is_set()
+    _wait_for_queued(queued["delegation_id"])
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?", (queued["delegation_id"],)
+        ).fetchone() == ("queued",)
+
+
+def test_queued_admission_does_not_submit_when_ledger_write_changes_zero_rows(monkeypatch):
+    from contextlib import contextmanager
+
+    release = threading.Event()
+    started = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="owned",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    queued = ad.dispatch_async_delegation(
+        goal="queued", context=None, toolsets=None, role="leaf", model="m", session_key="owned",
+        runner=lambda: (started.set(), {"status": "completed"})[1],
+        max_async_children=1, max_queued_delegations=1,
+    )
+    assert queued["status"] == "queued"
+    original_transaction = ad._transaction
+
+    class ZeroRowsCursor:
+        rowcount = 0
+
+    class ZeroRowsConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, params=()):
+            if "SET state='running'" in sql:
+                return ZeroRowsCursor()
+            return self._conn.execute(sql, params)
+
+    @contextmanager
+    def transaction():
+        with original_transaction() as conn:
+            yield ZeroRowsConnection(conn)
+
+    monkeypatch.setattr(ad, "_transaction", transaction)
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert not started.is_set()
+    _wait_for_queued(queued["delegation_id"])
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?", (queued["delegation_id"],)
+        ).fetchone() == ("queued",)
 
 
 def test_interrupt_all_signals_running_children():
