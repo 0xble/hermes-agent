@@ -4692,19 +4692,52 @@ class BasePlatformAdapter(ABC):
         """
         if getattr(event, "_restart_note_reconciled", False):
             return None
-        store = getattr(self.gateway_runner, "async_session_store", None)
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
         get_note = getattr(store, "get_restart_note", None)
         if not callable(get_note):
             return None
-        note = await get_note(session_key)
-        note_id = note[3] if note else None
+
+        # Final delivery must not pay for a store lookup when this session has no visible
+        # interruption note.  The live runner and AsyncSessionStore expose the routing index
+        # in memory; a missing/unmarked entry is a definitive fast negative.  If a test or
+        # alternate runner provides no recognizable index, only trust an explicitly async
+        # lookup and fail open for loose mocks (whose callable attributes are MagicMocks).
+        entries = None
+        for candidate in (
+            getattr(runner, "session_store", None),
+            getattr(store, "_store", None),
+            getattr(self, "_session_store", None),
+        ):
+            candidate_entries = getattr(candidate, "_entries", None)
+            if isinstance(candidate_entries, dict):
+                entries = candidate_entries
+                break
+        if entries is not None:
+            entry = entries.get(session_key)
+            if entry is None or not getattr(entry, "restart_note_message_id", None):
+                return None
+        elif not inspect.iscoroutinefunction(get_note):
+            return None
+
+        try:
+            note_result = get_note(session_key)
+            note = await note_result if inspect.isawaitable(note_result) else note_result
+            if not isinstance(note, (tuple, list)) or len(note) < 4:
+                return None
+            note_id = note[3] if note else None
+        except Exception:
+            logger.warning("[%s] Restart-note lookup failed for %s; continuing normal delivery",
+                           self.name, session_key, exc_info=True)
+            return None
         if not note_id or str(note_id).startswith("pending:"):
             return None
         if str(note_id).startswith("sent:"):
             # Signal-like transports have no platform handle. The sentinel is reconciled by
             # clearing the durable record, then the answer is sent normally.
             try:
-                await store.clear_restart_note(session_key)
+                clear_result = store.clear_restart_note(session_key)
+                await clear_result if inspect.isawaitable(clear_result) else clear_result
             except Exception:
                 logger.warning("[%s] Failed to clear no-id restart note for %s", self.name, session_key,
                                exc_info=True)
@@ -4717,7 +4750,8 @@ class BasePlatformAdapter(ABC):
             if not callable(record_failure):
                 return
             try:
-                dropped = await record_failure(session_key)
+                failure_result = record_failure(session_key)
+                dropped = await failure_result if inspect.isawaitable(failure_result) else failure_result
                 if dropped:
                     logger.warning(
                         "[%s] Dropping restart note for %s after bounded reconciliation failures",
@@ -4729,7 +4763,8 @@ class BasePlatformAdapter(ABC):
 
         async def _clear_reconciled_note() -> None:
             try:
-                await store.clear_restart_note(session_key)
+                clear_result = store.clear_restart_note(session_key)
+                await clear_result if inspect.isawaitable(clear_result) else clear_result
             except Exception:
                 # Do not block the user's answer on a bookkeeping write. The durable note is
                 # intentionally retained so a later final delivery can retry reconciliation.
@@ -4741,8 +4776,12 @@ class BasePlatformAdapter(ABC):
             deleted = False
             if callable(delete):
                 try:
-                    deleted = bool(await delete(event.source.chat_id, str(note_id)))
+                    delete_result = delete(event.source.chat_id, str(note_id))
+                    delete_result = await delete_result if inspect.isawaitable(delete_result) else delete_result
+                    deleted = bool(delete_result)
                 except Exception:
+                    logger.warning("[%s] Failed to delete restart note for %s; continuing normal delivery",
+                                   self.name, session_key, exc_info=True)
                     deleted = False
             if deleted:
                 await _clear_reconciled_note()
@@ -4753,29 +4792,39 @@ class BasePlatformAdapter(ABC):
         result = None
         if callable(edit):
             try:
-                result = await edit(
+                edit_result = edit(
                     chat_id=event.source.chat_id, message_id=str(note_id), content=text_content,
                     finalize=True, metadata=metadata,
                 )
+                result = await edit_result if inspect.isawaitable(edit_result) else edit_result
             except TypeError:
                 try:
-                    result = await edit(
+                    edit_result = edit(
                         chat_id=event.source.chat_id, message_id=str(note_id), content=text_content,
                         finalize=True,
                     )
+                    result = await edit_result if inspect.isawaitable(edit_result) else edit_result
                 except Exception:
+                    logger.warning("[%s] Failed to edit restart note for %s; continuing normal delivery",
+                                   self.name, session_key, exc_info=True)
                     result = None
             except Exception:
+                logger.warning("[%s] Failed to edit restart note for %s; continuing normal delivery",
+                               self.name, session_key, exc_info=True)
                 result = None
-        if result is not None and getattr(result, "success", False):
+        if result is not None and getattr(result, "success", False) is True:
             await _clear_reconciled_note()
             return result
         deleted = False
         delete = getattr(self, "delete_message", None)
         if callable(delete):
             try:
-                deleted = bool(await delete(event.source.chat_id, str(note_id)))
+                delete_result = delete(event.source.chat_id, str(note_id))
+                delete_result = await delete_result if inspect.isawaitable(delete_result) else delete_result
+                deleted = bool(delete_result)
             except Exception:
+                logger.warning("[%s] Failed to delete restart note for %s; continuing normal delivery",
+                               self.name, session_key, exc_info=True)
                 deleted = False
         if deleted:
             await _clear_reconciled_note()
