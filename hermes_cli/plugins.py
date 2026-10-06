@@ -1831,20 +1831,14 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
     return PluginManager().has_enabled_portable_mcp(raw_config)
 
 
-def discover_plugins(force: bool = False) -> None:
-    """Discover and load all plugins (idempotent; ``force=True`` rescans). Joins an in-flight
-    background discovery instead of racing a second scan."""
-    _join_background_discovery()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return
-    get_plugin_manager().discover_and_load(force=force)
-
-
 _background_discovery_thread: Optional[threading.Thread] = None
-_background_discovery_lock = threading.Lock()
-_background_discovery_incomplete = False
-_background_discovery_warning_emitted = False
+_background_discovery_lock = threading.RLock()
+# The event is the publication barrier. It intentionally starts clear: no background discovery exists
+# until a worker or synchronous discovery publishes its outcome in its completion ``finally`` block.
+_discovery_done = threading.Event()
+_discovery_outcome = "ok"  # ``ok`` or ``failed``; written before ``_discovery_done.set()``.
+_barrier_timed_out = False  # write-once per discovery generation; only shortens later waits.
+_delivery_warning_emitted = False
 
 # A normal per-plugin deadline gets five seconds of outer slack, with a 30-second minimum so a
 # multi-plugin scan is not cut off merely because each individual load stayed within its deadline.
@@ -1863,85 +1857,129 @@ def _discovery_barrier_timeout() -> float:
 
 
 def _discovery_incomplete() -> bool:
-    with _background_discovery_lock:
-        return _background_discovery_incomplete
+    """Whether a background sweep is still allowed to mutate the hook registry."""
+    return _background_discovery_thread is not None and not _discovery_done.is_set()
 
 
-def _mark_discovery_incomplete(timeout: float, manager: PluginManager) -> None:
-    global _background_discovery_incomplete, _background_discovery_warning_emitted
+def _discovery_failed() -> bool:
+    """Whether the published discovery outcome failed; failed delivery never retries implicitly."""
+    return _discovery_done.is_set() and _discovery_outcome == "failed"
+
+
+def _reset_discovery_generation() -> None:
+    """Start a new explicit discovery generation and clear only generation-scoped barrier state."""
+    global _discovery_outcome, _barrier_timed_out, _delivery_warning_emitted
     with _background_discovery_lock:
-        if _background_discovery_incomplete:
+        _discovery_outcome = "ok"
+        _barrier_timed_out = False
+        _delivery_warning_emitted = False
+        _discovery_done.clear()
+
+
+def _publish_discovery_outcome(outcome: str) -> None:
+    """Publish the outcome before releasing waiters; callers must set the event only at completion."""
+    global _discovery_outcome
+    _discovery_outcome = outcome
+    _discovery_done.set()
+
+
+def _warn_discovery_closed() -> None:
+    """Warn once when delivery is closed by an incomplete or failed discovery."""
+    global _delivery_warning_emitted
+    with _background_discovery_lock:
+        if _delivery_warning_emitted:
             return
-        _background_discovery_incomplete = True
-        _background_discovery_warning_emitted = False
-    current = getattr(manager, "_discovery_current_plugin", None) or "unknown (filesystem scan or other discovery work)"
-    logger.error(
-        "Plugin discovery incomplete after %.3gs; currently loading %s. Plugin hook delivery is disabled "
-        "until discovery completes",
-        timeout, current,
-    )
+        _delivery_warning_emitted = True
+    if _discovery_failed():
+        logger.warning("Plugin hook delivery skipped because plugin discovery failed")
+    else:
+        logger.warning("Plugin hook delivery skipped because plugin discovery is incomplete")
 
 
-def _mark_discovery_complete() -> None:
-    global _background_discovery_incomplete, _background_discovery_warning_emitted
-    with _background_discovery_lock:
-        _background_discovery_incomplete = False
-        _background_discovery_warning_emitted = False
+def _discover_synchronously(manager: PluginManager, *, force: bool = False) -> None:
+    """Run a caller-owned discovery and publish its outcome for every delivery waiter."""
+    _reset_discovery_generation()
+    outcome = "ok"
+    try:
+        manager.discover_and_load(force=force)
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        _publish_discovery_outcome(outcome)
 
 
-def _warn_discovery_incomplete() -> None:
-    global _background_discovery_warning_emitted
-    with _background_discovery_lock:
-        if not _background_discovery_incomplete or _background_discovery_warning_emitted:
-            return
-        _background_discovery_warning_emitted = True
-    logger.warning("Plugin hook delivery skipped because plugin discovery is incomplete")
+def discover_plugins(force: bool = False) -> None:
+    """Discover and load all plugins (idempotent; ``force=True`` rescans). Joins an in-flight
+    background discovery instead of racing a second scan."""
+    _join_background_discovery()
+    if _discovery_incomplete() or (_discovery_failed() and not force):
+        _warn_discovery_closed()
+        return
+    _discover_synchronously(get_plugin_manager(), force=force)
 
 
 def start_background_plugin_discovery() -> None:
     """Run discovery in a daemon thread to overlap the rest of CLI startup (~150ms). Synchronous
     consumers wait up to the bounded barrier; after expiry they fail closed until this worker finishes.
-    No-op when already done or in flight."""
+    No-op when already done, failed, or in flight."""
     global _background_discovery_thread
     manager = get_plugin_manager()
-    if manager._discovered:
+    if manager._discovered or _discovery_failed():
         return
     with _background_discovery_lock:
-        if _background_discovery_thread is not None and _background_discovery_thread.is_alive():
+        if _background_discovery_thread is not None and not _discovery_done.is_set():
             return
+        _reset_discovery_generation()
 
         def _run() -> None:
+            outcome = "ok"
             try:
                 manager.discover_and_load()
                 _persist_plugin_toolset_keys()
-            except Exception:
+            except BaseException:
+                outcome = "failed"
                 logger.warning("background plugin discovery failed", exc_info=True)
-            else:
-                # Only a completed sweep may reopen delivery; a timed-out worker can finish later and
-                # then safely publish its now-complete registry to subsequent callers.
-                _mark_discovery_complete()
+            finally:
+                # The outcome is assigned before the Event is set, so no consumer can read a partial
+                # registry as a successful discovery. Late completion naturally reopens delivery.
+                _publish_discovery_outcome(outcome)
 
         _background_discovery_thread = threading.Thread(target=_run, name="plugin-discovery", daemon=True)
         _background_discovery_thread.start()
 
 
 def _join_background_discovery() -> None:
-    """Wait for an in-flight background discovery up to the hard outer deadline.
+    """Wait on the single completion event up to the bounded outer deadline.
 
-    The barrier is deliberately bounded even when ``plugins.load_timeout_seconds: 0`` disables each
-    per-plugin deadline. Expiry records an explicit incomplete state; callers must not inspect the partial
-    registry or restart the same wait on every delivery attempt. A later successful worker completion clears
-    the state. No-op from the worker itself or a plugin-load worker whose parent is waiting on it.
+    A timeout is remembered only to make later delivery attempts non-blocking. Incomplete state is
+    derived from the event, so a late worker completion reopens delivery without a clear/race step.
+    No-op from the worker itself or a plugin-load worker whose parent is waiting on it.
     """
+    global _barrier_timed_out
     t = _background_discovery_thread
-    if t is None or not t.is_alive() or t is threading.current_thread() or in_plugin_load_worker():
+    if t is None or t is threading.current_thread() or in_plugin_load_worker() or _discovery_done.is_set():
         return
-    if _discovery_incomplete():
+    with _background_discovery_lock:
+        timeout = 0.0 if _barrier_timed_out else _discovery_barrier_timeout()
+    if _discovery_done.wait(timeout=timeout):
         return
-    timeout = _discovery_barrier_timeout()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        _mark_discovery_incomplete(timeout, get_plugin_manager())
+    # Do not publish an incomplete state: completion may have raced the timeout return.
+    if _discovery_done.is_set():
+        return
+    with _background_discovery_lock:
+        if _barrier_timed_out:
+            return
+        _barrier_timed_out = True
+        should_log = not _discovery_done.is_set()
+    if should_log:
+        manager = get_plugin_manager()
+        current = getattr(manager, "_discovery_current_plugin", None) or "unknown (filesystem scan or other discovery work)"
+        logger.error(
+            "Plugin discovery incomplete after %.3gs; currently loading %s. Plugin hook delivery is disabled "
+            "until discovery completes",
+            timeout, current,
+        )
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
@@ -1991,102 +2029,55 @@ def get_portable_mcp_server_names_nowait() -> "set[str]":
     return _nowait_plugin_set("portable_mcp", lambda m: set(m.get_portable_mcp_servers()))
 
 
-def _delivery_manager() -> PluginManager:
-    """Active manager, lazily discovering if it never ran — delivery must not depend on WHICH
-    surface imported us (dashboards/TUI/cron never import model_tools). ``getattr`` default
-    ``True`` leaves test doubles untouched.
+def _delivery_manager() -> Optional[PluginManager]:
+    """Return the manager only after discovery is published and delivery is open.
 
-    Hook/middleware delivery must not depend on WHICH surface imported us: dashboards, TUI slash workers,
-    query mode, and cron delivery paths never import ``model_tools`` (whose import side-effect is the
-    discovery trigger on the interactive CLI path), so hooks registered by user plugins were silently dead
-    on those surfaces (#50776, #67597, #67890, #50937; tracking #64178 — salvaged from PR #64188).
+    Every hook, middleware, streaming snapshot, and prompt-section consumer uses this barrier. A
+    failed worker and an expired in-flight worker both return ``None``; neither path reads a partial
+    registry or retries discovery implicitly.
     """
     manager = get_plugin_manager()
-    # ``PluginManager.discover_and_load`` sets ``_discovered`` before loading any
-    # plugin so recursive discovery cannot re-enter the sweep.  A startup caller
-    # can therefore observe ``_discovered`` while the background worker is still
-    # populating hooks; join the worker before reading the registry.
     _join_background_discovery()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return manager
+    if _discovery_incomplete() or _discovery_failed():
+        _warn_discovery_closed()
+        return None
     if not getattr(manager, "_discovered", True):
-        manager.discover_and_load()
+        _discover_synchronously(manager)
+        if _discovery_failed():
+            _warn_discovery_closed()
+            return None
     return manager
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook (lazy-discovers first); return non-``None`` callback results.
-
-    Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hook ``pre_tool_call`` are
-    bounded by ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not
-    joined) so we do not reintroduce the #6622 hang. Timed-out or still-running ``pre_tool_call`` callbacks
-    fail closed with a block directive; other bounded hooks fail open (skip).
-    Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
-    ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
-    callbacks registered by user plugins (tracking #64178).
-    """
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return []
+    """Invoke a lifecycle hook (lazy-discovers first); return non-``None`` callback results."""
     manager = _delivery_manager()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return []
-    return manager.invoke_hook(hook_name, **kwargs)
+    return [] if manager is None else manager.invoke_hook(hook_name, **kwargs)
 
 
 async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """:func:`invoke_hook` for callers on an event loop: ``async def`` callbacks are awaited
     there instead of bridged through a helper thread (see ``PluginManager.ainvoke_hook``)."""
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return []
     manager = _delivery_manager()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return []
-    return await manager.ainvoke_hook(hook_name, **kwargs)
+    return [] if manager is None else await manager.ainvoke_hook(hook_name, **kwargs)
 
 
 def render_system_prompt_sections(session_info: Mapping[str, Any]) -> List[RenderedPluginSystemPromptSection]:
-    """Render plugin prompt sections after idempotent plugin discovery."""
-    manager = _ensure_plugins_discovered()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return []
-    return manager.render_system_prompt_sections(session_info)
+    """Render plugin prompt sections only after the delivery barrier opens."""
+    manager = _delivery_manager()
+    return [] if manager is None else manager.render_system_prompt_sections(session_info)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
-    """Invoke registered middleware callbacks (lazy-discovers like :func:`invoke_hook`).
-
-    Lazy-discovers plugins on first use — same delivery-parity guarantee as :func:`invoke_hook` (tracking
-    #64178).
-    """
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return []
+    """Invoke registered middleware callbacks through the discovery delivery barrier."""
     manager = _delivery_manager()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return []
-    return manager.invoke_middleware(kind, **kwargs)
+    return [] if manager is None else manager.invoke_middleware(kind, **kwargs)
 
 
 def has_middleware(kind: str) -> bool:
-    """True when middleware is registered for ``kind``; lazy-discovers first since callers gate
-    :func:`invoke_middleware` on it.
-
-    Lazy-discovers first: callers use this as a gate before :func:`invoke_middleware`, so a pre-discovery
-    ``False`` here would silently skip delivery on surfaces that never ran discovery (#64178).
-    """
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return False
+    """True when middleware is registered after the discovery delivery barrier opens."""
     manager = _delivery_manager()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
+    if manager is None:
         return False
     method = getattr(manager, "has_middleware", None)
     if callable(method):
@@ -2095,34 +2086,15 @@ def has_middleware(kind: str) -> bool:
 
 
 def has_hook(hook_name: str) -> bool:
-    """True when a loaded plugin handles a hook (lazy-discovers first, like :func:`has_middleware`).
-
-    Lazy-discovers first — same gate-before-invoke rationale as :func:`has_middleware` (tracking #64178).
-    """
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return False
+    """True when a loaded plugin handles a hook after the discovery delivery barrier opens."""
     manager = _delivery_manager()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return False
-    return manager.has_hook(hook_name)
+    return False if manager is None else manager.has_hook(hook_name)
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
-    """Return a stable snapshot of callbacks registered for a hook.
-
-    Goes through :func:`_delivery_manager` so streaming hook consumers wait for an in-flight
-    background discovery, like :func:`invoke_hook` and :func:`has_hook`.
-    """
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return ()
+    """Return a stable callback snapshot after the discovery delivery barrier opens."""
     manager = _delivery_manager()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
-        return ()
-    return manager.iter_hook_callbacks(hook_name)
+    return () if manager is None else manager.iter_hook_callbacks(hook_name)
 
 
 def fire_pre_command_hook(
@@ -2132,11 +2104,8 @@ def fire_pre_command_hook(
     """Fire the observer-only ``pre_command`` hook; never raises. Directive-shaped returns are
     logged at debug so future block/rewrite adopters are discoverable."""
     try:
-        if _discovery_incomplete():
-            _warn_discovery_incomplete()
-            return
-        manager = get_plugin_manager()
-        if not manager.has_hook("pre_command"):
+        manager = _delivery_manager()
+        if manager is None or not manager.has_hook("pre_command"):
             return
         results = manager.invoke_hook(
             "pre_command", surface=surface, command=command, alias_used=alias_used,
@@ -2378,10 +2347,13 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     """Return the global manager after idempotent (or ``force``d) discovery."""
     _join_background_discovery()
     manager = get_plugin_manager()
-    if _discovery_incomplete():
-        _warn_discovery_incomplete()
+    if _discovery_incomplete() or (_discovery_failed() and not force):
+        _warn_discovery_closed()
         return manager
-    manager.discover_and_load(force=force)
+    if not getattr(manager, "_discovered", True):
+        _discover_synchronously(manager, force=force)
+    elif force:
+        _discover_synchronously(manager, force=True)
     return manager
 
 
