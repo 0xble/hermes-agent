@@ -24,7 +24,9 @@ from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
-from gateway.run_notifications_ledger import settle_durable_claim, settle_durable_claims
+from gateway.run_notifications_ledger import (
+    claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
+)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -1795,14 +1797,15 @@ class GatewayNotificationsMixin:
                 return False
         return True
 
-    async def _preflight_completion_delivery(self, evt: dict) -> "_CompletionClaim":
+    async def _preflight_completion_delivery(self, evt: dict, claim=None) -> "_CompletionClaim":
         """Claim the durable row (async delegations) and verify the target before adapter acceptance.
 
         Adapter acceptance is not proof of delivery: the inner resolver can still fail closed inside
         the pipeline after acceptance, falsely acking the durable row. Verifying first gives drops an
-        honest durable disposition.
+        honest durable disposition. ``claim`` is the caller's record, filled in place so the caller's
+        cleanup sees a claim taken before a cancellation interrupts the pre-flight.
         """
-        claim = self._CompletionClaim()
+        claim = self._CompletionClaim() if claim is None else claim
         evt_type = evt.get("type")
         if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
             claim.proceed, claim.early_result = False, False
@@ -1813,9 +1816,14 @@ class GatewayNotificationsMixin:
             claim.delegation_id = str(evt.get("delegation_id") or "")
             if claim.delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
-                    claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not await asyncio.to_thread(claim_completion_delivery, claim.delegation_id, claim.claim_id):
+                    from tools.async_delegation import claim_completion_delivery, defer_completion_delivery
+                    delegation_id = claim.delegation_id
+                    claim_id = claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                    claimed = await claim_off_loop(
+                        lambda: claim_completion_delivery(delegation_id, claim_id),
+                        lambda ok: ok and defer_completion_delivery(delegation_id, claim_id),
+                    )
+                    if not claimed:
                         claim.proceed = False
                         return claim
                 except Exception as exc:
@@ -1913,7 +1921,7 @@ class GatewayNotificationsMixin:
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = False
         try:
-            claim = await self._preflight_completion_delivery(evt)
+            claim = await self._preflight_completion_delivery(evt, claim)
             if not claim.proceed:
                 return claim.early_result
             if identity is not None:
@@ -2134,12 +2142,11 @@ class GatewayNotificationsMixin:
         for evt, _text in deliverable:
             if not await self._completion_delivery_ready(evt):
                 return False
-        from tools.async_delegation import claim_event_delivery
         primary_evt, primary_text = deliverable[0]
+        claimed = await claim_siblings_off_loop(deliverable[1:], f"gateway-batch:{id(self)}")
         blocks = [primary_text]
         siblings: list[tuple[dict, str]] = []
-        for evt, synth_text in deliverable[1:]:
-            claim_id = await asyncio.to_thread(claim_event_delivery, evt, f"gateway-batch:{id(self)}")
+        for evt, synth_text, claim_id in claimed:
             if claim_id is None:
                 # Another consumer owns this row: keep it out of our text so it is never double-injected.
                 continue
@@ -2211,15 +2218,16 @@ class GatewayNotificationsMixin:
                 release_auto_resume_trigger,
             )
 
-            async def _suppress_claimed_notice() -> bool:
-                """Terminally consume a notice that must not be retried."""
-                record, reason = await asyncio.to_thread(claim_auto_resume_trigger, evt.get("delegation_id", ""))
+            delegation_id = str(evt.get("delegation_id") or "")
+
+            def _claim_and_consume() -> None:
+                record, reason = claim_auto_resume_trigger(delegation_id)
                 if reason is None and record is not None:
-                    await asyncio.to_thread(
-                        complete_auto_resume_trigger,
-                        str(evt.get("delegation_id") or ""),
-                        str(record.get("auto_resume_claim") or ""),
-                    )
+                    complete_auto_resume_trigger(delegation_id, str(record.get("auto_resume_claim") or ""))
+
+            async def _suppress_claimed_notice() -> bool:
+                """Terminally consume a notice that must not be retried (claim and consume in one hop)."""
+                await asyncio.to_thread(_claim_and_consume)
                 return True
 
             if parent_session_id:
@@ -2246,7 +2254,13 @@ class GatewayNotificationsMixin:
                     authorized = False
                 if not authorized:
                     return await _suppress_claimed_notice()
-            record, reason = await asyncio.to_thread(claim_auto_resume_trigger, evt.get("delegation_id", ""))
+            def _release_abandoned(claimed) -> None:
+                record, reason = claimed
+                if reason is None and record is not None:
+                    release_auto_resume_trigger(delegation_id, str(record.get("auto_resume_claim") or ""))
+
+            record, reason = await claim_off_loop(lambda: claim_auto_resume_trigger(delegation_id),
+                                                  _release_abandoned)
             if reason is not None or record is None:
                 # Includes an explicit resume claim racing this notice, or another gateway
                 # already owning/finishing the boot notice.
@@ -2264,7 +2278,7 @@ class GatewayNotificationsMixin:
                 return False
             finally:
                 settle = complete_auto_resume_trigger if accepted else release_auto_resume_trigger
-                await asyncio.to_thread(settle, str(evt.get("delegation_id") or ""), claim_id)
+                await asyncio.to_thread(settle, delegation_id, claim_id)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async completions and pattern notifications even while sessions are idle.

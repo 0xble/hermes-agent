@@ -1046,3 +1046,41 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
     for event in events:
         assert async_delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
     assert worst_gap < 1.0, f"event loop stalled {worst_gap:.2f}s behind a slow ledger transaction"
+
+
+def test_cancelled_sibling_claim_releases_its_lease(monkeypatch, isolated_registry):
+    """A claim taken in a worker thread must not strand its lease when the awaiting task is
+    cancelled (shutdown): the row stays immediately claimable instead of waiting out the lease."""
+    import threading
+
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_cancel_{i}") for i in range(2)]
+    for event in events:
+        _persist_pending_completion(event)
+    entered, proceed = threading.Event(), threading.Event()
+    real_claim = async_delegation.claim_event_delivery
+
+    def _gated_claim(evt, consumer):
+        entered.set()
+        proceed.wait(5)
+        return real_claim(evt, consumer)
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _gated_claim)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+
+    async def _exercise():
+        task = asyncio.create_task(runner._deliver_async_delegation_group([dict(e) for e in events]))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        proceed.set()
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if async_delegation.claim_completion_delivery(events[1]["delegation_id"], "next-consumer"):
+                return True
+        return False
+
+    assert asyncio.run(_exercise()), "cancelled sibling claim stranded its lease"
