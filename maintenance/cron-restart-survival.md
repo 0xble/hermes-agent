@@ -12,6 +12,18 @@ This is a core scheduler/dispatch invariant; a plugin or skill cannot atomically
 
 Run `tests/cron/test_restart_safe_worker.py`, `tests/cron/test_bounded_worker_recovery.py`, `tests/cron/test_delivery_queue.py`, `tests/cron/test_hard_wall_real_path.py`, `tests/cron/test_double_fork_sweep.py` and `tests/cron/test_hard_wall_completion_race.py` on macOS, then `./bin/ci preflight` and the exact-SHA `gate`. The SQLite execution row is the sole completion fence: worker output is composed and, for gateway-queued notices, an idempotent gated queue item is admitted before the terminal result commits. The gateway cannot claim a gated item until that result commits with a matching outcome. At the cap the watchdog CAS-writes failed(timeout) only if the row remains running. A pre-committed success notice is suppressed when timeout wins, and the occurrence is never retried. When completion won, the watchdog grants a config-derived, finite post-commit allowance (up to 60s including descendant cleanup), then exits with the recorded result. An abandoned executor never disarms the cap. Once a queue receipt exists its status projects onto the execution row; an eligible delivery survives a worker exit after terminal commit and drains once. Only unprojected terminal queue receipts/tombstones are reconciled, in one indexed scan and one execution-ledger connection per drain. The E2E uses a disposable profile, script and fake `ai.hermes-test.*` identity; never touch the live gateway job.
 
+## Operator-selected job deadlines
+
+The `cron-restart-survival` patch also permits a persisted, CLI-only per-job
+`hard_wall_timeout_seconds` override for detached/external workers. Unset or
+cleared jobs retain the profile cap; malformed legacy overrides fall back to it.
+The in-process gateway path remains outside this process-termination guarantee.
+Upstream adoption must preserve both per-job selection and watchdog ownership
+after an inactivity future is abandoned. Additional proof:
+`tests/cron/test_job_wall_timeout.py` and `tests/cron/test_immutable_worker_real.py`.
+Pinned-release fixtures must stage the candidate scheduler with its job and
+deadline dependencies, not mix its facade with older committed implementations.
+
 ## Cross-store state machine
 
 | Boundary | Durable transition | Crash recovery |
