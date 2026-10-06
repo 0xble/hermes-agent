@@ -1,5 +1,5 @@
 import type { AppendMessage } from '@assistant-ui/react'
-import { JsonRpcGatewayError } from '@hermes/shared'
+import { JsonRpcGatewayError, SLASH_COMMAND_RE } from '@hermes/shared'
 
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -730,4 +730,18 @@ export interface SubmitTextOptions {
   /** Stable stored session id for optimistic/cache updates and stale-runtime
    *  recovery. Distinct from the runtime session id minted by the gateway. */
   storedSessionId?: string | null
+}
+
+/**
+ * Route a normal composer submit through the desktop slash-command shortcut.
+ * A deferred `/moa` payload is already the backend-produced prompt and carries
+ * its one-shot identity in `moaToken`; dispatching its visible `/moa !payload`
+ * text again would create a second one-shot instead of submitting the queued
+ * payload.
+ */
+export function shouldUseSlashCommandShortcut(
+  visibleText: string,
+  options: { hasAttachments: boolean; moaToken?: string }
+): boolean {
+  return !options.hasAttachments && !options.moaToken && SLASH_COMMAND_RE.test(visibleText)
 }

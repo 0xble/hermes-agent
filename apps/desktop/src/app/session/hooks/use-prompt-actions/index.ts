@@ -1,6 +1,5 @@
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
 import { JsonRpcGatewayError } from '@hermes/shared'
-import { SLASH_COMMAND_RE } from '@hermes/shared'
 import { stripAnsi } from '@hermes/shared/ansi'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
@@ -83,6 +82,7 @@ import {
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
   shouldInterruptBeforeRewind,
+  shouldUseSlashCommandShortcut,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from './utils'
@@ -627,7 +627,12 @@ export function usePromptActions({
       const visibleText = sanitizeComposerInput(rawText).trim()
       const attachments = options?.attachments ?? $composerAttachments.get()
 
-      if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
+      if (
+        shouldUseSlashCommandShortcut(visibleText, {
+          hasAttachments: attachments.length > 0,
+          moaToken: options?.moaToken
+        })
+      ) {
         triggerHaptic('selection')
         // Forward the explicit target (background queue drain, tile) — dropping
         // it ran the command against whatever chat happened to be in front.

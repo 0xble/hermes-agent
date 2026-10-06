@@ -9,6 +9,7 @@ import {
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isQueueParked,
+  isSteerableEntry,
   migrateQueuedPrompts,
   parkQueuedPrompts,
   promoteQueuedPrompt,
@@ -174,6 +175,25 @@ describe('composer queue store', () => {
     expect(queue[0]?.text).toBe('edited text')
     expect(queue[0]?.attachments).toEqual(editedAttachments)
     expect(queue[0]?.attachments[0]).not.toBe(editedAttachments[0])
+  })
+
+  it('preserves a deferred MoA token through persistence and queue mutations', () => {
+    const token = 'queued-moa-1'
+    const ordinary = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'ordinary' })!
+    const deferred = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: '!inspect', moaToken: token })!
+
+    expect(isSteerableEntry(deferred)).toBe(false)
+    expect(updateQueuedPromptText(SESSION_KEY, deferred.id, '!payload-edited')).toBe(true)
+    expect(promoteQueuedPrompt(SESSION_KEY, deferred.id)).toBe(true)
+    expect(getQueuedPrompts(SESSION_KEY)[0]).toMatchObject({
+      id: deferred.id,
+      moaToken: token,
+      text: '!payload-edited'
+    })
+    expect(JSON.parse(String(window.localStorage.getItem(QUEUE_STORAGE_KEY)))[SESSION_KEY][0].moaToken).toBe(token)
+
+    expect(dequeueQueuedPrompt(SESSION_KEY)).toMatchObject({ id: deferred.id, moaToken: token })
+    expect(dequeueQueuedPrompt(SESSION_KEY)).toMatchObject({ id: ordinary.id })
   })
 
   it('clears queue state for a session', () => {

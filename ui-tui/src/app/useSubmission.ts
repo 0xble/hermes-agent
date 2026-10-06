@@ -180,7 +180,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
   const sendQueued = useCallback(
     (item: QueueItem) => {
-      if (item.text.startsWith('!')) {
+      if (item.text.startsWith('!') && !item.moaToken) {
         return shellExec(item.text.slice(1).trim())
       }
 
@@ -222,6 +222,14 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const fallback = (note: string) => {
         enqueueText()
         sys(note)
+      }
+
+      // Deferred MoA prompts carry a backend-owned one-shot identity. They must
+      // never steer or interrupt the current turn, because doing so can execute
+      // the queued payload against the wrong live request. Keep the identity on
+      // the queue until the current turn settles.
+      if (item.moaToken) {
+        return enqueueText()
       }
 
       if (mode === 'queue') {
@@ -266,6 +274,16 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const submission = prepareSubmission(full, submissionTokens)
       const toHistory = submission.text
 
+      // A deferred MoA item is already a backend-resolved payload. While the
+      // current turn is busy, bypass slash/shell interpretation entirely and
+      // return the item to the queue with its opaque identity intact.
+      if (moaToken && getUiState().busy) {
+        composerActions.pushHistory(toHistory)
+        composerActions.clearIn()
+
+        return handleBusyInput(queueItem(full, full, moaToken))
+      }
+
       if (looksLikeSlashCommand(full)) {
         const slash = prepareSlashSubmission(full, submissionTokens)
 
@@ -291,7 +309,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return
       }
 
-      if (full.startsWith('!')) {
+      if (full.startsWith('!') && !moaToken) {
         composerActions.clearIn()
 
         return shellExec(full.slice(1).trim())
@@ -335,7 +353,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       composerActions.pushHistory(toHistory)
 
       if (getUiState().busy) {
-        return handleBusyInput(queueItem(full))
+        return handleBusyInput(queueItem(full, full, moaToken))
       }
 
       if (shouldInterpolateSubmission(full)) {

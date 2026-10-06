@@ -241,6 +241,25 @@ describe('useComposerQueue park integration', () => {
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
   })
 
+  it('keeps a deferred MoA token queued through force-send and forwards it on drain', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: '!inspect', moaToken: 'queued-moa-1' })!
+    const onSteer = vi.fn(async () => true)
+    const { hook, onCancel, onSubmit } = renderQueueHook({ busy: true, onSteer })
+
+    await act(async () => {
+      expect(await hook.result.current.steerQueuedNow(entry.id)).toBe(false)
+      expect(hook.result.current.sendQueuedNow(entry.id)).toBe(true)
+    })
+
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onCancel).toHaveBeenCalledTimes(1)
+
+    hook.rerender({ busy: false })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0]?.[0]).toBe('!inspect')
+    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({ fromQueue: true, moaToken: 'queued-moa-1' })
+  })
+
   it('a delivered steer lifts the park so the rest of the queue flows', async () => {
     const steerable = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'redirect' })
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'follows after' })

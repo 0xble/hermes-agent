@@ -1,7 +1,14 @@
-import { describe, expect, it } from 'vitest'
+import { PassThrough } from 'node:stream'
 
-import type { ComposerToken } from '../app/interfaces.js'
-import { prepareSubmission, shouldInterpolateSubmission } from '../app/useSubmission.js'
+import { renderSync } from '@hermes/ink'
+import React from 'react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import type { ComposerActions, ComposerRefs, ComposerState, ComposerToken } from '../app/interfaces.js'
+import { patchUiState, resetUiState } from '../app/uiStore.js'
+import { prepareSubmission, shouldInterpolateSubmission, useSubmission } from '../app/useSubmission.js'
+import type { GatewayClient } from '../gatewayClient.js'
+import { queueItem, type QueueItem } from '../hooks/useQueue.js'
 
 describe('prepareSubmission', () => {
   it('keeps the collapsed paste for display and expands the model payload', () => {
@@ -49,5 +56,164 @@ describe('visible interpolation combined with a collapsed paste', () => {
     expect(submission.display).toBe(`Tue for ${label}`)
     expect(submission.display).not.toContain('{!')
     expect(submission.text).toBe('Tue for line one\nline two')
+  })
+})
+
+type SubmissionHarness = ReturnType<typeof useSubmission>
+
+const createSubmissionHarness = (takeQueue: () => QueueItem | undefined = () => undefined) => {
+  let result!: SubmissionHarness
+
+  const request = vi.fn((method: string) => {
+    if (method === 'input.detect_drop') {
+      return Promise.resolve({ matched: false })
+    }
+
+    return Promise.resolve({})
+  })
+
+  const actions = {
+    attachClipboardImage: vi.fn(),
+    attachImagePath: vi.fn(),
+    clearIn: vi.fn(),
+    dequeue: vi.fn(),
+    enqueue: vi.fn(),
+    handleTextPaste: vi.fn(),
+    openEditor: vi.fn(),
+    prependQueue: vi.fn(),
+    pushHistory: vi.fn(),
+    removeQueue: vi.fn(),
+    setCompIdx: vi.fn(),
+    setComposerTokens: vi.fn(),
+    setHistoryIdx: vi.fn(),
+    setInput: vi.fn(),
+    setInputBuf: vi.fn(),
+    setQueueEdit: vi.fn(),
+    takeQueue: vi.fn(takeQueue),
+    syncTokens: vi.fn()
+  } as unknown as ComposerActions
+
+  const refs = {
+    historyDraftRef: { current: '' },
+    historyRef: { current: [] as string[] },
+    queueEditRef: { current: null as null | number },
+    queueRef: { current: [] as QueueItem[] },
+    submitRef: { current: vi.fn() },
+    tokensRef: { current: [] as ComposerToken[] }
+  } as unknown as ComposerRefs
+
+  const state = {
+    compIdx: 0,
+    compReplace: 0,
+    completions: [],
+    historyIdx: null,
+    input: '',
+    inputBuf: [],
+    queueEditIdx: null,
+    queuedDisplay: [],
+    tokens: []
+  } as ComposerState
+
+  const gw = { request } as unknown as GatewayClient
+  const appendMessage = vi.fn()
+  const setLastUserMsg = vi.fn()
+  const sys = vi.fn()
+  const slashRef = { current: vi.fn(() => false) }
+  const submitRef = { current: vi.fn() }
+
+  function Harness() {
+    result = useSubmission({
+      appendMessage,
+      composerActions: actions,
+      composerRefs: refs,
+      composerState: state,
+      gw,
+      setLastUserMsg,
+      slashRef,
+      submitRef,
+      sys
+    })
+
+    return null
+  }
+
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  Object.assign(stdout, { columns: 80, isTTY: false, rows: 20 })
+
+  const instance = renderSync(React.createElement(Harness), {
+    patchConsole: false,
+    stdin: stdin as unknown as NodeJS.ReadStream,
+    stdout: stdout as unknown as NodeJS.WriteStream,
+    stderr: stderr as unknown as NodeJS.WriteStream
+  })
+
+  return { actions, close: () => instance.unmount(), gw: request, refs, result }
+}
+
+describe('deferred MoA submissions while busy', () => {
+  afterEach(resetUiState)
+
+  it('keeps a token-bearing submission queued in steer mode', () => {
+    patchUiState({ busy: true, busyInputMode: 'steer', sid: 'sid-steer' })
+    const harness = createSubmissionHarness()
+
+    harness.result.dispatchSubmission('!inspect', 'token-steer')
+
+    expect(harness.actions.enqueue).toHaveBeenCalledWith('!inspect', '!inspect', 'token-steer')
+    expect(harness.gw).not.toHaveBeenCalledWith('session.steer', expect.anything())
+    harness.close()
+  })
+
+  it('keeps a token-bearing submission queued in interrupt mode', () => {
+    patchUiState({ busy: true, busyInputMode: 'interrupt', sid: 'sid-interrupt' })
+    const harness = createSubmissionHarness()
+
+    harness.result.dispatchSubmission('!inspect', 'token-interrupt')
+
+    expect(harness.actions.enqueue).toHaveBeenCalledWith('!inspect', '!inspect', 'token-interrupt')
+    expect(harness.gw).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
+    harness.close()
+  })
+
+  it('preserves the token when the busy re-queue branch receives a deferred item', () => {
+    patchUiState({ busy: true, busyInputMode: 'queue', sid: 'sid-queue' })
+    const harness = createSubmissionHarness()
+
+    harness.result.dispatchSubmission('!inspect', 'token-queue')
+
+    expect(harness.actions.enqueue).toHaveBeenCalledWith('!inspect', '!inspect', 'token-queue')
+    harness.close()
+  })
+
+  it('keeps a token-bearing queue edit at the front while busy', () => {
+    patchUiState({ busy: true, busyInputMode: 'interrupt', sid: 'sid-edit' })
+    const item = queueItem('original payload', '/moa original payload', 'token-edit')
+    const harness = createSubmissionHarness(() => item)
+    harness.refs.queueEditRef.current = 0
+
+    harness.result.dispatchSubmission('edited payload')
+
+    expect(harness.actions.prependQueue).toHaveBeenCalledWith(item)
+    expect(harness.gw).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
+    harness.close()
+  })
+
+  it('does not route a token-bearing ! payload through the shell shortcut', async () => {
+    patchUiState({ sid: 'sid-shell' })
+    const harness = createSubmissionHarness()
+
+    harness.result.sendQueued(queueItem('!inspect', '/moa !inspect', 'token-shell'))
+
+    await vi.waitFor(() =>
+      expect(harness.gw).toHaveBeenCalledWith('prompt.submit', {
+        moa_token: 'token-shell',
+        session_id: 'sid-shell',
+        text: '!inspect'
+      })
+    )
+    expect(harness.gw).not.toHaveBeenCalledWith('shell.exec', expect.anything())
+    harness.close()
   })
 })
