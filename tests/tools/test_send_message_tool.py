@@ -773,7 +773,12 @@ class TestSendTelegramHtmlDetection:
 
         assert result["success"] is True
         assert bot.send_message.await_count == 2
-        sleep_mock.assert_awaited_once()
+        # The 502 backs off once; the retry then also waits for the chat's outbound budget slot,
+        # because a retry spends the same per-chat allowance as the first attempt.
+        from plugins.platforms.telegram.chat_budget import PRIVATE_GAP_SECS
+        waits = [c.args[0] for c in sleep_mock.await_args_list]
+        assert waits[0] == 1.0
+        assert len(waits) <= 2 and all(0 < w <= PRIVATE_GAP_SECS for w in waits[1:])
 
 
 class TestSendTelegramThreadIdMapping:

@@ -109,6 +109,7 @@ def test_fast_auto_and_cold_parse_and_slash_command(monkeypatch):
         assert GatewayRunner._load_service_tier() == expected
     assert DEFAULT_CONFIG["agent"]["service_tier"] == ""
     assert DEFAULT_CONFIG["agent"]["fast_auto_seconds"] == 60
+    assert DEFAULT_CONFIG["agent"]["fast_expiry_seconds"] == 0
 
     # /fast auto — session-scoped, agent rebuilt, status reports the mode
     fast_cmd = next(c for c in COMMAND_REGISTRY if c.name == "fast")
@@ -230,3 +231,33 @@ def test_recovery_retries_a_proxied_credit_refusal_at_standard_speed():
     )
     assert retry is True
     assert agent._fast_mode_unavailable_models == {"claude-opus-5-5"}
+
+
+def test_expired_gateway_fast_overlay_is_filtered_without_mutation(monkeypatch):
+    agent = _agent(
+        service_tier="priority",
+        request_overrides={
+            "extra_body": {"fallback_route": "keep"},
+            "service_tier": "priority",
+            "speed": "fast",
+            "non_fast": {"same": "value"},
+        },
+    )
+    agent._gateway_fast_expiry_at = 100.0
+    agent._gateway_session_fast_overlay = {"service_tier": "priority", "speed": "fast"}
+    monkeypatch.setattr(fast_mode.time, "time", lambda: 100.0)
+    before = dict(agent.request_overrides)
+
+    assert fast_mode.effective_request_overrides(agent) == {
+        "extra_body": {"fallback_route": "keep"}, "non_fast": {"same": "value"},
+    }
+    assert agent.request_overrides == before
+
+
+def test_expired_gateway_fast_overlay_does_not_remove_nonmatching_values(monkeypatch):
+    agent = _agent(request_overrides={"service_tier": "provider-default", "keep": True})
+    agent._gateway_fast_expiry_at = 100.0
+    agent._gateway_session_fast_overlay = {"service_tier": "priority", "speed": "fast"}
+    monkeypatch.setattr(fast_mode.time, "time", lambda: 100.0)
+
+    assert fast_mode.effective_request_overrides(agent) == agent.request_overrides

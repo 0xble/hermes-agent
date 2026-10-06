@@ -596,7 +596,7 @@ once (default 4, `0` = unlimited), so a fleet of profiles with many stdio server
 no longer spawns every helper process in the same instant. Trust policy stays per
 profile: a `trust: untrusted` profile sharing a `trust: full` profile's
 connection is still asked before every write-capable call, and
-`supports_parallel_tool_calls` applies only to the profile that set it. Terminal settings
+`supports_parallel_tool_calls` and `caller_identity` apply only to the profile that set them. Terminal settings
 (`terminal.backend`, `terminal.cwd`, `terminal.docker_volumes`,
 `terminal.docker_shared_container_key`, SSH targets, …) are likewise resolved
 per profile on every routed turn: a profile that omits a terminal key gets the
