@@ -152,7 +152,7 @@ from agent.i18n import get_language, t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
-    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, in_ingress_consumer,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -420,6 +420,23 @@ def check_telegram_requirements() -> bool:
 
 # Every char MarkdownV2 requires backslash-escaped outside code spans/fences.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
+# A one-line CommonMark code span delimited by two or more backticks, and the real (line-start) fenced
+# blocks such a span must never be matched inside.
+_MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
+_LINE_START_FENCE_RE = re.compile(r'^ {0,3}(?P<f>`{3,})[^`\n]*\n[\s\S]*?(?:^ {0,3}(?P=f)`*[ \t]*$|\Z)', re.MULTILINE)
+_BACKTICK_RUN_RE = re.compile(r'`+')
+
+
+def _progress_code_span(text: str) -> str:
+    """``text`` as one CommonMark inline code span: a backtick run longer than any inside it, padded
+    with a space when it starts or ends with a backtick (or with a space on both sides, which
+    CommonMark would otherwise strip). Newlines fold to spaces, as a code span renders them anyway."""
+    text = " ".join(str(text).split("\n"))
+    if not text.strip():
+        return text
+    fence = "`" * (max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0) + 1)
+    pad = " " if text[0] == "`" or text[-1] == "`" or (text[0] == " " and text[-1] == " ") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _escape_mdv2(text: str) -> str:
@@ -455,7 +472,9 @@ from gateway.platforms.helpers import cancel_task
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
 _RICH_PROTECTED_REGION_RE = re.compile(
-    r'(?:```[^\n]*\n[\s\S]*?```)'                       # fenced code block
+    # A fence opens only at line start (after indentation or list/quote markers) and, per CommonMark, its
+    # info string has no backtick: an inline ```code `` span``` followed later by a fence is not a block.
+    r'(?:^[ \t>*+\-\d.)]*```[^`\n]*\n[\s\S]*?```)'      # fenced code block
     r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
     r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
     r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows (newline-led, trailing \n left for prose)
@@ -799,6 +818,10 @@ _POLLING_STALL_TIMEOUT = 150.0
 # that PTB's dispatcher ever handed the fetched updates to a handler. Two heartbeats (180s) with a
 # backlog and no dispatch progress: diagnostic only, never drives recovery (#71240 owns that).
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 2
+# A reconnect can start while the failed generation's in-process poller is still stopping (its stop
+# waits for the outstanding long poll, up to the poll timeout plus one second). Waiting for that
+# release costs seconds; refusing costs the reconnect ladder's 30s backoff.
+_POLLER_RELEASE_WAIT_SECONDS = 25.0
 # sendVideo transcodes before answering, outlasting the 20s read timeout; also how long a user waits
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
@@ -2008,7 +2031,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._is_rich_capability_error(exc):
             self._rich_send_disabled = True
-        logger.debug("[%s] %s rejected (%s) — falling back to %s", self.name, what, _redact_telegram_error_text(exc), fallback)
+        logger.warning(
+            "[%s] %s rejected (%s) — falling back to %s",
+            self.name, what, _redact_telegram_error_text(exc), fallback)
         return True
 
     async def _try_edit_rich(
@@ -2156,6 +2181,14 @@ class TelegramAdapter(BasePlatformAdapter):
             verifier.cancel()
         self._polling_progress_verifier_task = None
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
+        # Capability failures are generation-scoped: reconnect may restore a previously unavailable
+        # rich endpoint, while the latch still prevents a retry storm within this generation.
+        if getattr(self, "_rich_send_disabled", False) or getattr(self, "_rich_draft_disabled", False):
+            logger.info(
+                "[%s] Resetting rich-message capability latches for polling generation %d",
+                self.name, self._polling_generation,
+            )
+        self._rich_send_disabled = self._rich_draft_disabled = False
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
         self._send_path_degraded = True
@@ -2167,6 +2200,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # update_queue, so old dispatches can briefly exceed received; the check treats that as no backlog.
         self._updates_received_total = self._updates_dispatched_total = 0
         self._ingress_dispatched_seen = self._ingress_stalled_heartbeats = 0
+        self._polling_pending_dispatched_seen = None
         return self._polling_generation, self._polling_progress_event
 
     def _record_polling_progress(self, generation: int) -> bool:
@@ -2927,8 +2961,21 @@ class TelegramAdapter(BasePlatformAdapter):
         except (asyncio.TimeoutError, OSError):
             return  # connectivity symptom for the get_me() path, not a stuck-queue signal
         pending = int(getattr(info, "pending_update_count", 0) or 0)
+        dispatched = getattr(self, "_updates_dispatched_total", 0)
+        seen = getattr(self, "_polling_pending_dispatched_seen", None)
+        progressed = seen is not None and dispatched != seen
+        self._polling_pending_dispatched_seen = dispatched
         if pending <= 0:
             self._polling_pending_stuck_count = 0
+            return
+        if progressed:
+            # Telegram counts the batch being handled as pending until the next getUpdates confirms its
+            # offset, and the controlled poller does not poll again until that batch drains. So a probe
+            # landing while any handler runs sees a backlog. Only a backlog with no update dispatched
+            # since the previous probe is a stuck consumer: start a new window at this probe.
+            self._polling_pending_stuck_count = 1
+            logger.debug("[%s] Telegram polling heartbeat: %d update(s) pending while dispatch progresses",
+                         self.name, pending)
             return
         self._polling_pending_stuck_count += 1
         logger.warning(
@@ -3948,7 +3995,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             from gateway.config import load_gateway_config
             from gateway.generation import GenerationCoordinator, overlap_handover_enabled
-            from plugins.platforms.telegram.polling_transfer import PollingJournal, token_has_active_poller
+            from plugins.platforms.telegram.polling_transfer import PollingJournal, wait_for_poller_release
             from hermes_constants import get_routing_process_hermes_home
             overlap_enabled = overlap_handover_enabled(load_gateway_config())
             webhook_url = (_get_scoped_secret("TELEGRAM_WEBHOOK_URL") or "").strip()
@@ -3960,7 +4007,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 PollingJournal, GenerationCoordinator(get_routing_process_hermes_home()), self.config.token)
                 if overlap_enabled and not webhook_url else None)
             if (not polling_standby and self._controlled_journal is not None
-                    and token_has_active_poller(self._controlled_journal.token_hash)):
+                    and not await wait_for_poller_release(self._controlled_journal.token_hash,
+                                                          _POLLER_RELEASE_WAIT_SECONDS)):
                 raise RuntimeError("old Telegram poller still owns this token")
             if not polling_standby and not await self._acquire_polling_token_lock():
                 return False
@@ -6636,7 +6684,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("[%s] Telegram flood deadline has no durable copy for chat %s", self.name, key, exc_info=True)
         platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
         platform[key] = max(platform.get(key, 0.0), until[key])
-        return _flood_cap_result(max(wait, until[key] - now))
+        remaining = max(wait, until[key] - now)
+        # Keep the typed contract stable when the deadline was created from this same wait: subtracting
+        # two monotonic timestamps can otherwise turn an exact 30.0-second refusal into 30.0000000000057.
+        if math.isclose(remaining, wait, rel_tol=0.0, abs_tol=1e-6):
+            remaining = wait
+        return _flood_cap_result(remaining)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
         """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
@@ -6795,6 +6848,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 e), exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
 
+    def format_progress_literal(self, text: str) -> str:
+        """Tool names and previews in progress lines are code spans, so neither the rich Markdown
+        parser nor ``format_message`` reads ``mcp__a__b``, ``**/*.md``, ``README.md`` or ``\\s+``
+        as markup or a link."""
+        return _progress_code_span(text)
+
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2: code is stashed behind placeholders first (never
         modified), markdown constructs become MarkdownV2 syntax, everything else is escaped."""
@@ -6815,6 +6874,21 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # 0) GFM pipe tables → Telegram-friendly row groups, before the MarkdownV2 conversions.
         text = _wrap_markdown_tables(content)
+        # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
+        # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
+        # fenced pass, which would otherwise read a one-line ```a `` b``` span as a fence; spans inside a real
+        # line-start fence stay that fence's content.
+        fences = [m.span() for m in _LINE_START_FENCE_RE.finditer(text)]
+
+        def _protect_multi_tick(m):
+            if any(start <= m.start() < end for start, end in fences):
+                return m.group(0)
+            body = m.group('body')
+            if body.startswith(' ') and body.endswith(' ') and body.strip():
+                body = body[1:-1]  # CommonMark strips one padding space from each side
+            return _ph('`' + body.replace('\\', '\\\\').replace('`', '\\`') + '`')
+
+        text = _MULTI_TICK_CODE_SPAN_RE.sub(_protect_multi_tick, text)
         # 1) Protect fenced code blocks; per MarkdownV2 spec \\ and ` inside pre/code must be escaped.
         def _protect_fenced(m):
             raw = m.group(0)
@@ -6881,9 +6955,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.
         for key in reversed(list(placeholders.keys())):
             text = text.replace(key, placeholders[key])
-        # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans.
+        # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans. A span's
+        # own escaped \` does not close it, and an escaped \` in prose does not open one.
         _safe_parts = []
-        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|`[^`]+`)', text)):
+        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|(?:(?<!\\)|(?<=\\\\))`(?:[^`\\]|\\[\s\S])+`)', text)):
             if _idx % 2 == 1:
                 _safe_parts.append(_seg)  # inside code — untouched
             else:
@@ -7507,11 +7582,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 kind=t(_MEDIA_KIND_KEYS[kind]) if kind in _MEDIA_KIND_KEYS else kind,
                 name=named, error=exc.__class__.__name__))
             if notice:
-                try:
-                    self._accept_update()
-                    await msg.reply_text(notice)
-                except Exception as reply_err:
-                    logger.warning("[Telegram] Failed to notify user about %s cache failure: %s", kind, reply_err, exc_info=True)
+                self._accept_update()
+
+                async def notify() -> None:
+                    try:
+                        await msg.reply_text(notice)
+                    except Exception as reply_err:
+                        logger.warning("[Telegram] Failed to notify user about %s cache failure: %s", kind, reply_err,
+                                       exc_info=True)
+
+                if in_ingress_consumer():
+                    self.spawn_ingress_reply(notify(), label="media retry notice")
+                else:
+                    await notify()
             # The agent-visible note is execution evidence, not a channel diagnostic; it stays in both modes.
             event.text = self._append_observed_note(
                 event.text,

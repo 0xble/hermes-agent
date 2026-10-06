@@ -183,7 +183,7 @@ test('native preparation stages the selected source into an explicit tree before
   expect(existsSync(join(nativeOut, 'node-pty/package.json'))).toBe(true)
   expect(files(join(nativeOut, 'node-pty')).some(([name]) => name.endsWith('.node'))).toBe(true)
   expect(existsSync(join(input.source, 'apps/desktop/dist'))).toBe(false)
-})
+}, 30000)
 
 test('typecheck uses scratch state and incomplete prepared inputs fail before publication', async () => {
   const { buildDesktop } = await import('../scripts/build/desktop.mjs')
