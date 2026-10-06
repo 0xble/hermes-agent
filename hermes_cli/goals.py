@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TURNS = 20
 
+# Stable opening used by every standing-goal continuation prompt. Consumers that need to
+# distinguish synthetic turns (for example durable-memory filters) should match this exact
+# generated boundary rather than the loose ``[Continuing toward`` text.
+GOAL_CONTINUATION_PREFIX = "[Continuing toward your standing goal]\nGoal:"
+GOAL_GATE_FAILED_PREFIX = "[Continuing toward your standing goal — a quality gate failed]\nGoal:"
+
 
 def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> int:
     """Normalize a goal budget; zero is the explicit unlimited sentinel."""
@@ -124,8 +130,7 @@ _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
-    "[Continuing toward your standing goal]\n"
-    "Goal: {goal}\n\n"
+    f"{GOAL_CONTINUATION_PREFIX} {{goal}}\n\n"
     "Continue working toward this goal. Take the next concrete step. "
     "If you believe the goal is complete, state so explicitly, cite the proof "
     "(exact identifiers or output lines from tool results, in backticks), and stop. "
@@ -146,8 +151,7 @@ CONTINUATION_REVISIONS_TEMPLATE = (
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
 # not to break, scope, and when to stop — so it targets the verification surface.
 CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
-    "[Continuing toward your standing goal]\n"
-    "Goal: {goal}\n\n"
+    f"{GOAL_CONTINUATION_PREFIX} {{goal}}\n\n"
     "Completion contract:\n"
     "{contract_block}\n\n"
     "Continue working toward the outcome above. Take the next concrete step. "
@@ -165,8 +169,7 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
 
 # With /subgoal criteria: surfaced verbatim to the agent and to the judge.
 CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
-    "[Continuing toward your standing goal]\n"
-    "Goal: {goal}\n\n"
+    f"{GOAL_CONTINUATION_PREFIX} {{goal}}\n\n"
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
     "Continue working toward the goal AND all additional criteria. Take "
@@ -178,8 +181,7 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
 
 # Fed back when a quality gate fails: bounded output is the evidence to repair against (no judge).
 CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
-    "[Continuing toward your standing goal — a quality gate failed]\n"
-    "Goal: {goal}\n\n"
+    f"{GOAL_GATE_FAILED_PREFIX} {{goal}}\n\n"
     "The quality gate command below must pass before this goal can be "
     "declared done, and it just failed (attempt {attempt}/{max_retries}):\n"
     "  $ {command}\n"
@@ -2546,9 +2548,9 @@ class GoalManager:
 
 # Fed to a kanban goal-mode worker that hasn't completed/blocked its task yet: short, and points it
 # back at the lifecycle contract (it already has the full task body).
+KANBAN_GOAL_CONTINUATION_PREFIX = "[Continuing toward this kanban task — judge says it is not done yet]\nReason:"
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
-    "[Continuing toward this kanban task — judge says it is not done yet]\n"
-    "Reason: {reason}\n\n"
+    f"{KANBAN_GOAL_CONTINUATION_PREFIX} {{reason}}\n\n"
     "Take the next concrete step toward completing the task. When the work "
     "is genuinely finished, call kanban_complete with a summary. If it is a "
     "code change that needs same-card review before counting as done, call "
