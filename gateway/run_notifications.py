@@ -125,6 +125,11 @@ _DURABLE_CLAIM_OPS = {
     "defer": ("defer_completion_delivery", "Could not defer unadmitted completion claim"),
     "complete": ("complete_completion_delivery", "Could not acknowledge durable completion claim"),
 }
+# Completion readiness is deliberately not a bool: an unresolvable route is terminal,
+# while a disconnected adapter or transient store miss must remain retryable.
+_COMPLETION_READY = "ready"
+_COMPLETION_RETRY = "retry"
+_COMPLETION_DROP = "drop"
 
 
 INTERNAL_NOTIFICATION_FOOTER = (
@@ -1419,11 +1424,18 @@ class GatewayNotificationsMixin:
             # origins first, then leave this recognized route to the API dispatcher.
             if _raw_process_event_session_id(evt):
                 return None
-            logger.warning(
-                "Synthetic event source unresolvable: "
-                "session_key=%r platform=%r chat_type=%r chat_id=%r evt_type=%s",
-                session_key, platform_name, chat_type, chat_id, evt.get("type", "?"),
-            )
+            if evt.get("type") == "async_delegation":
+                logger.debug(
+                    "Synthetic event source unresolvable: "
+                    "session_key=%r platform=%r chat_type=%r chat_id=%r evt_type=%s",
+                    session_key, platform_name, chat_type, chat_id, evt.get("type", "?"),
+                )
+            else:
+                logger.warning(
+                    "Synthetic event source unresolvable: "
+                    "session_key=%r platform=%r chat_type=%r chat_id=%r evt_type=%s",
+                    session_key, platform_name, chat_type, chat_id, evt.get("type", "?"),
+                )
             return None
         try:
             platform = Platform(platform_name)
@@ -1436,7 +1448,10 @@ class GatewayNotificationsMixin:
                 except Exception:
                     raise ValueError(platform_name)
         except Exception:
-            logger.warning("Synthetic process event has invalid platform metadata: %r", platform_name)
+            if evt.get("type") == "async_delegation":
+                logger.debug("Synthetic process event has invalid platform metadata: %r", platform_name)
+            else:
+                logger.warning("Synthetic process event has invalid platform metadata: %r", platform_name)
             return None
 
         def _opt(field: str) -> Optional[str]:
@@ -1774,16 +1789,24 @@ class GatewayNotificationsMixin:
         except Exception:
             logger.log(logging.WARNING if kind == "complete" else logging.DEBUG, fail_msg, exc_info=True)
 
-    async def _completion_delivery_ready(self, evt: dict) -> bool:
-        """Unavailable owners/transports must not spend a durable delivery attempt."""
+    async def _completion_delivery_ready(self, evt: dict) -> str:
+        """Classify delivery before spending a durable attempt.
+
+        ``ready`` may be admitted, ``retry`` keeps a transient failure queued, and
+        ``drop`` is reserved for async completions with neither a messaging source
+        nor a raw API session id.
+        """
         from gateway.wake import adapter_supports_push
 
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
             verdict = await self._classify_completion_target(parent_session_id)
-            if verdict != "deliver":
-                # Definitively closed targets still need the normal terminal disposition.
-                return verdict == "terminal"
+            if verdict == "retry":
+                return _COMPLETION_RETRY
+            # Definitively closed targets still need the normal terminal disposition.
+            # Let preflight claim and mark the durable row dropped.
+            if verdict == "terminal":
+                return _COMPLETION_READY
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if source is not None:
             platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -1794,18 +1817,32 @@ class GatewayNotificationsMixin:
             adapters = self._adapters_for_profile(profile)
             adapter = adapters.get(Platform.API_SERVER) if raw_sid else None
             if adapter is not None and adapter_supports_push(adapter):
-                return False
+                return _COMPLETION_RETRY
+            if not raw_sid and evt.get("type") in {"async_delegation", "delegation_auto_resume"}:
+                return _COMPLETION_DROP
         if adapter is None:
-            return False
+            return _COMPLETION_RETRY
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
             try:
                 if not callable(ensure) or await asyncio.to_thread(ensure) is None:
-                    return False
+                    return _COMPLETION_RETRY
             except Exception:
                 logger.debug("Async-completion delivery DB unavailable", exc_info=True)
-                return False
-        return True
+                return _COMPLETION_RETRY
+        return _COMPLETION_READY
+
+    def _unresolvable_async_drop_logged(self, evt: dict) -> bool:
+        """Deduplicate the terminal warning for one async delegation event."""
+        delegation_id = str(evt.get("delegation_id") or "")
+        key = delegation_id or f"event:{id(evt)}"
+        logged = getattr(self, "_unresolvable_async_drops_logged", None)
+        if logged is None:
+            logged = self._unresolvable_async_drops_logged = set()
+        if key in logged:
+            return True
+        logged.add(key)
+        return False
 
     async def _preflight_completion_delivery(self, evt: dict) -> "_CompletionClaim":
         """Claim the durable row (async delegations) and verify the target before adapter acceptance.
@@ -1816,9 +1853,12 @@ class GatewayNotificationsMixin:
         """
         claim = self._CompletionClaim()
         evt_type = evt.get("type")
-        if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
-            claim.proceed, claim.early_result = False, False
-            return claim
+        readiness = _COMPLETION_READY
+        if evt_type == "async_delegation":
+            readiness = await self._completion_delivery_ready(evt)
+            if readiness == _COMPLETION_RETRY:
+                claim.proceed, claim.early_result = False, False
+                return claim
         # An interim per-task notice shares the batch's delegation_id but is not the durable
         # completion; claiming that row here would acknowledge the FINAL result before it exists.
         if evt_type == "async_delegation" and not evt.get("task_failure_notice"):
@@ -1834,6 +1874,26 @@ class GatewayNotificationsMixin:
                     logger.warning("Could not claim durable async completion %s: %s", claim.delegation_id, exc)
                     claim.proceed, claim.early_result = False, False
                     return claim
+            if readiness == _COMPLETION_DROP:
+                if not self._unresolvable_async_drop_logged(evt):
+                    logger.warning(
+                        "Dropping async delegation %s: no resolvable messaging source and no raw API session",
+                        claim.delegation_id or "<missing>",
+                    )
+                if claim.claim_id:
+                    self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id)
+                    claim.claim_id = ""
+                claim.proceed, claim.early_result = False, None
+                return claim
+        elif evt_type == "async_delegation":
+            if readiness == _COMPLETION_DROP:
+                if not self._unresolvable_async_drop_logged(evt):
+                    logger.warning(
+                        "Dropping async delegation %s: no resolvable messaging source and no raw API session",
+                        str(evt.get("delegation_id") or "<missing>"),
+                    )
+                claim.proceed, claim.early_result = False, None
+                return claim
         elif evt_type != "completion":
             return claim
         # Background completions carry only session_key, so after /new the OLD session's notification
@@ -2138,7 +2198,15 @@ class GatewayNotificationsMixin:
             identity = self._completion_delivery_identity(evt)
             if identity is not None and self._completion_identity_seen(identity):
                 continue
+            readiness = await self._completion_delivery_ready(evt)
+            if readiness == _COMPLETION_DROP:
+                # Route the event through the normal claim/settlement seam so its
+                # durable row becomes terminally dropped and the warning is emitted once.
+                await self._deliver_completion_notification(synth_text, evt)
+                continue
             deliverable.append((evt, synth_text))
+        # Do not let a dropped sibling be requeued with a transiently unavailable one.
+        group[:] = [evt for evt, _text in deliverable]
         if not deliverable:
             return None
         if len(deliverable) == 1:
@@ -2147,7 +2215,7 @@ class GatewayNotificationsMixin:
         # Check the entire group before claiming ANY row: an unavailable sibling must
         # not exhaust its budget just because the primary has a usable route.
         for evt, _text in deliverable:
-            if not await self._completion_delivery_ready(evt):
+            if await self._completion_delivery_ready(evt) not in (_COMPLETION_READY, True):
                 return False
         from tools.async_delegation import claim_event_delivery
         primary_evt, primary_text = deliverable[0]
@@ -2250,7 +2318,14 @@ class GatewayNotificationsMixin:
                 platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
                 if self._resolve_injection_adapter(platform, source) is None:
                     return False
-            if not await self._completion_delivery_ready(evt):
+            readiness = await self._completion_delivery_ready(evt)
+            if readiness == _COMPLETION_DROP:
+                logger.warning(
+                    "Dropping auto-resume notice %s: no resolvable messaging source and no raw API session",
+                    str(evt.get("delegation_id") or "<missing>"),
+                )
+                return await _suppress_claimed_notice()
+            if readiness is False or readiness == _COMPLETION_RETRY:
                 return False
             if source is not None:
                 try:

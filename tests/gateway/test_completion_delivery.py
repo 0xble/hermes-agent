@@ -121,23 +121,76 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
-def test_unroutable_async_event_remains_retryable(
-    monkeypatch, isolated_registry,
+def test_unresolvable_async_event_is_consumed_once_and_dropped(
+    monkeypatch, isolated_registry, caplog,
 ):
     isolated = queue.Queue()
     monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
-    event = _async_event("deleg_desktop_or_cli")
-    event["session_key"] = "20260711_unparseable_ui_session"
+    event = _async_event("deleg_unresolvable")
+    event["session_key"] = ""
+    _persist_pending_completion(event)
     isolated.put(event)
 
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     _stop_after_sleeps(monkeypatch, runner, count=2)
 
-    asyncio.run(runner._async_delegation_watcher(interval=0))
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    from tools import async_delegation
 
     adapter.handle_message.assert_not_awaited()
+    assert isolated.empty()
+    assert async_delegation.get_durable_delegation("deleg_unresolvable")["delivery_state"] == "dropped"
+    warnings = [record.message for record in caplog.records if "Dropping async delegation deleg_unresolvable" in record.message]
+    assert len(warnings) == 1
+
+
+def test_resolvable_async_event_without_adapter_remains_retryable(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_transient_route")
+    _persist_pending_completion(event)
+    isolated.put(event)
+
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner.adapters = {}
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    from tools import async_delegation
+
     assert not isolated.empty()
+    row = async_delegation.get_durable_delegation("deleg_transient_route")
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+
+
+def test_raw_api_session_async_event_routes_to_api_dispatcher(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_raw_api")
+    event["session_key"] = "raw-api-session-42"
+    event.pop("origin_profile", None)
+    isolated.put(event)
+
+    api_adapter = SimpleNamespace(handle_message=AdmittingHandler(), _ensure_session_db=lambda: object())
+    runner = _runner(api_adapter)
+    runner.adapters = {Platform.API_SERVER: api_adapter}
+    runner._self_post_api_server = AsyncMock(return_value=True)
+    monkeypatch.setattr("gateway.wake.adapter_supports_push", lambda _adapter: False)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    runner._self_post_api_server.assert_awaited_once()
+    assert runner._self_post_api_server.await_args.args[2] == "raw-api-session-42"
+    assert isolated.empty()
 
 
 def test_concurrent_claims_share_the_same_narrow_delivery_seam():
