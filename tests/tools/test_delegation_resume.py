@@ -75,6 +75,38 @@ def _mark(delegation_id, state, result=None):
         )
 
 
+def test_pruning_preserves_delivered_interrupted_delegation_for_resume(monkeypatch):
+    """A delivered completion must not evict a still-eligible recovery row."""
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    resumable = _dispatch_row("deleg_prune_resumable")
+    _mark(resumable, "interrupted")
+    filler_ids = []
+    for index in range(2):
+        did = _dispatch_row(f"deleg_prune_filler_{index}")
+        _mark(did, "completed")
+        filler_ids.append(did)
+
+    old = time.time() - 60.0
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='delivered', updated_at=? WHERE delegation_id=?",
+            (old, resumable),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='superseded', updated_at=? "
+            "WHERE delegation_id IN (?, ?)",
+            (time.time(), *filler_ids),
+        )
+
+    # Dispatch is the production pruning trigger. The old cap ordering deletes
+    # the delivered interrupted row before the unsuccessful terminal fillers.
+    _dispatch_row("deleg_prune_new_dispatch")
+
+    record, reason = dr.claim_resume(resumable)
+    assert reason is None
+    assert record["state"] == "interrupted"
+
+
 # ---------------------------------------------------------------------------
 # Eligibility
 # ---------------------------------------------------------------------------

@@ -2223,7 +2223,7 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             from tools.delegation_resume import (
                 claim_auto_resume_trigger, complete_auto_resume_trigger,
-                release_auto_resume_trigger,
+                inspect_resumable, release_auto_resume_trigger,
             )
 
             async def _suppress_claimed_notice() -> bool:
@@ -2266,6 +2266,13 @@ class GatewayNotificationsMixin:
                 # already owning/finishing the boot notice.
                 return True
             claim_id = str(record.get("auto_resume_claim") or "")
+            # The row may have been pruned or explicitly resumed after the boot
+            # candidate was queued/claimed. Re-check immediately before injection;
+            # a stale notice must be consumed without reaching the parent turn.
+            _, eligibility_reason = inspect_resumable(str(evt.get("delegation_id") or ""))
+            if eligibility_reason is not None:
+                release_auto_resume_trigger(str(evt.get("delegation_id") or ""), claim_id)
+                return True
             accepted = False
             try:
                 injected = await self._inject_watch_notification(

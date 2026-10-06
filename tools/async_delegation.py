@@ -180,7 +180,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound terminal history without deleting rows still eligible for recovery."""
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -191,17 +191,29 @@ def _prune_durable_records() -> None:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
+                       AND NOT (
+                           state IN ('unknown','interrupted','stalled')
+                           AND resume_state='none'
+                           AND parent_session_id IS NOT NULL AND parent_session_id != ''
+                           AND updated_at >= ?
+                       )
+                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 1 ELSE 0 END,
                               updated_at ASC LIMIT ?
-                   )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
+                   )""", (cutoff, terminal_count - _MAX_RETAINED_COMPLETED))
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                       AND NOT (
+                           state IN ('unknown','interrupted','stalled')
+                           AND resume_state='none'
+                           AND parent_session_id IS NOT NULL AND parent_session_id != ''
+                           AND updated_at >= ?
+                       )
                      ORDER BY updated_at ASC LIMIT ?
-                   )""", (pending_count - _MAX_DURABLE_PENDING,))
+                   )""", (cutoff, pending_count - _MAX_DURABLE_PENDING))
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any], delivery_state: str = "pending") -> None:
