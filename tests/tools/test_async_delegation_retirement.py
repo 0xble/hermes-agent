@@ -57,30 +57,60 @@ def test_queued_admission_requeues_when_retirement_fence_closes(monkeypatch):
     release.set()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if any(r["delegation_id"] == queued["delegation_id"] and r["status"] == "queued"
-               for r in async_delegation.list_async_delegations()):
+        record = next((r for r in async_delegation.list_async_delegations()
+                       if r["delegation_id"] == queued["delegation_id"]), None)
+        if record is not None and record["status"] in {"failed", "error"}:
             break
-        time.sleep(0.02)
-    assert any(r["delegation_id"] == queued["delegation_id"] and r["status"] == "queued"
-               for r in async_delegation.list_async_delegations())
-    deadline = time.monotonic() + 5
-    while fence.active and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert fence.active == 0
-    fence.reject = False
-    # The existing stale monitor retries pending admission after the transient
-    # retirement fence reopens. No later completion is required to retrigger it.
-    deadline = time.monotonic() + 5
-    while not queued_started.is_set() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    assert queued_started.is_set(), "queued runner was never admitted and started"
-    deadline = time.monotonic() + 5
-    while async_delegation.active_count() and time.monotonic() < deadline:
         time.sleep(0.02)
     record = next(r for r in async_delegation.list_async_delegations()
                   if r["delegation_id"] == queued["delegation_id"])
-    assert record["status"] in {"completed", "success", "error"}
+    assert record["status"] in {"failed", "error"}
+    assert not queued_started.is_set()
+    assert fence.active == 0
     assert async_delegation.active_count() == 0
+    async_delegation._reset_for_tests()
+
+
+
+
+def test_retirement_fence_failure_terminally_settles_unsubmitted_siblings(monkeypatch):
+    """A closed retirement fence settles every unsubmitted sibling, not just the first."""
+    from tools import async_delegation
+
+    release = threading.Event()
+    first = async_delegation.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    counts = [0, 0]
+    slot_key = "retiring-sibling-group"
+    handles = [
+        async_delegation.dispatch_async_delegation_batch(
+            goals=[f"sibling-{i}"], context=None, toolsets=None, role="leaf", model="m", session_key="",
+            slot_key=slot_key,
+            runner=lambda i=i: (counts.__setitem__(i, counts[i] + 1),
+                                {"results": [{"task_index": 0, "status": "completed"}]})[1],
+            max_async_children=1, max_queued_delegations=1,
+        )
+        for i in range(2)
+    ]
+    assert first["status"] == "dispatched"
+    assert [handle["status"] for handle in handles] == ["queued", "queued"]
+
+    monkeypatch.setattr(async_delegation, "_submit_record", lambda *_args: async_delegation._BACKEND_RETIRING)
+    release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with async_delegation._records_lock:
+            statuses = [async_delegation._records[h["delegation_id"]]["status"] for h in handles]
+            if all(status in async_delegation._TERMINAL_STATES for status in statuses):
+                break
+        time.sleep(0.01)
+    with async_delegation._records_lock:
+        assert all(async_delegation._records[h["delegation_id"]]["status"] == "failed" for h in handles)
+        assert all(not async_delegation._records[h["delegation_id"]].get("_future") for h in handles)
+        assert slot_key not in async_delegation._active_slots_locked()
+    assert counts == [0, 0]
     async_delegation._reset_for_tests()
 
 

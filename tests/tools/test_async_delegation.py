@@ -666,6 +666,168 @@ def test_queued_sibling_admission_rolls_back_as_one_transaction(monkeypatch):
         assert all(ad._records[h["delegation_id"]]["status"] in ad._TERMINAL_STATES for h in handles)
 
 
+def test_submission_failure_rolls_back_entire_sibling_group_and_retries(monkeypatch):
+    """A first-submit failure restores every sibling, then FIFO admission runs each once."""
+    release = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    counts = [0, 0]
+    slot_key = "submit-failure-group"
+    handles = [
+        ad.dispatch_async_delegation_batch(
+            goals=[f"sibling-{i}"], context=None, toolsets=None, role="leaf", model="m", session_key="",
+            slot_key=slot_key,
+            runner=lambda i=i: (counts.__setitem__(i, counts[i] + 1),
+                                {"results": [{"task_index": 0, "status": "completed"}]})[1],
+            max_async_children=1, max_queued_delegations=1,
+        )
+        for i in range(2)
+    ]
+    assert first["status"] == "dispatched"
+    assert [handle["status"] for handle in handles] == ["queued", "queued"]
+
+    original_submit = ad._submit_record
+    failed = threading.Event()
+    injected = {"done": False}
+
+    def fail_first(record, max_async_children):
+        if not injected["done"]:
+            injected["done"] = True
+            failed.set()
+            raise RuntimeError("injected first submit failure")
+        return original_submit(record, max_async_children)
+
+    monkeypatch.setattr(ad, "_submit_record", fail_first)
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert failed.wait(5)
+    with ad._records_lock:
+        assert all(ad._records[h["delegation_id"]]["status"] == "queued" for h in handles)
+        assert all(ad._records[h["delegation_id"]].get("_future") is None for h in handles)
+        assert all(not ad._records[h["delegation_id"]].get("_slot_reserved") for h in handles)
+        assert slot_key not in ad._active_slots_locked()
+
+    monkeypatch.setattr(ad, "_submit_record", original_submit)
+    ad._admit_pending()
+    for handle in handles:
+        assert _drain_for(handle["delegation_id"]) is not None
+    assert counts == [1, 1]
+
+
+def test_second_submission_failure_leaves_first_running_and_settles_second(monkeypatch):
+    """A later submit failure cannot roll back a sibling that already has a Future."""
+    release = threading.Event()
+    first = ad.dispatch_async_delegation(
+        goal="occupy", context=None, toolsets=None, role="leaf", model="m", session_key="",
+        runner=lambda: (release.wait(30), {"status": "completed"})[1], max_async_children=1,
+    )
+    counts = [0, 0]
+    started = threading.Event()
+    first_release = threading.Event()
+    slot_key = "second-submit-failure"
+
+    def runner_for(index):
+        if index == 0:
+            def first_runner():
+                started.set()
+                first_release.wait(30)
+                counts[index] += 1
+                return {"results": [{"task_index": 0, "status": "completed"}]}
+            return first_runner
+
+        def later_runner():
+            counts[index] += 1
+            return {"results": [{"task_index": 0, "status": "completed"}]}
+        return later_runner
+
+    handles = [
+        ad.dispatch_async_delegation_batch(
+            goals=[f"sibling-{i}"], context=None, toolsets=None, role="leaf", model="m", session_key="",
+            slot_key=slot_key, runner=runner_for(i),
+            max_async_children=1, max_queued_delegations=1,
+        )
+        for i in range(2)
+    ]
+    assert first["status"] == "dispatched"
+    assert [handle["status"] for handle in handles] == ["queued", "queued"]
+
+    original_submit = ad._submit_record
+    failed = threading.Event()
+    injected = {"done": False}
+
+    def fail_second(record, max_async_children):
+        if record["goal"] == "sibling-1" and not injected["done"]:
+            injected["done"] = True
+            failed.set()
+            raise RuntimeError("injected second submit failure")
+        return original_submit(record, max_async_children)
+
+    monkeypatch.setattr(ad, "_submit_record", fail_second)
+    release.set()
+    assert _drain_for(first["delegation_id"]) is not None
+    assert failed.wait(5)
+    assert started.wait(5)
+    with ad._records_lock:
+        assert ad._records[handles[0]["delegation_id"]]["status"] == "running"
+        assert ad._records[handles[0]["delegation_id"]].get("_future") is not None
+        assert ad._records[handles[1]["delegation_id"]]["status"] == "queued"
+        assert ad._records[handles[1]["delegation_id"]].get("_future") is None
+
+    monkeypatch.setattr(ad, "_submit_record", original_submit)
+    first_release.set()
+    assert _drain_for(handles[0]["delegation_id"]) is not None
+    ad._admit_pending()
+    assert _drain_for(handles[1]["delegation_id"]) is not None
+    assert counts == [1, 1]
+
+
+def test_running_and_admitted_records_always_hold_a_future_under_injected_failures(monkeypatch):
+    """Fast property-style coverage of the Future/lifecycle invariant."""
+    original_submit = ad._submit_record
+    for index in range(200):
+        injected = index % 3 == 0
+        failed = {"done": False}
+
+        def submit_with_failure(record, max_async_children, *, injected=injected, failed=failed):
+            if injected and not failed["done"]:
+                failed["done"] = True
+                raise RuntimeError("property submit failure")
+            return original_submit(record, max_async_children)
+
+        monkeypatch.setattr(ad, "_submit_record", submit_with_failure)
+        handle = ad.dispatch_async_delegation(
+            goal=f"property-{index}", context=None, toolsets=None, role="leaf", model="m", session_key="",
+            runner=lambda: {"status": "completed"}, max_async_children=1, max_queued_delegations=1,
+        )
+        with ad._records_lock:
+            assert all(
+                not (record.get("status") in {"admitted", "running"} and record.get("_future") is None)
+                for record in ad._records.values()
+            )
+        if handle["status"] == "queued":
+            monkeypatch.setattr(ad, "_submit_record", original_submit)
+            ad._admit_pending()
+        delegation_id = handle.get("delegation_id")
+        if delegation_id is None:
+            continue
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with ad._records_lock:
+                record = ad._records.get(delegation_id)
+                if record is not None and record.get("status") in ad._TERMINAL_STATES:
+                    break
+            time.sleep(0.001)
+        with ad._records_lock:
+            assert all(
+                not (record.get("status") in {"admitted", "running"} and record.get("_future") is None)
+                for record in ad._records.values()
+            )
+
+    monkeypatch.setattr(ad, "_submit_record", original_submit)
+
+
 def test_queued_worker_preserves_parent_prompt_callbacks(monkeypatch):
     """A queued worker inherits the dispatching thread's approval callback."""
     from tools import thread_context

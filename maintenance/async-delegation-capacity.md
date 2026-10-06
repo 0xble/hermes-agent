@@ -13,8 +13,8 @@ its callback synchronously):
 | --- | --- | --- | --- |
 | `new` | no ledger row yet | `queued` | no admission eligibility |
 | `queued` (persisted) | durable INSERT committed | `admitted` or `cancelled` | no executor slot |
-| `admitted` | conditional `queued -> admitted` committed | `running` or terminal failure/cancellation | slot reserved before submit |
-| `running` | conditional `admitted -> running` committed | `completed`, `failed`, `interrupted`, `stalled`, or `unknown` | slot held until Future done callback |
+| `admitted` | conditional `queued -> admitted` committed; no Future yet | `running` only after a Future is attached, or terminal failure/cancellation | slot reserved before submit |
+| `running` | Future attached and conditional `admitted -> running` committed | `completed`, `failed`, `interrupted`, `stalled`, or `unknown` | slot held until Future done callback |
 | `terminal` | conditional UPDATE from the expected prior state committed | none | slot remains held if a Future is still running |
 
 Admission reserves the slot while holding the lock, then submits the Future;
@@ -46,11 +46,7 @@ from a new persisted record or a slot-release callback and loops to capacity.
 - Pending admission is bounded. Queued state is durable or is surfaced as an
   explicit interrupted/unknown outcome on owner restart; it must not disappear
   silently.
-- Sibling-group admission is all-or-nothing: the queued-to-admitted and
-  admitted-to-running durable transitions update every selected sibling in one
-  transaction before in-memory promotion or submission. A failed group update
-  restores the entire FIFO group to `queued`; an admitted record with no Future
-  past the short pre-submit recovery deadline is requeued by the stale monitor.
+- Sibling-group admission is all-or-nothing: the queued-to-admitted durable transition updates every selected sibling in one transaction before in-memory promotion. Submission then settles the whole selected group: each record becomes running only after its own Future is attached; siblings without a Future are restored to queued in FIFO order, or terminally failed together when the retirement fence closes. An admitted or running record without a Future is recovered by the stale monitor after the short grace period. Cancellation treats an admitted no-Future record like queued work and terminally claims it; recovery operates on durable rows in one transaction, while stale-monitor requeue is conditional per record.
 - The durable INSERT commits independently of retention pruning. Post-insert
   housekeeping failures are logged and do not convert an accepted queued
   dispatch into a rejected in-memory-only record.

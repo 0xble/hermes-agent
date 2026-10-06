@@ -51,7 +51,7 @@ _TRANSITIONS = {
     "new": {"queued"},
     "queued": {"admitted", "cancelled", "interrupted", "finalizing"},
     "admitted": {"running", "queued", "failed", "interrupted", "cancelled", "finalizing"},
-    "running": {"queued", "stalling", "completed", "failed", "error", "interrupted", "stalled", "unknown", "finalizing"},
+    "running": {"admitted", "queued", "stalling", "completed", "failed", "error", "interrupted", "stalled", "unknown", "finalizing"},
     "stalling": {"completed", "failed", "interrupted", "stalled", "unknown", "finalizing"},
     "finalizing": _TERMINAL_STATES,
 }
@@ -64,6 +64,8 @@ def _transition_memory_locked(record: Dict[str, Any], new: str, *, expected: Opt
         raise RuntimeError(f"async delegation {record.get('delegation_id')} expected {expected}, found {old}")
     if new not in _LIFECYCLE_STATES or new not in _TRANSITIONS.get(old, set()):
         raise RuntimeError(f"invalid async delegation transition {old!r} -> {new!r}")
+    if new == "running" and record.get("_future") is None:
+        raise RuntimeError("running async delegation requires an attached Future")
     record["status"] = new
     return old
 
@@ -950,13 +952,16 @@ def _record_context_run(record: Dict[str, Any], fn: Callable, *args):
 
 
 def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[str]:
-    """Submit an already admitted record; caller owns ``_records_lock``.
+    """Submit an admitted record and make it running only while a Future exists.
 
-    Admission has reserved the slot before this function runs.  The only normal
-    release is ``release_slot``, the Future done callback.  In particular,
-    ``_finalize`` never releases a slot merely because the user-visible state is
-    terminal.
+    A placeholder Future is attached before invoking the executor.  That keeps
+    the invariant true even for executors that run their callable before
+    ``submit()`` returns; the real Future replaces the placeholder immediately
+    after submission and owns normal slot release callbacks.  The caller owns
+    ``_records_lock``.
     """
+    from concurrent.futures import Future
+
     delegation_id = record["delegation_id"]
     is_batch = bool(record.get("is_batch"))
     label = " batch" if is_batch else ""
@@ -988,10 +993,39 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
     from hermes_cli.backend_retirement import retirement
     if not retirement.acquire():
         return _BACKEND_RETIRING
+
+    placeholder = Future()
+    record["_future"] = placeholder
+    record["_slot_release_done"] = False
+    record["_submitting"] = True
+    future = None
+
+    def release_slot(done_future: Any) -> None:
+        released = False
+        with _records_lock:
+            live = _records.get(delegation_id)
+            if live is not None and not live.get("_slot_release_done"):
+                live["_slot_release_done"] = True
+                live["_slot_reserved"] = False
+                released = True
+        if released:
+            # A force-finalized runner only becomes capacity-free here.
+            _admit_pending()
+
     try:
-        # Let a controlled executor complete the worker before submit() returns.
-        # The lifecycle record remains slot-reserved, and the done callback is
-        # attached immediately after the Future is available.
+        # The placeholder is the proof that running is legal even if a custom
+        # executor starts the worker synchronously inside submit().
+        changed = _record_context_run(record, _persist_transition, delegation_id, "admitted", "running")
+        if changed != 1:
+            raise RuntimeError(f"async delegation {delegation_id} could not transition admitted -> running")
+        _transition_memory_locked(record, "running", expected="admitted")
+        record["_durable_state"] = "running"
+        record["_running_at"] = time.time()
+        record["_started"] = False
+
+        # Let the worker acquire the lifecycle lock if submit() starts it before
+        # returning.  The placeholder Future keeps the invariant during this
+        # handoff; the real Future is attached before this function returns.
         is_owned = getattr(_records_lock, "_is_owned", lambda: False)
         release_save = getattr(_records_lock, "_release_save", lambda: None)
         acquire_restore = getattr(_records_lock, "_acquire_restore", lambda _: None)
@@ -1002,25 +1036,53 @@ def _submit_record(record: Dict[str, Any], max_async_children: int) -> Optional[
             if lock_state is not None:
                 acquire_restore(lock_state)
         record["_future"] = future
-        record["_slot_release_done"] = False
-
-        def release_slot(done_future: Any) -> None:
-            released = False
-            with _records_lock:
-                live = _records.get(delegation_id)
-                if live is not None and not live.get("_slot_release_done"):
-                    live["_slot_release_done"] = True
-                    live["_slot_reserved"] = False
-                    released = True
-            if released:
-                # A force-finalized runner only becomes capacity-free here.
-                _admit_pending()
 
         future.add_done_callback(release_slot)
         future.add_done_callback(lambda _: retirement.release())
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
+        record["_submitting"] = False
+    except Exception as exc:  # pragma: no cover — pool submit/transition failure is rare
+        record["_submitting"] = False
+        if future is not None:
+            # executor.submit() succeeded, so this record owns a real Future even
+            # if callback registration failed.  It is already submitted and must
+            # not be rolled back with its siblings or have its Future hidden.
+            record["_future"] = future
+            record["_slot_release_done"] = False
+            record["_slot_reserved"] = True
+            logger.warning("Async delegation %s completed submit setup with a live Future: %s", delegation_id, exc)
+            try:
+                future.add_done_callback(release_slot)
+                future.add_done_callback(lambda _: retirement.release())
+            except Exception:
+                # Future callback registration is not expected to fail, but the
+                # worker remains the source of truth; never pretend it was not
+                # submitted. The retirement lease is released by the done path
+                # when possible, and the capacity reservation stays conservative.
+                logger.exception("Async delegation %s could not attach completion callbacks", delegation_id)
+            return None
+        # No real Future exists. Remove the placeholder and leave the record for
+        # the caller's settle-all path; it will restore the whole sibling group
+        # to queued or terminally fail it. Do not enqueue this item here.
+        record["_future"] = None
+        record["_slot_release_done"] = True
+        record["_slot_reserved"] = True
+        if record.get("status") not in {"admitted", "running"}:
+            # A nonstandard executor may run the worker and then raise from
+            # submit(). There is no Future to release later, and finalization
+            # already owns the terminal outcome, so do not retain the slot.
+            record["_slot_reserved"] = False
+            logger.warning("Async delegation %s submit failed after terminal worker completion: %s", delegation_id, exc)
+            retirement.release()
+            return f"Failed to schedule async delegation{label}: {exc}"
+        if record.get("status") == "running":
+            try:
+                changed = _record_context_run(record, _persist_transition, delegation_id, "running", "admitted")
+            except Exception:
+                changed = 0
+            if changed == 1:
+                _transition_memory_locked(record, "admitted", expected="running")
+                record["_durable_state"] = "admitted"
         retirement.release()
-        record["_slot_reserved"] = False
         logger.warning("Async delegation %s could not be submitted: %s", delegation_id, exc)
         return f"Failed to schedule async delegation{label}: {exc}"
     if record.get("progress_fn") is not None:
@@ -1051,13 +1113,89 @@ def _queue_selected_locked(selected: List[Dict[str, Any]]) -> None:
             _PENDING_QUEUE.appendleft(item["delegation_id"])
 
 
+def _settle_unsubmitted_locked(
+    selected: List[Dict[str, Any]], submitted: List[Dict[str, Any]], error: str,
+) -> None:
+    """Settle selected siblings that do not hold a real Future.
+
+    The submission loop is per record, but a failure decision is for the whole
+    selected sibling group. Futures already attached are allowed to finish;
+    every other record is transitioned from its actual state and then restored
+    to FIFO queue order or terminally failed on retirement. The caller owns
+    ``_records_lock``.
+    """
+    submitted_ids = {item["delegation_id"] for item in submitted if item.get("_future") is not None}
+    unsettled = [
+        item for item in selected
+        if item["delegation_id"] not in submitted_ids
+        and item.get("_future") is None
+        and item.get("status") in {"admitted", "running"}
+    ]
+    if not unsettled:
+        return
+
+    def settle_group(items: List[Dict[str, Any]], target: str) -> List[Dict[str, Any]]:
+        """Persist and publish one target for groups split by current state."""
+        settled: List[Dict[str, Any]] = []
+        for expected in ("admitted", "running"):
+            state_items = [item for item in items if item.get("status") == expected]
+            if not state_items:
+                continue
+            ids = [item["delegation_id"] for item in state_items]
+            try:
+                _record_context_run(state_items[0], _persist_transition_group, ids, expected, target)
+            except Exception:
+                logger.exception("Could not settle unsubmitted sibling group %s (%s -> %s)", ids, expected, target)
+                _ensure_stale_monitor()
+                continue
+            for item in state_items:
+                _transition_memory_locked(item, target, expected=expected)
+                item["_durable_state"] = target
+                settled.append(item)
+        return settled
+
+    if error == _BACKEND_RETIRING:
+        settled = settle_group(unsettled, "finalizing")
+        for item in settled:
+            item["_terminal_state"] = "failed"
+            item["completed_at"] = time.time()
+            item["_slot_reserved"] = False
+            item["_slot_release_done"] = True
+            item["interrupt_fn"] = None
+            item["progress_fn"] = None
+            snapshot = dict(item)
+            _record_context_run(
+                item,
+                lambda item=item, snapshot=snapshot: _finalize(
+                    item["delegation_id"], item["crash_result"](error, 0.0), "failed", _claimed_snapshot=snapshot,
+                ),
+            )
+        return
+
+    queued = [item for item in unsettled if item.get("_initially_queued")]
+    rejected = [item for item in unsettled if not item.get("_initially_queued")]
+    settled_queued = settle_group(queued, "queued")
+    if settled_queued:
+        order = {item["delegation_id"]: index for index, item in enumerate(selected)}
+        settled_queued.sort(key=lambda item: order[item["delegation_id"]])
+        _queue_selected_locked(settled_queued)
+        _ensure_stale_monitor()
+    for item in settle_group(rejected, "failed"):
+        item["_terminal_state"] = "failed"
+        item["_schedule_error"] = error
+        item["_slot_reserved"] = False
+        item["_slot_release_done"] = True
+        item["completed_at"] = time.time()
+
+
 def _admit_pending() -> None:
     """Promote durable queued records while capacity is available.
 
     Selection, sibling-group admission, slot reservation, cancellation
-    exclusion, durable transitions, and submission are lock-owned. A selected
-    sibling group is admitted all-or-nothing: every conditional durable update
-    must commit before any in-memory record becomes admitted or running.
+    exclusion, durable transitions, and submission are lock-owned. Admission is
+    transactional, while submission settles the entire selected sibling group:
+    records with Futures are left running and every record without one is
+    requeued (or terminally failed when retirement closed).
     """
     while True:
         with _records_lock:
@@ -1108,51 +1246,28 @@ def _admit_pending() -> None:
                 item["_slot_reserved"] = True
                 item["_slot_release_done"] = False
 
-            # Transition every selected record to running before submit. This
-            # closes the cancellation window while the executor is being called.
+            submitted: List[Dict[str, Any]] = []
+            submission_error: Optional[str] = None
             try:
-                _record_context_run(selected[0], _persist_transition_group, selected_ids, "admitted", "running")
-            except Exception:
-                logger.exception("Could not persist all-or-nothing running admission of siblings %s", selected_ids)
-                try:
-                    _record_context_run(selected[0], _persist_transition_group, selected_ids, "admitted", "queued")
-                except Exception:
-                    # The stale monitor will recover admitted records with no
-                    # Future after its short admission deadline.
-                    logger.exception("Could not roll back sibling admission %s to queued", selected_ids)
-                    return
-                _queue_selected_locked(selected)
-                _ensure_stale_monitor()
+                for item in selected:
+                    try:
+                        error = _record_context_run(item, _submit_record, item, item["max_async_children"])
+                    except Exception as exc:  # noqa: BLE001 - settle every sibling on any submit path
+                        logger.exception("Async delegation %s submission raised", item["delegation_id"])
+                        error = f"Failed to schedule async delegation: {exc}"
+                    if error:
+                        submission_error = error
+                        break
+                    submitted.append(item)
+            finally:
+                if submission_error is not None:
+                    _settle_unsubmitted_locked(selected, submitted, submission_error)
+
+            if submission_error is not None:
+                # A non-retirement failure restored queued entries and a
+                # retirement failure terminally settled them.  In both cases a
+                # later loop must not touch this partially submitted group.
                 return
-
-            for item in selected:
-                _transition_memory_locked(item, "running", expected="admitted")
-                item["_durable_state"] = "running"
-                item["_started"] = False
-
-            for item in selected:
-                delegation_id = item["delegation_id"]
-                error = _record_context_run(item, _submit_record, item, item["max_async_children"])
-                if error:
-                    item["_slot_reserved"] = False
-                    if error == _BACKEND_RETIRING:
-                        # The submission fence closed without creating a
-                        # Future. Keep durable queued work for the fence reopen
-                        # retry; no slot is released before actual Future done.
-                        changed = _record_context_run(item, _persist_transition, delegation_id, "running", "queued")
-                        if changed == 1:
-                            _queue_selected_locked([item])
-                            _ensure_stale_monitor()
-                            return
-                    item["_schedule_error"] = error
-                    if not item.get("_initially_queued"):
-                        # Direct dispatch callers own the existing synchronous
-                        # fallback and its resources on schedule rejection. Do
-                        # not emit a spurious completion or call cancel_fn.
-                        _transition_memory_locked(item, "failed", expected="running")
-                        _record_context_run(item, _persist_transition, delegation_id, "running", "failed")
-                    else:
-                        _record_context_run(item, _finalize, delegation_id, item["crash_result"](error, 0.0), "error")
             # Loop again: a done callback may have released a slot while this
             # batch was being submitted, and the queue should fill capacity.
 def _dispatch_admitted(
@@ -1534,10 +1649,41 @@ def _sweep_stale_locked(now: float):
         if status == "queued":
             any_monitorable = True
             continue
+        if status == "running" and record.get("_future") is None:
+            # Running is only valid after a Future has been attached.  This is
+            # a bounded recovery path for an injected/partial submit failure;
+            # normal submission transitions to running atomically with Future
+            # attachment and never enters this branch.
+            any_monitorable = True
+            if now - (record.get("_running_at") or record.get("_admitted_at") or now) >= _ADMITTED_RECOVERY_SECONDS:
+                delegation_id = record["delegation_id"]
+                try:
+                    changed = _record_context_run(record, _persist_transition, delegation_id, "running", "queued")
+                except Exception:
+                    logger.exception("Could not recover running async delegation %s without a Future", delegation_id)
+                    changed = 0
+                if changed == 1:
+                    _transition_memory_locked(record, "queued", expected="running")
+                    record["_durable_state"] = "queued"
+                    record["_slot_reserved"] = False
+                    record["_slot_release_done"] = True
+                    record["queue_reason"] = "async pool capacity"
+                    if delegation_id not in _PENDING_QUEUE:
+                        _PENDING_QUEUE.appendleft(delegation_id)
+                else:
+                    durable = _record_context_run(record, _durable_state, delegation_id)
+                    if durable and durable.get("state") == "queued":
+                        _transition_memory_locked(record, "queued", expected="running")
+                        record["_durable_state"] = "queued"
+                        record["_slot_reserved"] = False
+                        record["_slot_release_done"] = True
+                        record["queue_reason"] = "async pool capacity"
+                        if delegation_id not in _PENDING_QUEUE:
+                            _PENDING_QUEUE.appendleft(delegation_id)
+            continue
         if status == "admitted":
             any_monitorable = True
-            # A sibling-group admission reserves capacity before submit. It is
-            # recoverable only while the short pre-submit window is active;
+            # It is recoverable only while the short pre-submit window is
             # after that, an absent Future means the record was stranded.
             if record.get("_future") is None and now - (record.get("_admitted_at") or now) >= _ADMITTED_RECOVERY_SECONDS:
                 delegation_id = record["delegation_id"]
@@ -1796,30 +1942,32 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
             live = _records.get(delegation_id)
             if live is None or live.get("status") not in _INTERRUPTIBLE_STATES:
                 continue
-            if live.get("status") == "queued":
-                if live.get("_persisting"):
-                    # Record the request while the insert owns the lifecycle
-                    # handoff; dispatch will not publish/admit this record.
-                    live["_cancel_requested"] = True
-                    live["_cancel_reason"] = reason
-                    persist_wait = live.get("_persist_done")
-                else:
-                    prior_status = live.get("status")
+            if live.get("status") == "queued" and live.get("_persisting"):
+                # Record the request while the insert owns the lifecycle
+                # handoff; dispatch will not publish/admit this record.
+                live["_cancel_requested"] = True
+                live["_cancel_reason"] = reason
+                persist_wait = live.get("_persist_done")
+            elif live.get("status") in {"queued", "admitted"} and live.get("_future") is None:
+                if live.get("status") == "queued" and not live.get("_persisting"):
+                    # A queued record may still be visible in the FIFO; an
+                    # admitted no-Future record was already removed by the
+                    # admission selector and has no queue entry to remove.
                     try:
                         _PENDING_QUEUE.remove(live["delegation_id"])
                     except ValueError:
                         pass
-                    _transition_memory_locked(live, "finalizing")
-                    live["_durable_state"] = prior_status
-                    live["completed_at"] = time.time()
-                    if prior_status == "queued":
-                        live["_slot_reserved"] = False
-                        live["_slot_release_done"] = True
-                    queued_interrupt_fn = live.get("interrupt_fn")
-                    live["interrupt_fn"] = None
-                    live["progress_fn"] = None
-                    queued_snapshot = dict(live)
-                    interrupt_fn = None
+                prior_status = live.get("status")
+                _transition_memory_locked(live, "finalizing")
+                live["_durable_state"] = prior_status
+                live["completed_at"] = time.time()
+                live["_slot_reserved"] = False
+                live["_slot_release_done"] = True
+                queued_interrupt_fn = live.get("interrupt_fn")
+                live["interrupt_fn"] = None
+                live["progress_fn"] = None
+                queued_snapshot = dict(live)
+                interrupt_fn = None
             else:
                 interrupt_fn = live.get("interrupt_fn")
         if persist_wait is not None:
