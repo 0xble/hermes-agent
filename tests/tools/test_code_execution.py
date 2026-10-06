@@ -62,7 +62,7 @@ from tools.code_execution_tool import (
 from tools.registry import registry
 
 
-def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
+def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None, **_ids):
     """Mock dispatcher that returns canned responses for each tool."""
     if function_name == "terminal":
         cmd = function_args.get("command", "")
@@ -384,7 +384,7 @@ else:
     print(f"OK {N}/{N}")
 '''
 
-        def slow_mock(function_name, function_args, task_id=None, user_task=None):
+        def slow_mock(function_name, function_args, task_id=None, user_task=None, **_ids):
             import time as _t
             if function_name == "terminal":
                 _t.sleep(0.05)  # ensure requests overlap on the socket
@@ -867,6 +867,21 @@ class TestHeadTailTruncation(unittest.TestCase):
             body = f.read()
         self.assertIn("HEAD", body)
         self.assertIn("TAIL", body)
+
+
+class TestRpcDispatchIdentity(unittest.TestCase):
+    def test_default_dispatch_assigns_a_unique_tool_call_id_per_rpc(self):
+        """Nested RPC calls must not share the hook gate's missing-id fallback."""
+        from tools.code_execution_rpc import _default_dispatch
+
+        with patch("model_tools.handle_function_call", return_value='{"ok": true}') as handle:
+            dispatch = _default_dispatch("task-identity")
+            dispatch("read_file", {"path": "a"})
+            dispatch("read_file", {"path": "b"})
+
+        first_id = handle.call_args_list[0].kwargs["tool_call_id"]
+        second_id = handle.call_args_list[1].kwargs["tool_call_id"]
+        assert first_id and second_id and first_id != second_id
 
 
 class TestRpcTokenAuthorization(unittest.TestCase):

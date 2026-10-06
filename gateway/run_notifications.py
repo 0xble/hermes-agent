@@ -2218,7 +2218,7 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             from tools.delegation_resume import (
                 claim_auto_resume_trigger, complete_auto_resume_trigger,
-                release_auto_resume_trigger,
+                inspect_resumable, release_auto_resume_trigger,
             )
 
             delegation_id = str(evt.get("delegation_id") or "")
@@ -2271,6 +2271,13 @@ class GatewayNotificationsMixin:
             claim_id = str(record.get("auto_resume_claim") or "")
             accepted = False
             try:
+                # Cheap guard for a row resumed or pruned between the claim above and
+                # injection. It narrows that window but cannot close it; a notice that
+                # still slips through is refused safely by claim_resume. Inside the try so
+                # the finally releases the claim on this path and on cancellation alike.
+                _, eligibility_reason = await asyncio.to_thread(inspect_resumable, delegation_id)
+                if eligibility_reason is not None:
+                    return True
                 injected = await self._inject_watch_notification(
                     str(evt.get("text") or ""), evt, raise_not_accepted=True,
                 )
