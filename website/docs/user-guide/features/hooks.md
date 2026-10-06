@@ -1713,11 +1713,14 @@ hooks:
       timeout: <seconds>         # Optional; default 60, capped at 300
       fail_closed: <bool>        # Optional; default false. pre_tool_call only.
                                  # `failClosed` also accepted (Cursor/Claude Code compat)
+      requires_env: <name-or-list> # Optional; skip when any named var is unset/empty
 
 hooks_auto_accept: false         # See "Consent model" below
 ```
 
-Event names must be one of the [plugin hook events](#plugin-hooks); typos produce a "Did you mean X?" warning and are skipped. Unknown keys inside a single entry are ignored; missing `command` is a skip-with-warning. `timeout > 300` is clamped with a warning. `fail_closed: true` on an event other than `pre_tool_call` warns and is ignored (only blocking-capable events can fail closed).
+`requires_env` accepts one environment-variable name or a list. Hermes checks the current process environment at dispatch time; if any required variable is missing or empty, the hook is skipped before its worker or subprocess starts. This is a generic applicability filter, not a cmux-specific switch, so the same declaration works for any optional runtime context.
+
+Event names must be one of the [plugin hook events](#plugin-hooks); typos produce a "Did you mean X?" warning and are skipped. Unknown keys inside a single entry are ignored; missing `command` is a skip-with-warning. `timeout > 300` is clamped with a warning. `requires_env` must be a string or list of strings; malformed values warn and are ignored. `fail_closed: true` on an event other than `pre_tool_call` warns and is ignored (only blocking-capable events can fail closed).
 
 On Windows, a `command` that starts with an existing script file — the `~/.hermes/agent-hooks/x.sh` shape the examples below use — is spawned through that file's own interpreter (Git Bash for `.sh`/`.bash`, the running Hermes Python for `.py`), because `CreateProcess` has no shebang support and rejects a bare script with `WinError 193`. Every other command, and every POSIX platform, passes `argv` straight to `Popen`, where the kernel already honours the shebang.
 

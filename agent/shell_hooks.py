@@ -45,6 +45,16 @@ _BLOCKING_EVENTS = frozenset({"pre_tool_call"})
 _TOOL_EVENTS = frozenset({"pre_tool_call", "post_tool_call"})
 _STDERR_MESSAGE_LIMIT = 400
 _TRUTHY = {"1", "true", "yes", "on"}
+# Fail-open hooks that repeatedly time out or fail to spawn are temporarily suppressed so a
+# broken observer cannot consume the full subprocess timeout on every agent event. The first
+# failure waits 60s, then the window doubles up to 15 minutes; any completed subprocess resets it.
+_SHELL_HOOK_BACKOFF_BASE_SECONDS = 60.0
+_SHELL_HOOK_BACKOFF_MAX_SECONDS = 15 * 60.0
+# Tests replace this indirection with a deterministic clock without changing subprocess timing.
+_monotonic = time.monotonic
+# (event, command) -> (consecutive failures, suppressed-until monotonic timestamp).
+_shell_hook_backoff: Dict[Tuple[str, str], Tuple[int, float]] = {}
+_shell_hook_backoff_lock = threading.Lock()
 # kwargs promoted to top-level payload keys; everything else lands under ``extra``.
 _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
 
@@ -133,10 +143,70 @@ class ShellHookSpec(_ToolMatcherMixin):
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
+    requires_env: Tuple[str, ...] = ()
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
+    def missing_required_env(self) -> Tuple[str, ...]:
+        return tuple(name for name in self.requires_env if not os.environ.get(name))
 
-# --- Public API ---
+
+# --- Applicability and fail-open backoff ---------------------------------
+
+
+def _shell_hook_key(spec: ShellHookSpec) -> Tuple[str, str]:
+    """Backoff identity deliberately excludes matcher: the configured hook is one spec."""
+    return spec.event, spec.command
+
+
+def shell_hook_should_skip(spec: ShellHookSpec) -> bool:
+    """Return whether a shell callback can be skipped before its worker/subprocess is started."""
+    missing = spec.missing_required_env()
+    if missing:
+        logger.debug(
+            "shell hook skipped (event=%s command=%s): missing required env %s",
+            spec.event, spec.command, ", ".join(missing),
+        )
+        return True
+    if spec.fail_closed:
+        return False
+    now = _monotonic()
+    with _shell_hook_backoff_lock:
+        state = _shell_hook_backoff.get(_shell_hook_key(spec))
+        if state is None or state[1] <= now:
+            return False
+        remaining = state[1] - now
+    logger.debug(
+        "shell hook skipped during backoff (event=%s command=%s remaining=%.1fs)",
+        spec.event, spec.command, remaining,
+    )
+    return True
+
+
+def _record_shell_hook_failure(spec: ShellHookSpec, reason: str) -> None:
+    """Start or extend a fail-open cooldown after a subprocess timeout/spawn failure."""
+    if spec.fail_closed:
+        return
+    now = _monotonic()
+    with _shell_hook_backoff_lock:
+        key = _shell_hook_key(spec)
+        failures, suppressed_until = _shell_hook_backoff.get(key, (0, 0.0))
+        # A concurrent worker may have failed after another worker already started this window.
+        if suppressed_until > now:
+            return
+        delay = min(_SHELL_HOOK_BACKOFF_BASE_SECONDS * (2 ** failures), _SHELL_HOOK_BACKOFF_MAX_SECONDS)
+        _shell_hook_backoff[key] = (failures + 1, now + delay)
+    logger.warning(
+        "shell hook entering fail-open backoff for %.0fs (event=%s command=%s; %s)",
+        delay, spec.event, spec.command, reason,
+    )
+
+
+def _reset_shell_hook_backoff(spec: ShellHookSpec) -> None:
+    if spec.fail_closed:
+        return
+    with _shell_hook_backoff_lock:
+        _shell_hook_backoff.pop(_shell_hook_key(spec), None)
+
 
 def register_from_config(cfg: Optional[Dict[str, Any]], *, accept_hooks: bool = False) -> List[ShellHookSpec]:
     """Register every configured shell hook (idempotent); returns the newly wired specs. Skipped
@@ -201,9 +271,11 @@ def re_register_config_hooks() -> None:
 
 
 def reset_for_tests() -> None:
-    """Test-only: clear the idempotence set."""
+    """Test-only: clear the idempotence set and fail-open cooldowns."""
     with _registered_lock:
         _registered.clear()
+    with _shell_hook_backoff_lock:
+        _shell_hook_backoff.clear()
 
 
 # --- Config parsing ---
@@ -276,7 +348,26 @@ def _parse_single_entry(event: str, index: int, raw: Any) -> Optional[ShellHookS
         warn(".fail_closed=true will be ignored at runtime — fail_closed only applies to blocking-capable "
              "events (%s).  The hook will fail open on %s like any other hook.", ", ".join(sorted(_BLOCKING_EVENTS)), event)
         fail_closed = False
-    return ShellHookSpec(event=event, command=command.strip(), matcher=matcher, timeout=timeout, fail_closed=fail_closed)
+    requires_env_raw = raw.get("requires_env", ())
+    if isinstance(requires_env_raw, str):
+        requires_env = (requires_env_raw.strip(),) if requires_env_raw.strip() else ()
+    elif isinstance(requires_env_raw, list):
+        names = []
+        for item in requires_env_raw:
+            if not isinstance(item, str) or not item.strip():
+                warn(".requires_env entries must be non-empty strings; ignoring %r", item)
+                continue
+            name = item.strip()
+            if name not in names:
+                names.append(name)
+        requires_env = tuple(names)
+    elif requires_env_raw in (None, ()):
+        requires_env = ()
+    else:
+        warn(".requires_env must be an env var name or list of names; ignoring %r", requires_env_raw)
+        requires_env = ()
+    return ShellHookSpec(event=event, command=command.strip(), matcher=matcher, timeout=timeout,
+                         fail_closed=fail_closed, requires_env=requires_env)
 
 
 # --- Subprocess callback ---
@@ -371,7 +462,14 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
     def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
         if spec.event in _TOOL_EVENTS and not spec.matches_tool(kwargs.get("tool_name")):
             return None
-        return _evaluate_result(spec, _spawn(spec, _serialize_payload(spec.event, kwargs)))
+        if shell_hook_should_skip(spec):
+            return None
+        result = _spawn(spec, _serialize_payload(spec.event, kwargs))
+        if result["error"] or result["timed_out"]:
+            _record_shell_hook_failure(spec, result["error"] or f"timed out after {spec.timeout}s")
+        else:
+            _reset_shell_hook_backoff(spec)
+        return _evaluate_result(spec, result)
 
     _callback.__name__ = _callback.__qualname__ = f"shell_hook[{spec.event}:{spec.command}]"
     # The dispatcher reads this to let the hook gate itself: matcher decides applicability, the
