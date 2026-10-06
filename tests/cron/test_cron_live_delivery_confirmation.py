@@ -457,15 +457,16 @@ class TestShortFloodWaitStaysOnTheLiveLane:
         assert "via live adapter" in caplog.text
         assert "falling back to standalone" not in caplog.text
 
-    def test_long_flood_still_falls_back(self, caplog):
+    def test_long_flood_fails_closed_without_standalone(self, caplog):
         with caplog.at_level(logging.INFO, logger="cron.scheduler"):
             error, router_calls, standalone_calls, sleeps = self._run_sequence([
                 RuntimeError("flood_control:120.0")])
 
         assert len(router_calls) == 1
         assert sleeps == []
-        assert len(standalone_calls) == 1
-        assert "falling back to standalone" in caplog.text
+        assert standalone_calls == []
+        assert "flood-control deadline is active" in error
+        assert "falling back to standalone" not in caplog.text
 
     def test_repeated_floods_stop_at_the_budget(self):
         floods = [RuntimeError("flood_control:6.0") for _ in range(5)]
@@ -473,7 +474,7 @@ class TestShortFloodWaitStaysOnTheLiveLane:
 
         assert sum(sleeps) <= sched_delivery._LIVE_FLOOD_WAIT_BUDGET_SECS
         assert len(router_calls) == len(sleeps) + 1
-        assert len(standalone_calls) == 1
+        assert standalone_calls == []
 
     def test_other_errors_fall_back_without_waiting(self):
         _, router_calls, standalone_calls, sleeps = self._run_sequence([
