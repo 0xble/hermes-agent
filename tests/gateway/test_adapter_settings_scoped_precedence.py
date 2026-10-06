@@ -97,7 +97,7 @@ def test_secondary_reads_own_yaml_and_never_the_launch_env(homes, monkeypatch):
         monkeypatch.setenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "true")
         built: list = []
         with patch.object(tg, "HTTPXRequest", lambda **kw: built.append(kw) or types.SimpleNamespace()), \
-                patch.object(t, "_wrap_polling_request", side_effect=lambda r: r):
+                patch.object(t, "_instrument_polling_request", side_effect=lambda r: r):
             asyncio.run(t._build_ptb_requests())
         assert [kw.get("proxy") for kw in built] == ["http://127.0.0.1:18080"] * 2
 
