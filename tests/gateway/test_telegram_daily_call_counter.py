@@ -147,10 +147,45 @@ def test_long_retry_after_logs_the_window_counts(tmp_path, caplog):
 
     with caplog.at_level(logging.INFO, logger=chat_budget.__name__):
         asyncio.run(run())
+        _drain(counter)
     assert recorded == [("2027045491", 34507.0)]
     text = caplog.text
     assert "retry_after=34507.0s (trigger untagged)" in text
     assert "calls since" in text and "(retry_after=34507s): 2 total" in text
+
+
+def _drain(counter, timeout=5.0):
+    """Wait for the background worker to finish its queued flush and summaries."""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if counter.idle():
+            return
+        _time.sleep(0.01)
+    raise AssertionError("counter worker did not drain")
+
+
+def test_record_never_blocks_on_a_locked_database(tmp_path):
+    """Regression: persistence ran inline in record(), so a locked DB stalled the send path ~1-2s."""
+    import time as _time
+    wall = _Wall()
+    counter = DailyCallCounter(tmp_path, wall=wall, flush_interval=60.0)
+    counter.record("1", "sendMessage", "typed")
+    counter.flush()  # create the table
+    blocker = sqlite3.connect(tmp_path / "telegram-flood-state.db", timeout=0)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        wall.t += 61  # a flush is now due
+        started = _time.monotonic()
+        for _ in range(50):
+            counter.record("1", "editMessageText", "goal")
+        assert _time.monotonic() - started < 0.2
+    finally:
+        blocker.rollback()
+        blocker.close()
+    _drain(counter)
+    counter.flush()
+    assert counter.window("1")["chats"]["1"]["total"] == 51  # nothing lost while locked
 
 
 def test_counter_failure_never_blocks_a_send(tmp_path):
@@ -170,4 +205,5 @@ def test_hourly_summary_is_logged(tmp_path, caplog):
         assert "calls since" not in caplog.text
         wall.t += 3601
         counter.record("1", "editMessageText", "goal")
+        _drain(counter)
     assert "Telegram chat 1 calls since" in caplog.text and "(hourly): 2 total" in caplog.text

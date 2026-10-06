@@ -349,9 +349,10 @@ shed typing or drafts are not counted. `TelegramAdapter.handle_message` binds th
 in a ContextVar that the turn task inherits. Calls outside a turn (cron delivery, outbox
 replay, housekeeping) are `untagged`. Counts flush additively to `call_counts` in the profile's
 `telegram-flood-state.db` at most once a minute, are kept for 30 days, and log a rolling 24h
-summary hourly. Any `retry_after` of 600s or more also logs that window's counts. The counter
-never delays, sheds or refuses a call. A counter failure is logged at debug level and the call
-proceeds.
+summary hourly. Any `retry_after` of 600s or more also logs that window's counts. The send path
+only updates an in-memory dict. Persistence and summaries run on the counter's own daemon thread,
+so a slow or locked database cannot delay a call. The counter never sheds or refuses a call.
+Counter failures are logged at debug level and unflushed counts are kept for the next flush.
 
 **Reading it.** `sqlite3 ~/.hermes/telegram-flood-state.db "select chat_id, endpoint, trigger,
 sum(count) from call_counts where hour >= strftime('%s','now','-1 day') group by 1,2,3"`. The

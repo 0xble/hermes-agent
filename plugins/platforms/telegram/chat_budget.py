@@ -339,7 +339,7 @@ class ChatBudgetRateLimiter:
                                key, endpoint, wait, current_trigger())
                 if wait >= COUNTER_LONG_PENALTY_SECS:
                     try:
-                        self.counter.log_summary(key, reason=f"retry_after={wait:.0f}s")
+                        self.counter.request_summary(key, reason=f"retry_after={wait:.0f}s")
                     except Exception:
                         logger.debug("Telegram call counter summary failed", exc_info=True)
                 if self._on_retry_after is not None:
@@ -431,6 +431,11 @@ class DailyCallCounter:
         self._log_interval = log_interval
         self._lock = threading.Lock()
         self._dirty: Dict[Tuple[float, str, str, str], int] = {}
+        self._pending_logs: list = []
+        self._work = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._busy = 0
+        self._db_lock = threading.Lock()
         now = wall()
         self._last_flush = now
         self._last_log = now
@@ -445,16 +450,64 @@ class DailyCallCounter:
         return self._profile_dir
 
     def record(self, chat: str, endpoint: str, trigger: Optional[str] = None) -> None:
+        """Count one call. Never touches disk: persistence and the hourly summary run on the
+        counter's own background thread, so a slow or locked database cannot delay a send."""
         now = self._wall()
         bucket = now - (now % _HOUR)
         key = (bucket, chat, endpoint, trigger or current_trigger())
         with self._lock:
             self._dirty[key] = self._dirty.get(key, 0) + 1
-        if now - self._last_flush >= self._flush_interval:
-            self.flush()
-        if now - self._last_log >= self._log_interval:
-            self._last_log = now
-            self.log_summary()
+        due_flush = now - self._last_flush >= self._flush_interval
+        due_log = now - self._last_log >= self._log_interval
+        if due_flush or due_log:
+            if due_flush:
+                self._last_flush = now
+            if due_log:
+                self._last_log = now
+            self._schedule(log=due_log)
+
+    def _schedule(self, *, log: bool = False, chat: Optional[str] = None, reason: str = "hourly") -> None:
+        """Hand persistence (and optionally a summary) to the background worker; never blocks."""
+        with self._lock:
+            if log:
+                self._pending_logs.append((chat, reason))
+            self._work.set()
+            worker = self._worker
+            if worker is None or not worker.is_alive():
+                worker = self._worker = threading.Thread(
+                    target=self._run_worker, name="telegram-call-counter", daemon=True)
+                worker.start()
+
+    def _run_worker(self) -> None:
+        while True:
+            if not self._work.wait(timeout=self._flush_interval):
+                with self._lock:
+                    if not self._dirty and not self._pending_logs:
+                        self._worker = None
+                        return
+            with self._lock:
+                self._work.clear()
+                self._busy += 1
+            try:
+                self.flush()
+                with self._lock:
+                    logs, self._pending_logs = self._pending_logs, []
+                for chat, reason in logs:
+                    self.log_summary(chat, reason=reason)
+            except Exception:  # the worker must survive anything a measurement can raise
+                logger.debug("Telegram call counter worker failed", exc_info=True)
+            finally:
+                with self._lock:
+                    self._busy -= 1
+
+    def idle(self) -> bool:
+        """True when no persistence or summary work is queued or running (tests, shutdown)."""
+        with self._lock:
+            return not self._busy and not self._work.is_set() and not self._pending_logs
+
+    def request_summary(self, chat: Optional[str] = None, *, reason: str) -> None:
+        """Log the window's counts from the worker thread (used at a long ``retry_after``)."""
+        self._schedule(log=True, chat=chat, reason=reason)
 
     def _db(self):
         home = self._home()
@@ -467,24 +520,26 @@ class DailyCallCounter:
         return closing(conn)
 
     def flush(self) -> None:
+        """Persist pending counts. Blocking: call from the worker thread or tests, never a send path."""
         self._last_flush = self._wall()
-        with self._lock:
-            pending, self._dirty = self._dirty, {}
-        if not pending or self._home() is None:
-            return
-        try:
-            with self._db() as conn:
-                conn.executemany(
-                    "INSERT INTO call_counts VALUES (?,?,?,?,?) ON CONFLICT(hour, chat_id, endpoint, trigger) "
-                    "DO UPDATE SET count = count + excluded.count",
-                    [(*key, count) for key, count in pending.items()])
-                conn.execute("DELETE FROM call_counts WHERE hour < ?", (self._wall() - COUNTER_RETENTION_SECS,))
-                conn.commit()
-        except (OSError, sqlite3.Error):
-            logger.warning("Could not persist Telegram call counts; keeping them for the next flush", exc_info=True)
+        with self._db_lock:
             with self._lock:
-                for key, count in pending.items():
-                    self._dirty[key] = self._dirty.get(key, 0) + count
+                pending, self._dirty = self._dirty, {}
+            if not pending or self._home() is None:
+                return
+            try:
+                with self._db() as conn:
+                    conn.executemany(
+                        "INSERT INTO call_counts VALUES (?,?,?,?,?) ON CONFLICT(hour, chat_id, endpoint, trigger) "
+                        "DO UPDATE SET count = count + excluded.count",
+                        [(*key, count) for key, count in pending.items()])
+                    conn.execute("DELETE FROM call_counts WHERE hour < ?", (self._wall() - COUNTER_RETENTION_SECS,))
+                    conn.commit()
+            except (OSError, sqlite3.Error):
+                logger.debug("Could not persist Telegram call counts; keeping them for the next flush", exc_info=True)
+                with self._lock:
+                    for key, count in pending.items():
+                        self._dirty[key] = self._dirty.get(key, 0) + count
 
     def window(self, chat: Optional[str] = None, *, since: Optional[float] = None) -> Dict[str, Any]:
         """Totals since ``since`` (default: the last 24h), flushed and unflushed together."""
@@ -502,7 +557,7 @@ class DailyCallCounter:
                         params.append(chat)
                     rows = conn.execute(query + " GROUP BY 1,2,3", params).fetchall()
             except (OSError, sqlite3.Error):
-                logger.warning("Could not read Telegram call counts", exc_info=True)
+                logger.debug("Could not read Telegram call counts", exc_info=True)
         chats: Dict[str, Dict[str, Any]] = {}
         for chat_id, endpoint, trigger, count in rows:
             entry = chats.setdefault(chat_id, {"total": 0, "endpoints": {}, "triggers": {}})
