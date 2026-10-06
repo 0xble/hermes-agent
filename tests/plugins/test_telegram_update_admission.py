@@ -766,7 +766,18 @@ async def test_only_pre_handoff_failure_reopens_admission(monkeypatch, tmp_path,
             first.cancel()
             await asyncio.gather(first, return_exceptions=True)
             raise
-        if failure == "cancel":
+        if stage == "media_warning":
+            # The retry notice is a paced delivery, so it runs off the update consumer: the update
+            # is accepted and finished before the notice lands, and a failed or cancelled notice
+            # cannot reopen it.
+            await asyncio.wait_for(first, 2)
+            notices = [task for task in adapter._background_tasks if "media-retry-notice" in task.get_name()]
+            assert len(notices) == 1
+            if failure == "cancel":
+                notices[0].cancel()
+            release.set()
+            await asyncio.gather(*notices, return_exceptions=True)
+        elif failure == "cancel":
             if stage in ("enqueued", "dispatch", "batch_prepare"):
                 release.set()
             else:
