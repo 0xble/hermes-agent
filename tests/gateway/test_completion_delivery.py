@@ -993,3 +993,56 @@ def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
     assert isolated_registry.completion_queue.empty()
+
+
+def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isolated_registry):
+    """A state.db commit/close that checkpoints a large WAL can block for tens of seconds. Every
+    durable claim and settle on the delivery path must run off the loop, so the loop keeps
+    answering liveness probes while the ledger is slow."""
+    import contextlib
+    import time
+
+    import hermes_cli.sqlite_util as sqlite_util
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_slow_{i}") for i in range(2)]
+    for event in events:
+        _persist_pending_completion(event)
+
+    stall_s = 1.2
+    real_transaction = sqlite_util.transaction
+
+    @contextlib.contextmanager
+    def _slow_transaction(conn, **kwargs):
+        with real_transaction(conn, **kwargs) as inner:
+            yield inner
+        time.sleep(stall_s)  # the blocking close/checkpoint seen in the gateway freeze
+
+    monkeypatch.setattr(sqlite_util, "transaction", _slow_transaction)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    async def _exercise():
+        ticks = [time.monotonic()]
+        delivery_done = asyncio.Event()
+
+        async def _heartbeat():
+            while not delivery_done.is_set():
+                await asyncio.sleep(0.05)
+                ticks.append(time.monotonic())
+
+        heartbeat = asyncio.create_task(_heartbeat())
+        try:
+            result = await runner._deliver_async_delegation_group([dict(e) for e in events])
+        finally:
+            delivery_done.set()
+            await heartbeat
+        return result, max(b - a for a, b in zip(ticks, ticks[1:]))
+
+    result, worst_gap = asyncio.run(_exercise())
+
+    assert result is True
+    adapter.handle_message.assert_awaited_once()
+    for event in events:
+        assert async_delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    assert worst_gap < 1.0, f"event loop stalled {worst_gap:.2f}s behind a slow ledger transaction"
