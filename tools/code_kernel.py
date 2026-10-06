@@ -265,6 +265,7 @@ class CellAuthority:
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
         from model_tools import handle_function_call
+        from tools.code_execution_rpc import nested_tool_call_id
         previous = None
         if self._callbacks:
             try:
@@ -274,7 +275,8 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            return handle_function_call(tool_name, tool_args, task_id=self.task_id,
+                                        tool_call_id=nested_tool_call_id(self.task_id))
         finally:
             if previous is not None:
                 try:

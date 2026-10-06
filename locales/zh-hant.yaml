@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ 我在完成前不得不停止{reason}。請使用 /retry 重試；若這段對話已相當長，可使用 /compress。"
     no_response: "⚠️ 處理已完成，但沒有產生任何回應。這可能是暫時性錯誤 — 請試著重新傳送訊息。"
     previous_turn_cleanup: "⚠️ 你的訊息未被處理（上一輪仍在清理中）。請重新傳送。"
-    unexpected_silence: "⚠️ 對於需要回覆的訊息，模型只回傳了靜默標記。請重試或換個說法。"
+    unexpected_silence: "⚠️ 這則訊息沒有寫入任何回覆。如果您原本期待收到回覆，請重新傳送。"
     empty_response_model_label: "模型"
     hint_auth: " 你在 AI 模型服務的登入已逾期，或 API 金鑰有誤。請在此使用 /login，或在主機上執行 `{relogin}`。"
     hint_quota: " 你的 AI 模型服務餘額或配額已用完。請到該服務網站儲值，或使用 /model 切換模型。"
@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ 已暫停{suffix}。新的排程／kanban／閘道工作將暫緩；進行中的工作會正常完成。使用 `/pause off` 恢復。"
   queue:
     usage: "用法：/queue <prompt>"
-    queued: "已排入下一輪佇列。"
+    queued: "⏳ 已排入下一輪佇列。"
     queued_depth: " （{depth} 則排隊中）"
   steer:
     usage: "用法：/steer <prompt>"

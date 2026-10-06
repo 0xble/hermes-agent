@@ -6,8 +6,33 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any, Optional
+
+# First-line headers that mark an inbound message as sent by another agent session, not typed by
+# the user. Such a message may end in a bare silence marker. Relay's own parser uses the same
+# value class (``[^\s\]]+``), so both sides agree on what a header is.
+_AGENT_ORIGIN_HEADERS = (
+    re.compile(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]"),
+)
+
+
+def is_agent_origin_text(text: Any) -> bool:
+    """True when the first non-blank line is a complete registered agent-origin header."""
+    stripped = text.lstrip() if isinstance(text, str) else ""
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0].rstrip()
+    return any(pattern.fullmatch(first_line) for pattern in _AGENT_ORIGIN_HEADERS)
+
+
+def apply_agent_origin_reply_expectation(event: Any) -> Any:
+    """Mark an agent-origin event as not needing a reply; an explicit True is never overridden."""
+    if getattr(event, "reply_expected", None) is not True and is_agent_origin_text(getattr(event, "text", "")):
+        event.reply_expected = False
+    return event
+
 
 # Exact whole-response markers meaning "the agent intentionally chose not to
 # reply". Keep small and explicit; arbitrary empty output remains an

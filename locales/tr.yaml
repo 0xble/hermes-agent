@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ Bitiremeden durmak zorunda kaldım{reason}. Yeniden denemek için /retry, konuşma çok uzadıysa /compress kullanın."
     no_response: "⚠️ İşleme tamamlandı ancak yanıt üretilmedi. Bu geçici bir hata olabilir — mesajınızı yeniden göndermeyi deneyin."
     previous_turn_cleanup: "⚠️ Mesajınız işlenmedi (önceki turun temizliği hâlâ sürüyordu). Lütfen yeniden gönderin."
-    unexpected_silence: "⚠️ Model, yanıt gerektiren bir mesaja yalnızca sessizlik işareti döndürdü. Yeniden deneyin veya farklı ifade edin."
+    unexpected_silence: "⚠️ Bu mesaj için hiçbir yanıt yazılmadı. Yanıt bekliyorsanız tekrar gönderin."
     empty_response_model_label: "Model"
     hint_auth: " Yapay zekâ model servisi girişinizin süresi dolmuş veya API anahtarı hatalı. Burada /login kullanın ya da ana makinede `{relogin}` çalıştırın."
     hint_quota: " Yapay zekâ model servisi bakiyeniz veya kotanız tükenmiş. Servisin web sitesinden bakiye yükleyin veya model değiştirmek için /model kullanın."
@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ Duraklatıldı{suffix}. Yeni cron/kanban/gateway işleri beklemeye alındı; sürmekte olan işler normal şekilde tamamlanır. Devam etmek için `/pause off` kullanın."
   queue:
     usage: "Kullanım: /queue <prompt>"
-    queued: "Sonraki tur için sıraya alındı."
+    queued: "⏳ Sonraki tur için sıraya alındı."
     queued_depth: " ({depth} sırada)"
   steer:
     usage: "Kullanım: /steer <prompt>"

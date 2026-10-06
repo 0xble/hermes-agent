@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ Ek moes stop voordat ek klaar was{reason}. Gebruik /retry om weer te probeer, of /compress as hierdie gesprek baie lank geword het."
     no_response: "⚠️ Verwerking is voltooi, maar geen antwoord is gegenereer nie. Dit kan 'n tydelike fout wees — probeer jou boodskap weer stuur."
     previous_turn_cleanup: "⚠️ Jou boodskap is nie verwerk nie (die vorige beurt was nog besig om opgeruim te word). Stuur dit asseblief weer."
-    unexpected_silence: "⚠️ Die model het slegs 'n stilte-merker teruggestuur vir 'n boodskap wat 'n antwoord nodig gehad het. Probeer weer of herformuleer."
+    unexpected_silence: "⚠️ Die model het geen antwoord vir hierdie boodskap geskryf nie. Stuur dit weer as jy 'n antwoord verwag het."
     empty_response_model_label: "Die model"
     hint_auth: " Jou aanmelding by die KI-modeldiens het verval of die API-sleutel is verkeerd. Gebruik /login hier, of voer `{relogin}` op die gasheer uit."
     hint_quota: " Jou KI-modeldiens se saldo of kwota is opgebruik. Laai dit op die diens se webwerf op, of gebruik /model om modelle te wissel."
@@ -748,7 +748,7 @@ gateway:
     paused: "⏸️ Gepouseer{suffix}. Nuwe cron-/kanban-/gateway-werk is opgeskort; werk wat reeds loop, word normaal voltooi. Gebruik `/pause off` om te hervat."
   queue:
     usage: "Gebruik: /queue <prompt>"
-    queued: "In die tou vir die volgende beurt."
+    queued: "⏳ In die tou vir die volgende beurt."
     queued_depth: " ({depth} in die tou)"
   steer:
     usage: "Gebruik: /steer <prompt>"
