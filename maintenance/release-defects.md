@@ -16,6 +16,19 @@ records its patch identity and guard test. Offer upstream-origin fixes upstream 
 drop each once upstream carries an equivalent fix. Append new defects as sections
 here; move a section into a behavior-specific unit when that unit starts owning it.
 
+## Relay close-failure abort ordering
+
+- Fork patch identity: `relay-close-failure-test-race`.
+- Relay's managed stream can be aborted by the monitor before the worker
+  observes its interrupt and closes the stream. Both aborts may legitimately
+  target the same request client; the worker close-failure abort must remain
+  observable so the reuse-slot guard still poisons that client. The regression
+  test now asserts that contract without requiring one scheduling order and
+  includes an event-synchronized monitor-first case.
+- Guard: `tests/agent/test_request_client_reuse_abort_races.py`
+  (`test_relay_managed_close_failure_poisons_request_client`,
+  `test_relay_managed_close_failure_preserves_poison_when_monitor_wins`).
+
 ## Parked status hides a live gateway
 
 - Fork patch identity: `parked-status-live-gateway`.
