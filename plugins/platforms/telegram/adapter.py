@@ -20,10 +20,7 @@ from hermes_cli import setup_platforms
 
 logger = logging.getLogger(__name__)
 
-_POLLING_PROGRESS_UNSET = object()
-_POLLING_PROGRESS_GENERATION: ContextVar[object] = ContextVar(
-    "telegram_polling_progress_generation", default=_POLLING_PROGRESS_UNSET
-)
+_POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
 from agent.deadline import run_bounded_async
 from gateway.outbox import durable_control, durable_egress
@@ -2278,7 +2275,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(result, list) and result:
             self._updates_received_total += len(result)
 
-    def _wrap_polling_request(self, request):
+    def _instrument_polling_request(self, request):
         """Instrument one dedicated PTB getUpdates request with progress tracking.
 
         PTB request classes use ``__slots__`` (no ``__dict__`` on 3.13), so re-tag the instance to a thin ``__slots__ = ()``
@@ -2291,24 +2288,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         adapter = self
 
-        class _PollingRequest(type(request)):
+        class _InstrumentedPollingRequest(type(request)):
             __slots__ = ()
 
             async def do_request(self, *args, **kwargs):
-                context_generation = _POLLING_PROGRESS_GENERATION.get()
-                if context_generation is _POLLING_PROGRESS_UNSET:
-                    generation = (
-                        adapter._polling_generation
-                        if adapter._polling_progress_accepting
-                        else None
-                    )
-                else:
-                    generation = context_generation
+                generation = _POLLING_GENERATION_CONTEXT.get()
                 result = await super().do_request(*args, **kwargs)
                 adapter._observe_polling_request_result(self, generation, result)
                 return result
 
-        request.__class__ = _PollingRequest
+        request.__class__ = _InstrumentedPollingRequest
         return request
 
     async def _start_polling_once(
@@ -2325,15 +2314,15 @@ class TelegramAdapter(BasePlatformAdapter):
         def _generation_error_callback(error: Exception) -> None:
             if self._teardown_started or generation != self._polling_generation or error_callback is None:
                 return
-            callback_context_token = _POLLING_PROGRESS_GENERATION.set(None)
+            callback_context_token = _POLLING_GENERATION_CONTEXT.set(None)
             try:
                 error_callback(error)
             finally:
-                _POLLING_PROGRESS_GENERATION.reset(callback_context_token)
+                _POLLING_GENERATION_CONTEXT.reset(callback_context_token)
 
         # asyncio.wait_for can wait forever on httpcore/AnyIO shielded scopes; use the wall-deadline
         # helper and abandon the partial updater (caller rebuilds).
-        context_token = _POLLING_PROGRESS_GENERATION.set(generation)
+        context_token = _POLLING_GENERATION_CONTEXT.set(generation)
         try:
             await _await_with_thread_deadline(
                 app.updater.start_polling(
@@ -2341,7 +2330,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 timeout=_UPDATER_START_TIMEOUT,
                 on_abandon=((lambda app=app: _shutdown_abandoned_app(app)) if abandon_app_on_timeout else None))
         finally:
-            _POLLING_PROGRESS_GENERATION.reset(context_token)
+            _POLLING_GENERATION_CONTEXT.reset(context_token)
         if self._teardown_started:
             self._fence_polling()
             raise _PollingLifecycleAbort("Telegram polling teardown started")
@@ -3631,7 +3620,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if disable_fallback:
                 logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
             request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
-        return request, self._wrap_polling_request(get_updates_request)
+        return request, self._instrument_polling_request(get_updates_request)
 
     async def _initialize_app_with_retries(self, builder) -> None:
         """``app.initialize()`` with a bounded retry ladder; rebuilds ``self._app``/``self._bot`` from

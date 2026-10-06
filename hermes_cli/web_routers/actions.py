@@ -335,7 +335,7 @@ def _completed_exit_code(
         return result.get("exit_code")
     if durable_action_id:
         return 0
-    if receipt is not None and receipt.get("outcome") in ("success", "partial"):
+    if receipt is not None and receipt.get("outcome") in ("success", "partial", "failed", "refused"):
         # No in-memory result and no log marker (e.g. log rotated), but the
         # receipt proves a completed run: report its outcome rather than a
         # null clients time out on. ``partial`` maps to exit 1 like the CLI.

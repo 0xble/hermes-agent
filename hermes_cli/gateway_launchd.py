@@ -387,7 +387,8 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
     interpreter = (str(_gw().get_hermes_home() / "current" / ".venv" / "bin" / "python")
                    if release_target else None)
     command = _timestamped_stderr_gateway_command(
-        stderr_log, external_supervisor=True, interpreter=interpreter)
+        stderr_log, external_supervisor=True, interpreter=interpreter,
+        release_root=release_target)
     prog_args_xml = "\n        ".join(
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
     )

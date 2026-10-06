@@ -331,10 +331,6 @@ class GatewayInboundMixin:
                 logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
             else:
                 bind_turn(home, turn_id)
-        # A restore-queued event keeps its owned placeholder until it reaches
-        # this admission boundary, rather than losing it when a task is spawned.
-        if getattr(event, "_owned_local_pending", None) is not None:
-            event._owned_local_pending = None
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:

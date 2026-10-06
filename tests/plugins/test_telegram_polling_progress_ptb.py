@@ -135,16 +135,16 @@ async def test_real_base_request_bom_rejected_by_ptb_cannot_record_progress():
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
     adapter._polling_conflict_count = 3
-    request = adapter._wrap_polling_request(
+    request = adapter._instrument_polling_request(
         _EnvelopeRequest(b'\xef\xbb\xbf{"ok":true,"result":[]}')
     )
-    context_token = None
+    context_token = tg_adapter._POLLING_GENERATION_CONTEXT.set(generation)
 
     try:
         with pytest.raises(TelegramError, match="Invalid server response"):
             await request.post("https://api.telegram.org/bot-token/getUpdates")
     finally:
-        pass
+        tg_adapter._POLLING_GENERATION_CONTEXT.reset(context_token)
 
     assert not progress.is_set()
     assert adapter._polling_network_error_count == 4
@@ -158,15 +158,15 @@ async def test_real_base_request_ptb_replacement_decode_records_progress():
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
     adapter._polling_conflict_count = 3
-    request = adapter._wrap_polling_request(
+    request = adapter._instrument_polling_request(
         _EnvelopeRequest(b'{"ok":true,"result":[],"note":"\xff"}')
     )
-    context_token = None
+    context_token = tg_adapter._POLLING_GENERATION_CONTEXT.set(generation)
 
     try:
         result = await request.post("https://api.telegram.org/bot-token/getUpdates")
     finally:
-        pass
+        tg_adapter._POLLING_GENERATION_CONTEXT.reset(context_token)
 
     assert result == []
     assert progress.is_set()
@@ -190,8 +190,8 @@ async def test_real_base_request_unsuccessful_200_envelope_cannot_record_progres
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
     adapter._polling_conflict_count = 3
-    request = adapter._wrap_polling_request(_EnvelopeRequest(payload))
-    context_token = None
+    request = adapter._instrument_polling_request(_EnvelopeRequest(payload))
+    context_token = tg_adapter._POLLING_GENERATION_CONTEXT.set(generation)
 
     try:
         if missing_result:
@@ -202,7 +202,7 @@ async def test_real_base_request_unsuccessful_200_envelope_cannot_record_progres
                 "https://api.telegram.org/bot-token/getUpdates"
             ) == []
     finally:
-        pass
+        tg_adapter._POLLING_GENERATION_CONTEXT.reset(context_token)
 
     assert not progress.is_set()
     assert adapter._polling_network_error_count == 4
@@ -216,17 +216,17 @@ async def test_real_base_request_valid_success_envelope_records_progress():
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
     adapter._polling_conflict_count = 3
-    request = adapter._wrap_polling_request(
+    request = adapter._instrument_polling_request(
         _EnvelopeRequest(b'{"ok":true,"result":[]}')
     )
-    context_token = None
+    context_token = tg_adapter._POLLING_GENERATION_CONTEXT.set(generation)
 
     try:
         result = await request.post(
             "https://api.telegram.org/bot-token/getUpdates"
         )
     finally:
-        pass
+        tg_adapter._POLLING_GENERATION_CONTEXT.reset(context_token)
 
     assert result == []
     assert progress.is_set()
@@ -246,7 +246,7 @@ async def test_real_ptb_stop_cleanup_cannot_heal_recovery_generation():
         tg_adapter.Application.builder()
         .token("123456:test-token")
         .request(_GeneralRequest())
-        .get_updates_request(adapter._wrap_polling_request(polling_request))
+        .get_updates_request(adapter._instrument_polling_request(polling_request))
         .build()
     )
     adapter._app = app

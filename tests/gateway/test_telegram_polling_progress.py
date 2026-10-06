@@ -133,7 +133,12 @@ async def _cancel_task(task):
 
 async def _request_for_generation(generation, request, *args):
     """Run a direct request double under the production polling context."""
-    return await request.do_request(*args)
+    generation_context = tg_adapter._POLLING_GENERATION_CONTEXT
+    token = generation_context.set(generation)
+    try:
+        return await request.do_request(*args)
+    finally:
+        generation_context.reset(token)
 
 
 @pytest.mark.asyncio
@@ -353,7 +358,7 @@ async def test_current_polling_generation_success_records_progress():
     adapter._polling_network_error_count = 3
     request = _ControlledRequest(result=(200, b'{"ok":true,"result":[]}'))
 
-    instrumented = adapter._wrap_polling_request(request)
+    instrumented = adapter._instrument_polling_request(request)
     result = await _request_for_generation(
         generation, instrumented, "https://api.telegram.org/getUpdates"
     )
@@ -372,7 +377,7 @@ async def test_unsuccessful_polling_request_does_not_record_progress(error_type)
     adapter = _make_adapter()
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 3
-    request = adapter._wrap_polling_request(
+    request = adapter._instrument_polling_request(
         _ControlledRequest(error=error_type("request did not complete"))
     )
 
@@ -391,7 +396,7 @@ async def test_http_error_response_does_not_record_polling_progress():
     adapter = _make_adapter()
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 3
-    request = adapter._wrap_polling_request(
+    request = adapter._instrument_polling_request(
         _ControlledRequest(result=(500, b"bad"))
     )
 

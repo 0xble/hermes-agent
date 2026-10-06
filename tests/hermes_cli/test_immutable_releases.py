@@ -38,6 +38,70 @@ def test_archive_fallback_rejects_unsafe_members(tmp_path, monkeypatch):
     assert (tmp_path / "stage" / "safe" / "file").is_file()
 
 
+@pytest.mark.platforms("macos")
+def test_release_plist_executes_selected_release_with_managed_source_launcher(tmp_path, monkeypatch):
+    import plistlib
+    import shlex
+    import shutil
+    import venv
+    from hermes_cli import gateway, stderr_timestamp
+    from hermes_cli._launchers import resolve_store_python
+    from pm.environments import store_root
+
+    home = tmp_path / "profile"
+    source = tmp_path / "source"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", source)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: sys.executable)
+    runtime = store_root(source)
+    tool = runtime / "python-test" / "bin" / "python3"
+    tool.parent.mkdir(parents=True)
+    tool.symlink_to(sys.executable)
+    (runtime / "facts.json").write_text(json.dumps({"packages": {"python": {"entry": "python-test"}}}), encoding="utf-8")
+    assert resolve_store_python(source) == tool
+    launcher = source / ".hermes" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    output = home / "observed.json"
+    source_probe = f"import pathlib; pathlib.Path({str(output)!r}).write_text('source', encoding='utf-8')"
+    launcher.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, "-I", "-c", source_probe]) + "\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    normal = plistlib.loads(gateway.generate_launchd_plist().encode())
+    subprocess.run(normal["ProgramArguments"], check=True, timeout=30)
+    assert output.read_text(encoding="utf-8") == "source"
+
+    for marker in ("A", "B"):
+        root = home / "releases" / marker
+        _fake_release(root, marker)
+        (root / ".venv" / "bin" / "python").unlink()
+        venv.EnvBuilder(with_pip=False).create(root / ".venv")
+        package = root / "hermes_cli"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        shutil.copy2(stderr_timestamp.__file__, package / "stderr_timestamp.py")
+        (root / "hermes_bootstrap.py").write_text(
+            "import os,pathlib\n"
+            "pathlib.Path(os.environ['HERMES_HOME'], 'bootstrap-root').write_text(str(pathlib.Path(__file__).parent), encoding='utf-8')\n", encoding="utf-8")
+        (package / "main.py").write_text(
+            "import json,os,pathlib,sys\n"
+            "pathlib.Path(os.environ['HERMES_HOME'], 'observed.json').write_text(json.dumps({'root':str(pathlib.Path(__file__).parent.parent), 'python':sys.executable, 'argv':sys.argv[1:]}), encoding='utf-8')\n", encoding="utf-8")
+
+    for marker in ("A", "B", "A"):
+        candidate = home / "releases" / marker
+        releases.promote(home, candidate)
+        release = plistlib.loads(gateway.generate_launchd_plist(release_target=candidate).encode())
+        subprocess.run(release["ProgramArguments"], cwd=release["WorkingDirectory"],
+                       env={**os.environ, **release["EnvironmentVariables"]}, check=True, timeout=30)
+        observed = json.loads(output.read_text(encoding="utf-8"))
+        assert observed == {"root": str(candidate), "python": str(home / "current/.venv/bin/python"),
+                            "argv": ["gateway", "run", "--external-supervisor"]}
+        assert (home / "bootstrap-root").read_text(encoding="utf-8") == str(candidate)
+        assert release["EnvironmentVariables"]["PATH"].split(":")[0] == str(home / "current/.venv/bin")
+        unchanged_keys = normal.keys() - {"ProgramArguments", "WorkingDirectory", "EnvironmentVariables"}
+        assert {key: normal[key] for key in unchanged_keys} == {key: release[key] for key in unchanged_keys}
+
+
 def _fake_release(path: Path, marker: str, *, lock: str = "same") -> None:
     path.mkdir(parents=True)
     (path / "pyproject.toml").write_text(f"[project]\nname='hermes-{marker}'\n")
