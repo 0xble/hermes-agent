@@ -786,7 +786,7 @@ gateway:
     stopped_before_finishing: "⚠️ J'ai dû m'arrêter avant de terminer{reason}. Utilisez /retry pour réessayer, ou /compress si cette conversation est devenue très longue."
     no_response: "⚠️ Le traitement s'est terminé mais aucune réponse n'a été générée. Il s'agit peut-être d'une erreur passagère — essayez de renvoyer votre message."
     previous_turn_cleanup: "⚠️ Votre message n'a pas été traité (le tour précédent était encore en cours de nettoyage). Veuillez le renvoyer."
-    unexpected_silence: "⚠️ Le modèle n'a renvoyé qu'un marqueur de silence pour un message qui attendait une réponse. Réessayez ou reformulez."
+    unexpected_silence: "⚠️ Aucune réponse n'a été écrite pour ce message. Renvoyez-le si vous attendiez une réponse."
     empty_response_model_label: "Le modèle"
     hint_auth: " Votre connexion au service de modèle IA a expiré ou la clé API est incorrecte. Utilisez /login ici, ou lancez `{relogin}` sur l'hôte."
     hint_quota: " Le solde ou le quota de votre service de modèle IA est épuisé. Rechargez-le sur le site du service, ou utilisez /model pour changer de modèle."
