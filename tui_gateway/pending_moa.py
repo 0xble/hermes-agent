@@ -70,15 +70,15 @@ def get(session: dict, token: str) -> dict | None:
         return record if isinstance(record, dict) else None
 
 
-def restore_snapshot(session: dict) -> dict:
-    """Capture the standing runtime identity when a deferred MoA turn is claimed.
+def restore_snapshot(session: dict, *, agent: Any) -> dict:
+    """Capture the standing runtime identity from the process that owns the agent.
 
     Queue acceptance can happen inside a ``/model --once`` turn, while that turn's
     temporary model is still installed. Claiming happens at the next-turn boundary,
     after ``_TurnRun.one_turn_restore`` has reinstated the standing model, so the
-    snapshot belongs here rather than at ``/moa`` acceptance.
+    snapshot belongs here rather than at ``/moa`` acceptance. Compute-host sessions
+    call this in the child, because the parent deliberately has no live agent.
     """
-    agent = session.get("agent")
     return {
         "override": session.get("model_override"),
         "model": getattr(agent, "model", None),

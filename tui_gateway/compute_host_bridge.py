@@ -57,10 +57,10 @@ def _compute_host_turn_frame(
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
-    pending_record = (
-        pending_moa.claim(session, queue_token, restore=pending_moa.restore_snapshot(session))
-        if queue_token else None
-    )
+    pending_record = None
+    if queue_token:
+        record = pending_moa.get(session, queue_token)
+        pending_record = dict(record) if isinstance(record, dict) else None
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,

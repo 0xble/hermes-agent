@@ -779,7 +779,10 @@ def _cmd_moa(rid, params, session, name, arg):
         # is after any completed one-turn restore and before applying the MoA model.
         record = pending_moa.create(session, preset=preset, restore={}, prompt=arg)
         queue_token = record["token"]
-        pending_moa.claim(session, queue_token, restore=pending_moa.restore_snapshot(session))
+        pending_moa.claim(
+            session, queue_token,
+            restore=pending_moa.restore_snapshot(session, agent=agent),
+        )
         session["_active_moa_token"] = queue_token
         if agent is not None:
             try:  # persist_override=False: turn-scoped, never persist the MoA provider to config.yaml

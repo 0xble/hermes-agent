@@ -143,20 +143,90 @@ def test_missing_token_drops_prompt_with_visible_notice(monkeypatch):
     assert "prompt dropped" in events[-1][2]["message"]
 
 
-def test_compute_host_frame_carries_claimed_server_record():
+def test_compute_host_frame_carries_unclaimed_server_record():
     token = "host-moa"
     session = _session(running=False)
-    session.update({"history_lock": RLock(), "session_key": "session-key", "history": []})
+    session.update({"agent": None, "history_lock": RLock(), "session_key": "session-key", "history": []})
     session["pending_moa"] = {token: {
         "token": token, "prompt": "compare answers", "preset": "default", "status": "pending",
-        "restore": {"override": None, "model": "gpt-4", "provider": "openai"},
+        "restore": {},
     }}
 
     frame = server._compute_host_turn_frame("r1", "sid", session, "compare answers", queue_token=token)
 
     assert frame["pending_moa_record"]["token"] == token
-    assert session["pending_moa"][token]["status"] == "claimed"
+    assert session["pending_moa"][token]["status"] == "pending"
     assert frame["pending_moa_record"]["preset"] == "default"
+
+
+def test_compute_host_moa_restore_uses_child_pinned_agent(monkeypatch):
+    token = "host-pinned-moa"
+    parent = _session(running=False)
+    parent.update({"agent": None, "history_lock": RLock(), "session_key": "session-key", "history": []})
+    parent["pending_moa"] = {token: {
+        "token": token, "prompt": "compare answers", "preset": "default", "status": "pending",
+        "restore": {},
+    }}
+    frame = server._compute_host_turn_frame("r1", "sid", parent, "compare answers", queue_token=token)
+
+    child_agent = SimpleNamespace(model="pinned-model", provider="pinned-provider")
+    child = {
+        "agent": child_agent,
+        "model_override": {"model": "pinned-model", "provider": "pinned-provider"},
+        "pending_moa": {},
+    }
+    pending_moa.install(child, frame["pending_moa_record"])
+    calls = []
+
+    def apply(_sid, _session, raw, **kwargs):
+        calls.append(raw)
+        if "--provider moa" in raw:
+            child_agent.model, child_agent.provider = "default", "moa"
+        else:
+            child_agent.model, child_agent.provider = "pinned-model", "pinned-provider"
+
+    monkeypatch.setattr(server, "_apply_model_switch", apply)
+    assert server._apply_pending_moa("sid", child, "compare answers", token) is True
+    assert child["pending_moa"][token]["restore"] == {
+        "override": {"model": "pinned-model", "provider": "pinned-provider"},
+        "model": "pinned-model", "provider": "pinned-provider",
+    }
+    assert (child_agent.model, child_agent.provider) == ("default", "moa")
+
+    server._restore_moa_one_shot("sid", child)
+    assert calls == ["default --provider moa", "pinned-model --provider pinned-provider"]
+    assert (child_agent.model, child_agent.provider) == ("pinned-model", "pinned-provider")
+
+
+def test_compute_host_moa_restore_uses_child_default_agent_without_pin(monkeypatch):
+    token = "host-default-moa"
+    parent = _session(running=False)
+    parent.update({"agent": None, "model_override": None, "history_lock": RLock(),
+                   "session_key": "session-key", "history": []})
+    parent["pending_moa"] = {token: {
+        "token": token, "prompt": "compare answers", "preset": "default", "status": "pending",
+        "restore": {},
+    }}
+    frame = server._compute_host_turn_frame("r1", "sid", parent, "compare answers", queue_token=token)
+
+    child_agent = SimpleNamespace(model="default-model", provider="default-provider")
+    child = {"agent": child_agent, "pending_moa": {}}
+    pending_moa.install(child, frame["pending_moa_record"])
+
+    def apply(_sid, _session, raw, **kwargs):
+        if "--provider moa" in raw:
+            child_agent.model, child_agent.provider = "default", "moa"
+        else:
+            child_agent.model, child_agent.provider = "default-model", "default-provider"
+
+    monkeypatch.setattr(server, "_apply_model_switch", apply)
+    assert server._apply_pending_moa("sid", child, "compare answers", token) is True
+    assert child["pending_moa"][token]["restore"]["model"] == "default-model"
+    assert child["pending_moa"][token]["restore"]["provider"] == "default-provider"
+
+    server._restore_moa_one_shot("sid", child)
+    assert (child_agent.model, child_agent.provider) == ("default-model", "default-provider")
+    assert "model_override" not in child
 
 
 def test_cancel_all_marks_pending_and_claimed_records_cancelled():
