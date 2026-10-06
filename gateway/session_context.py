@@ -179,6 +179,17 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def bound_session_env(name: str, default: str = "") -> str:
+    """Like :func:`get_session_env`, but for identity that crosses a trust boundary: once any
+    session has been bound in this process the ContextVar is authoritative and an unbound var is
+    *default*, because ``os.environ`` then mirrors whichever concurrent turn wrote last. A process
+    that never bound one (plain CLI) has a single session, so its ``os.environ`` mirror is used."""
+    var = _VAR_MAP[name]
+    if (value := var.get()) is not _UNSET:
+        return value
+    return default if _session_context_engaged else os.getenv(name, default)
+
+
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/
 # desktop bind HERMES_SESSION_SOURCE, so both are consulted).  Default-deny: an unrecognized
 # identity counts as messaging.  Mirrors LOCAL_SESSION_SOURCE_IDS in apps/desktop session-source.ts.

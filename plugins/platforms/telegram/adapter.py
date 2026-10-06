@@ -26,6 +26,8 @@ from gateway.deadline import detached_context
 from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
+from plugins.platforms.telegram.chat_budget import (
+    KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -150,7 +152,7 @@ from agent.i18n import get_language, t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
-    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, in_ingress_consumer,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -200,14 +202,20 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # — a 97-minute penalty on the boot path froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
 
-# Shared per-chat outbound budget (#116312): Telegram counts an editMessageText against the
-# SAME per-chat allowance as a sendMessage, but streaming previews used to pace only edits at
-# DEFAULT_STREAMING_EDIT_INTERVAL = 0.8s (1.25 msg/s into one chat before any reply was sent)
-# — that was 83% of measured flood penalties.  One shared slot per chat: a SEND waits for its
-# slot (skipping a send would drop a message), an INTERIM edit is skipped (the next tick shows
-# the same text anyway), and the FINAL edit is never gated (the answer itself is never
-# withheld).  Tunable: validated in production by the issue reporter at 0 flood events.
-_TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0
+# Shared per-chat outbound budget (#116312, #107612): Telegram counts every Bot API call to a chat
+# against ONE per-chat allowance. The clock lives in chat_budget.py and is installed at PTB's request
+# layer, so sends, interim and final edits, typing, drafts, deletions, topic edits and reactions all
+# spend the same slot (sized 45/min private, 15/min group). Here: a SEND waits for its slot outside
+# its transport deadline, an INTERIM edit is skipped when the slot is busy (the next tick shows newer
+# text), and a FINAL edit waits for its slot (never withheld, never unmetered).
+
+
+def _loop_clock() -> float:
+    """The adapter's budget runs on loop time, like its flood windows (monotonic either way)."""
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return time.monotonic()
 
 
 def _flood_cap_result(wait: float) -> "SendResult":
@@ -791,6 +799,10 @@ _POLLING_STALL_TIMEOUT = 150.0
 # that PTB's dispatcher ever handed the fetched updates to a handler. Two heartbeats (180s) with a
 # backlog and no dispatch progress: diagnostic only, never drives recovery (#71240 owns that).
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 2
+# A reconnect can start while the failed generation's in-process poller is still stopping (its stop
+# waits for the outstanding long poll, up to the poll timeout plus one second). Waiting for that
+# release costs seconds; refusing costs the reconnect ladder's 30s backoff.
+_POLLER_RELEASE_WAIT_SECONDS = 25.0
 # sendVideo transcodes before answering, outlasting the 20s read timeout; also how long a user waits
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
@@ -2169,6 +2181,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # update_queue, so old dispatches can briefly exceed received; the check treats that as no backlog.
         self._updates_received_total = self._updates_dispatched_total = 0
         self._ingress_dispatched_seen = self._ingress_stalled_heartbeats = 0
+        self._polling_pending_dispatched_seen = None
         return self._polling_generation, self._polling_progress_event
 
     def _record_polling_progress(self, generation: int) -> bool:
@@ -2929,8 +2942,21 @@ class TelegramAdapter(BasePlatformAdapter):
         except (asyncio.TimeoutError, OSError):
             return  # connectivity symptom for the get_me() path, not a stuck-queue signal
         pending = int(getattr(info, "pending_update_count", 0) or 0)
+        dispatched = getattr(self, "_updates_dispatched_total", 0)
+        seen = getattr(self, "_polling_pending_dispatched_seen", None)
+        progressed = seen is not None and dispatched != seen
+        self._polling_pending_dispatched_seen = dispatched
         if pending <= 0:
             self._polling_pending_stuck_count = 0
+            return
+        if progressed:
+            # Telegram counts the batch being handled as pending until the next getUpdates confirms its
+            # offset, and the controlled poller does not poll again until that batch drains. So a probe
+            # landing while any handler runs sees a backlog. Only a backlog with no update dispatched
+            # since the previous probe is a stuck consumer: start a new window at this probe.
+            self._polling_pending_stuck_count = 1
+            logger.debug("[%s] Telegram polling heartbeat: %d update(s) pending while dispatch progresses",
+                         self.name, pending)
             return
         self._polling_pending_stuck_count += 1
         logger.warning(
@@ -3950,7 +3976,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             from gateway.config import load_gateway_config
             from gateway.generation import GenerationCoordinator, overlap_handover_enabled
-            from plugins.platforms.telegram.polling_transfer import PollingJournal, token_has_active_poller
+            from plugins.platforms.telegram.polling_transfer import PollingJournal, wait_for_poller_release
             from hermes_constants import get_routing_process_hermes_home
             overlap_enabled = overlap_handover_enabled(load_gateway_config())
             webhook_url = (_get_scoped_secret("TELEGRAM_WEBHOOK_URL") or "").strip()
@@ -3962,7 +3988,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 PollingJournal, GenerationCoordinator(get_routing_process_hermes_home()), self.config.token)
                 if overlap_enabled and not webhook_url else None)
             if (not polling_standby and self._controlled_journal is not None
-                    and token_has_active_poller(self._controlled_journal.token_hash)):
+                    and not await wait_for_poller_release(self._controlled_journal.token_hash,
+                                                          _POLLER_RELEASE_WAIT_SECONDS)):
                 raise RuntimeError("old Telegram poller still owns this token")
             if not polling_standby and not await self._acquire_polling_token_lock():
                 return False
@@ -3981,6 +4008,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info("[%s] Using Telegram local_mode (read files from disk)", self.name)
             request, get_updates_request = await self._build_ptb_requests()
             builder = builder.request(request).get_updates_request(get_updates_request)
+            # Every request to a chat (raw do_api_request included) spends that chat's one budget.
+            # PTB builder setters mutate in place, so the rebuild-on-retry path keeps the limiter.
+            builder.rate_limiter(self._chat_rate_limiter())
             self._app = builder.build()
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
@@ -4402,10 +4432,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     # coroutine open for. Sleeping the server value verbatim pinned send() for 97 minutes in
                     # production and froze inbound on every platform when it ran on the gateway boot path
                     # (#91969).
-                    if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
+                    if wait > self._flood_inline_wait_cap(chat_id):
                         logger.warning(
                             "[%s] Telegram flood control on send (retry_after=%.1fs > %.0fs); failing closed instead of sleeping: %s",
-                            self.name, wait, _FLOOD_INLINE_WAIT_CAP_SECS, safe_send_error)
+                            self.name, wait, self._flood_inline_wait_cap(chat_id), safe_send_error)
                         return self._record_send_flood_cooldown(chat_id, wait)
                     if _send_attempt < 2:
                         logger.warning(
@@ -4729,8 +4759,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return _flood_cap_result(_edit_cooldown)
         # Shared per-chat budget (#116312): an interim (preview) edit is SKIPPED when the slot is busy —
         # the text it would show is shown by the next edit anyway, so a burst of edits can't trip flood
-        # control. A final edit is never gated (the completed answer is always delivered). Sends wait for
-        # their slot; edits defer instead. Over-cap interim edits are exempt: the saturated-preview dedup
+        # control. A final edit is never skipped (the completed answer is always delivered) but waits
+        # for its slot below. Over-cap interim edits are exempt: the saturated-preview dedup
         # below already throttles them to one real edit per ~4096-char growth. Consumed only when the
         # edit actually fires. The skip is flagged in raw_response so the stream consumer does not
         # record never-shown text as the visible prefix (a later flood fallback would then drop the
@@ -4738,12 +4768,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if (
             not finalize
             and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
-            and self._chat_outbound_slot_remaining(chat_id) > 0
+            and self._chat_budget().interim_blocked(chat_id)
         ):
             logger.debug(
                 "[%s] skipping interim edit for chat %s (shared send+edit budget: slot busy)",
                 self.name, chat_id)
             return SendResult(success=True, message_id=message_id, raw_response={"skipped": True})
+        # Final and over-cap edits are never skipped, but they are metered: wait for the slot here,
+        # under the chat lock and outside the transport deadline, instead of firing past the budget.
+        _edit_wait = self._chat_outbound_slot_remaining(chat_id)
+        if _edit_wait > 0:
+            await asyncio.sleep(_edit_wait)
+            _edit_cooldown = self._send_flood_cooldown_remaining(chat_id)
+            if _edit_cooldown is not None:
+                return _flood_cap_result(_edit_cooldown)
+        if not finalize:
+            self._chat_budget().note_interim(chat_id)
         self._hold_chat_outbound_slot(chat_id)
         # Rich finalize (Bot API 10.1): edit the preview IN PLACE via rich_message — no fresh send + delete.
         # Before the 4,096 pre-flight because the rich cap is 32,768; falls back to legacy on rejection.
@@ -4813,11 +4853,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # to a normal final send instead of a clipped partial.
             wait = _telegram_retry_after(e)
             if wait is not None:
-                if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
+                if wait > self._flood_inline_wait_cap(chat_id):
                     # Log AFTER the cap check: "waiting 33.0s" followed by no wait misled an investigation.
                     logger.warning(
                         "[%s] Telegram flood control, refusing edit (retry_after %.1fs > %.0fs inline cap)",
-                        self.name, wait, _FLOOD_INLINE_WAIT_CAP_SECS)
+                        self.name, wait, self._flood_inline_wait_cap(chat_id))
                     # Arm the shared window: an edit refusal proves the chat is penalised, and the
                     # very next send would otherwise spend another request discovering the same thing.
                     return self._record_send_flood_cooldown(chat_id, wait)
@@ -4985,6 +5025,39 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
             return False
+
+    async def delete_messages(self, chat_id: str, message_ids: List[str]) -> Dict[str, bool]:
+        """Batch ``deleteMessages`` (up to 100 ids per request): end-of-turn cleanup spends one slot of
+        the chat's budget instead of one per bubble. Telegram skips ids it cannot delete, so success
+        is per batch. A flood refusal keeps every id (and its status-cache owner) for a later retry;
+        any other batch failure falls back to single deletes, which report per id."""
+        ids = [str(mid) for mid in dict.fromkeys(message_ids)]
+        results: Dict[str, bool] = {mid: False for mid in ids}
+        if not ids:
+            return results
+        if not self._bot:
+            live = self._replacement_telegram_adapter()
+            return await live.delete_messages(chat_id, ids) if live is not None else results
+        if not hasattr(self._bot, "delete_messages"):
+            return await super().delete_messages(chat_id, ids)
+        for start in range(0, len(ids), 100):
+            batch = ids[start:start + 100]
+            try:
+                await call_with_flood_guard(self, chat_id, lambda batch=batch: self._bot.delete_messages(
+                    chat_id=normalize_telegram_chat_id(chat_id), message_ids=[int(mid) for mid in batch]))
+            except FloodRefusal as e:
+                logger.debug("[%s] Batch delete deferred by flood control (%.0fs)", self.name, e.retry_after)
+                return results
+            except Exception as e:
+                logger.debug("[%s] Batch delete of %d messages failed, deleting singly: %s", self.name, len(batch),
+                             _redact_telegram_error_text(e))
+                for mid in batch:
+                    results[mid] = await self.delete_message(chat_id, mid)
+                continue
+            for mid in batch:
+                self._forget_status_message(chat_id, mid)
+                results[mid] = True
+        return results
 
     def supports_draft_streaming(self, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """sendMessageDraft works for private chats only (Bot API 9.5) and needs PTB >= 22.6; groups and
@@ -6102,7 +6175,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     wait = _telegram_retry_after(err)
                     if wait is None:
                         raise
-                    if wait > _FLOOD_INLINE_WAIT_CAP_SECS or attempt:
+                    if wait > self._flood_inline_wait_cap(chat_id) or attempt:
                         logger.warning(
                             "[%s] Telegram flood control on %s upload (retry_after=%.1fs); failing closed so the "
                             "delivery ledger owns the wait", self.name, media_label, wait)
@@ -6575,6 +6648,8 @@ class TelegramAdapter(BasePlatformAdapter):
         wait = float(wait)
         if not math.isfinite(wait) or wait <= 0:
             wait = 1.0
+        # Any published retry_after means the chat is near its ceiling: widen its gap for a while.
+        self._chat_budget().note_retry_after(key, wait)
         until[key] = max(until.get(key, 0.0), now + wait)
         profile_dir = getattr(self, "_update_receipt_dir", None)
         if profile_dir is not None:
@@ -6621,30 +6696,49 @@ class TelegramAdapter(BasePlatformAdapter):
         until.pop(key, None)
         return None
 
-    # --- shared per-chat send+edit pacing budget (#116312) -----------------------------------------
-    # One slot per chat that sendMessage AND editMessageText both draw from (Telegram counts them
-    # against the same per-chat allowance).  ``_telegram_chat_outbound_slot_until`` maps the
-    # normalized chat id to the loop-time when the next outbound call may fire.
+    # --- shared per-chat outbound budget (#116312, #107612) ---------------------------------------
+    # One clock per chat (chat_budget.py) that EVERY Bot API call to the chat draws from. The live
+    # bot meters requests itself through ChatBudgetRateLimiter; the adapter's own calls below only
+    # pre-wait (so pacing never eats a transport deadline) and charge the slot directly when the
+    # bot is not metered (bare/test bots).
+
+    def _chat_budget(self) -> ChatOutboundBudget:
+        """This adapter's per-chat budget; ``_telegram_chat_outbound_slot_secs`` overrides the base gap."""
+        override = self.__dict__.get("_telegram_chat_outbound_slot_secs")
+        budget = self.__dict__.get("_telegram_chat_budget")
+        if budget is None:
+            budget = self.__dict__["_telegram_chat_budget"] = ChatOutboundBudget(
+                gap_override=None if override is None else float(override), clock=_loop_clock)
+        else:
+            budget._gap_override = None if override is None else float(override)
+        return budget
+
+    def _chat_rate_limiter(self) -> ChatBudgetRateLimiter:
+        """The PTB request-layer gate sharing this adapter's budget and durable flood deadline."""
+        limiter = self.__dict__.get("_telegram_chat_rate_limiter")
+        if limiter is None:
+            limiter = self.__dict__["_telegram_chat_rate_limiter"] = ChatBudgetRateLimiter(
+                self._chat_budget(),
+                penalty_remaining=self._send_flood_cooldown_remaining,
+                on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait))
+        return limiter
+
+    def _flood_inline_wait_cap(self, chat_id: Any) -> float:
+        """Longest server ``retry_after`` slept inline. Floored at the chat's own routine gap so a
+        group's (or a penalised chat's) ordinary spacing is waited out, never surfaced as a flood error."""
+        return max(_FLOOD_INLINE_WAIT_CAP_SECS, self._chat_budget().gap(chat_id))
+
+    def _bot_meters_chat_budget(self) -> bool:
+        return isinstance(getattr(self._bot, "rate_limiter", None), ChatBudgetRateLimiter)
 
     def _chat_outbound_slot_remaining(self, chat_id: Any) -> float:
-        """Seconds until this chat's shared send+edit slot is open again (0 = may fire now)."""
-        slot_until: Dict[str, float] = self.__dict__.setdefault("_telegram_chat_outbound_slot_until", {})
-        key = str(normalize_telegram_chat_id(chat_id))
-        deadline = slot_until.get(key)
-        if deadline is None:
-            return 0.0
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            slot_until.pop(key, None)  # expired — bounded dict, like the send locks
-            return 0.0
-        return remaining
+        """Seconds until this chat's shared outbound slot is open again (0 = may fire now)."""
+        return self._chat_budget().remaining(chat_id)
 
     def _hold_chat_outbound_slot(self, chat_id: Any) -> None:
-        """Arm/re-arm this chat's slot after an actual send/edit API call fires."""
-        slot_until: Dict[str, float] = self.__dict__.setdefault("_telegram_chat_outbound_slot_until", {})
-        budget = getattr(self, "_telegram_chat_outbound_slot_secs", _TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS)
-        slot_until[str(normalize_telegram_chat_id(chat_id))] = (
-            asyncio.get_running_loop().time() + max(0.0, budget))
+        """Charge the slot for a call about to fire, unless the bot's request layer charges it."""
+        if not self._bot_meters_chat_budget():
+            self._chat_budget().reserve(chat_id)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
@@ -6654,6 +6748,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 await live.send_typing(chat_id, metadata)
             return
         key = str(normalize_telegram_chat_id(chat_id))
+        # Typing is cosmetic: one chat-wide budget for every session's loop, shed (never queued)
+        # when the chat's slot or its typing share is spent.
+        if self._chat_budget().typing_blocked(key):
+            return
         lock = self.__dict__.get("_telegram_chat_send_locks", {}).get(key)
         owner = self.__dict__.get("_telegram_chat_send_lock_owners", {}).get(key)
         if lock is not None and lock.locked() and owner is not asyncio.current_task():
@@ -6670,6 +6768,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # like any other: spending it during a penalty risks lengthening the penalty that is already
         # delaying a real answer, and a typing bubble is never worth that.
         if self._send_flood_cooldown_remaining(chat_id) is not None:
+            return
+        # A metered bot sheds at the request layer; a bare bot claims the typing share here.
+        if not self._bot_meters_chat_budget() and not self._chat_budget().try_take(chat_id, KIND_TYPING):
             return
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
@@ -7435,11 +7536,19 @@ class TelegramAdapter(BasePlatformAdapter):
                 kind=t(_MEDIA_KIND_KEYS[kind]) if kind in _MEDIA_KIND_KEYS else kind,
                 name=named, error=exc.__class__.__name__))
             if notice:
-                try:
-                    self._accept_update()
-                    await msg.reply_text(notice)
-                except Exception as reply_err:
-                    logger.warning("[Telegram] Failed to notify user about %s cache failure: %s", kind, reply_err, exc_info=True)
+                self._accept_update()
+
+                async def notify() -> None:
+                    try:
+                        await msg.reply_text(notice)
+                    except Exception as reply_err:
+                        logger.warning("[Telegram] Failed to notify user about %s cache failure: %s", kind, reply_err,
+                                       exc_info=True)
+
+                if in_ingress_consumer():
+                    self.spawn_ingress_reply(notify(), label="media retry notice")
+                else:
+                    await notify()
             # The agent-visible note is execution evidence, not a channel diagnostic; it stays in both modes.
             event.text = self._append_observed_note(
                 event.text,

@@ -180,6 +180,8 @@ gateway:
     label_normal: "NORMAL"
     status_fast: "hızlı"
     status_normal: "normal"
+    status_expiring: "\n\n⏱ Şu sürede sona erer: {remaining}"
+    expired: "⚡ Hızlı mod {duration} sonra kapatıldı."
     picker_title: "⚡ **Priority Processing**\\n\\nMevcut mod: `{mode}`\\n\\nBir seçenek seçin:"
     choice_fast: "fast — Priority Processing açık"
     choice_normal: "normal — standart işleme"

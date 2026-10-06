@@ -180,6 +180,8 @@ gateway:
     label_normal: "一般"
     status_fast: "快速"
     status_normal: "一般"
+    status_expiring: "\n\n⏱ 將於 {remaining}到期"
+    expired: "⚡ 快速模式已在 {duration} 後關閉。"
     picker_title: "⚡ **Priority Processing**\\n\\n目前模式：`{mode}`\\n\\n請選擇："
     choice_fast: "fast — 開啟 Priority Processing"
     choice_normal: "normal — 標準處理"
