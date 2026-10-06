@@ -1735,6 +1735,12 @@ class GatewayStartupMixin:
             recover_pending_shutdown_flush(self, candidates=candidates)
         except Exception:
             logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
+        # Startup recovery is the crash-before-send path: post any missing note now that adapters are connected.
+        # The durable row/id latch makes this safe after repeated boots and partial shutdown passes.
+        if candidates:
+            await self._send_interrupted_turn_notes(
+                [entry.session_key for entry in candidates], reclaim_pending=True,
+            )
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions(candidates=candidates)

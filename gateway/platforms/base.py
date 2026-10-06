@@ -4679,11 +4679,62 @@ class BasePlatformAdapter(ABC):
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
 
+    async def _reconcile_restart_note(
+        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
+    ) -> Optional[SendResult]:
+        """Replace the durable restart note with the resumed answer, falling back to delete+send."""
+        if not getattr(event, "internal", False) or getattr(event, "_restart_note_reconciled", False):
+            return None
+        store = getattr(self.gateway_runner, "async_session_store", None)
+        get_note = getattr(store, "get_restart_note", None)
+        if not callable(get_note):
+            return None
+        note = await get_note(session_key)
+        note_id = note[3] if note else None
+        if not note_id:
+            return None
+        event._restart_note_reconciled = True
+        edit = getattr(self, "edit_message", None)
+        result = None
+        if callable(edit):
+            try:
+                result = await edit(
+                    chat_id=event.source.chat_id, message_id=str(note_id), content=text_content,
+                    finalize=True, metadata=metadata,
+                )
+            except TypeError:
+                try:
+                    result = await edit(
+                        chat_id=event.source.chat_id, message_id=str(note_id), content=text_content,
+                        finalize=True,
+                    )
+                except Exception:
+                    result = None
+            except Exception:
+                result = None
+        if result is not None and getattr(result, "success", False):
+            await store.clear_restart_note(session_key)
+            return result
+        deleted = False
+        delete = getattr(self, "delete_message", None)
+        if callable(delete):
+            try:
+                deleted = bool(await delete(event.source.chat_id, str(note_id)))
+            except Exception:
+                deleted = False
+        if deleted:
+            await store.clear_restart_note(session_key)
+        return None
+
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable,
         attachments_pending: bool = False) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
+        restart_result = await self._reconcile_restart_note(event, session_key, text_content, metadata)
+        if restart_result is not None:
+            record_delivery(restart_result)
+            return
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,

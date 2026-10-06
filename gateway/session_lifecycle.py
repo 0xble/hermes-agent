@@ -123,12 +123,13 @@ class SessionLifecycleMixin:
         """
         return self._update_entry(session_key, lambda e: setattr(e, "suspended", True))
 
-    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at) -> None:
+    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at, *, human: bool = True) -> None:
         """Persist the active-turn pair BEFORE publishing it in memory, so a failed write can
         neither leak an unowned token nor drop a live one. Lock held."""
         candidate = entry.to_dict()
         candidate["active_turn_token"] = token
         candidate["active_turn_started_at"] = _iso(started_at)
+        candidate["active_turn_human"] = bool(human)
         touched = _now() if started_at is not None else None
         if touched is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
@@ -137,10 +138,11 @@ class SessionLifecycleMixin:
         self._save_entry(session_key, entry_data=candidate, lock_held=True)
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at
+        entry.active_turn_human = bool(human)
         if touched is not None:
             entry.updated_at = touched
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(self, session_key: str, *, human: bool = True) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
         unwind cannot clear a newer turn."""
@@ -151,7 +153,7 @@ class SessionLifecycleMixin:
                 return None
             # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
             # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
-            self._set_turn_marker_locked(session_key, entry, token, datetime.now(timezone.utc))
+            self._set_turn_marker_locked(session_key, entry, token, datetime.now(timezone.utc), human=human)
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
@@ -189,6 +191,9 @@ class SessionLifecycleMixin:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.resume_marker_token = uuid.uuid4().hex
+                    entry.resume_turn_id = entry.active_turn_token
+                    entry.resume_human = bool(entry.active_turn_human)
+                    entry.restart_note_message_id = None
                     entry.last_resume_marked_at = now  # freshness starts at discovery
                     promoted += 1
             entry.active_turn_token = None
@@ -208,16 +213,26 @@ class SessionLifecycleMixin:
             return True
         return self._update_all_entries_locked(_discard, exclude_session_keys=exclude_session_keys)
 
-    def mark_resume_pending(self, session_key: str, reason: str = "restart_timeout") -> bool:
+    def mark_resume_pending(
+        self, session_key: str, reason: str = "restart_timeout", *,
+        turn_id: Optional[str] = None, human: bool = True,
+    ) -> bool:
         """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
-        unlike ``suspend_session``). True if marked."""
+        unlike ``suspend_session``). A repeated shutdown pass for the same durable turn preserves
+        its marker token and note id so it cannot post a duplicate note."""
         def _apply(entry: SessionEntry):
             if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
                 return False
+            same_turn = bool(turn_id and entry.resume_pending and entry.resume_turn_id == turn_id)
             entry.resume_pending = True
             entry.resume_reason = reason
-            entry.resume_marker_token = uuid.uuid4().hex
-            entry.last_resume_marked_at = _now()
+            entry.resume_human = bool(human)
+            if not same_turn:
+                entry.resume_marker_token = uuid.uuid4().hex
+                entry.resume_turn_id = turn_id
+                entry.restart_note_message_id = None
+            if not same_turn:
+                entry.last_resume_marked_at = _now()
         return self._update_entry(session_key, _apply)
 
     def get_resume_pending_marker(self, session_key: str) -> Optional[tuple]:
@@ -227,6 +242,78 @@ class SessionLifecycleMixin:
             if entry is None or not entry.resume_pending:
                 return None
             return (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+
+    def claim_restart_note(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+        reclaim_pending: bool = False,
+    ) -> bool:
+        """Atomically reserve the current turn's note send before touching the network."""
+        def _apply(entry: SessionEntry):
+            if not entry.resume_pending:
+                return False
+            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            if expected_marker is not None and expected_marker != current:
+                return False
+            existing = entry.restart_note_message_id
+            if existing and not (reclaim_pending and str(existing).startswith("pending:")):
+                return False
+            entry.restart_note_message_id = f"pending:{entry.resume_marker_token or uuid.uuid4().hex}"
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def release_restart_note_claim(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
+        """Release a pre-send note reservation when no message was accepted by the adapter."""
+        def _apply(entry: SessionEntry):
+            claim = entry.restart_note_message_id
+            if not claim or not str(claim).startswith("pending:"):
+                return False
+            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            if expected_marker is not None and expected_marker != current:
+                return False
+            entry.restart_note_message_id = None
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def set_restart_note_message_id(
+        self, session_key: str, message_id: str, *, expected_marker: Optional[tuple] = None,
+    ) -> bool:
+        """Persist the visible interruption note id exactly once for the current resume marker."""
+        def _apply(entry: SessionEntry):
+            if not entry.resume_pending:
+                return False
+            existing = entry.restart_note_message_id
+            if existing and not str(existing).startswith("pending:"):
+                return False
+            if expected_marker is not None and expected_marker != (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            ):
+                return False
+            entry.restart_note_message_id = str(message_id)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def get_restart_note(self, session_key: str) -> Optional[tuple]:
+        """Return ``(session_id, marker_token, marked_at, message_id)`` for note reconciliation."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or not entry.resume_pending:
+                return None
+            return (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+                entry.restart_note_message_id,
+            )
+
+    def clear_restart_note(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
+        """Clear the note id after its resumed answer was edited or replaced."""
+        def _apply(entry: SessionEntry):
+            if not entry.restart_note_message_id:
+                return False
+            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            if expected_marker is not None and expected_marker != current:
+                return False
+            entry.restart_note_message_id = None
+            entry.resume_turn_id = None
+        return self._update_entry(session_key, _apply)
 
     def clear_resume_pending(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
         """Clear the resume-pending flag after a successful resumed turn; True if cleared."""
@@ -240,8 +327,11 @@ class SessionLifecycleMixin:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.resume_marker_token = None
+            entry.resume_turn_id = None
+            entry.resume_human = True
             entry.last_resume_marked_at = None
         return self._update_entry(session_key, _apply)
+
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop routing entries idle (by ``updated_at``) for more than max_age_days; suspended

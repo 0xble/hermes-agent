@@ -523,11 +523,15 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     resume_marker_token: Optional[str] = None
+    resume_turn_id: Optional[str] = None  # stable id of the interrupted turn, used for note deduplication
+    resume_human: bool = True  # internal turns are marked false and never get a visible restart note
+    restart_note_message_id: Optional[str] = None  # platform message id of the visible interruption note
     last_resume_marked_at: Optional[datetime] = None
     # Durable marker of the executing turn; CAS-cleared on normal unwind, left behind by
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
+    active_turn_human: bool = True
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
@@ -545,6 +549,7 @@ class SessionEntry:
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
         "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
+        "resume_turn_id", "resume_human", "restart_note_message_id", "active_turn_human",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",

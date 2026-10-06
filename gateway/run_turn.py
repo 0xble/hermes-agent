@@ -1559,14 +1559,10 @@ class GatewayTurnMixin:
             time.time() - _msg_start_time, agent_result.get("api_calls", 0), len(response),
         )
 
-        # Successful turn: clear the consecutive-restart stuck-loop counter and resume_pending (set
-        # by drain-timeout shutdown) so later messages don't get the restart-interruption note.
+        # Successful turns clear the durable restart marker only after final delivery has reconciled
+        # the visible interruption note. Clearing here used to make the resumed answer unable to find it.
         if session_key and _should_clear_resume_pending_after_turn(agent_result):
             await self._clear_restart_failure_count(session_key)
-            try:
-                await self.async_session_store.clear_resume_pending(session_key)
-            except Exception as _e:
-                logger.debug("clear_resume_pending failed for %s: %s", session_key, _e)
 
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
@@ -2291,6 +2287,11 @@ class GatewayTurnMixin:
             )
             from gateway.run import _should_clear_resume_pending_after_turn
             event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(agent_result)
+            if event._agent_turn_succeeded:
+                try:
+                    await self.async_session_store.clear_resume_pending(session_key)
+                except Exception as _e:
+                    logger.debug("clear_resume_pending after delivery failed for %s: %s", session_key, _e)
             return delivered_response
 
         except Exception as e:

@@ -913,7 +913,14 @@ class GatewayShutdownMixin:
             if _agent is _AGENT_PENDING_SENTINEL:
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
-                await self.async_session_store.mark_resume_pending(_sk, reason)
+                _state = getattr(self, "_peek_session_state", lambda _key: None)(_sk)
+                _event = getattr(getattr(_state, "turn", None), "event", None)
+                _human = bool(_event is not None and getattr(self, "_is_user_turn_event", lambda _event: not _event.internal)(_event))
+                _entry = getattr(self.session_store, "_entries", {}).get(_sk)
+                _turn_id = getattr(_entry, "active_turn_token", None)
+                await self.async_session_store.mark_resume_pending(
+                    _sk, reason, turn_id=_turn_id, human=_human,
+                )
                 marked.append(_sk)
         return marked
 
@@ -933,6 +940,84 @@ class GatewayShutdownMixin:
             "Shutdown notification suppressed for %s: %s has gateway_restart_notification=false", what, platform.value,
         )
         return False
+
+    async def _send_interrupted_turn_notes(self, session_keys, *, reclaim_pending: bool = False) -> int:
+        """Ensure one visible note for each interrupted human turn.
+
+        This deliberately bypasses ``gateway_restart_notification``: that flag controls broadcast
+        noise, not the per-turn recovery contract. The session row is the durable deduplication latch.
+        """
+        sent = 0
+        for session_key in dict.fromkeys(session_keys or ()):
+            marker = None
+            try:
+                entry = self.session_store._entries.get(session_key)
+                if entry is None or not getattr(entry, "resume_pending", False) or not getattr(entry, "resume_human", True):
+                    continue
+                marker = self.async_session_store.get_resume_pending_marker
+                marker = await marker(session_key)
+                note = await self.async_session_store.get_restart_note(session_key)
+                note_id = note[3] if note else None
+                if note_id and not str(note_id).startswith("pending:"):
+                    continue
+                if not await self.async_session_store.claim_restart_note(
+                    session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
+                ):
+                    continue
+                async def release_claim():
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
+                target = await self._shutdown_notification_target(session_key)
+                if target is None:
+                    await release_claim()
+                    continue
+                source, platform_str, chat_id, thread_id, profile = target
+                platform = Platform(platform_str)
+                adapter = self._delivery_adapter_for(source) if source is not None else None
+                if adapter is None:
+                    adapter = self._authorization_adapter(platform, profile)
+                if adapter is None:
+                    await release_claim()
+                    continue
+                metadata = self._thread_metadata_for_target(
+                    platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
+                    reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,
+                )
+                extra = getattr(getattr(adapter, "config", None), "extra", {})
+                if not bool(getattr(adapter, "interactive_resume", True)):
+                    policy = "continue"
+                elif isinstance(extra, dict) and "restart_resume_policy" in extra:
+                    policy = str(extra["restart_resume_policy"])
+                else:
+                    configured = getattr(self.config, "restart_resume_policy", None)
+                    policy = str(configured) if configured is not None else "ask"
+                text = t(
+                    "gateway.shutdown.interrupted_turn" if policy == "continue"
+                    else "gateway.shutdown.notice_restart"
+                )
+                result = await adapter.send(
+                    chat_id, text,
+                    metadata={**(metadata or {}), "_interim_send": True},
+                )
+                if not result or not getattr(result, "success", False) or not getattr(result, "message_id", None):
+                    await release_claim()
+                    continue
+                if await self.async_session_store.set_restart_note_message_id(
+                    session_key, str(result.message_id), expected_marker=marker,
+                ):
+                    sent += 1
+            except Exception:
+                try:
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
+                except Exception:
+                    pass
+                logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
+        if sent:
+            logger.info("Shutdown: delivered %d interrupted human-turn note(s)", sent)
+        return sent
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died; returns notices sent.
@@ -2029,7 +2114,10 @@ class GatewayShutdownMixin:
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
-        await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        _marked_keys = await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        # This is the last transport-connected phase for the interrupted human turn. It is intentionally
+        # independent of the ordinary restart-notification opt-out and is durable/deduplicated by the row.
+        await self._send_interrupted_turn_notes(_marked_keys)
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)
