@@ -93,6 +93,27 @@ async def _async_return_one_pair(*args, **kwargs):
 
 
 @pytest.mark.asyncio
+async def test_reconnect_watcher_waits_until_resume_scheduling_signal(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._reconnect_spool_tasks = {}
+    runner._reconnect_resume_events = {}
+    calls = []
+
+    async def recover(platform):
+        calls.append(platform)
+
+    runner._recover_spool_after_reconnect = recover
+    runner._retain_background_task = lambda task: task
+
+    resume_scheduled = runner._start_reconnect_spool_recovery(Platform.TELEGRAM)
+    assert not resume_scheduled.is_set()
+    await asyncio.sleep(0)
+    assert calls == [Platform.TELEGRAM]
+    await resume_scheduled.wait()
+    assert resume_scheduled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_finish_wiring_discovers_mcp_before_restore_gate(monkeypatch):
     import gateway.run as gateway_run
 
