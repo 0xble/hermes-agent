@@ -227,8 +227,9 @@ shared one DM. The standalone sender then sent 0.8s later, inside the window.
 
 The live lane now sits out a `flood_control:<seconds>` refusal and retries on the
 live adapter, as long as the cumulative wait for that target stays within
-`_LIVE_FLOOD_WAIT_BUDGET_SECS` (15s). Longer penalties, repeated refusals past the
-budget, and every other error still fall back to standalone, as before. Source:
+`_LIVE_FLOOD_WAIT_BUDGET_SECS` (15s). Every other error still falls back to
+standalone. A flood refusal past that budget fails closed instead (see
+[Cron Flood Fail-Closed](#cron-flood-fail-closed)). Source:
 `cron/scheduler_delivery.py` (`_short_flood_wait`, `_live_send_text`). Proof:
 `TestShortFloodWaitStaysOnTheLiveLane` in
 `tests/cron/test_cron_live_delivery_confirmation.py`, which fails without the patch.
@@ -241,6 +242,31 @@ latency-sensitive. No upstream issue or PR covered this on 2026-10-03. Retire
 when the standalone lane can send Rich Messages, or upstream retries short live
 floods equivalently. Roll back by reverting the commit. There are no
 configuration or persistent-state changes.
+
+## Cron Flood Fail-Closed
+
+**Patch identity:** `cron-flood-fail-closed`. Once a Telegram live send is refused with an
+active flood-control deadline that the short wait above cannot sit out, cron delivery
+records the target as deferred and does not enter the standalone sender. A second
+sender during the same penalty can extend or obscure the ban, and the standalone lane
+also drops Rich Message features. Relay targets and non-Telegram platforms are
+unchanged, and non-flood errors still fall back to standalone. Source:
+`cron/scheduler_delivery.py` (`_live_flood_held`, `_deliver_standalone`,
+`_warn_live_lane_failure`). Proof: `test_long_flood_fails_closed_without_standalone`
+and `test_repeated_floods_stop_at_the_budget` in
+`tests/cron/test_cron_live_delivery_confirmation.py`.
+
+Landed as [#335](https://github.com/0xble/hermes-agent/pull/335), commit
+`90fdfcecf4f5`, without a `Fork-Patch` trailer. The backfill line below records its
+stable patch ID, so `main` keeps passing the trailer check without rewriting
+published history.
+
+Fork-Patch-Backfill: 3b2042b08305abd280088b719767fdec1cc3ed92; cron-flood-fail-closed
+
+Retire when upstream cron delivery stops falling back to a second sender during an
+active Telegram flood deadline. Roll back by reverting `90fdfcecf4f5` and restoring the
+`Cron Short Flood Wait` fallback text. There are no configuration or persistent-state
+changes.
 
 ## Replacement Adapter Egress
 
@@ -261,6 +287,31 @@ fresh send. Media sends (`send_image`, `send_voice`, `send_multiple_images`, loc
 files) still refuse on a retired instance and remain a follow-up. Upstream has the
 same gap at `343500b354`. Retire when an upstream release forwards these calls.
 Roll back by reverting this patch's adapter and test changes. No state changes.
+
+## Transient Rich Delivery Recovery and Capability Latch
+
+**Patch identity:** `telegram-rich-delivery-recovery`. Cron delivery keeps a Telegram
+live-adapter send on the Rich Message path for a bounded 120-second exponential-backoff
+window after `send_path_degraded` or a short flood refusal. Only after that window does
+it use the legacy standalone sender. If that fallback succeeds after a transient live
+failure, the job records `last_delivery_formatting_degraded` with the affected target
+and emits a WARNING; non-Telegram targets are unchanged. The existing delivery ledger
+remains the recovery path when fallback cannot send.
+
+Rich capability rejection is WARNING-logged with the existing redaction helper and the
+adapter latch resets at the next polling generation. The latch still suppresses retries
+within one generation, so a genuine unsupported endpoint cannot create a retry storm.
+The current fork already contains the currency protection from `f9a4ab8558`; a direct
+payload reproduction for `costs $500 and $1,200` produces ``costs `$500` and `$1,200` ``
+and does not reproduce the reported LaTeX defect, so no currency source change is made.
+
+Source: `cron/scheduler_delivery.py` and `plugins/platforms/telegram/adapter.py`.
+Proof: `tests/cron/test_cron_reconnect_only_rejection.py` and
+`tests/gateway/test_telegram_rich_messages.py`. Upstream search on 2026-10-04 found no
+matching issue or pull request for these exact symbols. Retire when an upstream release
+keeps transient cron delivery on the rich live lane and resets capability latches by
+polling generation. Roll back the two source files and their regression tests together;
+there are no configuration or persistent-state migrations.
 
 ## Delivery Verification
 

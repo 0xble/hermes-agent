@@ -2031,7 +2031,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._is_rich_capability_error(exc):
             self._rich_send_disabled = True
-        logger.debug("[%s] %s rejected (%s) — falling back to %s", self.name, what, _redact_telegram_error_text(exc), fallback)
+        logger.warning(
+            "[%s] %s rejected (%s) — falling back to %s",
+            self.name, what, _redact_telegram_error_text(exc), fallback)
         return True
 
     async def _try_edit_rich(
@@ -2179,6 +2181,14 @@ class TelegramAdapter(BasePlatformAdapter):
             verifier.cancel()
         self._polling_progress_verifier_task = None
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
+        # Capability failures are generation-scoped: reconnect may restore a previously unavailable
+        # rich endpoint, while the latch still prevents a retry storm within this generation.
+        if getattr(self, "_rich_send_disabled", False) or getattr(self, "_rich_draft_disabled", False):
+            logger.info(
+                "[%s] Resetting rich-message capability latches for polling generation %d",
+                self.name, self._polling_generation,
+            )
+        self._rich_send_disabled = self._rich_draft_disabled = False
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = True
         self._send_path_degraded = True
