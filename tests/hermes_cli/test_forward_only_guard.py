@@ -6,6 +6,7 @@ import pytest
 from hermes_cli import forward_only_guard as guard
 
 
+@pytest.mark.platforms("macos")
 def test_loaded_forward_label_is_detected_from_launchctl_list(tmp_path, monkeypatch):
     monkeypatch.setattr(guard.sys, "platform", "darwin")
 
