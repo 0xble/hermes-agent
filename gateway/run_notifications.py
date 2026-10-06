@@ -1050,7 +1050,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 try:
                     from tools.async_delegation import claim_completion_delivery, defer_completion_delivery
                     delegation_id = claim.delegation_id
-                    claim_id = claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                    claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
                     claimed = await claim_off_loop(
                         lambda: claim_completion_delivery(delegation_id, claim_id),
                         lambda ok: ok and defer_completion_delivery(delegation_id, claim_id),
@@ -1058,6 +1058,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     if not claimed:
                         claim.proceed = False
                         return claim
+                    # Recorded only once held: a claim abandoned mid-flight has ONE cleanup (the
+                    # deferred refund above), never also the caller's attempt-spending release.
+                    claim.claim_id = claim_id
                 except Exception as exc:
                     logger.warning("Could not claim durable async completion %s: %s", claim.delegation_id, exc)
                     claim.proceed, claim.early_result = False, False
