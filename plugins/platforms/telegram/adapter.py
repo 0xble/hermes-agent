@@ -420,6 +420,23 @@ def check_telegram_requirements() -> bool:
 
 # Every char MarkdownV2 requires backslash-escaped outside code spans/fences.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
+# A one-line CommonMark code span delimited by two or more backticks, and the real (line-start) fenced
+# blocks such a span must never be matched inside.
+_MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
+_LINE_START_FENCE_RE = re.compile(r'^ {0,3}(?P<f>`{3,})[^`\n]*\n[\s\S]*?(?:^ {0,3}(?P=f)`*[ \t]*$|\Z)', re.MULTILINE)
+_BACKTICK_RUN_RE = re.compile(r'`+')
+
+
+def _progress_code_span(text: str) -> str:
+    """``text`` as one CommonMark inline code span: a backtick run longer than any inside it, padded
+    with a space when it starts or ends with a backtick (or with a space on both sides, which
+    CommonMark would otherwise strip). Newlines fold to spaces, as a code span renders them anyway."""
+    text = " ".join(str(text).split("\n"))
+    if not text.strip():
+        return text
+    fence = "`" * (max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0) + 1)
+    pad = " " if text[0] == "`" or text[-1] == "`" or (text[0] == " " and text[-1] == " ") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _escape_mdv2(text: str) -> str:
@@ -455,7 +472,9 @@ from gateway.platforms.helpers import cancel_task
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
 _RICH_PROTECTED_REGION_RE = re.compile(
-    r'(?:```[^\n]*\n[\s\S]*?```)'                       # fenced code block
+    # A fence opens only at line start (after indentation or list/quote markers) and, per CommonMark, its
+    # info string has no backtick: an inline ```code `` span``` followed later by a fence is not a block.
+    r'(?:^[ \t>*+\-\d.)]*```[^`\n]*\n[\s\S]*?```)'      # fenced code block
     r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
     r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
     r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows (newline-led, trailing \n left for prose)
@@ -6665,7 +6684,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("[%s] Telegram flood deadline has no durable copy for chat %s", self.name, key, exc_info=True)
         platform: Dict[str, float] = self.__dict__.setdefault("_telegram_platform_flood_until", {})
         platform[key] = max(platform.get(key, 0.0), until[key])
-        return _flood_cap_result(max(wait, until[key] - now))
+        remaining = max(wait, until[key] - now)
+        # Keep the typed contract stable when the deadline was created from this same wait: subtracting
+        # two monotonic timestamps can otherwise turn an exact 30.0-second refusal into 30.0000000000057.
+        if math.isclose(remaining, wait, rel_tol=0.0, abs_tol=1e-6):
+            remaining = wait
+        return _flood_cap_result(remaining)
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
         """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
@@ -6824,6 +6848,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 e), exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
 
+    def format_progress_literal(self, text: str) -> str:
+        """Tool names and previews in progress lines are code spans, so neither the rich Markdown
+        parser nor ``format_message`` reads ``mcp__a__b``, ``**/*.md``, ``README.md`` or ``\\s+``
+        as markup or a link."""
+        return _progress_code_span(text)
+
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2: code is stashed behind placeholders first (never
         modified), markdown constructs become MarkdownV2 syntax, everything else is escaped."""
@@ -6844,6 +6874,21 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # 0) GFM pipe tables → Telegram-friendly row groups, before the MarkdownV2 conversions.
         text = _wrap_markdown_tables(content)
+        # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
+        # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
+        # fenced pass, which would otherwise read a one-line ```a `` b``` span as a fence; spans inside a real
+        # line-start fence stay that fence's content.
+        fences = [m.span() for m in _LINE_START_FENCE_RE.finditer(text)]
+
+        def _protect_multi_tick(m):
+            if any(start <= m.start() < end for start, end in fences):
+                return m.group(0)
+            body = m.group('body')
+            if body.startswith(' ') and body.endswith(' ') and body.strip():
+                body = body[1:-1]  # CommonMark strips one padding space from each side
+            return _ph('`' + body.replace('\\', '\\\\').replace('`', '\\`') + '`')
+
+        text = _MULTI_TICK_CODE_SPAN_RE.sub(_protect_multi_tick, text)
         # 1) Protect fenced code blocks; per MarkdownV2 spec \\ and ` inside pre/code must be escaped.
         def _protect_fenced(m):
             raw = m.group(0)
@@ -6910,9 +6955,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # 11) Restore placeholders in reverse insertion order so nested placeholders resolve.
         for key in reversed(list(placeholders.keys())):
             text = text.replace(key, placeholders[key])
-        # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans.
+        # 12) Safety net: escape bare ( ) { } that slipped through, but never inside ``` or ` spans. A span's
+        # own escaped \` does not close it, and an escaped \` in prose does not open one.
         _safe_parts = []
-        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|`[^`]+`)', text)):
+        for _idx, _seg in enumerate(re.split(r'(```[\s\S]*?```|(?:(?<!\\)|(?<=\\\\))`(?:[^`\\]|\\[\s\S])+`)', text)):
             if _idx % 2 == 1:
                 _safe_parts.append(_seg)  # inside code — untouched
             else:
