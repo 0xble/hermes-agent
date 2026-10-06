@@ -3684,7 +3684,8 @@ class GatewayRunner(
         self._completion_notification_batch_tasks: dict[tuple[str, ...], asyncio.Task] = {}
         self._completion_notification_batch_flush_tasks: set[asyncio.Task] = set()
         self._completion_notification_batch_releases: dict[tuple[str, ...], asyncio.Event] = {}
-        self._completion_notification_batch_window = self._completion_notification_batch_window_from_config()
+        # None: read gateway.completion_notification_batch_window_seconds per owning profile.
+        self._completion_notification_batch_window: Optional[float] = None
         self._async_delegation_batches: dict[tuple[str, ...], list[dict]] = {}
         self._async_delegation_batch_tasks: dict[tuple[str, ...], asyncio.Task] = {}
         self._async_delegation_batch_releases: dict[tuple[str, ...], asyncio.Event] = {}

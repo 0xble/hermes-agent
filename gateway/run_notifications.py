@@ -209,6 +209,7 @@ class GatewayNotificationsMixin:
         return min(parsed, self._COMPLETION_BATCH_WINDOW_MAX_S)
 
     def _completion_notification_window_seconds(self) -> float:
+        """Explicit runner override (tests), else the ambient profile's configured window."""
         value = getattr(self, "_completion_notification_batch_window", None)
         return self._completion_notification_batch_window_from_config() if value is None else float(value)
 
@@ -229,8 +230,16 @@ class GatewayNotificationsMixin:
     def _completion_awaited_by_goal(evt: dict) -> bool:
         """Blocking: whether the session's active goal is explicitly parked on this result
         (``/goal wait`` on its process session or pid, or a wait on live delegations)."""
-        from hermes_cli.goals import load_goal
-        state = load_goal(str(evt.get("parent_session_id") or "").strip())
+        from hermes_cli.goals import _get_session_db, load_goal
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        state = load_goal(parent_session_id)
+        if (state is None or state.status != "active") and parent_session_id:
+            # Compression migrates the goal to the continuation session and clears this row,
+            # while the event keeps the spawning id: follow the chain to its live tip.
+            db = _get_session_db()
+            tip = db.get_compression_tip(parent_session_id) if db is not None else None
+            if tip and tip != parent_session_id:
+                state = load_goal(tip)
         if state is None or state.status != "active":
             return False
         if evt.get("type") == "async_delegation":
@@ -245,23 +254,25 @@ class GatewayNotificationsMixin:
         return False
 
     async def _completion_hold_seconds(self, evt: dict, *, session_busy: bool = False) -> float:
-        """How long to hold this result before waking its session; 0 means deliver promptly."""
-        window = self._completion_notification_window_seconds()
+        """How long to hold this result before waking its session; 0 means deliver promptly.
+
+        Window and goal state are read in the owning profile's scope (multiplexed gateways)."""
         session_key = str(evt.get("session_key") or "").strip()
-        if window <= 0 or not session_key or self._completion_is_failure(evt):
-            return 0.0
-        state = self._peek_session_state(session_key)
-        started = state.conversation.last_turn_started_at if state is not None else 0.0
-        running = session_busy or self._is_session_running(session_key)
-        remaining = (started + window - time.time()) if started else 0.0
-        if not running and remaining <= 0:
+        if not session_key or self._completion_is_failure(evt):
             return 0.0
         try:
             async with self._completion_event_scope(evt):
+                window = self._completion_notification_window_seconds()
+                state = self._peek_session_state(session_key)
+                started = state.conversation.last_turn_started_at if state is not None else 0.0
+                running = session_busy or self._is_session_running(session_key)
+                remaining = (started + window - time.time()) if started else 0.0
+                if window <= 0 or (not running and remaining <= 0):
+                    return 0.0
                 if await asyncio.to_thread(self._completion_awaited_by_goal, evt):
                     return 0.0
         except Exception:
-            logger.debug("Completion goal-wait check failed; delivering promptly", exc_info=True)
+            logger.debug("Completion hold check failed; delivering promptly", exc_info=True)
             return 0.0
         return window if running else min(window, remaining)
 
@@ -2178,6 +2189,9 @@ class GatewayNotificationsMixin:
             logger.exception("Coalesced process completion delivery failed")
             delivered = False
         finally:
+            # A failure while stopping has no watcher retry left: spool it rather than drop it.
+            if delivered is False and self._completion_notification_batches_stopping:
+                self._preserve_undelivered_batch(entries)
             # Never strand watcher futures: False = watcher retry path; None = ordinary dedupe result.
             self._settle_batch_waiters(entries, delivered)
             self._detach_batch_flush(tasks, releases, key, current_task, release)
@@ -2187,6 +2201,40 @@ class GatewayNotificationsMixin:
         for _text, _evt, future in entries:
             if not future.done():
                 future.set_result(result)
+
+    def _spool_completion_for_restart(self, synth_text: str, evt: dict) -> bool:
+        """Last resort while stopping: a process completion has no durable copy and its watcher
+        stops retrying, so write its wake straight to the drain spool (replayed on next boot)."""
+        try:
+            source = self._build_process_event_source(evt)
+            if source is None:
+                return False
+            if getattr(source, "message_id", None):
+                from gateway.session_identity import replace_source
+                source = replace_source(source, message_id=None)
+            metadata = {"notification_origin": "process_registry_synthetic"}
+            session_key = str(evt.get("session_key") or "").strip()
+            if session_key.startswith("agent:"):
+                metadata["gateway_session_key"] = session_key
+            if str(evt.get("parent_session_id") or "").strip():
+                metadata["gateway_session_id"] = str(evt["parent_session_id"]).strip()
+            event = MessageEvent(text=_mark_internal_notification(synth_text), message_type=MessageType.TEXT,
+                                 source=source, internal=True, metadata=metadata)
+            return bool(self._preserve_drain_event(self._session_key_for_source(source), event))
+        except Exception:
+            logger.warning("Could not spool completion %s for restart", evt.get("session_id"), exc_info=True)
+            return False
+
+    def _preserve_undelivered_batch(self, entries) -> None:
+        """Stopping: spool each undelivered entry and settle its waiter; True once preserved."""
+        for synth_text, evt, future in entries:
+            if future.done():
+                continue
+            preserved = self._spool_completion_for_restart(synth_text, evt)
+            if not preserved:
+                logger.error("Background completion %s could not be preserved across shutdown",
+                             evt.get("session_id"))
+            future.set_result(True if preserved else False)
 
     @staticmethod
     def _requeue_completion_events(events: list[dict]) -> None:
@@ -2219,7 +2267,7 @@ class GatewayNotificationsMixin:
                 await asyncio.gather(*stuck, return_exceptions=True)
         # Defensive cleanup for an orphaned queue with no live flush task.
         for entries in self._completion_notification_batches.values():
-            self._settle_batch_waiters(entries, False)
+            self._preserve_undelivered_batch(entries)
         for group in self._async_delegation_batches.values():
             self._requeue_completion_events(group)
         for attr in ("_completion_notification_batches", "_completion_notification_batch_tasks",
@@ -2234,10 +2282,11 @@ class GatewayNotificationsMixin:
         """Fan in one conversation's completions; hold routine successes per the batch window."""
         self._ensure_completion_batch_state()
         if self._completion_notification_batches_stopping:
-            return False
+            # The watcher will not get another chance once teardown starts: spool, never drop.
+            return self._spool_completion_for_restart(synth_text, evt)
         hold = await self._completion_hold_seconds(evt, session_busy=session_busy)
         if self._completion_notification_batches_stopping:
-            return False
+            return self._spool_completion_for_restart(synth_text, evt)
         if hold <= 0:
             self._release_held_completions(str(evt.get("session_key") or ""))
         key = self._event_route_key(evt, self._COMPLETION_BATCH_KEY_FIELDS)

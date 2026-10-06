@@ -491,3 +491,56 @@ async def test_held_completions_never_mix_across_a_new_session_boundary(hermes_h
     adapter.handle_message.assert_awaited_once()
     text = adapter.handle_message.await_args.args[0].text
     assert "OLD-SECRET" not in text and "proc_old" not in text
+
+
+@pytest.mark.asyncio
+async def test_completion_failing_during_shutdown_lands_in_the_real_drain_spool(hermes_home):
+    """No adapter FIFO to fall back on: the production preserve path writes the durable spool."""
+    import json as _json
+
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    runner._served_profile_homes = {}
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")})
+    runner.session_store = SimpleNamespace(
+        _ensure_loaded=lambda: None, _entries={},
+        _generate_session_key=lambda source: ROUTE["session_key"],
+    )
+    adapter.handle_message = AdmittingHandler(side_effect=RuntimeError("adapter gone"))
+    held = asyncio.create_task(runner._enqueue_process_completion_notification(
+        "proc_spool finished", _completion("proc_spool")))
+    await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(runner._cancel_process_completion_batch_tasks(), timeout=7.0)
+
+    assert await asyncio.wait_for(held, timeout=1.0) is True
+    spooled = [_json.loads(p.read_text()) for p in (hermes_home / "pending_messages").glob("*.json")]
+    assert len(spooled) == 1
+    payload = spooled[0]
+    assert payload["session_key"] == ROUTE["session_key"]
+    assert "proc_spool finished" in payload["data"]["text"]
+    assert payload["data"]["internal"] is True and payload["data"]["drain_deferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_goal_awaited_result_is_prompt_after_compression_rotation(hermes_home):
+    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    mgr = goals.GoalManager("pre-compression")
+    mgr.set("ship it")
+    mgr._park("waiting for the build", waiting_on_session="proc_build")
+    assert goals.migrate_goal_to_session("pre-compression", "post-compression", reason="compression")
+    db = goals._get_session_db()
+    with patch.object(type(db), "get_compression_tip", lambda self, sid: "post-compression"):
+        evt = {**_completion("proc_build"), "parent_session_id": "pre-compression"}
+        assert await asyncio.wait_for(
+            runner._enqueue_process_completion_notification("done", evt), timeout=2.0) is True
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_window_is_read_from_the_owning_profile_config(hermes_home):
+    runner, adapter = _fan_in_runner(window=None, last_turn_age=0.0)
+    (hermes_home / "config.yaml").write_text(
+        "gateway:\n  completion_notification_batch_window_seconds: 0\n", encoding="utf-8")
+    assert await asyncio.wait_for(
+        runner._enqueue_process_completion_notification("done", _completion("proc_cfg")), timeout=2.0) is True
+    adapter.handle_message.assert_awaited_once()

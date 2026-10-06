@@ -625,7 +625,22 @@ def test_shutdown_releases_batch_held_in_window_for_delivery():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
+def _spooled_texts(runner):
+    """Completions preserved for the next boot through the drain-spool seam."""
+    return list(getattr(runner, "_spooled", []))
+
+
+def _capture_spool(runner):
+    runner._spooled = []
+
+    def _preserve(session_key, event):
+        runner._spooled.append(event.text)
+        return True
+
+    runner._preserve_drain_event = _preserve
+
+
+def test_shutdown_cancels_blocked_batch_delivery_and_spools_it():
     delivery_entered = asyncio.Event()
 
     async def _blocked_delivery(_event):
@@ -637,6 +652,7 @@ def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
     runner._completion_notification_batch_window = 0
     runner._COMPLETION_SHUTDOWN_FLUSH_S = 0.2
     event = _completion_event(started_at=1.0, session_id="proc_cancel_delivery")
+    _capture_spool(runner)
 
     async def _exercise():
         pending = asyncio.create_task(
@@ -647,7 +663,9 @@ def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
 
         await runner._cancel_process_completion_batch_tasks()
 
-        assert await asyncio.wait_for(pending, timeout=1.0) is False
+        # The watcher stops retrying at shutdown, so the result goes to the drain spool instead.
+        assert await asyncio.wait_for(pending, timeout=1.0) is True
+        assert len(_spooled_texts(runner)) == 1 and "completion" in _spooled_texts(runner)[0]
         assert flush_task.cancelled()
         assert runner._completion_delivery_identity(event) not in runner._completion_deliveries_inflight
         assert runner._completion_delivery_identity(event) not in runner._completion_deliveries_delivered
@@ -658,9 +676,10 @@ def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_completion_enqueue_stays_retryable_after_shutdown_starts():
+def test_completion_enqueued_after_shutdown_starts_is_spooled():
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
+    _capture_spool(runner)
 
     async def _exercise():
         await runner._cancel_process_completion_batch_tasks()
@@ -669,7 +688,8 @@ def test_completion_enqueue_stays_retryable_after_shutdown_starts():
             _completion_event(started_at=1.0, session_id="proc_after_shutdown"),
         )
 
-    assert asyncio.run(_exercise()) is False
+    assert asyncio.run(_exercise()) is True
+    assert len(_spooled_texts(runner)) == 1
     assert runner._completion_notification_batches == {}
     assert runner._completion_notification_batch_tasks == {}
     adapter.handle_message.assert_not_awaited()
@@ -705,6 +725,7 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
     runner = _runner(adapter)
     runner._completion_notification_batch_window = 0
     runner._COMPLETION_SHUTDOWN_FLUSH_S = 0.2
+    _capture_spool(runner)
     first_event = _completion_event(started_at=1.0, session_id="proc_old_flush")
     second_event = _completion_event(started_at=2.0, session_id="proc_new_flush")
 
@@ -729,7 +750,8 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
 
         await runner._cancel_process_completion_batch_tasks()
 
-        assert await asyncio.gather(first, second) == [False, False]
+        assert await asyncio.gather(first, second) == [True, True]
+        assert len(_spooled_texts(runner)) == 2
         assert all(task.cancelled() for task in flush_tasks)
         assert runner._completion_notification_batches == {}
         assert runner._completion_notification_batch_tasks == {}

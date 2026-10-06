@@ -125,10 +125,14 @@ Failed or interrupted model turns do not run completion judging.
   `gateway.completion_notification_batch_window_seconds` (default 300, capped 3600,
   `0` = same-tick 0.1s fan-in only) is held and delivered as one synthetic turn.
   Failures, non-zero or abnormal exits, failed delegations and results a parked
-  goal waits on are prompt and release held siblings into the same turn. Shutdown
-  releases held batches for delivery; while draining, injection goes to the drain
-  spool, and delegations that cannot finish are requeued (their ledger row stays
-  pending). Regression: `uv run --frozen --group dev pytest -q
+  goal waits on (session, pid, or delegations; the goal is followed through
+  compression to the chain tip) are prompt and release the conversation's held
+  batches. The busy-turn #112033 chat receipt is sent at once, independent of the
+  hold. Batches are partitioned by `parent_session_id` so nothing mixes across
+  `/new`. The window is read per owning profile. Shutdown releases held batches for
+  delivery; while draining, injection goes to the drain spool, a process batch that
+  fails or is cancelled while stopping is spooled per event, and delegations that
+  cannot finish are requeued (their ledger row stays pending). Regression: `uv run --frozen --group dev pytest -q
   tests/gateway/test_autonomous_wake_pacing.py tests/hermes_cli/test_goals.py
   tests/gateway/test_completion_delivery.py`. Rollback reverts this identity; the
   new `last_continuation_at` field defaults to 0 on old rows and needs no migration.
