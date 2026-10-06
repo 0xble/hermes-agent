@@ -3746,10 +3746,10 @@ class GatewayRunner(
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
     def _init_session_db(self, *, maintenance: bool = True) -> None:
-        """Open the session DB for the active scope and run opportunistic state.db / checkpoint maintenance."""
+        """Initialize lazy state.db handle caches; defer all SQLite I/O until after adapter readiness."""
         # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
-        # root home under multiplex); priming here keeps startup diagnostics at init.
-        # Initialize session database for session_search tool support. Same frozen-handle class of bug as
+        # root home under multiplex); initialize the cache here without opening SQLite. Session search and
+        # recovery obtain the active handle lazily through their async/thread boundaries.
         # SessionStore._db (#88532): a handle bound here is pinned to the process's root home, but /resume,
         # /title, /history and session search all run inside _profile_runtime_scope on a multiplexed gateway
         # and must see that profile's own state.db.
@@ -3759,37 +3759,13 @@ class GatewayRunner(
         from gateway.session_db_recovery import RecoverableHandleCache
         self._session_db_handle_cache = RecoverableHandleCache(
             handles=self._session_db_handles, lock=self._session_db_handles_lock)
-        try:
-            self._open_session_db_for_active_scope(raise_on_error=True)
-        except Exception as e:
-            # WARNING (not DEBUG) so it lands in errors.log; else an NFS HERMES_HOME silently loses /resume etc.
-            logger.warning("SQLite session store not available: %s", e)
-            self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
-
-        if not maintenance:
-            return  # The standby canary must not prune unrelated user sessions.
-
-        # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
-        # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
-        # Surface the failure to the user via their home channel(s) once the gateway connects. Without this,
-        # state.db corruption or NFS/SMB lock failures silently degrade the entire gateway — messages may
-        # flow but nothing is persisted, and the user has no indication until they try /resume and find
-        # nothing (#88235).
-        # Once per SERVED profile, each under its own scope: both the store and the ``sessions:``
-        # config that governs it must be the profile's own. Bound to ``self._session_db`` this ran
-        # against the construction-time launch home only, so a multiplexed secondary profile's
-        # state.db was never pruned or vacuumed by anybody, and the launch profile's
-        # retention_days/auto_prune decided whether it happened at all.
-        from gateway.run_profile_reconcile import _for_each_served_profile
-        _launch_sessions = _launch_sessions_dir(self.config)  # resolved OUTSIDE any profile scope
-        _housekeeping_chore(
-            "state.db startup maintenance",
-            lambda: _for_each_served_profile(
-                self, lambda _label: _housekeeping_state_db_maintenance(_launch_sessions)))
-        # Checkpoint store pruning is a housekeeping chore (``_housekeeping_checkpoint_prune``), not a
-        # constructor step: its ``git gc`` repacks the whole store (tens of seconds on a GB store) and
-        # here it ran before the control socket, adapters and the code_sha stamp — so the first
-        # restart of the day (the ``hermes update`` one) looked hung and failed fleet verification.
+        # Session DB initialization is lazy and is first exercised by the off-loop startup recovery
+        # snapshot. Do not open state.db here: another Hermes process may hold its writer lock.
+        # State.db archive/prune/VACUUM can likewise wait on another Hermes process for minutes, so it
+        # must not run before the control socket or adapters exist. The gateway housekeeping worker starts
+        # after adapters are connected and runs the same due-gated maintenance tick there. Checkpoint store
+        # pruning follows the same rule: its ``git gc`` can repack a large store for tens of seconds and
+        # must never delay readiness.
 
     def _init_registries_and_clocks(self) -> None:
         """Pairing stores, hook registry, voice modes, background-task set, liveness and idle clocks."""
@@ -6101,16 +6077,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
     _ensure_windows_gateway_venv_imports()
 
-    # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
-    try:
-        # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
-
+    # MCP discovery runs in executor threads but can still wait up to 120s per profile. Start it only after
+    # adapter polling is healthy so unavailable MCP servers cannot delay Telegram readiness.
     try:
         success = await runner.start()
     except BaseException:
@@ -6121,6 +6089,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _shutdown_gateway_health_export(runner)
         await _close_active_generation()
         return False
+
+    async def _discover_mcp_after_ready() -> None:
+        try:
+            await _discover_gateway_mcp_tools(runner.config)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("MCP tool discovery failed: %s", e)
+
+    if not runner.should_exit_cleanly:
+        mcp_task = asyncio.create_task(_discover_mcp_after_ready(), name="gateway:mcp-discovery")
+        runner._background_tasks.add(mcp_task)
+        mcp_task.add_done_callback(runner._background_tasks.discard)
 
     if runner.should_exit_cleanly:
         _shutdown_gateway_health_export(runner)

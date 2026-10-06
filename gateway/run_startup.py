@@ -587,6 +587,12 @@ class GatewayStartupMixin:
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
 
+    async def _resume_pending_candidates_async(self, platform=None, *, record_boot=True) -> Optional[list]:
+        """Snapshot resume-pending entries without running the state.db load on the gateway loop."""
+        return await asyncio.to_thread(
+            self._resume_pending_candidates, platform, record_boot=record_boot,
+        )
+
     def _resume_owner_authorized(self, session_key: str, source) -> bool | None:
         """True for an authorized owner, False for denial, None when checking failed."""
         try:
@@ -826,6 +832,19 @@ class GatewayStartupMixin:
             resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age, **kwargs)
         return resumed, ledgered
 
+    def _snapshot_active_turns_for_recovery(self, exclude_session_keys) -> list:
+        """Read active-turn recovery rows under the store lock off the gateway loop."""
+        excluded = exclude_session_keys or frozenset()
+        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            return [
+                (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
+                 e.transport_profile)
+                for e in self.session_store._entries.values()  # noqa: SLF001
+                if e.session_key not in excluded
+                and e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
+            ]
+
     async def _ledger_crash_left_replies(self, max_age_seconds: int, *, exclude_session_keys=None) -> int:
         """Settle every marked turn whose final reply was persisted and clear its marker, so
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
@@ -837,15 +856,9 @@ class GatewayStartupMixin:
             exclude_session_keys, _owned = await asyncio.to_thread(startup_recovery_fences, self)
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
-        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-            self.session_store._ensure_loaded_locked()  # noqa: SLF001
-            marked = [
-                (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
-                 e.transport_profile)
-                for e in self.session_store._entries.values()  # noqa: SLF001
-                if e.session_key not in exclude_session_keys
-                and e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
-            ]
+        marked = await asyncio.to_thread(
+            self._snapshot_active_turns_for_recovery, exclude_session_keys,
+        )
         ledgered = 0
         for key, session_id, token, started_at, origin, profile in marked:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
@@ -1223,6 +1236,21 @@ class GatewayStartupMixin:
                 logger.warning("Process checkpoint recovery for profile %r failed", profile_name, exc_info=True)
         return recovered
 
+    async def _start_prime_session_db_after_ready(self) -> None:
+        """Open the shared state.db handles only after adapters are ready, never on the loop."""
+        store = getattr(self, "session_store", None)
+        open_store = getattr(store, "_open_session_db_for_active_scope", None)
+        open_runner = getattr(self, "_open_session_db_for_active_scope", None)
+        if not callable(open_store) or not callable(open_runner):
+            return
+        try:
+            await asyncio.to_thread(open_store)
+            await asyncio.to_thread(open_runner, True)
+        except Exception as exc:
+            # First-use async callers retain the existing recoverable fallback/backoff behavior.
+            logger.warning("SQLite session store not available after adapter readiness: %s", exc)
+            self._session_db_init_error = str(exc)
+
     async def _start_recover_previous_run(self) -> None:
         """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
         from gateway.run import _hermes_home
@@ -1270,7 +1298,7 @@ class GatewayStartupMixin:
             # drains. Defer this global legacy sweep rather than suspending A
             # or bulk-saving B's stale snapshot over its living owner's state.
             stuck = (0 if getattr(self, "_startup_live_recovery_keys", frozenset())
-                     else self._suspend_stuck_loop_sessions())
+                     else await asyncio.to_thread(self._suspend_stuck_loop_sessions))
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
 
@@ -1730,9 +1758,9 @@ class GatewayStartupMixin:
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
-        candidates = self._resume_pending_candidates()
+        candidates = await self._resume_pending_candidates_async()
         try:
-            recover_pending_shutdown_flush(self, candidates=candidates)
+            await asyncio.to_thread(recover_pending_shutdown_flush, self, candidates=candidates)
         except Exception:
             logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
@@ -1831,12 +1859,12 @@ class GatewayStartupMixin:
             return True
         if self._start_check_access_policy():
             return True
-        await self._start_recover_previous_run()
-        # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
+        # Session/process recovery is deliberately performed after adapter connections. Its SQLite work
+        # is offloaded below, and the startup-restore gate keeps inbound turns queued until the snapshot
+        # and auto-resume scheduling are complete.
         # demand-time site (provider resolution, /login, the connector token) is a read that needs the
-        # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
-        # first DM from arriving with nothing to resolve. With the launch gate unset this is a local
-        # inventory and no network.
+        # identity to already exist. Keep the local bootstrap ahead of inbound admission; it does not
+        # touch state.db.
         await self._run_free_tier_bootstrap()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
@@ -1875,6 +1903,8 @@ class GatewayStartupMixin:
             return True
         if await self._abort_startup_if_shutdown_requested():
             return True
+        await self._start_recover_previous_run()
+        await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
         if getattr(self.config, "durable_outbox_enabled", False):
             from gateway.outbox import open_outbox, recover

@@ -858,12 +858,14 @@ class GatewayAdapterLifecycleMixin:
         """Claim owed follow-ups before resume and drain them as separate turns."""
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
         from gateway.run import _startup_restore_drain_timeout_secs
-        candidates = self._resume_pending_candidates(record_boot=False)
+        candidates = await self._resume_pending_candidates_async(record_boot=False)
         queued_before = len(getattr(self, "_startup_restore_queue", []))
         tasks = []
         keys = set()
         try:
-            recover_pending_shutdown_flush(self, candidates=candidates, platform=platform)
+            await asyncio.to_thread(
+                recover_pending_shutdown_flush, self, candidates=candidates, platform=platform,
+            )
         except Exception:
             logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
                            exc_info=True)
