@@ -1,92 +1,234 @@
-"""Machine-wide throttling for local test and CI commands.
+"""Machine-wide throttling for local test suites and CI gates.
 
-The Mac Studio's ``heavy-slot`` executable owns the cross-process semaphore. Hermes
-only decides which local terminal commands are heavy and wraps them once; the
-``HEAVY_SLOT_HELD`` marker makes nested commands run directly inside the slot.
-Remote and sandbox terminal backends are intentionally untouched.
+The host's ``heavy-slot`` executable owns the cross-process semaphore. Hermes only
+decides which simple commands inside a local terminal command are heavy and puts
+the helper in front of each of them::
+
+    cd repo && pytest -q        ->  cd repo && heavy-slot --label ... -- pytest -q
+
+The rest of the command still runs in the session shell, so ``cd``, exports,
+functions and background ``&`` behave exactly as before. Only the heavy
+process waits for and holds a slot.
+
+Not wrapped: non-local backends (Docker, SSH, Modal and other sandboxes),
+commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
+``HERMES_HEAVY_SLOT=off``, hosts without the helper, text that only mentions a
+runner (``grep pytest``, quoted strings, comments, heredoc bodies), and
+targeted runs of 1-10 explicit test files without worker flags.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
 import shutil
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Optional
 
-_HEAVY_PROFILES = {"pytest", "vitest", "ci", "ci-gate", "test"}
-_CI_PROFILES = {"gate", "preflight", "affected"}
+logger = logging.getLogger(__name__)
+
+_OPT_OUT_VALUES = {"0", "off", "false", "no"}
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Words that put the NEXT word in command position.
+_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "command", "exec", "nohup"}
+# Cheap prefilter: every heavy form contains one of these, so most commands skip parsing.
+_CANDIDATE = re.compile(r"test|jest|bin/ci|tox|nox")
+_SHELLS = {"bash", "sh", "zsh"}
+_PY_RUNNERS = {"pytest", "py.test"}
+_JS_RUNNERS = {"vitest", "jest"}
+# Package-script runners: `test` / `test:*` scripts are heavy, package management is not.
+_PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
+_PACKAGE_VALUE_OPTIONS = {"--filter", "-F", "--dir", "-C", "--prefix", "--cwd", "--workspace", "-w"}
+_ENV_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
+_EXEC_RUNNERS = {"npx", "bunx", "uvx", "pnpx"}
+_SUITE_RUNNERS = {"tox", "nox"}
+# Repository CI profiles that only run fast local checks (mirrors ~/.config/shell/heavy-slot.sh).
+_LIGHT_CI_PROFILES = {"preflight", "install-hooks", "list", "-h", "--help"}
+_PARALLEL_FLAGS = ("-n", "--numprocesses", "--workers", "-j", "--jobs", "--dist")
+_TEST_FILE = re.compile(r"(\.py(::.*)?|\.(test|spec)\.[cm]?[jt]sx?)$")
+_MAX_TARGETED_FILES = 10
 
 
-def _split_shell_segments(command: str) -> list[str]:
-    """Split at shell command boundaries without trying to execute the input."""
-    return [segment.strip() for segment in re.split(r"&&|\|\||[;|&\n]", command) if segment.strip()]
+def heavy_slot_enabled(environment: Mapping[str, str]) -> bool:
+    """False inside an existing slot or when the operator opted out."""
+    if environment.get("HEAVY_SLOT_HELD"):
+        return False
+    return str(environment.get("HERMES_HEAVY_SLOT", "")).strip().lower() not in _OPT_OUT_VALUES
 
 
-def _command_words(segment: str) -> list[str]:
-    """Return conservative shell words for one command segment."""
+def _unquote(word: str) -> Optional[str]:
     try:
-        words = shlex.split(segment, posix=True)
+        parts = shlex.split(word, posix=True)
     except ValueError:
-        return []
-    while words and _ASSIGNMENT.match(words[0]):
-        words.pop(0)
-    # Common command-position wrappers. Keep this finite so prose or arguments
-    # cannot accidentally turn an ordinary command into a heavy run.
-    while words and words[0] in {"command", "exec", "sudo", "time", "nice"}:
-        words.pop(0)
-        while words and _ASSIGNMENT.match(words[0]):
-            words.pop(0)
-    if words and words[0] == "env":
-        words.pop(0)
-        while words and (words[0] == "--" or words[0].startswith("-") or _ASSIGNMENT.match(words[0])):
-            if words[0] == "--":
-                words.pop(0)
-                break
-            words.pop(0)
-    return words
+        return None
+    return parts[0] if len(parts) == 1 else None
 
 
 def _basename(word: str) -> str:
     return word.rsplit("/", 1)[-1]
 
 
-def _is_test_script(word: str) -> bool:
-    return word == "test" or word.startswith("test:")
-
-
-def classify_heavy_command(command: str) -> Optional[str]:
-    """Return a stable label for a recognized heavy command, else ``None``."""
-    for segment in _split_shell_segments(command):
-        words = _command_words(segment)
-        if not words:
+def _is_targeted(args: list[str]) -> bool:
+    """1-10 explicit test files, no directories or worker flags: cheap enough to run unslotted."""
+    files = 0
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
             continue
-        executable = words[0]
-        name = _basename(executable)
-        args = words[1:]
+        if arg == "--":
+            continue
+        if arg.startswith(_PARALLEL_FLAGS):
+            return False
+        if arg in {"-k", "-m", "-p", "-o", "-c", "-r", "-W", "--tb", "--file-timeout", "--file-retries"}:
+            skip_value = True
+            continue
+        if arg.startswith("-"):
+            continue
+        if not _TEST_FILE.search(arg):
+            return False  # a directory, `run` subcommand target set, or anything broad
+        files += 1
+    return 1 <= files <= _MAX_TARGETED_FILES
 
-        if name in {"pytest", "py.test", "vitest"}:
-            return name
-        if name.startswith("python") and len(args) >= 2 and args[0] == "-m" and args[1] in {"pytest", "py.test"}:
-            return "pytest"
-        if name in {"uv", "poetry", "pipenv", "hatch", "tox", "nox", "npx"}:
-            if any(token in {"pytest", "py.test", "vitest"} for token in args):
-                return "pytest" if "pytest" in args or "py.test" in args else "vitest"
-        if name in {"npm", "pnpm", "yarn", "bun"}:
-            if any(_is_test_script(token) for token in args):
-                return "test"
-            if "vitest" in args:
-                return "vitest"
-        if name == "turbo" and any(_is_test_script(token) for token in args):
+
+def _first_positional(args: list[str], value_options: Collection[str] = ()) -> tuple[Optional[str], list[str]]:
+    skip = False
+    for index, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if arg in value_options:
+            skip = True
+            continue
+        if arg.startswith("-"):
+            continue
+        return arg, args[index + 1:]
+    return None, []
+
+
+def _is_test_script(word: Optional[str]) -> bool:
+    return word is not None and (word == "test" or word.startswith("test:"))
+
+
+def classify_words(words: list[str]) -> Optional[str]:
+    """Label for a heavy simple command given its unquoted words (command first), else ``None``."""
+    if not words:
+        return None
+    executable, args = words[0], words[1:]
+    name = _basename(executable)
+
+    if name in _SHELLS and args:
+        if args[0].startswith("-") and "c" in args[0] and len(args) > 1:
+            return classify_command(args[1])  # whole `bash -c '...'` payload runs in the slot
+        if not args[0].startswith("-"):
+            return classify_words(args)  # `bash scripts/run_tests.sh ...`
+        return None
+    if name in _PY_RUNNERS:
+        return None if _is_targeted(args) else "pytest"
+    if name.startswith("python") and len(args) >= 2 and args[0] == "-m" and args[1] in _PY_RUNNERS:
+        return None if _is_targeted(args[2:]) else "pytest"
+    if name in _JS_RUNNERS:
+        rest = args[1:] if args[:1] in (["run"], ["related"]) else args
+        return None if _is_targeted(rest) else name
+    if name == "run_tests.sh":
+        return None if _is_targeted(args) else "run_tests"
+    if name in _SUITE_RUNNERS:
+        return name
+    if name in _ENV_RUNNERS:
+        sub, rest = _first_positional(args, {"--project", "--directory", "--python", "-p", "--with", "--group",
+                                              "--extra", "--package", "--env", "-e"})
+        if sub == "run":
+            inner, inner_rest = _first_positional(rest, {"--with", "--group", "--extra", "--package", "--python",
+                                                         "-p", "--env", "-e", "--directory", "--project"})
+            return classify_words([inner, *inner_rest]) if inner else None
+        return None
+    if name in _EXEC_RUNNERS:
+        inner, rest = _first_positional(args, {"--package", "-p", "--from", "--with"})
+        return classify_words([inner, *rest]) if inner else None
+    if name in _PACKAGE_MANAGERS:
+        sub, rest = _first_positional(args, _PACKAGE_VALUE_OPTIONS)
+        if _is_test_script(sub):
             return "test"
-        if (executable == "./bin/ci" or executable.endswith("/bin/ci")) and args and args[0] in _CI_PROFILES:
-            return f"ci-{args[0]}"
-        if name == "ci-gate" or executable.endswith("/ci-gate"):
-            return "ci-gate"
+        if sub in {"run", "run-script"}:
+            script, _ = _first_positional(rest, _PACKAGE_VALUE_OPTIONS)
+            return "test" if _is_test_script(script) else None
+        if sub in {"exec", "dlx"}:
+            inner, inner_rest = _first_positional(rest)
+            return classify_words([inner, *inner_rest]) if inner else None
+        return None
+    if name == "turbo":
+        sub, rest = _first_positional(args)
+        if sub == "run":
+            sub, _ = _first_positional(rest)
+        return "test" if _is_test_script(sub) else None
+    if executable.endswith("bin/ci") and _basename(executable) == "ci":
+        profile = args[0] if args else "full"
+        return None if profile in _LIGHT_CI_PROFILES else f"ci-{profile}"
+    # git-guard's `ci-gate` takes its own slot around the repository gate (with a
+    # better label), so it is deliberately not wrapped here.
     return None
+
+
+def _command_start(words: list[str]) -> int:
+    """Index of the word in command position, after assignments, keywords and prefix commands."""
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if _ASSIGNMENT.match(word) or word in _KEYWORDS:
+            index += 1
+        elif word == "env":
+            index += 1
+            while index < len(words) and (words[index].startswith("-") or _ASSIGNMENT.match(words[index])):
+                index += 1 + (words[index] in {"-u", "--unset", "-C", "--chdir"})
+        elif word in {"nice", "timeout", "gtimeout"}:
+            index += 1
+            while index < len(words) and words[index].startswith("-"):
+                index += 1 + (words[index] in {"-n", "-s", "-k", "--signal", "--kill-after"})
+            if word != "nice" and index < len(words):
+                index += 1  # the duration
+        else:
+            return index
+    return index
+
+
+def _simple_commands(command: str) -> list[list[tuple[int, str]]]:
+    """Top-level simple commands as ``[(offset, raw_word), ...]``; heredoc bodies are never scanned."""
+    from tools.self_repo_guard import _mask_heredocs
+    from tools.terminal_tool_sudo import _scan_shell
+
+    masked, _ = _mask_heredocs(command)  # same length: body characters become spaces
+    segments: list[list[tuple[int, str]]] = [[]]
+    for kind, start, end, _at_start in _scan_shell(masked):
+        if kind == "op" or (kind == "ws" and masked[start:end] == "\n"):
+            segments.append([])
+        elif kind == "word":
+            segments[-1].append((start, masked[start:end]))
+    return [segment for segment in segments if segment]
+
+
+def classify_command(command: str) -> Optional[str]:
+    """First heavy label among the command's simple commands, else ``None``."""
+    for _, label in _heavy_positions(command):
+        return label
+    return None
+
+
+def _heavy_positions(command: str) -> list[tuple[int, str]]:
+    if not _CANDIDATE.search(command):
+        return []
+    found: list[tuple[int, str]] = []
+    for segment in _simple_commands(command):
+        words = [_unquote(raw) for _, raw in segment]
+        start = _command_start([w or "" for w in words])
+        if start >= len(words) or any(w is None for w in words[start:]):
+            continue  # unparseable word in the command itself: leave it alone
+        label = classify_words(words[start:])  # type: ignore[arg-type]
+        if label:
+            found.append((segment[start][0], label))
+    return found
 
 
 def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
@@ -98,25 +240,32 @@ def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
     return path_candidate if path_candidate and os.access(path_candidate, os.X_OK) else None
 
 
-def wrap_heavy_command(
-    command: str,
-    *,
-    env_type: str,
-    environment: Optional[Mapping[str, str]] = None,
-) -> str:
-    """Wrap a recognized local test/CI command in the machine-wide slot helper."""
-    if env_type != "local":
+def wrap_heavy_command(command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None) -> str:
+    """Prefix each heavy simple command in a local terminal command with ``heavy-slot``."""
+    if env_type != "local" or not command:
         return command
-    effective_environment = dict(os.environ)
-    if environment is not None:
-        effective_environment.update(environment)
-    if effective_environment.get("HEAVY_SLOT_HELD"):
+    try:
+        return _wrap_local(command, environment)
+    except Exception:  # throttling is best-effort and must never break the terminal
+        logger.debug("heavy-slot wrapping failed; running the command unwrapped", exc_info=True)
         return command
-    profile = classify_heavy_command(command)
-    if profile is None:
+
+
+def _wrap_local(command: str, environment: Optional[Mapping[str, str]]) -> str:
+    effective = dict(os.environ)
+    if environment:
+        effective.update(environment)
+    if not heavy_slot_enabled(effective):
         return command
-    executable = _heavy_slot_executable(effective_environment)
+    positions = _heavy_positions(command)
+    if not positions:
+        return command
+    executable = _heavy_slot_executable(effective)
     if executable is None:
         return command
-    label = f"hermes-terminal {profile}"
-    return f"{shlex.quote(executable)} --label {shlex.quote(label)} -- bash -c {shlex.quote(command)}"
+    rewritten = command
+    for offset, label in reversed(positions):
+        # The cwd is only known when the shell reaches this command, so expand it there.
+        prefix = f"{shlex.quote(executable)} --label {shlex.quote('hermes ' + label)}\" (in $PWD)\" -- "
+        rewritten = rewritten[:offset] + prefix + rewritten[offset:]
+    return rewritten

@@ -1271,10 +1271,12 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    metered: bool = True,
+    metered: bool = True, execution_command: Optional[str] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
-    is False for Hermes' own control-plane commands (``_host_local``)."""
+    is False for Hermes' own control-plane commands (``_host_local``). ``execution_command``
+    is what the shell runs (the heavy-slot rewrite); metrics, exit-code notes, verification
+    evidence and redaction keep describing the user's ``command``."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
     max_retries = 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
@@ -1299,7 +1301,7 @@ def _run_foreground(
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
@@ -1489,9 +1491,9 @@ def terminal_tool(
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
-        # Keep approval and pre-exec security checks on the user-supplied command, then wrap only
-        # the actual local execution. A slot marker inherited by a nested test command makes the
-        # wrapper a no-op, so a CI profile and the suites it launches consume one slot together.
+        # Approval and pre-exec security checks above saw the user-supplied command; only the
+        # local execution is rewritten, putting heavy-slot in front of each recognized test or
+        # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
         execution_command = wrap_heavy_command(
             command,
             env_type=env_type,
@@ -1513,7 +1515,7 @@ def terminal_tool(
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
             return _metered(None if _host_local else plan, result)
         return _metered(None if _host_local else plan, _run_foreground(
-            execution_command, env, plan,
+            command, env, plan, execution_command=execution_command,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
             metered=not _host_local,
