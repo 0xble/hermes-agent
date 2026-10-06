@@ -287,7 +287,9 @@ class GatewayStartupMixin:
                 logger.log(level, message, exc_info=(type(exc), exc, exc.__traceback__))
         return _report
 
-    async def _await_startup_boot_sends(self, *, planned_restart_notification_pending: bool) -> None:
+    async def _await_startup_boot_sends(
+        self, *, planned_restart_notification_pending: bool, interrupted_note_keys=(),
+    ) -> None:
         """Run boot-path sends without letting them pin the inbound restore gate (one Telegram
         flood-control sleep must not freeze inbound on every platform): same bounded wait as the
         resume gate, sends finish in the background on timeout. The ledger claim + ``resume_pending``
@@ -306,6 +308,10 @@ class GatewayStartupMixin:
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed)
+            if interrupted_note_keys:
+                await self._send_interrupted_turn_notes(
+                    interrupted_note_keys, reclaim_pending=True,
+                )
 
         boot_task = asyncio.create_task(_boot_sends())
         timeout = _startup_restore_drain_timeout_secs()
@@ -617,6 +623,18 @@ class GatewayStartupMixin:
         if not self._resume_owner_authorized(entry.session_key, source) or (require_adapter and adapter is None):
             return None
         return adapter, source
+
+    def _startup_interrupted_note_candidates(self, candidates) -> list[str]:
+        """Return fresh, eligible feature-version rows that may receive a startup note.
+
+        ``resume_pending`` predates S2 and is not sufficient evidence for a note: legacy rows have no
+        ``resume_turn_id``. Keep the note admission identical to auto-resume so stale or unavailable
+        sessions remain recoverable without producing an orphan notice.
+        """
+        return [
+            entry.session_key for entry in (candidates or [])
+            if getattr(entry, "resume_turn_id", None) and self._auto_resume_ready(entry) is not None
+        ]
 
     def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
                                           candidates=_NOT_SUPPLIED) -> int:
@@ -1720,27 +1738,22 @@ class GatewayStartupMixin:
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():
             self._booted_from_restart = True
-        # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
-        # control sleep here once froze every platform).
-        # Restart notification, home-channel startup notice, and obligation redelivery all call
-        # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
-        await self._await_startup_boot_sends(
-            planned_restart_notification_pending=_planned_restart_notification_pending(),
-        )
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
         candidates = self._resume_pending_candidates()
+        # Only this version's durable turn markers may create a startup interruption note. Legacy
+        # resume_pending rows have no resume_turn_id; apply the same freshness/authorization/adapter
+        # admission as auto-resume before routing note sends through the bounded boot-send task.
+        interrupted_note_keys = self._startup_interrupted_note_candidates(candidates)
+        await self._await_startup_boot_sends(
+            planned_restart_notification_pending=_planned_restart_notification_pending(),
+            interrupted_note_keys=interrupted_note_keys,
+        )
         try:
             recover_pending_shutdown_flush(self, candidates=candidates)
         except Exception:
             logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
-        # Startup recovery is the crash-before-send path: post any missing note now that adapters are connected.
-        # The durable row/id latch makes this safe after repeated boots and partial shutdown passes.
-        if candidates:
-            await self._send_interrupted_turn_notes(
-                [entry.session_key for entry in candidates], reclaim_pending=True,
-            )
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions(candidates=candidates)

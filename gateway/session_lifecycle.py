@@ -335,7 +335,7 @@ class SessionLifecycleMixin:
             )
 
     def clear_restart_note(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
-        """Clear the note id after its resumed answer was edited or replaced."""
+        """Clear the note id after its resumed answer was deleted or replaced."""
         def _apply(entry: SessionEntry):
             if not entry.restart_note_message_id:
                 return False
@@ -347,7 +347,6 @@ class SessionLifecycleMixin:
             entry.restart_note_turn_id = None
             entry.restart_note_marked_at = None
             entry.restart_note_reconcile_attempts = 0
-            entry.resume_turn_id = None
         return self._update_entry(session_key, _apply)
 
     def record_restart_note_reconcile_failure(self, session_key: str, *, max_attempts: int = 3) -> bool:

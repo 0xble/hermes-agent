@@ -946,44 +946,41 @@ class GatewayShutdownMixin:
 
         This deliberately bypasses ``gateway_restart_notification``: that flag controls broadcast
         noise, not the per-turn recovery contract. The session row is the durable deduplication latch.
+        Sends run concurrently behind one hard deadline so a slow transport cannot delay agent
+        interruption; unfinished claims remain reclaimable by startup recovery.
         """
-        sent = 0
-        for session_key in dict.fromkeys(session_keys or ()):
+        async def _send_one(session_key) -> int:
             marker = None
             send_succeeded = False
             try:
                 entry = self.session_store._entries.get(session_key)
                 if entry is None or not getattr(entry, "resume_pending", False) or not getattr(entry, "resume_human", True):
-                    continue
-                marker = self.async_session_store.get_resume_pending_marker
-                marker = await marker(session_key)
+                    return 0
+                marker = await self.async_session_store.get_resume_pending_marker(session_key)
                 note = await self.async_session_store.get_restart_note(session_key)
                 note_id = note[3] if note else None
                 if note_id and str(note_id).startswith("pending:") and not reclaim_pending:
-                    continue
+                    return 0
                 stale_note_id = None
                 current_marker = marker[1] if marker else None
                 if note_id and not str(note_id).startswith("pending:") and note[1] == current_marker:
-                    continue
+                    return 0
                 if note_id and str(note_id).startswith("sent:"):
                     # No platform id exists for this transport; clear the sentinel before
                     # allocating the one visible note for the new interruption.
                     await self.async_session_store.clear_restart_note(session_key)
                 elif note_id and not str(note_id).startswith("pending:"):
-                    current_marker = marker[1] if marker else None
-                    if note[1] == current_marker:
-                        continue
                     stale_note_id = str(note_id)
                 target = await self._shutdown_notification_target(session_key)
                 if target is None:
-                    continue
+                    return 0
                 source, platform_str, chat_id, thread_id, profile = target
                 platform = Platform(platform_str)
                 adapter = self._delivery_adapter_for(source) if source is not None else None
                 if adapter is None:
                     adapter = self._authorization_adapter(platform, profile)
                 if adapter is None:
-                    continue
+                    return 0
                 if stale_note_id:
                     deleted = False
                     delete = getattr(adapter, "delete_message", None)
@@ -994,12 +991,12 @@ class GatewayShutdownMixin:
                             deleted = False
                     if not deleted:
                         logger.warning("Unable to replace stale restart note for %s", session_key)
-                        continue
+                        return 0
                     await self.async_session_store.clear_restart_note(session_key)
                 if not await self.async_session_store.claim_restart_note(
                     session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
                 ):
-                    continue
+                    return 0
                 async def release_claim():
                     await self.async_session_store.release_restart_note_claim(
                         session_key, expected_marker=marker,
@@ -1008,14 +1005,8 @@ class GatewayShutdownMixin:
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,
                 )
-                extra = getattr(getattr(adapter, "config", None), "extra", {})
-                if not bool(getattr(adapter, "interactive_resume", True)):
-                    policy = "continue"
-                elif isinstance(extra, dict) and "restart_resume_policy" in extra:
-                    policy = str(extra["restart_resume_policy"])
-                else:
-                    configured = getattr(self.config, "restart_resume_policy", None)
-                    policy = str(configured) if configured is not None else "ask"
+                from gateway.run import resolve_restart_resume_policy
+                policy = resolve_restart_resume_policy(self.config, adapter)
                 text = t(
                     "gateway.shutdown.interrupted_turn" if policy == "continue"
                     else ("gateway.shutdown.notice_restart" if getattr(self, "_restart_requested", False)
@@ -1027,13 +1018,14 @@ class GatewayShutdownMixin:
                 )
                 if not result or not getattr(result, "success", False):
                     await release_claim()
-                    continue
+                    return 0
                 send_succeeded = True
                 note_id = getattr(result, "message_id", None) or "sent:no-id"
                 if await self.async_session_store.set_restart_note_message_id(
                     session_key, str(note_id), expected_marker=marker,
                 ):
-                    sent += 1
+                    return 1
+                return 0
             except Exception:
                 if not send_succeeded:
                     try:
@@ -1043,6 +1035,35 @@ class GatewayShutdownMixin:
                     except Exception:
                         pass
                 logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
+                return 0
+
+        unique_keys = list(dict.fromkeys(session_keys or ()))
+        if not unique_keys:
+            return 0
+
+        async def _send_batch():
+            return await asyncio.gather(*(_send_one(key) for key in unique_keys), return_exceptions=True)
+
+        batch_task = asyncio.create_task(_send_batch())
+        wait_or_detach = getattr(self, "_wait_or_detach", None)
+        if callable(wait_or_detach):
+            completed = await wait_or_detach(batch_task, 2.0)
+        else:
+            done, _pending = await asyncio.wait({batch_task}, timeout=2.0)
+            completed = batch_task in done
+            if not completed:
+                batch_task.cancel()
+
+                def _consume(task):
+                    with suppress(asyncio.CancelledError, Exception):
+                        task.exception()
+
+                batch_task.add_done_callback(_consume)
+        if not completed:
+            logger.warning("Interrupted-turn notes exceeded 2s total; continuing agent interruption")
+            return 0
+        results = batch_task.result()
+        sent = sum(result for result in results if isinstance(result, int))
         if sent:
             logger.info("Shutdown: delivered %d interrupted human-turn note(s)", sent)
         return sent
@@ -1219,6 +1240,8 @@ class GatewayShutdownMixin:
                     profile=update_profile,
                 ))
         for session_key in self._snapshot_running_agents():
+            if session_key in getattr(self, "_s2_note_session_keys", set()):
+                continue
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
@@ -2070,6 +2093,17 @@ class GatewayShutdownMixin:
         if callable(stop_watchdog):
             await stop_watchdog()
         await self._cancel_secondary_profile_reconnect_tasks()
+        # A timed-out human turn gets the S2 interruption note after the drain. Suppress the
+        # earlier per-session broadcast for those lanes so restart notifications do not duplicate it.
+        self._s2_note_session_keys = set()
+        for _session_key in list(getattr(self, "_running_agents", {}).keys()):
+            try:
+                _state = getattr(self, "_peek_session_state", lambda _key: None)(_session_key)
+                _event = getattr(getattr(_state, "turn", None), "event", None)
+                if _event is not None and getattr(self, "_is_user_turn_event", lambda event: not event.internal)(_event):
+                    self._s2_note_session_keys.add(_session_key)
+            except Exception:
+                continue
         # Network sends are best-effort; a slow Telegram request must not consume launchd's stop leash.
         # Detach-on-deadline rather than wait_for: a transport may swallow cancellation.
         from gateway.run import GatewayRunner

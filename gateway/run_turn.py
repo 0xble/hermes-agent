@@ -1559,8 +1559,8 @@ class GatewayTurnMixin:
             time.time() - _msg_start_time, agent_result.get("api_calls", 0), len(response),
         )
 
-        # Successful turns clear the durable restart marker only after final delivery has reconciled
-        # the visible interruption note. Clearing here used to make the resumed answer unable to find it.
+        # Successful turns clear the restart-failure escalation state before final delivery. The visible
+        # interruption note has its own durable record and remains available until delivery deletes it.
         if session_key and _should_clear_resume_pending_after_turn(agent_result):
             await self._clear_restart_failure_count(session_key)
 

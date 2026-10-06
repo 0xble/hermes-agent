@@ -4683,12 +4683,13 @@ class BasePlatformAdapter(ABC):
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
         streamed: bool = False,
     ) -> Optional[SendResult]:
-        """Replace the durable restart note with the resumed answer, or delete it after streaming.
+        """Delete the durable restart note before normal final delivery.
 
-        ``streamed=True`` is used when the answer body is already visible in a separate message: the
-        interruption note cannot be edited into that message, so delete the note before the caller clears
-        ``resume_pending``. A successful send without a platform message id is recorded as ``sent:no-id``;
-        there is no transport handle to edit or delete on those platforms, so the answer is sent normally.
+        ``streamed`` is retained for the caller's API compatibility: both streamed and non-streamed
+        answers delete the note first, because editing a note far up a thread does not notify the user
+        or move the answer to the bottom. A successful send without a platform message id is recorded as
+        ``sent:no-id``; there is no transport handle to delete on those platforms, so the answer is sent
+        normally.
         """
         if getattr(event, "_restart_note_reconciled", False):
             return None
@@ -4771,52 +4772,11 @@ class BasePlatformAdapter(ABC):
                 logger.warning("[%s] Failed to clear reconciled restart note for %s",
                                self.name, session_key, exc_info=True)
 
-        if streamed:
-            delete = getattr(self, "delete_message", None)
-            deleted = False
-            if callable(delete):
-                try:
-                    delete_result = delete(event.source.chat_id, str(note_id))
-                    delete_result = await delete_result if inspect.isawaitable(delete_result) else delete_result
-                    deleted = bool(delete_result)
-                except Exception:
-                    logger.warning("[%s] Failed to delete restart note for %s; continuing normal delivery",
-                                   self.name, session_key, exc_info=True)
-                    deleted = False
-            if deleted:
-                await _clear_reconciled_note()
-            else:
-                await _record_failed_reconciliation()
-            return None
-        edit = getattr(self, "edit_message", None)
-        result = None
-        if callable(edit):
-            try:
-                edit_result = edit(
-                    chat_id=event.source.chat_id, message_id=str(note_id), content=text_content,
-                    finalize=True, metadata=metadata,
-                )
-                result = await edit_result if inspect.isawaitable(edit_result) else edit_result
-            except TypeError:
-                try:
-                    edit_result = edit(
-                        chat_id=event.source.chat_id, message_id=str(note_id), content=text_content,
-                        finalize=True,
-                    )
-                    result = await edit_result if inspect.isawaitable(edit_result) else edit_result
-                except Exception:
-                    logger.warning("[%s] Failed to edit restart note for %s; continuing normal delivery",
-                                   self.name, session_key, exc_info=True)
-                    result = None
-            except Exception:
-                logger.warning("[%s] Failed to edit restart note for %s; continuing normal delivery",
-                               self.name, session_key, exc_info=True)
-                result = None
-        if result is not None and getattr(result, "success", False) is True:
-            await _clear_reconciled_note()
-            return result
-        deleted = False
+        # A resumed answer is always sent as a fresh message. Editing a note far up a thread
+        # does not notify the user or move the answer to the bottom, so delete the note first
+        # and let the normal final-delivery path send the answer.
         delete = getattr(self, "delete_message", None)
+        deleted = False
         if callable(delete):
             try:
                 delete_result = delete(event.source.chat_id, str(note_id))
@@ -4825,7 +4785,6 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 logger.warning("[%s] Failed to delete restart note for %s; continuing normal delivery",
                                self.name, session_key, exc_info=True)
-                deleted = False
         if deleted:
             await _clear_reconciled_note()
         else:
