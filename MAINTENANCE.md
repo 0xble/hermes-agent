@@ -125,6 +125,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Manual compression levels | `/compress --level 1-3` escalation and a `here N` head that keeps no extra tail | `/compress` parsing, `here N`, or manual compression budget changes | [Manual compression levels](maintenance/manual-compression-levels.md) |
 | Long request turn split | Split an oversized in-progress turn even when its opening request is long, so goal runs stay compressible | Oversized-turn split gates or in-flight request restatement changes | [Long request turn split](maintenance/long-request-turn-split.md) |
 | Oneshot plugin-hook discovery | Complete background plugin discovery before first-turn lifecycle hook delivery so `pre_llm_call` cannot observe a partial registry | Plugin startup discovery barriers, oneshot hook delivery, or plugin registry readiness | [Oneshot plugin-hook discovery](maintenance/oneshot-plugin-hook-discovery.md) |
+| Plugin and hook dispatch gates | Keep concurrent lifecycle and nested execute_code hook calls on distinct gate keys, let shell hooks own their matcher, timeout and fail_closed policy, avoid disk-cleanup temp-file races, and log default capability denials at DEBUG | Hook gate identity, shell-hook dispatch, execute_code nested tool-call ids, disk-cleanup state writes, or capability-check logging | [Plugin and hook dispatch gates](maintenance/plugin-hook-gates.md) |
 | MCP caller identity | Opted-in MCP servers receive the calling session's ContextVar identity as per-call request `_meta`, never the model's arguments or `os.environ` | MCP tool-call dispatch, per-server opt-ins, or session identity reads for MCP | [MCP caller identity](maintenance/mcp-caller-identity.md) |
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
@@ -138,6 +139,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/gateway/test_response_filters.py tests/gateway/test_gateway_silence_tokens.py tests/gateway/test_busy_redirect_anchor.py`.
 - **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
 - **Rollback:** Revert the relay-silence fix commit.
+
+## Active patch record: resumable delegation retention
+
+- **Patch identity:** `resumable-delegation-retention`.
+- **Behavior:** Keep resume-eligible (`unknown`/`interrupted`/`stalled`, unspent resume claim, parent or origin session) delegations in the durable ledger through terminal-cap and pending-cap pruning while they remain inside the seven-day retention window. Terminal-cap pruning deletes delivered rows first and pending completions last, so a pending child result is dropped only when nothing else is left to remove. A boot notice re-checks eligibility just before injection, which narrows but does not close the race; `claim_resume` remains the authority and refuses a notice that slips through. Retained resumable rows are bounded by age, not by the caps.
+- **Source surfaces:** `tools/async_delegation.py`, `tools/delegation_resume.py`, `gateway/run_notifications.py`, and focused async-delegation recovery tests.
+- **Upstream status:** NousResearch #128623 and PR #128634 retain delivered audit records, but do not preserve resume-eligible interrupted rows or guard the queued boot-notice race; no equivalent upstream fix found.
+- **Focused regression:** `scripts/run_tests.sh tests/tools/test_delegation_resume.py tests/gateway/test_delegation_auto_resume.py`.
+- **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
+- **Rollback:** Revert the resumable-delegation-retention fix commit.
 
 ## Update
 
