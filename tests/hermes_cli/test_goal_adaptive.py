@@ -480,12 +480,16 @@ def test_revision_refuses_a_source_message_too_long_to_judge(hermes_home):
 
 
 def test_evidence_can_supersede_an_obsolete_verification_without_user_quote(hermes_home):
-    mgr = GoalManager(session_id="rev-evidence")
+    sid = "rev-evidence"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
     mgr.set("Ship X", contract=GoalContract(verification="Check the removed component"))
+    recorded = "The approved plan removed the component, so that check is impossible."
+    _tool(db, sid, "read_file", {"path": "plan.md"}, recorded, "plan")
     result = mgr.revise(
         reason="the approved plan removed the component",
         contract={"verification": "X is live"},
-        evidence="The approved plan removed the component, so that check is impossible.",
+        evidence=recorded,
     )
     assert result["ok"] and result["version"] == 2
     revision = load_goal("rev-evidence").revisions[-1]
@@ -497,6 +501,24 @@ def test_evidence_can_supersede_an_obsolete_verification_without_user_quote(herm
     assert "evidence: The approved plan removed the component" in history
     assert "agent, agent" not in history
     assert "earlier verification: Check the removed component" in history
+
+
+def test_fabricated_evidence_cannot_weaken_verification(hermes_home):
+    sid = "rev-fabricated-evidence"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship X", contract=GoalContract(verification="Check the removed component"))
+    _tool(db, sid, "read_file", {"path": "plan.md"}, "The component is still required.", "plan")
+
+    result = mgr.revise(
+        reason="the component is gone",
+        contract={"verification": "X is live"},
+        evidence="The approved plan removed the component entirely",
+    )
+
+    assert result["error_code"] == "evidence_not_recorded"
+    assert mgr.state.contract.verification == "Check the removed component"
+    assert mgr.state.revisions == []
 
 
 def test_evidence_does_not_authorize_objective_or_constraint_changes(hermes_home):
@@ -526,11 +548,15 @@ def test_short_evidence_is_refused(hermes_home):
 
 
 def test_evidence_can_drop_an_obsolete_subgoal_and_is_shown_as_agent_evidence(hermes_home):
-    mgr = GoalManager(session_id="rev-evidence-subgoal")
+    sid = "rev-evidence-subgoal"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
     mgr.set("Ship X")
     mgr.add_subgoal("Willow watch runs on schedule")
+    recorded = "measurement-plan.md removes the Willow watch instead of migrating it"
+    _tool(db, sid, "read_file", {"path": "measurement-plan.md"}, recorded, "plan")
     result = mgr.revise(reason="Willow watch was removed by the approved plan", subgoals=[],
-                        evidence="measurement-plan.md removes the Willow watch instead of migrating it")
+                        evidence=recorded)
     assert result["ok"]
     revision = load_goal("rev-evidence-subgoal").revisions[-1]
     assert revision["authority"] == "evidence"
@@ -550,10 +576,13 @@ def test_valid_quote_is_not_limited_by_evidence_scope(hermes_home):
 
 
 def test_evidence_prompts_require_support_from_recorded_results(hermes_home, monkeypatch):
-    mgr = GoalManager(session_id="rev-evidence-judge")
+    sid = "rev-evidence-judge"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
     mgr.set("Ship X", contract=GoalContract(verification="Check the removed component"))
-    mgr.revise(reason="obsolete", contract={"verification": "X is live"},
-               evidence="The approved plan removed the component entirely")
+    recorded = "The approved plan removed the component entirely"
+    _tool(db, sid, "read_file", {"path": "plan.md"}, recorded, "plan")
+    mgr.revise(reason="obsolete", contract={"verification": "X is live"}, evidence=recorded)
     prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
     mgr.evaluate_after_turn("working")
     assert "only when the recorded tool results support that evidence" in prompts[0]
@@ -564,6 +593,23 @@ def test_replace_without_a_goal_returns_an_error_dict(hermes_home):
     result = GoalManager(session_id="replace-none").replace(
         reason="new", goal="Ship Y", user_quote="set a better goal", user_messages=["set a better goal"])
     assert result == {"ok": False, "error_code": "no_active_goal", "error": "no active or paused goal"}
+
+
+def test_unauthorized_replace_leaves_prior_goal_active_and_unchanged(hermes_home):
+    sid = "replace-unauthorized"
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship the original outcome", contract=GoalContract(constraints="never publish secrets"))
+    before = load_goal(sid).to_json()
+
+    result = mgr.replace(
+        reason="agent wants a new direction", goal="Ship the unrestricted outcome",
+        user_quote="the user said replace", user_messages=["Please keep going on the original outcome."],
+    )
+
+    assert result["error_code"] == "user_quote_not_found"
+    assert mgr.state.goal == "Ship the original outcome"
+    assert mgr.state.contract.constraints == "never publish secrets"
+    assert load_goal(sid).to_json() == before
 
 
 def test_replace_uses_current_user_quote_and_records_the_replaced_goal(hermes_home):
@@ -601,7 +647,7 @@ def test_freshly_replaced_goal_has_no_revision_notice(hermes_home):
     assert revised is not None and "This goal has been revised" in revised
 
 
-def test_replace_starts_new_revision_numbering_and_exposes_authority_only_to_judge(hermes_home, monkeypatch):
+def test_replace_starts_new_revision_numbering_and_exposes_authority_in_continuation_prompt(hermes_home, monkeypatch):
     mgr = GoalManager(session_id="replace-version")
     mgr.set("Old goal", contract=GoalContract(constraints="never push to main"))
     mgr.replace(reason="new direction", goal="New goal", user_quote="replace with the new goal",
@@ -612,6 +658,7 @@ def test_replace_starts_new_revision_numbering_and_exposes_authority_only_to_jud
     prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
     mgr.evaluate_after_turn("working")
     assert "Old goal" in prompts[0]
+    assert "never push to main" in prompts[0]
     assert "Replacement authority audit" in prompts[0]
     assert "Please replace with the new goal now." in prompts[0]
     assert "v2" in prompts[0]
