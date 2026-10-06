@@ -16,6 +16,7 @@ import shlex
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import Context
 from pathlib import Path
@@ -216,8 +217,8 @@ class GatewayShutdownMixin:
         # which is fine for a drain but unsafe for a suspend predicate — a transient read failure would make
         # live work look idle and reopen the mid-job freeze. Here an unreadable source counts as work
         # (sentinel 1) so the machine stays awake until the source is readable again.
-        from cron.scheduler import get_running_job_ids
-        return len(get_running_job_ids())
+        from cron.scheduler import get_shutdown_drain_job_ids
+        return len(get_shutdown_drain_job_ids())
 
     def _active_cron_job_count(self) -> int:
         """Cron jobs currently executing — they run outside ``_running_agents``; 0 if cron can't import.
@@ -2194,28 +2195,34 @@ class GatewayShutdownMixin:
         """
         persisted = 0
 
-        def _slot(mapping, key, value, *, overflow: bool = False) -> None:
+        def _slot(mapping, key, value, *, source_value=None, overflow: bool = False) -> None:
             nonlocal persisted
             try:
                 if self._flush_owned_pending(
                     key, value, reason="shutdown", overflow=overflow,
                 ):
-                    if mapping.get(key) is value:
-                        mapping.pop(key, None)
+                    current = mapping.get(key)
+                    expected = value if source_value is None else source_value
+                    # SessionFieldView is a live Mapping, not a dict. Remove only the
+                    # exact slot we flushed; a concurrent replacement must survive.
+                    if current is expected:
+                        remover = getattr(mapping, "pop", None)
+                        if callable(remover):
+                            remover(key, None)
                     persisted += 1
             except Exception:
                 logger.exception("Failed to durably spool shutdown-pending message for %s", key)
 
         pending = getattr(self, "_pending_messages", None)
-        if isinstance(pending, dict):
+        if isinstance(pending, Mapping):
             for key, value in list(pending.items()):
                 _slot(pending, key, value)
 
         queued_events = getattr(self, "_queued_events", None)
-        if isinstance(queued_events, dict):
+        if isinstance(queued_events, Mapping):
             for key, events in list(queued_events.items()):
                 if events:
-                    _slot(queued_events, key, list(events), overflow=True)
+                    _slot(queued_events, key, list(events), source_value=events, overflow=True)
 
         profile_adapters = getattr(self, "_profile_adapters", {})
         adapters = [*list(getattr(self, "adapters", {}).items())]
@@ -2226,7 +2233,7 @@ class GatewayShutdownMixin:
         )
         for platform, adapter in adapters:
             adapter_pending = getattr(adapter, "_pending_messages", None)
-            if not isinstance(adapter_pending, dict):
+            if not isinstance(adapter_pending, Mapping):
                 continue
             for key, value in list(adapter_pending.items()):
                 _slot(adapter_pending, key, value)
@@ -2318,7 +2325,7 @@ class GatewayShutdownMixin:
             if stop_event is not None and stop_event.is_set():
                 return
             pending = getattr(adapter, "_pending_messages", None)
-            if not isinstance(pending, dict) or not pending:
+            if not isinstance(pending, Mapping) or not pending:
                 continue
             for key, value in list(pending.items()):
                 if stop_event is not None and stop_event.is_set():

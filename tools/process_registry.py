@@ -2640,41 +2640,120 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 and s.id not in exclude_ids and not s.exited
                 and not (lifecycle and s.persist_on_release)
             ]
-        def _kill_one(session: ProcessSession, *, target_deadline: Optional[float]) -> bool:
+        def _fallback_kill_one(session: ProcessSession) -> bool:
             if stop_event is not None and stop_event.is_set():
                 return False
-            if target_deadline is not None and time.monotonic() >= target_deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return False
-            kill_kwargs = {"source": source, "consume_output": consume_output}
-            if target_deadline is not None:
-                kill_kwargs["deadline"] = target_deadline
-            return self.kill_process(session.id, **kill_kwargs).get("status") in {"killed", "already_exited"}
+            kwargs = {"source": source, "consume_output": consume_output}
+            if deadline is not None:
+                kwargs["deadline"] = deadline
+            return self.kill_process(session.id, **kwargs).get("status") in {"killed", "already_exited"}
 
-        killed = 0
-        # A shutdown grace is shared by the whole sweep. Start every local kill in
-        # parallel so a SIGTERM-ignoring first process cannot consume the grace
-        # before later targets receive SIGTERM. Each kill uses the same deadline,
-        # then escalates its owned tree to SIGKILL before that shared deadline.
-        shared_parallel = False
-        if deadline is not None and len(targets) > 1:
-            shared_parallel = max(0.0, deadline - time.monotonic()) > max(
-                0.1, 2.0 * self._daemon_term_grace_seconds(),
-            )
-        if shared_parallel:
-            with ThreadPoolExecutor(max_workers=len(targets), thread_name_prefix="process-kill") as pool:
-                futures = [pool.submit(_kill_one, session, target_deadline=deadline) for session in targets]
-                killed = sum(bool(future.result()) for future in futures)
-        else:
-            for session in targets:
-                if deadline is None:
-                    target_deadline = None
+        def _signal_group(session: ProcessSession, sig: int) -> bool:
+            """Signal one owned local process group without waiting for it."""
+            if session.systemd_unit:
+                if sig == getattr(signal, "SIGKILL", signal.SIGTERM):
+                    return _stop_systemd_unit(session.systemd_unit)
+                return True
+            pid = getattr(getattr(session, "process", None), "pid", None) or session.pid
+            if not pid or session.pid_scope != "host":
+                if session.env_ref and session.pid:
+                    with suppress(Exception):
+                        session.env_ref.execute(f"kill -{int(sig)} {session.pid} 2>/dev/null", timeout=5)
+                        return True
+                return False
+            if session.host_start_time is not None and not self._host_pid_is_ours(pid, session.host_start_time):
+                return False
+            try:
+                killpg = getattr(os, "killpg", None)
+                if killpg is None:
+                    return False
+                pgid = os.getpgid(pid)
+                # Test/legacy Popen callers may not create a new session. Never
+                # signal our own process group; fall back to the owned PID there.
+                if pgid == os.getpgrp():
+                    os.kill(pid, sig)
                 else:
-                    target_deadline = deadline
-                if _kill_one(session, target_deadline=target_deadline):
+                    killpg(pgid, sig)
+                return True
+            except (ProcessLookupError, PermissionError, OSError):
+                return False
+
+        def _alive(session: ProcessSession) -> bool:
+            proc = getattr(session, "process", None)
+            if proc is not None:
+                with suppress(Exception):
+                    return proc.poll() is None
+                return True
+            if session._pty is not None:
+                with suppress(Exception):
+                    return bool(session._pty.isalive())
+                return True
+            if session.pid_scope == "host" and session.pid:
+                return self._is_host_pid_alive(session.pid)
+            return False
+
+        # Real local workers are killed in one bounded sweep: TERM every process group,
+        # one shared grace, KILL every survivor, then a short reap/poll. This deliberately
+        # has no sequential-under-deadline path: bash -lic wrappers commonly ignore TERM.
+        signalable = [
+            session for session in targets
+            if not _IS_WINDOWS and (
+                getattr(getattr(session, "process", None), "pid", None)
+                or session._pty is not None or (session.detached and session.pid)
+            )
+        ]
+        if signalable:
+            for session in signalable:
+                _signal_group(session, signal.SIGTERM)
+            started = time.monotonic()
+            configured_grace = self._daemon_term_grace_seconds()
+            remaining = None if deadline is None else max(0.0, deadline - started)
+            grace = configured_grace if remaining is None else min(configured_grace, 0.4 * remaining)
+            grace_deadline = started + grace
+            while time.monotonic() < grace_deadline:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if not any(_alive(session) for session in signalable):
+                    break
+                time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
+            for session in signalable:
+                if _alive(session):
+                    _signal_group(session, getattr(signal, "SIGKILL", signal.SIGTERM))
+            reap_deadline = time.monotonic() + 0.2
+            if deadline is not None:
+                reap_deadline = min(reap_deadline, deadline)
+            while time.monotonic() < reap_deadline and any(_alive(session) for session in signalable):
+                time.sleep(0.02)
+            killed = 0
+            for session in signalable:
+                if _alive(session):
+                    continue
+                with session._lock:
+                    if not session.exited:
+                        session.exited = True
+                        session.exit_code = -signal.SIGTERM
+                        session.completion_reason = "killed"
+                        session.termination_source = source
+                        if consume_output:
+                            self._completion_consumed.add(session.id)
+                if self._move_to_finished(session):
                     killed += 1
-        # A reader racing the kill can finish after the per-target deadline. One final checkpoint
-        # after the whole sweep makes the durable registry reflect every kill whose result is now
-        # in _finished, without relying on a reader thread that may have skipped its own write.
+            # Non-local targets are handled by the same bounded parallel phase, never serially.
+            remainder = [session for session in targets if session not in signalable]
+            if remainder:
+                with ThreadPoolExecutor(max_workers=len(remainder), thread_name_prefix="process-kill") as pool:
+                    killed += sum(bool(future.result()) for future in
+                                  [pool.submit(_fallback_kill_one, session) for session in remainder])
+        else:
+            # Opaque test doubles have no process group or runtime handle; preserve the
+            # legacy kill_process contract for those registry-only records. Real host
+            # workers never enter this branch.
+            killed = 0
+            for session in targets:
+                if _fallback_kill_one(session):
+                    killed += 1
         self._write_checkpoint()
         return killed
 

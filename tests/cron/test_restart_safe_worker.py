@@ -24,6 +24,26 @@ def execution_ledger(tmp_path, monkeypatch):
     return executions
 
 
+def test_pre_ack_scoped_worker_stays_active_but_is_not_interrupted(monkeypatch):
+    import cron.scheduler as sched
+
+    key = sched._inflight_key("pre-ack-scoped")
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+        sched._external_worker_modes[key] = "scoped"
+        sched._running_fire_owners[key] = {object(): ("owner", sched._get_hermes_home().resolve())}
+    monkeypatch.setattr(sched, "mark_job_run", lambda *args, **kwargs: pytest.fail("safe worker marked"))
+    try:
+        assert sched.get_shutdown_drain_job_ids() == frozenset({"pre-ack-scoped"})
+        assert sched.mark_running_jobs_interrupted("shutdown") == []
+        assert key not in sched._interrupted_job_ids
+    finally:
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+            sched._running_fire_owners.pop(key, None)
+            sched._external_worker_modes.pop(key, None)
+
+
 def test_execution_owner_moves_to_external_worker_before_running(
     execution_ledger, monkeypatch
 ):

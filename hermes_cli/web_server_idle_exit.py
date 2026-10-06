@@ -124,10 +124,10 @@ def busy_ledger() -> Optional[str]:
         if busy_sessions:
             return "session:" + ",".join(str(sid) for sid in busy_sessions)
         from tools.async_delegation import active_count
-        from cron.scheduler import get_running_job_ids
+        from cron.scheduler import get_shutdown_drain_job_ids
         if active_count():
             return "delegation"
-        running_jobs = get_running_job_ids()
+        running_jobs = get_shutdown_drain_job_ids()
         return "cron:" + ",".join(sorted(running_jobs)) if running_jobs else ""
     except Exception:
         if not _probe_failure_logged:

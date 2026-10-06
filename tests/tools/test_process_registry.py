@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import psutil
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -106,6 +107,32 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
             },
         )
     ]
+
+
+def test_kill_all_real_login_shell_groups_die_with_default_grace(registry):
+    """The real restart bound must kill every bash -lic group in one shared sweep."""
+    pytest.importorskip("psutil")
+    sessions = [
+        registry.spawn_local("trap '' TERM; sleep 60", task_id="restart-sweep")
+        for _ in range(4)
+    ]
+    root_pids = [session.pid for session in sessions]
+    try:
+        deadline = time.monotonic() + 3.0  # production restart bound
+        registry.kill_all(
+            "restart-sweep", deadline=deadline,
+            source="gateway_turn_timeout", consume_output=True,
+        )
+        time.sleep(0.2)  # brief post-sweep reap/poll allowance
+        survivors = []
+        for root_pid in root_pids:
+            if root_pid and psutil.pid_exists(root_pid):
+                process = psutil.Process(root_pid)
+                if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                    survivors.append(root_pid)
+        assert not survivors
+    finally:
+        registry.kill_all("restart-sweep", source="test-cleanup", consume_output=True)
 
 
 def test_kill_all_deadline_stops_followup_targets_and_checkpoint_writes(registry):

@@ -733,6 +733,18 @@ def get_running_job_details() -> list[dict]:
         ]
 
 
+def get_shutdown_drain_job_ids() -> "frozenset[str]":
+    """Host-wide cron jobs that keep a gateway restart drain active.
+
+    Unlike the general liveness accessors, acknowledged restart-safe external workers
+    remain here: they are still executing and matter to idle-exit/metrics and the
+    shutdown drain's accounting even though they do not need interruption.
+    """
+    with _running_lock:
+        active = _running_job_ids | _running_fire_owners.keys()
+        return frozenset(key[1] for key in active)
+
+
 def get_wedged_job_ids() -> "frozenset[str]":
     """In-flight job IDs older than their stale-inflight allowance (``max(2 * interval,
     cron.inflight_max_minutes)``) — the scheduler's own definition of a claim that can no longer be
@@ -1089,10 +1101,19 @@ def mark_running_jobs_interrupted(
     """
     with _running_lock:
         restart_safe_waiters = set(_restart_safe_external_worker_job_ids) | set(_restart_safe_waiter_job_ids)
+        # A scoped/detached dispatch is restart-safe even before its ready ack arrives:
+        # the worker may already own the durable execution while the parent is still
+        # polling for acknowledgement. Keep it in the drain, but never mark it
+        # interrupted or send the interrupted notice from this path.
+        restart_safe_modes = {
+            key for key, mode in _external_worker_modes.items()
+            if mode in {"scoped", "detached"}
+        }
+        restart_safe_for_interrupt = restart_safe_waiters | restart_safe_modes
         active_fires = [
             (token, key, owner, profile_home)
             for key, executions in _running_fire_owners.items()
-            if key not in restart_safe_waiters
+            if key not in restart_safe_for_interrupt
             for token, (owner, profile_home) in executions.items()
         ]
         if only_owners is not None:
@@ -1105,7 +1126,7 @@ def mark_running_jobs_interrupted(
             active_fires.extend(
                 (None, key, None, _inflight_home_path(key[0]))
                 for key in (
-                    _running_job_ids - registered_keys - restart_safe_waiters
+                    _running_job_ids - registered_keys - restart_safe_for_interrupt
                 )
             )
         _interrupted_job_ids.update(
