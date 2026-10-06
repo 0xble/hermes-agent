@@ -417,8 +417,14 @@ class LoopManager:
         return self._state
 
     def refresh(self) -> None:
-        """Re-read state from the DB (cross-process safety for the gateway)."""
-        self._state = load_loop(self.session_id)
+        """Re-read state from the DB (cross-process safety for the gateway).
+
+        A failed read also yields None; keep the cached state then, or a transient DB error during a
+        wakeup would drop ``awaiting_response`` handling and wedge the tick. Rows are never deleted
+        (stop marks them cleared), so None with a cached state means the read failed."""
+        fresh = load_loop(self.session_id)
+        if fresh is not None or self._state is None:
+            self._state = fresh
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -620,10 +626,9 @@ class LoopManager:
             after["interval_seconds"] if after["mode"] == "interval"
             else (after["current_delay"] or float(self_paced_floor_seconds()))
         )
-        faster = (
-            new_effective_delay < current_effective_delay
-            and not (self_paced and state.mode != "self_paced")
-        )
+        # Switching to self-paced starts at the floor, so it is faster whenever the floor is below the
+        # current delay; it gets the same authority check as any other cadence change.
+        faster = new_effective_delay < current_effective_delay
         raising_times = (
             "times" in changed
             and state.times > 0
@@ -747,8 +752,10 @@ class LoopManager:
             "after": new_snapshot,
         }
         old_route = dict(state.route)
+        # Resume is a user-only control: a replaced paused loop stays paused (with its reason) until /loop resume.
+        was_paused = state.status == "paused"
         state.prompt = prompt
-        state.status = "active"
+        state.status = "paused" if was_paused else "active"
         state.mode = new_snapshot["mode"]
         state.interval_seconds = interval
         state.current_delay = new_snapshot["current_delay"]
@@ -761,7 +768,8 @@ class LoopManager:
         state.next_due_at = now
         state.awaiting_response = False
         state.last_response_digest = ""
-        state.paused_reason = None
+        if not was_paused:
+            state.paused_reason = None
         state.last_stop_reason = None
         state.route = dict(old_route if route is None else route)
         state.revisions.append(revision)

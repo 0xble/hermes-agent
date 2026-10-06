@@ -71,7 +71,57 @@ def test_authority_branches(tmp_path, monkeypatch):
     assert mgr.revise(reason="faster", interval_seconds=60)["error_code"] == "user_authority_required"
     assert mgr.revise(reason="cap", times=2)["ok"] is True
     assert mgr.revise(reason="remove cap", times=0)["error_code"] == "user_authority_required"
-    assert mgr.revise(reason="switch mode", self_paced=True)["ok"] is True
+    # Self-paced starts at the 60s floor: faster than 300s, so it needs the user's words.
+    assert mgr.revise(reason="switch mode", self_paced=True)["error_code"] == "user_authority_required"
+
+    mgr = _manager(tmp_path, monkeypatch, "authority3")
+    mgr.set("watch", interval_seconds=30)
+    # From a 30s interval the 60s floor is slower, so no quote is needed.
+    assert mgr.revise(reason="back off", self_paced=True)["ok"] is True
+
+
+def test_loop_wakeup_text_is_never_user_authority(tmp_path, monkeypatch):
+    from hermes_cli import goals
+
+    mgr = _manager(tmp_path, monkeypatch, "wakeup-quote")
+    state = mgr.set("watch", interval_seconds=3600)
+    state.next_due_at = time.time() - 1
+    wakeup = mgr.fire_tick()
+    # CLI/TUI submit wakeups as plain user turns with no display_kind.
+    assert goals._is_user_typed({"content": wakeup, "display_kind": None}) is False
+    guidance = "revise the loop with the loop_set tool (action=revise)"
+    assert guidance in wakeup
+    rows = [{"content": wakeup, "display_kind": None}]
+    pool = [r["content"] for r in rows if goals._is_user_typed(r)]
+    result = mgr.revise(reason="faster", interval_seconds=30, user_quote=guidance, user_messages=pool)
+    assert result["error_code"] == "user_quote_not_found"
+    assert mgr.state.interval_seconds == 3600
+
+
+def test_refresh_keeps_cached_state_when_read_fails(tmp_path, monkeypatch):
+    from hermes_cli import loops
+
+    mgr = _manager(tmp_path, monkeypatch, "refresh-fail")
+    state = mgr.set("watch", interval_seconds=300)
+    state.next_due_at = time.time() - 1
+    mgr.fire_tick()
+    monkeypatch.setattr(loops, "load_loop", lambda _sid: None)
+    mgr.refresh()
+    assert mgr.state is not None and mgr.state.awaiting_response is True
+    assert mgr.complete_tick("still working")["status"] == "active"
+
+
+def test_replace_keeps_a_user_paused_loop_paused(tmp_path, monkeypatch):
+    mgr = _manager(tmp_path, monkeypatch, "replace-paused")
+    mgr.set("old", interval_seconds=300)
+    mgr.pause(reason="user-paused")
+    quote = "Please reword the loop to check the deploy instead"
+    result = mgr.replace(prompt="check the deploy", interval_seconds=300, reason="reworded",
+                         user_quote=quote, user_messages=[quote])
+    assert result["ok"] is True
+    assert mgr.state.status == "paused"
+    assert mgr.state.paused_reason == "user-paused"
+    assert mgr.is_due() is False
 
 
 def test_invalid_no_change_and_done_errors(tmp_path, monkeypatch):
