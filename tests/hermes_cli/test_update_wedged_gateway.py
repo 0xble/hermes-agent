@@ -419,9 +419,9 @@ class TestEscalateWedgedGateway:
         )
 
         # The first reading is the recorded process; the next proves PID reuse.
-        readings = iter([1000, 99999])
+        readings = iter([99999])
         monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: next(readings))
-        assert gateway_cli._escalate_wedged_gateway(4242) is True
+        assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000) is True
         assert signals == []
 
 class TestLaunchdRestartWedgedIntegration:
