@@ -62,3 +62,28 @@ def test_streaming_hook_snapshot_sees_hook_registered_by_inflight_discovery(monk
     plugins, callback, worker = _inflight_discovery(monkeypatch)
     assert callback in plugins.iter_hook_callbacks("pre_llm_call")
     worker.join(5)
+
+
+def test_background_discovery_barrier_has_no_partial_registry_timeout(monkeypatch):
+    """The delivery barrier must not return while a slow worker still owns discovery."""
+    import hermes_cli.plugins as plugins
+
+    class SlowWorker:
+        def __init__(self):
+            self.join_calls = []
+            self._alive = True
+
+        def is_alive(self):
+            return self._alive
+
+        def join(self, *args, **kwargs):
+            self.join_calls.append((args, kwargs))
+            self._alive = False
+
+    worker = SlowWorker()
+    monkeypatch.setattr(plugins, "_background_discovery_thread", worker)
+    monkeypatch.setattr(plugins, "in_plugin_load_worker", lambda: False)
+
+    plugins._join_background_discovery()
+
+    assert worker.join_calls == [((), {})]

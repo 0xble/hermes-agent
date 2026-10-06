@@ -1860,13 +1860,19 @@ def start_background_plugin_discovery() -> None:
         _background_discovery_thread.start()
 
 
-def _join_background_discovery(timeout: float = 30.0) -> None:
-    """Wait for an in-flight background discovery (no-op from its own thread or a plugin-load worker it
-    spawned — that worker's parent is blocked waiting on it)."""
+def _join_background_discovery() -> None:
+    """Wait until an in-flight background discovery completes (no-op from its own thread or a
+    plugin-load worker it spawned — that worker's parent is blocked waiting on it).
+
+    Discovery publishes ``_discovered`` before loading plugin modules. It is therefore a correctness
+    barrier, not a best-effort startup wait: returning after a fixed timeout would expose the same
+    partial registry this helper exists to prevent. Individual plugin loads already have their own
+    deadline, so the discovery worker has a bounded failure path without this outer timeout.
+    """
     t = _background_discovery_thread
     if t is None or not t.is_alive() or t is threading.current_thread() or in_plugin_load_worker():
         return
-    t.join(timeout=timeout)
+    t.join()
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
