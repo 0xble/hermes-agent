@@ -823,10 +823,10 @@ class SessionStore(
         self._has_active_processes_fn = has_active_processes_fn
         self._write_sessions_json = bool(getattr(config, "write_sessions_json", True))
 
-        # Session DB handles are intentionally lazy. Opening state.db can contend with other Hermes
-        # processes, so constructor-time priming would delay the control socket and adapter readiness.
-        # AsyncSessionStore offloads first-use SQLite work; startup recovery explicitly awaits its
-        # off-loop snapshot before admitting restored turns.
+        # Keep the cheap handle probe at construction: callers and the isolation guard rely on a
+        # SessionStore having an explicit DB/fallback decision. The expensive routing load, stale-row
+        # recovery, archive/prune and VACUUM remain demand-time/off-loop; AsyncSessionStore and startup
+        # recovery offload those operations before admitting restored turns.
         self._db_pinned = _DB_UNPINNED
         self._db_handles: Dict[Path, Any] = {}
         self._db_handles_lock = threading.Lock()
@@ -847,6 +847,8 @@ class SessionStore(
             self._routing_home: Optional[Path] = Path(get_hermes_home())
         except Exception:
             self._routing_home = None
+        # Probe the handle now, but keep all state.db table scans and maintenance off the readiness path.
+        self._open_session_db_for_active_scope()
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via

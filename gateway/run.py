@@ -6090,19 +6090,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await _close_active_generation()
         return False
 
-    async def _discover_mcp_after_ready() -> None:
-        try:
-            await _discover_gateway_mcp_tools(runner.config)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("MCP tool discovery failed: %s", e)
-
-    if not runner.should_exit_cleanly:
-        mcp_task = asyncio.create_task(_discover_mcp_after_ready(), name="gateway:mcp-discovery")
-        runner._background_tasks.add(mcp_task)
-        mcp_task.add_done_callback(runner._background_tasks.discard)
-
     if runner.should_exit_cleanly:
         _shutdown_gateway_health_export(runner)
         await _close_active_generation()

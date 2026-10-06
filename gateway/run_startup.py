@@ -1755,6 +1755,14 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
+        # MCP discovery stays off the event loop (the helper uses executor threads), but it must finish
+        # before the startup restore gate opens so the first inbound turn sees the complete tool surface.
+        # Adapters are already polling by this point, so slow MCP servers cannot delay adapter readiness.
+        from gateway.run import _discover_gateway_mcp_tools
+        try:
+            await _discover_gateway_mcp_tools(self.config)
+        except Exception as exc:
+            logger.debug("MCP tool discovery failed: %s", exc)
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
