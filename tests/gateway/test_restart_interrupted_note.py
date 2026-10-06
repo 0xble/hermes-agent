@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult, _ExtractedResponse
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.run_shutdown import GatewayShutdownMixin
@@ -152,7 +152,7 @@ async def test_user_message_after_note_keeps_new_turn_resumable(tmp_path):
     store.set_restart_note_message_id(entry.session_key, "note-user")
     event = MessageEvent(text="continue this", message_type=MessageType.TEXT, source=_source(), internal=False)
 
-    assert await adapter._reconcile_restart_note(event, entry.session_key, "answer", {}) is None
+    await adapter._reconcile_restart_note(event, entry.session_key)
     assert adapter.deleted == [("chat", "note-user")]
     assert store._entries[entry.session_key].resume_turn_id == "turn-2"
 
@@ -302,14 +302,33 @@ async def test_sent_no_id_note_is_cleared_at_final_delivery(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_attachment_only_final_reconciles_restart_note(tmp_path):
+    adapter = NoteAdapter()
+    store, entry, event = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-attachment")
+    adapter._deliver_media_attachments = AsyncMock()
+    extracted = _ExtractedResponse(
+        text_content="", images=[], media_files=[("answer.txt", False)], local_files=[],
+        force_document_attachments=False, pre_extract="MEDIA: answer.txt",
+    )
+
+    await adapter._deliver_attachments(
+        event, extracted, {}, anything_sent=False, record_delivery=lambda _result: None,
+        session_key=entry.session_key,
+    )
+
+    assert adapter.deleted == [("chat", "note-attachment")]
+    assert store.get_restart_note(entry.session_key)[3] is None
+
+
+@pytest.mark.asyncio
 async def test_resumed_answer_deletes_note_and_sends_fresh_message(tmp_path):
     adapter = NoteAdapter()
     store, entry, event = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-7")
 
-    result = await adapter._reconcile_restart_note(event, entry.session_key, "resumed answer", {})
+    await adapter._reconcile_restart_note(event, entry.session_key)
 
-    assert result is None
     assert adapter.edited == []
     assert adapter.deleted == [("chat", "note-7")]
     assert store.get_restart_note(entry.session_key)[3] is None
@@ -321,12 +340,11 @@ async def test_resumed_answer_delete_send_fallback_has_no_orphan(tmp_path):
     store, entry, event = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-8")
 
-    result = await adapter._reconcile_restart_note(event, entry.session_key, "replacement", {})
+    await adapter._reconcile_restart_note(event, entry.session_key)
     sent = await adapter.send("chat", "replacement")
 
-    assert result is None
-    assert adapter.deleted == [("chat", "note-8")]
     assert sent.success is True
+    assert adapter.deleted == [("chat", "note-8")]
     assert store.get_restart_note(entry.session_key)[3] is None
 
 
@@ -337,9 +355,8 @@ async def test_user_message_recovery_turn_reconciles_note(tmp_path):
     store.set_restart_note_message_id(entry.session_key, "note-user")
     event = MessageEvent(text="continue this", message_type=MessageType.TEXT, source=_source(), internal=False)
 
-    result = await adapter._reconcile_restart_note(event, entry.session_key, "answer", {})
+    await adapter._reconcile_restart_note(event, entry.session_key)
 
-    assert result is None
     assert adapter.edited == []
     assert adapter.deleted == [("chat", "note-user")]
     assert store.get_restart_note(entry.session_key)[3] is None
@@ -448,8 +465,8 @@ async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path
     runner._authorization_adapter = lambda *_args: adapter
     runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
 
-    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
-    assert "Hermes is shutting down" in adapter.sent[0][1]
+    assert await runner._send_interrupted_turn_notes([entry.session_key], reclaim_pending=True) == 1
+    assert "Hermes is restarting" in adapter.sent[0][1]
     assert store.get_restart_note(entry.session_key)[3] == "m1"
     assert store._entries[entry.session_key].resume_pending is True
 
@@ -536,6 +553,70 @@ async def test_startup_boot_send_path_includes_interrupted_notes_without_blockin
     )
     assert calls == [(["fresh"], {"reclaim_pending": True})]
 
+
+@pytest.mark.asyncio
+async def test_startup_claims_ledger_answer_before_resume_snapshot(tmp_path, monkeypatch):
+    """An answered ledger row must not be resumed or get a startup interruption note (#91969)."""
+    from gateway import delivery_ledger as ledger
+    from gateway.run_startup import GatewayStartupMixin
+    import gateway.run_pending_recovery as pending_recovery
+    import gateway.run_startup as startup_module
+    import gateway.run as run_module
+
+    monkeypatch.setattr(ledger, "_db_path", lambda: tmp_path / "state.db")
+    obligation_id = ledger.compute_obligation_id("answered-session", "inbound", "answer")
+    ledger.record_obligation(
+        obligation_id=obligation_id, session_key="answered-session", platform="telegram",
+        chat_id="chat", thread_id="thread", content="answer",
+    )
+    ledger.mark_attempting(obligation_id)
+    with ledger._connect() as conn:
+        conn.execute(
+            "UPDATE delivery_obligations SET owner_pid=?, owner_started_at=? WHERE obligation_id=?",
+            (999999999, 1, obligation_id),
+        )
+
+    store = _store(tmp_path / "sessions")
+    source = _source("startup-order")
+    entry = store.get_or_create_session(source)
+    entry.session_key = "answered-session"
+    store._entries["answered-session"] = entry
+    store._entries.pop(entry.session_key, None) if entry.session_key != "answered-session" else None
+    store.mark_resume_pending("answered-session", turn_id="turn-answered", human=True)
+
+    runner = object.__new__(GatewayStartupMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.adapters = {Platform.TELEGRAM: object()}
+    runner._profile_adapters = {}
+    runner._restart_loop_guard_config = lambda: (100, 3600, 0)
+    runner._auto_resume_ready = lambda _entry: (object(), source)
+    runner._start_post_connect_services = AsyncMock()
+    runner._send_restart_notification = AsyncMock()
+    runner._schedule_update_notification_watch = Mock()
+    runner._redeliver_claimed_obligations = AsyncMock()
+    note_calls = []
+    runner._send_interrupted_turn_notes = AsyncMock(
+        side_effect=lambda keys, **kwargs: note_calls.append((keys, kwargs)),
+    )
+    scheduled = []
+    runner._schedule_resume_pending_sessions = Mock(
+        side_effect=lambda **kwargs: scheduled.append(kwargs["candidates"]),
+    )
+    runner._finish_startup_restore = AsyncMock()
+    runner._schedule_auto_resume_delegations = Mock()
+    runner._send_session_db_warning_notifications = AsyncMock()
+    monkeypatch.setattr(run_module, "_startup_restore_drain_timeout_secs", lambda: 0)
+    monkeypatch.setattr(startup_module, "recover_pending_shutdown_flush", lambda *args, **kwargs: None,
+                        raising=False)
+    monkeypatch.setattr(pending_recovery, "recover_pending_shutdown_flush", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.restart_loop_guard.check_and_record", lambda *args, **kwargs: False)
+
+    await GatewayStartupMixin._start_finish_wiring(runner, 0)
+
+    assert entry.resume_pending is False
+    assert note_calls == []
+    assert scheduled == [[]]
 
 
 def test_pending_note_claim_is_atomic_and_recoverable(tmp_path):

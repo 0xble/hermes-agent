@@ -1944,10 +1944,10 @@ class GatewayTurnMixin:
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
-            # A streamed body is already a separate visible message, so remove the restart note rather than
-            # editing it into a duplicate answer. This runs before the caller clears resume_pending.
+            # The final body has already reached the chat, so reconcile the note before the
+            # caller clears resume_pending. The adapter latch makes this idempotent with other lanes.
             if adapter:
-                await adapter._reconcile_restart_note(event, session_key, response or "", {}, streamed=True)
+                await adapter._reconcile_restart_note(event, session_key)
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             if response and adapter and not agent_result.get("media_already_delivered"):

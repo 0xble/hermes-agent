@@ -4651,6 +4651,7 @@ class BasePlatformAdapter(ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
+        await self._reconcile_restart_note(event, session_key)
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
@@ -4679,25 +4680,21 @@ class BasePlatformAdapter(ABC):
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
 
-    async def _reconcile_restart_note(
-        self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
-        streamed: bool = False,
-    ) -> Optional[SendResult]:
-        """Delete the durable restart note before normal final delivery.
+    async def _reconcile_restart_note(self, event: MessageEvent, session_key: str) -> None:
+        """Delete the durable restart note before final delivery.
 
-        ``streamed`` is retained for the caller's API compatibility: both streamed and non-streamed
-        answers delete the note first, because editing a note far up a thread does not notify the user
-        or move the answer to the bottom. A successful send without a platform message id is recorded as
-        ``sent:no-id``; there is no transport handle to delete on those platforms, so the answer is sent
-        normally.
+        A resumed answer is always sent as a fresh message. Editing a note far up a thread does not
+        notify the user or move the answer to the bottom, so delete the note first and let the normal
+        final-delivery path send the answer. The reconciliation latch makes all delivery lanes safe to
+        call through the turn's single finalization path.
         """
         if getattr(event, "_restart_note_reconciled", False):
-            return None
+            return
         runner = getattr(self, "gateway_runner", None)
         store = getattr(runner, "async_session_store", None)
         get_note = getattr(store, "get_restart_note", None)
         if not callable(get_note):
-            return None
+            return
 
         # Final delivery must not pay for a store lookup when this session has no visible
         # interruption note.  The live runner and AsyncSessionStore expose the routing index
@@ -4717,22 +4714,22 @@ class BasePlatformAdapter(ABC):
         if entries is not None:
             entry = entries.get(session_key)
             if entry is None or not getattr(entry, "restart_note_message_id", None):
-                return None
+                return
         elif not inspect.iscoroutinefunction(get_note):
-            return None
+            return
 
         try:
             note_result = get_note(session_key)
             note = await note_result if inspect.isawaitable(note_result) else note_result
             if not isinstance(note, (tuple, list)) or len(note) < 4:
-                return None
+                return
             note_id = note[3] if note else None
         except Exception:
             logger.warning("[%s] Restart-note lookup failed for %s; continuing normal delivery",
                            self.name, session_key, exc_info=True)
-            return None
+            return
         if not note_id or str(note_id).startswith("pending:"):
-            return None
+            return
         if str(note_id).startswith("sent:"):
             # Signal-like transports have no platform handle. The sentinel is reconciled by
             # clearing the durable record, then the answer is sent normally.
@@ -4743,7 +4740,7 @@ class BasePlatformAdapter(ABC):
                 logger.warning("[%s] Failed to clear no-id restart note for %s", self.name, session_key,
                                exc_info=True)
             event._restart_note_reconciled = True
-            return None
+            return
         event._restart_note_reconciled = True
 
         async def _record_failed_reconciliation() -> None:
@@ -4789,17 +4786,12 @@ class BasePlatformAdapter(ABC):
             await _clear_reconciled_note()
         else:
             await _record_failed_reconciliation()
-        return None
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable,
         attachments_pending: bool = False) -> None:
         """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
-        restart_result = await self._reconcile_restart_note(event, session_key, text_content, metadata)
-        if restart_result is not None:
-            record_delivery(restart_result)
-            return
         result, delivery_adapter = await self.send_final_ledgered(
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response,
@@ -4808,7 +4800,9 @@ class BasePlatformAdapter(ABC):
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
-    async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
+    async def _notify_turn_error(
+        self, event: MessageEvent, e: BaseException, session_key: Optional[str] = None,
+    ) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
@@ -4824,6 +4818,8 @@ class BasePlatformAdapter(ABC):
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
             if content is None:
                 return _thread_metadata
+            if session_key:
+                await self._reconcile_restart_note(event, session_key)
             await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
         except Exception as notify_err:
             logger.error(
@@ -4832,10 +4828,12 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
-                                   record_delivery: Callable) -> None:
+                                   record_delivery: Callable, session_key: Optional[str] = None) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them."""
+        if session_key:
+            await self._reconcile_restart_note(event, session_key)
         human_delay = self._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
         if images:
@@ -5021,6 +5019,10 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
+            if response and hasattr(self, "_reconcile_restart_note"):
+                # This is the common final-delivery entry for text, TTS captions, and attachments;
+                # specialized streamed/queued/error lanes reconcile before their own sends.
+                await self._reconcile_restart_note(event, session_key)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -5067,7 +5069,7 @@ class BasePlatformAdapter(ABC):
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                    record_delivery=_record_delivery, session_key=session_key)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -5106,7 +5108,7 @@ class BasePlatformAdapter(ABC):
             bind_event_turn(event)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
+            _thread_metadata = (await self._notify_turn_error(event, e, session_key)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise

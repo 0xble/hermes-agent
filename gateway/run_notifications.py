@@ -474,6 +474,10 @@ class GatewayNotificationsMixin:
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        if session_key and hasattr(adapter, "_reconcile_restart_note"):
+            await adapter._reconcile_restart_note(
+                MessageEvent(text="", source=source, message_id=event_message_id), session_key,
+            )
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:

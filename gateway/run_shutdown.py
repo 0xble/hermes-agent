@@ -1009,7 +1009,8 @@ class GatewayShutdownMixin:
                 policy = resolve_restart_resume_policy(self.config, adapter)
                 text = t(
                     "gateway.shutdown.interrupted_turn" if policy == "continue"
-                    else ("gateway.shutdown.notice_restart" if getattr(self, "_restart_requested", False)
+                    else ("gateway.shutdown.notice_restart" if (reclaim_pending
+                          or getattr(self, "_restart_requested", False))
                           else "gateway.shutdown.notice_shutdown")
                 )
                 result = await adapter.send(
@@ -1052,6 +1053,9 @@ class GatewayShutdownMixin:
             done, _pending = await asyncio.wait({batch_task}, timeout=2.0)
             completed = batch_task in done
             if not completed:
+                # A transport may accept the send just before this local cancellation while the
+                # durable claim remains pending; startup recovery can then post one duplicate note.
+                # This low-probability 2s deadline window is accepted rather than guessing success.
                 batch_task.cancel()
 
                 def _consume(task):

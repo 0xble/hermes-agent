@@ -289,6 +289,7 @@ class GatewayStartupMixin:
 
     async def _await_startup_boot_sends(
         self, *, planned_restart_notification_pending: bool, interrupted_note_keys=(),
+        claimed=None,
     ) -> None:
         """Run boot-path sends without letting them pin the inbound restore gate (one Telegram
         flood-control sleep must not freeze inbound on every platform): same bounded wait as the
@@ -300,14 +301,14 @@ class GatewayStartupMixin:
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
         from gateway.run import _startup_restore_drain_timeout_secs
-        claimed = await self._claim_pending_obligations()
+        claimed_rows: list = (await self._claim_pending_obligations() if claimed is None else claimed)
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
             self._schedule_update_notification_watch()
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
-            await self._redeliver_claimed_obligations(claimed)
+            await self._redeliver_claimed_obligations(claimed_rows)
             if interrupted_note_keys:
                 await self._send_interrupted_turn_notes(
                     interrupted_note_keys, reclaim_pending=True,
@@ -614,6 +615,8 @@ class GatewayStartupMixin:
             _resume_pending_marker_timestamp,
         )
         marker = _resume_pending_marker_timestamp(entry)
+        if not getattr(entry, "resume_pending", True):
+            return None
         if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
             return None
         if self._is_session_running(entry.session_key):
@@ -1738,9 +1741,10 @@ class GatewayStartupMixin:
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():
             self._booted_from_restart = True
-        # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
-        # interrupted session must wait as a distinct event, not enter that turn's history.
+        # Claim delivery-ledger obligations before snapshotting resume-pending sessions. Claiming an
+        # answered turn clears its live resume flag; taking this snapshot first replays the turn (#91969).
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
+        claimed = await self._claim_pending_obligations()
         candidates = self._resume_pending_candidates()
         # Only this version's durable turn markers may create a startup interruption note. Legacy
         # resume_pending rows have no resume_turn_id; apply the same freshness/authorization/adapter
@@ -1749,13 +1753,13 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
             interrupted_note_keys=interrupted_note_keys,
+            claimed=claimed,
         )
         try:
             recover_pending_shutdown_flush(self, candidates=candidates)
         except Exception:
             logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
-        # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
-        # auto-resume stays visible on the next user message.
+        # Auto-resume only the live snapshot: ledger-answered sessions were cleared before it was taken.
         self._schedule_resume_pending_sessions(candidates=candidates)
         await self._finish_startup_restore()
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
