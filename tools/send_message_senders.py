@@ -129,7 +129,11 @@ def _standalone_telegram_rate_limiter():
     def on_retry_after(key: str, wait: float) -> None:
         flood_state.record_deadline(profile_dir, key, wait)
 
-    return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining, on_retry_after=on_retry_after)
+    from plugins.platforms.telegram.daily_quota import DailyQuota
+    # One-shot lane: persist every call so the gateway's daily ledger sees this lane's volume.
+    daily = DailyQuota(soft_ceiling=None, profile_dir=profile_dir, flush_interval=0.0)
+    return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining,
+                                 on_retry_after=on_retry_after, daily=daily)
 
 
 def _telegram_bot(token):

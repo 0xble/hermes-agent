@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
+from plugins.platforms.telegram.daily_quota import OUTBOUND_PROGRESS, DailyQuota
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 
 logger = logging.getLogger(__name__)
@@ -284,8 +285,10 @@ class ChatBudgetRateLimiter:
         *,
         penalty_remaining: Optional[Callable[[str], Optional[float]]] = None,
         on_retry_after: Optional[Callable[[str, float], None]] = None,
+        daily: Optional["DailyQuota"] = None,
     ):
         self.budget = budget
+        self.daily = daily
         self._penalty_remaining = penalty_remaining
         self._on_retry_after = on_retry_after
         self.shed_count = 0
@@ -308,18 +311,25 @@ class ChatBudgetRateLimiter:
         kind = (rate_limit_args or {}).get("kind") if isinstance(rate_limit_args, dict) else None
         kind = kind or endpoint_kind(endpoint)
         if kind in (KIND_TYPING, KIND_INTERIM):
+            if self.daily is not None and self.daily.sheds(key, OUTBOUND_PROGRESS):
+                self.shed_count += 1
+                return True  # cosmetic traffic is the first spent when the day's volume runs low
             if not self.budget.try_take(key, kind):
                 self.shed_count += 1
                 logger.debug("Telegram chat %s: shed %s (%s), budget slot busy", key, endpoint, kind)
                 return True  # sendChatAction and draft endpoints return a bare boolean
         else:
             await self.budget.take(key)
+        if self.daily is not None:
+            self.daily.record(key, endpoint, data)
         try:
             return await callback(*args, **kwargs)
         except Exception as error:
             wait = _retry_after_seconds(error)
             if wait is not None:
                 self.budget.note_retry_after(key, wait)
+                if self.daily is not None:
+                    self.daily.note_retry_after(key, wait)
                 logger.warning("Telegram chat %s: %s refused with retry_after=%.1fs", key, endpoint, wait)
                 if self._on_retry_after is not None:
                     try:
