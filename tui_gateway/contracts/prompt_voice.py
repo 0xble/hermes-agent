@@ -57,6 +57,7 @@ class PromptSubmitStatus(WireEnum):
     queued = "queued"
     steered = "steered"
     redirected = "redirected"
+    dropped = "dropped"
 
 
 class PromptSubmitResult(Result):
@@ -72,6 +73,8 @@ class PromptSubmitResult(Result):
     survivor_user_row_ids: list[int | None] | None = None
     survivor_row_id_map: dict[str, int | None] | None = None
     turn_isolation: bool | None = None
+    reason: str | None = None
+    message: str | None = None
 
 
 method("prompt.submit", params=PromptSubmitParams, result=PromptSubmitResult,

@@ -678,7 +678,7 @@ def _apply_pending_moa(sid: str, session: dict, prompt: Any, queue_token: str | 
     """Claim the session-owned MoA record attached to this exact queued item."""
     if not queue_token:
         return True
-    item = pending_moa.claim(session, queue_token)
+    item = pending_moa.claim(session, queue_token, restore=pending_moa.restore_snapshot(session))
     if item is None:
         _emit("error", sid, {
             "message": "Deferred MoA request was cancelled or is no longer available; prompt dropped."

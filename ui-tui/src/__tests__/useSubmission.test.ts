@@ -5,7 +5,7 @@ import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ComposerActions, ComposerRefs, ComposerState, ComposerToken } from '../app/interfaces.js'
-import { patchUiState, resetUiState } from '../app/uiStore.js'
+import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import { prepareSubmission, shouldInterpolateSubmission, useSubmission } from '../app/useSubmission.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import { queueItem, type QueueItem } from '../hooks/useQueue.js'
@@ -61,7 +61,10 @@ describe('visible interpolation combined with a collapsed paste', () => {
 
 type SubmissionHarness = ReturnType<typeof useSubmission>
 
-const createSubmissionHarness = (takeQueue: () => QueueItem | undefined = () => undefined) => {
+const createSubmissionHarness = (
+  takeQueue: () => QueueItem | undefined = () => undefined,
+  promptResponse: Record<string, unknown> = {}
+) => {
   let result!: SubmissionHarness
 
   const request = vi.fn((method: string) => {
@@ -69,7 +72,7 @@ const createSubmissionHarness = (takeQueue: () => QueueItem | undefined = () => 
       return Promise.resolve({ matched: false })
     }
 
-    return Promise.resolve({})
+    return method === 'prompt.submit' ? Promise.resolve(promptResponse) : Promise.resolve({})
   })
 
   const actions = {
@@ -149,7 +152,7 @@ const createSubmissionHarness = (takeQueue: () => QueueItem | undefined = () => 
     stderr: stderr as unknown as NodeJS.WriteStream
   })
 
-  return { actions, close: () => instance.unmount(), gw: request, refs, result }
+  return { actions, close: () => instance.unmount(), gw: request, refs, result, sys }
 }
 
 describe('deferred MoA submissions while busy', () => {
@@ -200,20 +203,55 @@ describe('deferred MoA submissions while busy', () => {
     harness.close()
   })
 
-  it('does not route a token-bearing ! payload through the shell shortcut', async () => {
-    patchUiState({ sid: 'sid-shell' })
+  it('submits an idle token-bearing leading-slash payload literally', async () => {
+    patchUiState({ sid: 'sid-idle-token', busy: false })
     const harness = createSubmissionHarness()
 
-    harness.result.sendQueued(queueItem('!inspect', '/moa !inspect', 'token-shell'))
+    harness.result.dispatchSubmission('/not-a-command {!date}', 'token-idle')
 
     await vi.waitFor(() =>
       expect(harness.gw).toHaveBeenCalledWith('prompt.submit', {
-        moa_token: 'token-shell',
-        session_id: 'sid-shell',
-        text: '!inspect'
+        moa_token: 'token-idle',
+        session_id: 'sid-idle-token',
+        text: '/not-a-command {!date}'
       })
     )
     expect(harness.gw).not.toHaveBeenCalledWith('shell.exec', expect.anything())
+    harness.close()
+  })
+
+  it('reports a cancelled token as terminal so the queue can drop it', async () => {
+    patchUiState({ sid: 'sid-dropped-token', busy: false })
+    const harness = createSubmissionHarness(() => undefined, {
+      status: 'dropped',
+      reason: 'deferred_moa_unavailable',
+      message: 'Deferred MoA request was cancelled; prompt dropped.'
+    })
+
+    harness.result.sendQueued(queueItem('/payload', '/moa /payload', 'token-dropped'))
+
+    await vi.waitFor(() =>
+      expect(harness.sys).toHaveBeenCalledWith('Deferred MoA request was cancelled; prompt dropped.')
+    )
+    expect(getUiState().busy).toBe(false)
+    expect(getUiState().status).toBe('ready')
+    harness.close()
+  })
+  it('does not interpolate a token-bearing queued payload', async () => {
+    patchUiState({ sid: 'sid-token-interpolation', busy: false })
+    const harness = createSubmissionHarness()
+
+    harness.result.sendQueued(queueItem('!inspect {!date}', '/moa !inspect {!date}', 'token-interpolation'))
+
+    await vi.waitFor(() =>
+      expect(harness.gw).toHaveBeenCalledWith('prompt.submit', {
+        moa_token: 'token-interpolation',
+        session_id: 'sid-token-interpolation',
+        text: '!inspect {!date}'
+      })
+    )
+    expect(harness.gw).not.toHaveBeenCalledWith('shell.exec', expect.anything())
+    expect(harness.gw).not.toHaveBeenCalledWith('shell.exec', { command: 'date' })
     harness.close()
   })
 })

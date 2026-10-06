@@ -634,6 +634,18 @@ def _(rid, params: dict) -> dict:
             return refusal
         if (t := current_transport()) is not None:
             _rebind_live_transport(sid, session, t)
+    # Stop/Esc cancels the session-owned record. Resolve that terminal state before
+    # accepting a queued client retry so every surface can drop its stale queue item
+    # instead of treating a canceled token as a transient submit failure.
+    moa_token = params.get("moa_token")
+    if moa_token:
+        from . import pending_moa
+        record = pending_moa.get(session, moa_token)
+        if record is None or pending_moa.status(record) in {"cancelled", "consumed"}:
+            message = "Deferred MoA request was cancelled or is no longer available; prompt dropped."
+            return _ok(rid, {
+                "status": "dropped", "reason": "deferred_moa_unavailable", "message": message,
+            })
     # Claim the turn against a possibly-running session (busy/queued reply, else fall
     # through once ``running`` is observed False).  The provider interrupt happens after
     # history_lock is released (a non-interruptible tool may hold it); if the old turn

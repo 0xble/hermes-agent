@@ -104,7 +104,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { moaToken?: string; skipDetectDrop?: boolean } = {}
+      submitOpts: { moaToken?: string; skipDetectDrop?: boolean; literal?: boolean } = {}
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
@@ -180,7 +180,17 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
   const sendQueued = useCallback(
     (item: QueueItem) => {
-      if (item.text.startsWith('!') && !item.moaToken) {
+      // A token-bearing item is an opaque backend payload: no shell shortcut,
+      // interpolation, paste expansion, or slash handling may reinterpret it.
+      if (item.moaToken) {
+        return send(item.text, true, item.display, undefined, {
+          literal: true,
+          moaToken: item.moaToken,
+          skipDetectDrop: true
+        })
+      }
+
+      if (item.text.startsWith('!')) {
         return shellExec(item.text.slice(1).trim())
       }
 
@@ -263,6 +273,25 @@ export function useSubmission(opts: UseSubmissionOptions) {
     (full: string, moaToken?: string) => {
       if (!full.trim()) {
         return
+      }
+
+      // Deferred MoA payloads are opaque: preserve the exact text and token on
+      // every path, including idle force-send and queue edits. Never run shell,
+      // interpolation, paste expansion, or slash parsing on them.
+      if (moaToken) {
+        const live = getUiState()
+        composerActions.pushHistory(full)
+        composerActions.clearIn()
+
+        if (!live.sid) {
+          return composerActions.enqueue(full, full, moaToken)
+        }
+
+        if (live.busy) {
+          return handleBusyInput(queueItem(full, full, moaToken))
+        }
+
+        return send(full, true, full, undefined, { literal: true, moaToken, skipDetectDrop: true })
       }
 
       // History stores resolved content, not `[[…]]` labels: tokens are cleared

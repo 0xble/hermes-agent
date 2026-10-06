@@ -693,6 +693,8 @@ export function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targ
   return targetOrdinal >= 0 && targetOrdinal < indices.length ? indices[targetOrdinal] : -1
 }
 
+export type SubmitTextResult = boolean | 'dropped'
+
 export interface SubmitTextOptions {
   moaToken?: string
   attachments?: ComposerAttachment[]

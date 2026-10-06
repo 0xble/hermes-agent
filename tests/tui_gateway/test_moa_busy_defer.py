@@ -43,10 +43,7 @@ def test_moa_during_running_turn_does_not_touch_live_agent(monkeypatch):
     assert session["pending_moa"][result["result"]["moa_token"]]["prompt"] == "compare answers"
     assert session["pending_moa"][result["result"]["moa_token"]]["preset"] == "default"
     assert session["pending_moa"][result["result"]["moa_token"]]["status"] == "pending"
-    assert session["pending_moa"][result["result"]["moa_token"]]["restore"] == {
-        "override": {"model": "standing", "provider": "openai"},
-        "model": "gpt-4", "provider": "openai",
-    }
+    assert session["pending_moa"][result["result"]["moa_token"]]["restore"] == {}
 
 
 def test_pending_moa_applies_to_matching_next_turn_and_restores(monkeypatch):
@@ -99,8 +96,29 @@ def test_two_queued_moa_commands_keep_the_base_restore_snapshot(monkeypatch):
 
     assert len(session["pending_moa"]) == 2
     assert first["result"]["moa_token"] != second["result"]["moa_token"]
-    assert session["pending_moa"][first["result"]["moa_token"]]["restore"] == session["pending_moa"][second["result"]["moa_token"]]["restore"]
-    assert session["pending_moa"][first["result"]["moa_token"]]["restore"]["provider"] == "openai"
+    assert session["pending_moa"][first["result"]["moa_token"]]["restore"] == {}
+    assert session["pending_moa"][second["result"]["moa_token"]]["restore"] == {}
+
+
+
+def test_claim_time_restore_ignores_expired_model_once_override(monkeypatch):
+    session = _session(running=False)
+    session["agent"].model = "standing-model"
+    session["agent"].provider = "openai"
+    token = "queued-after-once"
+    session["pending_moa"] = {token: {
+        "token": token, "prompt": "compare", "preset": "default", "status": "pending", "restore": {},
+    }}
+    calls = []
+
+    def apply(_sid, _session, raw, **kwargs):
+        calls.append(raw)
+        return None
+
+    monkeypatch.setattr(server, "_apply_model_switch", apply)
+    assert server._apply_pending_moa("sid", session, "compare", token) is True
+    assert session["pending_moa"][token]["restore"]["model"] == "standing-model"
+    assert session["pending_moa"][token]["restore"]["model"] != "X"
 
 
 def test_moa_queue_token_prevents_same_text_queue_merge():

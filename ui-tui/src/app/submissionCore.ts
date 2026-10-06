@@ -50,22 +50,24 @@ export function submitPrompt(
   deps: SubmitPromptDeps,
   showUserMessage = true,
   displayOverride?: string,
-  opts: { moaToken?: string; skipDetectDrop?: boolean } = {}
-): void {
+  opts: { moaToken?: string; skipDetectDrop?: boolean; literal?: boolean } = {}
+): Promise<boolean> {
   const sid = getUiState().sid
 
   if (!sid) {
-    return deps.sys('session not ready yet')
+    deps.sys('session not ready yet')
+    return Promise.resolve(false)
   }
 
   // Close the async-busy gap up front, before the detect_drop round-trip.
   markSubmitting()
 
-  const startSubmit = (displayText: string, submitText: string, show = true) => {
+  const startSubmit = (displayText: string, submitText: string, show = true): Promise<boolean> => {
     const liveSid = getUiState().sid
 
     if (!liveSid) {
-      return deps.sys('session not ready yet')
+      deps.sys('session not ready yet')
+      return Promise.resolve(false)
     }
 
     turnController.clearStatusTimer()
@@ -79,19 +81,27 @@ export function submitPrompt(
     turnController.bufRef = ''
     turnController.interrupted = false
 
-    deps.gw
+    return deps.gw
       .request<PromptSubmitResponse>('prompt.submit', {
         ...(opts.moaToken ? { moa_token: opts.moaToken } : {}),
         session_id: liveSid,
         text: submitText
       })
       .then(r => {
+        if (r?.status === 'dropped' && r.reason === 'deferred_moa_unavailable') {
+          deps.sys(r.message || 'Deferred MoA request was cancelled; prompt dropped.')
+          patchUiState({ busy: false, status: 'ready' })
+          return false
+        }
+
         // The gateway consumed a typed voice stop phrase server-side (voice
         // chat ended, no turn started) — release the busy latch; the
         // voice.transcript {stop_phrase} event handles the mode flags + notice.
         if (r?.voice_stopped) {
           patchUiState({ busy: false, status: 'ready' })
         }
+
+        return true
       })
       .catch((e: Error) => {
         // Defensive: prompt.submit no longer rejects a mid-turn send with
@@ -101,12 +111,14 @@ export function submitPrompt(
         if (isSessionBusyError(e)) {
           deps.enqueue(submitText, submitText, opts.moaToken)
           patchUiState({ busy: true, status: 'queued for next turn' })
+          deps.sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
 
-          return deps.sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
+          return false
         }
 
         deps.sys(`error: ${e.message}`)
         patchUiState({ busy: false, status: 'ready' })
+        return false
       })
   }
 
@@ -120,17 +132,17 @@ export function submitPrompt(
   // in place. Announcing it a second time above the status bar was the old
   // out-of-band attachment UI.
   if (opts.skipDetectDrop) {
-    return startSubmit(text, deps.expand(text), showUserMessage)
+    return startSubmit(text, opts.literal ? text : deps.expand(text), showUserMessage)
   }
 
-  deps.gw
+  return deps.gw
     .request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
     .then(r => {
       if (!r?.matched) {
-        return startSubmit(text, deps.expand(text), showUserMessage)
+        return startSubmit(text, opts.literal ? text : deps.expand(text), showUserMessage)
       }
 
-      startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage)
+      return startSubmit(r.text || text, opts.literal ? text : deps.expand(r.text || text), showUserMessage)
     })
-    .catch(() => startSubmit(text, deps.expand(text), showUserMessage))
+    .catch(() => startSubmit(text, opts.literal ? text : deps.expand(text), showUserMessage))
 }

@@ -238,6 +238,18 @@ export function useComposerQueue({
             })
           )
 
+          if (accepted === 'dropped') {
+            removeQueuedPrompt(drainQueueSessionKey, entry.id, { retainPreviewUrls: true })
+            notify({
+              id: `composer-deferred-moa-dropped-${entry.id}`,
+              kind: 'info',
+              title: t.composer.queueDroppedTitle,
+              message: t.composer.queueDroppedBody
+            })
+            unparkQueuedPrompts(drainQueueSessionKey)
+            return true
+          }
+
           if (accepted === false) {
             return false
           }

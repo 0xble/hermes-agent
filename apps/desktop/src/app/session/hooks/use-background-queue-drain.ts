@@ -27,7 +27,7 @@ import { $workingSessionIds } from '@/store/session-states'
 
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 
-type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise<boolean | 'dropped'> | boolean | 'dropped'
 
 interface BackgroundQueueDrainOptions {
   enabled: boolean
@@ -182,6 +182,19 @@ export function useBackgroundQueueDrain({
             storedSessionId: sessionKey
           })
         )
+
+        if (accepted === 'dropped') {
+          removeQueuedPrompt(sessionKey, liveEntry.id, { retainPreviewUrls: true })
+          notify({
+            id: `composer-deferred-moa-dropped-${liveEntry.id}`,
+            kind: 'info',
+            title: t.composer.queueDroppedTitle,
+            message: t.composer.queueDroppedBody
+          })
+          resetBrowseState(runtimeSessionId)
+          scheduleRetry()
+          return true
+        }
 
         if (accepted === false) {
           return false

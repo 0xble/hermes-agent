@@ -84,6 +84,7 @@ import {
   shouldInterruptBeforeRewind,
   shouldUseSlashCommandShortcut,
   type SubmitTextOptions,
+  type SubmitTextResult,
   withSessionNotFoundResume
 } from './utils'
 
@@ -623,9 +624,10 @@ export function usePromptActions({
   })
 
   const submitText = useCallback(
-    async (rawText: string, options?: SubmitTextOptions) => {
-      const visibleText = sanitizeComposerInput(rawText).trim()
-      const attachments = options?.attachments ?? $composerAttachments.get()
+    async (rawText: string, options?: SubmitTextOptions): Promise<SubmitTextResult> => {
+      const tokenPayload = Boolean(options?.moaToken)
+      const visibleText = tokenPayload ? rawText : sanitizeComposerInput(rawText).trim()
+      const attachments = tokenPayload ? (options?.attachments ?? []) : (options?.attachments ?? $composerAttachments.get())
 
       if (
         shouldUseSlashCommandShortcut(visibleText, {

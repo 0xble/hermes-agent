@@ -70,7 +70,23 @@ def get(session: dict, token: str) -> dict | None:
         return record if isinstance(record, dict) else None
 
 
-def claim(session: dict, token: str) -> dict | None:
+def restore_snapshot(session: dict) -> dict:
+    """Capture the standing runtime identity when a deferred MoA turn is claimed.
+
+    Queue acceptance can happen inside a ``/model --once`` turn, while that turn's
+    temporary model is still installed. Claiming happens at the next-turn boundary,
+    after ``_TurnRun.one_turn_restore`` has reinstated the standing model, so the
+    snapshot belongs here rather than at ``/moa`` acceptance.
+    """
+    agent = session.get("agent")
+    return {
+        "override": session.get("model_override"),
+        "model": getattr(agent, "model", None),
+        "provider": getattr(agent, "provider", None),
+    }
+
+
+def claim(session: dict, token: str, *, restore: dict | None = None) -> dict | None:
     """Claim once; an existing claim may be resumed by an inline fallback or host child."""
     if not token:
         return None
@@ -80,6 +96,8 @@ def claim(session: dict, token: str) -> dict | None:
             return None
         status = record.get("status")
         if status == _PENDING:
+            if isinstance(restore, dict):
+                record["restore"] = dict(restore)
             record["status"] = _CLAIMED
             return record
         if status == _CLAIMED:
@@ -147,5 +165,6 @@ __all__ = [
     "install",
     "locked",
     "mark_host_result",
+    "restore_snapshot",
     "status",
 ]

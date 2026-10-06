@@ -60,6 +60,7 @@ import {
   releaseSubmitInFlight,
   SessionRecoveryAborted,
   type SubmitTextOptions,
+  type SubmitTextResult,
   withSessionBusyRetry,
   withSessionNotFoundResume
 } from './utils'
@@ -166,24 +167,25 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
   } = deps
 
   return useCallback(
-    async (rawText: string, options?: SubmitTextOptions) => {
-      const visibleText = sanitizeComposerInput(rawText).trim()
-      const usingComposerAttachments = !options?.attachments
+    async (rawText: string, options?: SubmitTextOptions): Promise<SubmitTextResult> => {
+      const tokenPayload = Boolean(options?.moaToken)
+      const visibleText = tokenPayload ? rawText : sanitizeComposerInput(rawText).trim()
+      const usingComposerAttachments = !options?.attachments && !tokenPayload
 
       // Drop undefined/null holes a session switch or draft restore can leave in
       // the attachments array (same bug class as AttachmentList #49624). Without
       // this, the sibling iterations below (a.kind / a.label / a.refText, and the
       // sync step) throw "Cannot read properties of undefined (reading 'refText')"
       // and break the chat surface.
-      const attachments = (options?.attachments ?? scope.readAttachments()).filter((a): a is ComposerAttachment =>
-        Boolean(a)
+      const attachments = (tokenPayload ? (options?.attachments ?? []) : (options?.attachments ?? scope.readAttachments())).filter(
+        (a): a is ComposerAttachment => Boolean(a)
       )
 
       const titlePreview = attachments.find(
         a => typeof a.titlePreview === 'string' && a.titlePreview.trim()
       )?.titlePreview
 
-      const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
+      const terminalContextBlocks = tokenPayload ? '' : terminalContextBlocksFromDraft(rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
 
       // Refs are recomputed after sync (file.attach rewrites @file: refs to
@@ -963,6 +965,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             // instead of erroring out and losing the session binding.
             { alsoTimeout: true }
           )
+
+          if (submitted.result?.status === 'dropped' && submitted.result.reason === 'deferred_moa_unavailable') {
+            dropOptimistic(sessionId)
+            releaseBusy()
+
+            if (!options?.fromQueue && targetIsCurrentView()) {
+              notify({ message: submitted.result.message || 'Deferred MoA request was cancelled; prompt dropped.' })
+            }
+
+            return options?.fromQueue ? ('dropped' as const) : false
+          }
 
           const rowId = submitted.result?.user_row_id
 

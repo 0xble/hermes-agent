@@ -57,7 +57,10 @@ def _compute_host_turn_frame(
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
-    pending_record = pending_moa.claim(session, queue_token) if queue_token else None
+    pending_record = (
+        pending_moa.claim(session, queue_token, restore=pending_moa.restore_snapshot(session))
+        if queue_token else None
+    )
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -290,7 +293,10 @@ def _submit_prompt_to_compute_host(
         _emit("error", sid, {
             "message": "Deferred MoA request was cancelled or is no longer available; prompt dropped."
         })
-        return _err(rid, 4092, "deferred MoA request is no longer available")
+        return _ok(rid, {
+            "status": "dropped", "reason": "deferred_moa_unavailable",
+            "message": "Deferred MoA request was cancelled or is no longer available; prompt dropped.",
+        })
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
