@@ -79,7 +79,8 @@ and draft, and is idempotent. Verified against live `sendRichMessage` output on
 
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
   `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
-  `telegram-ordered-list-separation`, `telegram-footnote-refs`.
+  `telegram-ordered-list-separation`, `telegram-footnote-refs`,
+  `telegram-progress-literal`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -137,6 +138,130 @@ It does not import newer upstream approval-header or CJK opt-in changes. On ever
 upstream sync, read this unit and compare the released adapter, config loader,
 prompt hint, and streaming finalization together. A preserved YAML value alone
 is not proof that the configured behavior survives an update.
+
+## Active patch: Telegram tool-progress literal rendering (2026-10-04)
+
+**Status:** Active fork patch `telegram-progress-literal`, based on `origin/main`
+`555ccdf1052d644bc1f44b3957e36fe77a813919`. Not upstreamed.
+
+**Behavior:** Tool-progress lines name MCP and connector tools by their friendly
+label (`🔌 Paper · get guide`, from `tools.tool_labels.label_for_tool_name`) and
+show every interpolated tool label, argument preview, and verbose args dump
+verbatim on Telegram. Terminal commands keep their fenced blocks. A compact
+preview that is an http(s) URL stays plain text so auto-linking keeps it
+tappable, and Discord/Slack keep their own `format_tool_preview` overrides.
+
+**Source surfaces:**
+
+- `gateway/platforms/base.py`: `BasePlatformAdapter.format_progress_literal`
+  (identity), base `format_tool_preview` routing non-URL previews through it,
+  and `format_tool_event` (the stream-event formatter) routing the label,
+  preview, and verbose keys/args through it. `_BARE_HTTP_URL_RE`.
+- `gateway/run_turn_runner.py`: `TurnRunner._progress_build_message`, the live
+  `progress_callback` line builder, routes the same fragments through the
+  delivery adapter's hook. No Telegram checks at call sites.
+- `agent/display.py`: `progress_tool_label` (friendly MCP/connector label and
+  emoji, honoring `display.friendly_tool_labels` and skin emoji overrides).
+- `plugins/platforms/telegram/adapter.py`: `format_progress_literal` →
+  `_progress_code_span` (CommonMark code span whose backtick run is longer than
+  any run inside, space-padded when the text starts or ends with a backtick).
+  `format_message` converts multi-backtick spans to MarkdownV2 single-backtick
+  code with `` ` `` and `\` escaped, and its bracket safety net skips escaped
+  backticks inside a span. `_RICH_PROTECTED_REGION_RE` opens a fence only at
+  line start with a backtick-free info string, so an inline triple-backtick
+  span no longer swallows the lines up to a later terminal fence.
+
+**Parse paths (evidence):** progress uses `TurnRunner._send_progress_text`
+(`adapter.send` with progress metadata, no `expect_edits`) and
+`_edit_progress_message` (`finalize=True`, because Telegram sets
+`REQUIRES_EDIT_FINALIZE`). With `rich_messages: always` both reach the rich
+API (`sendRichMessage`, rich `editMessageText`) with the raw Markdown from
+`_rich_message_payload`. With `auto`/`never` or a rich fallback they take
+MarkdownV2 via `format_message`. Both are covered.
+
+**Outbound budget:** no new send, edit, typing, or reaction call site, and no
+cadence change. The progress lane's call sites (`_send_progress_text`,
+`_edit_progress_message`, `_PROGRESS_EDIT_INTERVAL = 1.5`, overflow rolling)
+and the Telegram shared per-chat send+edit slot
+(`_TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0`; progress edits pass
+`finalize=True`, so they hold the slot but are not skipped by it) are
+untouched, as is `_progress_restore_typing`. The per-conversation worst case is
+therefore whatever it was before this patch. Only the text of lines already
+sent changes. Wrapping adds two to about eight characters per fragment, so a
+very long turn can reach the 4,032-character bubble split slightly sooner and
+spend one more overflow send over its lifetime. That send goes through the same
+throttled loop, so calls per minute cannot rise.
+
+**Focused regression:** `scripts/run_tests.sh
+tests/gateway/test_telegram_progress_literals.py` (15 of 16 fail on the base,
+all pass with the patch). Neighbors: `test_telegram_format.py`,
+`test_telegram_rich_messages.py`, `test_discord_format.py`, `test_slack.py`,
+`test_stream_events.py`, `test_run_progress_topics.py`, `tests/agent/test_display.py`.
+
+**Upstream replacement condition:** retire when a released upstream version
+makes the focused regression pass without the fork's `format_progress_literal`
+path: the live `progress_callback` line builder and the stream-event formatter
+both keep tool names, previews, and args literal on Telegram rich and MarkdownV2
+payloads, including embedded backticks, while Discord/Slack URL previews stay
+clickable. Open upstream #68182 alone does not qualify (stream-event formatter
+only, no embedded-backtick handling).
+
+**Rollback (this patch only):** revert the patch commit. If it shares a squash
+with other work, remove `format_progress_literal` and `_BARE_HTTP_URL_RE` from
+`base.py` and restore `format_tool_preview` to `return preview.text`, restore
+`tool=event.tool_name`/raw keys/args in `format_tool_event`, restore
+`get_tool_emoji` and raw `tool_name`/preview/args in `_progress_build_message`,
+delete `progress_tool_label`, and in the Telegram adapter delete
+`format_progress_literal`, `_progress_code_span`, `_MULTI_TICK_CODE_SPAN_RE`,
+`_LINE_START_FENCE_RE`, `_BACKTICK_RUN_RE`, the step-1a block in
+`format_message`, the bracket-split regex change, and the line-start fence
+anchor in `_RICH_PROTECTED_REGION_RE`. Delete the focused test file. No state,
+schema, or configuration migration.
+
+**Upstreamability:** good candidate. The hook is generic (identity base), the
+call sites are platform-neutral, and the Telegram encoding is self-contained.
+An upstream PR should supersede #68182 by covering the live callback and the
+embedded-backtick case. No upstream PR or issue has been opened.
+
+**Independent hypothesis (frozen before upstream tracker search):** Tool-progress
+construction interpolates raw tool names and previews into ordinary Markdown. The
+editable progress sender passes those strings to Telegram `send()`/`edit_message()`
+without a literal-text boundary; when rich delivery is selected, the raw Markdown
+is sent unchanged, so `__name__`, `**glob**`, backslash regex escapes, and `.md`
+fragments remain parser input. The correction belongs at the shared progress
+formatting boundary, not in individual tools or the rich final-response parser.
+The smallest complete shape is one adapter hook for literal progress fragments,
+used by both `run_turn_runner.py` and `gateway/platforms/base.py`, plus friendly
+MCP/connector labels from `tools.tool_labels`. Telegram should encode the marked
+fragments for both rich and MarkdownV2 delivery, preserving Discord/Slack preview
+URL behavior and safe embedded backticks. The durable regression boundary is the
+actual Telegram rich payload and legacy formatted payload produced from progress
+lines, covering the screenshot strings, a literal backtick, and the friendly MCP
+label. Alternatives considered weaker: escaping only Telegram's final-response
+parser misses progress-specific rich sends; patching each call site duplicates the
+contract; changing tool names globally would affect logs and model-facing IDs.
+Compatibility is additive (base hook remains identity), rollback is deleting the
+hook calls and Telegram implementation, and no outbound call type or cadence
+changes are intended.
+
+**Reproduction:** `_progress_build_message("mcp__paper__get_guide", ...)` emits
+`⚙️ mcp__paper__get_guide: ...`; Telegram `_rich_message_payload` returns that
+same raw Markdown. `references/index.md`, `README.md`, `**/*.md`, and `\\s+`
+likewise remain parser input.
+
+**Upstream prior art and reconciliation:** No exact released or merged upstream
+fix covers the active `progress_callback` plus Telegram rich and MarkdownV2
+payloads. Open [upstream PR #68182](https://github.com/NousResearch/hermes-agent/pull/68182)
+wraps tool names/previews in backticks in the unused stream-event formatter; its
+maintainer review explicitly found that it misses the live gateway callback and
+embedded backticks. Merged [PR #42421](https://github.com/NousResearch/hermes-agent/pull/42421)
+only restores MarkdownV2 formatting for legacy Telegram progress edits. Closed
+[PR #45844](https://github.com/NousResearch/hermes-agent/pull/45844) attempted
+rich streaming edits but is not released and does not solve progress-line
+interpolation. These findings confirm the frozen boundary and strengthen the
+safe-backtick requirement. This fork implementation intentionally diverges from
+#68182 by fixing the active runner and base formatter, using the existing
+friendly MCP/connector labels, and testing Telegram's final wire payloads.
 
 ## Verification
 

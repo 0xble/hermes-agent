@@ -16,7 +16,7 @@ from hermes_platform import declaration
 from tools.registry import invalidate_check_fn_cache, tool_error
 from tools.ansi_strip import strip_unicode_tags
 from tools.mcp_tool_common import _exc_str, _sanitize_error, mcp_field, _core
-from tools import mcp_tool_loop as _loop
+from tools import mcp_tool_caller as _caller, mcp_tool_loop as _loop
 from tools.mcp_tool_content import (
     _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block,
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
@@ -377,12 +377,14 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
-async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict):
+async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict,
+                                        meta: Optional[dict] = None):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
     ``_watch_stdio_children``). Both raise :class:`_StdioChildExited` for the respawn path, which
     owns the reconnect signal; only pre-call failure is safe to replay. callable()/``is True``
-    because MagicMock attributes are truthy."""
+    because MagicMock attributes are truthy. ``meta`` is request ``_meta``; without it the request
+    is exactly the plain call."""
     # Fast-fail (#81995): a stdio subprocess that is already dead must not own this call slot — fail
     # immediately instead of waiting out the full tool timeout on a transport nobody will ever answer.
     _stdio_dead = getattr(server, "_stdio_children_dead", None)
@@ -391,7 +393,8 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
+    _call_coro = (server.session.call_tool(tool_name, arguments=args) if meta is None
+                  else server.session.call_tool(tool_name, arguments=args, meta=meta))
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.
@@ -567,12 +570,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # Only a tool annotated readOnlyHint=True is replayed after session expiry; a 401 is always
         # pre-dispatch so the auth recoverer keeps its retry for every tool.
         read_only = _tool_is_read_only(server_name, tool_name)
+        # Captured in the calling turn's thread, before scheduling onto the MCP loop.
+        from tools import mcp_tool_discovery as _discovery  # lazy: discovery -> registration -> handlers cycle
+        meta = _caller.caller_identity_meta() if _discovery.mcp_server_wants_caller_identity(server_name) else None
 
         async def _call():
             async with server._rpc_lock, _track_inflight_rpc(server, server_name, op, retry_safe=read_only):
                 server._pending_call_context = contextvars.copy_context()  # for the elicitation callback
                 try:
-                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args)
+                    result = await _call_tool_racing_stdio_death(server, server_name, tool_name, args, meta)
                 finally:
                     server._pending_call_context = None
             if getattr(server, "_mark_session_proven", None) is not None:  # round-trip done: transport healthy
