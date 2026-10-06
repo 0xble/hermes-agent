@@ -35,6 +35,20 @@ def _event(*, internal: bool = False, reply_expected=None):
     )
 
 
+def _relay_text(body="please handle this"):
+    return f"[relay from=agent@example.com receipt=receipt-1 task=task-1]\n{body}"
+
+
+def _relay_event(*, text=None, reply_expected=None):
+    return MessageEvent(
+        text=text or _relay_text(),
+        source=_source(),
+        message_id="relay-msg-1",
+        reply_expected=reply_expected,
+    )
+
+
+
 def _runner(monkeypatch, tmp_path):
     runner = gateway_run.GatewayRunner(GatewayConfig())
     runner.adapters = {}
@@ -93,6 +107,169 @@ def test_blank_and_prose_mentions_are_not_silence():
 def test_failed_agent_result_never_counts_as_intentional_silence():
     assert is_intentional_silence_agent_result({"failed": False}, "NO_REPLY")
     assert not is_intentional_silence_agent_result({"failed": True}, "NO_REPLY")
+
+
+
+
+@pytest.mark.parametrize("command", ["/queue", "/steer"])
+def test_idle_queue_or_steer_relay_payload_is_marked_unaddressed(command):
+    # Relay always sends "/queue <header>" or "/steer <header>". On an idle session, admission
+    # sees the command prefix, so the stripped payload must be judged when the prefix is removed.
+    event = _relay_event(text=f"{command} {_relay_text()}")
+    handled, reply = gateway_run.GatewayRunner._hm_send_payload_as_turn(event, "usage")
+    assert (handled, reply) == (False, None)
+    assert event.text == _relay_text()
+    assert event.reply_expected is False
+
+
+def test_idle_typed_queue_payload_keeps_reply_expected_unknown():
+    event = _relay_event(text="/queue please handle this")
+    gateway_run.GatewayRunner._hm_send_payload_as_turn(event, "usage")
+    assert event.reply_expected is None
+
+
+@pytest.mark.asyncio
+async def test_relay_origin_is_marked_unaddressed_at_shared_admission(monkeypatch):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = GatewayConfig()
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._admit_bot_message_for_source = lambda source: True
+    event = _relay_event()
+
+    admitted = await runner._hm_admit_event(event)
+
+    assert admitted is not None
+    assert event.reply_expected is False
+
+
+@pytest.mark.asyncio
+async def test_relay_header_turn_answered_no_reply_stays_silent_on_normal_path(monkeypatch, tmp_path, caplog):
+    runner = _runner(monkeypatch, tmp_path)
+    event = _relay_event()
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda current, source: current)
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._admit_bot_message_for_source = lambda source: True
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "NO_REPLY",
+        "messages": [
+            {"role": "user", "content": event.text},
+            {"role": "assistant", "content": "NO_REPLY"},
+        ],
+        "tools": [], "history_offset": 0, "last_prompt_tokens": 0,
+        "api_calls": 1, "failed": False,
+    })
+
+    assert await runner._hm_admit_event(event)
+    with caplog.at_level("DEBUG"):
+        response = await runner._handle_message_with_agent(
+            event, event.source, "agent:main:telegram:group:-1001:12345", 1
+        )
+
+    assert response == ""
+    assert not any("silence marker rejected" in record.message for record in caplog.records)
+    assert not any("unexpected_silence" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_relay_origin_is_persisted_for_crash_recovery(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    event = _relay_event()
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda current, source: current)
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._admit_bot_message_for_source = lambda source: True
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "NO_REPLY", "messages": [], "tools": [],
+        "history_offset": 0, "last_prompt_tokens": 0, "api_calls": 1, "failed": False,
+    })
+
+    assert await runner._hm_admit_event(event)
+    await runner._handle_message_with_agent(
+        event, event.source, "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    kwargs = runner._run_agent.await_args.kwargs
+    assert kwargs["reply_expected"] is False
+    assert kwargs["persist_user_display_metadata"]["reply_expected"] is False
+
+
+@pytest.mark.asyncio
+async def test_queued_relay_origin_stays_silent_and_queue_event_keeps_metadata(monkeypatch):
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    queued = []
+    runner._delivery_adapter_for = lambda source: object()
+    runner._enqueue_fifo = lambda session_key, event, adapter: queued.append(event)
+    event = MessageEvent(
+        text=f"/queue {_relay_text()}", source=_source(), message_id="queue-msg-1"
+    )
+
+    reply = await runner._busy_queue_command(event, "session", event.source)
+
+    assert reply is None
+    assert len(queued) == 1
+    assert queued[0].reply_expected is False
+    turn_ctx = SimpleNamespace(
+        session_key="session", stream_consumer_holder=[None], mute_notification_reply=False,
+        persist_user_display_kind=None, reply_expected=queued[0].reply_expected, source=_source(),
+        _status_thread_metadata=None, event_message_id=None, inbound_message_id="queue-msg-1",
+        run_generation=1,
+    )
+    runner._deliver_queued_first_response = AsyncMock()
+    result = {"final_response": "NO_REPLY", "failed": False}
+
+    assert await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
+    runner._deliver_queued_first_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_addressed_relay_queue_keeps_its_ack():
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    queued = []
+    runner._delivery_adapter_for = lambda source: object()
+    runner._enqueue_fifo = lambda session_key, event, adapter: queued.append(event)
+    event = MessageEvent(
+        text=f"/queue {_relay_text()}", source=_source(), message_id="queue-msg-3", reply_expected=True
+    )
+
+    reply = await runner._busy_queue_command(event, "session", event.source)
+
+    assert reply == "⏳ Queued for the next turn."
+    assert queued[0].reply_expected is True
+
+
+@pytest.mark.asyncio
+async def test_typed_queue_keeps_its_ack():
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    queued = []
+    runner._delivery_adapter_for = lambda source: object()
+    runner._enqueue_fifo = lambda session_key, event, adapter: queued.append(event)
+    event = MessageEvent(text="/queue please handle this", source=_source(), message_id="queue-msg-2")
+
+    reply = await runner._busy_queue_command(event, "session", event.source)
+
+    assert reply == "⏳ Queued for the next turn."
+    assert len(queued) == 1
+    assert queued[0].reply_expected is None
+
+
+@pytest.mark.parametrize("text", [
+    "body\n[relay from=agent@example.com receipt=receipt-1]",
+    "[relay from=agent@example.com receipt=receipt-1",
+])
+def test_malformed_or_mid_text_relay_header_keeps_reply_expected_unknown(text):
+    event = _relay_event(text=text)
+    assert event.reply_expected is None
+
+
+def test_mixing_relay_and_typed_message_keeps_reply_expected_true():
+    relay = _relay_event()
+    typed = _event(reply_expected=True)
+    relay.reply_expected = False
+    relay.absorb_reply_expected(typed)
+    assert relay.reply_expected is True
 
 
 @pytest.mark.asyncio

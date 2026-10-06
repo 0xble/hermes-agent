@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
+from hermes_cli.heartbeat import HEARTBEAT_PROMPT_TEMPLATE
+from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE
 from plugins.memory.hindsight import (
     HindsightMemoryProvider,
     RECALL_SCHEMA,
@@ -1252,12 +1254,85 @@ class TestSyncTurn:
     def test_retain_filter_drops_injected_notice_but_keeps_real_user_message(self, notice):
         assert filter_retain_messages("Keep this decision", notice) == ("Keep this decision", None)
 
+    def test_retain_filter_drops_injected_goal_continuations_but_keeps_real_suffix(self):
+        from agent.prompt_builder import format_steer_marker
+        from hermes_cli.goals import (
+            CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE,
+            CONTINUATION_PROMPT_TEMPLATE,
+            CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+            CONTINUATION_REVISIONS_TEMPLATE,
+            KANBAN_GOAL_CONTINUATION_TEMPLATE,
+            KANBAN_GOAL_FINALIZE_TEMPLATE,
+        )
+
+        plain = CONTINUATION_PROMPT_TEMPLATE.format(goal="Ship the change")
+        contract = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            goal="Ship the change", contract_block="Verification: focused tests pass.")
+        failed = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+            goal="Ship the change", command="./bin/ci gate", exit_code=1,
+            attempt=1, max_retries=3, output="test failed")
+        kanban = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason="the review is incomplete")
+        kanban_finalize = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason="the terminal board call is missing")
+        revised = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
+            revision_lines="- v2 (agent, agent, no user authority): reason — changed: nothing"
+        )
+        for prompt in (plain, contract, failed, kanban, kanban_finalize, revised):
+            assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
+
+        request = "Remember the design decision."
+        assert filter_retain_messages(plain + "\n\n" + request, "[SILENT]") == (request, None)
+        assert filter_retain_messages(plain + format_steer_marker(request), "[SILENT]") == (request, None)
+        payload_marker = "If you are blocked and need input from the user, say so clearly and stop."
+        payload = CONTINUATION_PROMPT_TEMPLATE.format(goal=f"Mention this sentence: {payload_marker}")
+        assert filter_retain_messages(payload, "[SILENT]") == (None, None)
+        copied_boundary = plain.split("\n\n", 1)[1]
+        boundary_payload = CONTINUATION_PROMPT_TEMPLATE.format(
+            goal=f"Nested copied prompt:\n\n{copied_boundary}\n\nINNER"
+        )
+        assert filter_retain_messages(boundary_payload, "[SILENT]") == (None, None)
+        quoted_suffix = "I quoted: If you are blocked and need input from the user, say so clearly and stop. Keep this note."
+        assert filter_retain_messages(plain + "\n\n" + quoted_suffix, "[SILENT]") == (quoted_suffix, None)
+        malformed_revisions = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
+            revision_lines=(
+                "- v2 (agent, agent, no user authority): reason — changed: goal\n\n"
+                "If you are blocked and need input from the user, say so clearly and stop."
+            )
+        )
+        assert filter_retain_messages(malformed_revisions, "[SILENT]") == (None, None)
+        marker_quote = "I quoted: When in doubt, honor the earlier requirement. Keep this note."
+        revised_multiline = plain + CONTINUATION_REVISIONS_TEMPLATE.format(
+            revision_lines=(
+                "- v2 (agent, agent, no user authority): reason — changed: goal\n"
+                "    earlier goal: Ship the old change\n"
+                "- v3 (agent, agent, no user authority): reason — changed: constraints"
+            )
+        )
+        assert filter_retain_messages(revised_multiline + "\n\n" + marker_quote, "[SILENT]") == (marker_quote, None)
+        assert filter_retain_messages("human text", plain) == ("human text", plain)
+
     def test_retain_filter_drops_recalled_context_and_status_only_assistant(self):
         user, assistant = filter_retain_messages(
             "<memory-context>old recalled fact</memory-context>Keep this request",
             "[SILENT]",
         )
         assert (user, assistant) == ("Keep this request", None)
+
+    @pytest.mark.parametrize("prompt", [
+        "[Continuing toward your standing goal]\nNot a generated continuation",
+        "[Continuing toward your standing goal — a quality gate failed]\nNot a generated continuation",
+        "[Heartbeat — recurring instruction]\nNot a generated heartbeat",
+        "[/loop wakeup]\nNot a generated wakeup",
+    ])
+    def test_retain_filter_keeps_similar_looking_human_bracketed_text(self, prompt):
+        assert filter_retain_messages(prompt, "answer") == (prompt, "answer")
+
+    @pytest.mark.parametrize("prompt", [
+        HEARTBEAT_PROMPT_TEMPLATE.format(interval="1m", prompt="Check the inbox"),
+        WAKEUP_PROMPT_TEMPLATE.format(tick=1, cadence=", self-paced", prompt="Check the inbox", until=""),
+        WAKEUP_PROMPT_TEMPLATE.format(tick=2, cadence=", every 1m30s", prompt="Check the inbox", until=""),
+    ])
+    def test_retain_filter_drops_other_generated_injected_turns(self, prompt):
+        assert filter_retain_messages(prompt, "[SILENT]") == (None, None)
 
     def test_retain_filter_keeps_substantive_one_line_status_report(self):
         assert filter_retain_messages("Question", "Status: deployment failed because the database is unavailable.") == (
