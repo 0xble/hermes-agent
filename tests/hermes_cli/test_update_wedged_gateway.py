@@ -391,6 +391,39 @@ class TestEscalateWedgedGateway:
         assert gateway_cli._escalate_wedged_gateway(4242) is False
         assert calls == [False, True]
 
+    def test_start_time_drift_does_not_skip_sigkill(self, monkeypatch):
+        """macOS start-time readings drift; drift must still escalate to SIGKILL."""
+        signals, waits = [], []
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False, **kwargs: signals.append("kill" if force else "term"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_pid_exit",
+            lambda pid, timeout, **_: waits.append(timeout) or len(waits) > 1,
+        )
+        readings = iter([1000, 1050, 1080, 1090, 1100])
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: next(readings))
+
+        assert gateway_cli._escalate_wedged_gateway(4242) is True
+        assert signals == ["term", "kill"]
+
+    def test_replaced_incarnation_is_not_signalled(self, monkeypatch):
+        signals = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False, **kwargs: signals.append(force),
+        )
+
+        # The first reading is the recorded process; the next proves PID reuse.
+        readings = iter([1000, 99999])
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda pid: next(readings))
+        assert gateway_cli._escalate_wedged_gateway(4242) is True
+        assert signals == []
+
 class TestLaunchdRestartWedgedIntegration:
     """launchd_restart must skip the 180s drain only for a wedged loop."""
 

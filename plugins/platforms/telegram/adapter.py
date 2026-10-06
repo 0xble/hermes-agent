@@ -818,10 +818,6 @@ _POLLING_STALL_TIMEOUT = 150.0
 # that PTB's dispatcher ever handed the fetched updates to a handler. Two heartbeats (180s) with a
 # backlog and no dispatch progress: diagnostic only, never drives recovery (#71240 owns that).
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 2
-# A reconnect can start while the failed generation's in-process poller is still stopping (its stop
-# waits for the outstanding long poll, up to the poll timeout plus one second). Waiting for that
-# release costs seconds; refusing costs the reconnect ladder's 30s backoff.
-_POLLER_RELEASE_WAIT_SECONDS = 25.0
 # sendVideo transcodes before answering, outlasting the 20s read timeout; also how long a user waits
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0

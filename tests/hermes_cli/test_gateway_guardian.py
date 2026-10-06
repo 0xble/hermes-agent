@@ -46,9 +46,9 @@ def fake_launchctl(monkeypatch, label, *, loaded=False):
     return calls
 
 @pytest.mark.platforms("macos")
-def test_explicit_grace_does_not_load_flag_off_config(tmp_path, monkeypatch):
+def test_explicit_grace_does_not_load_user_config(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)
-    (home / "config.yaml").write_text("gateway:\n  overlap_handover:\n    enabled: false\n")
+    (home / "config.yaml").write_text("updates:\n  release_acknowledgement_timeout_seconds: 180\n")
     monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective",
                         lambda *args, **kwargs: pytest.fail("flag-off config loaded"))
     monkeypatch.setattr(guardian, "_run", lambda *args, **kwargs: "healthy")

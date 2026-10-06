@@ -65,6 +65,16 @@ The legacy single-gateway launchd `KeepAlive` path is canonical. Restarts remain
 
 The former overlap design, generation coordinator, polling transfer, owned routing/admission, startup gate, and forward-only updater are withdrawn rather than partially supported. The shipped Phase 0, S1–S3, durable outbox, immutable-release, and G1 guardian behavior remains subject to the legacy single-gateway path.
 
+### Leftovers after withdrawal
+
+Profiles where forward-only handover ran may retain `gateway-coordinator.db`, `ai.hermes.gateway.g-<uuid>` LaunchAgents/labels, `forward-update.json`, `gateway_runtime.<gen>.json`, and per-PID heartbeat files. Check for generation labels manually with:
+
+```sh
+launchctl list | grep ai.hermes.gateway.g-
+```
+
+`HERMES_GENERATION_SCOPE` in an existing plist is inert after withdrawal and disappears the next time `hermes gateway install` rewrites the plist. No automatic cleanup is performed.
+
 ## Shipped Status
 
 Every row merged with an independent `review_candidate` approval on its exact head and a green exact-SHA `qualification` check, using normal merges.

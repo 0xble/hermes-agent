@@ -556,20 +556,48 @@ def _escalate_wedged_gateway(pid: int, *, term_grace: float = 5.0, kill_wait: fl
 
     See #86684.
     """
-    from gateway.status import get_process_start_time
+    from gateway.status import get_process_start_time, start_time_fingerprints_match
+
     expected_start_time = get_process_start_time(pid)
+
+    def replaced() -> bool:
+        # Only a readable, different incarnation proves the recorded process is gone; macOS
+        # start-time drift within the tolerance is not evidence of replacement.
+        current = get_process_start_time(pid)
+        return (
+            expected_start_time is not None
+            and current is not None
+            and not start_time_fingerprints_match(expected_start_time, current)
+        )
+
+    def guarded_start_time():
+        # ``terminate_pid`` compares strictly. Hand it a reading that just matched within
+        # drift so a legitimate macOS process is not spared from SIGKILL.
+        current = get_process_start_time(pid)
+        if (
+            expected_start_time is not None
+            and current is not None
+            and start_time_fingerprints_match(expected_start_time, current)
+        ):
+            return current
+        return expected_start_time
+
     try:
         terminate_pid(pid, force=False)
     except (ProcessLookupError, PermissionError, OSError):
-        return _wait_for_pid_exit(pid, 1.0)
+        gone = _wait_for_pid_exit(pid, 1.0)
+        return gone or replaced()
     if _wait_for_pid_exit(pid, max(float(term_grace), 0.0)):
         return True
+    if replaced():
+        return True
     try:
-        terminate_pid(pid, force=True, expected_start_time=expected_start_time)
+        terminate_pid(pid, force=True, expected_start_time=guarded_start_time())
         print(f"⚠ Gateway PID {pid} unresponsive to SIGTERM; sent SIGKILL")
     except (ProcessLookupError, PermissionError, OSError):
         pass
-    return _wait_for_pid_exit(pid, max(float(kill_wait), 0.0))
+    gone = _wait_for_pid_exit(pid, max(float(kill_wait), 0.0))
+    return gone or replaced()
 
 
 def _get_ancestor_pids() -> set[int]:
