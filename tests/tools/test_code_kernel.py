@@ -431,7 +431,7 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
 class TestInScriptToolErrors(unittest.TestCase):
     def test_ignored_helper_error_is_reported_for_that_cell_only(self):
         """A script that drops a helper's {"error": ...} return must not read as a clean success."""
-        def _handle(tool_name, tool_args, task_id=None):
+        def _handle(tool_name, tool_args, task_id=None, **_ids):
             if tool_name == "write_file":
                 return json.dumps({"error": "Refusing to overwrite a.py: never read"})
             return json.dumps({"ok": True})
@@ -448,7 +448,7 @@ class TestPerCellRpcAuthority(unittest.TestCase):
     """Interpreter state persists across cells; RPC authority must not."""
 
     def _recorder(self, seen):
-        def _handle(tool_name, tool_args, task_id=None):
+        def _handle(tool_name, tool_args, task_id=None, **_ids):
             from tools.thread_context import _callback_api
 
             (get_approval, _set_a), *_rest = _callback_api()
@@ -528,6 +528,20 @@ class TestPerCellRpcAuthority(unittest.TestCase):
         authority.retire()
         result = authority.dispatch("web_search", {"query": "q"})
         self.assertIn("No active execute_code cell", result)
+
+    def test_cell_authority_assigns_a_unique_tool_call_id_per_nested_call(self):
+        """Local execute_code dispatches nested tool calls through CellAuthority, not
+        _default_dispatch; without a per-call id concurrent cells collapse into one hook
+        gate key and a fail-closed pre_tool_call guard blocks the second (#98382 class)."""
+        from tools.code_kernel import CellAuthority
+
+        authority = CellAuthority("turn-1")
+        with patch("model_tools.handle_function_call", return_value='{"ok": true}') as handle:
+            authority.dispatch("read_file", {"path": "a"})
+            authority.dispatch("read_file", {"path": "b"})
+        ids = [c.kwargs.get("tool_call_id") for c in handle.call_args_list]
+        self.assertTrue(all(ids), ids)
+        self.assertNotEqual(ids[0], ids[1])
 
     def test_each_cell_installs_a_fresh_authority(self):
         with _kernel_config():

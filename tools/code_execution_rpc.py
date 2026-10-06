@@ -25,13 +25,22 @@ logger = logging.getLogger("tools.code_execution_tool")
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release"}
 
 
+def nested_tool_call_id(task_id) -> str:
+    """A unique ``tool_call_id`` for one tool call made from inside execute_code.
+
+    Nested calls have no model-issued id. Without one, concurrent nested calls share the hook
+    gate's missing-id key, so a fail-closed ``pre_tool_call`` guard blocks the second as
+    "still running". Shared by the remote RPC loop and the local session kernel."""
+    return f"execute_code:{task_id}:{secrets.token_urlsafe(18)}"
+
+
 def _default_dispatch(task_id):
     from model_tools import handle_function_call
     return lambda tool_name, tool_args: handle_function_call(
         tool_name,
         tool_args,
         task_id=task_id,
-        tool_call_id=f"execute_code:{task_id}:{secrets.token_urlsafe(18)}",
+        tool_call_id=nested_tool_call_id(task_id),
     )
 
 
