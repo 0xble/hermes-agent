@@ -25,6 +25,13 @@ to cron preflight, provider recovery, agent construction, or fallback normalizat
 - Source adoption does not activate the personal or company installations or
   change their model policy. Use the separately authorized runtime owner for that.
 
+PR #335 (fail closed during active Telegram flood control) carried
+`Fork-Patch: cron-fallback-routing` on its branch commit, but its squash merge
+`90fdfcecf4f5` dropped the trailer. This exact stable patch ID backfills only that
+reviewed content under `cron-fallback-routing`; it does not advance the trailer floor.
+
+Fork-Patch-Backfill: 3b2042b08305abd280088b719767fdec1cc3ed92; cron-fallback-routing
+
 ## Proof and retirement
 
 The proof surface is `tests/cron/test_cron_fallback_config.py`, the existing
