@@ -138,47 +138,59 @@ def test_follow_up_merged_with_a_single_newline_survives(build):
     assert filter_retain_messages(merged, "Answer.")[0] == HUMAN
 
 
-def test_merged_follow_up_quoting_the_template_terminal_is_kept_whole():
-    """A person's follow-up may paste the generated closing paragraph. The merge's single newline
-    marks the real boundary, so the quote and everything after it survive."""
+def _goal_terminal() -> str:
     from string import Formatter
 
-    from agent.prompt_builder import format_steer_marker
-    from gateway.platforms.base import _append_text
-    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
-
-    terminal = [lit for lit, _f, _s, _c in Formatter().parse(CONTINUATION_PROMPT_TEMPLATE)][-1]
-    follow_up = "I quoted:" + terminal + "\nRemember X"
-
-    assert human_prompt_text(_append_text(_goal_prompt(), follow_up)) == follow_up
-    assert human_prompt_text(_goal_prompt() + format_steer_marker(follow_up)) == follow_up
+    return [lit for lit, _f, _s, _c in Formatter().parse(CONTINUATION_PROMPT_TEMPLATE)][-1]
 
 
-def test_payload_copying_the_terminal_before_a_blank_line_stays_generated():
-    """#320's invariant: a goal that copies the closing paragraph and continues after a blank line
-    is payload, not a human suffix."""
-    from string import Formatter
-
-    from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
-
-    terminal = [lit for lit, _f, _s, _c in Formatter().parse(CONTINUATION_PROMPT_TEMPLATE)][-1]
-    payload = CONTINUATION_PROMPT_TEMPLATE.format(goal="Nested copied prompt:" + terminal + "\n\nINNER")
+@pytest.mark.parametrize("joint", ["\n", "\n\n"], ids=["single newline", "blank line"])
+def test_payload_copying_the_terminal_stays_generated(joint):
+    """Safety invariant (#320): when the closing paragraph appears more than once, the LAST copy is
+    the generated boundary, so a goal that copies it can never leak its own text, or the real
+    closing paragraph after it, as human. The single-newline form is the review's exact case."""
+    payload = CONTINUATION_PROMPT_TEMPLATE.format(goal=_goal_terminal() + joint + "INNER")
 
     assert human_prompt_text(payload) is None
+    assert auto_recall_query(payload) == ""
+    assert filter_retain_messages(payload, "[SILENT]") == (None, None)
+
+
+def test_merged_follow_up_quoting_the_closing_paragraph_keeps_only_text_after_the_quote():
+    """Accepted limitation of the last-copy rule: text cannot tell a person's quote of the closing
+    paragraph from a payload copy, so the boundary moves to the quote. Text after the quote still
+    recalls and is retained; the quote and anything before it are skipped for memory only. The
+    message itself is still delivered and answered."""
+    from agent.prompt_builder import format_steer_marker
+    from gateway.platforms.base import _append_text
+
+    quoted = "I quoted:" + _goal_terminal()
+
+    assert human_prompt_text(_append_text(_goal_prompt(), quoted + "\nRemember X")) == "Remember X"
+    assert human_prompt_text(_goal_prompt() + format_steer_marker(quoted + "\nRemember X")) == "Remember X"
+    assert human_prompt_text(_append_text(_goal_prompt(), quoted)) is None
 
 
 def test_text_glued_to_the_template_terminal_is_not_a_human_suffix():
     assert human_prompt_text(_goal_prompt() + " and also this") is None
 
 
-def test_revision_block_still_needs_a_blank_line_before_human_text():
+@pytest.mark.parametrize("revision_lines", [
+    "- v2 (agent, agent, no user authority): reason — changed: goal\n    earlier goal: Ship the old change",
+    # An earlier goal is rendered in full, so it may span paragraphs or copy the closing paragraph.
+    "- v2 (agent, agent, no user authority): reason — changed: goal\n    earlier goal: Ship A\n\nSecond paragraph",
+    "- v2 (agent, agent, no user authority): reason — changed: goal\n    earlier goal: Ship A"
+    + CONTINUATION_PROMPT_TEMPLATE.split("{goal}", 1)[1] + "\nLEAK",
+], ids=["plain", "multi-paragraph earlier goal", "earlier goal copying the terminal"])
+def test_revised_continuation_is_generated_through_its_end(revision_lines):
+    """The revision block has no closing marker and carries multi-line goal text, so nothing after it
+    can be proven human: a revised continuation is generated in full, including any merged text."""
     from hermes_cli.goals import CONTINUATION_REVISIONS_TEMPLATE
 
-    revised = _goal_prompt() + CONTINUATION_REVISIONS_TEMPLATE.format(
-        revision_lines="- v2 (agent, agent, no user authority): reason — changed: goal\n"
-                       "    earlier goal: Ship the old change")
-    assert human_prompt_text(revised + "\nnext line of the payload") is None
-    assert human_prompt_text(revised + "\n\n" + HUMAN) == HUMAN
+    revised = _goal_prompt() + CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=revision_lines)
+
+    assert human_prompt_text(revised) is None
+    assert human_prompt_text(revised + "\n\n" + HUMAN) is None
 
 
 def test_cron_runs_are_unattended_so_even_the_task_text_skips_recall():

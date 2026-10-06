@@ -281,7 +281,9 @@ itself (background-process and delegation notices, goal continuations, heartbeat
 wakeups, scheduled cron job runs, recovery notes) skip it, because their generated text is a poor
 search query and repeats verbatim from turn to turn. A cron run counts as generated in full, including
 the job's stored task text, because no person is present. If a person's message was merged into such a turn,
-recall runs on that message alone. The provider's explicit recall tools work on every turn. Set
+recall runs on that message alone. When that message quotes the generated prompt's exact closing
+paragraph, only the text after the quote is used, and a message merged into a revised goal's
+continuation is not used at all. The message is still answered. The provider's explicit recall tools work on every turn. Set
 `recall_synthetic_turns: true` to recall on generated turns as well.
 
 Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the

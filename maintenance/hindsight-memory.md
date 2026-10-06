@@ -36,6 +36,15 @@ strategy and cron-exclusion behavior.
   merged after that boundary. Add a new generated prompt there, beside its producer constant,
   rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
   generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
+- Template boundary rule: when a template's closing paragraph appears more than once, the LAST
+  copy is the generated boundary. Generated text is never classified as human, which is #320's
+  invariant. A revised goal continuation (with its "This goal has been revised" block) has no
+  provable end and is generated in full. Accepted limitation: a person's message that the gateway
+  text-merged into a pending goal, kanban, heartbeat or `/loop` prompt and that quotes that
+  prompt's exact closing paragraph keeps only the text after the quote for recall and retention,
+  and a message merged into a revised continuation keeps none. The message itself is still
+  delivered and answered. Text cannot tell such a quote from a payload copy, and carrying the human
+  part as structured metadata through every merge path was judged too wide for this patch.
 
 ## Proof surface
 
