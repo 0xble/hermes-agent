@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -174,6 +175,14 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
+def _persist_shutdown_pending_messages(runner):
+    """Invoke the shutdown queue spool even on lightweight GatewayRunner test doubles."""
+    method = getattr(runner, "_persist_shutdown_pending_messages", None)
+    if callable(method):
+        return method()
+    return GatewayShutdownMixin._persist_shutdown_pending_messages(runner)
+
+
 class GatewayShutdownMixin:
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
@@ -217,8 +226,8 @@ class GatewayShutdownMixin:
         # which is fine for a drain but unsafe for a suspend predicate — a transient read failure would make
         # live work look idle and reopen the mid-job freeze. Here an unreadable source counts as work
         # (sentinel 1) so the machine stays awake until the source is readable again.
-        from cron.scheduler import get_shutdown_drain_job_ids
-        return len(get_shutdown_drain_job_ids())
+        from cron.scheduler import get_running_job_ids
+        return len(get_running_job_ids())
 
     def _active_cron_job_count(self) -> int:
         """Cron jobs currently executing — they run outside ``_running_agents``; 0 if cron can't import.
@@ -232,7 +241,8 @@ class GatewayShutdownMixin:
         a minimal test double for this class).
         """
         try:
-            return self._running_cron_job_count()
+            from cron.scheduler import get_shutdown_drain_job_ids
+            return len(get_shutdown_drain_job_ids())
         except Exception:
             return 0
 
@@ -2275,18 +2285,25 @@ class GatewayShutdownMixin:
             return
         # Keep direct phase callers safe too. _stop_impl performs the same spool before creating this
         # cancellable task, so a timed-out restart never relies on this coroutine reaching its first await.
-        self._persist_shutdown_pending_messages()
+        _persist_shutdown_pending_messages(self)
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
         if stop_event is not None and stop_event.is_set():
             return
-        if self._restart_requested and ctx.timed_out:
-            await self._finalize_shutdown_agents(
-                ctx.active_agents, interrupted=True, stop_event=stop_event, deadline=deadline,
-            )
-        else:
-            await self._finalize_shutdown_agents(ctx.active_agents, stop_event=stop_event)
+        finalize = self._finalize_shutdown_agents
+        try:
+            parameters = inspect.signature(finalize).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        finalize_kwargs = {}
+        if "interrupted" in parameters and self._restart_requested and ctx.timed_out:
+            finalize_kwargs["interrupted"] = True
+        if "stop_event" in parameters:
+            finalize_kwargs["stop_event"] = stop_event
+        if "deadline" in parameters:
+            finalize_kwargs["deadline"] = deadline
+        await finalize(ctx.active_agents, **finalize_kwargs)
         if stop_event is not None and stop_event.is_set():
             return
         # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
@@ -2603,7 +2620,7 @@ class GatewayShutdownMixin:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
             # This spool is intentionally outside the cancellable finalization bound: it is the
             # successor's only durable copy of queued user follow-ups.
-            GatewayRunner._persist_shutdown_pending_messages(self)
+            _persist_shutdown_pending_messages(self)
             _finalize_stop_event = threading.Event()
             self._shutdown_finalize_stop_event = _finalize_stop_event
             _finalize_bound = self._restart_shutdown_bound() if ctx.timed_out and self._restart_requested else None

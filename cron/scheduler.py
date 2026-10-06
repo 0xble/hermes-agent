@@ -711,10 +711,11 @@ def get_running_job_ids() -> "frozenset[str]":
     entirely outside that dict, so without this the drain is structurally blind to them (#60432).
     """
     with _running_lock:
-        # ``_restart_safe_waiter_job_ids`` is retained as a compatibility/test seam, but
-        # production dispatch only adds it for the same acknowledged safe modes below.
-        restart_safe = _restart_safe_external_worker_job_ids | _restart_safe_waiter_job_ids
-        active = (_running_job_ids | _running_fire_owners.keys()) - restart_safe
+        # A parent waiter is no longer a visible running job until its external
+        # worker has acknowledged ownership. Once acknowledged, the worker remains
+        # visible to general liveness/metrics consumers.
+        restart_safe_waiters = _restart_safe_waiter_job_ids - _restart_safe_external_worker_job_ids
+        active = (_running_job_ids | _running_fire_owners.keys()) - restart_safe_waiters
         return frozenset(key[1] for key in active)
 
 
@@ -723,8 +724,8 @@ def get_running_job_details() -> list[dict]:
     runs). The drain wait publishes this so ``hermes update`` can say WHICH job it is waiting on."""
     now = time.time()
     with _running_lock:
-        restart_safe = _restart_safe_external_worker_job_ids | _restart_safe_waiter_job_ids
-        active = (_running_job_ids | _running_fire_owners.keys()) - restart_safe
+        restart_safe_waiters = _restart_safe_waiter_job_ids - _restart_safe_external_worker_job_ids
+        active = (_running_job_ids | _running_fire_owners.keys()) - restart_safe_waiters
         return [
             {"job_id": key[1],
              "elapsed_s": round(now - _running_since[key], 1) if key in _running_since else None,
@@ -734,15 +735,15 @@ def get_running_job_details() -> list[dict]:
 
 
 def get_shutdown_drain_job_ids() -> "frozenset[str]":
-    """Host-wide cron jobs that keep a gateway restart drain active.
+    """Host-wide cron jobs considered by the gateway restart shutdown drain.
 
-    Unlike the general liveness accessors, acknowledged restart-safe external workers
-    remain here: they are still executing and matter to idle-exit/metrics and the
-    shutdown drain's accounting even though they do not need interruption.
+    Keep this accessor separate so shutdown accounting can evolve without changing
+    the general liveness and observability contract. It intentionally preserves
+    acknowledged restart-safe workers in the drain snapshot.
     """
-    with _running_lock:
-        active = _running_job_ids | _running_fire_owners.keys()
-        return frozenset(key[1] for key in active)
+    # Route through the public general accessor so test seams and callers that
+    # replace that snapshot continue to observe the same host-wide ledger.
+    return get_running_job_ids()
 
 
 def get_wedged_job_ids() -> "frozenset[str]":
