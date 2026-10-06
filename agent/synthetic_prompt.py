@@ -1,7 +1,7 @@
 """Separate the human-authored part of a user-role turn from Hermes-generated prompt text.
 
 Hermes injects many user-role turns itself: background-process and delegation notices, goal
-continuations, heartbeat and ``/loop`` wakeups, cron preambles and recovery notes. They are real
+continuations, heartbeat and ``/loop`` wakeups, cron job runs and recovery notes. They are real
 execution events but poor memory signal, so automatic memory recall and transcript retention both
 ask :func:`human_prompt_text` for the part a person actually wrote. One classifier keeps the two
 memory paths from disagreeing about which turns are synthetic.
@@ -11,8 +11,9 @@ Provenance is read in this order:
 1. A recognized generated formatter boundary. The generated prefix is dropped and only text after
    its provable end survives, because the gateway can merge a real follow-up into a queued
    notification and that follow-up must not be lost.
-2. The turn's structured provenance: a runtime-owned ``display_kind`` or the ``cron`` platform.
-   With no recognized boundary there is no trustworthy human part, so nothing survives.
+2. The turn's structured provenance: a runtime-owned ``display_kind`` or an unattended platform
+   (``cron``: every turn of a scheduled run, not only its preamble). With no recognized boundary
+   there is no trustworthy human part, so nothing survives.
 3. Otherwise the whole text is human-authored.
 """
 
@@ -49,8 +50,12 @@ RUNTIME_PROMPT_DISPLAY_KINDS = frozenset({
     "async_delegation_complete",  # TUI/desktop delegation results
     "auto_continue",             # TUI crash-recovery continuation
 })
-# Agents on these platforms run a generated prompt with no person present.
-RUNTIME_PROMPT_PLATFORMS = frozenset({"cron"})
+# Unattended platforms: every turn is a scheduled run with no person present. A cron run's prompt
+# is the generated preamble (``cron.scheduler_prompt._CRON_HINT``, ~1.1K chars, longer than
+# Hindsight's default 800-char recall window), then the job's notepad, script output and stored
+# task text. The whole run is treated as generated, so cron jobs neither auto-recall nor
+# auto-retain by default; their explicit memory tools still work.
+UNATTENDED_PLATFORMS = frozenset({"cron"})
 
 # Legacy unframed rows have no reliable payload boundary, so only these exact
 # historical forms are dropped wholesale. Framed rows use the defining
@@ -70,39 +75,51 @@ _LEGACY_PROCESS_NOTICE_RE = re.compile(
 )
 
 
-def _template_pattern(template: str) -> re.Pattern[str]:
-    """Build an anchored matcher from a formatter template without copying its literals."""
-    parts = ["^"]
-    for literal, field_name, _format_spec, _conversion in Formatter().parse(template):
-        parts.append(re.escape(literal))
-        if field_name is not None:
-            parts.append(".*")
-    return re.compile("".join(parts), re.DOTALL)
+class _TemplateMatcher:
+    """Anchored matcher for one formatter template, built from the template's own literals.
 
+    Equivalent to the regex ``^L0.*L1.*…Ln`` with greedy DOTALL fields, but linear in the input:
+    ``str.find`` places each interior literal at its earliest position (leaving the most room for
+    the rest), then ``str.rfind`` places the terminal literal as late as possible, which is the
+    greedy match end. A regex with one ``.*`` per field backtracks polynomially on crafted input that
+    repeats the interior literals without the terminal one, and this runs on the turn path.
+    """
 
-def _template_terminal(template: str) -> str:
-    literals = [literal for literal, _field, _spec, _conversion in Formatter().parse(template)]
-    return literals[-1]
+    def __init__(self, template: str) -> None:
+        literals = [literal for literal, _field, _spec, _conversion in Formatter().parse(template)]
+        self.opening, self.interior, self.terminal = literals[0], literals[1:-1], literals[-1]
+
+    def match_end(self, content: str) -> int:
+        """End offset of the generated prompt at the start of ``content``, or -1."""
+        if not content.startswith(self.opening):
+            return -1
+        position = len(self.opening)
+        for literal in self.interior:
+            found = content.find(literal, position)
+            if found < 0:
+                return -1
+            position = found + len(literal)
+        found = content.rfind(self.terminal, position)
+        return -1 if found < 0 else found + len(self.terminal)
 
 
 # Match complete generated prompts from their defining templates. The formatter literals make this
-# stricter than a loose prefix while the greedy fields absorb any copied formatter prose inside
-# untrusted payloads and leave only the final generated boundary; quoted terminal prose in a later
-# human suffix is not itself treated as the boundary.
-_INJECTED_TURN_PATTERNS = (
-    ("goal", CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE)),
-    ("goal", CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE)),
-    ("goal", CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE)),
-    ("goal", CONTINUATION_PROMPT_TEMPLATE, _template_pattern(CONTINUATION_PROMPT_TEMPLATE)),
-    ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE, _template_pattern(KANBAN_GOAL_CONTINUATION_TEMPLATE)),
-    ("kanban", KANBAN_GOAL_FINALIZE_TEMPLATE, _template_pattern(KANBAN_GOAL_FINALIZE_TEMPLATE)),
-    ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE, _template_pattern(HEARTBEAT_PROMPT_TEMPLATE)),
-    ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _template_pattern(WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
-    ("loop", WAKEUP_PROMPT_TEMPLATE, _template_pattern(WAKEUP_PROMPT_TEMPLATE)),
-)
+# stricter than a loose prefix while the fields absorb any copied formatter prose inside untrusted
+# payloads and leave only the final generated boundary; quoted terminal prose in a later human
+# suffix is not itself treated as the boundary.
+_INJECTED_TURN_PATTERNS = tuple((kind, template, _TemplateMatcher(template)) for kind, template in (
+    ("goal", CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE),
+    ("goal", CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE),
+    ("goal", CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE),
+    ("goal", CONTINUATION_PROMPT_TEMPLATE),
+    ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE),
+    ("kanban", KANBAN_GOAL_FINALIZE_TEMPLATE),
+    ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE),
+    ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
+    ("loop", WAKEUP_PROMPT_TEMPLATE),
+))
 _INJECTED_TURN_TERMINALS = tuple(
-    terminal.strip().rsplit(". ", 1)[-1] for terminal in
-    (_template_terminal(template) for _kind, template, _pattern in _INJECTED_TURN_PATTERNS)
+    matcher.terminal.strip().rsplit(". ", 1)[-1] for _kind, _template, matcher in _INJECTED_TURN_PATTERNS
 )
 _REVISION_BLOCK_PREFIX = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0]
 _REVISION_ENTRY_RE = re.compile(r"- v\d+ \(")
@@ -144,11 +161,10 @@ def _user_after_injected_turn(content: str) -> str | None:
     """Drop a generated turn, preserving only a suffix after its exact formatter boundary."""
     match_kind = None
     marker_end = -1
-    for kind, _template, pattern in _INJECTED_TURN_PATTERNS:
-        match = pattern.match(content)
-        if match:
+    for kind, _template, matcher in _INJECTED_TURN_PATTERNS:
+        marker_end = matcher.match_end(content)
+        if marker_end >= 0:
             match_kind = kind
-            marker_end = match.end()
             break
     if marker_end < 0:
         return content
@@ -163,20 +179,19 @@ def _user_after_injected_turn(content: str) -> str | None:
     suffix = content[marker_end:]
     if not suffix.strip():
         return None
-    if not suffix.startswith("\n\n"):
-        # Never retain text from inside an injected payload when its boundary is ambiguous.
+    # The gateway's text merge joins a queued follow-up with a single newline, so one newline is a
+    # real boundary after the template's terminal literal. Text glued to the terminal is not.
+    # A revision block is different: its reason and earlier-requirement values may span lines, so
+    # only a blank line (enforced by _revision_suffix_boundary) separates it from human text.
+    if not suffix.startswith("\n"):
         return None
     suffix = suffix.strip()
     if revision_block and any(fragment and fragment in suffix for fragment in _INJECTED_TURN_TERMINALS):
         return None
     if match_kind == "goal" and suffix.startswith(GOAL_WAIT_LIFTED_NOTE_OPEN):
-        # GoalManager appends one generated barrier-lift line to an idle-woken continuation.
+        # GoalManager appends one generated single-line barrier-lift note to an idle-woken continuation.
         note, _newline, rest = suffix.partition("\n")
         if not note.endswith("]"):
-            return None
-        if not rest.strip():
-            return None
-        if not rest.startswith("\n"):
             return None
         suffix = rest.strip()
     return _unwrap_steer(suffix) or None
@@ -225,7 +240,7 @@ def text_after_generated_prefix(content: str, *, include_templates: bool = True)
 def is_runtime_prompt(*, display_kind: Optional[str] = None, platform: Optional[str] = None) -> bool:
     """Whether the turn's structured provenance says Hermes, not a person, wrote the prompt."""
     return (display_kind in RUNTIME_PROMPT_DISPLAY_KINDS
-            or str(platform or "").strip().lower() in RUNTIME_PROMPT_PLATFORMS)
+            or str(platform or "").strip().lower() in UNATTENDED_PLATFORMS)
 
 
 def human_prompt_text(

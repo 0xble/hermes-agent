@@ -41,9 +41,8 @@ _INTERVAL_TOKEN_RE = re.compile(
 )
 
 
-WAKEUP_PROMPT_PREFIX = "[/loop wakeup #"
 WAKEUP_PROMPT_TEMPLATE = (
-    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "[/loop wakeup #{tick}{cadence}]\n"
     "Recurring task: {prompt}\n\n"
     "This is an automatic wakeup from the /loop the user set. Perform the "
     "task now against the CURRENT state (re-check files, processes, or "
@@ -55,7 +54,7 @@ WAKEUP_PROMPT_TEMPLATE = (
 )
 
 WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
-    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "[/loop wakeup #{tick}{cadence}]\n"
     "Recurring task: {prompt}\n\n"
     "Stop condition: {until}\n\n"
     "This is an automatic wakeup from the /loop the user set. Perform the "

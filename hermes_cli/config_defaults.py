@@ -1340,7 +1340,7 @@ DEFAULT_CONFIG = {
         # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
         "provider": "",
         # Let Hermes-generated turns (process and delegation notices, goal continuations, heartbeat
-        # and /loop wakeups, cron preambles, recovery notes) key the external provider's automatic
+        # and /loop wakeups, cron job runs, recovery notes) key the external provider's automatic
         # recall. Off: their generated text is a poor query and repeats verbatim across turns, while
         # the session's own context already carries what they need. Text a person merged into such a
         # turn still recalls. Explicit memory tools are unaffected.

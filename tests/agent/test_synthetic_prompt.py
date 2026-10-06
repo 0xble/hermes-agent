@@ -127,6 +127,63 @@ def test_retention_drops_structured_synthetic_turn_without_a_known_formatter():
     assert filter_retain_messages(prompt, "HERMES_READY 1234") == (prompt, "HERMES_READY 1234")
 
 
+@pytest.mark.parametrize("build", [_process_notice, _goal_prompt, _goal_prompt_after_wait])
+def test_follow_up_merged_with_a_single_newline_survives(build):
+    """The gateway's pending-slot text merge (``_append_text``) joins with one newline."""
+    from gateway.platforms.base import _append_text
+
+    merged = _append_text(build(), HUMAN)
+
+    assert human_prompt_text(merged, display_kind="internal_notification") == HUMAN
+    assert filter_retain_messages(merged, "Answer.")[0] == HUMAN
+
+
+def test_text_glued_to_the_template_terminal_is_not_a_human_suffix():
+    assert human_prompt_text(_goal_prompt() + " and also this") is None
+
+
+def test_revision_block_still_needs_a_blank_line_before_human_text():
+    from hermes_cli.goals import CONTINUATION_REVISIONS_TEMPLATE
+
+    revised = _goal_prompt() + CONTINUATION_REVISIONS_TEMPLATE.format(
+        revision_lines="- v2 (agent, agent, no user authority): reason — changed: goal\n"
+                       "    earlier goal: Ship the old change")
+    assert human_prompt_text(revised + "\nnext line of the payload") is None
+    assert human_prompt_text(revised + "\n\n" + HUMAN) == HUMAN
+
+
+def test_cron_runs_are_unattended_so_even_the_task_text_skips_recall():
+    """Documented default: a cron run has no person present, so the stored job text after the
+    generated preamble is not a human message either."""
+    assert human_prompt_text("Summarize overnight alerts.", platform="cron") is None
+    assert auto_recall_query(_cron_prompt(), platform="cron", include_synthetic=True) == _cron_prompt().strip()
+
+
+@pytest.mark.parametrize("module_name,template_name", [
+    ("hermes_cli.goals", "CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE"),  # 6 fields
+    ("hermes_cli.loops", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE"),  # 4 fields
+])
+def test_crafted_near_miss_is_classified_in_linear_time(module_name, template_name):
+    """A person can start a message with a template's opening and repeat its interior literals
+    without the terminal one. Matching must stay linear: this ran for seconds with one greedy
+    ``.*`` per field and runs synchronously on the turn path and the memory-sync worker."""
+    import importlib
+    import time
+    from string import Formatter
+
+    template = getattr(importlib.import_module(module_name), template_name)
+    literals = [lit for lit, _f, _s, _c in Formatter().parse(template)]
+    opening, interior = literals[0], [lit for lit in literals[1:-1] if lit]
+    # Measured with the former one-``.*``-per-field regex: 0.8s at 3 KB, 46s at 6 KB.
+    crafted = opening + "".join((lit + "x") * 400 for lit in interior) + "no terminal here"
+    assert len(crafted) > 10_000
+
+    started = time.perf_counter()
+    for _ in range(5):
+        assert human_prompt_text(crafted) == crafted.strip()
+    assert time.perf_counter() - started < 1.0
+
+
 def test_trivial_suffix_still_skips_recall():
     assert auto_recall_query(_goal_prompt() + "\n\nok", display_kind=None, platform="telegram") == ""
 

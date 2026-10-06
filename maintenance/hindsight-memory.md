@@ -29,8 +29,8 @@ strategy and cron-exclusion behavior.
   `_session_turns` once queued), so the writer keeps a failed job in an ordered, bounded
   backlog and retries it instead of discarding it (`TestRetainRetry`). Tag settings
   (`retain_tags`, `recall_tags`) accept comma-separated strings and reach the SDK as lists.
-- Hermes-generated user turns (notices, goal continuations, heartbeat and `/loop` wakeups, cron
-  preambles, recovery notes) neither key automatic recall nor enter retained transcripts. Both
+- Hermes-generated user turns (notices, goal continuations, heartbeat and `/loop` wakeups, every
+  turn of a cron run, recovery notes) neither key automatic recall nor enter retained transcripts. Both
   gates call `agent.synthetic_prompt.human_prompt_text`, which reads the turn's runtime-owned
   `display_kind` and platform and each producer's own formatter boundary, keeping any human text
   merged after that boundary. Add a new generated prompt there, beside its producer constant,

@@ -278,8 +278,9 @@ memory:
 
 An external provider's automatic recall runs only for text a person wrote. Turns Hermes generates
 itself (background-process and delegation notices, goal continuations, heartbeat and `/loop`
-wakeups, cron preambles, recovery notes) skip it, because their generated text is a poor search
-query and repeats verbatim from turn to turn. If a person's message was merged into such a turn,
+wakeups, scheduled cron job runs, recovery notes) skip it, because their generated text is a poor
+search query and repeats verbatim from turn to turn. A cron run counts as generated in full, including
+the job's stored task text, because no person is present. If a person's message was merged into such a turn,
 recall runs on that message alone. The provider's explicit recall tools work on every turn. Set
 `recall_synthetic_turns: true` to recall on generated turns as well.
 
