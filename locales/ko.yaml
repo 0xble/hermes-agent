@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ 끝내기 전에 중단해야 했어요{reason}. /retry로 다시 시도하거나, 대화가 아주 길어졌다면 /compress를 사용하세요."
     no_response: "⚠️ 처리는 완료됐지만 응답이 생성되지 않았어요. 일시적인 오류일 수 있으니 메시지를 다시 보내 보세요."
     previous_turn_cleanup: "⚠️ 메시지가 처리되지 않았어요 (이전 턴이 아직 정리 중이었어요). 다시 보내 주세요."
-    unexpected_silence: "⚠️ 답변이 필요한 메시지에 모델이 무응답 표시만 반환했어요. 다시 시도하거나 다르게 표현해 보세요."
+    unexpected_silence: "⚠️ 이 메시지에 대한 답변이 작성되지 않았어요. 답변을 기대했다면 다시 보내 주세요."
     empty_response_model_label: "모델"
     hint_auth: " AI 모델 서비스 로그인이 만료되었거나 API 키가 잘못되었어요. 여기서 /login을 사용하거나, 호스트에서 `{relogin}`을 실행하세요."
     hint_quota: " AI 모델 서비스의 잔액이나 한도를 모두 사용했어요. 서비스 웹사이트에서 충전하거나, /model로 모델을 바꾸세요."
