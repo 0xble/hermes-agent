@@ -60,6 +60,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Documents extra | Opt-in, platform-gated document toolchain extra that bundles never preinstall and PM detects once installed | Optional extras, opt-in or platform gates, extra anchors, or document toolchain pins | [Documents extra](maintenance/documents-extra.md) |
 | TTS discovery without installation | Defer optional SDK installation until TTS use instead of blocking unrelated turns | TTS capability registration, lazy SDK imports, or tool-schema discovery changes | [TTS discovery](maintenance/tts-discovery-no-install.md) |
 | Goal lifecycle | Complete judge criteria, conversational recovery of blocker pauses, and durable command authority during judging | Goal judging, admission, continuation, or concurrent goal-command changes | [Goal lifecycle](maintenance/goal-lifecycle.md) |
+| Loop lifecycle | Versioned agent-authorized /loop revisions preserve user authority, cadence state, and cross-surface wakeup persistence | LoopManager revisions, loop wakeup prompts, stale loop-manager caches, or loop receipts | [Loop lifecycle](maintenance/loop-lifecycle.md) |
 | Internal notification silence | Internal process/delegation turns use an exact silence contract; parked-goal notices are durable and state-change deduplicated | Internal notification footer, process/delegation wake delivery, parked-goal status notices, or their regressions | [Internal notification silence](maintenance/internal-notification-silence.md) |
 | Goal status flood retry | Important parked, continuing, wait-ended, achieved, paused, and blocked notices survive short Telegram flood windows without blocking the turn pipeline | Goal status notice delivery, flood-control classification, or shared cron/notice retry budgets | [Goal status flood retry](maintenance/goal-notice-flood-retry.md) |
 | External-wait goal backoff | Park goals gated on external work, back off after no-progress turns, and re-arm still-running pid/session barriers | Goal judge WAIT semantics, persistent no-progress state, barrier liveness, or idle wake behavior | [External-wait goal backoff](maintenance/goal-external-wait-backoff.md) |
@@ -139,6 +140,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/gateway/test_response_filters.py tests/gateway/test_gateway_silence_tokens.py tests/gateway/test_busy_redirect_anchor.py`.
 - **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
 - **Rollback:** Revert the relay-silence fix commit.
+
+## Active patch record: resumable delegation retention
+
+- **Patch identity:** `resumable-delegation-retention`.
+- **Behavior:** Keep resume-eligible (`unknown`/`interrupted`/`stalled`, unspent resume claim, parent or origin session) delegations in the durable ledger through terminal-cap and pending-cap pruning while they remain inside the seven-day retention window. Terminal-cap pruning deletes delivered rows first and pending completions last, so a pending child result is dropped only when nothing else is left to remove. A boot notice re-checks eligibility just before injection, which narrows but does not close the race; `claim_resume` remains the authority and refuses a notice that slips through. Retained resumable rows are bounded by age, not by the caps.
+- **Source surfaces:** `tools/async_delegation.py`, `tools/delegation_resume.py`, `gateway/run_notifications.py`, and focused async-delegation recovery tests.
+- **Upstream status:** NousResearch #128623 and PR #128634 retain delivered audit records, but do not preserve resume-eligible interrupted rows or guard the queued boot-notice race; no equivalent upstream fix found.
+- **Focused regression:** `scripts/run_tests.sh tests/tools/test_delegation_resume.py tests/gateway/test_delegation_auto_resume.py`.
+- **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
+- **Rollback:** Revert the resumable-delegation-retention fix commit.
 
 ## Update
 

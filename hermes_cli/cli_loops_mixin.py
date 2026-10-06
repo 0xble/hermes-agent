@@ -602,14 +602,20 @@ class CLILoopsMixin:
         """
         from cli import _DIM, _RST, _cprint
         mgr = self._get_loop_manager()
-        if mgr is None or not mgr.is_due():
+        if mgr is None:
             return
-        # The idle poll runs at ~10 Hz; a due-but-deferred tick would otherwise hit the
-        # DB (goal_blocks_loop_tick) on every poll. Throttle the re-check.
+        # The idle poll runs at ~10 Hz; refresh the cached manager at most every 2s so a
+        # revision made by a tool during a wakeup is visible without turning the poll into a DB loop.
         now = time.time()
         if now - getattr(self, "_last_loop_tick_check", 0.0) < 2.0:
             return
         self._last_loop_tick_check = now
+        try:
+            mgr.refresh()
+        except Exception:
+            return
+        if not mgr.is_due():
+            return
         try:
             if not self._pending_input.empty():
                 return
@@ -673,6 +679,10 @@ class CLILoopsMixin:
         from cli import _DIM, _RST, _cprint
         mgr = self._get_loop_manager()
         if mgr is None:
+            return
+        try:
+            mgr.refresh()
+        except Exception:
             return
         state = mgr.state
         if state is None or not state.awaiting_response:
