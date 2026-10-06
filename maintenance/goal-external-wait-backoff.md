@@ -362,11 +362,13 @@ The full collected set that must turn green is:
 - `test_real_judge_wait_at_six_hours_pauses_without_a_second_judge`;
 - `test_real_exited_target_lifts_barrier_for_a_continuation`.
 
-Production code is intentionally unchanged in this design/test phase.
+The implementation lives in `hermes_cli/goals.py`, `gateway/run_goals.py`,
+`gateway/run_busy.py`, the CLI/TUI goal mixins and `tui_gateway/` notification paths,
+and all of the regressions above pass against it.
 
 ## Retirement and rollback
 
 Retire when a released upstream implementation satisfies the complete contract
-and passes the focused regressions. Rollback is a source revert of this patch's
-doc/tests commit; the durable fields remain optional and old rows remain
-readable.
+and passes the focused regressions. Rollback is a source revert of every commit
+carrying `Fork-Patch: goal-external-wait-backoff` (production code, tests and this
+record together). The durable fields remain optional, so old rows stay readable.
