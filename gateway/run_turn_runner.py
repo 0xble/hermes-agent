@@ -275,14 +275,20 @@ class TurnRunner:
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
 
     def _progress_build_message(self, tool_name, preview, args) -> Optional[str]:
-        """Render the progress line. Verbose mode queues directly (no dedup) and returns None."""
+        """Render the progress line. Verbose mode queues directly (no dedup) and returns None.
+
+        Every interpolated tool label, preview and args dump passes through the delivery adapter's
+        ``format_progress_literal`` (via ``format_tool_preview`` for compact previews), so a
+        Markdown-parsing platform shows ``mcp__x__y``, ``**/*.md`` or ``\\s+`` verbatim."""
         ctx = self._ctx
-        from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(tool_name, default="⚙️")
+        from agent.display import progress_tool_label
+        emoji, label = progress_tool_label(tool_name, default="⚙️")
         try:
             adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
             adapter = None
+        literal = getattr(adapter, "format_progress_literal", None) or (lambda text: text)
+        tool = literal(label)
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
         code = code_full if verbose else code_short
@@ -296,16 +302,17 @@ class TurnRunner:
                 # for full detail and platform message-length limits handle the rest.
                 if pl > 0 and len(args_str) > pl:
                     args_str = args_str[:pl - 3] + "..."
-                code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool_name, keys=list(args.keys()), args=args_str)
+                code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool,
+                         keys=literal(str(list(args.keys()))), args=literal(args_str))
             elif code is None:
-                code = (t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview) if preview
-                        else t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name))
+                code = (t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=literal(preview)) if preview
+                        else t("gateway.progress.tool_pending", emoji=emoji, tool=tool))
             ctx.progress_queue.put(code)
             return None
         if code is not None:
             return code
         if not preview:
-            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name)
+            return t("gateway.progress.tool_pending", emoji=emoji, tool=tool)
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
         prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
         preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
@@ -313,7 +320,7 @@ class TurnRunner:
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
         verb = get_tool_verb(tool_name)
         if not verb:
-            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
+            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=preview)
         return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
 
     def _progress_emit(self, msg: str) -> None:
