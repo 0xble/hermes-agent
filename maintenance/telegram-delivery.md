@@ -330,3 +330,38 @@ while preserving the independently required local deltas. Retire flood
 coherence when upstream classifies media floods and shares one per-chat window. Retire
 emphasis when PR 106906 merges and the candidate tag includes it. Roll back by reverting
 the logical patch; no persistent data changes.
+
+## Daily call counter (measurement only)
+
+**Evidence (2026-10-06).** The last two bans were each a single 429 with a multi-hour wait:
+`editMessageText` at 2026-10-04 20:35 (23019s) and at 2026-10-05 17:23:52 PDT
+(`retry_after=34507.0s`, the first 429 that day). Both ended near 02:59 PDT (09:59 UTC). In the
+24 minutes before the second one the log shows only progress edits, a few `deleteMessages`
+bubble cleanups and sends, about 1 call every 4-6s, inside the 45/min budget above. So the
+per-minute budget cannot be the binding limit. The fixed end time points to a volume window.
+Its size, and whether it applies per chat or per bot, were not known because successful calls
+were only logged at debug level.
+
+**Contract.** `ChatBudgetRateLimiter` counts every metered call that reaches Telegram in
+`DailyCallCounter`, by chat, endpoint and trigger, in hourly buckets. Local penalty refusals and
+shed typing or drafts are not counted. `TelegramAdapter.handle_message` binds the trigger
+(`typed`, `goal`, `loop`, `relay`, `process`, `delegation`, `restart`, `heartbeat`, `internal`)
+in a ContextVar that the turn task inherits. Calls outside a turn (cron delivery, outbox
+replay, housekeeping) are `untagged`. Counts flush additively to `call_counts` in the profile's
+`telegram-flood-state.db` at most once a minute, are kept for 30 days, and log a rolling 24h
+summary hourly. Any `retry_after` of 600s or more also logs that window's counts. The counter
+never delays, sheds or refuses a call. A counter failure is logged at debug level and the call
+proceeds.
+
+**Reading it.** `sqlite3 ~/.hermes/telegram-flood-state.db "select chat_id, endpoint, trigger,
+sum(count) from call_counts where hour >= strftime('%s','now','-1 day') group by 1,2,3"`. The
+threshold is the window total logged with the next long `retry_after`. Comparing per-chat
+totals across chats at that moment shows whether the limit is per chat or per bot.
+
+**Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_daily_call_counter.py`.
+
+**Rollback:** Revert the `feat(telegram): count daily calls per chat` commit. The
+`call_counts` table can stay, because nothing else reads it.
+
+**Retirement:** Retire once the threshold is measured and upstream exposes equivalent per-chat
+call accounting, or once the early-warning cron reads another source.

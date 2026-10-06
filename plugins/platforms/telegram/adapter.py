@@ -27,7 +27,7 @@ from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.chat_budget import (
-    KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget)
+    KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter, reset_trigger)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -3664,6 +3664,9 @@ class TelegramAdapter(BasePlatformAdapter):
             claim.failed = True
 
     async def handle_message(self, event: MessageEvent) -> None:
+        # Label this turn's Bot API calls for the daily call counter (chat_budget.py). The turn
+        # task is created inside, so it inherits the label; measurement only.
+        trigger_token = bind_trigger(event)
         if getattr(self, "_owned_routing", None) is None:
             # Without owned admission, native dispatch may hand work off before
             # returning (including a task that outlives a cancelled callback).
@@ -3673,6 +3676,8 @@ class TelegramAdapter(BasePlatformAdapter):
         except BaseException:
             self._fail_update_preparation()
             raise
+        finally:
+            reset_trigger(trigger_token)
         self._accept_update()
 
     def _register_handlers(self, app) -> None:
@@ -6744,7 +6749,8 @@ class TelegramAdapter(BasePlatformAdapter):
             limiter = self.__dict__["_telegram_chat_rate_limiter"] = ChatBudgetRateLimiter(
                 self._chat_budget(),
                 penalty_remaining=self._send_flood_cooldown_remaining,
-                on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait))
+                on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait),
+                counter=call_counter(getattr(self, "_update_receipt_dir", None)))
         return limiter
 
     def _flood_inline_wait_cap(self, chat_id: Any) -> float:
