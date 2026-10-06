@@ -29,6 +29,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    _admit_api_agent_request,
     _api_request_profile,
     _IdempotencyCache,
     _derive_chat_session_id,
@@ -3167,3 +3168,43 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="s2", gateway_session_key="ch")
         assert captured[1]["model"] == "anthropic/claude-opus-4.6"
+
+
+@pytest.mark.asyncio
+async def test_api_admission_waits_for_mcp_discovery(monkeypatch):
+    """Authenticated API turns cannot enter a handler before startup tool discovery completes."""
+    import gateway.platforms.api_server as api_server
+
+    ready = asyncio.Event()
+    calls = []
+
+    class Adapter:
+        gateway_runner = types.SimpleNamespace(_mcp_discovery_ready=ready)
+        _pending_agent_requests = 0
+
+        @staticmethod
+        def _check_auth(request):
+            del request
+            return None
+
+        @staticmethod
+        def _draining_response():
+            return None
+
+    monkeypatch.setattr(api_server._api_runs, "_uses_room_run_auth", lambda *_args: False)
+
+    @_admit_api_agent_request
+    async def handler(self, request):
+        del request
+        calls.append(True)
+        return "ok"
+
+    adapter = Adapter()
+    task = asyncio.create_task(handler(adapter, types.SimpleNamespace(app={})))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert calls == []
+    assert adapter._pending_agent_requests == 1
+    ready.set()
+    assert await task == "ok"
+    assert adapter._pending_agent_requests == 0
