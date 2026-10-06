@@ -526,6 +526,12 @@ class SessionEntry:
     resume_turn_id: Optional[str] = None  # stable id of the interrupted turn, used for note deduplication
     resume_human: bool = True  # internal turns are marked false and never get a visible restart note
     restart_note_message_id: Optional[str] = None  # platform message id of the visible interruption note
+    # The note has its own durable identity: clearing ``resume_pending`` must not erase the
+    # marker/turn needed to reconcile a note that is still visible on the platform.
+    restart_note_marker_token: Optional[str] = None
+    restart_note_turn_id: Optional[str] = None
+    restart_note_marked_at: Optional[datetime] = None
+    restart_note_reconcile_attempts: int = 0
     last_resume_marked_at: Optional[datetime] = None
     # Durable marker of the executing turn; CAS-cleared on normal unwind, left behind by
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
@@ -549,7 +555,8 @@ class SessionEntry:
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
         "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
-        "resume_turn_id", "resume_human", "restart_note_message_id", "active_turn_human",
+        "resume_turn_id", "resume_human", "restart_note_message_id", "restart_note_marker_token",
+        "restart_note_turn_id", "restart_note_reconcile_attempts", "active_turn_human",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
@@ -565,6 +572,7 @@ class SessionEntry:
             "chat_type": self.chat_type, "metadata": self.metadata,
         }
         result.update((name, getattr(self, name)) for name in self._PLAIN_FIELDS)
+        result["restart_note_marked_at"] = _iso(self.restart_note_marked_at)
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
         result["active_turn_token"] = self.active_turn_token
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
@@ -615,6 +623,7 @@ class SessionEntry:
             updated_at=datetime.fromisoformat(data["updated_at"]), origin=origin,
             display_name=data.get("display_name"), platform=platform,
             chat_type=data.get("chat_type", "dm"), metadata=dict(data.get("metadata") or {}),
+            restart_note_marked_at=_parse_iso(data.get("restart_note_marked_at")),
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
             model_override=sanitize_model_override(data.get("model_override")),

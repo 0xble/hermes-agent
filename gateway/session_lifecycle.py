@@ -193,7 +193,16 @@ class SessionLifecycleMixin:
                     entry.resume_marker_token = uuid.uuid4().hex
                     entry.resume_turn_id = entry.active_turn_token
                     entry.resume_human = bool(entry.active_turn_human)
-                    entry.restart_note_message_id = None
+                    if entry.restart_note_message_id and not str(entry.restart_note_message_id).startswith(("pending:", "sent:")):
+                        # Reuse the one visible note for the new marker; shutdown delivery will
+                        # delete it before posting a replacement, avoiding two visible notes.
+                        entry.restart_note_reconcile_attempts = 0
+                    else:
+                        entry.restart_note_message_id = None
+                        entry.restart_note_marker_token = None
+                        entry.restart_note_turn_id = None
+                        entry.restart_note_marked_at = None
+                        entry.restart_note_reconcile_attempts = 0
                     entry.last_resume_marked_at = now  # freshness starts at discovery
                     promoted += 1
             entry.active_turn_token = None
@@ -230,8 +239,16 @@ class SessionLifecycleMixin:
             if not same_turn:
                 entry.resume_marker_token = uuid.uuid4().hex
                 entry.resume_turn_id = turn_id
-                entry.restart_note_message_id = None
-            if not same_turn:
+                if entry.restart_note_message_id and not str(entry.restart_note_message_id).startswith(("pending:", "sent:")):
+                    # A stale visible note is the single slot for this session. Shutdown delivery
+                    # removes it before claiming a replacement note, preserving one-visible-note.
+                    entry.restart_note_reconcile_attempts = 0
+                else:
+                    entry.restart_note_message_id = None
+                    entry.restart_note_marker_token = None
+                    entry.restart_note_turn_id = None
+                    entry.restart_note_marked_at = None
+                    entry.restart_note_reconcile_attempts = 0
                 entry.last_resume_marked_at = _now()
         return self._update_entry(session_key, _apply)
 
@@ -258,6 +275,10 @@ class SessionLifecycleMixin:
             if existing and not (reclaim_pending and str(existing).startswith("pending:")):
                 return False
             entry.restart_note_message_id = f"pending:{entry.resume_marker_token or uuid.uuid4().hex}"
+            entry.restart_note_marker_token = entry.resume_marker_token
+            entry.restart_note_turn_id = entry.resume_turn_id
+            entry.restart_note_marked_at = entry.last_resume_marked_at
+            entry.restart_note_reconcile_attempts = 0
             return True
         return self._update_entry(session_key, _apply)
 
@@ -271,6 +292,10 @@ class SessionLifecycleMixin:
             if expected_marker is not None and expected_marker != current:
                 return False
             entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
+            entry.restart_note_reconcile_attempts = 0
             return True
         return self._update_entry(session_key, _apply)
 
@@ -289,6 +314,10 @@ class SessionLifecycleMixin:
             ):
                 return False
             entry.restart_note_message_id = str(message_id)
+            entry.restart_note_marker_token = entry.resume_marker_token
+            entry.restart_note_turn_id = entry.resume_turn_id
+            entry.restart_note_marked_at = entry.last_resume_marked_at
+            entry.restart_note_reconcile_attempts = 0
             return True
         return self._update_entry(session_key, _apply)
 
@@ -296,10 +325,12 @@ class SessionLifecycleMixin:
         """Return ``(session_id, marker_token, marked_at, message_id)`` for note reconciliation."""
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or not entry.resume_pending:
+            if entry is None or (not entry.resume_pending and not entry.restart_note_message_id):
                 return None
             return (
-                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+                entry.session_id,
+                entry.restart_note_marker_token or entry.resume_marker_token,
+                entry.restart_note_marked_at or entry.last_resume_marked_at,
                 entry.restart_note_message_id,
             )
 
@@ -312,7 +343,27 @@ class SessionLifecycleMixin:
             if expected_marker is not None and expected_marker != current:
                 return False
             entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
+            entry.restart_note_reconcile_attempts = 0
             entry.resume_turn_id = None
+        return self._update_entry(session_key, _apply)
+
+    def record_restart_note_reconcile_failure(self, session_key: str, *, max_attempts: int = 3) -> bool:
+        """Count a failed edit/delete attempt; drop a permanently unreachable note after a bound."""
+        def _apply(entry: SessionEntry):
+            if not entry.restart_note_message_id or str(entry.restart_note_message_id).startswith(("pending:", "sent:")):
+                return False
+            entry.restart_note_reconcile_attempts += 1
+            if entry.restart_note_reconcile_attempts < max_attempts:
+                return False
+            entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
+            entry.restart_note_reconcile_attempts = 0
+            return True
         return self._update_entry(session_key, _apply)
 
     def clear_resume_pending(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:

@@ -959,8 +959,43 @@ class GatewayShutdownMixin:
                 marker = await marker(session_key)
                 note = await self.async_session_store.get_restart_note(session_key)
                 note_id = note[3] if note else None
-                if note_id and not str(note_id).startswith("pending:"):
+                if note_id and str(note_id).startswith("pending:") and not reclaim_pending:
                     continue
+                stale_note_id = None
+                current_marker = marker[1] if marker else None
+                if note_id and not str(note_id).startswith("pending:") and note[1] == current_marker:
+                    continue
+                if note_id and str(note_id).startswith("sent:"):
+                    # No platform id exists for this transport; clear the sentinel before
+                    # allocating the one visible note for the new interruption.
+                    await self.async_session_store.clear_restart_note(session_key)
+                elif note_id and not str(note_id).startswith("pending:"):
+                    current_marker = marker[1] if marker else None
+                    if note[1] == current_marker:
+                        continue
+                    stale_note_id = str(note_id)
+                target = await self._shutdown_notification_target(session_key)
+                if target is None:
+                    continue
+                source, platform_str, chat_id, thread_id, profile = target
+                platform = Platform(platform_str)
+                adapter = self._delivery_adapter_for(source) if source is not None else None
+                if adapter is None:
+                    adapter = self._authorization_adapter(platform, profile)
+                if adapter is None:
+                    continue
+                if stale_note_id:
+                    deleted = False
+                    delete = getattr(adapter, "delete_message", None)
+                    if callable(delete):
+                        try:
+                            deleted = bool(await delete(chat_id, stale_note_id))
+                        except Exception:
+                            deleted = False
+                    if not deleted:
+                        logger.warning("Unable to replace stale restart note for %s", session_key)
+                        continue
+                    await self.async_session_store.clear_restart_note(session_key)
                 if not await self.async_session_store.claim_restart_note(
                     session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
                 ):
@@ -969,18 +1004,6 @@ class GatewayShutdownMixin:
                     await self.async_session_store.release_restart_note_claim(
                         session_key, expected_marker=marker,
                     )
-                target = await self._shutdown_notification_target(session_key)
-                if target is None:
-                    await release_claim()
-                    continue
-                source, platform_str, chat_id, thread_id, profile = target
-                platform = Platform(platform_str)
-                adapter = self._delivery_adapter_for(source) if source is not None else None
-                if adapter is None:
-                    adapter = self._authorization_adapter(platform, profile)
-                if adapter is None:
-                    await release_claim()
-                    continue
                 metadata = self._thread_metadata_for_target(
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,

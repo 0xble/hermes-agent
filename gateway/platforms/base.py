@@ -4698,11 +4698,44 @@ class BasePlatformAdapter(ABC):
             return None
         note = await get_note(session_key)
         note_id = note[3] if note else None
-        if not note_id or str(note_id).startswith(("pending:", "sent:")):
-            if note_id and str(note_id).startswith("sent:"):
-                event._restart_note_reconciled = True
+        if not note_id or str(note_id).startswith("pending:"):
+            return None
+        if str(note_id).startswith("sent:"):
+            # Signal-like transports have no platform handle. The sentinel is reconciled by
+            # clearing the durable record, then the answer is sent normally.
+            try:
+                await store.clear_restart_note(session_key)
+            except Exception:
+                logger.warning("[%s] Failed to clear no-id restart note for %s", self.name, session_key,
+                               exc_info=True)
+            event._restart_note_reconciled = True
             return None
         event._restart_note_reconciled = True
+
+        async def _record_failed_reconciliation() -> None:
+            record_failure = getattr(store, "record_restart_note_reconcile_failure", None)
+            if not callable(record_failure):
+                return
+            try:
+                dropped = await record_failure(session_key)
+                if dropped:
+                    logger.warning(
+                        "[%s] Dropping restart note for %s after bounded reconciliation failures",
+                        self.name, session_key,
+                    )
+            except Exception:
+                logger.warning("[%s] Failed to record restart-note reconciliation failure for %s",
+                               self.name, session_key, exc_info=True)
+
+        async def _clear_reconciled_note() -> None:
+            try:
+                await store.clear_restart_note(session_key)
+            except Exception:
+                # Do not block the user's answer on a bookkeeping write. The durable note is
+                # intentionally retained so a later final delivery can retry reconciliation.
+                logger.warning("[%s] Failed to clear reconciled restart note for %s",
+                               self.name, session_key, exc_info=True)
+
         if streamed:
             delete = getattr(self, "delete_message", None)
             deleted = False
@@ -4712,7 +4745,9 @@ class BasePlatformAdapter(ABC):
                 except Exception:
                     deleted = False
             if deleted:
-                await store.clear_restart_note(session_key)
+                await _clear_reconciled_note()
+            else:
+                await _record_failed_reconciliation()
             return None
         edit = getattr(self, "edit_message", None)
         result = None
@@ -4733,7 +4768,7 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 result = None
         if result is not None and getattr(result, "success", False):
-            await store.clear_restart_note(session_key)
+            await _clear_reconciled_note()
             return result
         deleted = False
         delete = getattr(self, "delete_message", None)
@@ -4743,7 +4778,9 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 deleted = False
         if deleted:
-            await store.clear_restart_note(session_key)
+            await _clear_reconciled_note()
+        else:
+            await _record_failed_reconciliation()
         return None
 
     async def _send_final_text(

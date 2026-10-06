@@ -133,6 +133,112 @@ def _pending_store(tmp_path, adapter):
     return store, entry, event
 
 
+def _configure_real_final_delivery(adapter, store):
+    adapter.gateway_runner = SimpleNamespace(
+        async_session_store=AsyncSessionStore(store),
+        _delivery_adapter_for=lambda _source: adapter,
+        config=SimpleNamespace(durable_outbox_enabled=False),
+    )
+    adapter._record_delivery_obligation = AsyncMock(return_value=None)
+    adapter._finalize_delivery_obligation = AsyncMock()
+
+
+@pytest.mark.asyncio
+async def test_real_nonstream_delivery_reconciles_after_runner_clears_resume_pending(tmp_path, monkeypatch):
+    """The runner returns text, clears resume_pending, then the adapter performs final delivery."""
+    from gateway import run_turn
+    from gateway.run_turn import GatewayTurnMixin
+
+    adapter = NoteAdapter()
+    store, entry, _ = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-real")
+    _configure_real_final_delivery(adapter, store)
+    runner = object.__new__(GatewayTurnMixin)
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._should_send_voice_reply = lambda *args, **kwargs: False
+    monkeypatch.setattr(run_turn, "diagnostic_wake_muted", lambda _event: False)
+    event = MessageEvent(text="continue", message_type=MessageType.TEXT, source=_source(), internal=False)
+    delivered_response = await runner._hmwa_deliver_turn_response(
+        event, event.source, entry, entry.session_key, 1,
+        {"already_sent": False}, [], "resumed answer", None, False,
+    )
+    assert delivered_response == "resumed answer"
+    assert store.clear_resume_pending(entry.session_key)
+    delivered = []
+
+    await adapter._send_final_text(event, entry.session_key, delivered_response, {}, False, 0, delivered.append)
+
+    assert adapter.edited == [("chat", "note-real", "resumed answer", True)]
+    assert adapter.deleted == []
+    assert adapter.sent == []
+    assert store.get_restart_note(entry.session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_real_delivery_keeps_failed_note_and_retries_on_next_final(tmp_path):
+    adapter = NoteAdapter(edit_result=False, delete_result=False)
+    store, entry, _ = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-retry")
+    assert store.clear_resume_pending(entry.session_key)
+    _configure_real_final_delivery(adapter, store)
+    first_event = MessageEvent(text="continue", message_type=MessageType.TEXT, source=_source(), internal=False)
+
+    await adapter._send_final_text(first_event, entry.session_key, "first answer", {}, False, 0, lambda _r: None)
+
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "note-retry"
+    adapter.delete_result = True
+    second_event = MessageEvent(text="later", message_type=MessageType.TEXT, source=_source(), internal=False)
+    await adapter._send_final_text(second_event, entry.session_key, "later answer", {}, False, 0, lambda _r: None)
+
+    assert adapter.deleted == [("chat", "note-retry"), ("chat", "note-retry")]
+    assert store.get_restart_note(entry.session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_new_interruption_replaces_stale_note_before_posting_one(tmp_path):
+    adapter = NoteAdapter()
+    store = _store(tmp_path)
+    source = _source("stale-thread")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-old", human=True)
+    store.set_restart_note_message_id(entry.session_key, "old-note")
+    assert store.clear_resume_pending(entry.session_key)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-new", human=True)
+
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner.async_session_store = runner._async_session_store
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None)
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert adapter.deleted == [("chat", "old-note")]
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "m1"
+
+
+@pytest.mark.asyncio
+async def test_sent_no_id_note_is_cleared_at_final_delivery(tmp_path):
+    adapter = NoteAdapter(no_message_id=True)
+    store, entry, _ = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "sent:no-id")
+    assert store.clear_resume_pending(entry.session_key)
+    _configure_real_final_delivery(adapter, store)
+    event = MessageEvent(text="continue", message_type=MessageType.TEXT, source=_source(), internal=False)
+
+    await adapter._send_final_text(event, entry.session_key, "normal answer", {}, False, 0, lambda _r: None)
+
+    assert adapter.sent == [("chat", "normal answer", {})]
+    assert store.get_restart_note(entry.session_key) is None
+
+
 @pytest.mark.asyncio
 async def test_resumed_answer_edits_note_and_clears_marker(tmp_path):
     adapter = NoteAdapter()
