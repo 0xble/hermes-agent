@@ -872,8 +872,9 @@ class GatewayAdapterLifecycleMixin:
             logger.warning("Pending follow-up recovery after %s reconnect failed; spools retained", platform.value,
                            exc_info=True)
         for event in recovered_events:
-            self._queue_startup_restore_event(event)
-            keys.add(self._session_key_for_source(self._normalize_source_for_session_key(event.source)))
+            key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+            self._queue_startup_restore_event(event, session_key=key)
+            keys.add(key)
         try:
             # Recovery scans all served homes, but only the newly available platform resumes.
             self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,

@@ -32,7 +32,9 @@ from gateway.restart import (
 #: restartable exit introduces: a permanently dead backend looping forever unnoticed.
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
 from gateway.run_shutdown import _log_suppressed, _send_error
-from gateway.replay_scheduler import REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME
+from gateway.replay_scheduler import (
+    REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME, REPLAY_PRIORITY_SYNTHETIC,
+)
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
@@ -87,7 +89,7 @@ class GatewayStartupMixin:
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
 
-    def _queue_startup_restore_event(self, event: MessageEvent) -> None:
+    def _queue_startup_restore_event(self, event: MessageEvent, *, session_key: Optional[str] = None) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
@@ -102,7 +104,7 @@ class GatewayStartupMixin:
             logger.info(
                 "Queued replay source: kind=%s session_key=%s",
                 kind,
-                self._session_key_for_source(self._normalize_source_for_session_key(source)),
+                session_key or self._session_key_for_source(self._normalize_source_for_session_key(source)),
                 extra={"replay_scheduler": "source_queued", "kind": kind},
             )
 
@@ -146,8 +148,17 @@ class GatewayStartupMixin:
                 if getattr(event, "_hermes_recovered_followup", False)
                 else "startup_queued_human"
             )
+            resume_task = (
+                getattr(self, "_replay_resume_tasks", {}) or {}
+            ).get(key) if kind == "recovered_followup" else None
 
-            async def _dispatch(event=event, adapter=adapter):
+            async def _dispatch(event=event, adapter=adapter, resume_task=resume_task):
+                # A recovered follow-up is a second turn, not a competing replay:
+                # wait for this session's synthetic resume to finish before handing
+                # the user message to the adapter.  The wait is per-session, so the
+                # scheduler can still admit unrelated replays concurrently.
+                if resume_task is not None:
+                    await resume_task
                 await adapter.handle_message(event)
                 if getattr(event, "_gateway_accepted", False) is True:
                     spool = getattr(event, "_hermes_recovery_spool", None)
@@ -157,7 +168,7 @@ class GatewayStartupMixin:
 
             profile_home = self._resolve_profile_home_for_source(source)
             handles.append(self._enqueue_replay(
-                priority=REPLAY_PRIORITY_STARTUP,
+                priority=(REPLAY_PRIORITY_SYNTHETIC if kind == "recovered_followup" else REPLAY_PRIORITY_STARTUP),
                 kind=kind,
                 session_key=key,
                 dispatch=_dispatch,
@@ -172,6 +183,10 @@ class GatewayStartupMixin:
                     self._get_replay_scheduler().wait_for(handle)
                 ))
                 task.add_done_callback(self._late_failure_callback("background startup replay failed", level=logging.DEBUG))
+            # Let workers admit the first batch before releasing the startup gate. This
+            # keeps the non-blocking drain observable to callers without awaiting the
+            # entire replay backlog.
+            await asyncio.sleep(0)
             return len(handles)
         if handles:
             results = await asyncio.gather(
@@ -287,7 +302,7 @@ class GatewayStartupMixin:
         drained = 0
         try:
             await self._await_startup_warmup()
-            drained = await self._drain_startup_restore_queue(wait=False)
+            drained = await self._drain_startup_restore_queue()
         finally:
             self._startup_restore_in_progress = False
         if drained:
@@ -654,6 +669,9 @@ class GatewayStartupMixin:
         if candidates is None:
             return 0
         scheduled = 0
+        resume_tasks = getattr(self, "_replay_resume_tasks", None)
+        if resume_tasks is None:
+            resume_tasks = self._replay_resume_tasks = {}
         for entry in candidates:
             # Epoch math: the marker was stamped naive-local by the previous process, possibly
             # on the other side of a DST change; wall-clock subtraction is off by the shift.
@@ -686,6 +704,13 @@ class GatewayStartupMixin:
             task = self._retain_background_task(asyncio.create_task(
                 self._get_replay_scheduler().wait_for(handle)
             ))
+            resume_tasks[entry.session_key] = task
+            task.add_done_callback(self._late_failure_callback("background startup auto-resume task failed", level=logging.DEBUG))
+            task.add_done_callback(
+                lambda done, key=entry.session_key, tasks=resume_tasks: (
+                    tasks.pop(key, None) if tasks.get(key) is done else None
+                )
+            )
             if restore_tasks is not None:
                 restore_tasks.append(task)
             if restore_keys is not None:
@@ -697,6 +722,7 @@ class GatewayStartupMixin:
                 tasks.append(task)
             scheduled += 1
         if scheduled:
+            self._get_replay_scheduler().start()
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
 
