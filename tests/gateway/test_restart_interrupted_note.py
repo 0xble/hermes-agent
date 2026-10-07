@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult, _ExtractedResponse
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
@@ -186,6 +186,183 @@ async def test_shutdown_broadcast_skips_only_lanes_that_received_s2_note(tmp_pat
     )
 
     assert [item[0] for item in adapter.sent] == [missed_source.chat_id]
+
+
+@pytest.mark.asyncio
+async def test_failed_s2_transport_releases_real_store_claim_for_retry(tmp_path):
+    store = _store(tmp_path)
+    source = _source("retry-after-failure")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-retry", human=True)
+    adapter = NoteAdapter()
+    attempts = 0
+
+    async def send_once_fails(chat_id, content, reply_to=None, metadata=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return SendResult(success=False, error="transport down")
+        adapter.sent.append((chat_id, content, metadata))
+        return SendResult(success=True, message_id=f"m{attempts}")
+
+    adapter.send = send_once_fails
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 0
+    assert store.get_restart_note(entry.session_key) is None
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert attempts == 2
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "m2"
+
+
+@pytest.mark.asyncio
+async def test_s2_note_reserves_home_destination_until_note_delivery(tmp_path):
+    store = _store(tmp_path)
+    source = _source("home-dedup")
+    source.chat_type = "group"
+    source.chat_id = "home"
+    source.thread_id = None
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-home", human=True)
+    adapter = NoteAdapter()
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._s2_note_session_keys = {entry.session_key}
+    runner._s2_note_delivered_keys = set()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._snapshot_running_agents = lambda: [entry.session_key]
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._owning_profile = lambda *_args: (True, None)
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+    runner._served_home_channel_configs = lambda: [(
+        None, Platform.TELEGRAM,
+        PlatformConfig(enabled=True, token="***", home_channel=HomeChannel(
+            platform=Platform.TELEGRAM, chat_id="home", name="Home",
+        )),
+    )]
+    runner._restart_requested = False
+    runner._restart_command_source = None
+    runner._restart_reason = None
+
+    await runner._notify_active_sessions_of_shutdown()
+    assert adapter.sent == []
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert len(adapter.sent) == 1
+    assert "interrupted" in adapter.sent[0][1].lower()
+
+
+@pytest.mark.asyncio
+async def test_s2_note_reserves_telegram_private_topic_parent(tmp_path):
+    store = _store(tmp_path)
+    source = _source("private-topic-dedup")
+    source.chat_type = "dm"
+    source.chat_id = "private-home"
+    source.thread_id = "topic"
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-private-topic", human=True)
+    adapter = NoteAdapter()
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._s2_note_session_keys = {entry.session_key}
+    runner._s2_note_delivered_keys = set()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._snapshot_running_agents = lambda: [entry.session_key]
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._owning_profile = lambda *_args: (True, None)
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+    runner._served_home_channel_configs = lambda: [(
+        None, Platform.TELEGRAM,
+        PlatformConfig(enabled=True, token="***", home_channel=HomeChannel(
+            platform=Platform.TELEGRAM, chat_id=source.chat_id, name="Home",
+        )),
+    )]
+    runner._restart_requested = False
+    runner._restart_command_source = None
+    runner._restart_reason = None
+
+    await runner._notify_active_sessions_of_shutdown()
+    assert adapter.sent == []
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0][2]["thread_id"] == "topic"
+
+
+@pytest.mark.asyncio
+async def test_failed_s2_note_uses_one_ordinary_home_fallback(tmp_path):
+    store = _store(tmp_path)
+    source = _source("home-fallback")
+    source.chat_type = "group"
+    source.chat_id = "home-fallback"
+    source.thread_id = None
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-home-fallback", human=True)
+    adapter = NoteAdapter()
+    attempts = 0
+
+    async def fail_once(chat_id, content, reply_to=None, metadata=None):
+        nonlocal attempts
+        attempts += 1
+        if "Interrupted by a restart" in content:
+            raise RuntimeError("transport down")
+        adapter.sent.append((chat_id, content, metadata))
+        return SendResult(success=True, message_id=f"m{attempts}")
+
+    adapter.send = fail_once
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._s2_note_session_keys = {entry.session_key}
+    runner._s2_note_delivered_keys = set()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._snapshot_running_agents = lambda: [entry.session_key]
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._owning_profile = lambda *_args: (True, None)
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._served_home_channel_configs = lambda: [(
+        None, Platform.TELEGRAM,
+        PlatformConfig(enabled=True, token="***", home_channel=HomeChannel(
+            platform=Platform.TELEGRAM, chat_id=source.chat_id, name="Home",
+        )),
+    )]
+    runner._restart_requested = False
+    runner._restart_command_source = None
+    runner._restart_reason = None
+
+    await runner._notify_active_sessions_of_shutdown()
+    assert adapter.sent == []
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 0
+    runner._s2_note_session_keys = set(runner._s2_note_delivered_keys)
+    await runner._notify_active_sessions_of_shutdown({entry.session_key}, include_home_channels=False)
+    assert len(adapter.sent) == 1
+    assert "Hermes is shutting down" in adapter.sent[0][1]
 
 
 @pytest.mark.asyncio

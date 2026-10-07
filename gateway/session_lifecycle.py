@@ -338,6 +338,12 @@ class SessionLifecycleMixin:
             if record is None or not str(record.get("message_id", "")).startswith("pending:"):
                 return False
             self._note_records_locked(entry).remove(record)
+            # Clear the legacy compatibility view before syncing. Otherwise an empty record list
+            # re-migrates the just-released pending claim as a legacy record.
+            entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
             self._sync_legacy_note_fields(entry)
             return True
         return self._update_entry(session_key, _apply)
