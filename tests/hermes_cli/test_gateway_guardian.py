@@ -375,6 +375,45 @@ def test_unloaded_pending_reload_waits_until_grace_expires(tmp_path, monkeypatch
 
 
 @pytest.mark.platforms("macos")
+def test_guardian_rollback_inherits_the_run_startup_deadline(tmp_path, monkeypatch):
+    # _run is bounded by STARTUP_SECONDS. The rollback it triggers must spend that same deadline,
+    # not open a fresh ROLLBACK_SECONDS window that outlives the guardian's startup bound.
+    home, plist, label, a, b = layout(tmp_path)
+    fake_launchctl(monkeypatch, label)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: False)
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: 1000.0)
+    txn = {"version": 1, "operation": "promote", "candidate": str(b),
+           "previous_intended": str(a), "reload_issued": {"at": "2020-01-01T00:00:00+00:00"}}
+    (home / "release-last-txn.json").write_text(json.dumps(txn))
+    seen = []
+    monkeypatch.setattr(guardian, "rollback_switch",
+                        lambda *args, deadline=None, **kwargs: seen.append(deadline) or True)
+    assert guardian.run_once(home, plist, label, grace=0.000001, domain=f"gui/{os.getuid()}") == "rolled_back"
+    assert seen == [1000.0 + guardian.STARTUP_SECONDS]
+
+
+@pytest.mark.platforms("macos")
+def test_health_proof_finished_after_the_deadline_does_not_count(tmp_path, monkeypatch):
+    from hermes_cli import gateway_launchd
+    import psutil
+    home, plist, label, a, b = layout(tmp_path)
+    (home / "gateway_state.json").write_text(json.dumps({
+        "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+    clock = {"now": 100.0}
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: clock["now"])
+
+    def slow_probe(name, *, timeout=10):
+        clock["now"] = 103.0  # the probe returns after the 102.0 deadline
+        return os.getpid()
+
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", slow_probe)
+    monkeypatch.setattr(psutil.Process, "cwd", lambda self: str(b))
+    assert not guardian.healthy(home, label, b, 102.0)
+
+
+@pytest.mark.platforms("macos")
 def test_gateway_restart_command_clears_stopped_intent(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway

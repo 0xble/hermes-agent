@@ -138,11 +138,13 @@ def healthy(home: Path, label: str, expected: Path, deadline: float | None = Non
         return False
     try:
         process = psutil.Process(pid)
-        return (process.is_running() and
-                (supervised == pid or supervised in {p.pid for p in process.parents()}) and
-                process.cwd() == str(expected))
+        proven = (process.is_running() and
+                  (supervised == pid or supervised in {p.pid for p in process.parents()}) and
+                  process.cwd() == str(expected))
     except (psutil.Error, OSError):
         return False
+    # A proof that finished after the bound does not count: the caller's deadline has already passed.
+    return proven and (deadline is None or time.monotonic() < deadline)
 
 
 def _bounded_timeout(requested: float, deadline: float | None) -> float:
@@ -278,7 +280,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             return "capped"
         _refuse_leftovers_before_launch(home)
         receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
-        ok = rollback_switch(home, plist, label, old, domain=domain)
+        ok = rollback_switch(home, plist, label, old, domain=domain, deadline=deadline)
         receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
         return "rolled_back" if ok else "failed"
     if state == "loaded":
