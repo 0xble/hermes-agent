@@ -3761,6 +3761,10 @@ class GatewayTurnMixin:
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
         first_response = _delivery_result.get("final_response", "")
+        # LOOP_COMPLETE is /loop control text: this lane sends before the normal completion
+        # filter runs, so strip it here too. Loop detection reads the untouched result dict.
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        first_response = strip_trailing_loop_complete_marker(first_response)
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
