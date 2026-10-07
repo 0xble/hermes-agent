@@ -303,15 +303,17 @@ class GatewayStartupMixin:
         from gateway.run import _startup_restore_drain_timeout_secs
         claimed_rows: list = (await self._claim_pending_obligations() if claimed is None else claimed)
 
+        # S2 interruption notes have a stricter lifecycle than the other boot sends: a resumed turn
+        # must not be scheduled until this bounded, cancel-on-timeout step has completed. The sender
+        # owns its timeout and _cancel_task_with_grace behavior, so keep it outside the detachable
+        # boot-send task below.
+        if interrupted_note_keys:
+            await self._send_interrupted_turn_notes(
+                interrupted_note_keys, reclaim_pending=True,
+                cancel_on_timeout=True, timeout=_startup_restore_drain_timeout_secs(),
+            )
+
         async def _boot_sends() -> None:
-            # Post per-turn interruption notes first. If the bounded boot-send task detaches, a resumed
-            # turn must not finish before its note is recorded; later boot broadcasts/redelivery are not
-            # part of the S2 note lifecycle.
-            if interrupted_note_keys:
-                await self._send_interrupted_turn_notes(
-                    interrupted_note_keys, reclaim_pending=True,
-                    cancel_on_timeout=True, timeout=_startup_restore_drain_timeout_secs(),
-                )
             await self._send_restart_notification()
             self._schedule_update_notification_watch()
             if planned_restart_notification_pending:
@@ -323,26 +325,12 @@ class GatewayStartupMixin:
         if timeout <= 0:
             await boot_task  # unbounded: a failing send surfaces here (unlike the gate path)
             return
-        done, _pending = await asyncio.wait({boot_task}, timeout=timeout)
-        if boot_task not in done:
-            # Resume turns follow this method. Ordering is guaranteed when the transport honours
-            # cancellation within the short grace; a transport that ignores cancellation is detached
-            # so recovery never hangs, and its note may arrive after the resumed answer.
-            detached = not await _cancel_task_with_grace(boot_task)
-            if detached:
-                logger.warning(
-                    "Boot-path interrupted-turn note task detached for sessions %s after %.1fs timeout; "
-                    "note may arrive after the resumed answer",
-                    list(interrupted_note_keys),
-                    timeout,
-                )
-            else:
-                logger.warning(
-                    "Boot-path sends exceeded %.1fs; cancelled and awaited before resume",
-                    timeout,
-                )
-            return
-        await boot_task
+        await self._wait_bounded_or_release(
+            {boot_task}, timeout,
+            "Boot-path sends still running after %.0fs; releasing inbound gate so other platforms are not "
+            "frozen. Restart notification / obligation redelivery continue in the background.",
+            "background boot-path send failed after gate release: see traceback", track=True,
+        )
 
     async def _clear_resume_pending_for_claimed_obligations(
         self, claimed: list, *, require_success: bool = False

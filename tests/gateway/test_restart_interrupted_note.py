@@ -1228,13 +1228,12 @@ async def test_startup_detaches_cancel_ignoring_note_before_resume(monkeypatch):
     release = asyncio.Event()
     scheduled = []
 
-    async def hanging_note(*_args, **_kwargs):
+    async def hanging_note(*_args, **kwargs):
         started.set()
         try:
-            await release.wait()
-        except asyncio.CancelledError:
-            await release.wait()
-            raise RuntimeError("cancel ignored by transport")
+            await asyncio.wait_for(release.wait(), timeout=kwargs["timeout"])
+        except asyncio.TimeoutError:
+            return 0
 
     runner._claim_pending_obligations = AsyncMock(return_value=[])
     runner._send_interrupted_turn_notes = hanging_note
@@ -1934,13 +1933,13 @@ async def test_startup_timeout_cancels_note_before_resume(tmp_path, monkeypatch)
     events = []
     blocker = asyncio.Event()
 
-    async def hanging_notes(_keys, **_kwargs):
+    async def hanging_notes(_keys, **kwargs):
         events.append("note-start")
         try:
-            await blocker.wait()
-        except asyncio.CancelledError:
+            await asyncio.wait_for(blocker.wait(), timeout=kwargs["timeout"])
+        except asyncio.TimeoutError:
             events.append("note-cancelled")
-            raise
+            return 0
 
     runner._claim_pending_obligations = AsyncMock(return_value=[])
     runner._send_interrupted_turn_notes = hanging_notes
@@ -1959,6 +1958,118 @@ async def test_startup_timeout_cancels_note_before_resume(tmp_path, monkeypatch)
 
     assert events == ["note-start", "note-cancelled", "resume"]
     blocker.set()
+
+
+@pytest.mark.asyncio
+async def test_startup_note_timeout_does_not_cancel_other_boot_sends(monkeypatch):
+    """Only the S2 note step is cancel-on-timeout; boot sends keep running detached."""
+    import gateway.run as run_module
+
+    runner = object.__new__(GatewayStartupMixin)
+    runner._background_tasks = set()
+    runner._wait_bounded_or_release = GatewayStartupMixin._wait_bounded_or_release.__get__(runner)
+    runner._late_failure_callback = lambda *args, **kwargs: (lambda task: None)
+    runner._retain_background_task = lambda task: (runner._background_tasks.add(task), task)[1]
+    events = []
+    release_redelivery = asyncio.Event()
+    note_started = asyncio.Event()
+
+    async def notes(_keys, **kwargs):
+        note_started.set()
+        events.append(("note", kwargs["cancel_on_timeout"], kwargs["timeout"]))
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=kwargs["timeout"])
+        except asyncio.TimeoutError:
+            events.append("note-cancelled")
+            return 0
+
+    async def redeliver(_rows):
+        events.append("redeliver-start")
+        try:
+            await release_redelivery.wait()
+        except asyncio.CancelledError:
+            events.append("redeliver-cancelled")
+            raise
+        events.append("redeliver-done")
+        return 1
+
+    runner._claim_pending_obligations = AsyncMock(return_value=[{"obligation_id": "owed"}])
+    runner._send_interrupted_turn_notes = notes
+    runner._send_restart_notification = AsyncMock(side_effect=lambda: events.append("restart"))
+    runner._schedule_update_notification_watch = Mock(side_effect=lambda: events.append("update-watch"))
+    runner._redeliver_claimed_obligations = redeliver
+    monkeypatch.setattr(run_module, "_startup_restore_drain_timeout_secs", lambda: 0.01)
+
+    await runner._await_startup_boot_sends(
+        planned_restart_notification_pending=False,
+        interrupted_note_keys=["interrupted"],
+    )
+
+    assert note_started.is_set()
+    assert events[:4] == [
+        ("note", True, 0.01),
+        "note-cancelled",
+        "restart",
+        "update-watch",
+    ]
+    assert "redeliver-start" in events
+    assert "redeliver-done" not in events
+    redelivery_tasks = [task for task in runner._background_tasks if not task.done()]
+    assert len(redelivery_tasks) == 1
+    assert not redelivery_tasks[0].cancelled()
+
+    release_redelivery.set()
+    await asyncio.gather(*redelivery_tasks)
+    assert events[-1] == "redeliver-done"
+    assert "redeliver-cancelled" not in events
+
+
+@pytest.mark.asyncio
+async def test_startup_slow_note_finishes_before_detached_boot_sends_and_resume(monkeypatch):
+    """A timed-out note is settled before resume scheduling while other sends remain live."""
+    import gateway.run as run_module
+
+    runner = object.__new__(GatewayStartupMixin)
+    runner._background_tasks = set()
+    runner._wait_bounded_or_release = GatewayStartupMixin._wait_bounded_or_release.__get__(runner)
+    runner._late_failure_callback = lambda *args, **kwargs: (lambda task: None)
+    runner._retain_background_task = lambda task: (runner._background_tasks.add(task), task)[1]
+    events = []
+    release_redelivery = asyncio.Event()
+
+    async def notes(_keys, **kwargs):
+        events.append("note-start")
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=kwargs["timeout"])
+        except asyncio.TimeoutError:
+            events.append("note-cancelled")
+            return 0
+
+    async def redeliver(_rows):
+        events.append("redeliver-start")
+        await release_redelivery.wait()
+        events.append("redeliver-done")
+
+    runner._claim_pending_obligations = AsyncMock(return_value=[])
+    runner._send_interrupted_turn_notes = notes
+    runner._send_restart_notification = AsyncMock(side_effect=lambda: events.append("restart"))
+    runner._schedule_update_notification_watch = Mock()
+    runner._redeliver_claimed_obligations = redeliver
+    monkeypatch.setattr(run_module, "_startup_restore_drain_timeout_secs", lambda: 0.01)
+
+    await runner._await_startup_boot_sends(
+        planned_restart_notification_pending=False,
+        interrupted_note_keys=["interrupted"],
+    )
+    events.append("resume")
+
+    assert events[:4] == ["note-start", "note-cancelled", "restart", "redeliver-start"]
+    assert events[-1] == "resume"
+    assert "redeliver-done" not in events
+
+    release_redelivery.set()
+    await asyncio.gather(*runner._background_tasks)
+    assert events[-1] == "redeliver-done"
 
 
 @pytest.mark.asyncio
