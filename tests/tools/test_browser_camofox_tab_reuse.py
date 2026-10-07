@@ -363,3 +363,51 @@ def test_stale_tab_record_is_pruned_once_the_server_forgets_the_tab(camofox):
     camofox.server.tabs[user_id] = [t for t in camofox.server.tabs[user_id] if t["tabId"] != tab]
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
     assert user_id not in cf._stale_tab_ids
+
+
+def test_turns_without_a_task_id_keep_the_tab(camofox):
+    """CLI one-shot and direct AIAgent callers omit task_id, so each turn gets a new UUID."""
+    from agent.turn_context import _bind_turn_identity
+
+    agent = SimpleNamespace(session_id="s", _relay_pending_turn_id=None)
+    with patch("agent.agent_runtime_helpers.note_turn_start"):
+        first, _ = _bind_turn_identity(agent, None, None, None, None, None)
+        assert _dispatch("browser_handoff", {"account": "brianle"}, first)["success"]
+        _end_turn(first)
+        second, _ = _bind_turn_identity(agent, None, None, None, None, None)
+    assert second != first and first not in camofox.cf._sessions
+    snapshot = _dispatch("browser_snapshot", {}, second)
+    assert snapshot["success"] and "visible-tab" in snapshot["snapshot"]
+    assert _dispatch("browser_navigate", {"url": "https://login.example.test/next"}, second)["success"]
+    assert camofox.server.tab_posts() == []
+    assert set(camofox.server.acted_on()) == {"visible-tab"}
+
+
+def test_handoff_reserves_the_shared_tab_from_concurrent_adoption(camofox):
+    """While /open is in flight another task must not adopt the shared tab it returns."""
+    cf = camofox.cf
+    real_post = cf._post
+    adopted = {}
+
+    def post(path, body, *args, **kwargs):
+        result = real_post(path, body, *args, **kwargs)
+        if path.endswith("/open"):  # the tab exists on the server, the handoff has not bound it yet
+            adopted["result"] = _dispatch("browser_navigate", {"url": "https://login.example.test/x",
+                                                               "account": "brianle"}, "racer")
+        return result
+
+    with patch.object(cf, "_post", side_effect=post):
+        assert _dispatch("browser_handoff", {"account": "brianle"}, "owner")["success"]
+    assert adopted["result"]["success"]
+    assert cf._sessions["owner"]["tab_id"] == "visible-tab"
+    assert cf._sessions["racer"]["tab_id"] != "visible-tab"
+
+
+def test_handoff_detaches_another_task_bound_to_the_visible_tab(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_handoff", {"account": "brianle"}, "first")["success"]
+    _end_turn("first")
+    assert _dispatch("browser_handoff", {"account": "brianle"}, "second")["success"]
+    assert cf._sessions["second"]["tab_id"] == "visible-tab"
+    assert cf._sessions["first"]["tab_id"] is None
+    assert not _dispatch("browser_snapshot", {}, "first")["success"]  # rebinds only by navigating

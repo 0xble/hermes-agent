@@ -551,6 +551,14 @@ def _bind_turn_identity(
     agent._persist_user_message_platform_id = persist_user_platform_id
     # Unique task_id when not provided isolates VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
+    previous_generated = getattr(agent, "_generated_task_id", None)
+    agent._generated_task_id = None if task_id else effective_task_id
+    if not task_id and previous_generated:
+        # The browser tab still continues across this agent's turns (e.g. after a handoff).
+        camofox = sys.modules.get("tools.browser_camofox")
+        if camofox is not None:
+            with suppress(Exception):
+                camofox.carry_task_binding(previous_generated, effective_task_id, move=True)
     agent._current_task_id = effective_task_id
     agent._process_owner_task_ids = {*getattr(agent, "_process_owner_task_ids", ()), effective_task_id}
     turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "") or (
