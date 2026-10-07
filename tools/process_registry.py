@@ -2656,6 +2656,25 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 kwargs["deadline"] = deadline
             return self.kill_process(session.id, **kwargs).get("status") in {"killed", "already_exited"}
 
+        def _signal_pid_group(pid: int, sig: int, *, pgid: Optional[int] = None) -> bool:
+            """Signal one snapshotted host PID and its own process group without waiting."""
+            if not pid:
+                return False
+            try:
+                killpg = getattr(os, "killpg", None)
+                if killpg is None:
+                    return False
+                target_pgid = pgid if pgid is not None else os.getpgid(pid)
+                # Never signal the registry process group. This also handles
+                # legacy Popen callers that did not create a new session.
+                if target_pgid == os.getpgrp():
+                    os.kill(pid, sig)
+                else:
+                    killpg(target_pgid, sig)
+                return True
+            except (ProcessLookupError, PermissionError, OSError):
+                return False
+
         def _signal_group(session: ProcessSession, sig: int, *, pgid: Optional[int] = None) -> bool:
             """Signal one owned local process group without waiting for it."""
             # A systemd scope is an additional cgroup boundary, not a reason to
@@ -2670,20 +2689,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return False
             if session.host_start_time is not None and pgid is None and not self._host_pid_is_ours(pid, session.host_start_time):
                 return False
-            try:
-                killpg = getattr(os, "killpg", None)
-                if killpg is None:
-                    return False
-                pgid = pgid if pgid is not None else os.getpgid(pid)
-                # Test/legacy Popen callers may not create a new session. Never
-                # signal our own process group; fall back to the owned PID there.
-                if pgid == os.getpgrp():
-                    os.kill(pid, sig)
-                else:
-                    killpg(pgid, sig)
-                return True
-            except (ProcessLookupError, PermissionError, OSError):
-                return False
+            return _signal_pid_group(pid, sig, pgid=pgid)
 
         def _alive(session: ProcessSession) -> bool:
             proc = getattr(session, "process", None)
@@ -2699,8 +2705,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return self._is_host_pid_alive(session.pid)
             return False
 
-        def _sweep_snapshot(session: ProcessSession) -> tuple[Optional[int], tuple[int, ...]]:
-            """Capture the group and descendants before TERM can reap the root."""
+        def _sweep_snapshot(session: ProcessSession) -> tuple[Optional[int], tuple[tuple[int, Optional[int]], ...]]:
+            """Capture the group and full descendant tree before TERM can reap the root."""
             pid = getattr(getattr(session, "process", None), "pid", None) or session.pid
             if session.pid_scope != "host" or not pid:
                 return None, ()
@@ -2710,14 +2716,36 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 pgid = os.getpgid(pid)
             except (ProcessLookupError, PermissionError, OSError):
                 pgid = None
-            return pgid, tuple(self._live_descendants(pid))
+            try:
+                import psutil
+                descendants = psutil.Process(pid).children(recursive=True)
+            except Exception:
+                descendants = []
+
+            def _descendant_pgid(child_pid: int) -> Optional[int]:
+                try:
+                    return os.getpgid(child_pid)
+                except (ProcessLookupError, PermissionError, OSError):
+                    return None
+
+            snapshot = tuple(
+                (child.pid, _descendant_pgid(child.pid))
+                for child in descendants
+                if self._proc_alive(child)
+            )
+            return pgid, snapshot
 
         def _snapshot_alive(session: ProcessSession, snapshot) -> bool:
-            """Include descendants whose root disappeared after SIGTERM."""
+            """Include every descendant whose root disappeared after SIGTERM."""
             if _alive(session):
                 return True
             _pgid, descendants = snapshot
-            return any(self._is_host_pid_alive(pid) for pid in descendants)
+            return any(self._is_host_pid_alive(pid) for pid, _child_pgid in descendants)
+
+        def _signal_snapshot_member(kind, target, sig: int, pgid: Optional[int]) -> bool:
+            if kind == "root":
+                return _signal_group(target, sig, pgid=pgid)
+            return _signal_pid_group(target, sig, pgid=pgid)
 
         # Real local workers are killed in one bounded sweep: TERM every process group,
         # one shared grace, KILL every survivor, then a short reap/poll. This deliberately
@@ -2753,8 +2781,23 @@ class ProcessRegistry(ProcessCheckpointMixin):
             threading.Thread(target=_stop, name="process-systemd-stop", daemon=True).start()
 
         if signalable:
+            # Signal every snapshotted root/descendant group in one parallel pass. A
+            # descendant may have called setsid(), so the root group alone is not an
+            # ownership boundary for the full psutil tree.
+            term_jobs = []
             for session in signalable:
-                _signal_group(session, signal.SIGTERM)
+                root_pgid, descendants = snapshots[session.id]
+                term_jobs.append(("root", session, root_pgid))
+                term_jobs.extend(("descendant", pid, pgid) for pid, pgid in descendants)
+            with ThreadPoolExecutor(max_workers=len(term_jobs), thread_name_prefix="process-term") as pool:
+                futures = [
+                    pool.submit(_signal_snapshot_member, kind, target, signal.SIGTERM, pgid)
+                    for kind, target, pgid in term_jobs
+                ]
+                for future in futures:
+                    with suppress(Exception):
+                        future.result()
+            for session in signalable:
                 _systemd_stop_async(session)
             started = time.monotonic()
             configured_grace = self._daemon_term_grace_seconds()
@@ -2770,11 +2813,27 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     break
                 time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
             for session in signalable:
-                if _snapshot_alive(session, snapshots[session.id]):
-                    _signal_group(
-                        session, getattr(signal, "SIGKILL", signal.SIGTERM),
-                        pgid=snapshots[session.id][0],
-                    )
+                snapshot = snapshots[session.id]
+                if not _snapshot_alive(session, snapshot):
+                    continue
+                root_pgid, descendants = snapshot
+                kill_jobs = [("root", session, root_pgid)]
+                kill_jobs.extend(
+                    ("descendant", pid, pgid)
+                    for pid, pgid in descendants
+                    if self._is_host_pid_alive(pid)
+                )
+                with ThreadPoolExecutor(max_workers=len(kill_jobs), thread_name_prefix="process-kill") as pool:
+                    futures = [
+                        pool.submit(
+                            _signal_snapshot_member, kind, target,
+                            getattr(signal, "SIGKILL", signal.SIGTERM), pgid,
+                        )
+                        for kind, target, pgid in kill_jobs
+                    ]
+                    for future in futures:
+                        with suppress(Exception):
+                            future.result()
             reap_deadline = time.monotonic() + 0.2
             if deadline is not None:
                 reap_deadline = min(reap_deadline, deadline)

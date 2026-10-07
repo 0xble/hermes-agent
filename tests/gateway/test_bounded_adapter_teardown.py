@@ -14,6 +14,7 @@ which wraps each await in the existing per-adapter timeout budget
 """
 
 import asyncio
+import contextlib
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,6 +22,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
+from gateway.run_shutdown import GatewayShutdownMixin
 
 
 @pytest.fixture
@@ -212,4 +214,58 @@ async def test_timed_out_restart_spools_followups_before_slow_cleanup(bare_runne
     payloads = [json.loads(path.read_text(encoding="utf-8")) for path in flush_dir.glob("*.json")]
     assert [payload["data"]["text"] for payload in payloads] == ["queued follow-up"]
     assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_timed_out_finalize_reserves_adapter_disconnect_budget(bare_runner):
+    """A slow finalize hook cannot consume the restart teardown/disconnect slice."""
+    import threading
+    import time
+
+    runner = bare_runner
+    runner._restart_requested = True
+    runner._restart_detached = False
+    runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._profile_adapters = {}
+    runner._startup_restore_queue = []
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {"idle:1": MagicMock()}
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    adapter.cancel_background_tasks = AsyncMock()
+    adapter.disconnect = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    async def slow_finalize(active, *, interrupted=False, stop_event=None, deadline=None):
+        deadline = deadline or time.monotonic()
+        await asyncio.sleep(max(0.0, deadline - time.monotonic()) + 0.05)
+
+    runner._finalize_shutdown_agents = slow_finalize
+
+    async def idle_cleanup(*_args, **_kwargs):
+        await asyncio.sleep(2.0)
+
+    runner._cleanup_agent_resources_off_loop = idle_cleanup
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=time.monotonic())
+    ctx.timed_out = True
+    ctx.active_agents = {"s": object()}
+
+    stop_event = threading.Event()
+    bound = runner._restart_shutdown_bound()
+    agent_bound = max(0.1, bound - min(0.75, max(0.25, bound * 0.25)))
+    started = time.monotonic()
+    task = asyncio.create_task(GatewayRunner._stop_finalize_agents_and_adapters(
+        runner, ctx, stop_event=stop_event, deadline=started + bound,
+        agent_deadline=started + agent_bound,
+    ))
+    if not await GatewayRunner._wait_or_detach(task, agent_bound):
+        stop_event.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    elapsed = time.monotonic() - started
+    assert adapter.disconnect.await_count >= 1
+    assert elapsed <= bound + 0.2
 

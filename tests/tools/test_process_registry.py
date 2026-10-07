@@ -186,6 +186,38 @@ def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
             os.unlink(pidfile)
 
 
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("mode", ["kill_all", "kill_process"])
+def test_kill_terminates_descendant_that_escaped_process_group(registry, mode):
+    """The full psutil tree is owned even when a child calls setsid()."""
+    pytest.importorskip("psutil")
+    pidfile = os.path.join(tempfile.gettempdir(), f"hermes-escaped-child-{os.getpid()}-{mode}.pid")
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(pidfile)
+    command = (
+        f"{sys.executable} -c \"import subprocess,sys,time; "
+        f"subprocess.Popen([sys.executable,'-c','import os,time; open(\\'{pidfile}\\',\\'w\\').write(str(os.getpid())); time.sleep(60)'], start_new_session=True); "
+        f"time.sleep(60)\""
+    )
+    session = registry.spawn_local(command, task_id=f"escaped-descendant-{mode}")
+    child_pid = None
+    try:
+        assert _wait_until(lambda: os.path.exists(pidfile))
+        child_pid = int(open(pidfile).read())
+        if mode == "kill_all":
+            result = registry.kill_all(session.task_id, source="gateway_shutdown")
+            assert result == 1
+        else:
+            result = registry.kill_process(session.id, source="gateway_shutdown")
+            assert result["status"] == "killed", result
+        time.sleep(0.2)
+        assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+    finally:
+        registry.kill_all(session.task_id, source="test-cleanup", consume_output=True)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pidfile)
+
+
 def test_kill_all_scoped_session_falls_back_to_direct_signal(registry, monkeypatch):
     """A failed systemctl stop must not prevent direct process-group signalling."""
     session = registry.spawn_local("exec sleep 30", task_id="scoped-test")

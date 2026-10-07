@@ -2319,7 +2319,10 @@ class GatewayShutdownMixin:
         # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         _cache = getattr(self, "_agent_cache", None)
-        if _cache_lock is not None and _cache is not None:
+        # Idle cached agents are best-effort after a timed-out finalize hook. They may
+        # consume the adapter teardown slice (memory providers can take seconds), so
+        # skip them after cancellation and go straight to transport/token release.
+        if not finalize_cancelled and _cache_lock is not None and _cache is not None:
             with _cache_lock:
                 _idle_agents = list(_cache.items())
                 _cache.clear()
@@ -2331,13 +2334,13 @@ class GatewayShutdownMixin:
                     _entry[0] if isinstance(_entry, tuple) else _entry, context="shutdown idle-cache",
                     session_key=_key,
                 )
-        if stop_event is not None and stop_event.is_set():
+        if stop_event is not None and stop_event.is_set() and not finalize_cancelled:
             return
         # Settle completion flush tasks while adapters are alive so every watcher gets a retryable result.
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
-        if cancel_completion_batches is not None:
+        if not finalize_cancelled and cancel_completion_batches is not None:
             await cancel_completion_batches()
-        if stop_event is not None and stop_event.is_set():
+        if stop_event is not None and stop_event.is_set() and not finalize_cancelled:
             return
         # Preserve each adapter's queue BEFORE any cancellable background-task cleanup. The
         # adapter normally flushes after its drain loop, but a slow unwind can outlast that
@@ -2349,7 +2352,7 @@ class GatewayShutdownMixin:
                         for profile, amap in list(_profile_adapters.items())
                         for platform, adapter in list(amap.items()))
         for platform, adapter, profile in adapters:
-            if stop_event is not None and stop_event.is_set():
+            if stop_event is not None and stop_event.is_set() and not finalize_cancelled:
                 return
             pending = getattr(adapter, "_pending_messages", None)
             if not isinstance(pending, Mapping) or not pending:
@@ -2638,7 +2641,7 @@ class GatewayShutdownMixin:
             _finalize_started = time.monotonic()
             _finalize_deadline = None if _finalize_bound is None else _finalize_started + _finalize_bound
             _agent_finalize_bound = None if _finalize_bound is None else max(
-                0.1, _finalize_bound - min(0.75, max(0.25, _finalize_bound * 0.25))
+                0.1, _finalize_bound - min(1.0, max(0.5, _finalize_bound / 3.0))
             )
             _agent_finalize_deadline = None if _agent_finalize_bound is None else _finalize_started + _agent_finalize_bound
             _finalize_task = asyncio.create_task(
