@@ -208,6 +208,19 @@ def ends_with_partial_loop_complete_marker(text: Any) -> bool:
     return bool(candidate) and _LOOP_COMPLETE_MARKER.startswith(candidate)
 
 
+def hide_loop_complete_marker(event: Any, response: Any) -> Any:
+    """Display text for a gateway final reply: strip a trailing ``LOOP_COMPLETE``.
+
+    The marker is /loop control text, but the /loop and /goal post-turn hooks read the delivered
+    reply and must still see it, so the raw reply is stashed on ``event`` as
+    ``_raw_final_response`` first (``GatewayGoalsMixin._final_text_for_post_turn_hooks`` prefers
+    it). Lanes that only send, with no post-turn hook, pass ``event=None``.
+    """
+    if event is not None:
+        event._raw_final_response = str(response or "")
+    return strip_trailing_loop_complete_marker(response)
+
+
 def split_trailing_loop_complete_marker(text: Any, *, context: str = "") -> tuple[Any, str]:
     """Split safe prefix from a trailing top-level marker candidate for streaming.
 

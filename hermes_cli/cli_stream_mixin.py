@@ -382,28 +382,7 @@ class CLIStreamMixin:
         if not getattr(self, "_in_reasoning_block", False):
             # Lowercased view catches mixed-case variants (<Think>, <THINKING>, …).
             prefilt_lower = self._stream_prefilt.lower()
-            for tag in _OPEN_TAGS:
-                tag_lower = tag.lower()
-                search_start = 0
-                while True:
-                    idx = prefilt_lower.find(tag_lower, search_start)
-                    if idx == -1:
-                        break
-                    preceding = self._stream_prefilt[:idx]
-                    # Boundary: only whitespace since the last newline — or, with no newline
-                    # buffered yet, since the last emit (which must have ended a line).
-                    is_block_boundary = preceding[preceding.rfind("\n") + 1:].strip() == "" and (
-                        "\n" in preceding or getattr(self, "_stream_last_was_newline", True))
-                    if is_block_boundary:
-                        if preceding:
-                            self._emit_stream_text(preceding)
-                            self._stream_last_was_newline = preceding.endswith("\n")
-                        self._in_reasoning_block = True
-                        self._stream_prefilt = self._stream_prefilt[idx + len(tag):]
-                        break
-                    search_start = idx + 1
-                if getattr(self, "_in_reasoning_block", False):
-                    break
+            self._stream_enter_reasoning_block(prefilt_lower)
 
             if not getattr(self, "_in_reasoning_block", False):
                 # Hold back a possible partial open tag at the end (case-insensitive).
@@ -444,6 +423,31 @@ class CLIStreamMixin:
                     self._stream_reasoning_delta(self._stream_prefilt[:-_MAX_CLOSE_TAG_LEN])
                 self._stream_prefilt = self._stream_prefilt[-_MAX_CLOSE_TAG_LEN:]
             return
+
+    def _stream_enter_reasoning_block(self, prefilt_lower: str) -> None:
+        """Enter a reasoning block at the first open tag on a block boundary, emitting the prose
+        before it. Open tags only count at a boundary (stream start / after a newline plus
+        optional whitespace) so prose that *mentions* a tag is not swallowed."""
+        for tag in _OPEN_TAGS:
+            tag_lower = tag.lower()
+            search_start = 0
+            while True:
+                idx = prefilt_lower.find(tag_lower, search_start)
+                if idx == -1:
+                    break
+                preceding = self._stream_prefilt[:idx]
+                # Boundary: only whitespace since the last newline — or, with no newline
+                # buffered yet, since the last emit (which must have ended a line).
+                is_block_boundary = preceding[preceding.rfind("\n") + 1:].strip() == "" and (
+                    "\n" in preceding or getattr(self, "_stream_last_was_newline", True))
+                if is_block_boundary:
+                    if preceding:
+                        self._emit_stream_text(preceding)
+                        self._stream_last_was_newline = preceding.endswith("\n")
+                    self._in_reasoning_block = True
+                    self._stream_prefilt = self._stream_prefilt[idx + len(tag):]
+                    return
+                search_start = idx + 1
 
     def _emit_stream_line(self, printed_line: str) -> None:
         """Print one response line with the skin's true-color text escape (if any)."""
