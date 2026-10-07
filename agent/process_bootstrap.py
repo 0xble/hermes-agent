@@ -17,6 +17,7 @@ from typing import Any, Optional
 from hermes_bootstrap import _happy_eyeballs_create_connection
 from utils import base_url_hostname, normalize_proxy_url
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy
+from agent.thread_scoped_output import adopt_routing_proxy, delegate_getattr, resolve_stdio, stdio_install_lock
 
 
 _OPENAI_CLS_CACHE = None
@@ -140,6 +141,9 @@ class _SafeWriter:
     __slots__ = ("_inner",)
 
     def __init__(self, inner):
+        # Collapse a redundant layer: wrapping another _SafeWriter adds nothing and lengthens the chain.
+        while isinstance(inner, _SafeWriter):
+            inner = object.__getattribute__(inner, "_inner")
         object.__setattr__(self, "_inner", inner)
 
     def write(self, data):
@@ -163,8 +167,11 @@ class _SafeWriter:
         except (OSError, ValueError):
             return False
 
+    def _hermes_stdio_next(self):
+        return self._inner
+
     def __getattr__(self, name):
-        return getattr(self._inner, name)
+        return delegate_getattr(self, name, _SafeWriter.__slots__)
 
 
 def _get_proxy_from_env() -> Optional[str]:
@@ -327,18 +334,26 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
 def _install_safe_stdio() -> None:
     """Wrap stdout/stderr so best-effort console output cannot crash the agent.
 
-    The thread-routing proxy already swallows a dead target's errors, so it is left
-    unwrapped. Wrapping it let each agent init and each later silence install add one
-    more layer, and a long-lived gateway's ``__getattr__`` chain eventually hit the
-    recursion limit inside ``review_candidate`` and subagent construction.
+    Runs on every agent build and every turn, so it must keep the stream at one Hermes layer.
+    A thread-scoped routing proxy anywhere in the chain is put back on top unwrapped (it guards
+    its own writes): wrapping it hid it from ``_ensure_installed``, which then stacked a new
+    proxy generation per agent build until lookups through the chain hit the recursion limit.
+    Otherwise the stream becomes one ``_SafeWriter`` over the resolved real stream, falling back
+    to the interpreter's original stream when the chain never reaches one.
     """
-    from agent.thread_scoped_output import is_routing_stream
-
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is not None and not isinstance(stream, _SafeWriter) and not is_routing_stream(stream):
-            setattr(sys, stream_name, _SafeWriter(stream))
-
+    with stdio_install_lock:
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(sys, stream_name, None)
+            if stream is None or adopt_routing_proxy(stream_name, stream) is not None:
+                continue
+            real = resolve_stdio(stream)
+            if real is None:
+                real = getattr(sys, f"__{stream_name}__", None)
+                if real is None:
+                    continue
+            if isinstance(stream, _SafeWriter) and object.__getattribute__(stream, "_inner") is real:
+                continue
+            setattr(sys, stream_name, _SafeWriter(real))
 
 # Drop-in for ``openai.OpenAI``.
 OpenAI = _OpenAIProxy()

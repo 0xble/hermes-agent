@@ -5681,6 +5681,48 @@ class TestSafeWriter:
     # test_installed_before_init_time_honcho_error_prints removed —
     # Honcho integration extracted to plugin (PR #4154).
 
+    def test_turn_succeeds_when_stdout_wrappers_form_a_cycle(self, monkeypatch):
+        """Gateway turns failed with RecursionError when the stdio wrappers wrapped each other:
+        agent build's ``setup_logging`` probes ``sys.stdout.line_buffering`` through the chain."""
+        import sys
+        import agent.thread_scoped_output as thread_output
+        from agent.process_bootstrap import _SafeWriter
+
+        monkeypatch.setattr(thread_output, "_installed", {})
+        monkeypatch.setattr(thread_output, "_sinks", {}, raising=False)
+        monkeypatch.setattr(thread_output, "_routing_states", {}, raising=False)
+        monkeypatch.setattr("hermes_logging._line_buffered_stdout", None)
+        real = io.StringIO()
+        monkeypatch.setattr(sys, "__stdout__", real)
+        original_stdout = sys.stdout
+        proxy = thread_output._ThreadRoutingStream(io.StringIO(), thread_output._RoutingState(io.StringIO()))
+        writer = _SafeWriter(proxy)
+        proxy._passthrough = writer
+        try:
+            sys.stdout = writer
+            with (
+                patch("model_tools.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+                patch("model_tools.check_toolset_requirements", return_value={}),
+                patch("agent.process_bootstrap.OpenAI"),
+            ):
+                built = AIAgent(
+                    api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+                    quiet_mode=True, skip_context_files=True, skip_memory=True,
+                )
+            built.client = MagicMock()
+            built.client.chat.completions.create.return_value = _mock_response(content="Done", finish_reason="stop")
+            with (
+                patch.object(built, "_persist_session"),
+                patch.object(built, "_save_trajectory"),
+                patch.object(built, "_cleanup_task_resources"),
+            ):
+                result = built.run_conversation("test")
+            assert result["final_response"] == "Done"
+            print("after-turn")
+            assert real.getvalue().endswith("after-turn\n")
+        finally:
+            sys.stdout = original_stdout
+
 
 # ===================================================================
 # Anthropic adapter integration fixes

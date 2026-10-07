@@ -1833,6 +1833,7 @@ class CLITuiMixin:
             self._pending_input.put(_seed_msg)
         # See constructor note; mirrored for the run() path that skips the earlier __init__ branch.
         self._last_turn_interrupted = False
+        self._goal_turn_user_initiated = True
         self._should_exit = False
         self._last_ctrl_c_time = 0  # double Ctrl+C force-exit tracking
 

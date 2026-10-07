@@ -1435,6 +1435,7 @@ DEFAULT_CONFIG = {
     "loops": {
         "min_interval_seconds": 30,  # smallest fixed interval; tighter cadences raised to it
         "max_ticks": 100,  # auto-pause after this many wakeups unless --times set; 0 = unlimited
+        "auto_notices": True,  # show agent loop_set receipts (set/revise/replace) to the user
         "self_paced_floor_seconds": 60,  # Self-paced cadence bounds (seconds).
         "self_paced_ceiling_seconds": 900,
     },
@@ -2489,6 +2490,10 @@ DEFAULT_CONFIG = {
     # External password managers are unlocked per session with a masked master-password prompt;
     # headless sessions (cron, webhook, API) never prompt and see them as locked.
     "vault": {
+        # Map an existing login handle or 1Password item ID to extra exact HTTPS origins.
+        # Aliases extend fill authorization without editing the password-manager item; malformed,
+        # HTTP, and wildcard origins are ignored. Example: {"item-id": ["https://signin.example.com"]}.
+        "origin_aliases": {},
         "onepassword": {
             # Detected managers are login sources unless the user opts out (vault.<name>.enabled: false).
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.
