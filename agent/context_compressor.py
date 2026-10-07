@@ -33,7 +33,7 @@ from agent.auxiliary_client import (
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
-from agent.context_compressor_retry import retryable_user_text
+from agent.context_compressor_retry import retryable_user_text  # noqa: F401 — public re-export
 from agent.context_compressor_tail import demote_stale_tail_tools, is_demoted_stub, skill_view_names_by_call_id
 from agent.context_compressor_telemetry import CompressionTelemetryMixin
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -5779,30 +5779,6 @@ def history_before_user_originated_turn(
         raise ValueError("selected row is not a user-originated turn")
     prefix = [message.copy() for message in messages[:index]] + ([handoff] if handoff is not None else [])
     return prefix, live_view
-
-
-def retryable_user_text(content: Any) -> str:
-    """Lossless retry text, or raise before destructive mutation (media/unknown parts fail closed: no replay protocol)."""
-    if not isinstance(content, (str, list)):
-        raise ValueError("retry does not support non-text content")
-    chunks: list[str] = []
-    for part in [content] if isinstance(content, str) else content:
-        if isinstance(part, str):
-            chunks.append(part)
-            continue
-        if not isinstance(part, dict):
-            raise ValueError("retry does not support non-text content")
-        if part.get("type") not in {"text", "input_text", "output_text"}:
-            raise ValueError("retry does not support media or unknown content parts")
-        if set(part) - {"type", "text"}:
-            raise ValueError("retry cannot losslessly flatten annotated text parts")
-        if not isinstance(part.get("text"), str):
-            raise ValueError("retry text parts must contain text")
-        chunks.append(part["text"])
-    text = "".join(chunks)
-    if not text.strip():
-        raise ValueError("retry found no text to send")
-    return text
 
 
 def _handoff_carries_live_user_content(message: Any) -> bool:
