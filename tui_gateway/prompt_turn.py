@@ -766,7 +766,8 @@ def _invoke_agent(
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
-    hold = {"buf": "", "held": "", "loop_held": ""} if _is_bot_mode_session(session) else None
+    hold = {"buf": "", "held": ""} if _is_bot_mode_session(session) else None
+    loop_hold = {"text": ""}
 
     def _deliver_delta(delta):
         with session["history_lock"]:
@@ -781,27 +782,28 @@ def _invoke_agent(
     def _stream(delta):
         if getattr(agent, "_mute_notification_reply", False):
             return
-        if hold is not None and isinstance(delta, str):
+        if isinstance(delta, str):
             from gateway.response_filters import (
                 ends_with_partial_loop_complete_marker,
-                is_partial_silence_marker,
                 split_trailing_loop_complete_marker,
             )
+            loop_candidate = loop_hold["text"] + delta
+            if ends_with_partial_loop_complete_marker(loop_candidate):
+                safe, partial = split_trailing_loop_complete_marker(loop_candidate)
+                loop_hold["text"] = partial
+                if safe:
+                    _stream(safe)
+                return
+            if loop_hold["text"]:
+                delta = loop_hold["text"] + delta
+                loop_hold["text"] = ""
+        if hold is not None and isinstance(delta, str):
+            from gateway.response_filters import is_partial_silence_marker
             hold["buf"] += delta
             if is_partial_silence_marker(hold["buf"]):
                 hold["held"] += delta
                 return
             delta, hold["held"] = hold["held"] + delta, ""
-            loop_candidate = hold["loop_held"] + delta
-            if ends_with_partial_loop_complete_marker(loop_candidate):
-                safe, partial = split_trailing_loop_complete_marker(loop_candidate)
-                hold["loop_held"] = partial
-                if safe:
-                    _deliver_delta(safe)
-                return
-            if hold["loop_held"]:
-                delta = hold["loop_held"] + delta
-                hold["loop_held"] = ""
         _deliver_delta(delta)
 
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
