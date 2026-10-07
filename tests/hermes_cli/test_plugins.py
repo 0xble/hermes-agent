@@ -1392,6 +1392,41 @@ class TestForceReloadSymmetry:
 
         assert len(starts) == 2
 
+    @pytest.mark.parametrize("hook_name", ["on_session_start", "on_session_end"])
+    def test_concurrent_session_hooks_with_distinct_sessions_both_run(self, monkeypatch, hook_name):
+        """Concurrent lifecycle hooks must not collapse when no tool/turn id is present."""
+        import time
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        hold = threading.Event()
+        starts = []
+
+        def recorder(**kwargs):
+            starts.append(kwargs["session_id"])
+            hold.wait(timeout=10.0)
+            return "ok"
+
+        mgr = PluginManager()
+        mgr._hooks[hook_name] = [recorder]
+
+        def fire(session_id):
+            mgr.invoke_hook(hook_name, session_id=session_id)
+
+        first = threading.Thread(target=fire, args=("session-a",), daemon=True)
+        first.start()
+        time.sleep(0.1)
+        second = threading.Thread(target=fire, args=("session-b",), daemon=True)
+        second.start()
+        time.sleep(0.4)
+        hold.set()
+        first.join(5.0)
+        second.join(5.0)
+
+        assert sorted(starts) == ["session-a", "session-b"]
+
     def test_repeated_same_call_identity_still_deduplicated(self, monkeypatch):
         """Negative control: the same call identity stays a duplicate while its worker
         is still running, so the running gate (not timeout suppression) dedupes it."""

@@ -594,43 +594,53 @@ def test_batch_format_failure_resolves_waiters_for_retry(monkeypatch):
     adapter.handle_message.assert_not_awaited()
 
 
-def test_shutdown_cancels_batch_during_window_and_settles_waiter_for_retry():
+def test_shutdown_releases_batch_held_in_window_for_delivery():
+    """A held routine completion has no durable copy: shutdown delivers it instead of dropping it."""
+    import time as _time
+
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
-    sleep_entered = asyncio.Event()
-    release_sleep = asyncio.Event()
-    real_sleep = asyncio.sleep
+    runner._completion_notification_batch_window = 3600
+    runner._session_state("agent:main:telegram:dm:123").conversation.last_turn_started_at = _time.time()
     event = _completion_event(started_at=1.0, session_id="proc_cancel_window")
-
-    async def _controlled_sleep(delay):
-        if delay == runner._completion_notification_batch_window:
-            sleep_entered.set()
-            await release_sleep.wait()
-            return
-        await real_sleep(delay)
 
     async def _exercise():
         pending = asyncio.create_task(
             runner._enqueue_process_completion_notification("completion", event)
         )
-        await sleep_entered.wait()
+        await asyncio.sleep(0.2)
+        adapter.handle_message.assert_not_awaited()
         flush_task = next(iter(runner._completion_notification_batch_tasks.values()))
         assert flush_task in runner._background_tasks
 
         await runner._cancel_process_completion_batch_tasks()
 
-        assert await asyncio.wait_for(pending, timeout=1.0) is False
-        assert flush_task.cancelled()
+        assert await asyncio.wait_for(pending, timeout=1.0) is True
+        assert flush_task.done() and not flush_task.cancelled()
         assert flush_task not in runner._background_tasks
         assert runner._completion_notification_batches == {}
         assert runner._completion_notification_batch_tasks == {}
 
-    with patch("gateway.run.asyncio.sleep", new=_controlled_sleep):
-        asyncio.run(_exercise())
-    adapter.handle_message.assert_not_awaited()
+    asyncio.run(_exercise())
+    adapter.handle_message.assert_awaited_once()
 
 
-def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
+def _spooled_texts(runner):
+    """Completions preserved for the next boot through the drain-spool seam."""
+    return list(getattr(runner, "_spooled", []))
+
+
+def _capture_spool(runner):
+    runner._spooled = []
+
+    def _preserve(session_key, event):
+        runner._spooled.append(event.text)
+        return True
+
+    runner._preserve_drain_event = _preserve
+
+
+def test_shutdown_cancels_blocked_batch_delivery_and_spools_it():
     delivery_entered = asyncio.Event()
 
     async def _blocked_delivery(_event):
@@ -640,7 +650,9 @@ def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
     adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=_blocked_delivery))
     runner = _runner(adapter)
     runner._completion_notification_batch_window = 0
+    runner._COMPLETION_SHUTDOWN_FLUSH_S = 0.2
     event = _completion_event(started_at=1.0, session_id="proc_cancel_delivery")
+    _capture_spool(runner)
 
     async def _exercise():
         pending = asyncio.create_task(
@@ -651,7 +663,9 @@ def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
 
         await runner._cancel_process_completion_batch_tasks()
 
-        assert await asyncio.wait_for(pending, timeout=1.0) is False
+        # The watcher stops retrying at shutdown, so the result goes to the drain spool instead.
+        assert await asyncio.wait_for(pending, timeout=1.0) is True
+        assert len(_spooled_texts(runner)) == 1 and "completion" in _spooled_texts(runner)[0]
         assert flush_task.cancelled()
         assert runner._completion_delivery_identity(event) not in runner._completion_deliveries_inflight
         assert runner._completion_delivery_identity(event) not in runner._completion_deliveries_delivered
@@ -662,9 +676,10 @@ def test_shutdown_cancels_blocked_batch_delivery_and_keeps_it_retryable():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_completion_enqueue_stays_retryable_after_shutdown_starts():
+def test_completion_enqueued_after_shutdown_starts_is_spooled():
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
+    _capture_spool(runner)
 
     async def _exercise():
         await runner._cancel_process_completion_batch_tasks()
@@ -673,7 +688,8 @@ def test_completion_enqueue_stays_retryable_after_shutdown_starts():
             _completion_event(started_at=1.0, session_id="proc_after_shutdown"),
         )
 
-    assert asyncio.run(_exercise()) is False
+    assert asyncio.run(_exercise()) is True
+    assert len(_spooled_texts(runner)) == 1
     assert runner._completion_notification_batches == {}
     assert runner._completion_notification_batch_tasks == {}
     adapter.handle_message.assert_not_awaited()
@@ -708,6 +724,8 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
     adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=_blocked_delivery))
     runner = _runner(adapter)
     runner._completion_notification_batch_window = 0
+    runner._COMPLETION_SHUTDOWN_FLUSH_S = 0.2
+    _capture_spool(runner)
     first_event = _completion_event(started_at=1.0, session_id="proc_old_flush")
     second_event = _completion_event(started_at=2.0, session_id="proc_new_flush")
 
@@ -719,20 +737,23 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
 
         # The first task has detached from the route index while blocked in
         # adapter delivery.  A new completion for the same route must create a
-        # second flush, and shutdown must still own and cancel both tasks.
+        # second flush; shutdown releases it, and cancels both once they stay blocked.
         assert runner._completion_notification_batch_tasks == {}
         runner._completion_notification_batch_window = 3600
         second = asyncio.create_task(
             runner._enqueue_process_completion_notification("second", second_event)
         )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        for _ in range(200):
+            if len(runner._completion_notification_batch_flush_tasks) == 2:
+                break
+            await asyncio.sleep(0.01)
         flush_tasks = set(runner._completion_notification_batch_flush_tasks)
         assert len(flush_tasks) == 2
 
         await runner._cancel_process_completion_batch_tasks()
 
-        assert await asyncio.gather(first, second) == [False, False]
+        assert await asyncio.gather(first, second) == [True, True]
+        assert len(_spooled_texts(runner)) == 2
         assert all(task.cancelled() for task in flush_tasks)
         assert runner._completion_notification_batches == {}
         assert runner._completion_notification_batch_tasks == {}
@@ -740,7 +761,7 @@ def test_shutdown_cancels_overlapping_flushes_for_same_route():
         assert runner._background_tasks == set()
 
     asyncio.run(_exercise())
-    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -993,3 +1014,134 @@ def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
     assert isolated_registry.completion_queue.empty()
+
+
+def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isolated_registry):
+    """A state.db commit/close that checkpoints a large WAL can block for tens of seconds. Every
+    durable claim and settle on the delivery path must run off the loop, so the loop keeps
+    answering liveness probes while the ledger is slow."""
+    import contextlib
+    import time
+
+    import hermes_cli.sqlite_util as sqlite_util
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_slow_{i}") for i in range(2)]
+    for event in events:
+        _persist_pending_completion(event)
+
+    stall_s = 1.2
+    real_transaction = sqlite_util.transaction
+
+    @contextlib.contextmanager
+    def _slow_transaction(conn, **kwargs):
+        with real_transaction(conn, **kwargs) as inner:
+            yield inner
+        time.sleep(stall_s)  # the blocking close/checkpoint seen in the gateway freeze
+
+    monkeypatch.setattr(sqlite_util, "transaction", _slow_transaction)
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+
+    async def _exercise():
+        ticks = [time.monotonic()]
+        delivery_done = asyncio.Event()
+
+        async def _heartbeat():
+            while not delivery_done.is_set():
+                await asyncio.sleep(0.05)
+                ticks.append(time.monotonic())
+
+        heartbeat = asyncio.create_task(_heartbeat())
+        try:
+            result = await runner._deliver_async_delegation_group([dict(e) for e in events])
+        finally:
+            delivery_done.set()
+            await heartbeat
+        return result, max(b - a for a, b in zip(ticks, ticks[1:]))
+
+    result, worst_gap = asyncio.run(_exercise())
+
+    assert result is True
+    adapter.handle_message.assert_awaited_once()
+    for event in events:
+        assert async_delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+    assert worst_gap < 1.0, f"event loop stalled {worst_gap:.2f}s behind a slow ledger transaction"
+
+
+def test_cancelled_sibling_claim_releases_its_lease(monkeypatch, isolated_registry):
+    """A claim taken in a worker thread must not strand its lease when the awaiting task is
+    cancelled (shutdown): the row stays immediately claimable instead of waiting out the lease."""
+    import threading
+
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_cancel_{i}") for i in range(2)]
+    for event in events:
+        _persist_pending_completion(event)
+    entered, proceed = threading.Event(), threading.Event()
+    real_claim = async_delegation.claim_event_delivery
+
+    def _gated_claim(evt, consumer):
+        entered.set()
+        proceed.wait(5)
+        return real_claim(evt, consumer)
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _gated_claim)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+
+    async def _exercise():
+        task = asyncio.create_task(runner._deliver_async_delegation_group([dict(e) for e in events]))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        proceed.set()
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if async_delegation.claim_completion_delivery(events[1]["delegation_id"], "next-consumer"):
+                return True
+        return False
+
+    assert asyncio.run(_exercise()), "cancelled sibling claim stranded its lease"
+
+
+def test_cancelled_primary_claim_is_refunded_not_released(monkeypatch, isolated_registry):
+    """A shutdown that cancels delivery after the primary claim commits must refund the attempt
+    exactly once; releasing it as a failed delivery would spend the budget on every restart."""
+    import threading
+
+    from tools import async_delegation
+
+    event = _distinct_async_event("deleg_cancel_primary")
+    _persist_pending_completion(event)
+    committed, proceed = threading.Event(), threading.Event()
+    real_claim = async_delegation.claim_completion_delivery
+
+    def _claim_then_stall(delegation_id, claim_id):
+        result = real_claim(delegation_id, claim_id)
+        committed.set()
+        proceed.wait(5)
+        return result
+
+    monkeypatch.setattr(async_delegation, "claim_completion_delivery", _claim_then_stall)
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+
+    async def _exercise():
+        task = asyncio.create_task(runner._deliver_async_delegation_group([dict(event)]))
+        while not committed.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        proceed.set()
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if real_claim(event["delegation_id"], "next-consumer"):
+                return True
+        return False
+
+    assert asyncio.run(_exercise()), "cancelled primary claim stranded its lease"
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert row["delivery_attempts"] == 1, f"cancellation spent an attempt: {row['delivery_attempts']}"

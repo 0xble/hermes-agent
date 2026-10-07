@@ -9,6 +9,7 @@ import contextlib
 import sys
 from pathlib import Path
 
+from . import pending_moa
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -760,13 +761,29 @@ def _cmd_moa(rid, params, session, name, arg):
         if not session:
             return _err(rid, 4001, "no active session")
         preset = moa.normalize_moa_config(_load_cfg().get("moa") or {})["default_preset"]
-        # Record the live identity for post-turn restore, then swap the agent's client in
-        # place: session["model_override"] alone never switches an already-built agent.
+        # A running turn owns the live agent. Queue the one-shot state alongside the
+        # prompt instead of switching that agent under its worker thread (#moa-busy-defer).
         agent = session.get("agent")
-        # See #53444.
-        session["moa_one_shot_restore"] = {
-            "override": session.get("model_override"), "model": getattr(agent, "model", None),
-            "provider": getattr(agent, "provider", None)}
+        if session.get("running"):
+            # The token is the only MoA state a client may carry. Preset and restore data remain
+            # in the session-owned record so edits, retries, and isolated turns cannot choose a model.
+            # The restore snapshot is intentionally empty here: claim-time capture runs after a
+            # preceding /model --once turn has restored its temporary model.
+            record = pending_moa.create(session, preset=preset, restore={}, prompt=arg)
+            queue_token = record["token"]
+            notice = f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn."
+            return _ok(rid, {"type": "send", "display": f"/moa {arg}", "queued": True,
+                             "moa_token": queue_token, "notice": notice, "message": arg})
+        # Record the live identity for post-turn restore in the same session-owned record used
+        # by busy turns. Clients never receive the preset or restore snapshot. Claim-time capture
+        # is after any completed one-turn restore and before applying the MoA model.
+        record = pending_moa.create(session, preset=preset, restore={}, prompt=arg)
+        queue_token = record["token"]
+        pending_moa.claim(
+            session, queue_token,
+            restore=pending_moa.restore_snapshot(session, agent=agent),
+        )
+        session["_active_moa_token"] = queue_token
         if agent is not None:
             try:  # persist_override=False: turn-scoped, never persist the MoA provider to config.yaml
                 _apply_model_switch(
@@ -774,7 +791,8 @@ def _cmd_moa(rid, params, session, name, arg):
                     confirm_expensive_model=False, pin_session_override=True, persist_override=False,
                     count_switch=False)
             except Exception:
-                session.pop("moa_one_shot_restore", None)
+                pending_moa.cancel(session, queue_token)
+                session.pop("_active_moa_token", None)
                 raise
         else:  # lazy/fresh session: the override is consumed by the first build
             session["model_override"] = {

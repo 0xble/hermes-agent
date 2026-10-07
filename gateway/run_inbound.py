@@ -316,6 +316,8 @@ class GatewayInboundMixin:
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        event = apply_agent_origin_reply_expectation(event)
         source = event.source
 
         if not self._is_user_authorized_for_source(source):
@@ -1095,6 +1097,10 @@ class GatewayInboundMixin:
             return True, usage
         with suppress(Exception):
             event.text = payload
+        # Admission saw "/queue <header>" and could not match the header; the stripped
+        # payload is what the turn persists, so judge agent origin on it now.
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(event)
         return False, None
 
     async def _hm_cmd_moa(self, event, source, _quick_key):
@@ -1520,7 +1526,7 @@ class GatewayInboundMixin:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.event = event
-        _claim_state.turn.started_ts = time.time()
+        _claim_state.turn.started_ts = _claim_state.conversation.last_turn_started_at = time.time()
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()

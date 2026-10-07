@@ -172,7 +172,8 @@ def test_tty_seeded_chat_keeps_background_delegation(monkeypatch, query, image):
 
     def dispatch(unit, unit_id, slot_key, routing):
         dispatched.append(unit)
-        return {"status": "dispatched", "delegation_id": "interactive-delegation"}
+        # Mirror _dispatch_unit's accepted async-dispatch contract.
+        return {"status": "dispatched", "accepted": True, "delegation_id": "interactive-delegation"}
 
     monkeypatch.setattr("tools.delegate_tool_dispatch._dispatch_unit", dispatch)
     seeded = SimpleNamespace(run=lambda: AIAgent._dispatch_delegate_task(

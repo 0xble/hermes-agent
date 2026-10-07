@@ -2614,6 +2614,7 @@ export interface PromptSubmitParams {
   display_kind?: string | null
   interrupted?: boolean | null
   queued?: boolean | null
+  moa_token?: string | null
   surface?: string | null
   voice_context?: string | null
   title_preview?: string | null
@@ -2632,8 +2633,10 @@ export interface PromptSubmitResult {
   survivor_user_row_ids?: (number | null)[] | null
   survivor_row_id_map?: Record<string, number | null> | null
   turn_isolation?: boolean | null
+  reason?: string | null
+  message?: string | null
 }
-export type PromptSubmitStatus = 'streaming' | 'queued' | 'steered' | 'redirected'
+export type PromptSubmitStatus = 'streaming' | 'queued' | 'steered' | 'redirected' | 'dropped'
 export interface ClipboardPasteParams {
   session_id: string
   profile?: string | null
@@ -3678,6 +3681,8 @@ export interface CommandDispatchResult {
   display?: string | null
   name?: string | null
   status?: string | null
+  queued?: boolean | null
+  moa_token?: string | null
 }
 /** ``apps/shared/src/slash.ts::parseCommandDispatch`` branches on this. */
 export type DispatchType = 'exec' | 'alias' | 'plugin' | 'send' | 'skill' | 'prefill'
@@ -3697,6 +3702,8 @@ export interface SlashExecResult {
   display?: string | null
   name?: string | null
   status?: string | null
+  queued?: boolean | null
+  moa_token?: string | null
 }
 export interface InsightsGetParams {
   days?: number | null
