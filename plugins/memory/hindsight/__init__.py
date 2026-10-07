@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
+from agent.memory_provider import MemoryProvider, PrefetchGeneration, RecallStatus, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_home
@@ -396,7 +396,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
-        self._prefetch_generation = 0
+        # Each queued request is its own generation; a discard obsoletes the worker in flight.
+        self._prefetch_generation = PrefetchGeneration(self._prefetch_lock)
         # Per-bank mission application (once per bank per process). The event is set when the
         # attempt finishes (success or failure); other callers for that bank wait for it.
         self._mission_banks: dict[str, threading.Event] = {}
@@ -1107,6 +1108,13 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
+    def _reset_prefetch_result(self) -> None:
+        self._prefetch_result, self._prefetch_count = "", 0
+
+    def discard_prefetch(self) -> None:
+        """Drop the buffered result; a worker still in flight belongs to a superseded generation."""
+        self._prefetch_generation.discard(self._reset_prefetch_result)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
         if self._recall_sync or self._recall_disabled():
@@ -1114,12 +1122,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Each queued request is its own generation: a worker that outlived prefetch()'s capped
         # join must not publish over a newer request's result, not only across session switches.
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            generation = self._prefetch_generation
-            # An older worker's result that landed after prefetch()'s capped join belongs to a
-            # superseded query; it must not be injected for this one.
-            self._prefetch_result, self._prefetch_count = "", 0
+        # An older worker's result that landed after prefetch()'s capped join belongs to a
+        # superseded query; it must not be injected for this one.
+        generation = self._prefetch_generation.begin(self._reset_prefetch_result)
 
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
@@ -1128,8 +1133,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
             text, count = self._do_recall(query)
             # Publish the current generation's result even when empty: an empty recall is an answer.
-            with self._prefetch_lock:
-                if generation == self._prefetch_generation:
+            with self._prefetch_generation.publishing(generation) as current:
+                if current:
                     self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
@@ -1137,8 +1142,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # -- retain ------------------------------------------------------------------
 
-    def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        user_content, assistant_content = filter_retain_messages(user_content, assistant_content)
+    def _build_turn_messages(self, user_content: str, assistant_content: str, *,
+                             display_kind: Optional[str] = None, platform: Optional[str] = None) -> List[Dict[str, str]]:
+        user_content, assistant_content = filter_retain_messages(
+            user_content, assistant_content, display_kind=display_kind, platform=platform)
         if not user_content and not assistant_content:
             return []
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
@@ -1254,7 +1261,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         return _job
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  display_kind: Optional[str] = None, platform: Optional[str] = None) -> None:
         """Enqueue a retain for the current turn (non-blocking; writer thread). Dropped
         once shutdown() fired so post-exit retains never reach aiohttp during teardown."""
         if self._cron_skipped:
@@ -1268,7 +1276,8 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        messages = self._build_turn_messages(user_content, assistant_content)
+        messages = self._build_turn_messages(user_content, assistant_content,
+                                             display_kind=display_kind, platform=platform)
         if not messages:
             logger.debug("sync_turn: skipped (no durable messages after retain filtering)")
             return
@@ -1414,9 +1423,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # 2. Drain the old session's in-flight prefetch and drop its result.
         self._join_prefetch(3.0)
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            self._prefetch_result, self._prefetch_count = "", 0
+        self.discard_prefetch()
 
         # 3. Rotate to the new session.
         # An explicit empty parent on a real switch clears the old lineage (an unrelated resumed

@@ -27,7 +27,8 @@ from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.chat_budget import (
-    KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget)
+    EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
+    reset_trigger)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -885,6 +886,8 @@ class TelegramAdapter(BasePlatformAdapter):
     # the final edit when raw text is unchanged.
     # Fixes #25710.
     REQUIRES_EDIT_FINALIZE: bool = True
+    # Progress bubbles edit no faster than the chat's interim-edit floor (10s, chat_budget.py).
+    PROGRESS_EDIT_INTERVAL: float = EDIT_FLOOR_SECS
     FALLBACK_ON_FINAL_EDIT_FLOOD: bool = True  # retrying a final edit burns the same flood budget
     RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK: bool = True  # a failed final edit may leave a partial preview
 
@@ -3674,6 +3677,24 @@ class TelegramAdapter(BasePlatformAdapter):
             self._fail_update_preparation()
             raise
         self._accept_update()
+
+    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        # Label this turn's Bot API calls for the daily call counter (chat_budget.py). Bound here,
+        # where every turn runs (including busy-session events drained later from another turn's
+        # task), so a queued goal/relay/process turn is never counted under its predecessor.
+        trigger_token = bind_trigger(event)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            reset_trigger(trigger_token)
+
+    def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
+        # The runner also drains a parked event in-band as the next turn of the SAME task; relabel
+        # the rest of that task so the follow-up's calls are counted under its own trigger.
+        event = super().get_pending_message(session_key)
+        if event is not None:
+            bind_trigger(event)
+        return event
 
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
@@ -6744,7 +6765,8 @@ class TelegramAdapter(BasePlatformAdapter):
             limiter = self.__dict__["_telegram_chat_rate_limiter"] = ChatBudgetRateLimiter(
                 self._chat_budget(),
                 penalty_remaining=self._send_flood_cooldown_remaining,
-                on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait))
+                on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait),
+                counter=call_counter(getattr(self, "_update_receipt_dir", None)))
         return limiter
 
     def _flood_inline_wait_cap(self, chat_id: Any) -> float:

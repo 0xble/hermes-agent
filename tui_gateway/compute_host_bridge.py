@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import threading
 
+from . import pending_moa
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -50,17 +51,24 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    user_turn: bool = False, display_metadata: dict | None = None) -> dict:
+    user_turn: bool = False, display_metadata: dict | None = None,
+    queue_token: str | None = None) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
+    pending_record = None
+    if queue_token:
+        record = pending_moa.get(session, queue_token)
+        pending_record = dict(record) if isinstance(record, dict) else None
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
         **({"display_kind": display_kind} if display_kind else {}), "history": history,
         **({"user_turn": True} if user_turn else {}),
         **({"display_metadata": display_metadata} if display_metadata else {}),
+        **({"queue_token": queue_token} if queue_token else {}),
+        **({"pending_moa_record": dict(pending_record)} if pending_record else {}),
         "history_version": history_version, "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
         "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
@@ -73,6 +81,7 @@ def _compute_host_turn_frame(
         # cleared only after a successful isolated turn (_on_compute_host_turn_done),
         # so the fail-open in-process path can still apply it if the host dispatch fails.
         "pending_model_switch": session.get("pending_model_switch"),
+        "pending_moa_missing": bool(queue_token and not pending_record),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
@@ -249,6 +258,9 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
         session.pop("_compute_host_open_request", None)
+        moa_token = session.pop("_compute_host_moa_token", None)
+    if moa_token:
+        pending_moa.mark_host_result(session, moa_token, success=frame.get("type") != "turn.error")
     # The isolated turn carried the queued model switch to the compute host, whose
     # turn thread applied it. Clear the server-side stash so it isn't re-forwarded
     # (kept on error so the fail-open in-process path can still apply it).
@@ -269,17 +281,30 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
 def _submit_prompt_to_compute_host(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    user_turn: bool = False, display_metadata: dict | None = None) -> dict:
+    user_turn: bool = False, display_metadata: dict | None = None,
+    queue_token: str | None = None) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
                                      queued_prompt_generation=queued_prompt_generation,
-                                     display_kind=display_kind, user_turn=user_turn, display_metadata=display_metadata)
+                                     display_kind=display_kind, user_turn=user_turn, display_metadata=display_metadata,
+                                     queue_token=queue_token)
+    if frame.get("pending_moa_missing"):
+        pending_moa.cancel(session, queue_token or "")
+        _emit("error", sid, {
+            "message": "Deferred MoA request was cancelled or is no longer available; prompt dropped."
+        })
+        return _ok(rid, {
+            "status": "dropped", "reason": "deferred_moa_unavailable",
+            "message": "Deferred MoA request was cancelled or is no longer available; prompt dropped.",
+        })
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
     with session["history_lock"]:
         session["_compute_host_turn_id"] = turn_id
         session.pop("_compute_host_activity_ns", None)
+        if queue_token:
+            session["_compute_host_moa_token"] = queue_token
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure via the callback before re-raising;
@@ -298,6 +323,7 @@ def _submit_prompt_to_compute_host(
             if session.get("_compute_host_turn_id") == turn_id:
                 session.pop("_compute_host_turn_id", None)
                 session.pop("_compute_host_activity_ns", None)
+                session.pop("_compute_host_moa_token", None)
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
