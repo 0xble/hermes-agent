@@ -2077,6 +2077,10 @@ class GatewayShutdownMixin:
 
     async def _stop_finalize_agents_and_adapters(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
+        scheduler = getattr(self, "_replay_scheduler", None)
+        if scheduler is not None:
+            with suppress(Exception):
+                await scheduler.close()
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()

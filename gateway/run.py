@@ -45,6 +45,7 @@ from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.deadline import detached_context
 from gateway.turn_executor import _UnboundedThreadExecutor
+from gateway.replay_scheduler import ReplayHandle, ReplayScheduler
 
 # Per-session AIAgent cache bounds (agents are heavy); see _enforce_agent_cache_cap/_session_housekeeping_watcher.
 _AGENT_CACHE_MAX_SIZE = 128
@@ -904,7 +905,8 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # task after a restart. 1h covers agent.gateway_timeout (30 min) + slack; cfg agent.gateway_auto_continue_freshness.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 
-# Boot auto-resume drain before the inbound gate opens. Override: agent.gateway_startup_restore_drain_timeout.
+# Bounded wait for boot/reconnect replay drains and boot-path sends before the inbound gate opens.
+# Override: agent.gateway_startup_restore_drain_timeout.
 _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT = 30.0
 
 # Bound on the boot warm-up BEFORE the gate opens (no skeleton system prompt on turn one); keeps a wedged init
@@ -950,9 +952,10 @@ def _auto_continue_freshness_window() -> float:
 
 
 def _startup_restore_drain_timeout_secs() -> float:
-    """Max seconds ``_finish_startup_restore`` holds the inbound gate for boot auto-resume; <=0 disables.
+    """Maximum seconds a startup or reconnect restore fence waits before releasing inbound traffic.
 
-    Duplicate-agent safety does NOT depend on it: ``_schedule_resume_pending_sessions`` claims SYNCHRONOUSLY.
+    A non-positive value keeps the fence unbounded. Resume-slot claims and scheduler admission remain
+    independent of this timeout, so releasing a fence cannot create a duplicate agent.
     """
     return _float_env("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
 
@@ -3556,10 +3559,53 @@ class GatewayRunner(
         self._init_runtime_settings()
         self._init_session_store()
         self._init_lifecycle_state()
+        self._init_replay_scheduler()
         self._init_runtime_caches()
         self._init_startup_checks()
         self._init_session_db()
         self._init_registries_and_clocks()
+
+    def _get_replay_scheduler(self) -> ReplayScheduler:
+        """Return the one gateway-wide replay admission scheduler.
+
+        Bare test runners are often built with ``object.__new__``; retain a lazy
+        fallback there while normal construction creates this before adapters start.
+        """
+        scheduler = self.__dict__.get("_replay_scheduler")
+        if scheduler is None:
+            scheduler = ReplayScheduler(getattr(self.config, "restart_replay_concurrency", 2))
+            self.__dict__["_replay_scheduler"] = scheduler
+        return scheduler
+
+    def _enqueue_replay(
+        self, *, priority: int, kind: str, session_key: Optional[str],
+        dispatch: Callable[[], Any], profile_home: Any = None, on_drop: Optional[Callable[[], Any]] = None,
+    ) -> ReplayHandle:
+        """Queue one replay with its owning profile captured at enqueue time."""
+        captured_home = profile_home
+        scheduler = self._get_replay_scheduler()
+
+        async def _scoped_dispatch() -> Any:
+            if captured_home is not None and getattr(self.config, "multiplex_profiles", False):
+                from gateway.run import _async_profile_runtime_scope
+                async with _async_profile_runtime_scope(captured_home):
+                    return await dispatch()
+            return await dispatch()
+
+        return scheduler.enqueue(
+            priority=priority,
+            kind=kind,
+            session_key=session_key,
+            profile_home=captured_home,
+            dispatch=_scoped_dispatch,
+            on_drop=on_drop,
+        )
+
+    def _init_replay_scheduler(self) -> None:
+        """Construct replay admission before any adapter can deliver an event."""
+        self._replay_scheduler = ReplayScheduler(
+            getattr(self.config, "restart_replay_concurrency", 2)
+        )
 
     def _init_runtime_settings(self) -> None:
         """Load ephemeral per-call config (prefill, reasoning, busy modes, timeouts, routing)."""
@@ -3660,10 +3706,12 @@ class GatewayRunner(
         # run_turn_runner._load_turn_history (#114266). Cleared on /new.
         self._transcript_lag_streaks: Dict[str, int] = {}
         # Startup restore gate: while restart-interrupted sessions auto-resume, real inbound messages
-        # queue instead of competing with the synthetic resume turns; drained after all resume tasks end.
+        # queue instead of competing with synthetic turns.  One claimed replay per session preserves
+        # ordering while the gateway-wide scheduler keeps unrelated sessions concurrent.
         self._startup_restore_in_progress = False
         self._startup_restore_queue: List[MessageEvent] = []
-        self._startup_restore_tasks: List[asyncio.Task] = []
+        self._startup_restore_keys: Dict[str, int] = {}
+        self._startup_restore_claimed_keys: set[str] = set()
         # Set by start_gateway() only for an explicit ``--replace`` launch; scoped to each adapter's
         # cold-start connect and removed before any reconnect can run.
         self._platform_lock_takeover_on_start = False

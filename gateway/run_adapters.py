@@ -857,7 +857,6 @@ class GatewayAdapterLifecycleMixin:
     async def _recover_spool_after_reconnect(self, platform, resume_scheduled=None) -> None:
         """Claim owed follow-ups before resume and drain them as separate turns."""
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
-        from gateway.run import _startup_restore_drain_timeout_secs
         if resume_scheduled is None:
             resume_scheduled = (getattr(self, "_reconnect_resume_events", None) or {}).get(platform)
         candidates = await self._resume_pending_candidates_async(record_boot=False)
@@ -873,8 +872,9 @@ class GatewayAdapterLifecycleMixin:
             logger.warning("Pending follow-up recovery after %s reconnect failed; spools retained", platform.value,
                            exc_info=True)
         for event in recovered_events:
-            self._queue_startup_restore_event(event)
-            keys.add(self._session_key_for_source(self._normalize_source_for_session_key(event.source)))
+            key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+            self._queue_startup_restore_event(event, session_key=key)
+            keys.add(key)
         try:
             # Recovery scans all served homes, but only the newly available platform resumes.
             self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
@@ -894,23 +894,38 @@ class GatewayAdapterLifecycleMixin:
             resume_scheduled.set()
         if not keys and not tasks:
             return
+        # Queue recovered follow-ups at synthetic priority. Admission is awaited so a
+        # confirmed gateway receipt can retire its spool, but the reconnect fence is
+        # bounded so a slow resume cannot block this session's control traffic forever.
+        drain_task = self._retain_background_task(asyncio.create_task(
+            self._drain_startup_restore_queue(keys, owned_keys=keys)
+        ))
+        wait_tasks = set(tasks)
+        wait_tasks.add(drain_task)
+        timed_out = False
         try:
-            if tasks:
-                await self._wait_bounded_or_release(
-                    set(tasks), _startup_restore_drain_timeout_secs(),
-                    "Reconnect restore released after %.0fs with %d resume turn(s) still running",
-                    "background reconnect auto-resume task failed", level=logging.DEBUG,
-                )
-            # Drain under our own gate even while boot restore is active. Boot skips
-            # keys held here, so skipping here too strands them after both gates open.
-            await self._drain_startup_restore_queue(keys, owned_keys=keys)
+            from gateway.run import _startup_restore_drain_timeout_secs
+            done = await self._wait_bounded_or_release(
+                wait_tasks,
+                _startup_restore_drain_timeout_secs(),
+                "Reconnect replay still running after %.0fs; releasing the session fence "
+                "so control traffic can be handled",
+                "reconnect replay failed after session fence release",
+                level=logging.DEBUG,
+            )
+            timed_out = bool(wait_tasks - done)
+            if not timed_out:
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
         finally:
-            # The timeout deliberately fails open after a bounded wait; unfinished resume turns
-            # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
             for key in keys:
                 counts[key] -= 1
                 if not counts[key]:
                     del counts[key]
+        # Events that arrived for an owned session while the replay was running
+        # become eligible exactly when the per-session fence is released.  If the
+        # bounded wait expired, admit them in the background rather than re-taking
+        # the fence while the old replay finishes.
+        await self._drain_startup_restore_queue(wait=not timed_out)
 
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
