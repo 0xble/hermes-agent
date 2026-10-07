@@ -5296,7 +5296,7 @@ def _cmd_run(args):
         return  # unreachable; execvp doesn't return
     # The direct/launchd ``gateway run`` path must refuse withdrawn handover leftovers too:
     # a live generation job beside this process would be a second poller on one bot token.
-    _refuse_forward_only_leftovers(fatal_on_inspection_error=False)
+    _refuse_forward_only_leftovers(retry_on_inspection_error=True)
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
     run_gateway(
@@ -5446,6 +5446,9 @@ def _cmd_install(args):
     if is_managed():
         managed_error("install gateway service")
         return
+    # Installing/bootstrapping the legacy service beside a live withdrawn generation job would
+    # start a second poller on the same bot token.
+    _refuse_forward_only_leftovers()
     if getattr(args, "if_missing", False) and _is_service_installed():
         print("✓ Gateway service already installed")
         return
@@ -5525,21 +5528,23 @@ def _print_unfolded_gateway_note(owner) -> None:
     print("  They were left running; fold them in with: hermes gateway migrate --multiplex")
 
 
-def _refuse_forward_only_leftovers(*, fatal_on_inspection_error: bool = True) -> None:
+def _refuse_forward_only_leftovers(*, retry_on_inspection_error: bool = False) -> None:
     """Block legacy gateway lifecycle actions until withdrawn handover state is inspected.
 
-    The supervised ``gateway run`` path passes ``fatal_on_inspection_error=False``: exit 78 parks a
-    launchd job (SuccessfulExit=false), so a transient launchctl failure must not leave the gateway
-    down. Leftovers that are actually found stay fatal on every path.
+    Every path fails closed. The supervised ``gateway run`` path passes
+    ``retry_on_inspection_error=True``: when launchd's inventory cannot be read it exits 75, which
+    launchd relaunches after ThrottleInterval, instead of 78, which parks the job
+    (SuccessfulExit=false) and would leave the gateway down over a transient launchctl failure.
+    Leftovers that are actually found exit 78 on every path.
     """
+    from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
     from hermes_cli.forward_only_guard import LeftoverInspectionError, refuse_if_forward_only_leftovers
     try:
         refuse_if_forward_only_leftovers(get_hermes_home())
     except LeftoverInspectionError as exc:
-        if fatal_on_inspection_error:
-            print_error(str(exc))
-            raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE) from exc
-        logging.getLogger(__name__).warning("Withdrawn-handover leftover check skipped: %s", exc)
+        print_error(str(exc))
+        code = GATEWAY_SERVICE_RESTART_EXIT_CODE if retry_on_inspection_error else GATEWAY_FATAL_CONFIG_EXIT_CODE
+        raise SystemExit(code) from exc
     except RuntimeError as exc:
         print_error(str(exc))
         raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE) from exc

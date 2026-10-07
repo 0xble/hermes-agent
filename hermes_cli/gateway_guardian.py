@@ -205,6 +205,17 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
+def _refuse_leftovers_before_launch(home: Path) -> None:
+    """Never (re)bootstrap the legacy gateway beside withdrawn handover state.
+
+    A live generation job plus a bootstrapped legacy job would be two pollers on one bot token.
+    Raises RuntimeError (leftovers found or launchd uninspectable); run_once records it as an alert.
+    Checked only right before a launch so inspection-only outcomes never shell out.
+    """
+    from hermes_cli.forward_only_guard import refuse_if_forward_only_leftovers
+    refuse_if_forward_only_leftovers(home)
+
+
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
          deadline: float | None = None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
@@ -252,6 +263,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         if _repair_count(home) >= MAX_REPAIRS:
             receipt(home, "rollback", "capped", candidate=str(current))
             return "capped"
+        _refuse_leftovers_before_launch(home)
         receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
         ok = rollback_switch(home, plist, label, old, domain=domain)
         receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
@@ -261,6 +273,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     if _repair_count(home) >= MAX_REPAIRS:
         receipt(home, "bootstrap", "capped", label=label)
         return "capped"
+    _refuse_leftovers_before_launch(home)
     receipt(home, "bootstrap", "attempt", label=label)
     subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True,
                    timeout=_bounded_timeout(10, deadline))

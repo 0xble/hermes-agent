@@ -96,13 +96,36 @@ def test_withdrawal_guard_blocks_start_restart_and_activation(tmp_path, monkeypa
         raise guard.LeftoverInspectionError("could not inspect loaded launchd jobs: timeout")
 
     monkeypatch.setattr(guard, "refuse_if_forward_only_leftovers", unreadable)
-    gateway._cmd_run(run_args)
-    assert ran == [True]
-    with pytest.raises(SystemExit):
-        gateway._cmd_start(args)  # explicit operator verbs stay fail-closed
+    with pytest.raises(SystemExit) as relaunch:
+        gateway._cmd_run(run_args)
+    assert relaunch.value.code == 75  # launchd relaunches 75; 78 would park the job
+    assert ran == []
+    with pytest.raises(SystemExit) as parked:
+        gateway._cmd_start(args)
+    assert parked.value.code == 78
     monkeypatch.setattr(guard, "refuse_if_forward_only_leftovers", refuse)
+
+    monkeypatch.setattr(gateway, "is_managed", lambda: False)
+    with pytest.raises(SystemExit):
+        gateway._cmd_install(SimpleNamespace(if_missing=False, system=False, force=True))
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
     monkeypatch.setattr(update_cmd, "_immutable_release_enabled", lambda paths: True)
     monkeypatch.setattr(update_cmd, "refuse_if_forward_only_leftovers", refuse)
     assert update_cmd._activate_immutable_release() is False
+
+
+def test_guardian_refuses_to_bootstrap_beside_withdrawn_leftovers(tmp_path, monkeypatch):
+    from hermes_cli import gateway_guardian
+
+    launched = []
+
+    def refuse(_home):
+        raise RuntimeError("withdrawn handover state remains")
+
+    monkeypatch.setattr(guard, "refuse_if_forward_only_leftovers", refuse)
+    monkeypatch.setattr(gateway_guardian.subprocess, "run",
+                        lambda argv, **k: launched.append(argv))
+    with pytest.raises(RuntimeError):
+        gateway_guardian._refuse_leftovers_before_launch(tmp_path)
+    assert launched == []

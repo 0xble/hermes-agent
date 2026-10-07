@@ -133,6 +133,20 @@ def test_stop_intent_short_circuits_malformed_config(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("macos")
+def test_unloaded_service_is_not_bootstrapped_beside_withdrawn_leftovers(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    calls = fake_launchctl(monkeypatch, label)
+    import hermes_cli.forward_only_guard as forward_guard
+
+    def refuse(_home):
+        raise RuntimeError("withdrawn handover state remains")
+
+    monkeypatch.setattr(forward_guard, "refuse_if_forward_only_leftovers", refuse)
+    assert guardian.run_once(home, plist, label, grace=0.000001) == "alert"
+    assert not any(row[1] == "bootstrap" for row in calls)
+
+
+@pytest.mark.platforms("macos")
 def test_loaded_service_does_not_bootstrap(tmp_path, monkeypatch):
     home, plist, label, a, b = layout(tmp_path)
     calls = fake_launchctl(monkeypatch, label, loaded=True)
