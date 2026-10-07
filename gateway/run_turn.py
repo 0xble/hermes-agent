@@ -1941,6 +1941,10 @@ class GatewayTurnMixin:
         raw_response = response if raw_response is None else raw_response
         # LOOP_COMPLETE is a control marker for /loop detection, not assistant content. Keep the
         # raw response available to post-turn hooks and strip only at this final display boundary.
+        # The non-streamed return value is the stripped display text, so the hooks read the raw
+        # copy stashed here instead (see _final_text_for_post_turn_hooks).
+        with suppress(Exception):
+            event._raw_final_response = str(raw_response or "")
         from gateway.response_filters import strip_trailing_loop_complete_marker
         response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
