@@ -956,6 +956,9 @@ class GatewayShutdownMixin:
             note_claims = getattr(self, "_s2_note_claimed_keys", None)
             if note_claims is None:
                 note_claims = self._s2_note_claimed_keys = {}
+            note_failed = getattr(self, "_s2_note_failed_keys", None)
+            if note_failed is None:
+                note_failed = self._s2_note_failed_keys = set()
             entry_snapshot = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
             claim_token = (
                 getattr(entry_snapshot, "resume_marker_token", None),
@@ -977,9 +980,11 @@ class GatewayShutdownMixin:
                 # A visible or in-flight note for this marker is terminal. Never delete or
                 # replace it, including during startup recovery.
                 if note and note[3]:
+                    getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
                     return 0
                 target = await self._shutdown_notification_target(session_key)
                 if target is None:
+                    note_failed.add(session_key)
                     return 0
                 source, platform_str, chat_id, thread_id, profile = target
                 platform = Platform(platform_str)
@@ -987,6 +992,7 @@ class GatewayShutdownMixin:
                 if adapter is None:
                     adapter = self._authorization_adapter(platform, profile)
                 if adapter is None:
+                    note_failed.add(session_key)
                     return 0
                 if not await self.async_session_store.claim_restart_note(
                     session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
@@ -1000,19 +1006,29 @@ class GatewayShutdownMixin:
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,
                 )
-                from gateway.run import resolve_restart_resume_policy
-                policy = resolve_restart_resume_policy(self.config, adapter)
-                text = t(
-                    "gateway.shutdown.interrupted_turn" if policy == "continue"
-                    else ("gateway.shutdown.notice_restart" if (reclaim_pending
-                          or getattr(self, "_restart_requested", False))
-                          else "gateway.shutdown.notice_shutdown")
-                )
-                result = await adapter.send(
-                    chat_id, text,
-                    metadata={**(metadata or {}), "_interim_send": True},
-                )
+                from gateway.run import _async_profile_runtime_scope, resolve_restart_resume_policy
+                profile_home = None
+                if source is not None:
+                    resolve_home = getattr(self, "_resolve_profile_home_for_source", None)
+                    if callable(resolve_home):
+                        with suppress(Exception):
+                            profile_home = resolve_home(source)
+                scope = (_async_profile_runtime_scope(profile_home) if profile_home else nullcontext())
+                async with scope:
+                    policy = resolve_restart_resume_policy(self.config, adapter)
+                    text = t(
+                        "gateway.shutdown.interrupted_turn" if policy == "continue"
+                        else ("gateway.shutdown.notice_restart" if (reclaim_pending
+                              or getattr(self, "_restart_requested", False))
+                              else "gateway.shutdown.notice_shutdown")
+                    )
+                    result = await adapter.send(
+                        chat_id, text,
+                        metadata={**(metadata or {}), "_interim_send": True},
+                    )
+
                 if not result or not getattr(result, "success", False):
+                    note_failed.add(session_key)
                     await release_claim()
                     return 0
                 send_succeeded = True
@@ -1030,6 +1046,7 @@ class GatewayShutdownMixin:
                 return 0
             except Exception:
                 if not send_succeeded:
+                    note_failed.add(session_key)
                     try:
                         await self.async_session_store.release_restart_note_claim(
                             session_key, expected_marker=marker,
@@ -2197,11 +2214,21 @@ class GatewayShutdownMixin:
         # the timeout phase; do not resurrect the pre-drain candidate as a fallback notice.
         _s2_candidates = set(getattr(self, "_s2_note_session_keys", set())) & set(_marked_keys)
         self._s2_note_delivered_keys = set()
+        self._s2_note_failed_keys = set()
         self._s2_note_claimed_keys = {}
         await self._send_interrupted_turn_notes(_marked_keys)
-        # S2 note misses stay fenced. An ordinary shutdown notice here could race a detached
-        # transport completion and produce two notes for the same interruption marker.
+        # S2 note misses need the ordinary shutdown notice, but only after the note sender has
+        # returned: delivered lanes remain fenced so no session can receive both messages.
         self._s2_note_session_keys = set(self._s2_note_delivered_keys)
+        _s2_note_misses = _s2_candidates & set(getattr(self, "_s2_note_failed_keys", set()))
+        if _s2_note_misses:
+            fallback_task = asyncio.create_task(self._notify_active_sessions_of_shutdown(
+                _s2_note_misses, include_home_channels=False,
+            ))
+            if not await GatewayRunner._wait_or_detach(fallback_task, 3.0):
+                logger.warning("Fallback shutdown notices for missed interrupted-turn notes exceeded 3s")
+            else:
+                await fallback_task
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)

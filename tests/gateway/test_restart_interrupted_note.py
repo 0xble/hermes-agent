@@ -1,6 +1,8 @@
 """S2 regressions: one durable visible note per restart-cut human turn."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -184,6 +186,155 @@ async def test_shutdown_broadcast_skips_only_lanes_that_received_s2_note(tmp_pat
     )
 
     assert [item[0] for item in adapter.sent] == [missed_source.chat_id]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_posts_missing_s2_note_before_resume(tmp_path, monkeypatch):
+    """A platform offline during boot gets its durable note before reconnect resume."""
+    from gateway import run_pending_recovery
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    runner, adapter = make_restart_runner()
+    store = _store(tmp_path)
+    source = _source("reconnect-note")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-reconnect", human=True)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._resume_pending_candidates = lambda platform=None, record_boot=False: [entry]
+    runner._auto_resume_ready = lambda _entry: (adapter, source)
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+    runner._startup_restore_queue = []
+    order = []
+    original_send = adapter.send
+
+    async def send_note(*args, **kwargs):
+        order.append("note")
+        return await original_send(*args, **kwargs)
+
+    adapter.send = send_note
+
+    def schedule_resume(**kwargs):
+        order.append("resume")
+        kwargs["restore_keys"].add(entry.session_key)
+        return 1
+
+    runner._schedule_resume_pending_sessions = schedule_resume
+    monkeypatch.setattr(run_pending_recovery, "recover_pending_shutdown_flush", lambda *a, **k: None)
+
+    await runner._recover_spool_after_reconnect(Platform.TELEGRAM)
+
+    assert order == ["note", "resume"]
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "1"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_notes_render_in_each_owning_profile_scope(tmp_path, monkeypatch):
+    """Multiplexed profiles use their own locale/runtime while rendering S2 notes."""
+    store = _store(tmp_path)
+    source_en = _source("profile-en")
+    source_en.chat_id = "chat-en"
+    source_en.profile = "english"
+    source_fr = _source("profile-fr")
+    source_fr.chat_id = "chat-fr"
+    source_fr.profile = "french"
+    entry_en = store.get_or_create_session(source_en)
+    entry_fr = store.get_or_create_session(source_fr)
+    store.mark_resume_pending(entry_en.session_key, turn_id="turn-en", human=True)
+    store.mark_resume_pending(entry_fr.session_key, turn_id="turn-fr", human=True)
+    adapter = NoteAdapter()
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    targets = {
+        entry_en.session_key: (source_en, "telegram", source_en.chat_id, source_en.thread_id, "english"),
+        entry_fr.session_key: (source_fr, "telegram", source_fr.chat_id, source_fr.thread_id, "french"),
+    }
+    runner._shutdown_notification_target = AsyncMock(side_effect=targets.get)
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+    runner._resolve_profile_home_for_source = lambda source: tmp_path / source.profile
+    current_locale = ContextVar("test_locale", default="launch")
+
+    @asynccontextmanager
+    async def profile_scope(home):
+        token = current_locale.set(home.name)
+        try:
+            yield
+        finally:
+            current_locale.reset(token)
+
+    monkeypatch.setattr("gateway.run._async_profile_runtime_scope", profile_scope)
+    monkeypatch.setattr("gateway.run_shutdown.t", lambda key: f"{current_locale.get()}:{key}")
+
+    assert await runner._send_interrupted_turn_notes(
+        [entry_en.session_key, entry_fr.session_key],
+    ) == 2
+    rendered = {chat_id: text for chat_id, text, _metadata in adapter.sent}
+    assert rendered[source_en.chat_id] == "english:gateway.shutdown.interrupted_turn"
+    assert rendered[source_fr.chat_id] == "french:gateway.shutdown.interrupted_turn"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("note_succeeds", [False, True])
+async def test_missed_s2_note_gets_one_shutdown_fallback_only_on_send_failure(
+    tmp_path, monkeypatch, note_succeeds,
+):
+    from gateway.run import GatewayRunner
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    runner, adapter = make_restart_runner()
+    store = _store(tmp_path)
+    source = _source("fallback-note")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-fallback", human=True)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._s2_note_session_keys = {entry.session_key}
+    runner._running_agents = {}
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+    if not note_succeeds:
+        async def failed_send(*_args, **_kwargs):
+            raise RuntimeError("transport down")
+        adapter.send = failed_send
+    fallback_calls = []
+
+    async def fallback_notice(keys, *, include_home_channels=True):
+        fallback_calls.append((set(keys), include_home_channels))
+
+    runner._notify_active_sessions_of_shutdown = fallback_notice
+    monkeypatch.setattr(GatewayRunner, "_mark_running_sessions_resume_pending", staticmethod(
+        lambda _self, _prefix: asyncio.sleep(0, result=[entry.session_key]),
+    ))
+    monkeypatch.setattr(GatewayRunner, "_shutdown_interrupt_reason", staticmethod(lambda _self: "test"))
+    monkeypatch.setattr(GatewayRunner, "_post_interrupt_grace_timeout", staticmethod(lambda _self: 0.0))
+    monkeypatch.setattr(GatewayRunner, "_stop_kill_tool_subprocesses_off_loop", staticmethod(
+        lambda _phase: asyncio.sleep(0, result=[]),
+    ))
+    runner._notify_interrupted_cron_jobs = AsyncMock()
+
+    ctx = GatewayShutdownMixin._StopContext(lambda: 0, started_at=0.0)
+    await runner._stop_interrupt_remaining_work(ctx)
+
+    if note_succeeds:
+        assert fallback_calls == []
+        assert len(adapter.sent) == 1
+    else:
+        assert fallback_calls == [({entry.session_key}, False)]
+        assert adapter.sent == []
 
 
 @pytest.mark.asyncio
@@ -921,7 +1072,7 @@ async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_succes
     event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
     event._gateway_active_turn_token = "turn-own"
 
-    async def remark_during_drain(*_args):
+    async def remark_during_drain(*_args, **_kwargs):
         assert store.mark_resume_pending(entry.session_key, turn_id="turn-own", human=True)
         return "done"
 

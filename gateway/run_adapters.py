@@ -868,6 +868,19 @@ class GatewayAdapterLifecycleMixin:
             logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
                            exc_info=True)
         try:
+            # A platform that was offline at boot could not receive its S2 note. Before reconnect
+            # resumes any durable interruption marker, claim and send that marker's note through the
+            # append-only sender; it is a no-op when restart_notes already has a visible/in-flight note.
+            reconnect_note_keys = []
+            for entry in candidates or ():
+                if (platform is not None and getattr(entry.origin, "platform", None) != platform):
+                    continue
+                if not getattr(entry, "resume_turn_id", None):
+                    continue
+                if self._auto_resume_ready(entry) is not None:
+                    reconnect_note_keys.append(entry.session_key)
+            if reconnect_note_keys:
+                await self._send_interrupted_turn_notes(reconnect_note_keys)
             # Recovery scans all served homes, but only the newly available platform resumes.
             self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
                                                    restore_tasks=tasks, restore_keys=keys)
