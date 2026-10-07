@@ -1924,6 +1924,11 @@ class GatewayTurnMixin:
         if diagnostic_wake_muted(event):
             return None
         raw_response = response if raw_response is None else raw_response
+        # LOOP_COMPLETE is a /loop control marker, not assistant content. The non-streamed
+        # return value is the stripped display text, so stash the raw reply for the
+        # post-turn hooks (see _final_text_for_post_turn_hooks).
+        with suppress(Exception):
+            event._raw_final_response = str(raw_response or "")
         from gateway.response_filters import strip_trailing_loop_complete_marker
         response = strip_trailing_loop_complete_marker(response)
         if _intentional_silence:
