@@ -474,10 +474,8 @@ class GatewayNotificationsMixin:
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
-        if session_key and hasattr(adapter, "_reconcile_restart_note"):
-            await adapter._reconcile_restart_note(
-                MessageEvent(text="", source=source, message_id=event_message_id), session_key,
-            )
+        note_event = MessageEvent(text="", source=source, message_id=event_message_id)
+        delivered_confirmed = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -496,6 +494,7 @@ class GatewayNotificationsMixin:
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            delivered_confirmed = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -524,7 +523,12 @@ class GatewayNotificationsMixin:
                         # the caller's normal completion send replays the whole response (text and
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
-        # Failed turns deliver their (normalized failure) text but must not upload attachments as if
+                    delivered_confirmed = True
+        if (delivered_confirmed and session_key
+                and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
+            if not hasattr(note_event, "_restart_note_marker_api_available"):
+                await adapter._capture_restart_note_marker(note_event, session_key)
+            await adapter._reconcile_restart_note_after_delivery(note_event, session_key)
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
             return True

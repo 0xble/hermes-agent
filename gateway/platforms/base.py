@@ -4651,8 +4651,8 @@ class BasePlatformAdapter(ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
-        if not is_ephemeral_response and not event.is_command():
-            await self._reconcile_restart_note(event, session_key)
+        if not hasattr(event, "_restart_note_marker_api_available"):
+            await self._capture_restart_note_marker(event, session_key)
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
@@ -4672,6 +4672,9 @@ class BasePlatformAdapter(ABC):
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+        if (result.success and not is_ephemeral_response and not event.is_command()
+                and hasattr(delivery_adapter, "_reconcile_restart_note_after_delivery")):
+            await delivery_adapter._reconcile_restart_note_after_delivery(event, session_key)
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
@@ -4681,13 +4684,37 @@ class BasePlatformAdapter(ABC):
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
 
+    async def _capture_restart_note_marker(self, event: MessageEvent, session_key: str) -> None:
+        """Capture the resume marker for lanes that synthesize their delivery event.
+
+        Older lightweight runners may not expose the marker API; those lanes retain their historical
+        fail-open reconciliation behavior.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        reader = getattr(store, "get_resume_pending_marker", None)
+        if not callable(reader):
+            event._restart_note_marker_api_available = False
+            return
+        try:
+            marker = reader(session_key)
+            event._restart_note_expected_marker = (
+                await marker if inspect.isawaitable(marker) else marker
+            )
+            event._restart_note_marker_api_available = True
+        except Exception:
+            event._restart_note_marker_api_available = False
+
     async def _reconcile_restart_note(self, event: MessageEvent, session_key: str) -> None:
-        """Delete the durable restart note before final delivery.
+        """Compatibility entry point for callers that already confirmed delivery."""
+        await self._reconcile_restart_note_after_delivery(event, session_key)
+
+    async def _reconcile_restart_note_after_delivery(self, event: MessageEvent, session_key: str) -> None:
+        """Delete and clear the durable restart note after a confirmed answer delivery.
 
         A resumed answer is always sent as a fresh message. Editing a note far up a thread does not
-        notify the user or move the answer to the bottom, so delete the note first and let the normal
-        final-delivery path send the answer. The reconciliation latch makes all delivery lanes safe to
-        call through the turn's single finalization path.
+        notify the user or move the answer to the bottom, so reconciliation happens only after the
+        answer is confirmed delivered. The resume marker is a CAS fence against a successor turn.
         """
         if getattr(event, "_restart_note_reconciled", False):
             return
@@ -4725,6 +4752,8 @@ class BasePlatformAdapter(ABC):
             if not isinstance(note, (tuple, list)) or len(note) < 4:
                 return
             expected_note = getattr(event, "_restart_note_expected", None)
+            marker_api_available = bool(getattr(event, "_restart_note_marker_api_available", False))
+            expected_marker = getattr(event, "_restart_note_expected_marker", None)
             if expected_note is not None and tuple(note[:4]) != tuple(expected_note[:4]):
                 return
             note_id = note[3] if note else None
@@ -4735,17 +4764,22 @@ class BasePlatformAdapter(ABC):
         if not note_id or str(note_id).startswith("pending:"):
             return
         if str(note_id).startswith("sent:"):
-            # Signal-like transports have no platform handle. The sentinel is reconciled by
-            # clearing the durable record, then the answer is sent normally.
+            # Signal-like transports have no platform handle. The sentinel is reconciled only after
+            # the resumed answer has already been confirmed by the caller.
+            clear_kwargs = {}
+            if marker_api_available and expected_marker is not None:
+                clear_kwargs["expected_marker"] = expected_marker
+            if expected_note is not None:
+                clear_kwargs["expected_note"] = expected_note
             try:
-                clear_result = store.clear_restart_note(session_key)
-                await clear_result if inspect.isawaitable(clear_result) else clear_result
+                clear_result = store.clear_restart_note(session_key, **clear_kwargs)
+                cleared = await clear_result if inspect.isawaitable(clear_result) else clear_result
+                if cleared is not None:
+                    event._restart_note_reconciled = True
             except Exception:
                 logger.warning("[%s] Failed to clear no-id restart note for %s", self.name, session_key,
                                exc_info=True)
-            event._restart_note_reconciled = True
             return
-        event._restart_note_reconciled = True
 
         async def _record_failed_reconciliation() -> None:
             record_failure = getattr(store, "record_restart_note_reconcile_failure", None)
@@ -4763,20 +4797,22 @@ class BasePlatformAdapter(ABC):
                 logger.warning("[%s] Failed to record restart-note reconciliation failure for %s",
                                self.name, session_key, exc_info=True)
 
-        async def _clear_reconciled_note() -> None:
+        async def _clear_reconciled_note() -> Optional[bool]:
             try:
-                clear_kwargs = ({"expected_note": expected_note} if expected_note is not None else {})
+                clear_kwargs = {}
+                if marker_api_available and expected_marker is not None:
+                    clear_kwargs["expected_marker"] = expected_marker
+                if expected_note is not None:
+                    clear_kwargs["expected_note"] = expected_note
                 clear_result = store.clear_restart_note(session_key, **clear_kwargs)
-                await clear_result if inspect.isawaitable(clear_result) else clear_result
+                return await clear_result if inspect.isawaitable(clear_result) else clear_result
             except Exception:
                 # Do not block the user's answer on a bookkeeping write. The durable note is
                 # intentionally retained so a later final delivery can retry reconciliation.
                 logger.warning("[%s] Failed to clear reconciled restart note for %s",
                                self.name, session_key, exc_info=True)
-
-        # A resumed answer is always sent as a fresh message. Editing a note far up a thread
-        # does not notify the user or move the answer to the bottom, so delete the note first
-        # and let the normal final-delivery path send the answer.
+                return None
+        # The answer has already been confirmed by the caller, so delete the old visible note now.
         delete = getattr(self, "delete_message", None)
         deleted = False
         if callable(delete):
@@ -4785,10 +4821,14 @@ class BasePlatformAdapter(ABC):
                 delete_result = await delete_result if inspect.isawaitable(delete_result) else delete_result
                 deleted = bool(delete_result)
             except Exception:
-                logger.warning("[%s] Failed to delete restart note for %s; continuing normal delivery",
+                logger.warning("[%s] Failed to delete restart note for %s; retaining durable pointer",
                                self.name, session_key, exc_info=True)
         if deleted:
-            await _clear_reconciled_note()
+            # A false CAS result is intentional when a successor owns the marker: never retry the
+            # old turn against that successor's note. Exceptions remain retryable.
+            clear_status = await _clear_reconciled_note()
+            if clear_status is not None:
+                event._restart_note_reconciled = True
         else:
             await _record_failed_reconciliation()
 
@@ -4823,9 +4863,10 @@ class BasePlatformAdapter(ABC):
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
             if content is None:
                 return _thread_metadata
-            if session_key and not event.is_command():
-                await self._reconcile_restart_note(event, session_key)
-            await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+            send_result = await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+            if (getattr(send_result, "success", False) and session_key and not event.is_command()
+                    and hasattr(self, "_reconcile_restart_note_after_delivery")):
+                await self._reconcile_restart_note_after_delivery(event, session_key)
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
@@ -4838,17 +4879,24 @@ class BasePlatformAdapter(ABC):
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them."""
-        if session_key and not is_ephemeral_response and not event.is_command():
-            await self._reconcile_restart_note(event, session_key)
         human_delay = self._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
+        attachment_delivered = False
+
+        def _record_attachment(result):
+            nonlocal attachment_delivered
+            record_delivery(result)
+            attachment_delivered = attachment_delivered or bool(getattr(result, "success", False))
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-            await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
+            await self._send_image_batch(event, images, metadata, human_delay, _record_attachment)
         await self._deliver_media_attachments(
             event, media_files, local_files,
             force_document_attachments=extracted.force_document_attachments,
-            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery)
+            human_delay=human_delay, metadata=metadata, record_delivery=_record_attachment)
+        if (attachment_delivered and session_key and not is_ephemeral_response and not event.is_command()
+                and hasattr(self, "_reconcile_restart_note_after_delivery")):
+            await self._reconcile_restart_note_after_delivery(event, session_key)
         if not (anything_sent or images or local_files or media_files) and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
                          "(%d chars) produced no delivered message or attachment "
@@ -5025,12 +5073,6 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
-            if response and not is_ephemeral_response and not event.is_command() \
-                    and hasattr(self, "_reconcile_restart_note"):
-                # This is the common final-delivery entry for agent text, TTS captions, and attachments;
-                # specialized streamed/queued/error lanes reconcile before their own sends. Gateway
-                # command replies and ephemeral control replies are not answers to interrupted work.
-                await self._reconcile_restart_note(event, session_key)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:

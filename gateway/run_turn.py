@@ -1944,10 +1944,6 @@ class GatewayTurnMixin:
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
-            # The final body has already reached the chat, so reconcile the note before the
-            # caller clears resume_pending. The adapter latch makes this idempotent with other lanes.
-            if adapter:
-                await adapter._reconcile_restart_note(event, session_key)
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             if response and adapter and not agent_result.get("media_already_delivered"):
@@ -1958,6 +1954,8 @@ class GatewayTurnMixin:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
+            if adapter and hasattr(adapter, "_reconcile_restart_note_after_delivery"):
+                await adapter._reconcile_restart_note_after_delivery(event, session_key)
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
@@ -2197,6 +2195,8 @@ class GatewayTurnMixin:
                 # their historical unconditional clear rather than making marker lookup required.
                 _resume_marker_reader_available = False
                 logger.debug("resume marker snapshot unavailable for %s: %s", session_key, _e)
+        event._restart_note_marker_api_available = _resume_marker_reader_available
+        event._restart_note_expected_marker = _resume_pending_marker if _resume_marker_reader_available else None
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )

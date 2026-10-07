@@ -193,7 +193,7 @@ async def test_user_message_after_note_keeps_new_turn_resumable(tmp_path):
     store.set_restart_note_message_id(entry.session_key, "note-user")
     event = MessageEvent(text="continue this", message_type=MessageType.TEXT, source=_source(), internal=False)
 
-    await adapter._reconcile_restart_note(event, entry.session_key)
+    await adapter._reconcile_restart_note_after_delivery(event, entry.session_key)
     assert adapter.deleted == [("chat", "note-user")]
     assert store._entries[entry.session_key].resume_turn_id == "turn-2"
 
@@ -299,6 +299,55 @@ async def test_real_delivery_keeps_failed_note_and_retries_on_next_final(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_final_send_failure_keeps_restart_note_and_pointer(tmp_path):
+    adapter = NoteAdapter()
+    store, entry, event = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-send-failed")
+    _configure_real_final_delivery(adapter, store)
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(success=False, error="transport down"))
+
+    await adapter._send_final_text(event, entry.session_key, "failed answer", {}, False, 0, lambda _r: None)
+
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-send-failed"
+
+
+@pytest.mark.asyncio
+async def test_successful_final_reconciles_note_once(tmp_path):
+    adapter = NoteAdapter()
+    store, entry, event = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-once")
+    _configure_real_final_delivery(adapter, store)
+
+    await adapter._send_final_text(event, entry.session_key, "answer", {}, False, 0, lambda _r: None)
+    await adapter._send_final_text(event, entry.session_key, "answer again", {}, False, 0, lambda _r: None)
+
+    assert adapter.deleted == [("chat", "note-once")]
+    assert store.get_restart_note(entry.session_key)[3] is None
+
+
+@pytest.mark.asyncio
+async def test_successor_marker_keeps_restart_note_pointer(tmp_path):
+    adapter = NoteAdapter()
+    store, entry, event = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-successor")
+    marker = store.get_resume_pending_marker(entry.session_key)
+    event._restart_note_marker_api_available = True
+    event._restart_note_expected_marker = marker
+    _configure_real_final_delivery(adapter, store)
+
+    async def _send_and_successor(*args, **kwargs):
+        store.mark_resume_pending(entry.session_key, turn_id="successor", human=True)
+        return SendResult(success=True, message_id="answer-1")
+
+    adapter._send_with_retry = _send_and_successor
+    await adapter._send_final_text(event, entry.session_key, "answer", {}, False, 0, lambda _r: None)
+
+    assert adapter.deleted == [("chat", "note-successor")]
+    assert store.get_restart_note(entry.session_key)[3] == "note-successor"
+
+
+@pytest.mark.asyncio
 async def test_new_interruption_replaces_stale_note_before_posting_one(tmp_path):
     adapter = NoteAdapter()
     store = _store(tmp_path)
@@ -379,7 +428,9 @@ async def test_attachment_only_final_reconciles_restart_note(tmp_path):
     adapter = NoteAdapter()
     store, entry, event = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-attachment")
-    adapter._deliver_media_attachments = AsyncMock()
+    async def _deliver_media(*args, **kwargs):
+        kwargs["record_delivery"](SendResult(success=True, message_id="media-1"))
+    adapter._deliver_media_attachments = _deliver_media
     extracted = _ExtractedResponse(
         text_content="", images=[], media_files=[("answer.txt", False)], local_files=[],
         force_document_attachments=False, pre_extract="MEDIA: answer.txt",
@@ -400,7 +451,7 @@ async def test_resumed_answer_deletes_note_and_sends_fresh_message(tmp_path):
     store, entry, event = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-7")
 
-    await adapter._reconcile_restart_note(event, entry.session_key)
+    await adapter._reconcile_restart_note_after_delivery(event, entry.session_key)
 
     assert adapter.edited == []
     assert adapter.deleted == [("chat", "note-7")]
@@ -428,7 +479,7 @@ async def test_user_message_recovery_turn_reconciles_note(tmp_path):
     store.set_restart_note_message_id(entry.session_key, "note-user")
     event = MessageEvent(text="continue this", message_type=MessageType.TEXT, source=_source(), internal=False)
 
-    await adapter._reconcile_restart_note(event, entry.session_key)
+    await adapter._reconcile_restart_note_after_delivery(event, entry.session_key)
 
     assert adapter.edited == []
     assert adapter.deleted == [("chat", "note-user")]

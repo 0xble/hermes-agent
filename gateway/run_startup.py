@@ -479,8 +479,15 @@ class GatewayStartupMixin:
             note = await self.async_session_store.get_restart_note(session_key)
             if not note or not note[3] or note[0] != entry.session_id:
                 return None
+            marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+            marker_available = callable(marker_reader)
+            marker = await marker_reader(session_key) if marker_available else None
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
             event._restart_note_expected = note
+            event._restart_note_marker_api_available = marker_available
+            # A recovered turn normally cleared resume_pending before its ledger row was written;
+            # retain the note's owner marker for the cleared-state CAS fallback.
+            event._restart_note_expected_marker = marker or tuple(note[:3])
             return event
         except Exception:
             logger.debug("Restart-note snapshot failed for recovered %s", session_key, exc_info=True)
@@ -520,7 +527,7 @@ class GatewayStartupMixin:
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
                     if note_event is not None:
-                        reconcile = getattr(adapter, "_reconcile_restart_note", None)
+                        reconcile = getattr(adapter, "_reconcile_restart_note_after_delivery", None)
                         if callable(reconcile):
                             try:
                                 await reconcile(note_event, row["session_key"])

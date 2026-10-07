@@ -343,8 +343,18 @@ class SessionLifecycleMixin:
             if not entry.restart_note_message_id:
                 return False
             current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
-            if expected_marker is not None and expected_marker != current:
-                return False
+            if expected_marker is not None:
+                if entry.resume_pending:
+                    if expected_marker != current:
+                        return False
+                elif expected_marker != (
+                    entry.session_id,
+                    entry.restart_note_marker_token or entry.resume_marker_token,
+                    entry.restart_note_marked_at or entry.last_resume_marked_at,
+                ):
+                    # The owning turn may have cleared resume_pending before final delivery. In that
+                    # case the note's captured marker is the only remaining ownership evidence.
+                    return False
             if expected_note is not None and expected_note != (
                 entry.session_id,
                 entry.restart_note_marker_token or entry.resume_marker_token,
