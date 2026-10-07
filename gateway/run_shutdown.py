@@ -28,10 +28,30 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
+from agent.async_utils import consume_detached_task_result
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+async def _cancel_task_with_grace(task: "asyncio.Future", grace: float = 0.5) -> bool:
+    """Cancel ``task`` and wait only a short grace before detaching it.
+
+    Some transports swallow ``CancelledError`` while stuck in I/O. Waiting for such a task
+    without a bound wedges restart recovery forever; a task that misses the grace is detached
+    and its result is consumed when it eventually finishes.
+    """
+    task.cancel()
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=grace)
+    except asyncio.CancelledError:
+        task.add_done_callback(consume_detached_task_result)
+        raise
+    if task not in done:
+        task.add_done_callback(consume_detached_task_result)
+        return False
+    return True
 
 
 def _exit_with_failure_verdict(runner) -> bool:
@@ -1109,23 +1129,30 @@ class GatewayShutdownMixin:
 
         batch_task = asyncio.create_task(_send_batch())
         if cancel_on_timeout:
-            # Startup/reconnect resume is ordered after this call. A detached note task could post
-            # after the resumed answer, so cancel it and await its termination before returning.
+            # Startup/reconnect resume is ordered after this call whenever the transport honours
+            # cancellation within the short grace. A transport that ignores cancellation is detached
+            # so recovery never hangs; its note may then arrive after the resumed answer.
             try:
                 wait_timeout = None if timeout <= 0 else timeout
                 done, _pending = await asyncio.wait({batch_task}, timeout=wait_timeout)
                 completed = batch_task in done
                 if not completed:
-                    batch_task.cancel()
-                    await asyncio.gather(batch_task, return_exceptions=True)
-                    logger.warning(
-                        "Interrupted-turn notes exceeded %.1fs; cancelled and awaited before resume",
-                        timeout,
-                    )
+                    cancelled_in_grace = await _cancel_task_with_grace(batch_task)
+                    if cancelled_in_grace:
+                        logger.warning(
+                            "Interrupted-turn notes exceeded %.1fs; cancelled and awaited before resume",
+                            timeout,
+                        )
+                    else:
+                        logger.warning(
+                            "Interrupted-turn note task detached for sessions %s after %.1fs timeout; "
+                            "note may arrive after the resumed answer",
+                            unique_keys,
+                            timeout,
+                        )
                     return 0
             except asyncio.CancelledError:
-                batch_task.cancel()
-                await asyncio.gather(batch_task, return_exceptions=True)
+                await _cancel_task_with_grace(batch_task)
                 raise
         else:
             # A transport may accept a send just before the local 2s deadline while the durable claim

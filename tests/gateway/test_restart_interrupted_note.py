@@ -62,6 +62,26 @@ class NoteAdapter(BasePlatformAdapter):
         return self.delete_result
 
 
+class SwallowCancelNoteAdapter(NoteAdapter):
+    """A transport that keeps running after cancellation until the test releases it."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.send_calls = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.send_calls += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            await self.release.wait()
+            raise RuntimeError("cancel ignored by transport")
+        raise RuntimeError("test transport held open")
+
+
 def _source(thread_id="224426"):
     return SessionSource(
         platform=Platform.TELEGRAM, chat_id="chat", chat_type="group", user_id="u",
@@ -1091,6 +1111,145 @@ async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path
     assert "Hermes is restarting" in adapter.sent[0][1]
     assert store.get_restart_note(entry.session_key)[3] == "m1"
     assert store._entries[entry.session_key].resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_note_task_detaches_after_grace_and_keeps_sending_claim(tmp_path):
+    store = _store(tmp_path)
+    source = _source("detach-shutdown")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-detach", human=True)
+    adapter = SwallowCancelNoteAdapter()
+    runner = _note_runner(store, source, adapter)
+
+    returned = asyncio.Event()
+
+    async def send_notes():
+        try:
+            return await runner._send_interrupted_turn_notes(
+                [entry.session_key], cancel_on_timeout=True, timeout=0.5,
+            )
+        finally:
+            returned.set()
+
+    note_task = asyncio.create_task(send_notes())
+    await asyncio.wait_for(adapter.started.wait(), timeout=1.0)
+    timed_out = False
+    try:
+        await asyncio.wait_for(asyncio.shield(returned.wait()), timeout=0.9)
+    except asyncio.TimeoutError:
+        timed_out = True
+    assert not timed_out
+    adapter.release.set()
+    await note_task
+    await asyncio.sleep(0)
+
+    assert not timed_out
+    assert adapter.send_calls == 1
+    assert store.get_restart_note(entry.session_key)[3].startswith("sending:")
+
+
+@pytest.mark.asyncio
+async def test_reconnect_detaches_cancel_ignoring_note_before_resume(tmp_path, monkeypatch):
+    from gateway import run_pending_recovery
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    runner, _ = make_restart_runner()
+    store = _store(tmp_path)
+    source = _source("detach-reconnect")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-reconnect-detach", human=True)
+    adapter = SwallowCancelNoteAdapter()
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._resume_pending_candidates = lambda platform=None, record_boot=False: [entry]
+    runner._auto_resume_ready = lambda _entry: (adapter, source)
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+    runner._startup_restore_queue = []
+    scheduled = []
+    runner._schedule_resume_pending_sessions = lambda **kwargs: scheduled.append(kwargs["restore_keys"].add(entry.session_key))
+    monkeypatch.setattr(run_pending_recovery, "recover_pending_shutdown_flush", lambda *a, **k: None)
+    monkeypatch.setattr("gateway.run._startup_restore_drain_timeout_secs", lambda: 0.5)
+
+    returned = asyncio.Event()
+
+    async def recover():
+        try:
+            await runner._recover_spool_after_reconnect(Platform.TELEGRAM)
+        finally:
+            returned.set()
+
+    recovery_task = asyncio.create_task(recover())
+    await asyncio.wait_for(adapter.started.wait(), timeout=1.0)
+    timed_out = False
+    try:
+        await asyncio.wait_for(asyncio.shield(returned.wait()), timeout=0.9)
+    except asyncio.TimeoutError:
+        timed_out = True
+    assert not timed_out
+    adapter.release.set()
+    await recovery_task
+    await asyncio.sleep(0)
+
+    assert not timed_out
+    assert scheduled == [None]
+    assert adapter.send_calls == 1
+    assert store.get_restart_note(entry.session_key)[3].startswith("sending:")
+
+
+@pytest.mark.asyncio
+async def test_startup_detaches_cancel_ignoring_note_before_resume(monkeypatch):
+    import gateway.run as run_module
+
+    runner = object.__new__(GatewayStartupMixin)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    scheduled = []
+
+    async def hanging_note(*_args, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise RuntimeError("cancel ignored by transport")
+
+    runner._claim_pending_obligations = AsyncMock(return_value=[])
+    runner._send_interrupted_turn_notes = hanging_note
+    runner._send_restart_notification = AsyncMock()
+    runner._redeliver_claimed_obligations = AsyncMock()
+    monkeypatch.setattr(run_module, "_startup_restore_drain_timeout_secs", lambda: 0.1)
+
+    returned = asyncio.Event()
+
+    async def await_boot():
+        try:
+            await runner._await_startup_boot_sends(
+                planned_restart_notification_pending=False,
+                interrupted_note_keys=["startup-detach"],
+            )
+        finally:
+            returned.set()
+
+    boot_task = asyncio.create_task(await_boot())
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    timed_out = False
+    try:
+        await asyncio.wait_for(asyncio.shield(returned.wait()), timeout=0.9)
+    except asyncio.TimeoutError:
+        timed_out = True
+    assert not timed_out
+    release.set()
+    await boot_task
+    scheduled.append("resume")
+
+    assert not timed_out
+    assert scheduled == ["resume"]
 
 
 @pytest.mark.asyncio

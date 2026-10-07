@@ -31,7 +31,7 @@ from gateway.restart import (
 #: gives up and parks with the fatal-config code instead. Bounds the one regression the
 #: restartable exit introduces: a permanently dead backend looping forever unnoticed.
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
-from gateway.run_shutdown import _log_suppressed, _send_error
+from gateway.run_shutdown import _cancel_task_with_grace, _log_suppressed, _send_error
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
@@ -325,15 +325,22 @@ class GatewayStartupMixin:
             return
         done, _pending = await asyncio.wait({boot_task}, timeout=timeout)
         if boot_task not in done:
-            # Resume turns follow this method. Do not detach the boot task: its note sender may still
-            # be in transport I/O, and a late note would arrive after the resumed answer. The global
-            # bound is intentional; cancellation is awaited before the caller schedules any resume.
-            boot_task.cancel()
-            await asyncio.gather(boot_task, return_exceptions=True)
-            logger.warning(
-                "Boot-path sends exceeded %.1fs; cancelled and awaited before resume",
-                timeout,
-            )
+            # Resume turns follow this method. Ordering is guaranteed when the transport honours
+            # cancellation within the short grace; a transport that ignores cancellation is detached
+            # so recovery never hangs, and its note may arrive after the resumed answer.
+            detached = not await _cancel_task_with_grace(boot_task)
+            if detached:
+                logger.warning(
+                    "Boot-path interrupted-turn note task detached for sessions %s after %.1fs timeout; "
+                    "note may arrive after the resumed answer",
+                    list(interrupted_note_keys),
+                    timeout,
+                )
+            else:
+                logger.warning(
+                    "Boot-path sends exceeded %.1fs; cancelled and awaited before resume",
+                    timeout,
+                )
             return
         await boot_task
 
