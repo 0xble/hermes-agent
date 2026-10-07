@@ -54,8 +54,8 @@ _SHELL_HOOK_BACKOFF_MAX_SECONDS = 15 * 60.0
 _SHELL_HOOK_BACKOFF_MAX_EXPONENT = 10
 # Tests replace this indirection with a deterministic clock without changing subprocess timing.
 _monotonic = time.monotonic
-# (event, command) -> (consecutive failures, suppressed-until monotonic timestamp).
-_shell_hook_backoff: Dict[Tuple[str, str], Tuple[int, float]] = {}
+# (home, event, matcher, command) -> (consecutive failures, suppressed-until monotonic timestamp).
+_shell_hook_backoff: Dict[Tuple[str, str, Optional[str], str], Tuple[int, float]] = {}
 _shell_hook_backoff_lock = threading.Lock()
 # kwargs promoted to top-level payload keys; everything else lands under ``extra``.
 _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
@@ -146,6 +146,8 @@ class ShellHookSpec(_ToolMatcherMixin):
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
     requires_env: Tuple[str, ...] = ()
+    # Hermes home this spec was registered under; scopes fail-open backoff per profile.
+    home: str = ""
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     def missing_required_env(self) -> Tuple[str, ...]:
@@ -155,9 +157,10 @@ class ShellHookSpec(_ToolMatcherMixin):
 # --- Applicability and fail-open backoff ---------------------------------
 
 
-def _shell_hook_key(spec: ShellHookSpec) -> Tuple[str, str]:
-    """Backoff identity deliberately excludes matcher: the configured hook is one spec."""
-    return spec.event, spec.command
+def _shell_hook_key(spec: ShellHookSpec) -> Tuple[str, str, Optional[str], str]:
+    """Backoff identity matches registration identity, so one failing hook never silences a
+    sibling with the same command under another matcher or profile."""
+    return spec.home, spec.event, spec.matcher, spec.command
 
 
 def shell_hook_should_skip(spec: ShellHookSpec) -> bool:
@@ -229,6 +232,7 @@ def register_from_config(cfg: Optional[Dict[str, Any]], *, accept_hooks: bool = 
     manager, home_key, registered = get_plugin_manager(), _home_key(), []
     # Idempotence + allowlist read under the lock; TTY prompt outside it; mutation re-takes the lock and re-checks.
     for spec in specs:
+        spec.home = home_key
         key = (home_key, spec.event, spec.matcher, spec.command)
         with _registered_lock:
             if key in _registered:

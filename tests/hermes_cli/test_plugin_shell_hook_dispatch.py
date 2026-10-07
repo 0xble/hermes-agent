@@ -154,6 +154,22 @@ class TestShellHookBackoff:
         assert windows[:5] == [60.0, 120.0, 240.0, 480.0, 900.0]
         assert set(windows[4:]) == {shell_hooks._SHELL_HOOK_BACKOFF_MAX_SECONDS}
 
+    def test_backoff_is_scoped_to_matcher_and_home(self, monkeypatch):
+        """One failing hook must not silence a sibling with the same command (#353 review)."""
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+
+        def spec(matcher, home):
+            return shell_hooks.ShellHookSpec(
+                event="pre_tool_call", command="python hook.py", matcher=matcher, home=home,
+            )
+
+        failing = spec("terminal", "/profiles/a")
+        shell_hooks._record_shell_hook_failure(failing, "timed out")
+        assert shell_hooks.shell_hook_should_skip(spec("terminal", "/profiles/a"))
+        assert not shell_hooks.shell_hook_should_skip(spec("web_search", "/profiles/a"))
+        assert not shell_hooks.shell_hook_should_skip(spec("terminal", "/profiles/b"))
+
     def test_spawn_error_backs_off_like_a_timeout(self, monkeypatch):
         import hermes_cli.plugins as plugins_mod
 
