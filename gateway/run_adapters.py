@@ -854,50 +854,41 @@ class GatewayAdapterLifecycleMixin:
             ))
             task.add_done_callback(self._late_failure_callback("planned-restart notification replay failed"))
 
-    async def _recover_spool_after_reconnect(self, platform, resume_scheduled=None) -> None:
+    async def _recover_spool_after_reconnect(self, platform) -> None:
         """Claim owed follow-ups before resume and drain them as separate turns."""
+        completion = getattr(self, "_pending_recovery_complete", None)
+        if completion is not None and not completion.is_set():
+            # Boot recovery publishes claimed events on the loop after its worker scan. Wait at the
+            # asyncio level rather than taking a thread lock here, which would deadlock that publish.
+            await completion.wait()
+        from gateway.run_pending_recovery import recover_pending_shutdown_flush
         from gateway.run import _startup_restore_drain_timeout_secs
-        if resume_scheduled is None:
-            resume_scheduled = (getattr(self, "_reconnect_resume_events", None) or {}).get(platform)
+        candidates = self._resume_pending_candidates(record_boot=False)
+        queued_before = len(getattr(self, "_startup_restore_queue", []))
         tasks = []
         keys = set()
+        try:
+            recover_pending_shutdown_flush(self, candidates=candidates, platform=platform)
+        except Exception:
+            logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
+                           exc_info=True)
+        try:
+            # Recovery scans all served homes, but only the newly available platform resumes.
+            self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
+                                                   restore_tasks=tasks, restore_keys=keys)
+        except Exception:
+            logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                           exc_info=True)
+        keys.update(self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+                    for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
+        if not keys and not tasks:
+            return
         counts = getattr(self, "_reconnect_restore_keys", None)
         if counts is None:
             counts = self._reconnect_restore_keys = {}
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1
         try:
-            candidates = await self._resume_pending_candidates_async(record_boot=False)
-            try:
-                recovered_events = await self._recover_pending_shutdown_flush_off_loop(
-                    candidates=candidates,
-                    platform=platform,
-                    failure_message=(
-                        f"Pending follow-up recovery after {platform.value} reconnect failed; spools retained"
-                    ),
-                )
-            except Exception:
-                # The helper logs and retains spools on worker failure; this guard preserves the reconnect
-                # path's fail-open scheduling if a lightweight test runner overrides the helper itself.
-                logger.warning("Pending follow-up recovery after %s reconnect failed; spools retained", platform.value,
-                               exc_info=True)
-                recovered_events = []
-            for event in recovered_events:
-                keys.add(self._session_key_for_source(self._normalize_source_for_session_key(event.source)))
-            try:
-                # Recovery scans all served homes, but only the newly available platform resumes.
-                self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
-                                                       restore_tasks=tasks, restore_keys=keys)
-            except Exception:
-                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
-                               exc_info=True)
-            for key in keys:
-                counts[key] = counts.get(key, 0) + 1
-            # The reconnect watcher must not release the adapter until the per-session gate is
-            # installed. Otherwise fresh inbound can overtake a claimed pre-restart follow-up
-            # during the small window between scheduling and publishing _reconnect_restore_keys.
-            if resume_scheduled is not None:
-                resume_scheduled.set()
-            if not keys and not tasks:
-                return
             if tasks:
                 await self._wait_bounded_or_release(
                     set(tasks), _startup_restore_drain_timeout_secs(),
@@ -908,21 +899,12 @@ class GatewayAdapterLifecycleMixin:
             # keys held here, so skipping here too strands them after both gates open.
             await self._drain_startup_restore_queue(keys, owned_keys=keys)
         finally:
-            # Releasing this fence is paired with a platform-scoped drain so messages for sessions that
-            # recovery did not claim cannot remain stranded when the worker has no keys, raises, or is
-            # cancelled. Claimed keys stay fenced until their replay/resume path above has drained.
-            self._release_reconnect_platform_fence(platform)
-            if resume_scheduled is not None:
-                resume_scheduled.set()
-            try:
-                await self._drain_startup_restore_queue(platform=platform, exclude_keys=keys)
-            finally:
-                # The timeout deliberately fails open after a bounded wait; unfinished resume turns
-                # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
-                for key in keys:
-                    counts[key] -= 1
-                    if not counts[key]:
-                        del counts[key]
+            # The timeout deliberately fails open after a bounded wait; unfinished resume turns
+            # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
+            for key in keys:
+                counts[key] -= 1
+                if not counts[key]:
+                    del counts[key]
 
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:
@@ -956,74 +938,23 @@ class GatewayAdapterLifecycleMixin:
             await build_channel_directory(self.adapters)
         # A spool held while this adapter was offline must be reclaimed before its
         # interrupted session resumes, then replayed after the resumed answer.
-        resume_scheduled = self._start_reconnect_spool_recovery(platform)
-        # The built-in recovery hook signals once resume scheduling is complete. Subclasses and lightweight
-        # test runners may override it with an intentionally independent worker; preserve that non-blocking
-        # contract rather than waiting on an override that can represent the full drain lifetime.
-        recovery_hook = self._recover_spool_after_reconnect
-        if (
-            resume_scheduled is not None
-            and getattr(recovery_hook, "__func__", None)
-            is GatewayAdapterLifecycleMixin._recover_spool_after_reconnect
-        ):
-            from gateway.run import _startup_restore_drain_timeout_secs
-            timeout = _startup_restore_drain_timeout_secs()
-            if timeout <= 0:
-                await resume_scheduled.wait()
-            else:
-                try:
-                    await asyncio.wait_for(resume_scheduled.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Reconnect %s recovery scheduling exceeded %.0fs; continuing while recovery runs "
-                        "in the background",
-                        platform.value, timeout,
-                    )
+        self._start_reconnect_spool_recovery(platform)
 
-    def _release_reconnect_platform_fence(self, platform) -> None:
-        fences = getattr(self, "_reconnect_restore_platforms", None)
-        if fences is not None:
-            fences.discard(platform)
-
-    def _start_reconnect_spool_recovery(self, platform):
+    def _start_reconnect_spool_recovery(self, platform) -> None:
         """One retained recovery worker per platform, independent of the reconnect watcher."""
         pending = getattr(self, "_reconnect_spool_tasks", None)
         if pending is None:
             pending = self._reconnect_spool_tasks = {}
         if platform in pending and not pending[platform].done():
-            return None
-        fences = getattr(self, "_reconnect_restore_platforms", None)
-        if fences is None:
-            fences = self._reconnect_restore_platforms = set()
-        fences.add(platform)
-        resume_scheduled = asyncio.Event()
-        resume_events = getattr(self, "_reconnect_resume_events", None)
-        if resume_events is None:
-            resume_events = self._reconnect_resume_events = {}
-        resume_events[platform] = resume_scheduled
-        task_ref = None
-        def cleanup():
-            if resume_events.get(platform) is resume_scheduled:
-                resume_events.pop(platform, None)
-            if pending.get(platform) is task_ref:
-                pending.pop(platform, None)
+            return
         async def recover():
             try:
-                # Keep this call single-argument compatible with lightweight test runners and
-                # subclasses overriding the recovery hook; the per-platform event is looked up by the
-                # production implementation and completed by this wrapper on every exit.
                 await self._recover_spool_after_reconnect(platform)
             except Exception:
                 logger.warning("Pending recovery after %s reconnect failed", platform.value, exc_info=True)
             finally:
-                # Fail-open for the watcher if candidate snapshotting itself failed before the scheduling
-                # phase; the retained worker has already logged the failure and will not lose the spool.
-                self._release_reconnect_platform_fence(platform)
-                resume_scheduled.set()
-                asyncio.get_running_loop().call_soon(cleanup)
-        task_ref = self._retain_background_task(asyncio.create_task(recover()))
-        pending[platform] = task_ref
-        return resume_scheduled
+                pending.pop(platform, None)
+        pending[platform] = self._retain_background_task(asyncio.create_task(recover()))
 
     async def _cancel_secondary_profile_reconnect_tasks(self) -> None:
         """Cancel profile-scoped reconnects before tearing down their registry, so a reconnect

@@ -93,27 +93,6 @@ async def _async_return_one_pair(*args, **kwargs):
 
 
 @pytest.mark.asyncio
-async def test_reconnect_watcher_waits_until_resume_scheduling_signal(monkeypatch):
-    runner = object.__new__(GatewayRunner)
-    runner._reconnect_spool_tasks = {}
-    runner._reconnect_resume_events = {}
-    calls = []
-
-    async def recover(platform):
-        calls.append(platform)
-
-    runner._recover_spool_after_reconnect = recover
-    runner._retain_background_task = lambda task: task
-
-    resume_scheduled = runner._start_reconnect_spool_recovery(Platform.TELEGRAM)
-    assert not resume_scheduled.is_set()
-    await asyncio.sleep(0)
-    assert calls == [Platform.TELEGRAM]
-    await resume_scheduled.wait()
-    assert resume_scheduled.is_set()
-
-
-@pytest.mark.asyncio
 async def test_finish_wiring_waits_for_mcp_before_boot_resume(monkeypatch):
     import gateway.run as gateway_run
 
@@ -223,13 +202,12 @@ async def test_startup_recovery_snapshot_does_not_block_gateway_loop():
 
 
 @pytest.mark.asyncio
-async def test_clean_marker_failure_keeps_connected_startup_degraded(monkeypatch, tmp_path, caplog):
-    """A late clean-marker failure must not strand connected adapters by aborting startup."""
+async def test_clean_marker_failure_fails_closed(monkeypatch, tmp_path, caplog):
+    """A clean-marker cleanup failure must abort so a stale receipt cannot mask a later crash."""
     marker = tmp_path / ".clean_shutdown"
     marker.write_text("clean", encoding="utf-8")
     monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
     runner = object.__new__(GatewayRunner)
-    runner._startup_recovery_degraded = False
     runner._consume_clean_shutdown_marker = _raise_marker_cleanup
     runner._suspend_stuck_loop_sessions = lambda: 0
 
@@ -238,22 +216,11 @@ async def test_clean_marker_failure_keeps_connected_startup_degraded(monkeypatch
     monkeypatch.setattr(runner, "_recover_secondary_process_checkpoints", lambda registry: 0)
 
     with caplog.at_level(logging.ERROR):
-        await runner._start_recover_previous_run()
+        with pytest.raises(RuntimeError, match="clean-start recovery cleanup failed"):
+            await runner._start_recover_previous_run()
 
-    assert runner._startup_recovery_degraded is True
-    assert runner._serving_state() == "degraded"
-    assert not marker.exists()
-    assert "continuing in degraded mode" in caplog.text
-
-    recovered = []
-
-    async def recover_unclean():
-        recovered.append(True)
-        return 1, 0
-
-    runner._recover_unclean_sessions = recover_unclean
-    await runner._start_recover_previous_run()
-    assert recovered == [True]
+    assert marker.exists()
+    assert "refusing startup" in caplog.text
 
 
 async def _raise_marker_cleanup(marker_path):

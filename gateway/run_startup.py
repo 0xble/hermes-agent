@@ -60,13 +60,9 @@ class GatewayStartupMixin:
     # A configured platform failed non-retryably this boot and is parked: every "we are serving"
     # status stamp (startup, drain release, scale-to-zero wake) must say ``degraded``, not ``running``.
     _startup_parked_platforms: bool = False
-    _startup_recovery_degraded: bool = False
 
     def _serving_state(self) -> str:
-        return "degraded" if (
-            getattr(self, "_startup_parked_platforms", False)
-            or getattr(self, "_startup_recovery_degraded", False)
-        ) else "running"
+        return "degraded" if self._startup_parked_platforms else "running"
 
     async def _run_startup_resume_event(
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
@@ -102,20 +98,13 @@ class GatewayStartupMixin:
                 source.chat_id if source else "unknown",
             )
 
-    async def _drain_startup_restore_queue(
-        self, keys=None, *, owned_keys=None, platform=None, exclude_keys=None,
-    ) -> int:
+    async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
         """Replay ready inbound, leaving sessions owned by another restore in order."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
         def ready(event):
-            source = getattr(event, "source", None)
-            if platform is not None and getattr(source, "platform", None) != platform:
-                return False
-            key = self._session_key_for_source(self._normalize_source_for_session_key(source))
+            key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
             if keys is not None and key not in keys:
-                return False
-            if exclude_keys and key in exclude_keys:
                 return False
             # Our own gate permits one claimant; every other owner's gate must be fully open.
             limit = 1 if owned_keys and key in owned_keys else 0
@@ -280,26 +269,31 @@ class GatewayStartupMixin:
         """
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
 
+        completion = getattr(self, "_pending_recovery_complete", None)
+        if completion is None or completion.is_set():
+            completion = self._pending_recovery_complete = asyncio.Event()
         lock = getattr(self, "_pending_recovery_lock", None)
         if lock is None:
             # Bare test runners do not execute GatewayRunner.__init__; creation is synchronous before
             # the first await, so two callers on this loop cannot create separate locks.
             lock = self._pending_recovery_lock = asyncio.Lock()
-        async with lock:
-            recovered_events: list[MessageEvent] = []
-            try:
-                await asyncio.to_thread(
-                    recover_pending_shutdown_flush,
-                    self, candidates=candidates, platform=platform,
-                    recovered_events=recovered_events,
-                )
-            except Exception:
-                logger.warning(failure_message, exc_info=True)
-            # A reconnect fence queues fresh inbound while the worker scans. Put the older recovered
-            # follow-ups ahead of that queue so replay cannot be overtaken after the fence publishes.
-            for event in reversed(recovered_events):
-                self._queue_startup_restore_event(event, front=True)
-            return recovered_events
+        try:
+            async with lock:
+                recovered_events: list[MessageEvent] = []
+                try:
+                    await asyncio.to_thread(
+                        recover_pending_shutdown_flush,
+                        self, candidates=candidates, platform=platform,
+                        recovered_events=recovered_events,
+                    )
+                except Exception:
+                    logger.warning(failure_message, exc_info=True)
+                # Recovered follow-ups precede inbound messages queued during startup restore.
+                for event in reversed(recovered_events):
+                    self._queue_startup_restore_event(event, front=True)
+                return recovered_events
+        finally:
+            completion.set()
 
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED by ``_startup_restore_drain_timeout_secs``) for startup auto-resume, then
@@ -876,25 +870,6 @@ class GatewayStartupMixin:
         marker_path.unlink()
         return discarded
 
-    @staticmethod
-    def _retire_failed_clean_shutdown_marker(marker_path) -> bool:
-        """Ensure a receipt whose cleanup failed cannot be honored on a later boot."""
-        try:
-            marker_path.unlink()
-            return True
-        except OSError as unlink_error:
-            try:
-                stale = marker_path.with_name(f"{marker_path.name}.stale-{time.time_ns()}")
-                marker_path.rename(stale)
-                logger.warning("Renamed stale clean-shutdown marker to %s after unlink failed", stale)
-                return True
-            except OSError:
-                logger.error(
-                    "Could not retire stale clean-shutdown marker %s (unlink failed: %s)",
-                    marker_path, unlink_error, exc_info=True,
-                )
-                return False
-
     async def _recover_unclean_sessions(self) -> tuple[int, int]:
         """Recover only the turns the dead process left marked: one whose reply is already in the
         transcript is owed delivery, not a new answer; any other resumes once. An unmarked session
@@ -1355,16 +1330,11 @@ class GatewayStartupMixin:
             try:
                 discarded = await self._consume_clean_shutdown_marker(_clean_marker)
             except Exception as exc:
-                # Adapters are already connected, so fail open into a serving-but-degraded gateway
-                # rather than leaving live transports and queued inbound work without teardown. Retire
-                # the receipt before continuing: it must never survive to misclassify a later crash.
-                self._startup_recovery_degraded = True
-                if not self._retire_failed_clean_shutdown_marker(_clean_marker):
-                    self._suppress_clean_shutdown_receipt = True
                 logger.error(
-                    "Clean-start marker cleanup failed after adapters became ready; continuing in "
-                    "degraded mode with session recovery skipped: %s", exc,
+                    "Clean-start marker cleanup failed; refusing startup so the "
+                    "clean-exit receipt cannot mask a later unclean exit: %s", exc,
                 )
+                raise RuntimeError("clean-start recovery cleanup failed") from exc
             if discarded:
                 logger.info("Discarded %d orphan active-turn marker(s) after clean shutdown", discarded)
         else:
@@ -1992,7 +1962,6 @@ class GatewayStartupMixin:
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         self._startup_parked_platforms = False  # fresh boot: no platform has failed yet
-        self._startup_recovery_degraded = False
         (
             _aborted, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
         ) = await self._start_prefilter_platforms()

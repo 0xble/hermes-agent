@@ -271,7 +271,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
     if own_db and session_resolver is not None:
         needs_ambient_db = any(
             payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON
-            or bool((payload.get("data") or {}).get("session_id"))
+            or bool((payload.get("data") if isinstance(payload.get("data"), dict) else {}).get("session_id"))
             for _order, _path, payload in flush_files
         )
         if not needs_ambient_db:
