@@ -894,19 +894,38 @@ class GatewayAdapterLifecycleMixin:
             resume_scheduled.set()
         if not keys and not tasks:
             return
-        # Queue recovered follow-ups at priority 1. Admission is awaited so a
-        # confirmed gateway receipt can retire its spool, but auto-resume turns
-        # remain detached and are never used as a reconnect throttle.
-        await self._drain_startup_restore_queue(keys, owned_keys=keys)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for key in keys:
-            counts[key] -= 1
-            if not counts[key]:
-                del counts[key]
+        # Queue recovered follow-ups at synthetic priority. Admission is awaited so a
+        # confirmed gateway receipt can retire its spool, but the reconnect fence is
+        # bounded so a slow resume cannot block this session's control traffic forever.
+        drain_task = self._retain_background_task(asyncio.create_task(
+            self._drain_startup_restore_queue(keys, owned_keys=keys)
+        ))
+        wait_tasks = set(tasks)
+        wait_tasks.add(drain_task)
+        timed_out = False
+        try:
+            from gateway.run import _startup_restore_drain_timeout_secs
+            done = await self._wait_bounded_or_release(
+                wait_tasks,
+                _startup_restore_drain_timeout_secs(),
+                "Reconnect replay still running after %.0fs; releasing the session fence "
+                "so control traffic can be handled",
+                "reconnect replay failed after session fence release",
+                level=logging.DEBUG,
+            )
+            timed_out = bool(wait_tasks - done)
+            if not timed_out:
+                await asyncio.gather(*wait_tasks, return_exceptions=True)
+        finally:
+            for key in keys:
+                counts[key] -= 1
+                if not counts[key]:
+                    del counts[key]
         # Events that arrived for an owned session while the replay was running
-        # become eligible exactly when the per-session fence is released.
-        await self._drain_startup_restore_queue()
+        # become eligible exactly when the per-session fence is released.  If the
+        # bounded wait expired, admit them in the background rather than re-taking
+        # the fence while the old replay finishes.
+        await self._drain_startup_restore_queue(wait=not timed_out)
 
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:

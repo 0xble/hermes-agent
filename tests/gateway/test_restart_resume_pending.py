@@ -764,7 +764,6 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
 
     source = make_restart_source(chat_id="restore-chat")
     pending_entry = SessionEntry(
@@ -826,7 +825,6 @@ async def test_one_raising_replay_neither_wedges_gate_nor_eats_queue(monkeypatch
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
     monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
     runner._start_startup_warmup()
 
@@ -860,7 +858,6 @@ async def test_post_drain_inbound_processes_instead_of_queueing(monkeypatch):
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
     monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
     runner._start_startup_warmup()
 
@@ -883,9 +880,41 @@ async def test_post_drain_inbound_processes_instead_of_queueing(monkeypatch):
     assert runner._startup_restore_queue == []
 
 
-# ---------------------------------------------------------------------------
-# Fresh-boot turn-machinery warm-up gate (#99373)
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_startup_restore_opens_gate_while_replay_turn_is_queued():
+    """Startup gate release admits queued replay work without waiting for its turn."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._background_tasks = set()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(event: MessageEvent) -> None:
+        started.set()
+        await release.wait()
+        event._gateway_accepted = True
+
+    adapter.handle_message = handle
+    queued = MessageEvent(
+        text="human first", message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="queued-chat"),
+    )
+    runner._queue_startup_restore_event(queued)
+
+    finish = asyncio.create_task(runner._finish_startup_restore())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    await asyncio.wait_for(finish, timeout=5)
+
+    assert runner._startup_restore_in_progress is False
+    assert finish.done()
+    assert runner._startup_restore_queue == []
+    assert not release.is_set()
+
+    release.set()
+    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
+
+
 
 
 @pytest.mark.asyncio
@@ -896,8 +925,7 @@ async def test_fresh_boot_gate_stays_closed_until_warmup_completes(monkeypatch):
     system prompt (no context tier, no tool schemas)."""
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
-    runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []  # fresh boot: nothing to resume
+    runner._startup_restore_queue = []  # fresh boot: nothing to resume
 
     monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "5")
 
@@ -944,7 +972,6 @@ async def test_wedged_warmup_cannot_hold_gate_shut_past_timeout(monkeypatch):
     runner, _adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
 
     monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0.1")
 
@@ -965,7 +992,6 @@ async def test_warmup_disabled_by_nonpositive_timeout(monkeypatch):
     runner, _adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
 
     monkeypatch.setenv("HERMES_STARTUP_WARMUP_TIMEOUT", "0")
     runner._start_startup_warmup()
@@ -1341,7 +1367,6 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
     adapter.handle_message = fake_handle_message
 
     slow_task = asyncio.create_task(slow_resume_turn())
-    runner._startup_restore_tasks = [slow_task]
 
     inbound = MessageEvent(
         text="hello",
@@ -1383,7 +1408,6 @@ async def test_startup_restore_gate_releases_when_boot_path_send_hangs(
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
     runner._background_tasks = set()
 
     hung = asyncio.Event()

@@ -41,7 +41,6 @@ async def test_spooled_followup_waits_for_resumed_answer_with_own_reply_anchor(t
     db.append_message.side_effect = lambda **kw: rows.append({"role": kw["role"], "content": kw["content"]})
     runner.session_store.resolve_session_id_for_key = MagicMock(return_value=("sid", db))
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
     runner._startup_restore_in_progress = True
     monkeypatch.setattr("gateway.run_pending_recovery.get_routing_process_hermes_home", lambda: tmp_path)
     assert recover_pending_shutdown_flush(runner) == 1
@@ -64,6 +63,9 @@ async def test_spooled_followup_waits_for_resumed_answer_with_own_reply_anchor(t
     adapter.handle_message = handle
     assert runner._schedule_resume_pending_sessions() == 1
     await runner._finish_startup_restore()
+    # Startup admission opens the gate without waiting for replay turns; wait for the
+    # retained scheduler waiters before asserting the complete transcript.
+    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
     assert [row["role"] for row in rows] == ["user", "assistant", "user", "assistant", "user", "assistant"]
     assert rows[-4:][0]["content"].startswith("[System note:")
     assert rows[-2]["content"] == "B: answer separately"
@@ -85,7 +87,6 @@ def _spooled_runner(tmp_path, monkeypatch, *, pending=True, session_id="sid"):
     db = MagicMock()
     runner.session_store.resolve_session_id_for_key = MagicMock(return_value=(session_id, db))
     runner._startup_restore_queue = []
-    runner._startup_restore_tasks = []
     runner._startup_restore_in_progress = True
     return runner, adapter, source, key, db
 
@@ -470,6 +471,51 @@ async def test_reconnect_live_inbound_waits_until_older_followup_finishes(tmp_pa
     await asyncio.wait_for(recovery, 5)
     assert seen == ["older", "live"]
     assert not runner._reconnect_restore_keys
+
+
+@pytest.mark.asyncio
+async def test_reconnect_restore_fence_releases_after_bounded_resume_wait(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", "0.05")
+    runner, _adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    assert flush_pending_to_file({key: MessageEvent(text="older", source=source, user_id="u1")}) == 1
+
+    release = asyncio.Event()
+    resume_task = asyncio.create_task(release.wait())
+    runner._replay_resume_tasks = {key: resume_task}
+
+    def schedule_resume(*, restore_tasks, restore_keys, **_kwargs):
+        restore_tasks.append(resume_task)
+        restore_keys.add(key)
+        return 1
+
+    runner._schedule_resume_pending_sessions = schedule_resume
+    recovery = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(recovery, timeout=2)
+
+    assert not resume_task.done()
+    assert not runner._reconnect_restore_keys
+
+    release.set()
+    await resume_task
+    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_restore_fence_does_not_queue_control_commands(tmp_path, monkeypatch):
+    runner, _adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch, pending=False)
+    runner._startup_restore_in_progress = False
+    runner._reconnect_restore_keys = {key: 1}
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._admit_bot_message_for_source = MagicMock(return_value=True)
+
+    event = MessageEvent(text="/stop", message_type=MessageType.TEXT, source=source)
+    admitted = await runner._hm_admit_event(event)
+
+    assert admitted is not None
+    assert runner._startup_restore_queue == []
 
 
 def test_boot_snapshot_records_once_across_recovery_and_schedule(tmp_path, monkeypatch):

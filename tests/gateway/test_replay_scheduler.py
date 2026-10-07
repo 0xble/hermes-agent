@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from gateway.replay_scheduler import ReplayScheduler
+from gateway.config import GatewayConfig
 
 
 @pytest.mark.asyncio
@@ -62,3 +63,34 @@ async def test_replay_scheduler_failure_releases_slot():
     assert await scheduler.wait_for(second) == "ok"
     assert scheduler.active_count == 0
     await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_scheduler_orders_humans_then_resumes_then_followups():
+    scheduler = ReplayScheduler(1)
+    started = []
+    release = asyncio.Event()
+
+    async def work(name):
+        started.append(name)
+        await release.wait()
+        return name
+
+    scheduler.start()
+    human = scheduler.enqueue(priority=1, kind="human", session_key="h", dispatch=lambda: work("human"))
+    resume = scheduler.enqueue(priority=2, kind="resume", session_key="r", dispatch=lambda: work("resume"))
+    followup = scheduler.enqueue(priority=3, kind="followup", session_key="f", dispatch=lambda: work("followup"))
+    await asyncio.sleep(0)
+    assert started == ["human"]
+    release.set()
+    assert await asyncio.gather(
+        scheduler.wait_for(human), scheduler.wait_for(resume), scheduler.wait_for(followup)
+    ) == ["human", "resume", "followup"]
+    assert started == ["human", "resume", "followup"]
+    await scheduler.close()
+
+
+def test_restart_replay_concurrency_config_parses_and_defaults():
+    assert GatewayConfig.from_dict({"restart_replay_concurrency": 5}).restart_replay_concurrency == 5
+    assert GatewayConfig.from_dict({"restart_replay_concurrency": 0}).restart_replay_concurrency == 2
+    assert GatewayConfig.from_dict({"restart_replay_concurrency": "bad"}).restart_replay_concurrency == 2

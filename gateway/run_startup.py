@@ -109,7 +109,7 @@ class GatewayStartupMixin:
             )
 
     async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None, wait: bool = True) -> int:
-        """Submit ready startup/recovered events to the shared priority-1 scheduler."""
+        """Submit ready startup/recovered events to the shared priority scheduler."""
         handles = []
         queue = getattr(self, "_startup_restore_queue", None) or []
 
@@ -298,15 +298,18 @@ class GatewayStartupMixin:
         return done
 
     async def _finish_startup_restore(self) -> None:
-        """Release fresh inbound after warm-up without waiting for replay turns."""
+        """Open fresh inbound after warm-up and replay admission, without waiting for replay turns."""
         drained = 0
         try:
             await self._await_startup_warmup()
-            drained = await self._drain_startup_restore_queue()
+            # Replay turns run under the shared scheduler, not under the inbound gate.  Queue the
+            # complete batch first so humans retain priority over resumes, then let the gate open;
+            # recovered follow-ups still await their own session's resume task in _dispatch.
+            drained = await self._drain_startup_restore_queue(wait=False)
         finally:
             self._startup_restore_in_progress = False
         if drained:
-            logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+            logger.info("Admitted %d inbound message(s) queued during startup restore", drained)
 
     @staticmethod
     def _late_failure_callback(message: str, *, level: int = logging.WARNING):
@@ -715,11 +718,6 @@ class GatewayStartupMixin:
                 restore_tasks.append(task)
             if restore_keys is not None:
                 restore_keys.add(entry.session_key)
-            if getattr(self, "_startup_restore_in_progress", False):
-                tasks = getattr(self, "_startup_restore_tasks", None)
-                if tasks is None:
-                    tasks = self._startup_restore_tasks = []
-                tasks.append(task)
             scheduled += 1
         if scheduled:
             self._get_replay_scheduler().start()
@@ -1978,7 +1976,6 @@ class GatewayStartupMixin:
         self._mcp_discovery_ready = asyncio.Event()
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
-        self._startup_restore_tasks = []
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()

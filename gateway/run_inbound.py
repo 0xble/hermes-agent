@@ -44,6 +44,17 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def _is_restore_control_event(event: MessageEvent) -> bool:
+    """Allow recognized gateway controls through replay fences to reach the busy-session fast path."""
+    if not getattr(event, "allow_gateway_control", False):
+        return False
+    command = event.get_command()
+    if not command:
+        return False
+    from hermes_cli.commands import should_bypass_active_session
+    return should_bypass_active_session(command)
+
+
 def rehome_inbound_media(event: MessageEvent) -> None:
     """Move adapter-cached attachments into the ACTIVE profile's ``cache/`` and repoint the event.
 
@@ -304,6 +315,7 @@ class GatewayInboundMixin:
                 or (reconnect_keys and reconnect_keys.get(reconnect_key, 0))
             )
             and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not _is_restore_control_event(event)
         ):
             self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
