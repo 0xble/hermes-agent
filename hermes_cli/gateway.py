@@ -3,10 +3,8 @@
 Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
-import argparse
 import asyncio
 import contextlib
-import io
 from hermes_cli.cli_output import line_input  # noqa: F401 — resolved lazily by siblings through the facade
 import json
 import logging
@@ -20,7 +18,6 @@ import sys
 import textwrap
 import time
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from hermes_cli import setup_platforms  # noqa: F401 — resolved lazily by siblings through the facade
 
@@ -4835,6 +4832,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
             pass  # best-effort; don't block gateway startup
 
     from gateway.run import start_gateway
+    from gateway.shutdown_watchdog import sweep_stale_pid_heartbeats
+    sweep_stale_pid_heartbeats()
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ☤ Hermes Gateway Starting...                 │")
     print("├─────────────────────────────────────────────────────────┤")

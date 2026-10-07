@@ -424,6 +424,19 @@ class TestEscalateWedgedGateway:
         assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000) is True
         assert signals == []
 
+
+def test_review3_drifted_live_process_still_receives_guarded_signals(monkeypatch):
+    """Drift within tolerance must not make terminate_pid's strict guard refuse both signals."""
+    from gateway import status
+    sent = []
+    readings = iter([1000, 1050, 1050, 1050, 1050, 1050, 1050])
+    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: next(readings))
+    monkeypatch.setattr(status.os, "kill", lambda pid, sig: sent.append(sig))
+    monkeypatch.setattr(gateway_cli, "_wait_for_pid_exit", lambda pid, timeout, **_: len(sent) > 1)
+    assert gateway_cli._escalate_wedged_gateway(4242, expected_start_time=1000, term_grace=0, kill_wait=0) is True
+    assert len(sent) == 2
+
+
 class TestLaunchdRestartWedgedIntegration:
     """launchd_restart must skip the 180s drain only for a wedged loop."""
 

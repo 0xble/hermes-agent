@@ -16,7 +16,6 @@ import uuid
 import hermes_yaml as yaml
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from hermes_constants import get_hermes_home
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
@@ -24,6 +23,9 @@ from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollb
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
 INTERVAL = 30
 MAX_REPAIRS = 3
+STARTUP_SECONDS = 45
+ROLLBACK_SECONDS = 60
+POLL_SECONDS = 5
 
 
 def _domain(label: str) -> str:
@@ -162,6 +164,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     """Use S2 rollback with a targeted reload, never the ambient live gateway label."""
     from hermes_cli import gateway
     from hermes_cli.immutable_releases import wait_for_release_acknowledgement
+    deadline = deadline or time.monotonic() + ROLLBACK_SECONDS
     paths = ReleasePaths.for_home(home)
     pending = home / "release-txn.json"
     if pending.exists():
@@ -181,13 +184,13 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
         old_pid = _launchctl_supervised_pid(label)
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
-                       timeout=_bounded_timeout(15, deadline))
+                       timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         if old_pid is not None:
             try:
-                psutil.Process(old_pid).wait(timeout=_bounded_timeout(30, deadline))
+                psutil.Process(old_pid).wait(timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
             except psutil.NoSuchProcess:
                 pass
-        _launchctl_bootstrap(domain, plist, label, timeout=max(1, int(_bounded_timeout(30, deadline))))
+        _launchctl_bootstrap(domain, plist, label, timeout=max(1, int(_bounded_timeout(ROLLBACK_SECONDS, deadline))))
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
     if result.get("reload_pending"):
@@ -205,6 +208,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
          deadline: float | None = None) -> str:
     from hermes_cli.immutable_releases import _verify_transaction
+    deadline = deadline or time.monotonic() + STARTUP_SECONDS
     if intent_path(home).exists():
         return "stopped"
     if not plist.is_file():
@@ -249,7 +253,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             receipt(home, "rollback", "capped", candidate=str(current))
             return "capped"
         receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
-        ok = rollback_switch(home, plist, label, old, domain=domain, deadline=deadline)
+        ok = rollback_switch(home, plist, label, old, domain=domain)
         receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
         return "rolled_back" if ok else "failed"
     if state == "loaded":
@@ -299,7 +303,6 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
             # deliberately parked gateway stays parked even if config is now malformed.
             if intent_path(home).exists():
                 return "stopped"
-            deadline = time.monotonic() + 30.0
             from hermes_cli.config import _validate_updates
             if grace is None:
                 from hermes_cli.config_effective import load_user_config_effective
@@ -319,7 +322,7 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
                 grace = (config.get("updates") or {}).get(
                     "release_acknowledgement_timeout_seconds", 180.0)
             assert grace is not None
-            return _run(home, Path(plist), label, grace=float(grace), domain=domain, deadline=deadline)
+            return _run(home, Path(plist), label, grace=float(grace), domain=domain)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, yaml.YAMLError) as exc:
             receipt(home, "inspect", "alert", reason=str(exc))
             return "alert"

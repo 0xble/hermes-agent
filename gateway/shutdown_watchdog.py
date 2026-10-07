@@ -188,6 +188,19 @@ def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
 
 
+def sweep_stale_pid_heartbeats(home: Optional[Path] = None) -> None:
+    """Best-effort one-shot cleanup of per-PID heartbeat files from older gateway versions."""
+    try:
+        for stale in get_loop_heartbeat_path(home).parent.glob("gateway.heartbeat.*"):
+            try:
+                pid = int(stale.name.rsplit(".", 1)[1])
+                os.kill(pid, 0)
+            except (ValueError, IndexError, OSError):
+                stale.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("stale per-PID heartbeat sweep failed", exc_info=True)
+
+
 def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
     """``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` — PID-suffixed so a stale node from a
     dead process is never mistaken for this gateway's witness. Served by the loop itself

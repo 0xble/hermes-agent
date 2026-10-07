@@ -332,6 +332,40 @@ def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeyp
 
 
 @pytest.mark.platforms("macos")
+def test_slow_bootout_does_not_exhaust_rollback_repair_budget(tmp_path, monkeypatch):
+    home, plist, label, a, _ = layout(tmp_path)
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: clock[0])
+    from hermes_cli import gateway_launchd
+    import psutil
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: 123)
+
+    class Previous:
+        def __init__(self, pid):
+            assert pid == 123
+
+        def wait(self, timeout):
+            calls.append("drained")
+
+    monkeypatch.setattr(psutil, "Process", Previous)
+
+    def run(argv, **kwargs):
+        calls.append(argv[1])
+        if argv[1] == "bootout":
+            clock[0] += 50.0
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    monkeypatch.setattr(guardian, "rollback",
+                        lambda *args, **kwargs: (kwargs["reload_callback"](), {"reload_pending": False})[1])
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+
+    assert guardian.rollback_switch(home, plist, label, a, domain=f"gui/{os.getuid()}")
+    assert calls == ["bootout", "drained", "bootstrap"]
+
+
+@pytest.mark.platforms("macos")
 def test_repeated_alerts_are_deduplicated_and_old_receipts_pruned(tmp_path):
     home, *_ = layout(tmp_path)
     old = guardian.receipt(home, "inspect", "alert", reason="old")
