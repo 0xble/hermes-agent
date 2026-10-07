@@ -3729,9 +3729,12 @@ class GatewayRunner(
         # run_turn_runner._load_turn_history (#114266). Cleared on /new.
         self._transcript_lag_streaks: dict[str, int] = {}
         # Startup restore gate: while restart-interrupted sessions auto-resume, real inbound messages
-        # queue instead of competing with the synthetic resume turns; drained after all resume tasks end.
+        # queue instead of competing with synthetic turns.  One claimed replay per session preserves
+        # ordering while the gateway-wide scheduler keeps unrelated sessions concurrent.
         self._startup_restore_in_progress = False
         self._startup_restore_queue: list[MessageEvent] = []
+        self._startup_restore_keys: dict[str, int] = {}
+        self._startup_restore_claimed_keys: set[str] = set()
         self._startup_restore_tasks: list[asyncio.Task] = []
         # Set by start_gateway() only for an explicit ``--replace`` launch; scoped to each adapter's
         # cold-start connect and removed before any reconnect can run.

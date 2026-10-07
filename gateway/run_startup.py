@@ -127,12 +127,36 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 extra={"replay_scheduler": "source_queued", "kind": kind},
             )
 
+    def _requeue_startup_restore_event(self, event: MessageEvent, *, session_key: str) -> None:
+        """Return a replay item to the restore queue without creating a second claim.
 
+        Scheduler shutdown can cancel an item after it has been removed from the
+        restore queue but before its turn starts.  The existing restore-key claim
+        remains outstanding so the shutdown flush sees this copy exactly once.
+        """
+        queue = getattr(self, "_startup_restore_queue", None)
+        if queue is None:
+            queue = self._startup_restore_queue = []
+        if not any(existing is event for existing in queue):
+            queue.append(event)
+        with suppress(Exception):
+            logger.info(
+                "Returned dropped replay to restore queue: session_key=%s",
+                session_key,
+                extra={"replay_scheduler": "source_requeued", "session_key": session_key},
+            )
 
-
-
-
-
+    def _schedule_startup_restore_drain(self) -> None:
+        if not getattr(self, "_startup_restore_queue", None):
+            return
+        scheduler = getattr(self, "_replay_scheduler", None)
+        if scheduler is not None and getattr(scheduler, "_closed", False):
+            return
+        task = asyncio.create_task(self._drain_startup_restore_queue(wait=False))
+        self._retain_background_task(task)
+        task.add_done_callback(
+            self._late_failure_callback("background startup restore drain failed", level=logging.DEBUG)
+        )
 
     @staticmethod
     def _start_free_tier_bootstrap() -> None:
@@ -302,20 +326,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         drained = 0
         try:
             await self._await_startup_warmup()
-            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
-            self._startup_restore_tasks = []
-            if tasks:
-                from gateway.run import _startup_restore_drain_timeout_secs
-                await self._wait_bounded_or_release(
-                    set(tasks), _startup_restore_drain_timeout_secs(),
-                    "Startup restore backfill still running after %.0fs; releasing inbound gate; "
-                    "older backfill turns continue in the background.",
-                    "background startup restore backfill failed after gate release",
-                    level=logging.DEBUG,
-                )
-            # Replay turns run under the shared scheduler, not under the inbound gate. Queue the
-            # complete batch first so humans retain priority over resumes, then let the gate open;
-            # recovered follow-ups still await their own session's resume task in _dispatch.
+            # Replay turns run under the shared scheduler, not under the inbound gate. Queue one
+            # claimant per session so the per-session fence remains ordered while unrelated sessions
+            # retain concurrency; recovered follow-ups await their own resume task before admission.
             drained = await self._drain_startup_restore_queue(wait=False)
         finally:
             self._startup_restore_in_progress = False
