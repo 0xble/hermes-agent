@@ -5294,6 +5294,9 @@ def _print_runtime_health() -> None:
 def _cmd_run(args):
     if _maybe_redirect_run_to_s6_supervision(args):
         return  # unreachable; execvp doesn't return
+    # The direct/launchd ``gateway run`` path must refuse withdrawn handover leftovers too:
+    # a live generation job beside this process would be a second poller on one bot token.
+    _refuse_forward_only_leftovers(fatal_on_inspection_error=False)
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
     run_gateway(
@@ -5522,11 +5525,21 @@ def _print_unfolded_gateway_note(owner) -> None:
     print("  They were left running; fold them in with: hermes gateway migrate --multiplex")
 
 
-def _refuse_forward_only_leftovers() -> None:
-    """Block legacy gateway lifecycle actions until withdrawn handover state is inspected."""
-    from hermes_cli.forward_only_guard import refuse_if_forward_only_leftovers
+def _refuse_forward_only_leftovers(*, fatal_on_inspection_error: bool = True) -> None:
+    """Block legacy gateway lifecycle actions until withdrawn handover state is inspected.
+
+    The supervised ``gateway run`` path passes ``fatal_on_inspection_error=False``: exit 78 parks a
+    launchd job (SuccessfulExit=false), so a transient launchctl failure must not leave the gateway
+    down. Leftovers that are actually found stay fatal on every path.
+    """
+    from hermes_cli.forward_only_guard import LeftoverInspectionError, refuse_if_forward_only_leftovers
     try:
         refuse_if_forward_only_leftovers(get_hermes_home())
+    except LeftoverInspectionError as exc:
+        if fatal_on_inspection_error:
+            print_error(str(exc))
+            raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE) from exc
+        logging.getLogger(__name__).warning("Withdrawn-handover leftover check skipped: %s", exc)
     except RuntimeError as exc:
         print_error(str(exc))
         raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE) from exc

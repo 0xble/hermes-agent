@@ -12,6 +12,10 @@ _FORWARD_LABEL = re.compile(r"\b(ai\.hermes\.gateway\.g-[0-9a-fA-F]{32})\b")
 _TERMINAL_OUTCOMES = frozenset({"success", "rolled_back", "refused", "aborted"})
 
 
+class LeftoverInspectionError(RuntimeError):
+    """launchd's inventory could not be read, so leftover state is unknown (not known present)."""
+
+
 def _loaded_forward_labels(*, runner=None) -> list[str]:
     """Read launchd's loaded-job inventory without changing service state."""
     if sys.platform != "darwin":
@@ -27,10 +31,10 @@ def _loaded_forward_labels(*, runner=None) -> list[str]:
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError(f"could not inspect loaded launchd jobs: {exc}") from exc
+        raise LeftoverInspectionError(f"could not inspect loaded launchd jobs: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "unknown launchctl error").strip()
-        raise RuntimeError(f"could not inspect loaded launchd jobs: {detail}")
+        raise LeftoverInspectionError(f"could not inspect loaded launchd jobs: {detail}")
     return sorted(set(_FORWARD_LABEL.findall(result.stdout or "")))
 
 
@@ -109,4 +113,4 @@ def refuse_if_forward_only_leftovers(home: Path) -> None:
         )
 
 
-__all__ = ["LEFTOVERS_DOC", "leftover_forward_only_state", "refuse_if_forward_only_leftovers"]
+__all__ = ["LEFTOVERS_DOC", "LeftoverInspectionError", "leftover_forward_only_state", "refuse_if_forward_only_leftovers"]

@@ -83,6 +83,24 @@ def test_withdrawal_guard_blocks_start_restart_and_activation(tmp_path, monkeypa
     with pytest.raises(SystemExit):
         gateway._cmd_restart(args)
 
+    ran = []
+    monkeypatch.setattr(gateway, "_maybe_redirect_run_to_s6_supervision", lambda _args: False)
+    monkeypatch.setattr(gateway, "run_gateway", lambda *a, **k: ran.append(True))
+    run_args = SimpleNamespace(verbose=0, quiet=True, replace=False, force=False, external_supervisor=True)
+    with pytest.raises(SystemExit):
+        gateway._cmd_run(run_args)
+    assert ran == []  # the direct/launchd run path never reaches the gateway
+
+    # A transient launchctl failure must not park the supervised run path (exit 78 parks launchd).
+    def unreadable(_home):
+        raise guard.LeftoverInspectionError("could not inspect loaded launchd jobs: timeout")
+
+    monkeypatch.setattr(guard, "refuse_if_forward_only_leftovers", unreadable)
+    gateway._cmd_run(run_args)
+    assert ran == [True]
+    with pytest.raises(SystemExit):
+        gateway._cmd_start(args)  # explicit operator verbs stay fail-closed
+    monkeypatch.setattr(guard, "refuse_if_forward_only_leftovers", refuse)
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
     monkeypatch.setattr(update_cmd, "_immutable_release_enabled", lambda paths: True)
