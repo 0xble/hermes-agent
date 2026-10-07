@@ -63,6 +63,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Loop lifecycle | Versioned agent-authorized /loop revisions preserve user authority, cadence state, and cross-surface wakeup persistence | LoopManager revisions, loop wakeup prompts, stale loop-manager caches, or loop receipts | [Loop lifecycle](maintenance/loop-lifecycle.md) |
 | Internal notification silence | Internal process/delegation turns use an exact silence contract; parked-goal notices are durable and state-change deduplicated | Internal notification footer, process/delegation wake delivery, parked-goal status notices, or their regressions | [Internal notification silence](maintenance/internal-notification-silence.md) |
 | Goal status flood retry | Important parked, continuing, wait-ended, achieved, paused, and blocked notices survive short Telegram flood windows without blocking the turn pipeline | Goal status notice delivery, flood-control classification, or shared cron/notice retry budgets | [Goal status flood retry](maintenance/goal-notice-flood-retry.md) |
+| External-wait goal backoff | Park goals gated on external work, back off after no-progress turns, and re-arm still-running pid/session barriers | Goal judge WAIT semantics, persistent no-progress state, barrier liveness, or idle wake behavior | [External-wait goal backoff](maintenance/goal-external-wait-backoff.md) |
 | Parked goal idle wake | A parked goal resumes when its wait ends, even when no completion turn arrives (restart-killed process, no notify, elapsed timer), and stale restart-resume markers cannot wedge it forever | Goal wait barriers, the gateway loop wakeup watcher, TUI notification poller, or restart process cleanup changes | [Parked goal idle wake](maintenance/goal-parked-idle-wake.md) |
 | Restart-parked goal wake | A stale `resume_pending` marker yields ownership to the idle goal ticker after restart auto-resume's freshness window, with CAS fencing against a refreshed marker | Restart-interrupted parked goals and gateway idle wake ownership | [Restart-parked goal wake](maintenance/goal-restart-parked-wake.md) |
 | Gateway stop stays stopped | `/stop` pauses the standing goal and holds the completions it produced until the user's next turn | Gateway `/stop`, completion injection, or goal pause/revival changes | [Gateway stop stays stopped](maintenance/gateway-stop-stays-stopped.md) |
@@ -150,6 +151,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/tools/test_delegation_resume.py tests/gateway/test_delegation_auto_resume.py`.
 - **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
 - **Rollback:** Revert the resumable-delegation-retention fix commit.
+
+## Active patch record: trailing silence marker (S1)
+
+- **Patch identity:** `trailing-silence-marker`.
+- **Behavior:** Strip the run of trailing standalone `NO_REPLY`/`[SILENT]`/`no reply` marker lines from substantive interactive replies before delivery and assistant-transcript persistence. The decision is made on the visible text after inline think blocks are removed, so reasoning plus a bare marker stays intended silence. A response of only marker lines collapses to one marker and still goes through the silence guard. Preserve bare-marker suppression, fenced-code content, mid-sentence text, and autonomous-lane semantics.
+- **Source surfaces:** `gateway/response_filters.py`, `agent/turn_final_response.py`, `gateway/run_turn.py`, `gateway/stream_consumer.py`, and gateway response-filter/stream/final-persistence regression tests.
+- **Upstream status:** NousResearch #126581, #126646, and #126827 address bare-marker leaks on failed turns and segment-break previews; none strips a trailing marker line from substantive replies.
+- **Focused regression:** `HERMES_HEAVY_SLOT=off HERMES_HOME=<isolated-home> /Users/brianle/Repos/hermes-agent/.venv/bin/python -m pytest -q tests/gateway/test_trailing_silence_marker.py tests/gateway/test_response_filters.py tests/gateway/test_stream_consumer_silence.py`.
+- **Retirement:** Remove this patch when released upstream behavior strips trailing standalone markers at both persistence and every interactive streaming delivery boundary.
+- **Rollback:** Revert the trailing-silence-marker fix commit.
 
 ## Update
 

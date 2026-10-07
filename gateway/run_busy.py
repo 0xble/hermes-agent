@@ -177,7 +177,11 @@ class GatewayBusySessionMixin:
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
         """True for synthetic /goal continuation turns (so pause/clear can spare real /queue items)."""
         text = getattr(event_or_text, "text", event_or_text) or ""
-        return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        try:
+            from hermes_cli.goals import is_goal_continuation_text
+            return is_goal_continuation_text(str(text))
+        except Exception:
+            return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session; real /queue items are kept."""
@@ -509,11 +513,13 @@ class GatewayBusySessionMixin:
             return
         await send
 
-    def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> None:
-        """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing."""
+    def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing.
+
+        Returns whether the event was preserved (FIFO or durable spool)."""
         setattr(event, "_drain_deferred", True)
         if self._queue_or_replace_pending_event(session_key, event):
-            return
+            return True
         # No adapter or a full FIFO: use the same durable shutdown spool rather than lose
         # the turn. Recovery retains the file if its session cannot yet be resolved.
         try:
@@ -523,6 +529,7 @@ class GatewayBusySessionMixin:
             logger.warning("Failed to preserve drain arrival for %s", session_key, exc_info=True)
         if not preserved:
             logger.warning("Drain arrival for %s could not be preserved", session_key)
+        return bool(preserved)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command. English words
     # (and the thumbs) always match; ``approval.inputs.*`` adds the active language's synonyms.

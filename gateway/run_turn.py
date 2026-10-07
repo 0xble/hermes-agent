@@ -27,6 +27,7 @@ from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    strip_trailing_silence_marker,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -1525,6 +1526,12 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
+        # Webhook delivery is an autonomous lane with a looser first/last-line silence rule;
+        # leave its marker semantics unchanged. Interactive replies drop a trailing standalone
+        # marker from substantive text before the silence verdict, so a marker-only run that
+        # collapses to one marker still goes through the silence guard below.
+        if source.platform != Platform.WEBHOOK:
+            response = strip_trailing_silence_marker(response)
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
@@ -2248,6 +2255,10 @@ class GatewayTurnMixin:
                     event.ledger_message_id = str(_terminal_inbound)
                 if "queued_terminal_notification_category" in agent_result:
                     event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+                if agent_result.get("queued_terminal_notification_origin"):
+                    # A completion drained behind this turn is fresh goal evidence for the
+                    # chain's single post-turn judge (see _run_post_turn_hooks).
+                    event.metadata["notification_origin"] = agent_result["queued_terminal_notification_origin"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
@@ -2733,6 +2744,7 @@ class GatewayTurnMixin:
             cursor=_effective_cursor,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            strip_trailing_silence_markers=(source.platform != Platform.WEBHOOK),
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
@@ -4013,6 +4025,9 @@ class GatewayTurnMixin:
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
+                "queued_terminal_notification_origin": (
+                    (pending_event.metadata or {}).get("notification_origin")
+                    if pending_event is not None and pending_event.internal else None),
             }
         return merged
 

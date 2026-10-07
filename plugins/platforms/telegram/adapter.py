@@ -27,7 +27,8 @@ from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.chat_budget import (
-    KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter, reset_trigger)
+    EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
+    reset_trigger)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -885,6 +886,8 @@ class TelegramAdapter(BasePlatformAdapter):
     # the final edit when raw text is unchanged.
     # Fixes #25710.
     REQUIRES_EDIT_FINALIZE: bool = True
+    # Progress bubbles edit no faster than the chat's interim-edit floor (10s, chat_budget.py).
+    PROGRESS_EDIT_INTERVAL: float = EDIT_FLOOR_SECS
     FALLBACK_ON_FINAL_EDIT_FLOOD: bool = True  # retrying a final edit burns the same flood budget
     RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK: bool = True  # a failed final edit may leave a partial preview
 

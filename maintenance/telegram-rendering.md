@@ -180,8 +180,10 @@ API (`sendRichMessage`, rich `editMessageText`) with the raw Markdown from
 MarkdownV2 via `format_message`. Both are covered.
 
 **Outbound budget:** no new send, edit, typing, or reaction call site, and no
-cadence change. The progress lane's call sites (`_send_progress_text`,
-`_edit_progress_message`, `_PROGRESS_EDIT_INTERVAL = 1.5`, overflow rolling)
+cadence change from this patch. (Progress cadence is owned by
+[telegram-delivery](telegram-delivery.md): 10s for Telegram via
+`TelegramAdapter.PROGRESS_EDIT_INTERVAL`, 3s default elsewhere.) The progress lane's call sites
+(`_send_progress_text`, `_edit_progress_message`, overflow rolling)
 and the Telegram shared per-chat send+edit slot
 (`_TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0`; progress edits pass
 `finalize=True`, so they hold the slot but are not skipped by it) are
