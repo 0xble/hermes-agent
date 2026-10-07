@@ -697,7 +697,8 @@ def _runs_hermes_main(argv: list[str], root: Path) -> bool:
     return argv[1:4] == runtime_command(root, (), module="hermes_cli.main", python=argv[0])[1:4]
 
 
-def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -> bool:
+def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
+                                probe_timeout: float = 10) -> bool:
     """Finish a pending reload only after observing its supervised gateway."""
     paths = ReleasePaths.for_home(home)
     record = _read_txn(paths)
@@ -722,7 +723,7 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
         return False
     import psutil
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
-    supervisor_pid = _launchctl_supervised_pid(label)
+    supervisor_pid = _launchctl_supervised_pid(label, timeout=probe_timeout)
     if not supervisor_pid:
         return False
     try:
@@ -784,7 +785,10 @@ def wait_for_release_acknowledgement(home: Path, *, timeout_seconds: float = 180
     pending = ReleasePaths.for_home(home).home / "release-txn.json"
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while pending.exists():
-        if acknowledge_running_release(home) or not pending.exists():
+        # The launchd probe spends only what is left of this bounded wait.
+        probe = max(0.0, min(10.0, deadline - time.monotonic()))
+        if (probe > 0 and (acknowledge_running_release(home, probe_timeout=probe) if probe < 10
+                           else acknowledge_running_release(home))) or not pending.exists():
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:

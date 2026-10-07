@@ -72,7 +72,7 @@ def test_withdrawal_guard_blocks_start_restart_and_activation(tmp_path, monkeypa
 
     from hermes_cli import gateway, update_cmd
 
-    def refuse(_home):
+    def refuse(_home, **_):
         raise RuntimeError("withdrawn handover state remains")
 
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: tmp_path)
@@ -120,7 +120,7 @@ def test_guardian_refuses_to_bootstrap_beside_withdrawn_leftovers(tmp_path, monk
 
     launched = []
 
-    def refuse(_home):
+    def refuse(_home, **_):
         raise RuntimeError("withdrawn handover state remains")
 
     monkeypatch.setattr(guard, "refuse_if_forward_only_leftovers", refuse)

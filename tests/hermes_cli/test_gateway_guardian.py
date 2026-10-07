@@ -186,7 +186,7 @@ def test_unloaded_service_is_not_bootstrapped_beside_withdrawn_leftovers(tmp_pat
     calls = fake_launchctl(monkeypatch, label)
     import hermes_cli.forward_only_guard as forward_guard
 
-    def refuse(_home):
+    def refuse(_home, **_):
         raise RuntimeError("withdrawn handover state remains")
 
     monkeypatch.setattr(forward_guard, "refuse_if_forward_only_leftovers", refuse)
@@ -575,7 +575,7 @@ def test_healthy_rollback_is_acknowledged_on_subsequent_run(tmp_path, monkeypatc
     pending = home / "release-txn.json"
     pending.write_text(json.dumps({"version": 1, "operation": "rollback", "candidate": str(b)}))
     from hermes_cli import immutable_releases
-    def acknowledge(path):
+    def acknowledge(path, **_):
         assert path == home
         pending.unlink()
         return True
@@ -651,3 +651,53 @@ def test_failed_switch_rolls_back_only_verified_previous(tmp_path, monkeypatch):
     done.clear()
     assert guardian.run_once(home, plist, label, grace=0.000001) == "alert"
     assert done == []
+
+
+@pytest.mark.platforms("macos")
+def test_leftover_inspection_spends_only_the_guardian_deadline(tmp_path, monkeypatch):
+    # The pre-launch leftover check (launchctl list, then print per generation label) runs
+    # inside _run's bound, so each probe gets the remaining budget, not a fixed 5 s.
+    clock = {"now": 100.0}
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: clock["now"])
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append((argv[1], kwargs.get("timeout")))
+        clock["now"] += 1.0
+        if argv[1] == "list":
+            return subprocess.CompletedProcess(argv, 0, stdout="-\t0\tai.hermes.gateway.g-" + "a" * 32 + "\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=f"HERMES_HOME => {tmp_path / 'other'}\n", stderr="")
+
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    guardian._refuse_leftovers_before_launch(tmp_path, 102.5)
+    assert seen == [("list", 2.5), ("print", 1.5)]
+
+
+@pytest.mark.platforms("macos")
+def test_expired_deadline_aborts_leftover_inspection(tmp_path, monkeypatch):
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: 200.0)
+    monkeypatch.setattr(guardian.subprocess, "run",
+                        lambda *a, **k: pytest.fail("no launchctl call after the deadline"))
+    with pytest.raises(RuntimeError, match="deadline"):
+        guardian._refuse_leftovers_before_launch(tmp_path, 150.0)
+
+
+@pytest.mark.platforms("macos")
+def test_rollback_acknowledgement_probe_spends_the_run_deadline(tmp_path, monkeypatch):
+    home, plist, label, a, b = layout(tmp_path)
+    fake_launchctl(monkeypatch, label, loaded=True)
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    pending = home / "release-txn.json"
+    pending.write_text(json.dumps({"version": 1, "operation": "rollback", "candidate": str(b)}))
+    clock = {"now": 100.0}
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: clock["now"])
+    from hermes_cli import immutable_releases
+    seen = []
+
+    def acknowledge(path, *, probe_timeout=10, **_):
+        seen.append(probe_timeout)
+        return True
+
+    monkeypatch.setattr(immutable_releases, "acknowledge_running_release", acknowledge)
+    assert guardian._run(home, plist, label, grace=0, domain=None, deadline=103.0) == "healthy"
+    assert seen == [3.0]

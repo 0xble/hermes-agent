@@ -230,7 +230,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     return False
 
 
-def _refuse_leftovers_before_launch(home: Path) -> None:
+def _refuse_leftovers_before_launch(home: Path, deadline: float | None = None) -> None:
     """Never (re)bootstrap the legacy gateway beside withdrawn handover state.
 
     A live generation job plus a bootstrapped legacy job would be two pollers on one bot token.
@@ -238,7 +238,7 @@ def _refuse_leftovers_before_launch(home: Path) -> None:
     Checked only right before a launch so inspection-only outcomes never shell out.
     """
     from hermes_cli.forward_only_guard import refuse_if_forward_only_leftovers
-    refuse_if_forward_only_leftovers(home)
+    refuse_if_forward_only_leftovers(home, timeout_for=lambda cap: _bounded_timeout(cap, deadline))
 
 
 def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | None,
@@ -275,7 +275,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
             record = json.loads(pending.read_text(encoding="utf-8-sig"))
             if record.get("operation") in {"rollback", "first-migration-rollback"}:
                 from hermes_cli.immutable_releases import acknowledge_running_release
-                acknowledge_running_release(home)
+                acknowledge_running_release(home, probe_timeout=_bounded_timeout(10, deadline))
         return "healthy"
     if switch:
         old = Path(switch["previous_intended"])
@@ -288,7 +288,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         if _repair_count(home) >= MAX_REPAIRS:
             receipt(home, "rollback", "capped", candidate=str(current))
             return "capped"
-        _refuse_leftovers_before_launch(home)
+        _refuse_leftovers_before_launch(home, deadline)
         receipt(home, "rollback", "attempt", candidate=str(current), previous=str(old))
         ok = rollback_switch(home, plist, label, old, domain=domain, deadline=deadline)
         receipt(home, "rollback", "rolled_back" if ok else "failed", candidate=str(current), previous=str(old))
@@ -298,7 +298,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     if _repair_count(home) >= MAX_REPAIRS:
         receipt(home, "bootstrap", "capped", label=label)
         return "capped"
-    _refuse_leftovers_before_launch(home)
+    _refuse_leftovers_before_launch(home, deadline)
     receipt(home, "bootstrap", "attempt", label=label)
     if state == "parked":
         # Deliberate stops short-circuit above via the stopped intent, so a parked job here
