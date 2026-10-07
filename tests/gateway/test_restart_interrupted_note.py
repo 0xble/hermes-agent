@@ -446,6 +446,42 @@ async def test_attachment_only_final_reconciles_restart_note(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("upload_ok", [True, False])
+async def test_queued_attachment_only_final_reconciles_note_only_after_upload(tmp_path, upload_ok):
+    from gateway.run_notifications import GatewayNotificationsMixin
+
+    adapter = NoteAdapter()
+    store, entry, _ = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-queued-media")
+    media = tmp_path / "answer.txt"
+    media.write_text("answer", encoding="utf-8")
+    uploads = []
+
+    async def _send_document(chat_id, file_path, metadata=None, **kwargs):
+        uploads.append(file_path)
+        return SendResult(success=upload_ok, message_id="doc-1" if upload_ok else None)
+
+    adapter.send_document = _send_document
+    adapter.gateway_runner = SimpleNamespace(async_session_store=AsyncSessionStore(store))
+    runner = object.__new__(GatewayNotificationsMixin)
+    runner._thread_metadata_for_source = lambda *args, **kwargs: {}
+    runner._reply_anchor_for_event = lambda *_args: None
+
+    assert await runner._deliver_queued_first_response(
+        f"MEDIA:{media}", _source(), adapter, metadata={}, session_key=entry.session_key,
+    ) is True
+
+    assert uploads == [str(media)]
+    if upload_ok:
+        assert adapter.deleted == [("chat", "note-queued-media")]
+        assert store.get_restart_note(entry.session_key)[3] is None
+    else:
+        # Upload refused: keep the note so a later delivery can still reconcile it.
+        assert adapter.deleted == []
+        assert store.get_restart_note(entry.session_key)[3] == "note-queued-media"
+
+
+@pytest.mark.asyncio
 async def test_resumed_answer_deletes_note_and_sends_fresh_message(tmp_path):
     adapter = NoteAdapter()
     store, entry, event = _pending_store(tmp_path, adapter)
