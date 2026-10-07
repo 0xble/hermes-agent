@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ 完了前に停止する必要がありました{reason}。/retry で再試行するか、会話が非常に長くなっている場合は /compress を使ってください。"
     no_response: "⚠️ 処理は完了しましたが、応答が生成されませんでした。一時的なエラーの可能性があります — メッセージをもう一度送信してみてください。"
     previous_turn_cleanup: "⚠️ あなたのメッセージは処理されませんでした (前のターンの後処理がまだ進行中でした)。もう一度送信してください。"
-    unexpected_silence: "⚠️ 返答が必要なメッセージに対して、モデルは沈黙マーカーのみを返しました。もう一度試すか、言い換えてください。"
+    unexpected_silence: "⚠️ このメッセージには返信が書き込まれませんでした。返信を期待していた場合は、もう一度送信してください。"
     empty_response_model_label: "モデル"
     hint_auth: " AI モデルサービスへのサインインが期限切れか、API キーが誤っています。ここで /login を使うか、ホストで `{relogin}` を実行してください。"
     hint_quota: " AI モデルサービスの残高または割り当てを使い切りました。サービスのウェブサイトでチャージするか、/model でモデルを切り替えてください。"
@@ -703,7 +703,6 @@ gateway:
     action_shutting_down: "シャットダウン中"
     reject_model: "エージェントが実行中です — 完了を待つか、先に /stop してからモデルを切り替えてください。"
     reject_codex_runtime: "エージェントが実行中です — 完了を待つか、先に /stop してからランタイムを変更してください。"
-    reject_moa: "エージェントが実行中です — 完了を待つか、先に /stop してから /moa を実行してください。"
     drain_queued: "⏳ ゲートウェイは{action}です — 復帰後の次のターンにキューしました。"
     drain_rejected: "⏳ ゲートウェイは{action}のため、現在は次のターンを受け付けていません。"
     drain_rejected_new_work: "⏳ ゲートウェイは{action}のため、現在は新しい作業を受け付けていません。"
@@ -748,7 +747,7 @@ gateway:
     paused: "⏸️ 一時停止しました{suffix}。新しい cron/kanban/ゲートウェイの作業は保留され、進行中の作業は通常どおり完了します。再開するには `/pause off` を使ってください。"
   queue:
     usage: "使い方: /queue <プロンプト>"
-    queued: "次のターンにキューしました。"
+    queued: "⏳ 次のターンにキューしました。"
     queued_depth: " ({depth} 件キュー中)"
   steer:
     usage: "使い方: /steer <プロンプト>"

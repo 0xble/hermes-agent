@@ -677,7 +677,7 @@ gateway:
     stopped_before_finishing: "⚠️ Ich musste vor dem Abschluss abbrechen{reason}. Versuchen Sie es mit /retry erneut oder verwenden Sie /compress, falls diese Konversation sehr lang geworden ist."
     no_response: "⚠️ Die Verarbeitung wurde abgeschlossen, aber es wurde keine Antwort erzeugt. Das kann ein vorübergehender Fehler sein — senden Sie Ihre Nachricht erneut."
     previous_turn_cleanup: "⚠️ Ihre Nachricht wurde nicht verarbeitet (der vorherige Zug wurde noch aufgeräumt). Bitte senden Sie sie erneut."
-    unexpected_silence: "⚠️ Das Modell hat für eine Nachricht, die eine Antwort brauchte, nur einen Stille-Marker zurückgegeben. Versuchen Sie es erneut oder formulieren Sie um."
+    unexpected_silence: "⚠️ Für diese Nachricht wurde keine Antwort geschrieben. Senden Sie sie erneut, wenn Sie eine Antwort erwartet haben."
     empty_response_model_label: "Das Modell"
     hint_auth: " Ihre Anmeldung beim KI-Modelldienst ist abgelaufen oder der API-Schlüssel ist falsch. Verwenden Sie hier /login oder führen Sie `{relogin}` auf dem Host aus."
     hint_quota: " Ihr Guthaben oder Kontingent beim KI-Modelldienst ist aufgebraucht. Laden Sie es auf der Website des Dienstes auf oder wechseln Sie das Modell mit /model."
@@ -703,7 +703,6 @@ gateway:
     action_shutting_down: "wird heruntergefahren"
     reject_model: "Agent läuft — warten Sie oder verwenden Sie zuerst /stop, dann wechseln Sie das Modell."
     reject_codex_runtime: "Agent läuft — warten Sie oder verwenden Sie zuerst /stop, dann ändern Sie die Runtime."
-    reject_moa: "Agent läuft — warten Sie oder verwenden Sie zuerst /stop, dann führen Sie /moa aus."
     drain_queued: "⏳ Gateway {action} — für den nächsten Zug eingereiht, sobald es zurück ist."
     drain_rejected: "⏳ Gateway {action} und nimmt gerade keinen weiteren Zug an."
     drain_rejected_new_work: "⏳ Gateway {action} und nimmt gerade keine neue Arbeit an."
@@ -748,7 +747,7 @@ gateway:
     paused: "⏸️ Pausiert{suffix}. Neue Cron-/Kanban-/Gateway-Arbeit wird zurückgehalten; laufende Arbeit wird normal abgeschlossen. Verwenden Sie `/pause off` zum Fortsetzen."
   queue:
     usage: "Verwendung: /queue <prompt>"
-    queued: "Für den nächsten Zug eingereiht."
+    queued: "⏳ Für den nächsten Zug eingereiht."
     queued_depth: " ({depth} eingereiht)"
   steer:
     usage: "Verwendung: /steer <prompt>"

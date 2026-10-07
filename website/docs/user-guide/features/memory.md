@@ -273,7 +273,28 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
+  recall_synthetic_turns: false  # external provider auto-recall on Hermes-generated turns
+  prefetch_max_age_seconds: 1800 # oldest background recall still injected (0 = no limit)
 ```
+
+An external provider's automatic recall runs only for text a person wrote. Turns Hermes generates
+itself (background-process and delegation notices, goal continuations, heartbeat and `/loop`
+wakeups, scheduled cron job runs, recovery notes) skip it, because their generated text is a poor
+search query and repeats verbatim from turn to turn. A cron run counts as generated in full, including
+the job's stored task text, because no person is present. If a person's message was merged into a goal,
+kanban or `/loop` prompt, recall runs on that message alone. A message merged into a background
+notification is answered but not used for memory. When that message quotes the generated prompt's exact closing
+paragraph, only the text after the quote is used, and a message merged into a revised goal's
+continuation is not used at all. The message is still answered. The provider's explicit recall tools work on every turn. Set
+`recall_synthetic_turns: true` to recall on generated turns as well.
+
+Providers that recall in the background (Hindsight by default, RetainDB, Honcho's dialectic layer)
+compute it after each turn and inject it on the next one. Because generated turns neither use nor
+replace that result, the next message you send gets the recall for your previous message, even if
+several generated turns ran in between. `prefetch_max_age_seconds` bounds how old that result may be:
+past it the result is dropped and the turn gets no automatic recall, which is better than recall
+about a topic the session has moved past. The default of 30 minutes covers the large majority of
+follow-ups. Set `0` for no limit.
 
 Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the
 built-in stores off completely: the `memory` tool is dropped from the schema and

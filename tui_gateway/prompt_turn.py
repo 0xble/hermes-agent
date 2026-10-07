@@ -10,7 +10,9 @@ post-turn follow-ups (queued prompt, goal continuation, notifications).
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
+from . import pending_moa
 from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
@@ -355,7 +357,9 @@ def _turn_outcome(result: Any, error_surface: dict | None = None) -> tuple[Any, 
 
 
 def _goal_followup_after_turn(
-    sid: str, session: dict, result: Any, status: str, raw: Any) -> str | None:
+    sid: str, session: dict, result: Any, status: str, raw: Any,
+    *, user_initiated: bool = True,
+) -> str | None:
     """/goal continuation (mirrors gateway/run._post_turn_goal_continuation): the prompt to
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
@@ -387,7 +391,7 @@ def _goal_followup_after_turn(
                 _bg_procs = None
             # Goals are keyed by session_key; tool results live under the agent's transcript id.
             decision = goal_mgr.evaluate_after_turn(
-                raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg,
+                raw, user_initiated=user_initiated, background_processes=_bg_procs, active_delegations=_active_deleg,
                 evidence_session_id=getattr(session.get("agent"), "session_id", None) or None)
             if verdict_msg := decision.get("message") or "":
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
@@ -672,7 +676,69 @@ def _stage_first_contact_onboarding_note(session: dict, agent, history_empty: bo
         logger.debug("first-contact onboarding note failed", exc_info=True)
 
 
-def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
+def _apply_pending_moa(sid: str, session: dict, prompt: Any, queue_token: str | None = None) -> bool:
+    """Claim the session-owned MoA record attached to this exact queued item."""
+    if not queue_token:
+        return True
+    item = pending_moa.claim(
+        session, queue_token,
+        restore=pending_moa.restore_snapshot(session, agent=session.get("agent")),
+    )
+    if item is None:
+        _emit("error", sid, {
+            "message": "Deferred MoA request was cancelled or is no longer available; prompt dropped."
+        })
+        return False
+    restore = item.get("restore")
+    if not isinstance(restore, dict):
+        pending_moa.cancel(session, queue_token)
+        _emit("error", sid, {"message": "Deferred MoA request is invalid; prompt dropped."})
+        return False
+    session["_active_moa_token"] = queue_token
+    preset = str(item.get("preset") or "")
+    try:
+        _apply_model_switch(
+            sid, session, f"{preset} --provider moa", confirm_expensive_model=False,
+            pin_session_override=True, persist_override=False, count_switch=False)
+    except Exception as exc:
+        pending_moa.cancel(session, queue_token)
+        session.pop("_active_moa_token", None)
+        _emit("error", sid, {"message": f"Deferred MoA could not start; prompt dropped: {exc}"})
+        return False
+    return True
+
+
+def _restore_moa_one_shot(sid: str, session: dict) -> None:
+    """Restore and consume the session-owned MoA record after its turn."""
+    token = session.pop("_active_moa_token", None)
+    if not token:
+        return
+    record = pending_moa.get(session, token)
+    restore = record.get("restore") if isinstance(record, dict) else None
+    if not isinstance(restore, dict):
+        pending_moa.cancel(session, token)
+        return
+    previous_override = restore.get("override")
+    previous_model = restore.get("model")
+    previous_provider = restore.get("provider")
+    if previous_override is None:
+        session.pop("model_override", None)
+    else:
+        session["model_override"] = previous_override
+    if previous_model:
+        raw = f"{previous_model} --provider {previous_provider}" if previous_provider else previous_model
+        try:
+            _apply_model_switch(
+                sid, session, raw, confirm_expensive_model=False,
+                pin_session_override=bool(previous_override),
+                persist_override=False, count_switch=False)
+        except Exception as exc:
+            logger.warning("MoA one-shot model restore failed: %s", exc)
+    if token:
+        pending_moa.consume(session, token)
+
+
+def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str], queue_token: str | None = None):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
     ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
     Scopes fill field by field so a failure midway still leaves every bound token for the
@@ -695,12 +761,14 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     # The sudo password callback is thread-local: without re-wiring here, sudo prompts
     # fall through to /dev/tty and hang the headless gateway (re-run is a no-op).
     _wire_callbacks(sid)
-    if not st.one_turn_restore:
-        # Skip the config-model sync while a /model --once override is active: the once-model is
-        # intentionally not pinned as a session model_override (it must not persist), so without this guard
-        # the sync would see "agent model != config model" and clobber the once-override back to the config
-        # model before the turn runs (#29923 review defect). Any config.yaml change is adopted on the NEXT
-        # turn, after the finally-restore below.
+    # A missing/cancelled token is a failed deferred dispatch, never permission to
+    # run the prompt on the ordinary model.
+    if queue_token and not _apply_pending_moa(sid, session, text, queue_token):
+        return None
+    if not st.one_turn_restore and not session.get("_active_moa_token"):
+        # Skip the config-model sync while a /model --once override or /moa one-shot is active: the
+        # temporary model is intentionally not pinned as a session model_override (it must not persist),
+        # so without this guard the sync would clobber it before the turn runs.
         _apply_pending_model_switch(sid, session)
         _sync_agent_model_with_config(sid, session)
         _sync_agent_compression_with_config(sid, session)
@@ -763,17 +831,9 @@ def _invoke_agent(
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
     hold = {"buf": "", "held": ""} if _is_bot_mode_session(session) else None
+    loop_hold = {"text": "", "seen": ""}
 
-    def _stream(delta):
-        if getattr(agent, "_mute_notification_reply", False):
-            return
-        if hold is not None and isinstance(delta, str):
-            from gateway.response_filters import is_partial_silence_marker
-            hold["buf"] += delta
-            if is_partial_silence_marker(hold["buf"]):
-                hold["held"] += delta
-                return
-            delta, hold["held"] = hold["held"] + delta, ""
+    def _deliver_delta(delta):
         with session["history_lock"]:
             _append_inflight_delta(session, delta)
         payload = {"text": delta}
@@ -782,6 +842,36 @@ def _invoke_agent(
         if st.tts_queue is not None and isinstance(delta, str):
             st.tts_queue.put(delta)
         _emit("message.delta", sid, payload)
+
+    def _stream(delta):
+        if getattr(agent, "_mute_notification_reply", False):
+            return
+        if isinstance(delta, str):
+            from gateway.response_filters import (
+                ends_with_partial_loop_complete_marker,
+                split_trailing_loop_complete_marker,
+            )
+            loop_candidate = loop_hold["text"] + delta
+            # Judge against everything already released so an open fence keeps it as content.
+            if ends_with_partial_loop_complete_marker(loop_hold["seen"] + loop_candidate):
+                safe, partial = split_trailing_loop_complete_marker(
+                    loop_candidate, context=loop_hold["seen"])
+                loop_hold["text"] = partial
+                if not safe:
+                    return
+                delta = safe
+            else:
+                delta = loop_candidate
+                loop_hold["text"] = ""
+            loop_hold["seen"] += delta
+        if hold is not None and isinstance(delta, str):
+            from gateway.response_filters import is_partial_silence_marker
+            hold["buf"] += delta
+            if is_partial_silence_marker(hold["buf"]):
+                hold["held"] += delta
+                return
+            delta, hold["held"] = hold["held"] + delta, ""
+        _deliver_delta(delta)
 
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
     # by the desktop as its own segment instead of being lost to message.complete.
@@ -850,33 +940,8 @@ def _absorb_turn_result(
                     if display_metadata:
                         message["display_metadata"] = display_metadata
                     break
-    if "moa_one_shot_restore" in session:
-        # Undo a /moa one-shot through the switch path: resetting model_override alone
-        # would leave the live client pinned to MoA after the in-place switch_model().
-        _restore = session.pop("moa_one_shot_restore", None)
-        # Restore the model the user was on before the /moa one-shot. See #53444.
-        if isinstance(_restore, dict):
-            _prev_override = _restore.get("override")
-            _prev_model = _restore.get("model")
-            _prev_provider = _restore.get("provider")
-            if _prev_override is None:
-                session.pop("model_override", None)
-            else:
-                session["model_override"] = _prev_override
-            if _prev_model:
-                _raw = (
-                    f"{_prev_model} --provider {_prev_provider}" if _prev_provider else _prev_model)
-                try:
-                    _apply_model_switch(
-                        sid, session, _raw, confirm_expensive_model=False,
-                        pin_session_override=bool(_prev_override),
-                        persist_override=False, count_switch=False)  # session-internal restore, never config.yaml
-                except Exception as _moa_restore_exc:
-                    logger.warning("MoA one-shot model restore failed: %s", _moa_restore_exc)
-        elif _restore is None:
-            session.pop("model_override", None)
-        else:
-            session["model_override"] = _restore
+    if session.get("_active_moa_token"):
+        _restore_moa_one_shot(sid, session)
     status_note = None
     if isinstance(result, dict):
         if isinstance(result.get("messages"), list):
@@ -955,7 +1020,9 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
     if _is_bot_mode_session(session):
         raw = _bot_mode_delivery_text(raw, successful=status == "complete")
-    payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+    from gateway.response_filters import strip_trailing_loop_complete_marker
+    visible_raw = strip_trailing_loop_complete_marker(raw)
+    payload = {"text": visible_raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
     if last_reasoning:
@@ -975,7 +1042,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     if _billing_block := result.get("billing_block"):
         payload["billing"] = _billing_block
         payload["failure_reason"] = result.get("failure_reason")
-    if rendered := render_message(raw, cols):
+    if rendered := render_message(visible_raw, cols):
         payload["rendered"] = rendered
     error_value = result.get("error")
     final_text = result.get("final_response")
@@ -1076,6 +1143,8 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
             _persist_live_session_system_prompt(session)
         except Exception:
             logger.debug("TUI one-turn model restore failed", exc_info=True)
+    if session.get("_active_moa_token"):
+        _restore_moa_one_shot(sid, session)
     scopes = st.scopes
     with contextlib.suppress(Exception):
         if scopes.approval is not None:
@@ -1127,7 +1196,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    user_turn: bool = False, turn_author: dict | None = None) -> bool:
+    user_turn: bool = False, turn_author: dict | None = None, queue_token: str | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1178,7 +1247,7 @@ def _run_prompt_submit(
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
         try:
-            prepared = _prepare_turn_input(sid, session, st, text, images)
+            prepared = _prepare_turn_input(sid, session, st, text, images, queue_token)
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
                     st.receipt_attempted = True
@@ -1198,7 +1267,8 @@ def _run_prompt_submit(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
             _emit("message.complete", sid, payload)
-            goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+            goal_followup = _goal_followup_after_turn(
+                sid, session, st.result, status, raw, user_initiated=user_turn)
             if status == "complete":
                 _after_complete_turn(sid, session, st, raw)
             # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the

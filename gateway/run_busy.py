@@ -19,6 +19,7 @@ from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.response_filters import apply_agent_origin_reply_expectation, is_agent_origin_text
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -176,7 +177,11 @@ class GatewayBusySessionMixin:
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
         """True for synthetic /goal continuation turns (so pause/clear can spare real /queue items)."""
         text = getattr(event_or_text, "text", event_or_text) or ""
-        return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        try:
+            from hermes_cli.goals import is_goal_continuation_text
+            return is_goal_continuation_text(str(text))
+        except Exception:
+            return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session; real /queue items are kept."""
@@ -508,11 +513,13 @@ class GatewayBusySessionMixin:
             return
         await send
 
-    def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> None:
-        """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing."""
+    def _preserve_drain_event(self, session_key: str, event: MessageEvent) -> bool:
+        """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing.
+
+        Returns whether the event was preserved (FIFO or durable spool)."""
         setattr(event, "_drain_deferred", True)
         if self._queue_or_replace_pending_event(session_key, event):
-            return
+            return True
         # No adapter or a full FIFO: use the same durable shutdown spool rather than lose
         # the turn. Recovery retains the file if its session cannot yet be resolved.
         try:
@@ -522,6 +529,7 @@ class GatewayBusySessionMixin:
             logger.warning("Failed to preserve drain arrival for %s", session_key, exc_info=True)
         if not preserved:
             logger.warning("Drain arrival for %s could not be preserved", session_key)
+        return bool(preserved)
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command. English words
     # (and the thumbs) always match; ``approval.inputs.*`` adds the active language's synonyms.
@@ -1003,6 +1011,9 @@ class GatewayBusySessionMixin:
             if reject_key is not None:
                 return t(reject_key)
         if policy == "defer_until_idle":
+            if name == "moa" and not (event.get_command_args() or "").strip():
+                from hermes_cli.moa_config import moa_usage
+                return moa_usage()
             adapter = self._delivery_adapter_for(source)
             if adapter is None or not hasattr(adapter, "defer_command_until_idle"):
                 return f"⚠️ `/{name}` could not be scheduled because this session has no deferred-command queue."
@@ -1085,7 +1096,7 @@ class GatewayBusySessionMixin:
             return t("gateway.queue.usage")
         adapter = self._delivery_adapter_for(source)
         if adapter:
-            self._enqueue_fifo(quick_key, MessageEvent(
+            queued_event = MessageEvent(
                 text=queued_text, message_type=event.message_type if has_media else MessageType.TEXT,
                 source=event.source, raw_message=event.raw_message, message_id=event.message_id,
                 media_urls=list(getattr(event, "media_urls", []) or []),
@@ -1097,7 +1108,11 @@ class GatewayBusySessionMixin:
                 reply_to_is_own_message=event.reply_to_is_own_message, auto_skill=event.auto_skill,
                 channel_prompt=event.channel_prompt, channel_context=event.channel_context,
                 internal=event.internal, timestamp=event.timestamp,
-            ), adapter)
+                reply_expected=event.reply_expected,
+            )
+            self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+            if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
+                return None
         depth = self._queue_depth(quick_key, adapter=adapter)
         return t("gateway.queue.queued") + (t("gateway.queue.queued_depth", depth=depth) if depth > 1 else "")
 
@@ -1111,15 +1126,18 @@ class GatewayBusySessionMixin:
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
 
-        def _queue_fallback(reply: str) -> str:
+        def _queue_fallback(reply: str) -> Optional[str]:
             # Turn-boundary fallback: queue the steer text as its own follow-up turn.
             adapter = self._delivery_adapter_for(source)
             if adapter:
-                self._enqueue_fifo(quick_key, MessageEvent(
+                queued_event = MessageEvent(
                     text=steer_text, message_type=MessageType.TEXT, source=event.source,
                     message_id=event.message_id, channel_prompt=event.channel_prompt,
-                    channel_context=event.channel_context,
-                ), adapter)
+                    channel_context=event.channel_context, reply_expected=event.reply_expected,
+                )
+                self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+                if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
+                    return None
             return reply
 
         if running_agent is _AGENT_PENDING_SENTINEL:
@@ -1133,7 +1151,15 @@ class GatewayBusySessionMixin:
             return t("gateway.steer.failed", error=exc)
         if not accepted:
             return t("gateway.steer.rejected_empty")
+        # Admission saw "/steer <header>", so mark agent origin on the stripped text before the
+        # fold; otherwise absorbing an unknown expectation resets a relay turn's False to None.
+        # An explicitly addressed relay (True) keeps its expectation and its ack.
+        silent_relay = is_agent_origin_text(steer_text) and event.reply_expected is not True
+        if silent_relay:
+            event.reply_expected = False
         self._fold_into_running_turn(running_agent, quick_key, event)
+        if silent_relay:
+            return None
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
         target = (t("gateway.steer.target_subagents") if self._agent_has_active_subagents(running_agent)
                   else t("gateway.steer.target_run"))

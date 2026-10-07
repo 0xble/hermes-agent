@@ -6,8 +6,33 @@ not what should be persisted in conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any, Optional
+
+# First-line headers that mark an inbound message as sent by another agent session, not typed by
+# the user. Such a message may end in a bare silence marker. Relay's own parser uses the same
+# value class (``[^\s\]]+``), so both sides agree on what a header is.
+_AGENT_ORIGIN_HEADERS = (
+    re.compile(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]"),
+)
+
+
+def is_agent_origin_text(text: Any) -> bool:
+    """True when the first non-blank line is a complete registered agent-origin header."""
+    stripped = text.lstrip() if isinstance(text, str) else ""
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0].rstrip()
+    return any(pattern.fullmatch(first_line) for pattern in _AGENT_ORIGIN_HEADERS)
+
+
+def apply_agent_origin_reply_expectation(event: Any) -> Any:
+    """Mark an agent-origin event as not needing a reply; an explicit True is never overridden."""
+    if getattr(event, "reply_expected", None) is not True and is_agent_origin_text(getattr(event, "text", "")):
+        event.reply_expected = False
+    return event
+
 
 # Exact whole-response markers meaning "the agent intentionally chose not to
 # reply". Keep small and explicit; arbitrary empty output remains an
@@ -35,6 +60,7 @@ MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND})
 
 # Longer than any marker could plausibly be, even with stray punctuation.
 _MARKER_LENGTH_CAP = 64
+_FENCE_LINE_RE = re.compile(r"^\s*(`{3,}|~{3,})(?:.*)?$")
 
 
 def _canonical_silence_candidate(text: str) -> str:
@@ -73,6 +99,167 @@ def is_intentional_silence_response(response: Any) -> bool:
     response is not silence either — that is the empty-response failure path.
     """
     return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
+
+
+def _fenced_line_states(lines: list[str]) -> list[bool]:
+    """Return whether each line starts inside a Markdown fenced code block."""
+    states: list[bool] = []
+    fence_char: str | None = None
+    fence_len = 0
+    for line in lines:
+        states.append(fence_char is not None)
+        match = _FENCE_LINE_RE.match(line.rstrip("\r\n"))
+        if not match:
+            continue
+        fence = match.group(1)
+        if fence_char is not None:
+            if fence[0] == fence_char and len(fence) >= fence_len:
+                fence_char = None
+                fence_len = 0
+        else:
+            fence_char = fence[0]
+            fence_len = len(fence)
+    return states
+
+
+def _strip_trailing_marker_lines(
+    text: Any, is_marker, *, respect_fences: bool = True, preserve_bare: bool = False,
+) -> Any:
+    """Strip consecutive top-level marker lines from the end of *text*.
+
+    ``preserve_bare`` retains the last marker when removing it would otherwise make the
+    whole response empty. Silence uses that behavior so its existing exact-marker path
+    remains authoritative; display-only control markers do not.
+    """
+    if not isinstance(text, str):
+        return text
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    fenced = _fenced_line_states(lines) if respect_fences else [False] * len(lines)
+    end = len(lines)
+    last_marker = ""
+    while end:
+        while end and not lines[end - 1].strip():
+            end -= 1
+        if not end or fenced[end - 1] or not is_marker(lines[end - 1]):
+            break
+        last_marker = last_marker or lines[end - 1].strip()
+        end -= 1
+    if not last_marker:
+        return text
+    kept = "".join(lines[:end]).rstrip()
+    return kept if kept.strip() or not preserve_bare else last_marker
+
+
+def strip_trailing_silence_marker(text: Any, *, respect_fences: bool = True) -> Any:
+    """Remove the run of top-level standalone silence-marker lines ending substantive text.
+
+    One or more consecutive trailing marker lines are removed. The exact interactive
+    silence rule remains authoritative for a bare marker, so a bare marker is returned
+    unchanged, and a response made only of marker lines collapses to its last marker so
+    it still reaches the intentional-silence path rather than the empty-response one.
+    Marker-looking lines inside fenced code are content, not control text.
+    ``respect_fences=False`` is only for raw text whose fence-aware visible form
+    (think blocks removed) already proved the trailing lines are top-level.
+    """
+    if not isinstance(text, str) or is_intentional_silence_response(text):
+        return text
+    return _strip_trailing_marker_lines(
+        text, is_intentional_silence_response,
+        respect_fences=respect_fences, preserve_bare=True,
+    )
+
+
+_LOOP_COMPLETE_LINE_RE = re.compile(r"^\s*LOOP_COMPLETE\s*[.!]?\s*$", re.IGNORECASE)
+_LOOP_COMPLETE_MARKER = "LOOP_COMPLETE"
+
+
+def is_loop_complete_marker(text: Any) -> bool:
+    """True when a line is the loop completion marker with optional punctuation."""
+    return isinstance(text, str) and _LOOP_COMPLETE_LINE_RE.fullmatch(text) is not None
+
+
+def strip_trailing_loop_complete_marker(text: Any, *, respect_fences: bool = True) -> Any:
+    """Remove trailing top-level ``LOOP_COMPLETE`` lines for display only.
+
+    A marker in a fenced code block or mid-prose is content. A marker-only reply
+    becomes empty; loop detection must use the raw response instead.
+    """
+    return _strip_trailing_marker_lines(
+        text, is_loop_complete_marker,
+        respect_fences=respect_fences, preserve_bare=False,
+    )
+
+
+def split_trailing_loop_complete_marker(text: Any, *, context: str = "") -> tuple[Any, str]:
+    """Split safe prefix from a trailing top-level marker candidate for streaming.
+
+    The held tail is the trailing candidate line plus every complete top-level marker line
+    (and blank line) directly before it, so a repeated marker never flashes on screen.
+    ``context`` is the text already released this segment: fence state is judged over
+    ``context + text`` (a fence opened in an earlier chunk may close in this one), but only
+    ``text`` is ever split, since ``context`` is already on screen.
+    """
+    if not isinstance(text, str):
+        return text, ""
+    context = context if isinstance(context, str) else ""
+    full = context + text
+    if not ends_with_partial_loop_complete_marker(full):
+        return text, ""
+    lines = full.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end:
+        return text, ""
+    fenced = _fenced_line_states(lines)
+    start = end - 1
+    probe = start
+    while probe:
+        while probe and not lines[probe - 1].strip():
+            probe -= 1
+        if not probe or fenced[probe - 1] or not is_loop_complete_marker(lines[probe - 1]):
+            break
+        probe -= 1
+        start = probe
+    cut = max(len("".join(lines[:start])) - len(context), 0)
+    return text[:cut], text[cut:]
+
+
+def ends_with_partial_loop_complete_marker(text: Any) -> bool:
+    """True while the trailing top-level line could still become ``LOOP_COMPLETE``."""
+    if not isinstance(text, str):
+        return False
+    lines = text.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end or _fenced_line_states(lines)[end - 1]:
+        return False
+    candidate = lines[end - 1].strip().upper()
+    if not candidate:
+        return False
+    if candidate == _LOOP_COMPLETE_MARKER or is_loop_complete_marker(lines[end - 1]):
+        return True
+    return _LOOP_COMPLETE_MARKER.startswith(candidate)
+
+
+def ends_with_partial_silence_marker(text: Any) -> bool:
+    """True while the last top-level line of streamed ``text`` could still be a marker.
+
+    Mid-stream previews hold an edit while this is true, so prose followed by a
+    trailing ``NO_REPLY`` never shows the marker before the final strip removes it.
+    """
+    if not isinstance(text, str):
+        return False
+    lines = text.splitlines(keepends=True)
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end or _fenced_line_states(lines)[end - 1]:
+        return False
+    return is_partial_silence_marker(lines[end - 1])
 
 
 def is_autonomous_silence_response(response: Any) -> bool:

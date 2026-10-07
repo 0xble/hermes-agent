@@ -18,7 +18,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
-from agent.memory_provider import MemoryProvider, is_trivial_prompt
+from agent.memory_provider import MemoryProvider, PrefetchGeneration, is_trivial_prompt
 from agent.coding_context import INTERACTIVE_CODING_PLATFORMS as _LOCAL_PLATFORMS
 from agent.turn_author import a2a_key
 from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
@@ -127,6 +127,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._query_rewriter = query_rewriter
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
+        # Each spawned dialectic is a generation; a superseded or discarded one publishes nothing.
+        self._prefetch_generation = PrefetchGeneration(self._prefetch_lock)
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
         self._memwrite_thread: Optional[threading.Thread] = None

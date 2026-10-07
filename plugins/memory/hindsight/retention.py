@@ -4,25 +4,8 @@ from __future__ import annotations
 
 import re
 
-from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
-from tools.delegation_resume import AUTO_RESUME_NOTICE_OPEN
-from tools.process_registry_notifications import (
-    PROCESS_NOTICE_OPEN, PROCESS_NOTIFICATION_END, PROCESS_NOTICE_OPENERS,
-)
+from agent.synthetic_prompt import human_prompt_text, text_after_generated_prefix
 
-# Legacy unframed rows have no reliable payload boundary, so only these exact
-# historical forms are dropped wholesale. Framed rows use the defining
-# formatter's openers and end marker instead of a copied list of variants.
-_LEGACY_MACHINE_NOTICE_PREFIXES = (
-    "[NATIVE REVIEW COMPLETE",
-    "[SUBAGENT",
-    "⚠ SUBAGENT",
-    "[CONTEXT COMPACTION",
-    "[CONTEXT SUMMARY",
-    "[PRIOR CONTEXT",
-    "[System note:",
-)
-_MACHINE_NOTICE_PREFIXES = (*PROCESS_NOTICE_OPENERS, AUTO_RESUME_NOTICE_OPEN, *_LEGACY_MACHINE_NOTICE_PREFIXES)
 _MEMORY_CONTEXT_BLOCK_RE = re.compile(
     r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>",
     re.IGNORECASE,
@@ -55,40 +38,9 @@ def _clean_message(content: str, *, preserve_unmatched_literal: bool = False) ->
     return cleaned.strip()
 
 
-def _user_after_machine_notice(content: str) -> str | None:
-    """Keep only text after the formatter's boundary, never its untrusted payload."""
-    if not content.startswith(_MACHINE_NOTICE_PREFIXES):
-        return content
-    if content.startswith(PROCESS_NOTICE_OPEN) and f"\n{PROCESS_NOTIFICATION_END}" not in content:
-        # Preserve historical unframed process notices, but don't classify an
-        # arbitrary user-written [IMPORTANT: ...] as a process result.
-        if not re.match(r"\[IMPORTANT: (?:Background process |\d+ background (?:processes|subagent delegations) completed)", content):
-            return content
-    # Gateway recovery notes are a closed bracket followed by a blank line
-    # before any real user message (gateway.run.build_resume_recovery_note).
-    if content.startswith("[System note:"):
-        _, boundary, suffix = content.partition("]\n\n")
-        return suffix.strip() or None if boundary else None
-    # A legacy, unframed notice has no provable end: it cannot yield a
-    # trustworthy suffix, even if the goal/result contains request-like words.
-    _, boundary, suffix = content.rpartition(f"\n{PROCESS_NOTIFICATION_END}")
-    if not boundary:
-        return None
-    suffix = suffix.strip()
-    # Upstream appends machine provenance after the process payload boundary.
-    # Strip only the known complete footer forms, preserving any later human suffix.
-    from gateway.run_notifications import _INTERNAL_NOTIFICATION_FOOTERS
-    for footer in _INTERNAL_NOTIFICATION_FOOTERS:
-        if suffix.startswith(footer):
-            suffix = suffix[len(footer):].strip()
-            break
-    if suffix.startswith(STEER_MARKER_OPEN + "\n") and suffix.endswith("\n" + STEER_MARKER_CLOSE):
-        suffix = suffix[len(STEER_MARKER_OPEN): -len(STEER_MARKER_CLOSE)].strip()
-    return suffix or None
-
-
 def _is_machine_notice(content: str) -> bool:
-    return _user_after_machine_notice(content) is None
+    # Synthetic-turn filtering is user-side only; assistant text keeps the historical notice rules.
+    return text_after_generated_prefix(content, include_templates=False) is None
 
 
 def _is_assistant_status_only(content: str) -> bool:
@@ -97,15 +49,19 @@ def _is_assistant_status_only(content: str) -> bool:
     return "\n" not in content and bool(_ASSISTANT_STATUS_ONLY_RE.fullmatch(content))
 
 
-def filter_retain_messages(user_content: str, assistant_content: str) -> tuple[str | None, str | None]:
+def filter_retain_messages(
+    user_content: str, assistant_content: str, *, display_kind: str | None = None,
+    platform: str | None = None,
+) -> tuple[str | None, str | None]:
     """Return the durable parts of one user/assistant turn.
 
-    Machine notices and recalled memory context are excluded. User messages are
-    never classified by generic status wording; only known Hermes-injected
-    prefixes are dropped. Assistant text loses only exact silence markers and a
-    small, explicit set of one-line status-only responses.
+    The user side keeps only its human-authored part (``agent.synthetic_prompt``, shared with the
+    auto-recall gate): generated notices and prompts are dropped by their formatter boundary or by
+    the turn's runtime-owned provenance, never by generic status wording. Recalled memory context is
+    excluded. Assistant text loses only exact silence markers and a small, explicit set of one-line
+    status-only responses.
     """
-    user = _user_after_machine_notice(user_content.strip())
+    user = human_prompt_text(user_content, display_kind=display_kind, platform=platform)
     user = _clean_message(user, preserve_unmatched_literal=True) or None if user else None
     assistant = _clean_message(assistant_content)
     if not assistant or _is_machine_notice(assistant) or _is_assistant_status_only(assistant):
