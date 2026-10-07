@@ -34,6 +34,38 @@ def _loaded_forward_labels(*, runner=None) -> list[str]:
     return sorted(set(_FORWARD_LABEL.findall(result.stdout or "")))
 
 
+_HOME_LINE = re.compile(r"^\s*HERMES_HOME\s*=>\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _label_hermes_home(label: str, *, runner=None) -> Path | None:
+    """HERMES_HOME a loaded generation job was rendered for, or None when it cannot be read.
+
+    Generation plists pin ``EnvironmentVariables.HERMES_HOME`` to the resolved home, and
+    ``launchctl print`` echoes it in the job's ``environment`` block.
+    """
+    import os
+
+    runner = runner or subprocess.run
+    try:
+        result = runner(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = _HOME_LINE.search(result.stdout or "")
+    return Path(match.group(1)).expanduser() if match else None
+
+
+def _same_home(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
 def _forward_update_leftover(home: Path) -> bool:
     path = home / "forward-update.json"
     if not path.exists():
@@ -53,7 +85,14 @@ def leftover_forward_only_state(home: Path) -> list[str]:
     home = Path(home)
     findings = [f"file {home / 'forward-update.json'}"
                 ] if _forward_update_leftover(home) else []
-    findings.extend(f"loaded launchd label {label}" for label in _loaded_forward_labels())
+    for label in _loaded_forward_labels():
+        owner = _label_hermes_home(label)
+        # Another installation's generation job is not this home's leftover. An unreadable
+        # owner stays fail-closed: refusing is recoverable, a second poller on one token is not.
+        if owner is not None and not _same_home(owner, home):
+            continue
+        suffix = "" if owner is not None else " (owner HERMES_HOME unreadable)"
+        findings.append(f"loaded launchd label {label}{suffix}")
     return findings
 
 
