@@ -101,6 +101,16 @@ class TestLogicalLineStreaming:
         assert "Done." in plain
         assert "LOOP_COMPLETE" not in plain
 
+    def test_repeated_marker_never_flashes(self, cli_stub):
+        cli, emitted = cli_stub
+        cli._stream_delta("Done.\n")
+        cli._stream_delta("LOOP_COMPLETE\n")
+        cli._stream_delta("LOOP_COMPLETE")
+        cli._flush_stream()
+        plain = _strip_ansi("\n".join(emitted))
+        assert "Done." in plain
+        assert "LOOP_COMPLETE" not in plain
+
     def test_held_partial_marker_is_released_at_tool_boundary(self, cli_stub):
         """A held prefix is content when tools run next; it must not be lost or split."""
         cli, emitted = cli_stub

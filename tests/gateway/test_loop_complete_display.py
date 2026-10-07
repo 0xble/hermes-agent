@@ -17,3 +17,19 @@ def test_loop_complete_partial_marker_only_matches_top_level_tail():
     assert ends_with_partial_loop_complete_marker("Done.\nLOOP_COMPLETE")
     assert not ends_with_partial_loop_complete_marker("```\nLOOP_COM")
     assert not ends_with_partial_loop_complete_marker("Mention LOOP_COM in prose")
+
+
+def test_loop_complete_split_holds_the_whole_trailing_marker_run():
+    """A repeated marker must be held as one run so none of it flashes while streaming."""
+    from gateway.response_filters import split_trailing_loop_complete_marker
+
+    assert split_trailing_loop_complete_marker("Done.\nLOOP_COMPLETE\nLOOP_COMPLETE") == (
+        "Done.\n", "LOOP_COMPLETE\nLOOP_COMPLETE",
+    )
+    assert split_trailing_loop_complete_marker("Done.\nLOOP_COMPLETE\n\nLOOP_COM") == (
+        "Done.\n", "LOOP_COMPLETE\n\nLOOP_COM",
+    )
+    assert split_trailing_loop_complete_marker("Done.\nLOOP_COM") == ("Done.\n", "LOOP_COM")
+    assert split_trailing_loop_complete_marker("```\nLOOP_COMPLETE\n```\nLOOP_COM") == (
+        "```\nLOOP_COMPLETE\n```\n", "LOOP_COM",
+    )
