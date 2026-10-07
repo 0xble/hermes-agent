@@ -50,6 +50,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
 def discord_triggering_note(message_id: Any) -> str:
     """Model-facing routing note for a Discord turn (rides the API-bound user message only)."""
     return (
@@ -269,6 +270,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 or (reconnect_keys and reconnect_keys.get(reconnect_key, 0))
             )
             and not getattr(event, "_hermes_startup_restore_replay", False)
+            and not _is_restore_control_event(event)
         ):
             self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None

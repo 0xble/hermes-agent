@@ -2751,6 +2751,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         # Keep direct phase callers safe too. _stop_impl performs the same spool before creating this
         # cancellable task, so a timed-out restart never relies on this coroutine reaching its first await.
         _persist_shutdown_pending_messages(self)
+        scheduler = getattr(self, "_replay_scheduler", None)
+        if scheduler is not None:
+            with suppress(Exception):
+                await scheduler.close()
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()

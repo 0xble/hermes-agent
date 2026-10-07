@@ -890,7 +890,8 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # task after a restart. 1h covers agent.gateway_timeout (30 min) + slack; cfg agent.gateway_auto_continue_freshness.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 
-# Boot auto-resume drain before the inbound gate opens. Override: agent.gateway_startup_restore_drain_timeout.
+# Bounded wait for boot/reconnect replay drains and boot-path sends before the inbound gate opens.
+# Override: agent.gateway_startup_restore_drain_timeout.
 _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT = 30.0
 
 # Bound on the boot warm-up BEFORE the gate opens (no skeleton system prompt on turn one); keeps a wedged init

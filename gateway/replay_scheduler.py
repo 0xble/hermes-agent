@@ -55,6 +55,7 @@ class ReplayScheduler:
         self._sequence = itertools.count()
         self._condition = asyncio.Condition()
         self._workers: set[asyncio.Task] = set()
+        self._wake_tasks: set[asyncio.Task] = set()
         self._started = False
         self._active = 0
         self._closed = False
@@ -128,9 +129,11 @@ class ReplayScheduler:
                 self._condition.notify_all()
 
         # notify() must run under the condition lock, but enqueue itself is
-        # synchronous and intentionally does not await.  The notification task is
-        # tiny and is not a replay worker, so it cannot consume the cap.
-        asyncio.get_running_loop().create_task(_notify())
+        # synchronous and intentionally does not await.  The notification task
+        # is tiny and is not a replay worker, so it cannot consume the cap.
+        task = asyncio.get_running_loop().create_task(_notify())
+        self._wake_tasks.add(task)
+        task.add_done_callback(self._wake_tasks.discard)
 
     def _worker_done(self, worker: asyncio.Task) -> None:
         self._workers.discard(worker)
@@ -211,3 +214,5 @@ class ReplayScheduler:
             self._condition.notify_all()
         if self._workers:
             await asyncio.gather(*tuple(self._workers), return_exceptions=True)
+        if self._wake_tasks:
+            await asyncio.gather(*tuple(self._wake_tasks), return_exceptions=True)
