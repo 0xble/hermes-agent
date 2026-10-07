@@ -2044,17 +2044,21 @@ class GatewayShutdownMixin:
         cancellation only detaches the thread after its registry hooks have stopped issuing kills and
         checkpoint writes; it is therefore safe for the successor gateway to proceed.
         """
-        stop_event = threading.Event()
         deadline = time.monotonic() + timeout if timeout is not None else None
+        stop_event = threading.Event() if timeout is not None else None
+        kill_kwargs: dict[str, Any] = {"phase": phase, "deadline": deadline}
+        if stop_event is not None:
+            kill_kwargs["stop_event"] = stop_event
         task = asyncio.create_task(asyncio.to_thread(
             GatewayShutdownMixin._stop_kill_tool_subprocesses,
-            phase, deadline=deadline, stop_event=stop_event,
+            **kill_kwargs,
         ))
         if timeout is None:
             return await task
         done, _pending = await asyncio.wait({task}, timeout=timeout)
         if task in done:
             return await task
+        assert stop_event is not None
         stop_event.set()
         task.cancel()
         logger.warning("Shutdown phase: %s exceeded %.1fs; detaching cooperative cleanup", phase, timeout)
@@ -2180,16 +2184,38 @@ class GatewayShutdownMixin:
         # Record interrupted cron runs independently of the tool sweep. A blocked registry kill must not
         # turn a truncated cron run into a plausible success or lose its interruption notice.
         from cron.scheduler import mark_running_jobs_interrupted
-        _interrupted_cron_jobs = await asyncio.to_thread(
+        _mark_task = asyncio.create_task(asyncio.to_thread(
             GatewayRunner._quiet_step,
             "mark_running_jobs_interrupted (post-interrupt) error",
             lambda: mark_running_jobs_interrupted(
                 "Gateway shutdown (post-interrupt) interrupted the job before tool cleanup completed."
             ),
             level=logging.WARNING,
-        ) or []
+        ))
+        _restart_deadline = None
+        if self._restart_requested:
+            _restart_deadline = time.monotonic() + self._restart_shutdown_bound()
+            _mark_done, _pending = await asyncio.wait(
+                {_mark_task}, timeout=max(0.0, _restart_deadline - time.monotonic())
+            )
+            if _mark_task in _mark_done:
+                _interrupted_cron_jobs = await _mark_task or []
+            else:
+                # Do not cancel the worker: it may be waiting on a fire fence and must finish its
+                # durable mark when the in-flight delivery releases it. Any execution rows it has
+                # not reached remain recoverable by recover_interrupted_executions() on next boot.
+                logger.warning(
+                    "Shutdown phase: mark_running_jobs_interrupted exceeded the restart deadline; "
+                    "leaving the worker detached so unmarked execution rows can be recovered on next boot"
+                )
+                _interrupted_cron_jobs = []
+        else:
+            _interrupted_cron_jobs = await _mark_task or []
+        _sweep_timeout = min(2.0, self._restart_shutdown_bound())
+        if _restart_deadline is not None:
+            _sweep_timeout = min(_sweep_timeout, max(0.0, _restart_deadline - time.monotonic()))
         _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
-            "post-interrupt", timeout=min(2.0, self._restart_shutdown_bound()),
+            "post-interrupt", timeout=_sweep_timeout,
         )
         if _swept_cron_jobs:
             _interrupted_cron_jobs = list(dict.fromkeys(_interrupted_cron_jobs + _swept_cron_jobs))

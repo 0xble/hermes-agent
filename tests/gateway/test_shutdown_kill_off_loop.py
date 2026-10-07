@@ -73,6 +73,24 @@ async def test_post_interrupt_kill_runs_off_event_loop(monkeypatch):
         )
 
 
+@pytest.mark.asyncio
+async def test_graceful_kill_uses_parent_first_registry_path(monkeypatch):
+    """An unbounded stop must not opt the registry into the bounded sweep."""
+    import tools.process_registry as _pr
+
+    observed = {}
+
+    def _fake_kill_all(**kwargs):
+        observed.update(kwargs)
+        return 1
+
+    monkeypatch.setattr(_pr.process_registry, "kill_all", _fake_kill_all)
+
+    assert await GatewayShutdownMixin._stop_kill_tool_subprocesses_off_loop("graceful") == []
+    assert "deadline" not in observed
+    assert "stop_event" not in observed
+
+
 def test_foreground_processes_are_killed_after_shared_deadline(monkeypatch):
     """The fast foreground-process sweep is unconditional after kill_all expires."""
     events = []
@@ -105,6 +123,39 @@ async def test_mark_running_cron_jobs_runs_off_event_loop(monkeypatch):
     mark_threads = [thread for name, thread in events if name == "mark_cron"]
     assert mark_threads
     assert all(thread is not loop_thread for thread in mark_threads)
+
+
+@pytest.mark.asyncio
+async def test_restart_mark_running_cron_jobs_is_bounded(monkeypatch):
+    """A held cron fire fence cannot consume the whole bounded restart handoff."""
+    events: list = []
+    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    runner._restart_requested = True
+    runner._restart_shutdown_bound = lambda: 0.05
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def _blocked_mark(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        finished.set()
+        return ["late-job"]
+
+    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", _blocked_mark)
+
+    started = time.monotonic()
+    await runner._stop_interrupt_remaining_work(_make_ctx())
+    elapsed = time.monotonic() - started
+
+    try:
+        assert entered.wait(timeout=0.2)
+        assert elapsed < 0.5
+        assert not finished.is_set()
+    finally:
+        release.set()
+        assert finished.wait(timeout=1)
 
 
 @pytest.mark.asyncio
