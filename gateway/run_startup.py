@@ -37,7 +37,9 @@ from gateway.restart import (
 #: restartable exit introduces: a permanently dead backend looping forever unnoticed.
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
 from gateway.run_shutdown import _log_suppressed, _send_error
-from gateway.replay_scheduler import REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME
+from gateway.replay_scheduler import (
+    REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME, REPLAY_PRIORITY_SYNTHETIC,
+)
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
@@ -121,9 +123,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             logger.info(
                 "Queued replay source: kind=%s session_key=%s",
                 kind,
-                self._session_key_for_source(self._normalize_source_for_session_key(source)),
+                session_key or self._session_key_for_source(self._normalize_source_for_session_key(source)),
                 extra={"replay_scheduler": "source_queued", "kind": kind},
             )
+
 
 
 
@@ -295,7 +298,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         drained = 0
         try:
             await self._await_startup_warmup()
-            drained = await self._drain_startup_restore_queue(wait=False)
+            drained = await self._drain_startup_restore_queue()
         finally:
             self._startup_restore_in_progress = False
         if drained:

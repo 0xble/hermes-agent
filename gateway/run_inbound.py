@@ -263,11 +263,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             normalized = await asyncio.to_thread(self._normalize_source_for_session_key, source)
             reconnect_key = self._session_key_for_source(normalized)
         if (
-            reconnect_keys and reconnect_keys.get(reconnect_key, 0)
-            and not is_internal
+            not is_internal
+            and (
+                getattr(self, "_startup_restore_in_progress", False)
+                or (reconnect_keys and reconnect_keys.get(reconnect_key, 0))
+            )
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
-            self._queue_startup_restore_event(event)
+            self._queue_startup_restore_event(event, session_key=reconnect_key)
             return None
 
         # Adapter admission can precede this task by an arbitrary delay on an idle lane.
