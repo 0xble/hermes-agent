@@ -119,6 +119,13 @@ class PrefetchGeneration:
         """Obsolete every outstanding token and run ``reset`` (drop buffered state) under the lock."""
         self.begin(reset)
 
+    def discard_if(self, stale: Callable[[], bool]) -> bool:
+        """:meth:`discard` only when ``stale()`` holds, checked under the same lock.
+
+        ``stale`` decides and drops the state in one critical section, so a request that starts
+        concurrently is either seen (and kept) by the check or starts after the discard."""
+        return self.begin_if(stale) is not None
+
     @contextlib.contextmanager
     def publishing(self, token: int) -> Iterator[bool]:
         """Hold the lock and yield whether ``token`` is still current. Publish only when it is."""

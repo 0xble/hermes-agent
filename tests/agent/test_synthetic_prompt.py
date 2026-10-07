@@ -847,3 +847,41 @@ def test_human_suffix_quoting_the_revision_header_is_kept():
     header = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0].strip()
     suffix = f'Why does it say "{header}"? I never revised it.'
     assert human_prompt_text(_goal_prompt() + "\n" + suffix) == suffix
+
+
+def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
+    """Review of fbbb520: the age check, the timestamp clear and the discard are one critical section
+    with queue_prefetch_all, so a fresh request that lands while a stale one is being judged is either
+    seen by the check (and kept) or starts after the discard, never dropped by it."""
+    import threading
+
+    manager = MemoryManager(prefetch_max_age_seconds=1800.0)
+    provider = _BufferingProvider()
+    manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    manager.queue_prefetch_all("old topic", session_id="s-1")
+    assert manager.flush_pending(timeout=5) is True
+    clock[0] += 1801  # the buffered recall is now stale
+
+    import agent.memory_manager as memory_manager
+    stale_now = memory_manager._now
+    fresh = threading.Thread(target=manager.queue_prefetch_all, args=(HUMAN,), kwargs={"session_id": "s-1"})
+    raced = []
+
+    def now_with_a_fresh_queue_in_flight():
+        # The first clock read is the stale check: a fresh human turn queues right then. It must
+        # wait for the check's lock rather than slip between the check and the discard.
+        if not raced:
+            raced.append(True)
+            fresh.start()
+            fresh.join(0.3)
+        return stale_now()
+
+    memory_manager._now = now_with_a_fresh_queue_in_flight
+    try:
+        assert manager.prefetch_all("follow-up", session_id="s-1") == ""  # the stale recall is dropped
+    finally:
+        memory_manager._now = stale_now
+    fresh.join(5)
+    assert manager.flush_pending(timeout=5) is True
+    assert provider.queued[-1] == HUMAN
+    assert manager.prefetch_all("next", session_id="s-1") != ""  # the fresh recall survived

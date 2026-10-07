@@ -561,20 +561,25 @@ class MemoryManager:
         ``prefetch_max_age_seconds``. The buffer is keyed on the last turn that queued, which can be a
         human message many generated or trivial turns back. Within the bound that result is still the
         latest human intent and is kept; past it, injecting nothing beats injecting an old topic."""
-        queued_at, max_age = self._prefetch_queued_at, self._prefetch_max_age
-        if queued_at is None or max_age is None or _now() - queued_at <= max_age:
-            return
-        self._prefetch_queued_at = None
-        logger.debug("Discarding buffered memory prefetch queued %.0fs ago (limit %.0fs)", _now() - queued_at, max_age)
-        # Obsolete the manager token and drop provider buffers under the same lock a queued dispatch
-        # holds, so a dispatch that passed its check either finishes first (and its provider-level
-        # generation is then discarded here) or sees the discarded token and never reaches a provider.
+        # Check the age, clear the timestamp, obsolete the manager token and drop provider buffers in
+        # one critical section, the one queue_prefetch_all starts its token in and a queued dispatch
+        # holds. A fresh request is then either seen by the check (and kept) or starts after the
+        # discard, and a dispatch that passed its check either finishes first (and is dropped here)
+        # or sees the obsolete token and never reaches a provider.
         # Duck-typed providers that predate the hook have nothing to call.
-        def _discard_providers() -> None:
+        def _discard_if_stale() -> bool:
+            queued_at, max_age = self._prefetch_queued_at, self._prefetch_max_age
+            if queued_at is None or max_age is None or _now() - queued_at <= max_age:
+                return False
+            self._prefetch_queued_at = None
+            logger.debug("Discarding buffered memory prefetch queued %.0fs ago (limit %.0fs)",
+                         _now() - queued_at, max_age)
             self._each_provider("discard_prefetch failed (non-fatal)",
                                 lambda p: getattr(p, "discard_prefetch", lambda: None)())
+            return True
 
-        self._prefetch_generation.discard(_discard_providers)
+        if self._prefetch_max_age is not None:
+            self._prefetch_generation.discard_if(_discard_if_stale)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
