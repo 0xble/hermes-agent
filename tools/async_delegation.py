@@ -421,44 +421,28 @@ def recover_abandoned_delegations() -> int:
             if alive(pid, started):
                 continue
             task = json.loads(task_json or "{}")
-            if last_state == "queued":
-                error = "Delegation owner exited while this work was queued; it was never started."
-                event = {
-                    "type": "async_delegation", "delegation_id": delegation_id,
-                    "session_key": session_key, "origin_ui_session_id": origin_ui,
-                    "origin_session_id": origin_sid or "", "parent_session_id": parent_id,
-                    "goal": task.get("goal", ""), "goals": task.get("goals"),
-                    "context": task.get("context"), "toolsets": task.get("toolsets"),
-                    "role": task.get("role"), "model": task.get("model"),
-                    "is_batch": bool(task.get("is_batch")), "status": "interrupted",
-                    "summary": None, "error": error, "exit_reason": "interrupted",
-                    "dispatched_at": dispatched_at, "completed_at": now,
-                    **{k: task[k] for k in _ROUTING_KEYS if task.get(k)},
-                }
-                result = {"status": "interrupted", "summary": None, "error": error,
-                          "exit_reason": "interrupted"}
-                conn.execute("""UPDATE async_delegations SET state='interrupted', completed_at=?,
-                       updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                       WHERE delegation_id=? AND state='queued'""",
-                    (now, now, json.dumps(event), json.dumps(result), delegation_id))
-                recovered += 1
-                continue
             cron_execution_id = task.get("cron_execution_id")
             if cron_execution_id:
                 # A cron runner is merely a waiter. Its detached worker owns the
-                # execution and can outlive this process. Do not fabricate a
-                # terminal notification while that worker is still running.
+                # execution and can outlive this process. Do not classify the
+                # waiter's queued/admitted handoff as never-started work.
                 from cron.delivery_queue import MISSING_EXECUTION_GRACE
                 from cron.executions import get_execution
                 execution = get_execution(cron_execution_id)
                 if execution is None:
                     if now - dispatched_at < MISSING_EXECUTION_GRACE.total_seconds():
+                        if last_state in ("queued", "admitted"):
+                            conn.execute("""UPDATE async_delegations SET state='running', updated_at=?
+                                   WHERE delegation_id=? AND state=?""", (now, delegation_id, last_state))
                         continue
                     # A pruned row has no provable outcome. Use the generic
                     # unknown event below; never rerun or invent a completion.
                 elif execution["status"] not in ("completed", "failed", "unknown"):
                     # The scheduler owns ledger recovery on its tick. A delegation
                     # sweep must not mutate the cron store under its own DB lock.
+                    if last_state in ("queued", "admitted"):
+                        conn.execute("""UPDATE async_delegations SET state='running', updated_at=?
+                               WHERE delegation_id=? AND state=?""", (now, delegation_id, last_state))
                     continue
                 else:
                     from tools.cronjob_tools import _manual_run_completion
@@ -479,11 +463,34 @@ def recover_abandoned_delegations() -> int:
                     }
                     conn.execute("""UPDATE async_delegations SET state=?, completed_at=?,
                            updated_at=?, event_json=?, result_json=?, delivery_state='pending'
-                           WHERE delegation_id=? AND state IN ('running','finalizing','admitted')""",
+                           WHERE delegation_id=? AND state IN ('queued','running','finalizing','admitted')""",
                         (completed["status"], now, now, json.dumps(event),
                          json.dumps(completed), delegation_id))
                     recovered += 1
                     continue
+            if last_state in ("queued", "admitted") and not cron_execution_id:
+                error = (f"Delegation owner exited while this work was {last_state}; "
+                         "it was never started.")
+                event = {
+                    "type": "async_delegation", "delegation_id": delegation_id,
+                    "session_key": session_key, "origin_ui_session_id": origin_ui,
+                    "origin_session_id": origin_sid or "", "parent_session_id": parent_id,
+                    "goal": task.get("goal", ""), "goals": task.get("goals"),
+                    "context": task.get("context"), "toolsets": task.get("toolsets"),
+                    "role": task.get("role"), "model": task.get("model"),
+                    "is_batch": bool(task.get("is_batch")), "status": "interrupted",
+                    "summary": None, "error": error, "exit_reason": "interrupted",
+                    "dispatched_at": dispatched_at, "completed_at": now,
+                    **{k: task[k] for k in _ROUTING_KEYS if task.get(k)},
+                }
+                result = {"status": "interrupted", "summary": None, "error": error,
+                          "exit_reason": "interrupted"}
+                conn.execute("""UPDATE async_delegations SET state='interrupted', completed_at=?,
+                       updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                       WHERE delegation_id=? AND state=?""",
+                    (now, now, json.dumps(event), json.dumps(result), delegation_id, last_state))
+                recovered += 1
+                continue
             error = ("Cron execution record missing; outcome unknown."
                      if cron_execution_id else
                      "Delegation owner exited before recording a terminal result; outcome unknown.")
