@@ -131,6 +131,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
 
 
+
+
+
     @staticmethod
     def _start_free_tier_bootstrap() -> None:
         """Run the one-per-process free-tier identity bootstrap; it records failures itself."""
@@ -299,7 +302,18 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         drained = 0
         try:
             await self._await_startup_warmup()
-            # Replay turns run under the shared scheduler, not under the inbound gate.  Queue the
+            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
+            self._startup_restore_tasks = []
+            if tasks:
+                from gateway.run import _startup_restore_drain_timeout_secs
+                await self._wait_bounded_or_release(
+                    set(tasks), _startup_restore_drain_timeout_secs(),
+                    "Startup restore backfill still running after %.0fs; releasing inbound gate; "
+                    "older backfill turns continue in the background.",
+                    "background startup restore backfill failed after gate release",
+                    level=logging.DEBUG,
+                )
+            # Replay turns run under the shared scheduler, not under the inbound gate. Queue the
             # complete batch first so humans retain priority over resumes, then let the gate open;
             # recovered follow-ups still await their own session's resume task in _dispatch.
             drained = await self._drain_startup_restore_queue(wait=False)
@@ -736,6 +750,18 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             # under its own outbox identity so one marker resumes at most once.
             setattr(event, "_outbox_admission_id", f"resume:{resume_marker}")
         return event
+
+    async def _drop_queued_resume(self, session_key: str) -> None:
+        """Release a shutdown-dropped resume sentinel and keep the durable marker recoverable."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        state = self._peek_session_state(session_key)
+        if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
+            return
+        self._release_running_agent_state(session_key)
+        store = getattr(self, "async_session_store", None)
+        if store is not None:
+            with suppress(Exception):
+                await store.mark_resume_pending(session_key, "restart_replay_shutdown")
 
     def _schedule_auto_resume_delegations(self) -> int:
         """Queue bounded parent notices for eligible abandoned single-task rows.
@@ -2043,13 +2069,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         self._mcp_discovery_ready = asyncio.Event()
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
-<<<<<<< HEAD
         self._startup_restore_tasks = []
         self._start_mcp_discovery()
-||||||| parent of f8b0c0312cf3 (fix(gateway): release replay fences without waiting)
-        self._startup_restore_tasks = []
-=======
->>>>>>> f8b0c0312cf3 (fix(gateway): release replay fences without waiting)
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()

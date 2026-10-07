@@ -937,7 +937,7 @@ def _auto_continue_freshness_window() -> float:
 
 
 def _startup_restore_drain_timeout_secs() -> float:
-    """Max seconds ``_finish_startup_restore`` holds the inbound gate for boot auto-resume; <=0 disables.
+    """Maximum seconds a startup or reconnect restore fence waits before releasing inbound traffic.
 
     Duplicate-agent safety does NOT depend on it: ``_schedule_resume_pending_sessions`` claims SYNCHRONOUSLY.
     The implementation lives in a side-effect-free module so request admission does not import the gateway
@@ -3601,7 +3601,7 @@ class GatewayRunner(
 
     def _enqueue_replay(
         self, *, priority: int, kind: str, session_key: Optional[str],
-        dispatch: Callable[[], Any], profile_home: Any = None,
+        dispatch: Callable[[], Any], profile_home: Any = None, on_drop: Optional[Callable[[], Any]] = None,
     ) -> ReplayHandle:
         """Queue one replay with its owning profile captured at enqueue time."""
         captured_home = profile_home
@@ -3620,6 +3620,7 @@ class GatewayRunner(
             session_key=session_key,
             profile_home=captured_home,
             dispatch=_scoped_dispatch,
+            on_drop=on_drop,
         )
 
     def _init_replay_scheduler(self) -> None:

@@ -90,6 +90,35 @@ async def test_replay_scheduler_orders_humans_then_resumes_then_followups():
     await scheduler.close()
 
 
+@pytest.mark.asyncio
+async def test_replay_scheduler_close_drops_queued_and_bounds_active_work():
+    scheduler = ReplayScheduler(1)
+    started = asyncio.Event()
+    dropped = []
+    release = asyncio.Event()
+
+    async def active_work():
+        started.set()
+        await release.wait()
+
+    active = scheduler.enqueue(
+        priority=2, kind="resume", session_key="active", dispatch=active_work,
+    )
+    queued = scheduler.enqueue(
+        priority=2, kind="resume", session_key="queued", dispatch=active_work,
+        on_drop=lambda: dropped.append("queued"),
+    )
+    scheduler.start()
+    await started.wait()
+    await scheduler.close(timeout=0.01)
+
+    assert dropped == ["queued"]
+    assert queued.future.cancelled()
+    assert active.future.cancelled()
+    assert scheduler.queue_depth == 0
+    assert scheduler.active_count == 0
+
+
 def test_restart_replay_concurrency_config_parses_and_defaults():
     assert GatewayConfig.from_dict({"restart_replay_concurrency": 5}).restart_replay_concurrency == 5
     assert GatewayConfig.from_dict({"restart_replay_concurrency": 0}).restart_replay_concurrency == 2

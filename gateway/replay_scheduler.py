@@ -30,6 +30,7 @@ class ReplayItem:
     profile_home: Any = field(compare=False, default=None)
     dispatch: Optional[Callable[[], Awaitable[Any]]] = field(compare=False, default=None)
     future: Optional[asyncio.Future] = field(compare=False, default=None)
+    on_drop: Optional[Callable[[], Any]] = field(compare=False, default=None)
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class ReplayScheduler:
         session_key: Optional[str],
         dispatch: Callable[[], Awaitable[Any]],
         profile_home: Any = None,
+        on_drop: Optional[Callable[[], Any]] = None,
     ) -> ReplayHandle:
         if self._closed:
             raise RuntimeError("replay scheduler is closed")
@@ -94,6 +96,7 @@ class ReplayScheduler:
             profile_home=profile_home,
             dispatch=dispatch,
             future=loop.create_future(),
+            on_drop=on_drop,
         )
         heapq.heappush(self._queue, item)
         if self._started:
@@ -207,12 +210,29 @@ class ReplayScheduler:
         """Wait for one admission/turn without changing its retry semantics."""
         return await handle.future
 
-    async def close(self) -> None:
-        """Stop idle workers after queued work has drained; never cancel active work."""
+    async def close(self, timeout: float = 1.0) -> None:
+        """Drop queued work and bounded-wait active workers during shutdown."""
         self._closed = True
         async with self._condition:
+            dropped = list(self._queue)
+            self._queue.clear()
             self._condition.notify_all()
-        if self._workers:
-            await asyncio.gather(*tuple(self._workers), return_exceptions=True)
+        for item in dropped:
+            if item.future is not None and not item.future.done():
+                item.future.cancel()
+            if item.on_drop is not None:
+                try:
+                    result = item.on_drop()
+                    if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+                        await result
+                except Exception:
+                    logger.warning("Replay scheduler dropped-item cleanup failed", exc_info=True)
+        workers = tuple(self._workers)
+        if workers:
+            _done, pending = await asyncio.wait(workers, timeout=max(0.0, float(timeout)))
+            if pending:
+                for worker in pending:
+                    worker.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         if self._wake_tasks:
             await asyncio.gather(*tuple(self._wake_tasks), return_exceptions=True)

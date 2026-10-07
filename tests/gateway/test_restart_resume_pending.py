@@ -759,8 +759,8 @@ async def test_served_profile_reconnect_resumes_what_boot_deferred():
 
 
 @pytest.mark.asyncio
-async def test_startup_restore_waits_for_resume_before_draining_inbound():
-    """Queued inbound turns replay only after startup resume tasks finish."""
+async def test_startup_restore_dispatches_queued_humans_before_resume():
+    """Queued startup humans are admitted before restart resumes."""
     runner, adapter = make_restart_runner()
     runner._startup_restore_in_progress = True
     runner._startup_restore_queue = []
@@ -781,6 +781,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     runner.session_store._entries = {pending_entry.session_key: pending_entry}
 
     resume_done = asyncio.Event()
+    inbound_started = asyncio.Event()
     seen: list[str] = []
 
     async def fake_handle_message(event: MessageEvent) -> None:
@@ -790,11 +791,11 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
             adapter._session_tasks[pending_entry.session_key] = task
             return
         seen.append(f"inbound:{event.text}")
+        inbound_started.set()
 
     adapter.handle_message = fake_handle_message
 
     scheduled = runner._schedule_resume_pending_sessions()
-    await asyncio.sleep(0)
 
     inbound = MessageEvent(
         text="hello",
@@ -803,17 +804,18 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     )
     assert await runner._handle_message(inbound) is None
     assert scheduled == 1
-    assert seen == ["resume-start"]
+    assert seen == []
     assert runner._startup_restore_queue == [inbound]
 
     finish_task = asyncio.create_task(runner._finish_startup_restore())
-    await asyncio.sleep(0)
-    assert seen == ["resume-start"]
+    await asyncio.wait_for(inbound_started.wait(), timeout=5)
+    assert seen[0] == "inbound:hello"
 
     resume_done.set()
     await finish_task
+    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
 
-    assert seen == ["resume-start", "inbound:hello"]
+    assert seen == ["inbound:hello", "resume-start"]
     assert runner._startup_restore_queue == []
     assert runner._startup_restore_in_progress is False
 
@@ -913,6 +915,101 @@ async def test_startup_restore_opens_gate_while_replay_turn_is_queued():
 
     release.set()
     await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_startup_queues_humans_before_resume_workers_and_fences_same_chat():
+    """A startup human stays ahead of resumes even when it is discovered after start()."""
+    runner, adapter = make_restart_runner()
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._startup_restore_keys = {}
+    runner._replay_resume_tasks = {}
+    runner._background_tasks = set()
+    release = asyncio.Event()
+    human_started = asyncio.Event()
+    started: list[str] = []
+
+    source_x = make_restart_source(chat_id="ordered-chat")
+    source_y = make_restart_source(chat_id="other-chat")
+    entries = [
+        SessionEntry(
+            session_key=runner._session_key_for_source(source), session_id=f"sid-{source.chat_id}",
+            created_at=datetime.now(), updated_at=datetime.now(), origin=source,
+            platform=Platform.TELEGRAM, chat_type="dm", resume_pending=True,
+            resume_reason="restart_interrupted", last_resume_marked_at=datetime.now(),
+        )
+        for source in (source_x, source_y)
+    ]
+    runner._auto_resume_ready = lambda entry, **_kwargs: (adapter, entry.origin)
+
+    async def handle(event: MessageEvent) -> None:
+        if event.internal:
+            started.append(f"resume:{event.source.chat_id}")
+            await release.wait()
+            return
+        started.append(event.text)
+        human_started.set()
+        event._gateway_accepted = True
+        await release.wait()
+
+    adapter.handle_message = handle
+    assert runner._schedule_resume_pending_sessions(candidates=entries) == 2
+    # This yield is the realistic ordering that exposed fc77328c: start() had
+    # already admitted both resume workers before startup humans were enqueued.
+    await asyncio.sleep(0)
+    older = MessageEvent(text="A-older", message_type=MessageType.TEXT, source=source_x)
+    runner._queue_startup_restore_event(older)
+
+    finish = asyncio.create_task(runner._finish_startup_restore())
+    await asyncio.wait_for(human_started.wait(), timeout=5)
+    assert started[0] == "A-older"
+
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._admit_bot_message_for_source = MagicMock(return_value=True)
+    newer = MessageEvent(text="B-live", message_type=MessageType.TEXT, source=source_x)
+    assert await runner._hm_admit_event(newer) is None
+    assert runner._startup_restore_queue == [newer]
+
+    release.set()
+    await asyncio.wait_for(finish, timeout=5)
+    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
+    assert started.index("A-older") < started.index("B-live")
+
+
+@pytest.mark.asyncio
+async def test_stop_drops_queued_resume_after_sentinel_release():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="stopped-replay")
+    key = runner._session_key_for_source(source)
+    state = runner._session_state(key)
+    state.turn.agent = None  # /stop already released the pending sentinel
+    event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+    adapter.handle_message = AsyncMock()
+
+    await runner._run_startup_resume_event(adapter, event, key)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drop_releases_resume_sentinel_and_restores_marker():
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="dropped-replay")
+    key = runner._session_key_for_source(source)
+    state = runner._session_state(key)
+    state.turn.agent = _AGENT_PENDING_SENTINEL
+    store = MagicMock()
+    store._store = runner.session_store
+    store.mark_resume_pending = AsyncMock()
+    runner.__dict__["_async_session_store"] = store
+
+    await runner._drop_queued_resume(key)
+
+    assert state.turn.agent is None
+    store.mark_resume_pending.assert_awaited_once_with(key, "restart_replay_shutdown")
 
 
 
