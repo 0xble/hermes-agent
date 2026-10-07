@@ -33,3 +33,23 @@ def test_loop_complete_split_holds_the_whole_trailing_marker_run():
     assert split_trailing_loop_complete_marker("```\nLOOP_COMPLETE\n```\nLOOP_COM") == (
         "```\nLOOP_COMPLETE\n```\n", "LOOP_COM",
     )
+
+
+def test_loop_complete_split_uses_released_fence_context():
+    """A fence opened in an earlier chunk and closed in this one: the trailing marker after
+    the closing fence is control text and must be held, not released."""
+    from gateway.response_filters import split_trailing_loop_complete_marker
+
+    seen = "Example:\n```text\nLOOP_COMPLETE\n"
+    assert split_trailing_loop_complete_marker("```\nLOOP_COMPLETE", context=seen) == (
+        "```\n", "LOOP_COMPLETE",
+    )
+    assert split_trailing_loop_complete_marker("```\nLOOP_COM", context=seen) == ("```\n", "LOOP_COM")
+    # Still inside the open fence: nothing to hold.
+    assert split_trailing_loop_complete_marker("more\nLOOP_COMPLETE", context=seen) == (
+        "more\nLOOP_COMPLETE", "",
+    )
+    # A held run spanning released context only splits this chunk.
+    assert split_trailing_loop_complete_marker("LOOP_COMPLETE", context="Done.\nLOOP_COMPLETE\n") == (
+        "", "LOOP_COMPLETE",
+    )
