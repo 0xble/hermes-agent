@@ -59,6 +59,9 @@ class ConversationState:
     # completions (delegations, processes, watch patterns) stay queued instead of waking the
     # session, so a stop is not immediately undone by the completions the stop itself produced.
     stop_latched: bool = False
+    # Wall-clock start of the most recent turn of any kind. A routine completion result arriving
+    # within the batch window of it is held for fan-in rather than waking the session again.
+    last_turn_started_at: float = 0.0
 
     def clear(self) -> None:
         """Reset every field to its default, so new fields are cleared automatically."""
