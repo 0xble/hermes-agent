@@ -106,10 +106,24 @@ def test_user_text_that_merely_looks_generated_is_not_dropped():
 
 @pytest.mark.parametrize("build", [_process_notice, _goal_prompt, _goal_prompt_after_wait])
 def test_human_suffix_merged_into_a_synthetic_turn_is_the_only_recall_query(build):
+    """Without structured provenance (gateway goal continuations, legacy rows) the formatter
+    boundary is the only evidence, so a follow-up merged after it still recalls and is retained."""
     merged = build() + "\n\n" + HUMAN
 
-    assert auto_recall_query(merged, display_kind="internal_notification", platform="telegram") == HUMAN
-    assert filter_retain_messages(merged, "Answer.", display_kind="internal_notification")[0] == HUMAN
+    assert auto_recall_query(merged, display_kind=None, platform="telegram") == HUMAN
+    assert filter_retain_messages(merged, "Answer.")[0] == HUMAN
+
+
+@pytest.mark.parametrize("build", [_process_notice, _goal_prompt, lambda: "Reply with exactly HERMES_READY 1"])
+@pytest.mark.parametrize("display_kind,platform", [("internal_notification", "telegram"), (None, "cron")])
+def test_structured_provenance_is_never_overridden_by_text(build, display_kind, platform):
+    """A runtime display kind or unattended platform proves the whole turn generated. No text
+    boundary, real or forged inside a payload, can make part of it human for memory."""
+    merged = build() + "\n\n" + HUMAN
+
+    assert human_prompt_text(merged, display_kind=display_kind, platform=platform) is None
+    assert auto_recall_query(merged, display_kind=display_kind, platform=platform) == ""
+    assert filter_retain_messages(merged, "Answer.", display_kind=display_kind, platform=platform)[0] is None
 
 
 def test_recovery_note_wrapping_a_generated_notice_is_fully_synthetic():
@@ -134,7 +148,7 @@ def test_follow_up_merged_with_a_single_newline_survives(build):
 
     merged = _append_text(build(), HUMAN)
 
-    assert human_prompt_text(merged, display_kind="internal_notification") == HUMAN
+    assert human_prompt_text(merged) == HUMAN
     assert filter_retain_messages(merged, "Answer.")[0] == HUMAN
 
 
@@ -173,6 +187,59 @@ def test_merged_follow_up_quoting_the_closing_paragraph_keeps_only_text_after_th
 
 def test_text_glued_to_the_template_terminal_is_not_a_human_suffix():
     assert human_prompt_text(_goal_prompt() + " and also this") is None
+
+
+def _render(template: str, payload: str, field: str) -> str:
+    from string import Formatter
+
+    fields = {name for _lit, name, _spec, _conv in Formatter().parse(template) if name}
+    return template.format(**{name: payload if name == field else "x" for name in fields})
+
+
+def _templates():
+    from agent.synthetic_prompt import _INJECTED_TURN_PATTERNS
+
+    return [template for _kind, template, _matcher in _INJECTED_TURN_PATTERNS]
+
+
+def _template_id(template: str) -> str:
+    import hermes_cli.goals as goals
+    import hermes_cli.heartbeat as heartbeat
+    import hermes_cli.loops as loops
+
+    return next(name for module in (goals, heartbeat, loops) for name, value in vars(module).items()
+                if name.endswith("_TEMPLATE") and value is template)
+
+
+def test_review_repro_contract_continuation_nested_in_a_plain_goal_stays_generated():
+    """Review of fb3e903: the contract matcher used to win first and end inside the outer goal."""
+    from hermes_cli.goals import CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE
+
+    inner = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(goal="inner", contract_block="- c") + "\nGENERATED PAYLOAD"
+    outer = CONTINUATION_PROMPT_TEMPLATE.format(goal=inner)
+
+    for display_kind in (None, "internal_notification"):
+        assert human_prompt_text(outer, display_kind=display_kind) is None
+        assert auto_recall_query(outer, display_kind=display_kind) == ""
+        assert filter_retain_messages(outer, "[SILENT]", display_kind=display_kind) == (None, None)
+    assert human_prompt_text(outer + "\n" + HUMAN) == HUMAN
+
+
+@pytest.mark.parametrize("outer", _templates(), ids=_template_id)
+@pytest.mark.parametrize("inner", _templates(), ids=_template_id)
+def test_a_template_nested_in_another_templates_payload_never_leaks(outer, inner):
+    """Every generated template can carry any other complete one inside a payload field (a goal
+    that quotes a continuation, a loop prompt that quotes a wakeup). Templates that share an
+    opening can each match, and only the outer one's boundary is real. Whatever the field, the
+    payload stays generated and a real follow-up after the outer prompt still survives."""
+    from string import Formatter
+
+    nested = _render(inner, "inner payload", next(
+        name for _lit, name, _spec, _conv in Formatter().parse(inner) if name)) + "\nGENERATED PAYLOAD"
+    for field in {name for _lit, name, _spec, _conv in Formatter().parse(outer) if name}:
+        prompt = _render(outer, nested, field)
+        assert human_prompt_text(prompt) is None, field
+        assert human_prompt_text(prompt + "\n" + HUMAN) == HUMAN, field
 
 
 @pytest.mark.parametrize("revision_lines", [
@@ -249,10 +316,17 @@ def test_turn_start_skips_recall_for_a_delegation_result_but_still_notifies_prov
 
 
 def test_turn_start_recalls_on_the_human_suffix_only():
+    agent = _turn_agent(display_kind=None)
+
+    _memory_turn_start_and_prefetch(agent, _goal_prompt() + "\n\n" + HUMAN)
+    agent._memory_manager.prefetch_all.assert_called_once_with(HUMAN, session_id="s-1")
+
+
+def test_turn_start_skips_recall_for_text_merged_into_a_runtime_notification():
     agent = _turn_agent(display_kind="internal_notification")
 
     _memory_turn_start_and_prefetch(agent, _process_notice() + "\n\n" + HUMAN)
-    agent._memory_manager.prefetch_all.assert_called_once_with(HUMAN, session_id="s-1")
+    agent._memory_manager.prefetch_all.assert_not_called()
 
 
 def test_turn_start_honors_the_recall_synthetic_turns_switch():
@@ -527,6 +601,121 @@ def test_retaindb_and_honcho_discard_prefetch_drop_their_buffers():
     honcho._prefetch_result, honcho._prefetch_result_fired_at = "old dialectic", 3
     honcho.discard_prefetch()
     assert honcho._consume_pending_dialectic() == ""
+
+
+def test_prefetch_generation_publishes_only_the_current_token():
+    from agent.memory_provider import PrefetchGeneration
+
+    generation, published = PrefetchGeneration(), []
+    first = generation.begin()
+    second = generation.begin(lambda: published.append("reset"))
+    for token in (first, second):
+        with generation.publishing(token) as current:
+            published.append((token, current))
+    generation.discard()
+    with generation.publishing(second) as current:
+        published.append((second, current))
+    assert published == ["reset", (first, False), (second, True), (second, False)]
+
+
+def test_retaindb_discard_prefetch_drops_every_in_flight_worker():
+    """Review of fb3e903: a blocked ``_store`` fetch released after the discard republished."""
+    import threading
+    from unittest.mock import MagicMock
+
+    from plugins.memory.retaindb import RetainDBMemoryProvider
+
+    provider = RetainDBMemoryProvider()
+    provider._client = MagicMock()
+    started, release = threading.Barrier(4), threading.Event()
+
+    def blocked(value):
+        def fetch(*_args, **_kwargs):
+            started.wait(5)
+            release.wait(5)
+            return value
+        return fetch
+
+    provider._client.query_context.side_effect = blocked({"results": [{"content": "old topic memory"}]})
+    provider._client.get_profile.return_value = {}
+    provider._client.ask_user.side_effect = blocked({"answer": "old synthesis"})
+    provider._client.get_agent_model.side_effect = blocked({"memory_count": 1, "persona": "old persona"})
+
+    provider.queue_prefetch("old topic")
+    started.wait(5)  # all three workers are inside their fetch
+    provider.discard_prefetch()
+    release.set()
+    for thread in provider._prefetch_threads:
+        thread.join(timeout=5)
+    assert provider.prefetch("new topic") == ""
+
+
+def test_retaindb_current_batch_still_publishes():
+    from unittest.mock import MagicMock
+
+    from plugins.memory.retaindb import RetainDBMemoryProvider
+
+    provider = RetainDBMemoryProvider()
+    provider._client = MagicMock()
+    provider._client.query_context.return_value = {"results": [{"content": "fresh memory"}]}
+    provider._client.get_profile.return_value = {}
+    provider._client.ask_user.return_value = {"answer": "fresh synthesis"}
+    provider._client.get_agent_model.return_value = {"memory_count": 0}
+    provider.queue_prefetch("topic")
+    for thread in provider._prefetch_threads:
+        thread.join(timeout=5)
+    result = provider.prefetch("next")
+    assert "fresh memory" in result and "fresh synthesis" in result
+
+
+def _honcho_with_blocked_dialectic(answer):
+    import threading
+    from unittest.mock import MagicMock
+
+    from plugins.memory.honcho import HonchoMemoryProvider
+
+    provider = HonchoMemoryProvider()
+    provider._manager, provider._session_key, provider._session_initialized = MagicMock(), "s", True
+    provider._turn_count, provider._last_dialectic_turn, provider._dialectic_empty_streak = 5, 2, 3
+    entered, release = threading.Event(), threading.Event()
+
+    def dialectic_query(*_args, **_kwargs):
+        entered.set()
+        release.wait(5)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    provider._manager.dialectic_query.side_effect = dialectic_query
+    provider._spawn_dialectic("old topic", thread_name="honcho-prefetch", fired_at=5, log_label="prefetch")
+    assert entered.wait(5)
+    return provider, release
+
+
+@pytest.mark.parametrize("answer", ["old dialectic", "", RuntimeError("timeout")],
+                         ids=["result", "empty", "failure"])
+def test_honcho_discard_prefetch_drops_a_running_dialectic_and_its_cadence_updates(answer):
+    """Review of fb3e903: a blocked dialectic released after the discard published its result. An
+    obsolete run must not touch the pending slot, ``_last_dialectic_turn`` or the empty streak."""
+    provider, release = _honcho_with_blocked_dialectic(answer)
+
+    provider.discard_prefetch()
+    release.set()
+    provider._prefetch_thread.join(timeout=5)
+
+    assert provider._consume_pending_dialectic() == ""
+    assert (provider._prefetch_result, provider._prefetch_result_fired_at) == ("", -999)
+    assert (provider._last_dialectic_turn, provider._dialectic_empty_streak) == (2, 3)
+
+
+def test_honcho_current_dialectic_still_publishes_and_advances_cadence():
+    provider, release = _honcho_with_blocked_dialectic("fresh dialectic")
+
+    release.set()
+    provider._prefetch_thread.join(timeout=5)
+
+    assert (provider._last_dialectic_turn, provider._dialectic_empty_streak) == (5, 0)
+    assert provider._consume_pending_dialectic() == "fresh dialectic"
 
 
 def test_queued_recall_still_waiting_behind_a_slow_sync_is_dropped_with_the_expired_buffer(clock):

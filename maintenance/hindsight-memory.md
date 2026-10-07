@@ -31,13 +31,18 @@ strategy and cron-exclusion behavior.
   (`retain_tags`, `recall_tags`) accept comma-separated strings and reach the SDK as lists.
 - Hermes-generated user turns (notices, goal continuations, heartbeat and `/loop` wakeups, every
   turn of a cron run, recovery notes) neither key automatic recall nor enter retained transcripts. Both
-  gates call `agent.synthetic_prompt.human_prompt_text`, which reads the turn's runtime-owned
-  `display_kind` and platform and each producer's own formatter boundary, keeping any human text
-  merged after that boundary. Add a new generated prompt there, beside its producer constant,
+  gates call `agent.synthetic_prompt.human_prompt_text`. A runtime-owned `display_kind` or an
+  unattended platform is authoritative: the whole turn is generated and no text boundary overrides
+  it, so text the gateway merged into an internal notification is answered but not used for memory
+  (accepted cost of never letting a forged boundary in a payload win). Without that provenance (goal,
+  kanban and `/loop` prompts the gateway queues as ordinary events, legacy rows) each producer's own
+  formatter boundary decides, keeping any human text merged after it. Add a new generated prompt there, beside its producer constant,
   rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
   generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
 - Template boundary rule: when a template's closing paragraph appears more than once, the LAST
-  copy is the generated boundary. Generated text is never classified as human, which is #320's
+  copy is the generated boundary. Every template is tried and the FURTHEST boundary wins, because
+  templates share openings and a payload can hold a complete sibling template (a goal quoting a
+  contract continuation) whose boundary ends inside the outer payload. Generated text is never classified as human, which is #320's
   invariant. A revised goal continuation (with its "This goal has been revised" block) has no
   provable end and is generated in full. Accepted limitation: a person's message that the gateway
   text-merged into a pending goal, kanban, heartbeat or `/loop` prompt and that quotes that
@@ -57,8 +62,14 @@ strategy and cron-exclusion behavior.
   `prefetch_all`, calls every provider's `discard_prefetch()` once that is older than
   `memory.prefetch_max_age_seconds` (default 1800, `0` = no limit). The clock is wall time because
   macOS's monotonic clock stops during sleep. It is manager-level so every buffering provider is
-  covered: Hindsight bumps its generation (also drops an in-flight worker), RetainDB clears its
-  caches, Honcho drops its pending dialectic. Mem0 keys its buffer on the query and OpenViking,
+  covered. A discard must also stop a worker already in flight from republishing, so the manager,
+  Hindsight, RetainDB and Honcho share `agent.memory_provider.PrefetchGeneration`: each request
+  takes a token, a discard or newer request obsoletes it, and a worker publishes only while its
+  token is current, checked under the provider's existing state lock. Hindsight drops its buffered
+  recall, RetainDB its three caches, Honcho its pending dialectic plus any cadence or backoff update
+  from the obsolete run. Honcho's base context (representation and card) is outside this bound: it
+  is a per-session cache injected every turn by design, and a pending refresh only replaces it, so
+  dropping the refresh would keep an older copy rather than none. Mem0 keys its buffer on the query and OpenViking,
   ByteRover, Holographic and Supermemory recall live, so they keep the no-op default. The buffer
   lives on the provider instance owned by one agent's manager (each `load_memory_provider` call
   builds a new instance), so it does not cross sessions, and Hindsight's `on_session_switch`

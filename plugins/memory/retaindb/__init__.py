@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
-from agent.memory_provider import MemoryProvider, spawn_context_thread
+from agent.memory_provider import MemoryProvider, PrefetchGeneration, spawn_context_thread
 from agent.secret_scope import get_secret
 from agent.file_safety import raise_if_read_blocked
 from tools.registry import tool_error
@@ -310,6 +310,8 @@ class RetainDBMemoryProvider(MemoryProvider):
         self._user_id, self._session_id, self._agent_id = "default", "", "hermes"
         self._lock = threading.Lock()  # guards the prefetch caches below
         self._context_result, self._dialectic_result, self._agent_model = "", "", {}
+        # Every prefetch batch is a generation; only the current one may publish into the caches.
+        self._prefetch_generation = PrefetchGeneration(self._lock)
         self._prefetch_threads: list[threading.Thread] = []  # tracked so rapid turns don't pile up threads
 
     @property
@@ -368,7 +370,8 @@ class RetainDBMemoryProvider(MemoryProvider):
                 self._client.ask_user(self._user_id, query, reasoning_level=self._reasoning_level(query)).get("answer") or "") or None),
             ("retaindb-agent-model", "agent model", "_agent_model", lambda: self._agent_model_or_none(self._client.get_agent_model(self._agent_id))),
         )
-        self._prefetch_threads = [spawn_context_thread(self._store, args=(label, attr, fetch), name=name)
+        generation = self._prefetch_generation.begin()
+        self._prefetch_threads = [spawn_context_thread(self._store, args=(label, attr, fetch, generation), name=name)
                                   for name, label, attr, fetch in jobs]
         for t in self._prefetch_threads:
             t.start()
@@ -381,21 +384,26 @@ class RetainDBMemoryProvider(MemoryProvider):
     def _agent_model_or_none(model: dict) -> dict | None:
         return model if model.get("memory_count", 0) > 0 else None
 
-    def _store(self, label: str, attr: str, fetch: Callable[[], Any]) -> None:
-        """Run one prefetch job; cache its value under the lock unless None (failures log at debug)."""
+    def _store(self, label: str, attr: str, fetch: Callable[[], Any], generation: int) -> None:
+        """Run one prefetch job; cache its value under the lock unless None (failures log at debug)
+        or its batch was superseded by a newer batch or ``discard_prefetch``."""
         value = _quiet(f"{label} prefetch", fetch)
         if value is not None:
-            with self._lock:
-                setattr(self, attr, value)
+            with self._prefetch_generation.publishing(generation) as current:
+                if current:
+                    setattr(self, attr, value)
 
     @staticmethod
     def _reasoning_level(query: str) -> str:
         return "low" if len(query) < 120 else "medium" if len(query) < 400 else "high"
 
+    def _reset_prefetch_caches(self) -> None:
+        self._context_result, self._dialectic_result, self._agent_model = "", "", {}
+
     def discard_prefetch(self) -> None:
-        """Drop results queued for an earlier turn (see ``MemoryProvider.discard_prefetch``)."""
-        with self._lock:
-            self._context_result, self._dialectic_result, self._agent_model = "", "", {}
+        """Drop results queued for an earlier turn, and any batch still in flight
+        (see ``MemoryProvider.discard_prefetch``)."""
+        self._prefetch_generation.discard(self._reset_prefetch_caches)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Consume prefetched results and return them as a context block."""

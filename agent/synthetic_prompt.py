@@ -8,12 +8,13 @@ memory paths from disagreeing about which turns are synthetic.
 
 Provenance is read in this order:
 
-1. A recognized generated formatter boundary. The generated prefix is dropped and only text after
-   its provable end survives, because the gateway can merge a real follow-up into a queued
-   notification and that follow-up must not be lost.
-2. The turn's structured provenance: a runtime-owned ``display_kind`` or an unattended platform
-   (``cron``: every turn of a scheduled run, not only its preamble). With no recognized boundary
-   there is no trustworthy human part, so nothing survives.
+1. The turn's structured provenance: a runtime-owned ``display_kind`` or an unattended platform
+   (``cron``: every turn of a scheduled run, not only its preamble). It is authoritative, so the
+   whole turn is generated and text matching never overrides it. A person's message the gateway
+   text-merged into such a turn is still answered but is not used for memory.
+2. A recognized generated formatter boundary. The generated prefix is dropped and only text after
+   its provable end survives, because the gateway can merge a real follow-up into a queued goal,
+   kanban or ``/loop`` prompt that carries no runtime ``display_kind``, and legacy rows have none.
 3. Otherwise the whole text is human-authored.
 """
 
@@ -139,14 +140,20 @@ def _unwrap_steer(suffix: str) -> str:
 
 
 def _user_after_injected_turn(content: str) -> str | None:
-    """Drop a generated turn, preserving only a suffix after its exact formatter boundary."""
+    """Drop a generated turn, preserving only a suffix after its exact formatter boundary.
+
+    Every template is tried and the FURTHEST boundary wins. Templates share openings (all goal
+    continuations, both ``/loop`` wakeups), so a payload can hold a complete rendering of a sibling
+    template whose terminal ends inside the outer payload. The first match would end there and turn
+    the rest of the payload into a "human" suffix. The outer prompt's own terminal always comes
+    later, so the furthest boundary never calls generated text human, matching the last-copy rule.
+    """
     match_kind = None
     marker_end = -1
     for kind, _template, matcher in _INJECTED_TURN_PATTERNS:
-        marker_end = matcher.match_end(content)
-        if marker_end >= 0:
-            match_kind = kind
-            break
+        end = matcher.match_end(content)
+        if end > marker_end:
+            match_kind, marker_end = kind, end
     if marker_end < 0:
         return content
     if match_kind == "goal" and _REVISION_BLOCK_OPEN in content:
@@ -225,19 +232,17 @@ def human_prompt_text(
     ``display_kind`` is the turn's persisted user-row kind and ``platform`` the agent's platform.
     Both are optional so legacy rows without provenance still classify by their generated text.
     """
+    if is_runtime_prompt(display_kind=display_kind, platform=platform):
+        # Structured provenance is authoritative: no text boundary can make part of it human.
+        return None
     text = (content or "").strip()
-    generated = False
     # A recovery note can wrap another generated notice, so strip prefixes until none is left.
     while text:
         after = text_after_generated_prefix(text)
         if after == text:
             break
-        text, generated = (after or "").strip(), True
-    if not text:
-        return None
-    if not generated and is_runtime_prompt(display_kind=display_kind, platform=platform):
-        return None
-    return text
+        text = (after or "").strip()
+    return text or None
 
 
 def auto_recall_query(

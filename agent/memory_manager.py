@@ -17,7 +17,9 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_provider import (
+    MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, PrefetchGeneration, ctx_bound, spawn_context_thread,
+)
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
@@ -373,7 +375,9 @@ class MemoryManager:
         # memory.prefetch_max_age_seconds (None = unbounded) and when the buffered recall was queued.
         self._prefetch_max_age = prefetch_max_age_seconds
         self._prefetch_queued_at: Optional[float] = None
-        self._prefetch_discards = 0  # a queued task that has not reached its providers yet skips after a discard
+        # A queued task that has not reached its providers yet skips once a discard (or a newer
+        # queue) has superseded it.
+        self._prefetch_generation = PrefetchGeneration()
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
         self._has_external: bool = False
@@ -555,7 +559,7 @@ class MemoryManager:
         if queued_at is None or max_age is None or _now() - queued_at <= max_age:
             return
         self._prefetch_queued_at = None
-        self._prefetch_discards += 1
+        self._prefetch_generation.discard()
         logger.debug("Discarding buffered memory prefetch queued %.0fs ago (limit %.0fs)", _now() - queued_at, max_age)
         # Duck-typed providers that predate the hook have nothing to call.
         self._each_provider("discard_prefetch failed (non-fatal)",
@@ -568,11 +572,12 @@ class MemoryManager:
         if not clean_query:
             return
         # The result's age is measured from its query's turn, which is now.
-        self._prefetch_queued_at, discards = _now(), self._prefetch_discards
+        self._prefetch_queued_at, generation = _now(), self._prefetch_generation.begin()
 
         def _queue() -> None:
-            if discards != self._prefetch_discards:  # expired while waiting behind a slow sync
-                return
+            with self._prefetch_generation.publishing(generation) as current:
+                if not current:  # expired (or superseded) while waiting behind a slow sync
+                    return
             self._each_provider("queue_prefetch failed (non-fatal)",
                                 lambda p: p.queue_prefetch(clean_query, session_id=session_id), providers=providers)
 

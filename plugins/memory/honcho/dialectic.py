@@ -67,22 +67,29 @@ class DialecticMixin:
     ) -> threading.Thread:
         """Start a background dialectic run that publishes into the pending-result slot. Only a
         non-empty result advances ``_last_dialectic_turn`` (so empty returns retry next turn) and
-        resets the empty streak; failures widen the backoff."""
+        resets the empty streak; failures widen the backoff. A run superseded by a newer spawn or by
+        ``discard_prefetch`` publishes nothing: no result and no cadence or backoff update."""
+        generation = self._prefetch_generation.begin()
+
         def _run() -> None:
             try:
                 r = self._run_dialectic_depth(query, use_query_rewrite=use_query_rewrite)
             except Exception as exc:
                 logger.debug("Honcho %s failed: %s", log_label, exc)
-                self._note_dialectic_failure(exc)
+                with self._prefetch_generation.publishing(generation) as current:
+                    if current:
+                        self._note_dialectic_failure(exc)
                 return
-            if r and r.strip():
-                with self._prefetch_lock:
+            with self._prefetch_generation.publishing(generation) as current:
+                if not current:
+                    logger.debug("Honcho %s result dropped: superseded or discarded", log_label)
+                elif r and r.strip():
                     self._prefetch_result = r
                     self._prefetch_result_fired_at = fired_at
-                self._last_dialectic_turn = fired_at
-                self._dialectic_empty_streak = 0
-            else:
-                self._dialectic_empty_streak += 1
+                    self._last_dialectic_turn = fired_at
+                    self._dialectic_empty_streak = 0
+                else:
+                    self._dialectic_empty_streak += 1
 
         self._prefetch_thread_started_at = time.monotonic()
         thread = spawn_context_thread(_run, name=thread_name, owner=self)
@@ -90,10 +97,13 @@ class DialecticMixin:
         self._prefetch_thread = thread
         return thread
 
+    def _reset_pending_dialectic(self) -> None:
+        self._prefetch_result, self._prefetch_result_fired_at = "", -999
+
     def discard_prefetch(self) -> None:
-        """Drop a pending dialectic result queued for an earlier turn (``MemoryProvider.discard_prefetch``)."""
-        with self._prefetch_lock:
-            self._prefetch_result, self._prefetch_result_fired_at = "", -999
+        """Drop a pending dialectic result queued for an earlier turn, and the run still in flight
+        (``MemoryProvider.discard_prefetch``)."""
+        self._prefetch_generation.discard(self._reset_pending_dialectic)
 
     def _consume_pending_dialectic(self) -> str:
         """Pop the pending dialectic result, or "" when none is ready or it is stale."""

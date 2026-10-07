@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
+from agent.memory_provider import MemoryProvider, PrefetchGeneration, RecallStatus, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_home
@@ -396,7 +396,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
         self._prefetch_result, self._prefetch_count = "", 0
         self._prefetch_lock = threading.Lock()
-        self._prefetch_generation = 0
+        # Each queued request is its own generation; a discard obsoletes the worker in flight.
+        self._prefetch_generation = PrefetchGeneration(self._prefetch_lock)
         # Per-bank mission application (once per bank per process). The event is set when the
         # attempt finishes (success or failure); other callers for that bank wait for it.
         self._mission_banks: dict[str, threading.Event] = {}
@@ -1107,11 +1108,12 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
+    def _reset_prefetch_result(self) -> None:
+        self._prefetch_result, self._prefetch_count = "", 0
+
     def discard_prefetch(self) -> None:
         """Drop the buffered result; a worker still in flight belongs to a superseded generation."""
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            self._prefetch_result, self._prefetch_count = "", 0
+        self._prefetch_generation.discard(self._reset_prefetch_result)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
@@ -1120,12 +1122,9 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Each queued request is its own generation: a worker that outlived prefetch()'s capped
         # join must not publish over a newer request's result, not only across session switches.
-        with self._prefetch_lock:
-            self._prefetch_generation += 1
-            generation = self._prefetch_generation
-            # An older worker's result that landed after prefetch()'s capped join belongs to a
-            # superseded query; it must not be injected for this one.
-            self._prefetch_result, self._prefetch_count = "", 0
+        # An older worker's result that landed after prefetch()'s capped join belongs to a
+        # superseded query; it must not be injected for this one.
+        generation = self._prefetch_generation.begin(self._reset_prefetch_result)
 
         def _run():
             # Wait (bounded, off the reply path) for the just-completed turn's
@@ -1134,8 +1133,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
             text, count = self._do_recall(query)
             # Publish the current generation's result even when empty: an empty recall is an answer.
-            with self._prefetch_lock:
-                if generation == self._prefetch_generation:
+            with self._prefetch_generation.publishing(generation) as current:
+                if current:
                     self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
