@@ -50,6 +50,8 @@ _TRUTHY = {"1", "true", "yes", "on"}
 # failure waits 60s, then the window doubles up to 15 minutes; any completed subprocess resets it.
 _SHELL_HOOK_BACKOFF_BASE_SECONDS = 60.0
 _SHELL_HOOK_BACKOFF_MAX_SECONDS = 15 * 60.0
+# 2**10 * 60s is far past the cap; bounding the exponent keeps the float math finite forever.
+_SHELL_HOOK_BACKOFF_MAX_EXPONENT = 10
 # Tests replace this indirection with a deterministic clock without changing subprocess timing.
 _monotonic = time.monotonic
 # (event, command) -> (consecutive failures, suppressed-until monotonic timestamp).
@@ -193,8 +195,10 @@ def _record_shell_hook_failure(spec: ShellHookSpec, reason: str) -> None:
         # A concurrent worker may have failed after another worker already started this window.
         if suppressed_until > now:
             return
-        delay = min(_SHELL_HOOK_BACKOFF_BASE_SECONDS * (2 ** failures), _SHELL_HOOK_BACKOFF_MAX_SECONDS)
-        _shell_hook_backoff[key] = (failures + 1, now + delay)
+        delay = min(_SHELL_HOOK_BACKOFF_BASE_SECONDS * (2 ** min(failures, _SHELL_HOOK_BACKOFF_MAX_EXPONENT)),
+                    _SHELL_HOOK_BACKOFF_MAX_SECONDS)
+        # Saturate the streak too, so a hook failing for weeks never grows an unbounded counter.
+        _shell_hook_backoff[key] = (min(failures + 1, _SHELL_HOOK_BACKOFF_MAX_EXPONENT), now + delay)
     logger.warning(
         "shell hook entering fail-open backoff for %.0fs (event=%s command=%s; %s)",
         delay, spec.event, spec.command, reason,

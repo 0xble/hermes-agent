@@ -142,6 +142,51 @@ class TestShellHookBackoff:
         assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
         assert calls == [1, 2, 3, 4]
 
+    def test_backoff_doubles_to_cap_and_survives_long_failure_streaks(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+        spec = shell_hooks.ShellHookSpec(event="pre_llm_call", command="python hook.py")
+        windows = []
+        for _ in range(1100):  # past 2**1024, where an uncapped float exponent overflows
+            shell_hooks._record_shell_hook_failure(spec, "timed out")
+            windows.append(round(shell_hooks._shell_hook_backoff[shell_hooks._shell_hook_key(spec)][1] - clock.now, 6))
+            clock.advance(windows[-1] + 0.1)
+        assert windows[:5] == [60.0, 120.0, 240.0, 480.0, 900.0]
+        assert set(windows[4:]) == {shell_hooks._SHELL_HOOK_BACKOFF_MAX_SECONDS}
+
+    def test_spawn_error_backs_off_like_a_timeout(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+        calls = []
+
+        def spawn(spec, stdin_json):
+            calls.append(1)
+            return _spawn_result(error="command not found")
+
+        monkeypatch.setattr(shell_hooks, "_spawn", spawn)
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [_shell_hook_callback(fail_closed=False)]
+        mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+        mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+        assert calls == [1]
+
+    def test_requires_env_present_runs_hook(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setenv("HERMES_SHELL_HOOK_REQUIRED", "surface-1")
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        calls = []
+        monkeypatch.setattr(shell_hooks, "_spawn", lambda spec, stdin_json: calls.append(1) or _spawn_result(returncode=0))
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [
+            _shell_hook_callback(fail_closed=False, requires_env=("HERMES_SHELL_HOOK_REQUIRED",)),
+        ]
+        mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+        assert calls == [1]
+
 
 class TestShellHookWrapperTimeout:
     def test_wrapper_timeout_fails_open_for_fail_open_hook(self, monkeypatch):
