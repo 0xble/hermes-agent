@@ -1946,16 +1946,28 @@ class GatewayTurnMixin:
         if agent_result.get("already_sent") and not agent_result.get("failed"):
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
+            media_delivered = False
             if response and adapter and not agent_result.get("media_already_delivered"):
-                await self._deliver_media_from_response(response, event, adapter)
+                media_delivered = bool(await self._deliver_media_from_response(response, event, adapter))
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
+            # Reconcile the restart note only on a confirmed answer: streamed visible text, or a
+            # confirmed upload for an attachment-only answer. A failed upload keeps the note so a
+            # later delivery can still reconcile it (the queued lane reconciles its own uploads).
             if adapter and hasattr(adapter, "_reconcile_restart_note_after_delivery"):
-                await adapter._reconcile_restart_note_after_delivery(event, session_key)
+                streamed_text = False
+                if response:
+                    try:
+                        from gateway.run import _strip_response_attachments_for_direct_send
+                        streamed_text = bool(_strip_response_attachments_for_direct_send(response, adapter))
+                    except Exception:
+                        streamed_text = True  # fail open to the historical unconditional reconcile
+                if streamed_text or media_delivered:
+                    await adapter._reconcile_restart_note_after_delivery(event, session_key)
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):

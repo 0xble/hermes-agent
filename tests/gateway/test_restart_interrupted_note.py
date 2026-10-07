@@ -551,6 +551,38 @@ async def test_streamed_resumed_answer_deletes_note_before_marker_clear(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("upload_ok", [True, False])
+async def test_streamed_attachment_only_answer_reconciles_only_after_upload(tmp_path, monkeypatch, upload_ok):
+    from gateway import run_turn
+    from gateway.run_turn import GatewayTurnMixin
+
+    adapter = NoteAdapter()
+    store, entry, _ = _pending_store(tmp_path, adapter)
+    store.set_restart_note_message_id(entry.session_key, "note-stream-media")
+    runner = object.__new__(GatewayTurnMixin)
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._should_send_voice_reply = lambda *args, **kwargs: False
+    runner._deliver_media_from_response = AsyncMock(return_value=upload_ok)
+    adapter.gateway_runner = SimpleNamespace(async_session_store=AsyncSessionStore(store))
+    event = MessageEvent(text="", message_type=MessageType.TEXT, source=_source(), internal=True)
+    monkeypatch.setattr(run_turn, "diagnostic_wake_muted", lambda _event: False)
+
+    delivered = await runner._hmwa_deliver_turn_response(
+        event, event.source, entry, entry.session_key, 1,
+        {"already_sent": True}, [], "MEDIA:/tmp/answer.txt", None, False,
+    )
+
+    assert delivered is None
+    runner._deliver_media_from_response.assert_awaited_once()
+    if upload_ok:
+        assert adapter.deleted == [("chat", "note-stream-media")]
+        assert store.get_restart_note(entry.session_key)[3] is None
+    else:
+        assert adapter.deleted == []
+        assert store.get_restart_note(entry.session_key)[3] == "note-stream-media"
+
+
+@pytest.mark.asyncio
 async def test_crash_recovery_reclaims_unposted_note_once(tmp_path):
     store = _store(tmp_path)
     source = _source("crash-thread")
