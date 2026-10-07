@@ -941,7 +941,10 @@ class GatewayShutdownMixin:
         )
         return False
 
-    async def _send_interrupted_turn_notes(self, session_keys, *, reclaim_pending: bool = False) -> int:
+    async def _send_interrupted_turn_notes(
+        self, session_keys, *, reclaim_pending: bool = False,
+        cancel_on_timeout: bool = False, timeout: float = 2.0,
+    ) -> int:
         """Ensure one visible note for each interrupted human turn.
 
         This deliberately bypasses ``gateway_restart_notification``: that flag controls broadcast
@@ -1067,26 +1070,46 @@ class GatewayShutdownMixin:
             return await asyncio.gather(*(_send_one(key) for key in unique_keys), return_exceptions=True)
 
         batch_task = asyncio.create_task(_send_batch())
-        # A transport may accept a send just before the local 2s deadline while the durable claim
-        # remains pending; startup recovery can then post one duplicate note. This late-note window
-        # applies whether the configured waiter detaches or the fallback path cancels the batch.
-        wait_or_detach = getattr(self, "_wait_or_detach", None)
-        if callable(wait_or_detach):
-            completed = await wait_or_detach(batch_task, 2.0)
-        else:
-            done, _pending = await asyncio.wait({batch_task}, timeout=2.0)
-            completed = batch_task in done
-            if not completed:
+        if cancel_on_timeout:
+            # Startup/reconnect resume is ordered after this call. A detached note task could post
+            # after the resumed answer, so cancel it and await its termination before returning.
+            try:
+                wait_timeout = None if timeout <= 0 else timeout
+                done, _pending = await asyncio.wait({batch_task}, timeout=wait_timeout)
+                completed = batch_task in done
+                if not completed:
+                    batch_task.cancel()
+                    await asyncio.gather(batch_task, return_exceptions=True)
+                    logger.warning(
+                        "Interrupted-turn notes exceeded %.1fs; cancelled and awaited before resume",
+                        timeout,
+                    )
+                    return 0
+            except asyncio.CancelledError:
                 batch_task.cancel()
+                await asyncio.gather(batch_task, return_exceptions=True)
+                raise
+        else:
+            # A transport may accept a send just before the local 2s deadline while the durable claim
+            # remains pending; startup recovery can then post one duplicate note. This late-note window
+            # applies whether the configured waiter detaches or the fallback path cancels the batch.
+            wait_or_detach = getattr(self, "_wait_or_detach", None)
+            if callable(wait_or_detach):
+                completed = await wait_or_detach(batch_task, timeout)
+            else:
+                done, _pending = await asyncio.wait({batch_task}, timeout=timeout)
+                completed = batch_task in done
+                if not completed:
+                    batch_task.cancel()
 
-                def _consume(task):
-                    with suppress(asyncio.CancelledError, Exception):
-                        task.exception()
+                    def _consume(task):
+                        with suppress(asyncio.CancelledError, Exception):
+                            task.exception()
 
-                batch_task.add_done_callback(_consume)
-        if not completed:
-            logger.warning("Interrupted-turn notes exceeded 2s total; continuing agent interruption")
-            return 0
+                    batch_task.add_done_callback(_consume)
+            if not completed:
+                logger.warning("Interrupted-turn notes exceeded %.1fs total; continuing agent interruption", timeout)
+                return 0
         results = batch_task.result()
         sent = sum(result for result in results if isinstance(result, int))
         if sent:

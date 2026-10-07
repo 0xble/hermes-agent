@@ -1095,7 +1095,11 @@ async def test_startup_boot_send_path_posts_interrupted_notes_first(monkeypatch)
     )
 
     assert calls == [
-        (["fresh"], {"reclaim_pending": True}),
+        (["fresh"], {
+            "reclaim_pending": True,
+            "cancel_on_timeout": True,
+            "timeout": 0,
+        }),
         "restart",
         "update-watch",
         "redeliver",
@@ -1509,3 +1513,125 @@ async def test_late_s2_note_cannot_follow_fallback_notice(tmp_path, monkeypatch)
     assert len(adapter.sent) == 1
     assert "interrupted" in adapter.sent[0][1].lower()
     assert fallback_calls == []
+
+
+@pytest.mark.asyncio
+async def test_clear_without_snapshot_marker_cannot_clear_newer_turn(tmp_path):
+    store = _store(tmp_path)
+    entry = store.get_or_create_session(_source("clear-owner"))
+
+    store.mark_resume_pending(entry.session_key, turn_id="newer-turn", human=True)
+    assert not store.clear_resume_pending(entry.session_key, expected_turn_id="older-turn")
+    assert store._entries[entry.session_key].resume_turn_id == "newer-turn"
+
+    # A replacement marker for the same owner is still clearable even when the caller's snapshot
+    # predates the drain re-mark.
+    old_marker = store.get_resume_pending_marker(entry.session_key)
+    assert store.clear_resume_pending(entry.session_key)
+    store.mark_resume_pending(entry.session_key, turn_id="same-owner", human=True)
+    replacement_marker = store.get_resume_pending_marker(entry.session_key)
+    assert replacement_marker != old_marker
+    assert store.clear_resume_pending(
+        entry.session_key, expected_marker=old_marker, expected_turn_id="same-owner",
+    )
+
+    # Legacy markers have no ownership token and are not S2-note eligible; clear them rather than
+    # strand a stale resume that could replay an already-completed answer.
+    store.mark_resume_pending(entry.session_key, human=True)
+    assert store.clear_resume_pending(entry.session_key, expected_turn_id="normal-turn")
+
+
+@pytest.mark.asyncio
+async def test_startup_timeout_cancels_note_before_resume(tmp_path, monkeypatch):
+    runner = object.__new__(GatewayStartupMixin)
+    events = []
+    blocker = asyncio.Event()
+
+    async def hanging_notes(_keys, **_kwargs):
+        events.append("note-start")
+        try:
+            await blocker.wait()
+        except asyncio.CancelledError:
+            events.append("note-cancelled")
+            raise
+
+    runner._claim_pending_obligations = AsyncMock(return_value=[])
+    runner._send_interrupted_turn_notes = hanging_notes
+    runner._send_restart_notification = AsyncMock()
+    runner._schedule_update_notification_watch = Mock()
+    runner._replay_pending_planned_restart_notification = AsyncMock()
+    runner._redeliver_claimed_obligations = AsyncMock()
+    monkeypatch.setattr("gateway.run._startup_restore_drain_timeout_secs", lambda: 0.01)
+
+    await runner._await_startup_boot_sends(
+        planned_restart_notification_pending=False,
+        interrupted_note_keys=["session-key"],
+    )
+    events.append("resume")
+    await asyncio.sleep(0)
+
+    assert events == ["note-start", "note-cancelled", "resume"]
+    blocker.set()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_timeout_cancels_note_before_resume(tmp_path, monkeypatch):
+    from gateway import run_pending_recovery
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    runner, _adapter = make_restart_runner()
+    store = _store(tmp_path)
+    source = _source("reconnect-timeout")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-reconnect-timeout", human=True)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._resume_pending_candidates = lambda platform=None, record_boot=False: [entry]
+    runner._auto_resume_ready = lambda _entry: (object(), source)
+    runner._startup_restore_queue = []
+    runner._drain_startup_restore_queue = AsyncMock()
+    monkeypatch.setattr(run_pending_recovery, "recover_pending_shutdown_flush", lambda *a, **k: None)
+    monkeypatch.setattr("gateway.run._startup_restore_drain_timeout_secs", lambda: 0.01)
+
+    events = []
+    blocker = asyncio.Event()
+    detached = []
+
+    async def late_note():
+        try:
+            await blocker.wait()
+        except asyncio.CancelledError:
+            events.append("note-cancelled")
+            raise
+        events.append("note-delivered")
+
+    async def notes(_keys, **kwargs):
+        events.append("note-start")
+        task = asyncio.create_task(late_note())
+        if not kwargs.get("cancel_on_timeout"):
+            detached.append(task)
+            return 0
+        try:
+            await asyncio.wait_for(task, timeout=kwargs["timeout"])
+        except asyncio.TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return 0
+
+    runner._send_interrupted_turn_notes = notes
+
+    def schedule_resume(**kwargs):
+        events.append("resume")
+        kwargs["restore_keys"].add(entry.session_key)
+
+    runner._schedule_resume_pending_sessions = schedule_resume
+
+    await runner._recover_spool_after_reconnect(Platform.TELEGRAM)
+    blocker.set()
+    await asyncio.sleep(0)
+
+    assert events == ["note-start", "note-cancelled", "resume"]
+    for task in detached:
+        task.cancel()
+    if detached:
+        await asyncio.gather(*detached, return_exceptions=True)

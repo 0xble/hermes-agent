@@ -880,7 +880,10 @@ class GatewayAdapterLifecycleMixin:
                 if self._auto_resume_ready(entry) is not None:
                     reconnect_note_keys.append(entry.session_key)
             if reconnect_note_keys:
-                await self._send_interrupted_turn_notes(reconnect_note_keys)
+                await self._send_interrupted_turn_notes(
+                    reconnect_note_keys, cancel_on_timeout=True,
+                    timeout=_startup_restore_drain_timeout_secs(),
+                )
             # Recovery scans all served homes, but only the newly available platform resumes.
             self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
                                                    restore_tasks=tasks, restore_keys=keys)

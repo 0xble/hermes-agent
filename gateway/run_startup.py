@@ -310,6 +310,7 @@ class GatewayStartupMixin:
             if interrupted_note_keys:
                 await self._send_interrupted_turn_notes(
                     interrupted_note_keys, reclaim_pending=True,
+                    cancel_on_timeout=True, timeout=_startup_restore_drain_timeout_secs(),
                 )
             await self._send_restart_notification()
             self._schedule_update_notification_watch()
@@ -322,12 +323,19 @@ class GatewayStartupMixin:
         if timeout <= 0:
             await boot_task  # unbounded: a failing send surfaces here (unlike the gate path)
             return
-        await self._wait_bounded_or_release(
-            {boot_task}, timeout,
-            "Boot-path sends still running after %.0fs; releasing inbound gate so other platforms are not "
-            "frozen. Restart notification / obligation redelivery continue in the background.",
-            "background boot-path send failed after gate release: see traceback", track=True,
-        )
+        done, _pending = await asyncio.wait({boot_task}, timeout=timeout)
+        if boot_task not in done:
+            # Resume turns follow this method. Do not detach the boot task: its note sender may still
+            # be in transport I/O, and a late note would arrive after the resumed answer. The global
+            # bound is intentional; cancellation is awaited before the caller schedules any resume.
+            boot_task.cancel()
+            await asyncio.gather(boot_task, return_exceptions=True)
+            logger.warning(
+                "Boot-path sends exceeded %.1fs; cancelled and awaited before resume",
+                timeout,
+            )
+            return
+        await boot_task
 
     async def _clear_resume_pending_for_claimed_obligations(
         self, claimed: list, *, require_success: bool = False

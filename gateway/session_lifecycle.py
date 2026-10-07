@@ -424,6 +424,17 @@ class SessionLifecycleMixin:
             if expected_marker is not None and expected_marker != current:
                 if expected_turn_id is None or entry.resume_turn_id != expected_turn_id:
                     return False
+            # A normal turn may have no snapshot marker, but it still carries its own active-turn
+            # token. Never let it clear a newer interruption marker that names a different turn.
+            # Legacy markers with no owner token remain clearable: they predate the ownership CAS
+            # and are not eligible for an S2 note, so retaining them would strand a stale resume.
+            if (
+                expected_marker is None
+                and expected_turn_id is not None
+                and entry.resume_turn_id is not None
+                and entry.resume_turn_id != expected_turn_id
+            ):
+                return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.resume_marker_token = None
