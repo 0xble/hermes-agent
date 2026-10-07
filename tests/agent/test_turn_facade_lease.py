@@ -183,8 +183,10 @@ def test_lock_tolerance_never_outlives_the_committed_row_expiry(tmp_path, monkey
     lease = DurableTurnLease(agent, db, "s1", "h", expires_at=db.session_turn_lease_expires_at("s1", "h"))
     lease.turn_active = True
 
-    def row_expiry():
-        return db.session_turn_lease_expires_at("s1", "h")
+    def row_expiry() -> float:
+        committed = db.session_turn_lease_expires_at("s1", "h")
+        assert committed is not None, "the turn lost its lease row"
+        return committed
 
     def write_lock():
         conn = sqlite3.connect(path, timeout=0)
@@ -192,16 +194,28 @@ def test_lock_tolerance_never_outlives_the_committed_row_expiry(tmp_path, monkey
         return conn
 
     # A renewal that waits on the lock still succeeds, and the deadline it adopts is not later than
-    # the expiry the store committed (stamped before the wait).
+    # the expiry the store committed (stamped before the wait). The lock is released only once the
+    # renewal has provably been refused by it (its first retry sleep), never on a timer.
     clock.set(1060.0)
+    admitted_expiry = row_expiry()
     blocker = write_lock()
+    refused = threading.Event()
+    real_retry_sleep = db._sleep_before_write_retry
+
+    def retry_sleep(deadline, patience_s):
+        refused.set()
+        return real_retry_sleep(deadline, patience_s)
+
+    monkeypatch.setattr(db, "_sleep_before_write_retry", retry_sleep)
     worker = threading.Thread(target=lease.refresh_tick)
     worker.start()
-    time.sleep(0.5)
+    assert refused.wait(10), "renewal never reached the locked write"
     blocker.rollback()
     blocker.close()
     worker.join(10)
+    assert not worker.is_alive()
     assert events == []
+    assert row_expiry() > admitted_expiry, "the delayed renewal must have renewed the row"
     assert lease._authority_deadline <= row_expiry()
 
     # Near expiry with the lock held throughout: the renewal must give up and interrupt while the
