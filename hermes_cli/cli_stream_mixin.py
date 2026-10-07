@@ -314,9 +314,12 @@ class CLIStreamMixin:
         ``None`` = intermediate turn boundary (tools about to run): flush boxes and reset state.
         """
         if text is None:
-            if getattr(self, "_loop_complete_hold", ""):
-                self._stream_prefilt = getattr(self, "_stream_prefilt", "") + self._loop_complete_hold
-                self._loop_complete_hold = ""
+            # An intermediate tool boundary means more assistant text will follow, so a held
+            # marker candidate is content there: release it through the normal display path.
+            held = getattr(self, "_loop_complete_hold", "")
+            self._loop_complete_hold = ""
+            if held:
+                self._emit_unheld(held)
             self._flush_stream()
             self._reset_stream_state()
             return
@@ -326,17 +329,47 @@ class CLIStreamMixin:
             ends_with_partial_loop_complete_marker,
             split_trailing_loop_complete_marker,
         )
+        # Judge the hold against everything streamed this segment so an open code fence
+        # earlier in the reply keeps a marker-looking line as content.
+        seen = getattr(self, "_loop_complete_seen", "")
         held = getattr(self, "_loop_complete_hold", "")
         candidate = held + text
-        if ends_with_partial_loop_complete_marker(candidate):
+        if ends_with_partial_loop_complete_marker(seen + candidate):
             safe, partial = split_trailing_loop_complete_marker(candidate)
             if safe:
-                self._stream_delta(safe)
+                self._emit_unheld(safe)
             self._loop_complete_hold = partial
             return
-        if held:
-            text = held + text
-            self._loop_complete_hold = ""
+        self._loop_complete_hold = ""
+        self._emit_unheld(candidate)
+
+    def _resolve_loop_complete_hold(self) -> None:
+        """End of turn: drop a held tail only when it is a complete top-level marker.
+
+        A partial prefix (a reply that just ends in "LOOP") or a marker inside an open fence
+        is content and is emitted through the normal display path.
+        """
+        held = getattr(self, "_loop_complete_hold", "")
+        self._loop_complete_hold = ""
+        if not held:
+            return
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        full = getattr(self, "_loop_complete_seen", "") + held
+        if strip_trailing_loop_complete_marker(full) != full:
+            return
+        self._emit_unheld(held)
+
+    def _emit_unheld(self, text: str) -> None:
+        """Record released text for fence context, then send it down the display path."""
+        if not text:
+            return
+        self._loop_complete_seen = getattr(self, "_loop_complete_seen", "") + text
+        self._stream_delta_unheld(text)
+
+    def _stream_delta_unheld(self, text: str) -> None:
+        """Display path (reasoning tags, line buffering) for text cleared of a loop marker."""
+        if not text:
+            return
         self._stream_started = True
         self._stream_prefilt = getattr(self, "_stream_prefilt", "") + text
 
@@ -402,7 +435,7 @@ class CLIStreamMixin:
                     after = self._stream_prefilt[idx + len(tag):]
                     self._stream_prefilt = ""
                     if after:  # re-filter: the remainder could contain another open tag
-                        self._stream_delta(after)
+                        self._stream_delta_unheld(after)
                     return
             # Stream reasoning live when show_reasoning is on; keep only a possible partial
             # close-tag tail.
@@ -516,6 +549,9 @@ class CLIStreamMixin:
         """Emit any remaining partial line from the stream buffer and close the box."""
         from agent.markdown_tables import is_table_divider, looks_like_table_row
         from cli import _ACCENT, _RST, _cprint, _strip_markdown_syntax
+        # End of turn: a held complete top-level LOOP_COMPLETE is control text and is dropped;
+        # anything else held (a partial prefix, a marker inside an open fence) is content.
+        self._resolve_loop_complete_hold()
         # Still inside a "reasoning block" at end-of-stream = false positive (the model
         # mentioned a tag in prose and never closed it): recover the buffer as regular text.
         if getattr(self, "_in_reasoning_block", False) and getattr(self, "_stream_prefilt", ""):
@@ -523,7 +559,6 @@ class CLIStreamMixin:
             self._emit_stream_text(self._stream_prefilt)
             self._stream_prefilt = ""
         self._close_reasoning_box()  # in case no content tokens arrived
-        self._loop_complete_hold = ""
         # A trailing partial table row joins the table buffer so the whole block is re-aligned
         # together (else the final row prints under-padded).
         if (
@@ -548,6 +583,7 @@ class CLIStreamMixin:
         """Reset streaming state before each agent invocation."""
         self._stream_buf = ""
         self._loop_complete_hold = ""
+        self._loop_complete_seen = ""
         self._stream_started = False
         self._stream_box_opened = False
         self._stream_text_ansi = ""

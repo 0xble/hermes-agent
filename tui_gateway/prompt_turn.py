@@ -743,7 +743,7 @@ def _invoke_agent(
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
     hold = {"buf": "", "held": ""} if _is_bot_mode_session(session) else None
-    loop_hold = {"text": ""}
+    loop_hold = {"text": "", "seen": ""}
 
     def _deliver_delta(delta):
         with session["history_lock"]:
@@ -764,15 +764,17 @@ def _invoke_agent(
                 split_trailing_loop_complete_marker,
             )
             loop_candidate = loop_hold["text"] + delta
-            if ends_with_partial_loop_complete_marker(loop_candidate):
+            # Judge against everything already released so an open fence keeps it as content.
+            if ends_with_partial_loop_complete_marker(loop_hold["seen"] + loop_candidate):
                 safe, partial = split_trailing_loop_complete_marker(loop_candidate)
                 loop_hold["text"] = partial
-                if safe:
-                    _stream(safe)
-                return
-            if loop_hold["text"]:
-                delta = loop_hold["text"] + delta
+                if not safe:
+                    return
+                delta = safe
+            else:
+                delta = loop_candidate
                 loop_hold["text"] = ""
+            loop_hold["seen"] += delta
         if hold is not None and isinstance(delta, str):
             from gateway.response_filters import is_partial_silence_marker
             hold["buf"] += delta
