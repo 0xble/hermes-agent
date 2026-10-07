@@ -132,6 +132,54 @@ def test_stop_intent_short_circuits_malformed_config(tmp_path, monkeypatch):
     assert guardian.run_once(home, plist, label) == "stopped"
 
 
+def fake_parked_launchctl(monkeypatch, label):
+    """A loaded-but-parked job: print succeeds with no PID and last exit code 0."""
+    calls = []
+    state = {"phase": "parked"}
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "print":
+            if not argv[2].startswith(f"gui/{os.getuid()}/"):
+                return subprocess.CompletedProcess(argv, 113, stdout="", stderr="Could not find service")
+            if state["phase"] == "parked":
+                return subprocess.CompletedProcess(argv, 0, stdout="state = not running\n\tlast exit code = 0\n", stderr="")
+            if state["phase"] == "unloaded":
+                return subprocess.CompletedProcess(argv, 113, stdout="", stderr="Could not find service")
+            return subprocess.CompletedProcess(argv, 0, stdout="pid = 123\n", stderr="")
+        if argv[1] == "managername":
+            return subprocess.CompletedProcess(argv, 0, stdout="Aqua", stderr="")
+        if argv[1] == "bootout":
+            state["phase"] = "unloaded"
+        if argv[1] == "bootstrap":
+            state["phase"] = "running"
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    return calls
+
+
+@pytest.mark.platforms("macos")
+def test_parked_service_is_booted_out_and_rebootstrapped(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    calls = fake_parked_launchctl(monkeypatch, label)
+    # Unhealthy while parked; healthy only once the job has been re-bootstrapped.
+    monkeypatch.setattr(guardian, "healthy",
+                        lambda *args: any(row[1] == "bootstrap" for row in calls))
+    assert guardian.run_once(home, plist, label, grace=0.000001) == "repaired"
+    verbs = [row[1] for row in calls if row[1] in {"bootout", "bootstrap"}]
+    assert verbs == ["bootout", "bootstrap"]
+
+
+@pytest.mark.platforms("macos")
+def test_parked_service_repair_respects_stopped_intent(tmp_path, monkeypatch):
+    home, plist, label, *_ = layout(tmp_path)
+    calls = fake_parked_launchctl(monkeypatch, label)
+    guardian.set_intent(home, stopped=True)
+    assert guardian.run_once(home, plist, label) == "stopped"
+    assert not calls
+
+
 @pytest.mark.platforms("macos")
 def test_unloaded_service_is_not_bootstrapped_beside_withdrawn_leftovers(tmp_path, monkeypatch):
     home, plist, label, *_ = layout(tmp_path)

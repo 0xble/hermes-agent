@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -46,7 +47,7 @@ def _gateway_domain(label: str, preferred: str | None) -> str:
             states[candidate] = _launch_state(candidate, label)
         except RuntimeError:
             states[candidate] = "unknown"
-    loaded = [candidate for candidate, state in states.items() if state == "loaded"]
+    loaded = [candidate for candidate, state in states.items() if state in {"loaded", "parked"}]
     if len(loaded) > 1:
         raise RuntimeError("gateway label is loaded in both launchd domains")
     if loaded:
@@ -153,6 +154,12 @@ def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> 
     result = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
                             capture_output=True, text=True, encoding="utf-8", timeout=_bounded_timeout(5, deadline))
     if result.returncode == 0:
+        # A loaded job with no live PID whose last exit was clean is parked: KeepAlive's
+        # SuccessfulExit=false will never relaunch it (exit 0, or EX_CONFIG 78 mapped to 0).
+        pid = re.search(r"^\s*pid\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+        last_exit = re.search(r"^\s*last exit (?:code|status)\s*=\s*(\d+)\s*$", result.stdout, re.MULTILINE)
+        if (not pid or int(pid[1]) == 0) and last_exit and int(last_exit[1]) == 0:
+            return "parked"
         return "loaded"
     if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
         return "unloaded"
@@ -275,6 +282,15 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         return "capped"
     _refuse_leftovers_before_launch(home)
     receipt(home, "bootstrap", "attempt", label=label)
+    if state == "parked":
+        # Deliberate stops short-circuit above via the stopped intent, so a parked job here
+        # is an unintended clean exit. Bootstrap would fail on a still-loaded label: boot it
+        # out first and prove it unloaded. MAX_REPAIRS bounds a config-fatal relaunch loop.
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
+                       timeout=_bounded_timeout(10, deadline))
+        if _launch_state(domain, label, deadline=deadline) != "unloaded":
+            receipt(home, "bootstrap", "failed", label=label, reason="parked label bootout did not read back unloaded")
+            return "failed"
     subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True,
                    timeout=_bounded_timeout(10, deadline))
     deadline = deadline or time.monotonic() + 12
