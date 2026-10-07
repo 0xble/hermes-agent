@@ -350,6 +350,9 @@ class TestAckedReleaseWithoutFleetRow:
         monkeypatch.setattr("hermes_cli.gateway_launchd._launchctl_supervised_pid", lambda _: 111)
         monkeypatch.setattr("psutil.Process", lambda _: supervisor)
         monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **_: [])
+        clock = [0.0]
+        monkeypatch.setattr(fleet._time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(fleet._time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
 
         assert fleet._acknowledged_release_launchd_label(home, root) == label
 
@@ -363,6 +366,83 @@ class TestAckedReleaseWithoutFleetRow:
         )
         assert restarted == [label]
         assert failed == []
+
+    def test_live_ack_is_credited_when_current_row_appears_within_bound(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        root = tmp_path / "release"
+        home.mkdir()
+        root.mkdir()
+        label = "ai.hermes.gateway"
+        installed = tmp_path / f"{label}.plist"
+        body = plistlib.dumps({
+            "Label": label,
+            "EnvironmentVariables": {"HERMES_HOME": str(home)},
+        })
+        installed.write_bytes(body)
+        digest = hashlib.sha256(body).hexdigest()
+        (home / "release-last-txn.json").write_text(json.dumps({
+            "requires_reload": True,
+            "reload_ack": {
+                "release_root": str(root), "plist_sha256": digest,
+                "launchd_pid": 111, "gateway_pid": 222,
+            },
+            "plist": {"path": str(installed), "intended_sha256": digest},
+        }))
+        supervisor = SimpleNamespace(
+            pid=111,
+            children=lambda recursive=True: [SimpleNamespace(pid=222, cwd=lambda: str(root))],
+        )
+        monkeypatch.setattr(gw, "get_launchd_label", lambda: label)
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: installed)
+        monkeypatch.setattr("hermes_cli.gateway_launchd._launchctl_supervised_pid", lambda _: 111)
+        monkeypatch.setattr("psutil.Process", lambda _: supervisor)
+        snapshots = iter([
+            [], [],
+            [{"pid": 222, "state": "current", "code_root": str(root)}],
+        ])
+        monkeypatch.setattr(
+            "hermes_cli.update_receipt.collect_fleet_versions",
+            lambda **_: next(snapshots),
+        )
+        monkeypatch.setattr(fleet._time, "sleep", lambda _: None)
+
+        assert fleet._acknowledged_release_launchd_label(home, root) == label
+
+    def test_stale_row_does_not_credit_ack(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        root = tmp_path / "release"
+        home.mkdir()
+        root.mkdir()
+        label = "ai.hermes.gateway"
+        installed = tmp_path / f"{label}.plist"
+        body = plistlib.dumps({
+            "Label": label,
+            "EnvironmentVariables": {"HERMES_HOME": str(home)},
+        })
+        installed.write_bytes(body)
+        digest = hashlib.sha256(body).hexdigest()
+        (home / "release-last-txn.json").write_text(json.dumps({
+            "requires_reload": True,
+            "reload_ack": {
+                "release_root": str(root), "plist_sha256": digest,
+                "launchd_pid": 111, "gateway_pid": 222,
+            },
+            "plist": {"path": str(installed), "intended_sha256": digest},
+        }))
+        supervisor = SimpleNamespace(
+            pid=111,
+            children=lambda recursive=True: [SimpleNamespace(pid=222, cwd=lambda: str(root))],
+        )
+        monkeypatch.setattr(gw, "get_launchd_label", lambda: label)
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: installed)
+        monkeypatch.setattr("hermes_cli.gateway_launchd._launchctl_supervised_pid", lambda _: 111)
+        monkeypatch.setattr("psutil.Process", lambda _: supervisor)
+        monkeypatch.setattr(
+            "hermes_cli.update_receipt.collect_fleet_versions",
+            lambda **_: [{"pid": 222, "state": "stale", "code_root": str(root)}],
+        )
+
+        assert fleet._acknowledged_release_launchd_label(home, root) is None
 
     def test_missing_ack_keeps_the_normal_current_profile_restart(self, monkeypatch, tmp_path):
         home = tmp_path / "home"

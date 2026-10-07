@@ -1015,10 +1015,42 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
         if not any(p.pid == gateway_pid and Path(p.cwd()).resolve() == root.resolve()
                    for p in processes):
             return None
-        # ACK proves the live incarnation and its loaded release root. Do not require a
-        # fleet-status row here: the gateway publishes that row after startup, so an
-        # otherwise valid ACK can briefly predate it. Post-restart fleet verification
-        # remains the authority for successor health.
+        from hermes_cli.update_receipt import collect_fleet_versions
+        resolved_root = root.resolve()
+
+        def row_matches_release(row: dict) -> bool:
+            code_root = row.get("code_root")
+            if not isinstance(code_root, str):
+                return False
+            try:
+                return row.get("state") == "current" and Path(code_root).resolve() == resolved_root
+            except (OSError, TypeError, ValueError):
+                return False
+
+        def row_for_gateway(rows: list[dict]) -> dict | None:
+            return next((row for row in rows if row.get("pid") == gateway_pid), None)
+
+        # A gateway publishes its fleet row after startup. A row for this PID is
+        # authoritative when present: stale or mismatched identity must take the
+        # normal one-time corrective relaunch. Only the absence of this PID is
+        # transient, so wait within the same settle bound used by post-update fleet
+        # verification before crediting the ACK without a row.
+        rows = collect_fleet_versions(
+            expected_sha_override=root.name, expected_root_override=resolved_root)
+        row = row_for_gateway(rows)
+        if row is not None:
+            return label if row_matches_release(row) else None
+        deadline = _time.monotonic() + _FLEET_PROBE_SETTLE_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            _time.sleep(min(2.0, remaining))
+            row = row_for_gateway(collect_fleet_versions(
+                expected_sha_override=root.name, expected_root_override=resolved_root))
+            if row is not None:
+                return label if row_matches_release(row) else None
+        # Verification below remains the authority if the row never appears.
         return label
     except (OSError, ValueError, KeyError, TypeError, psutil.Error):
         return None
