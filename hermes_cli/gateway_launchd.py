@@ -18,6 +18,9 @@ from xml.sax.saxutils import escape
 
 from gateway.restart import LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S
 
+# Minimum seconds launchd waits between KeepAlive relaunches; written into the generated plist.
+LAUNCHD_THROTTLE_INTERVAL_S = 30
+
 
 def _gw():
     from hermes_cli import gateway  # late: the facade imports this module
@@ -138,6 +141,17 @@ def _launchd_reload_budget() -> float:
     """Bootstrap retry window for a plist reload: the failure happens while the old gateway is still
     draining (default 180s), so size it to the drain timeout with a 30s floor."""
     return max(30.0, _gw()._get_restart_drain_timeout())
+
+
+def _launchd_old_gateway_exit_budget() -> float:
+    """How long a reload waits for the booted-out gateway to exit before bootstrapping.
+
+    ``bootout`` SIGTERMs the old gateway and launchd SIGKILLs it at ``ExitTimeOut``, which the gui
+    domain clamps to 60s, so it is always gone by then. Bootstrapping earlier starts a replacement
+    that finds the host still owned, exits, and costs a full ``ThrottleInterval`` before launchd
+    relaunches it. A zero drain budget does not shorten teardown, which still interrupts agents,
+    kills tools and disconnects adapters."""
+    return max(_launchd_reload_budget(), LAUNCHD_GUI_EXIT_TIMEOUT_CLAMP_S + 5.0)
 
 
 def _launchctl_supervised_pid(label: str) -> int | None:
@@ -464,7 +478,7 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
          the live value at boot and fits its signal-driven drain inside it
          (gateway.restart.read_launchd_exit_timeout_s). -->
     <key>ThrottleInterval</key>
-    <integer>30</integer>
+    <integer>{LAUNCHD_THROTTLE_INTERVAL_S}</integer>
 
     <key>ExitTimeOut</key>
     <integer>60</integer>
@@ -508,6 +522,7 @@ def _spawn_deferred_launchd_reload(
     _gw()._append_launchd_reload_log(f"Launchd reload helper started for {target}")
 
     _reload_budget = int(_launchd_reload_budget())
+    _exit_budget = int(_launchd_old_gateway_exit_budget())
     q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
@@ -519,9 +534,9 @@ def _spawn_deferred_launchd_reload(
         f"sleep 2; "
         f"launchctl bootout {q_target} 2>/dev/null; "
         # Wait for the OLD gateway to exit: bootout only SIGTERMs and every bootstrap during the drain fails EIO.
-        f"_wait_deadline=$(($(date +%s) + {_reload_budget})); "
+        f"_wait_deadline=$(($(date +%s) + {_exit_budget})); "
         f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
-        f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_reload_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
+        f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_exit_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
         f"    break;   fi;   sleep 1; done; "
         # Let launchd finish unregistering the label after the process exits.
         f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
@@ -611,10 +626,11 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_gw()._CAPTURE_TEXT)
     _reload_budget = _launchd_reload_budget()
     # Wait out the old gateway's drain first so the budget isn't burned on guaranteed EIO ("already loaded").
-    if gateway_pid is not None and not _gw()._wait_for_pid_exit(gateway_pid, _reload_budget):
+    _exit_budget = _launchd_old_gateway_exit_budget()
+    if gateway_pid is not None and not _gw()._wait_for_pid_exit(gateway_pid, _exit_budget):
         _gw()._append_launchd_reload_log(
             f"old gateway pid {gateway_pid} still alive after "
-            f"{int(_reload_budget)}s drain wait — bootstrapping {target} anyway"
+            f"{int(_exit_budget)}s drain wait — bootstrapping {target} anyway"
         )
     _deadline = time.monotonic() + _reload_budget
     if not _gw()._retry_launchctl_bootstrap_until_registered(domain, plist_path, label, deadline=_deadline):
@@ -889,8 +905,9 @@ def launchd_restart():
         _launchd_ok("✓ Service restarted")
 
 
-# KeepAlive relaunches at most ~once per 10s, so a self-restart leaves the label pid-less that long.
-LAUNCHD_SUPERVISION_VERIFY_TIMEOUT = 20.0
+# KeepAlive relaunches at most once per ThrottleInterval, so a replacement that exits early leaves the
+# label pid-less that long. The window must outlast it or a healthy respawn reads as a failure.
+LAUNCHD_SUPERVISION_VERIFY_TIMEOUT = LAUNCHD_THROTTLE_INTERVAL_S + 10.0
 
 
 def wait_for_launchd_gateway_supervision(

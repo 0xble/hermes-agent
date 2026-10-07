@@ -26,6 +26,7 @@ async def test_boot_notice_delivery_claims_only_trigger_and_injects_parent_turn(
     release = lambda delegation_id, claim_id: seen.append(("release", delegation_id, claim_id))
     seen = []
     monkeypatch.setattr("tools.delegation_resume.claim_auto_resume_trigger", claim_fn)
+    monkeypatch.setattr("tools.delegation_resume.inspect_resumable", lambda _id: (claim, None))
     monkeypatch.setattr("tools.delegation_resume.complete_auto_resume_trigger", complete)
     monkeypatch.setattr("tools.delegation_resume.release_auto_resume_trigger", release)
 
@@ -38,6 +39,39 @@ async def test_boot_notice_delivery_claims_only_trigger_and_injects_parent_turn(
     assert await runner._deliver_auto_resume_notice(evt) is True
     runner._inject_watch_notification.assert_awaited_once_with(evt["text"], evt, raise_not_accepted=True)
     assert seen == [("complete", "deleg-1", "boot:claim")]
+
+
+@pytest.mark.asyncio
+async def test_boot_notice_rechecks_row_before_injection(monkeypatch):
+    """A queued notice must not inject after its durable row disappears."""
+    runner = object.__new__(GatewayRunner)
+    runner._completion_event_scope = lambda _evt: nullcontext()
+    runner._classify_completion_target = AsyncMock(return_value="deliver")
+    runner._completion_delivery_ready = AsyncMock(return_value=True)
+    runner._build_process_event_source = Mock(return_value=None)
+    runner._inject_watch_notification = AsyncMock(side_effect=AssertionError("stale notice injected"))
+
+    claim = {"delegation_id": "deleg-stale", "auto_resume_claim": "boot:stale"}
+    released = []
+    monkeypatch.setattr("tools.delegation_resume.claim_auto_resume_trigger", lambda _id: (claim, None))
+    monkeypatch.setattr(
+        "tools.delegation_resume.inspect_resumable",
+        lambda _id: (None, "no_such_delegation"),
+    )
+    monkeypatch.setattr(
+        "tools.delegation_resume.release_auto_resume_trigger",
+        lambda delegation_id, claim_id: released.append((delegation_id, claim_id)) or True,
+    )
+
+    evt = {
+        "type": "delegation_auto_resume",
+        "delegation_id": "deleg-stale",
+        "parent_session_id": "parent-stale",
+        "text": "resume",
+    }
+    assert await runner._deliver_auto_resume_notice(evt) is True
+    assert released == [("deleg-stale", "boot:stale")]
+    runner._inject_watch_notification.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -88,6 +122,8 @@ async def test_boot_notice_defers_disconnected_owner_then_delivers_after_reconne
     seen = []
     monkeypatch.setattr("tools.delegation_resume.claim_auto_resume_trigger",
                         lambda _id: (seen.append("claim") or {"auto_resume_claim": "boot:claim"}, None))
+    monkeypatch.setattr("tools.delegation_resume.inspect_resumable",
+                        lambda _id: ({"delegation_id": "deleg-reconnect"}, None))
     monkeypatch.setattr("tools.delegation_resume.complete_auto_resume_trigger",
                         lambda *_args: seen.append("complete"))
     monkeypatch.setattr("tools.delegation_resume.release_auto_resume_trigger",

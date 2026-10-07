@@ -2848,6 +2848,8 @@ class BasePlatformAdapter(ABC):
 
     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
     REQUIRES_EDIT_FINALIZE: bool = False
+    # Minimum seconds between progress-bubble edits for this platform; None keeps the runner's default.
+    PROGRESS_EDIT_INTERVAL: Optional[float] = None
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a fresh thread under ``parent_chat_id`` for a CLI→platform session handoff; its id

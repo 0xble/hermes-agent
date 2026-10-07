@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 import threading
 import time
@@ -1365,7 +1364,11 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
             if not is_core_memory_provider(_mem_provider_name):
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                from agent.memory_manager import parse_prefetch_max_age as _parse_prefetch_max_age
+                agent._memory_manager = _MemoryManager(
+                    recall_synthetic_turns=is_truthy_value(mem_config.get("recall_synthetic_turns"), default=False),
+                    prefetch_max_age_seconds=_parse_prefetch_max_age(mem_config.get("prefetch_max_age_seconds")),
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp is None:
                     # The provider left core for the catalog (or was never installed): fetch it once.

@@ -171,6 +171,15 @@ class TestExtractCacheBustingConfig:
         assert {k: v for k, v in legacy.items() if k.startswith("checkpoints.")} == {
             k: v for k, v in explicit.items() if k.startswith("checkpoints.")}
 
+    @pytest.mark.parametrize("key,other", [("recall_synthetic_turns", True), ("prefetch_max_age_seconds", 60)])
+    def test_memory_recall_settings_bust_the_cached_agent(self, key, other):
+        """The MemoryManager reads these at agent build, so changing either must rebuild the agent."""
+        from gateway.run import GatewayRunner
+
+        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)[f"memory.{key}"]  # noqa: E731
+        assert sig({}) == sig({"memory": {key: DEFAULT_CONFIG["memory"][key]}}) == DEFAULT_CONFIG["memory"][key]
+        assert sig({"memory": {key: other}}) == other != sig({})
+
     def test_non_dict_section_treated_as_missing(self):
         from gateway.run import GatewayRunner
 

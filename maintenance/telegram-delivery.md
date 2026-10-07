@@ -117,18 +117,22 @@ standalone sender's bot. Each metered request (any non-`get*` endpoint carrying 
 the chat's next slot. Deliveries (sends, final and over-cap edits, overflow continuations,
 media, controls, deletions, topic edits, reactions) wait FIFO and are never dropped. Typing and
 drafts are shed when no slot is free. Interim edits are skipped by the adapter inside the
-3.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
+10.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
 never eats a transport deadline. A request inside a durably recorded server penalty is refused
 locally with `RetryAfter` for every path. Any published `retry_after` widens that chat's gap
 2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
 floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
-`TurnRunner._PROGRESS_EDIT_INTERVAL` is 3.0s, the transport edit floor.
+`TelegramAdapter.PROGRESS_EDIT_INTERVAL` is 10.0s, the transport edit floor, and
+`TurnRunner._progress_edit_interval` uses it for Telegram progress bubbles. Other platforms keep
+the runner default (`TurnRunner._PROGRESS_EDIT_INTERVAL`, 3.0s). Telegram used 3.0s until
+2026-10-06, when the daily call counter showed progress-bubble edits were the largest share of
+typed-turn calls on a chat that hit a daily volume ban; Brian approved slower bubble updates.
 
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |
 | All metered calls to one chat (one shared slot) | 45/min (1.33s gap) | 15/min (4.0s gap) |
 | of which typing, at most | 15/min (4.0s) | 5/min (12.0s) |
-| of which interim edits and drafts, at most | 20/min (3.0s) | 15/min (4.0s) |
+| of which interim edits and drafts, at most | 6/min (10.0s) | 6/min (10.0s) |
 | After a published `retry_after` (10 min) | 22.5/min | 7.5/min |
 | Ceiling (community envelope) | ~60/min | ~20/min |
 
@@ -139,7 +143,7 @@ which the standalone lane now honours, so cron's standalone fallback can no long
 requests or sleep for hours inside a ban. Reads (`get*`) and chat-less calls such as
 `answerCallbackQuery` are unmetered. Visible effect: with many topics active at once, typing
 indicators refresh chat-wide at most every 4s, so not every topic shows "typing" continuously,
-and progress bubbles update at most every 3s.
+and progress bubbles update at most every 10s.
 
 **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
 pins the summed per-chat rate against each class ceiling with every path saturated at once,
@@ -330,3 +334,44 @@ while preserving the independently required local deltas. Retire flood
 coherence when upstream classifies media floods and shares one per-chat window. Retire
 emphasis when PR 106906 merges and the candidate tag includes it. Roll back by reverting
 the logical patch; no persistent data changes.
+
+## Daily call counter (measurement only)
+
+**Evidence (2026-10-06).** The last two bans were each a single 429 with a multi-hour wait:
+`editMessageText` at 2026-10-04 20:35 (23019s) and at 2026-10-05 17:23:52 PDT
+(`retry_after=34507.0s`, the first 429 that day). Both ended near 02:59 PDT (09:59 UTC). In the
+24 minutes before the second one the log shows only progress edits, a few `deleteMessages`
+bubble cleanups and sends, about 1 call every 4-6s, inside the 45/min budget above. So the
+per-minute budget cannot be the binding limit. The fixed end time points to a volume window.
+Its size, and whether it applies per chat or per bot, were not known because successful calls
+were only logged at debug level.
+
+**Contract.** `ChatBudgetRateLimiter` counts every metered call that reaches Telegram in
+`DailyCallCounter`, by chat, endpoint and trigger, in hourly buckets, after the request returns so
+measurement never shifts pacing. Local penalty refusals and shed typing or drafts are not counted.
+`TelegramAdapter._process_message_background` binds the trigger (`typed`, `goal`, `loop`, `relay`,
+`process`, `delegation`, `restart`, `heartbeat`, `internal`) in a ContextVar for the turn task, and
+`get_pending_message` rebinds it when the runner drains a queued event in-band, so a turn queued
+behind a busy session is never counted under its predecessor. Calls outside a turn (cron delivery, outbox
+replay, housekeeping) are `untagged`. Counts flush additively to `call_counts` in the profile's
+`telegram-flood-state.db` at most once a minute, are kept for 30 days, and log a 24h summary hourly
+(whole hourly buckets from the first hour at or after the cutoff, never reaching back before it).
+Each counter starts one long-lived daemon worker when it is created, so a quiet profile persists
+within a minute and no send pays for a thread start. Window reads include counts a locked database
+could not store yet. Any `retry_after` of 600s or more also logs every chat's window counts for the profile, so per-chat and per-bot limits can be told apart. Each profile directory gets its own counter, resolved on the caller's context, never on the worker thread. The send path
+only updates an in-memory dict. Persistence and summaries run on the counter's own daemon thread,
+so a slow or locked database cannot delay a call. The counter never sheds or refuses a call.
+Counter failures are logged at debug level and unflushed counts are kept for the next flush.
+
+**Reading it.** `sqlite3 ~/.hermes/telegram-flood-state.db "select chat_id, endpoint, trigger,
+sum(count) from call_counts where hour >= strftime('%s','now','-1 day') group by 1,2,3"`. The
+threshold is the window total logged with the next long `retry_after`. Comparing per-chat
+totals across chats at that moment shows whether the limit is per chat or per bot.
+
+**Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_daily_call_counter.py`.
+
+**Rollback:** Revert the `feat(telegram): count daily calls per chat` commit. The
+`call_counts` table can stay, because nothing else reads it.
+
+**Retirement:** Retire once the threshold is measured and upstream exposes equivalent per-chat
+call accounting, or once the early-warning cron reads another source.

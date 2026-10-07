@@ -25,8 +25,15 @@ import { useComposerQueue } from './use-composer-queue'
 
 const SESSION_KEY = 'stored-session-queue-hook'
 
-function renderQueueHook(overrides: { busy?: boolean; onCancel?: () => void; onSteer?: ChatBarProps['onSteer'] } = {}) {
-  const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
+function renderQueueHook(overrides: {
+  busy?: boolean
+  onCancel?: () => void
+  onSteer?: ChatBarProps['onSteer']
+  onSubmit?: ChatBarProps['onSubmit']
+} = {}) {
+  const onSubmit = (overrides.onSubmit ?? vi.fn<ChatBarProps['onSubmit']>(async () => true)) as ReturnType<
+    typeof vi.fn<ChatBarProps['onSubmit']>
+  >
   const onCancel = overrides.onCancel ?? vi.fn()
   const onSteer = overrides.onSteer
   const queueEditRef: { current: QueueEditState | null } = { current: null }
@@ -239,6 +246,44 @@ describe('useComposerQueue park integration', () => {
 
     expect(onSteer).not.toHaveBeenCalled()
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+  })
+
+  it('keeps a deferred MoA token queued through force-send and forwards it on drain', async () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: '!inspect', moaToken: 'queued-moa-1' })!
+    const onSteer = vi.fn(async () => true)
+    const { hook, onCancel, onSubmit } = renderQueueHook({ busy: true, onSteer })
+
+    await act(async () => {
+      expect(await hook.result.current.steerQueuedNow(entry.id)).toBe(false)
+      expect(hook.result.current.sendQueuedNow(entry.id)).toBe(true)
+    })
+
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onCancel).toHaveBeenCalledTimes(1)
+
+    hook.rerender({ busy: false })
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0]?.[0]).toBe('!inspect')
+    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({ fromQueue: true, moaToken: 'queued-moa-1' })
+  })
+
+  it('drops a cancelled deferred MoA token and lets the next queue entry drain', async () => {
+    const dropped = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: '!cancelled', moaToken: 'cancelled-moa' })!
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'next prompt' })
+    parkQueuedPrompts(SESSION_KEY)
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>()
+      .mockResolvedValueOnce('dropped')
+      .mockResolvedValueOnce(true)
+    const { hook } = renderQueueHook({ onSubmit })
+
+    await act(async () => {
+      expect(await hook.result.current.sendQueuedNow(dropped.id)).toBe(true)
+      expect(getQueuedPrompts(SESSION_KEY).map(item => item.text)).toEqual(['next prompt'])
+      expect(await hook.result.current.drainNextQueued()).toBe(true)
+    })
+
+    expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
+    expect(onSubmit.mock.calls.map(call => call[0])).toEqual(['!cancelled', 'next prompt'])
   })
 
   it('a delivered steer lifts the park so the rest of the queue flows', async () => {

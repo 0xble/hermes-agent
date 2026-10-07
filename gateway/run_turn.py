@@ -27,6 +27,7 @@ from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    strip_trailing_silence_marker,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -1520,6 +1521,12 @@ class GatewayTurnMixin:
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
+        # Webhook delivery is an autonomous lane with a looser first/last-line silence rule;
+        # leave its marker semantics unchanged. Interactive replies drop a trailing standalone
+        # marker from substantive text before the silence verdict, so a marker-only run that
+        # collapses to one marker still goes through the silence guard below.
+        if source.platform != Platform.WEBHOOK:
+            response = strip_trailing_silence_marker(response)
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
@@ -1920,11 +1927,21 @@ class GatewayTurnMixin:
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
+        raw_response=None,
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         if diagnostic_wake_muted(event):
             return None
+        raw_response = response if raw_response is None else raw_response
+        # LOOP_COMPLETE is a control marker for /loop detection, not assistant content. Keep the
+        # raw response available to post-turn hooks and strip only at this final display boundary.
+        # The non-streamed return value is the stripped display text, so the hooks read the raw
+        # copy stashed here instead (see _final_text_for_post_turn_hooks).
+        with suppress(Exception):
+            event._raw_final_response = str(raw_response or "")
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
@@ -1953,10 +1970,10 @@ class GatewayTurnMixin:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
-            # Return None so the body isn't sent twice; stash the delivered text on the event for the
+            # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
-                event._streamed_final_response = str(response or "")
+                event._streamed_final_response = str(raw_response or "")
             return None
 
         return response
@@ -2243,6 +2260,10 @@ class GatewayTurnMixin:
                     event.ledger_message_id = str(_terminal_inbound)
                 if "queued_terminal_notification_category" in agent_result:
                     event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+                if agent_result.get("queued_terminal_notification_origin"):
+                    # A completion drained behind this turn is fresh goal evidence for the
+                    # chain's single post-turn judge (see _run_post_turn_hooks).
+                    event.metadata["notification_origin"] = agent_result["queued_terminal_notification_origin"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
@@ -2259,6 +2280,9 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
+            raw_response_for_delivery = response
+            from gateway.response_filters import strip_trailing_loop_complete_marker
+            response = strip_trailing_loop_complete_marker(response)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
@@ -2283,6 +2307,7 @@ class GatewayTurnMixin:
             delivered_response = await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
+                raw_response=raw_response_for_delivery,
             )
             from gateway.run import _should_clear_resume_pending_after_turn
             event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(agent_result)
@@ -2724,6 +2749,7 @@ class GatewayTurnMixin:
             cursor=_effective_cursor,
             fresh_final_after_seconds=_fresh_final_secs, transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            strip_trailing_silence_markers=(source.platform != Platform.WEBHOOK),
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
@@ -3756,6 +3782,10 @@ class GatewayTurnMixin:
             turn_ctx.source.platform, _delivery_result.get("final_response", ""),
             interrupted=bool(_delivery_result.get("interrupted") or (result or {}).get("interrupted")),
         )
+        # LOOP_COMPLETE is /loop control text: this lane sends before the normal completion
+        # filter runs, so strip it here too. Loop detection reads the untouched result dict.
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        first_response = strip_trailing_loop_complete_marker(first_response)
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
@@ -3816,7 +3846,6 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3839,8 +3868,14 @@ class GatewayTurnMixin:
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+            if adapter and pending_event and session_key and hasattr(adapter, "_pending_messages"):
+                # The drain already dequeued this event and promoted the next one into the slot, so
+                # it is the OLDEST waiting message: put it back at the head, never behind newer ones.
+                existing = adapter._pending_messages.get(session_key)
+                if existing is not None and existing is not pending_event:
+                    self._session_state(session_key).conversation.queued_events.insert(0, existing)
+                adapter._pending_messages[session_key] = pending_event
+                pending_event._gateway_accepted = True
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
@@ -3999,6 +4034,9 @@ class GatewayTurnMixin:
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
+                "queued_terminal_notification_origin": (
+                    (pending_event.metadata or {}).get("notification_origin")
+                    if pending_event is not None and pending_event.internal else None),
             }
         return merged
 

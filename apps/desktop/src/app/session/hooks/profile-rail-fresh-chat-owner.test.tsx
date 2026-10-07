@@ -53,7 +53,7 @@ import type { ClientSessionState } from '../../types'
 
 import { usePromptActions } from './use-prompt-actions'
 import { clearSingleFlightSessionResumeState } from './use-prompt-actions/single-flight-resume'
-import type { SubmitTextOptions } from './use-prompt-actions/utils'
+import type { SubmitTextOptions, SubmitTextResult } from './use-prompt-actions/utils'
 import { useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
 
@@ -264,7 +264,7 @@ interface HarnessHandle {
   busyRef: { current: boolean }
   bindings: () => { runtimeForStored: null | string; storedForRuntime: null | string }
   createSession: () => Promise<string | null>
-  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean>
+  submitText: (text: string, options?: SubmitTextOptions) => Promise<SubmitTextResult>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,

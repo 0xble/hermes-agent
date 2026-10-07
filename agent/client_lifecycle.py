@@ -134,8 +134,17 @@ class ClientLifecycleMixin:
                 if owner and owner != task_id:
                     clear_file_ops_cache(owner)
 
+        def release_camofox_tabs() -> None:
+            # Per-turn cleanup keeps a managed Camofox task's tab binding for its next turn; the
+            # agent's end releases the tasks it ran. Not ``task_id``: a temporary agent (hygiene,
+            # manual compression) shares the live session's id but owns none of its tabs.
+            import sys
+            camofox = sys.modules.get("tools.browser_camofox")
+            if camofox is not None:
+                camofox.release_task_bindings(getattr(self, "_process_owner_task_ids", ()))
+
         for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
-                     release_computer_use, forget_file_state):
+                     release_camofox_tabs, release_computer_use, forget_file_state):
             _quietly(step)
 
     def _client_log_context(self) -> str:
