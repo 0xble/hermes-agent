@@ -577,6 +577,8 @@ HERMES_BACKGROUND_NOTIFICATIONS=result
 
 With `terminal(background=true, notify_on_complete=true)` the finished process starts a new agent turn and the agent reports the result itself, so no separate status line is sent. The exception is a process that finishes while the turn that launched it is still running: the completion is queued as the agent's next turn and you get the one-line `concise` status right away (unless the mode is `off`, or `error` with a zero exit code), instead of silence until that turn ends.
 
+While a chat is mid-turn or started a turn within the last `gateway.completion_notification_batch_window_seconds` (default 300), successful background results (exit 0, completed delegations) are held and handed to the agent together as one turn that lists every result. Failures, non-zero exits, and a result a parked `/goal` is explicitly waiting on are delivered at once, and they bring any held results with them. Results are never dropped: a restart releases held results for delivery on the next start. Set the window to `0` to deliver each result as soon as it lands.
+
 ### Use Cases
 
 - **Server monitoring** — "/bg Check the health of all services and alert me if anything is down"
