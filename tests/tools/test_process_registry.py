@@ -186,6 +186,22 @@ def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
             os.unlink(pidfile)
 
 
+def test_no_deadline_kill_all_delegates_to_parent_first_kill_process(registry):
+    """Unbounded kill_all preserves kill_process's parent-first tree teardown path."""
+    session = _make_session(sid="proc_parent_first")
+    session.process = MagicMock(pid=4242)
+    registry._running[session.id] = session
+    calls = []
+
+    def fake_kill(session_id, **kwargs):
+        calls.append((session_id, kwargs))
+        return {"status": "killed"}
+
+    registry.kill_process = fake_kill
+
+    assert registry.kill_all(session.task_id, source="cli_stop") == 1
+    assert calls == [(session.id, {"source": "cli_stop", "consume_output": False})]
+
 @pytest.mark.live_system_guard_bypass
 @pytest.mark.parametrize("mode", ["kill_all", "kill_process"])
 def test_kill_terminates_descendant_that_escaped_process_group(registry, mode):

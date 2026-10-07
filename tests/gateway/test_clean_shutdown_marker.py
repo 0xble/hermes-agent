@@ -67,11 +67,14 @@ class TestCleanShutdownMarker:
              patch("gateway.status.remove_pid_file"), \
              patch("tools.process_registry.process_registry") as mock_proc_reg, \
              patch("tools.terminal_tool.cleanup_all_environments"), \
-             patch("tools.browser_tool_lifecycle.cleanup_all_browsers"):
+             patch("tools.browser_tool_lifecycle.cleanup_all_browsers"), \
+             patch("gateway.run.GatewayRunner._stop_kill_tool_subprocesses_off_loop", new_callable=AsyncMock) as final_cleanup:
             mock_proc_reg.kill_all = MagicMock()
 
             import asyncio
             asyncio.get_event_loop().run_until_complete(runner.stop())
+
+        final_cleanup.assert_awaited_once_with("final-cleanup", timeout=None)
 
         assert marker.exists(), ".clean_shutdown marker should exist after graceful stop"
 

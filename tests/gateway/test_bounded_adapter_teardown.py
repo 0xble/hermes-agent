@@ -217,6 +217,70 @@ async def test_timed_out_restart_spools_followups_before_slow_cleanup(bare_runne
 
 
 @pytest.mark.asyncio
+async def test_real_stop_impl_cancellation_during_idle_cleanup_still_disconnects(bare_runner, monkeypatch):
+    """The production stop orchestration must reach disconnect after idle-cache cancellation."""
+    import threading
+    import time
+
+    runner = bare_runner
+    runner._restart_requested = True
+    runner._restart_detached = False
+    runner._restart_via_service = False
+    runner._restart_drain_timeout = 0.01
+    runner._stop_requested_by_signal = False
+    runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._profile_adapters = {}
+    runner._startup_restore_queue = []
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {"idle:1": MagicMock()}
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.01")
+    runner._restart_shutdown_bound = lambda: 0.5
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    adapter.cancel_background_tasks = AsyncMock()
+    adapter.disconnect = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    runner._finalize_shutdown_agents = AsyncMock()
+
+    async def slow_idle_cleanup(*_args, **_kwargs):
+        await asyncio.sleep(10)
+
+    runner._cleanup_agent_resources_off_loop = slow_idle_cleanup
+
+    async def begin(_self, ctx):
+        ctx.started_at = time.monotonic()
+
+    async def drain(_self, _timeout, ctx):
+        ctx.active_agents = {"active": object()}
+        ctx.timed_out = True
+
+    async def interrupt(_self, _ctx):
+        return None
+
+    async def release(_self, _ctx):
+        return None
+
+    def quiesce(_self, _timeout, _ctx):
+        return None
+
+    async def persist(_self, _ctx):
+        return None
+
+    monkeypatch.setattr(GatewayRunner, "_stop_begin_teardown", begin)
+    monkeypatch.setattr(GatewayRunner, "_stop_drain_active_work", drain)
+    monkeypatch.setattr(GatewayRunner, "_stop_interrupt_remaining_work", interrupt)
+    monkeypatch.setattr(GatewayRunner, "_stop_release_runtime_state", release)
+    monkeypatch.setattr(GatewayRunner, "_stop_quiesce_and_close_session_dbs", quiesce)
+    monkeypatch.setattr(GatewayRunner, "_stop_persist_exit_state", persist)
+
+    await GatewayRunner._stop_impl(runner)
+
+    adapter.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_timed_out_finalize_reserves_adapter_disconnect_budget(bare_runner):
     """A slow finalize hook cannot consume the restart teardown/disconnect slice."""
     import threading
@@ -253,7 +317,7 @@ async def test_timed_out_finalize_reserves_adapter_disconnect_budget(bare_runner
 
     stop_event = threading.Event()
     bound = runner._restart_shutdown_bound()
-    agent_bound = max(0.1, bound - min(0.75, max(0.25, bound * 0.25)))
+    agent_bound = runner._restart_agent_finalize_bound(bound)
     started = time.monotonic()
     task = asyncio.create_task(GatewayRunner._stop_finalize_agents_and_adapters(
         runner, ctx, stop_event=stop_event, deadline=started + bound,

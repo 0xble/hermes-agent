@@ -2747,6 +2747,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return _signal_group(target, sig, pgid=pgid)
             return _signal_pid_group(target, sig, pgid=pgid)
 
+        # Unbounded callers retain kill_process()'s parent-first tree semantics. The parallel
+        # root/descendant sweep is reserved for bounded shutdown, where a shared deadline is
+        # more important than Chromium/Electron's orderly parent teardown (#111598).
+        bounded_sweep = deadline is not None or stop_event is not None
+        if not bounded_sweep:
+            killed = sum(_fallback_kill_one(session) for session in targets)
+            self._write_checkpoint()
+            return killed
+
         # Real local workers are killed in one bounded sweep: TERM every process group,
         # one shared grace, KILL every survivor, then a short reap/poll. This deliberately
         # has no sequential-under-deadline path: bash -lic wrappers commonly ignore TERM.
@@ -2760,6 +2769,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # Snapshot each tree before TERM. Once a root exits, psutil cannot reliably
         # rediscover a same-group child that ignored TERM.
         snapshots = {session.id: _sweep_snapshot(session) for session in signalable}
+        if deadline is not None:
+            for session in targets:
+                session._kill_deadline = deadline
+        escalated_ids: set[str] = set()
 
         def _systemd_stop_async(session: ProcessSession) -> None:
             if not session.systemd_unit:
@@ -2823,6 +2836,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     for pid, pgid in descendants
                     if self._is_host_pid_alive(pid)
                 )
+                escalated_ids.add(session.id)
                 with ThreadPoolExecutor(max_workers=len(kill_jobs), thread_name_prefix="process-kill") as pool:
                     futures = [
                         pool.submit(
@@ -2854,7 +2868,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 with session._lock:
                     if not session.exited:
                         session.exited = True
-                        session.exit_code = -signal.SIGTERM
+                        session.exit_code = -getattr(
+                            signal, "SIGKILL", signal.SIGTERM
+                        ) if session.id in escalated_ids else -signal.SIGTERM
                         session.completion_reason = "killed"
                         session.termination_source = source
                         if consume_output:
