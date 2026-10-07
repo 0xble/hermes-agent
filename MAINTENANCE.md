@@ -107,6 +107,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Worktree GC Git isolation | Host Git config never hides files from the reclaim safety check; every listed path is archived exactly or the worktree is kept | Worktree-GC dirty checks, archiving, or reclaim changes | [Worktree GC Git isolation](maintenance/worktree-gc-git-isolation.md) |
 | Camofox accounts and vault | Preserve named accounts, Connect/secret-safe fills, shadow-DOM login forms | Browser account, vault, or 1Password backend changes | [Camofox and vault](maintenance/camofox-vault.md) |
 | Camofox navigation titles | Return the exact owned tab's title without crossing account boundaries | Camofox navigation or tab-list changes | [Camofox navigation titles](maintenance/camofox-navigation-titles.md) |
+| Camofox tab reuse | Keep a managed task's tab (including the handoff tab) across turns and adopt a safe existing tab before creating one | Camofox cleanup, tab adoption, handoff, or compression task-id changes | [Camofox tab reuse](maintenance/camofox-tab-reuse.md) |
 | Browser upload | Attach local files to the page's upload control, including cross-origin iframes, with safe path checks and staging | Camofox tab actions, upload route, or `uploads_dir` changes | [Browser upload](maintenance/browser-upload.md) |
 | Slack ordered list numbering | Preserve authored starts across paragraphs, bullets, and nesting | Slack rich-text list parsing, grouping, or outbound Block Kit rendering changes | [Slack ordered list numbering](maintenance/slack-ordered-list-numbering.md) |
 | Slack status on the legacy API | Thread status and its clear stay on `assistant.threads.setStatus`; titles may use Agent Sessions | Slack status/title calls or upstream Agent Sessions changes | [Slack status legacy](maintenance/slack-status-legacy.md) |
@@ -160,6 +161,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `HERMES_HEAVY_SLOT=off HERMES_HOME=<isolated-home> /Users/brianle/Repos/hermes-agent/.venv/bin/python -m pytest -q tests/gateway/test_trailing_silence_marker.py tests/gateway/test_response_filters.py tests/gateway/test_stream_consumer_silence.py`.
 - **Retirement:** Remove this patch when released upstream behavior strips trailing standalone markers at both persistence and every interactive streaming delivery boundary.
 - **Rollback:** Revert the trailing-silence-marker fix commit.
+
+## Active patch record: goal continuation silence
+
+- **Patch identity:** `goal-continuation-silence`.
+- **Behavior:** Gateway-built standing-goal continuations (the post-turn continuation and the lifted-barrier wake) carry `reply_expected=False`, so a no-change tick that answers a bare `NO_REPLY` stays silent instead of posting the "No reply was written" fallback. A typed message absorbed into the same turn restores `reply_expected` through `MessageEvent.absorb_reply_expected`, so the human-turn guard is unchanged. Heartbeat and `/loop` prompts keep their existing contract.
+- **Source surfaces:** `gateway/run_goals.py` (`_synthetic_prompt_event`, `_post_turn_goal_continuation`, lifted-barrier wake) and `tests/gateway/test_goal_continuation_silence.py`.
+- **Upstream status:** no upstream equivalent; upstream gateway goal continuations are plain synthetic text events.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_goal_continuation_silence.py tests/gateway/test_goal_continuation_drain.py`.
+- **Retirement:** Remove when upstream marks synthetic goal continuations as non-human for silence decisions.
+- **Rollback:** Revert the goal-continuation-silence fix commit.
 
 ## Update
 

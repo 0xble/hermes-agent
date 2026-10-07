@@ -27,6 +27,10 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   make them reachable. Regression exercises `_handle_message` with an active agent
   and verifies handler invocation without interruption or queueing.
 
+- Follow-up patch identity: `moa-busy-defer`. TUI half contributed as
+  [upstream PR 132644](https://github.com/NousResearch/hermes-agent/pull/132644); the gateway half
+  waits on upstream `defer_until_idle` (PR 116295 / 125345).
+
 - Patch identity: `queue-ack-emoji`. `/queue` replies lead with ⏳ like the other
   busy-input acknowledgments (⏩ steer, ↪ redirect, ⏳ busy queue): `gateway.queue.queued`
   in every locale, plus the ACP queue, steer-fallback and busy-queue replies. Upstream

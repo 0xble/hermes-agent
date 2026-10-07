@@ -486,7 +486,9 @@ DEFAULT_CONFIG = {
             # Externally managed Camofox identity, for when another app owns the visible browser.
             "user_id": "",
             "session_key": "",
-            "adopt_existing_tab": False,  # rehydrate tab_id from Camofox before creating a tab
+            # External user_id only: reuse its existing tab before creating one. Hermes-managed
+            # identities (accounts, managed_persistence) always reuse their own tabs.
+            "adopt_existing_tab": False,
             # Camofox's CAMOFOX_UPLOADS_DIR as seen from this host; browser_upload stages files here.
             # Empty = Camofox's default ~/.camofox/uploads.
             "uploads_dir": "",
