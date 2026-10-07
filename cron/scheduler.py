@@ -711,11 +711,10 @@ def get_running_job_ids() -> "frozenset[str]":
     entirely outside that dict, so without this the drain is structurally blind to them (#60432).
     """
     with _running_lock:
-        # A parent waiter is no longer a visible running job until its external
-        # worker has acknowledged ownership. Once acknowledged, the worker remains
-        # visible to general liveness/metrics consumers.
-        restart_safe_waiters = _restart_safe_waiter_job_ids - _restart_safe_external_worker_job_ids
-        active = (_running_job_ids | _running_fire_owners.keys()) - restart_safe_waiters
+        # Pending handoffs and acknowledged external workers both remain visible.
+        # Waiter/worker sets are populated together after ack, so neither filters
+        # this general liveness snapshot (or the restart drain).
+        active = _running_job_ids | _running_fire_owners.keys()
         return frozenset(key[1] for key in active)
 
 
@@ -724,8 +723,7 @@ def get_running_job_details() -> list[dict]:
     runs). The drain wait publishes this so ``hermes update`` can say WHICH job it is waiting on."""
     now = time.time()
     with _running_lock:
-        restart_safe_waiters = _restart_safe_waiter_job_ids - _restart_safe_external_worker_job_ids
-        active = (_running_job_ids | _running_fire_owners.keys()) - restart_safe_waiters
+        active = _running_job_ids | _running_fire_owners.keys()
         return [
             {"job_id": key[1],
              "elapsed_s": round(now - _running_since[key], 1) if key in _running_since else None,

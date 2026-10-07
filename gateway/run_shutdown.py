@@ -1264,6 +1264,11 @@ class GatewayShutdownMixin:
                 from gateway.shutdown_flush import flush_agent_history_to_file
                 flush_agent_history_to_file(getattr(agent, "session_id", None), _session_messages)
 
+    def _flush_shutdown_agent_transcripts(self, active_agents: Mapping[str, Any]) -> None:
+        """Flush every interrupted transcript before running any bounded cleanup hook."""
+        for agent in active_agents.values():
+            self._flush_agent_transcript_at_shutdown(agent)
+
     async def _finalize_shutdown_agents(
         self, active_agents: Dict[str, Any], *, interrupted: bool = False,
         stop_event: Optional[threading.Event] = None,
@@ -1271,17 +1276,23 @@ class GatewayShutdownMixin:
     ) -> None:
         if stop_event is None:
             stop_event = getattr(self, "_shutdown_finalize_stop_event", None)
+        # The transcript pass must precede every hook and deadline check. The outer
+        # restart path repeats this pass before creating its cancellable task; this
+        # copy keeps direct callers safe and makes the ordering explicit here.
+        if interrupted:
+            self._flush_shutdown_agent_transcripts(active_agents)
         for session_key, agent in active_agents.items():
             # A timed-out restart may detach this phase. Stop before starting another
             # agent's hooks so the following DB/adaptor teardown has exclusive ownership.
             if stop_event is not None and stop_event.is_set():
                 return
-            self._flush_agent_transcript_at_shutdown(agent)
+            if not interrupted:
+                self._flush_agent_transcript_at_shutdown(agent)
             if interrupted:
                 logger.warning(
                     "Skipping blocking shutdown cleanup for interrupted agent %s; "
-                    "running bounded memory flush/finalize hooks only. The next gateway "
-                    "will recover the transcript, but provider on_session_end/close work "
+                    "running bounded memory flush/finalize hooks only. Transcript persistence "
+                    "was attempted before bounded cleanup; provider on_session_end/close work "
                     "may still be lost",
                     session_key,
                 )
@@ -1998,6 +2009,15 @@ class GatewayShutdownMixin:
                 lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
             )
 
+        def _kill_foreground_processes() -> None:
+            from tools.environments.base import kill_live_foreground_processes
+            kill_live_foreground_processes(now=True)
+
+        # This signal-only sweep must run before the potentially blocked registry
+        # sweep; unlike the shared deadline it is safe and bounded after expiry.
+        GatewayShutdownMixin._quiet_step(
+            "kill_live_foreground_processes", _kill_foreground_processes, level=logging.WARNING,
+        )
         _step("process_registry.kill_all", _kill_processes)
         _marked_cron_jobs = _step("mark_running_jobs_interrupted", _mark_cron_interrupted) or []
         _step("async interrupt_all", _interrupt_delegations)
@@ -2677,9 +2697,11 @@ class GatewayShutdownMixin:
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
-            # This spool is intentionally outside the cancellable finalization bound: it is the
-            # successor's only durable copy of queued user follow-ups.
+            # This spool and transcript pass are intentionally outside the cancellable finalization bound:
+            # they are the successor's only durable copies of queued follow-ups and interrupted turns.
             _persist_shutdown_pending_messages(self)
+            if ctx.timed_out:
+                self._flush_shutdown_agent_transcripts(ctx.active_agents)
             _finalize_stop_event = threading.Event()
             self._shutdown_finalize_stop_event = _finalize_stop_event
             _finalize_bound = self._restart_shutdown_bound() if ctx.timed_out and self._restart_requested else None

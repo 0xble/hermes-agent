@@ -146,17 +146,24 @@ def test_degraded_external_worker_remains_active_during_shutdown():
             sched._running_worker_pids.pop(key, None)
 
 
-def test_restart_safe_waiters_are_excluded_from_ids_and_details():
+def test_acknowledged_restart_safe_worker_remains_in_ids_and_details():
     import cron.scheduler as sched
 
     key = sched._inflight_key("restart-safe")
     with sched._running_lock:
         sched._running_job_ids.add(key)
+        # The production acknowledgement path registers both sets together.
         sched._restart_safe_waiter_job_ids.add(key)
+        sched._restart_safe_external_worker_job_ids.add(key)
+        sched._running_worker_pids[key] = 4321
     try:
-        assert sched.get_running_job_ids() == frozenset()
-        assert sched.get_running_job_details() == []
+        assert sched.get_running_job_ids() == frozenset({"restart-safe"})
+        assert sched.get_running_job_details() == [
+            {"job_id": "restart-safe", "elapsed_s": None, "worker_pid": 4321}
+        ]
     finally:
         with sched._running_lock:
             sched._running_job_ids.discard(key)
             sched._restart_safe_waiter_job_ids.discard(key)
+            sched._restart_safe_external_worker_job_ids.discard(key)
+            sched._running_worker_pids.pop(key, None)

@@ -73,6 +73,23 @@ async def test_post_interrupt_kill_runs_off_event_loop(monkeypatch):
         )
 
 
+def test_foreground_processes_are_killed_after_shared_deadline(monkeypatch):
+    """The fast foreground-process sweep is unconditional after kill_all expires."""
+    events = []
+    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    import tools.environments.base as _base
+
+    monkeypatch.setattr(_base, "kill_live_foreground_processes", lambda **_kw: events.append(("foreground", None)))
+    stop_event = threading.Event()
+    stop_event.set()
+
+    GatewayShutdownMixin._stop_kill_tool_subprocesses(
+        "expired", deadline=time.monotonic() - 1.0, stop_event=stop_event,
+    )
+
+    assert [name for name, _thread in events] == ["foreground"]
+
+
 @pytest.mark.asyncio
 async def test_mark_running_cron_jobs_runs_off_event_loop(monkeypatch):
     """The cron jobs-store write must not block the shutdown event loop."""
@@ -134,7 +151,7 @@ async def test_blocking_kill_sweep_is_detached_without_late_registry_cleanup(mon
     started = time.monotonic()
     await runner._stop_kill_tool_subprocesses_off_loop("post-interrupt", timeout=0.1)
     elapsed = time.monotonic() - started
-    await asyncio.sleep(0.05)  # let the detached worker observe stop_event
+    await asyncio.sleep(0.2)  # let the detached worker observe stop_event
 
     assert elapsed < 0.5
     assert [name for name, _when in events] == ["kill_started", "kill_stopped"]

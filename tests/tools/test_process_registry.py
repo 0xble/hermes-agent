@@ -162,6 +162,23 @@ def test_kill_all_deadline_stops_followup_targets_and_checkpoint_writes(registry
     checkpoint.assert_not_called()
 
 
+def test_kill_all_clears_deadline_for_surviving_session_before_later_completion(registry):
+    """A missed bounded kill must not disable future durable completion writes."""
+    session = _make_session(sid="proc_survivor")
+    registry._running[session.id] = session
+    deadline = time.monotonic() - 1.0
+
+    assert registry.kill_all(deadline=deadline) == 0
+    assert session._kill_deadline is None
+
+    session.mark_exited(0)
+    with patch("tools.process_registry.save_completed_result") as save, \
+         patch.object(registry, "_write_checkpoint") as checkpoint:
+        registry._move_to_finished(session)
+    save.assert_called_once_with(session)
+    checkpoint.assert_called_once()
+
+
 def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
     """A TERM-exiting root cannot hide a same-group child that ignores TERM."""
     pytest.importorskip("psutil")

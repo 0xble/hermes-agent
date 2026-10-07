@@ -113,7 +113,27 @@ class TestFinalizeShutdownFlushesInflightTranscript:
         agent.close.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_timed_out_agent_flushes_transcript_and_bounded_hooks(self):
+    async def test_all_interrupted_transcripts_flush_before_slow_finalize_hook(self):
+        """A slow first hook must not prevent later interrupted transcripts from flushing."""
+        runner = _make_runner()
+        agent_a = _FakeAgent(session_messages=[{"role": "tool", "content": "A partial"}])
+        agent_b = _FakeAgent(session_messages=[{"role": "tool", "content": "B partial"}])
+        async def slow_finalize(**kwargs):
+            await asyncio.sleep(kwargs.get("timeout") or 0)
+
+        runner._finalize_session_off_loop = slow_finalize
+
+        await runner._finalize_shutdown_agents(
+            {"a": agent_a, "b": agent_b},
+            interrupted=True,
+            deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+
+        agent_a._flush_messages_to_session_db.assert_called_once_with(agent_a._session_messages)
+        agent_b._flush_messages_to_session_db.assert_called_once_with(agent_b._session_messages)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_agent_runs_bounded_hooks_after_flush(self):
         runner = _make_runner()
         agent = _FakeAgent(session_messages=[{"role": "tool", "content": "partial"}])
         runner._finalize_session_off_loop = AsyncMock()

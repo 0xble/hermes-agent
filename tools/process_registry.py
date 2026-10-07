@@ -2769,134 +2769,140 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # Snapshot each tree before TERM. Once a root exits, psutil cannot reliably
         # rediscover a same-group child that ignored TERM.
         snapshots = {session.id: _sweep_snapshot(session) for session in signalable}
-        if deadline is not None:
-            for session in targets:
-                session._kill_deadline = deadline
-        escalated_ids: set[str] = set()
+        try:
+            if deadline is not None:
+                for session in targets:
+                    session._kill_deadline = deadline
+            escalated_ids: set[str] = set()
 
-        def _systemd_stop_async(session: ProcessSession) -> None:
-            if not session.systemd_unit:
-                return
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                return
-            # systemctl may block on a dead user bus; keep it off the serial sweep
-            # and bound its subprocess by the same restart deadline.
-            def _stop() -> None:
-                with suppress(Exception):
-                    stop = _stop_systemd_unit
-                    if "timeout" in inspect.signature(stop).parameters:
-                        stop(session.systemd_unit, timeout=remaining)
-                    else:
-                        # Preserve simple test/embedding seams that predate the
-                        # bounded timeout keyword.
-                        stop(session.systemd_unit)
-            threading.Thread(target=_stop, name="process-systemd-stop", daemon=True).start()
-
-        if signalable:
-            # Signal every snapshotted root/descendant group in one parallel pass. A
-            # descendant may have called setsid(), so the root group alone is not an
-            # ownership boundary for the full psutil tree.
-            term_jobs = []
-            for session in signalable:
-                root_pgid, descendants = snapshots[session.id]
-                term_jobs.append(("root", session, root_pgid))
-                term_jobs.extend(("descendant", pid, pgid) for pid, pgid in descendants)
-            with ThreadPoolExecutor(max_workers=len(term_jobs), thread_name_prefix="process-term") as pool:
-                futures = [
-                    pool.submit(_signal_snapshot_member, kind, target, signal.SIGTERM, pgid)
-                    for kind, target, pgid in term_jobs
-                ]
-                for future in futures:
+            def _systemd_stop_async(session: ProcessSession) -> None:
+                if not session.systemd_unit:
+                    return
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return
+                # systemctl may block on a dead user bus; keep it off the serial sweep
+                # and bound its subprocess by the same restart deadline.
+                def _stop() -> None:
                     with suppress(Exception):
-                        future.result()
-            for session in signalable:
-                _systemd_stop_async(session)
-            started = time.monotonic()
-            configured_grace = self._daemon_term_grace_seconds()
-            remaining = None if deadline is None else max(0.0, deadline - started)
-            grace = configured_grace if remaining is None else min(configured_grace, 0.4 * remaining)
-            grace_deadline = started + grace
-            while time.monotonic() < grace_deadline:
-                if stop_event is not None and stop_event.is_set():
-                    break
-                if not any(
-                    _snapshot_alive(session, snapshots[session.id]) for session in signalable
-                ):
-                    break
-                time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
-            for session in signalable:
-                snapshot = snapshots[session.id]
-                if not _snapshot_alive(session, snapshot):
-                    continue
-                root_pgid, descendants = snapshot
-                kill_jobs = [("root", session, root_pgid)]
-                kill_jobs.extend(
-                    ("descendant", pid, pgid)
-                    for pid, pgid in descendants
-                    if self._is_host_pid_alive(pid)
-                )
-                escalated_ids.add(session.id)
-                with ThreadPoolExecutor(max_workers=len(kill_jobs), thread_name_prefix="process-kill") as pool:
+                        stop = _stop_systemd_unit
+                        if "timeout" in inspect.signature(stop).parameters:
+                            stop(session.systemd_unit, timeout=remaining)
+                        else:
+                            # Preserve simple test/embedding seams that predate the
+                            # bounded timeout keyword.
+                            stop(session.systemd_unit)
+                threading.Thread(target=_stop, name="process-systemd-stop", daemon=True).start()
+
+            if signalable:
+                # Signal every snapshotted root/descendant group in one parallel pass. A
+                # descendant may have called setsid(), so the root group alone is not an
+                # ownership boundary for the full psutil tree.
+                term_jobs = []
+                for session in signalable:
+                    root_pgid, descendants = snapshots[session.id]
+                    term_jobs.append(("root", session, root_pgid))
+                    term_jobs.extend(("descendant", pid, pgid) for pid, pgid in descendants)
+                with ThreadPoolExecutor(max_workers=len(term_jobs), thread_name_prefix="process-term") as pool:
                     futures = [
-                        pool.submit(
-                            _signal_snapshot_member, kind, target,
-                            getattr(signal, "SIGKILL", signal.SIGTERM), pgid,
-                        )
-                        for kind, target, pgid in kill_jobs
+                        pool.submit(_signal_snapshot_member, kind, target, signal.SIGTERM, pgid)
+                        for kind, target, pgid in term_jobs
                     ]
                     for future in futures:
                         with suppress(Exception):
                             future.result()
-            reap_deadline = time.monotonic() + 0.2
-            if deadline is not None:
-                reap_deadline = min(reap_deadline, deadline)
-            while time.monotonic() < reap_deadline and any(
-                _snapshot_alive(session, snapshots[session.id]) for session in signalable
+                for session in signalable:
+                    _systemd_stop_async(session)
+                started = time.monotonic()
+                configured_grace = self._daemon_term_grace_seconds()
+                remaining = None if deadline is None else max(0.0, deadline - started)
+                grace = configured_grace if remaining is None else min(configured_grace, 0.4 * remaining)
+                grace_deadline = started + grace
+                while time.monotonic() < grace_deadline:
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    if not any(
+                        _snapshot_alive(session, snapshots[session.id]) for session in signalable
+                    ):
+                        break
+                    time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
+                for session in signalable:
+                    snapshot = snapshots[session.id]
+                    if not _snapshot_alive(session, snapshot):
+                        continue
+                    root_pgid, descendants = snapshot
+                    kill_jobs = [("root", session, root_pgid)]
+                    kill_jobs.extend(
+                        ("descendant", pid, pgid)
+                        for pid, pgid in descendants
+                        if self._is_host_pid_alive(pid)
+                    )
+                    escalated_ids.add(session.id)
+                    with ThreadPoolExecutor(max_workers=len(kill_jobs), thread_name_prefix="process-kill") as pool:
+                        futures = [
+                            pool.submit(
+                                _signal_snapshot_member, kind, target,
+                                getattr(signal, "SIGKILL", signal.SIGTERM), pgid,
+                            )
+                            for kind, target, pgid in kill_jobs
+                        ]
+                        for future in futures:
+                            with suppress(Exception):
+                                future.result()
+                reap_deadline = time.monotonic() + 0.2
+                if deadline is not None:
+                    reap_deadline = min(reap_deadline, deadline)
+                while time.monotonic() < reap_deadline and any(
+                    _snapshot_alive(session, snapshots[session.id]) for session in signalable
+                ):
+                    time.sleep(0.02)
+                killed = 0
+                for session in signalable:
+                    if _snapshot_alive(session, snapshots[session.id]):
+                        # Do not report a clean kill, or move the live session out of
+                        # the registry, while a snapshotted descendant survived.
+                        continue
+                    if stop_event is not None and stop_event.is_set():
+                        continue
+                    if deadline is not None and time.monotonic() >= deadline:
+                        continue
+                    with session._lock:
+                        if not session.exited:
+                            session.exited = True
+                            session.exit_code = -getattr(
+                                signal, "SIGKILL", signal.SIGTERM
+                            ) if session.id in escalated_ids else -signal.SIGTERM
+                            session.completion_reason = "killed"
+                            session.termination_source = source
+                            if consume_output:
+                                self._completion_consumed.add(session.id)
+                    self._move_to_finished(session)
+                    if session.id not in exited_before_sweep:
+                        killed += 1
+                # Non-local targets are handled by the same bounded parallel phase, never serially.
+                remainder = [session for session in targets if session not in signalable]
+                if remainder:
+                    with ThreadPoolExecutor(max_workers=len(remainder), thread_name_prefix="process-kill") as pool:
+                        killed += sum(bool(future.result()) for future in
+                                      [pool.submit(_fallback_kill_one, session) for session in remainder])
+            else:
+                # Opaque test doubles have no process group or runtime handle; preserve the
+                # legacy kill_process contract for those registry-only records. Real host
+                # workers never enter this branch.
+                killed = 0
+                for session in targets:
+                    if _fallback_kill_one(session):
+                        killed += 1
+            if (stop_event is None or not stop_event.is_set()) and (
+                deadline is None or time.monotonic() < deadline
             ):
-                time.sleep(0.02)
-            killed = 0
-            for session in signalable:
-                if _snapshot_alive(session, snapshots[session.id]):
-                    # Do not report a clean kill, or move the live session out of
-                    # the registry, while a snapshotted descendant survived.
-                    continue
-                if stop_event is not None and stop_event.is_set():
-                    continue
-                if deadline is not None and time.monotonic() >= deadline:
-                    continue
-                with session._lock:
-                    if not session.exited:
-                        session.exited = True
-                        session.exit_code = -getattr(
-                            signal, "SIGKILL", signal.SIGTERM
-                        ) if session.id in escalated_ids else -signal.SIGTERM
-                        session.completion_reason = "killed"
-                        session.termination_source = source
-                        if consume_output:
-                            self._completion_consumed.add(session.id)
-                self._move_to_finished(session)
-                if session.id not in exited_before_sweep:
-                    killed += 1
-            # Non-local targets are handled by the same bounded parallel phase, never serially.
-            remainder = [session for session in targets if session not in signalable]
-            if remainder:
-                with ThreadPoolExecutor(max_workers=len(remainder), thread_name_prefix="process-kill") as pool:
-                    killed += sum(bool(future.result()) for future in
-                                  [pool.submit(_fallback_kill_one, session) for session in remainder])
-        else:
-            # Opaque test doubles have no process group or runtime handle; preserve the
-            # legacy kill_process contract for those registry-only records. Real host
-            # workers never enter this branch.
-            killed = 0
+                self._write_checkpoint()
+            return killed
+        finally:
+            # The sweep deadline fences writes only during teardown, not later reader completion.
             for session in targets:
-                if _fallback_kill_one(session):
-                    killed += 1
-        if (stop_event is None or not stop_event.is_set()) and (
-            deadline is None or time.monotonic() < deadline
-        ):
-            self._write_checkpoint()
-        return killed
+                if session._kill_deadline == deadline:
+                    session._kill_deadline = None
 
     # ----- Cleanup / Pruning -----
 
