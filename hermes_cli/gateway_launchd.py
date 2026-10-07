@@ -100,13 +100,24 @@ def _launchctl_domain_unsupported(returncode: int) -> bool:
 _LAUNCHCTL_BOOTSTRAP_EIO = 5
 
 
-def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 30) -> None:
+def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: float = 30) -> None:
     """Bootstrap a launchd job, recovering from a stale still-registered label (EIO 5). Without the
     bootout + retry that case is misread as an unmanageable domain and degrades to detached, silently
-    losing auto-start and crash-restart."""
+    losing auto-start and crash-restart.
+
+    ``timeout`` is one wall-clock budget shared by the bootstrap, bootout and retry, so a caller with
+    a bounded deadline (the guardian's rollback) is never overrun by the stale-label recovery."""
+    deadline = time.monotonic() + max(float(timeout), 0.0)
     bootstrap = ["launchctl", "bootstrap", domain, str(plist_path)]
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise subprocess.TimeoutExpired(bootstrap, timeout)
+        return value
+
     try:
-        subprocess.run(bootstrap, check=True, timeout=timeout)
+        subprocess.run(bootstrap, check=True, timeout=remaining())
     except subprocess.CalledProcessError as exc:
         if exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
             raise
@@ -115,8 +126,8 @@ def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 
         # unloaded), so its expected 3/113/125 stderr must not leak to the terminal.
         subprocess.run(
             ["launchctl", "bootout", f"{domain}/{label}"],
-            check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
-        subprocess.run(bootstrap, check=True, timeout=timeout)
+            check=False, timeout=remaining(), **_gw()._CAPTURE_TEXT)
+        subprocess.run(bootstrap, check=True, timeout=remaining())
 
 
 def _launchd_reload_log_path() -> Path:
