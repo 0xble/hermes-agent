@@ -163,6 +163,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove this patch when released upstream behavior strips trailing standalone markers at both persistence and every interactive streaming delivery boundary.
 - **Rollback:** Revert the trailing-silence-marker fix commit.
 
+## Active patch record: goal continuation silence
+
+- **Patch identity:** `goal-continuation-silence`.
+- **Behavior:** Gateway-built standing-goal continuations (the post-turn continuation and the lifted-barrier wake) carry `reply_expected=False`, so a no-change tick that answers a bare `NO_REPLY` stays silent instead of posting the "No reply was written" fallback. A typed message absorbed into the same turn restores `reply_expected` through `MessageEvent.absorb_reply_expected`, so the human-turn guard is unchanged. Heartbeat and `/loop` prompts keep their existing contract.
+- **Source surfaces:** `gateway/run_goals.py` (`_synthetic_prompt_event`, `_post_turn_goal_continuation`, lifted-barrier wake) and `tests/gateway/test_goal_continuation_silence.py`.
+- **Upstream status:** no upstream equivalent; upstream gateway goal continuations are plain synthetic text events.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_goal_continuation_silence.py tests/gateway/test_goal_continuation_drain.py`.
+- **Retirement:** Remove when upstream marks synthetic goal continuations as non-human for silence decisions.
+- **Rollback:** Revert the goal-continuation-silence fix commit.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
