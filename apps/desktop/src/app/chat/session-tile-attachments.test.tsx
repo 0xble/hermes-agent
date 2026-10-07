@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ComposerScope } from '@/app/chat/composer/scope'
 import { useSessionTileActions } from '@/app/chat/session-tile-actions'
+import type { SubmitTextResult } from '@/app/session/hooks/use-prompt-actions/utils'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import {
   type ComposerAttachment,
@@ -151,7 +152,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('describe this')
     })
@@ -197,7 +198,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('describe this')
     })
@@ -235,7 +236,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('describe this')
     })
@@ -272,7 +273,7 @@ describe('session tile attachment occurrence ownership', () => {
       useSessionTileActions({ requestGateway, runtimeId: RUNTIME_ID, scope, storedSessionId: STORED_ID })
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = result.current.submitText('read this')
     })

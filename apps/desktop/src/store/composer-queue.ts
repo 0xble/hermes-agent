@@ -12,6 +12,8 @@ export interface RemoveQueuedPromptOptions {
 }
 
 export interface QueuedPromptEntry {
+  /** Backend identity for a deferred one-shot; never eligible for mid-turn steering. */
+  moaToken?: string
   id: string
   text: string
   /** What the queue panel and the sent bubble show, when it differs from the
@@ -34,10 +36,10 @@ export interface QueuedPromptEntry {
 /** Whether a queued entry can ride a mid-turn redirect: text-only, non-empty,
  *  not a slash command — the same gate `steerDraft` applies to the live draft
  *  (attachments can't ride a redirect; slash commands execute, not steer). */
-export const isSteerableEntry = (entry: Pick<QueuedPromptEntry, 'attachments' | 'text'>): boolean => {
+export const isSteerableEntry = (entry: Pick<QueuedPromptEntry, 'attachments' | 'text' | 'moaToken'>): boolean => {
   const text = entry.text.trim()
 
-  return Boolean(text) && entry.attachments.length === 0 && !SLASH_COMMAND_RE.test(text)
+  return Boolean(text) && !entry.moaToken && entry.attachments.length === 0 && !SLASH_COMMAND_RE.test(text)
 }
 
 type QueueState = Record<string, QueuedPromptEntry[]>
@@ -197,7 +199,13 @@ export const withQueueDrainClaim = <T>(sid: string, task: (queue: QueuedPromptEn
 
 export const enqueueQueuedPrompt = (
   key: string | null | undefined,
-  payload: { text: string; attachments: ComposerAttachment[]; displayText?: string; displayKind?: 'hidden' }
+  payload: {
+    text: string
+    attachments: ComposerAttachment[]
+    displayText?: string
+    displayKind?: 'hidden'
+    moaToken?: string
+  }
 ): null | QueuedPromptEntry => {
   const sid = sidOf(key)
 
@@ -208,6 +216,7 @@ export const enqueueQueuedPrompt = (
   const entry: QueuedPromptEntry = {
     id: nextId(),
     text: payload.text,
+    ...(payload.moaToken ? { moaToken: payload.moaToken } : {}),
     ...(payload.displayText ? { displayText: payload.displayText } : {}),
     ...(payload.displayKind ? { displayKind: payload.displayKind } : {}),
     attachments: cloneAttachments(payload.attachments),
