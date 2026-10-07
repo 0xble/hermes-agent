@@ -720,7 +720,11 @@ def _target_selection(package, fact: dict, *, extras, inputs: dict, repair: bool
         return enabled, stamp, {"repair": True}
     # The first writable generation replaces, rather than layers on,
     # the payload. Retain its extras until a recorded selection owns them.
-    enabled = sorted(set(_still_declared(package, fact.get("extras", shipped or []))) | set(extras or []))
+    baseline = shipped
+    if not fact and shipped is None:
+        from pm.extras import installed_selection
+        baseline = installed_selection(package.project_root())
+    enabled = sorted(set(_still_declared(package, fact.get("extras", baseline or []))) | set(extras or []))
     return enabled, package.expected_stamp(enabled, **inputs), inputs
 
 

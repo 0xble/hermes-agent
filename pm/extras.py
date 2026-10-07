@@ -269,6 +269,32 @@ def missing(extra: str) -> tuple[str, ...]:
     return tuple(a for a in _anchors(extra) if not _importable(a))
 
 
+def installed_selection(project_root: Path) -> list[str]:
+    """Return declared extras whose anchors are present in the base environment.
+
+    A first PM generation may replace a release payload before it has facts or
+    an enabled-features file. Inspecting the payload's site-packages preserves
+    optional dependencies that the release actually shipped without importing
+    them into the process doing the replacement.
+    """
+    from pm.environments import base_venv, site_packages
+
+    try:
+        tree = site_packages(base_venv(Path(project_root)))
+    except (OSError, RuntimeError, ValueError):
+        return []
+    if not tree.is_dir():
+        return []
+    return sorted(
+        # Umbrella extras share anchors with individual extras. Carry only the
+        # concrete extra proven by the payload; otherwise a shipped telegram
+        # module would select the full messaging bundle on the first sync.
+        extra for extra in ANCHORS if extra not in {"messaging", "voice", "wake"}
+        if extra_supported(extra, importable=lambda _anchor: False)
+        and all(_installed_in(tree, anchor) for anchor in _anchors(extra))
+    )
+
+
 def _installed_in(site_packages: Path, anchor: str) -> bool:
     """Is ``anchor`` installed under a site-packages we must not import from?"""
     *parents, leaf = anchor.split(".")

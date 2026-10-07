@@ -678,3 +678,8 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Upstream status: no equivalent fix found on `upstream/main` or in upstream issue/PR searches for the display-watch duplicate symptom.
 - Guard: `scripts/run_tests.sh tests/tui_gateway/test_display_watch.py`.
 
+## First PM Sync Preserves Payload Extras
+
+- Fork patch identity: `pm-shipped-extras`.
+- When a release payload had shipped optional dependencies but PM had no facts or frozen feature inventory yet, the first on-demand extra sync selected only the requested extra and replaced the payload environment. Infer concrete shipped extras from the payload's site-packages before creating the first PM generation, while excluding umbrella aliases that share anchors with their member extras.
+- Guard: `tests/pm/test_environment_build.py` (`test_first_on_demand_extra_preserves_payload_extras`).
