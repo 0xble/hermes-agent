@@ -58,8 +58,11 @@ export interface SkillCommandDispatchResponse {
 }
 
 export interface SendCommandDispatchResponse {
+  moaToken?: string
   /** Set for a skill-bundle send: see SkillCommandDispatchResponse.display. */
   display?: string
+  /** Force the resulting prompt through the server's next-turn queue. */
+  queued?: boolean
   message: string
   notice?: string
   type: 'send'
@@ -103,7 +106,14 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
 
     case 'send':
       return typeof row.message === 'string'
-        ? { display: str(row.display), message: row.message, notice: str(row.notice), type: 'send' }
+        ? {
+            display: str(row.display),
+            message: row.message,
+            notice: str(row.notice),
+            ...(row.queued === true ? { queued: true } : {}),
+            ...(typeof row.moa_token === 'string' ? { moaToken: row.moa_token } : {}),
+            type: 'send'
+          }
         : null
 
     case 'skill':
