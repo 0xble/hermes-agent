@@ -29,23 +29,28 @@ ROLLBACK_SECONDS = 60
 POLL_SECONDS = 5
 
 
-def _domain(label: str) -> str:
+def _domain(label: str, *, deadline: float | None = None) -> str:
     if sys.platform != "darwin":
         raise RuntimeError("gateway guardian requires macOS launchd")
     from hermes_cli.gateway_launchd import _probe_launchd_domain_for_label
-    return _probe_launchd_domain_for_label(label)
+    return _probe_launchd_domain_for_label(label, budget=lambda cap: _bounded_timeout(cap, deadline))
 
 
-def _gateway_domain(label: str, preferred: str | None) -> str:
-    """Observe both domains before trusting a saved domain or starting an unloaded job."""
+def _gateway_domain(label: str, preferred: str | None, *, deadline: float | None = None) -> str:
+    """Observe both domains before trusting a saved domain or starting an unloaded job. Every
+    launchctl probe here spends the caller's deadline, so discovery cannot run outside the bound."""
     domains = (f"gui/{os.getuid()}", f"user/{os.getuid()}")  # windows-footgun: ok (macOS launchd only)
     if preferred is not None and preferred not in domains:
         raise RuntimeError("guardian domain is not a gateway launchd domain for this user")
     states = {}
     for candidate in domains:
         try:
-            states[candidate] = _launch_state(candidate, label)
+            states[candidate] = _launch_state(candidate, label, deadline=deadline)
+        except subprocess.TimeoutExpired:
+            states[candidate] = "unknown"
         except RuntimeError:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
             states[candidate] = "unknown"
     loaded = [candidate for candidate, state in states.items() if state in {"loaded", "parked"}]
     if len(loaded) > 1:
@@ -54,7 +59,7 @@ def _gateway_domain(label: str, preferred: str | None) -> str:
         return loaded[0]
     if "unknown" in states.values():
         raise RuntimeError("cannot prove gateway unloaded in both launchd domains")
-    return preferred or _domain(label)
+    return preferred or _domain(label, deadline=deadline)
 
 
 def intent_path(home: Path) -> Path:
@@ -153,7 +158,12 @@ def _bounded_timeout(requested: float, deadline: float | None) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise RuntimeError("guardian overall deadline expired")
-    return max(0.01, min(requested, remaining))
+    return min(requested, remaining)
+
+
+def _sleep_within(seconds: float, deadline: float) -> None:
+    """Poll pause that never sleeps past ``deadline``."""
+    time.sleep(max(0.0, min(seconds, deadline - time.monotonic())))
 
 
 def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> str:
@@ -191,7 +201,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         # A disposable label uses its own plist; never regenerate the real service.
         definition["WorkingDirectory"] = str(old)
         body = plistlib.dumps(definition)
-    domain = domain or _domain(label)
+    domain = domain or _domain(label, deadline=deadline)
     def reload_target():
         import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
@@ -216,7 +226,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     while time.monotonic() < deadline:
         if healthy(home, label, old, deadline):
             return True
-        time.sleep(.25)
+        _sleep_within(.25, deadline)
     return False
 
 
@@ -257,7 +267,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
     switch_state, switch = _switch(home, grace=grace)
     if switch_state == "waiting":
         return "waiting"
-    domain = _gateway_domain(label, domain)
+    domain = _gateway_domain(label, domain, deadline=deadline)
     state = _launch_state(domain, label, deadline=deadline)
     if state == "loaded" and healthy(home, label, current, deadline):
         pending = home / "release-txn.json"
@@ -306,7 +316,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         if _launch_state(domain, label, deadline=deadline) == "loaded" and healthy(home, label, current, deadline):
             receipt(home, "bootstrap", "repaired", label=label, release=str(current))
             return "repaired"
-        time.sleep(.25)
+        _sleep_within(.25, deadline)
     receipt(home, "bootstrap", "failed", label=label, reason="gateway not healthy after bootstrap")
     return "failed"
 

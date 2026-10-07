@@ -33,17 +33,19 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
-def _probe_launchd_domain_for_label(label: str) -> str:
+def _probe_launchd_domain_for_label(label: str, *, budget=None) -> str:
     """Launchd domain managing ``label`` (uncached): ``gui/<uid>`` (Aqua), then ``user/<uid>``
     (Background/SSH), else the ``launchctl managername`` heuristic. Sibling profiles may live in
-    different domains, so never reuse the cached ``_launchd_domain()`` for another label."""
+    different domains, so never reuse the cached ``_launchd_domain()`` for another label.
+    ``budget(cap)`` returns each probe's timeout; a bounded caller passes its remaining deadline."""
+    budget = budget or (lambda cap: cap)
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     gui_domain, user_domain = f"gui/{uid}", f"user/{uid}"
 
     launchctl_errors = (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError)
     for domain in (gui_domain, user_domain):
         try:
-            subprocess.run(["launchctl", "print", f"{domain}/{label}"], check=True, timeout=5, capture_output=True)
+            subprocess.run(["launchctl", "print", f"{domain}/{label}"], check=True, timeout=budget(5), capture_output=True)
             return domain
         except launchctl_errors:
             pass
@@ -51,7 +53,7 @@ def _probe_launchd_domain_for_label(label: str) -> str:
     # Not loaded anywhere: Aqua → gui/<uid>; anything else (Background, loginwindow) → user/<uid>,
     # the pre-probing default and the recommended domain on macOS 26+.
     try:
-        result = subprocess.run(["launchctl", "managername"], timeout=5, **_gw()._CAPTURE_TEXT)
+        result = subprocess.run(["launchctl", "managername"], timeout=budget(5), **_gw()._CAPTURE_TEXT)
         if "Aqua" in (result.stdout or ""):
             return gui_domain
     except launchctl_errors:

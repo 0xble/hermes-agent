@@ -414,6 +414,53 @@ def test_health_proof_finished_after_the_deadline_does_not_count(tmp_path, monke
 
 
 @pytest.mark.platforms("macos")
+def test_domain_discovery_spends_the_guardian_deadline(tmp_path, monkeypatch):
+    # Both-domain observation and the unloaded-label domain probe are inside _run's bound:
+    # each launchctl call gets only the time left, never a fixed 5 s per call.
+    from hermes_cli import gateway_launchd
+    clock = {"now": 100.0}
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: clock["now"])
+    timeouts = []
+
+    def run(argv, **kwargs):
+        timeouts.append((argv[1], kwargs.get("timeout")))
+        clock["now"] += 1.0
+        if argv[1] == "managername":
+            return subprocess.CompletedProcess(argv, 0, stdout="Aqua\n", stderr="")
+        if kwargs.get("check"):
+            # The launchd domain probe runs `launchctl print` with check=True.
+            raise subprocess.CalledProcessError(113, argv)
+        return subprocess.CompletedProcess(argv, 113, stdout="", stderr="Could not find service")
+
+    # gateway_guardian and gateway_launchd share the one ``subprocess`` module, so a single stub covers both.
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    assert gateway_launchd.subprocess is guardian.subprocess
+    domain = guardian._gateway_domain("ai.hermes.test", None, deadline=104.5)
+    assert domain == f"gui/{os.getuid()}"
+    # Each call costs 1 s on this clock and receives exactly what is left of the 4.5 s budget.
+    assert timeouts == [("print", 4.5), ("print", 3.5), ("print", 2.5), ("print", 1.5), ("managername", 0.5)]
+
+
+@pytest.mark.platforms("macos")
+def test_expired_deadline_during_domain_discovery_aborts_instead_of_probing_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: 200.0)
+    monkeypatch.setattr(guardian.subprocess, "run",
+                        lambda *a, **k: pytest.fail("no launchctl call after the deadline"))
+    with pytest.raises(RuntimeError, match="deadline"):
+        guardian._gateway_domain("ai.hermes.test", None, deadline=150.0)
+
+
+def test_poll_pause_never_sleeps_past_the_deadline(monkeypatch):
+    slept = []
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(guardian.time, "sleep", slept.append)
+    guardian._sleep_within(0.25, 100.1)
+    guardian._sleep_within(0.25, 99.0)
+    assert slept == [pytest.approx(0.1), 0.0]
+    assert guardian._bounded_timeout(10, 100.004) == pytest.approx(0.004)
+
+
+@pytest.mark.platforms("macos")
 def test_gateway_restart_command_clears_stopped_intent(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway
