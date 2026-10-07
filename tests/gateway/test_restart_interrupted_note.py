@@ -13,7 +13,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.run_shutdown import GatewayShutdownMixin
 from gateway.run_startup import GatewayStartupMixin
-from gateway.session import AsyncSessionStore, SessionSource, SessionStore
+from gateway.session import AsyncSessionStore, SessionEntry, SessionSource, SessionStore
 
 
 @pytest.fixture(autouse=True)
@@ -194,7 +194,8 @@ async def test_user_message_after_note_keeps_new_turn_resumable(tmp_path):
     event = MessageEvent(text="continue this", message_type=MessageType.TEXT, source=_source(), internal=False)
 
     await adapter._reconcile_restart_note_after_delivery(event, entry.session_key)
-    assert adapter.deleted == [("chat", "note-user")]
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-user"
     assert store._entries[entry.session_key].resume_turn_id == "turn-2"
 
     assert store.mark_resume_pending(entry.session_key, turn_id="turn-user", human=True)
@@ -270,11 +271,11 @@ async def test_real_nonstream_delivery_reconciles_after_runner_clears_resume_pen
 
     await adapter._send_final_text(event, entry.session_key, delivered_response, {}, False, 0, delivered.append)
 
-    assert adapter.deleted == [("chat", "note-real")]
+    assert adapter.deleted == []
     assert adapter.edited == []
     assert len(adapter.sent) == 1
     assert adapter.sent[0][1] == "resumed answer"
-    assert store.get_restart_note(entry.session_key) is None
+    assert store.get_restart_note(entry.session_key)[3] == "note-real"
 
 
 @pytest.mark.asyncio
@@ -294,8 +295,8 @@ async def test_real_delivery_keeps_failed_note_and_retries_on_next_final(tmp_pat
     second_event = MessageEvent(text="later", message_type=MessageType.TEXT, source=_source(), internal=False)
     await adapter._send_final_text(second_event, entry.session_key, "later answer", {}, False, 0, lambda _r: None)
 
-    assert adapter.deleted == [("chat", "note-retry"), ("chat", "note-retry")]
-    assert store.get_restart_note(entry.session_key) is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-retry"
 
 
 @pytest.mark.asyncio
@@ -322,8 +323,8 @@ async def test_successful_final_reconciles_note_once(tmp_path):
     await adapter._send_final_text(event, entry.session_key, "answer", {}, False, 0, lambda _r: None)
     await adapter._send_final_text(event, entry.session_key, "answer again", {}, False, 0, lambda _r: None)
 
-    assert adapter.deleted == [("chat", "note-once")]
-    assert store.get_restart_note(entry.session_key)[3] is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-once"
 
 
 @pytest.mark.asyncio
@@ -344,7 +345,8 @@ async def test_successor_marker_keeps_restart_note_pointer(tmp_path):
     await adapter._send_final_text(event, entry.session_key, "answer", {}, False, 0, lambda _r: None)
 
     assert adapter.deleted == []
-    assert store.get_restart_note(entry.session_key)[3] == "note-successor"
+    assert store._entries[entry.session_key].restart_notes[0]["message_id"] == "note-successor"
+    assert store._entries[entry.session_key].resume_turn_id == "successor"
 
 
 @pytest.mark.asyncio
@@ -371,8 +373,9 @@ async def test_new_interruption_replaces_stale_note_before_posting_one(tmp_path)
     runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
 
     assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
-    assert adapter.deleted == [("chat", "old-note")]
+    assert adapter.deleted == []
     assert len(adapter.sent) == 1
+    assert [n["message_id"] for n in store._entries[entry.session_key].restart_notes] == ["old-note", "m1"]
     assert store.get_restart_note(entry.session_key)[3] == "m1"
 
 
@@ -404,7 +407,8 @@ async def test_non_deleting_adapter_posts_each_consecutive_interruption_note(tmp
     assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
 
     assert len(adapter.sent) == 2
-    assert adapter.deleted == [(source.chat_id, "m1")]
+    assert adapter.deleted == []
+    assert [n["message_id"] for n in store._entries[entry.session_key].restart_notes] == ["m1", "m2"]
     assert store.get_restart_note(entry.session_key)[3] == "m2"
 
 
@@ -420,7 +424,7 @@ async def test_sent_no_id_note_is_cleared_at_final_delivery(tmp_path):
     await adapter._send_final_text(event, entry.session_key, "normal answer", {}, False, 0, lambda _r: None)
 
     assert adapter.sent == [("chat", "normal answer", {})]
-    assert store.get_restart_note(entry.session_key) is None
+    assert store.get_restart_note(entry.session_key)[3] == "sent:no-id"
 
 
 @pytest.mark.asyncio
@@ -441,8 +445,8 @@ async def test_attachment_only_final_reconciles_restart_note(tmp_path):
         session_key=entry.session_key,
     )
 
-    assert adapter.deleted == [("chat", "note-attachment")]
-    assert store.get_restart_note(entry.session_key)[3] is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-attachment"
 
 
 @pytest.mark.asyncio
@@ -473,8 +477,8 @@ async def test_queued_attachment_only_final_reconciles_note_only_after_upload(tm
 
     assert uploads == [str(media)]
     if upload_ok:
-        assert adapter.deleted == [("chat", "note-queued-media")]
-        assert store.get_restart_note(entry.session_key)[3] is None
+        assert adapter.deleted == []
+        assert store.get_restart_note(entry.session_key)[3] == "note-queued-media"
     else:
         # Upload refused: keep the note so a later delivery can still reconcile it.
         assert adapter.deleted == []
@@ -482,7 +486,7 @@ async def test_queued_attachment_only_final_reconciles_note_only_after_upload(tm
 
 
 @pytest.mark.asyncio
-async def test_resumed_answer_deletes_note_and_sends_fresh_message(tmp_path):
+async def test_resumed_answer_keeps_note_and_sends_fresh_message(tmp_path):
     adapter = NoteAdapter()
     store, entry, event = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-7")
@@ -490,12 +494,12 @@ async def test_resumed_answer_deletes_note_and_sends_fresh_message(tmp_path):
     await adapter._reconcile_restart_note_after_delivery(event, entry.session_key)
 
     assert adapter.edited == []
-    assert adapter.deleted == [("chat", "note-7")]
-    assert store.get_restart_note(entry.session_key)[3] is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-7"
 
 
 @pytest.mark.asyncio
-async def test_resumed_answer_delete_send_fallback_has_no_orphan(tmp_path):
+async def test_resumed_answer_keeps_note_on_send_fallback(tmp_path):
     adapter = NoteAdapter(edit_result=False, delete_result=True)
     store, entry, event = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-8")
@@ -504,12 +508,12 @@ async def test_resumed_answer_delete_send_fallback_has_no_orphan(tmp_path):
     await adapter._send_final_text(event, entry.session_key, "replacement", {}, False, 0, lambda _r: None)
 
     assert adapter.sent[-1][1] == "replacement"
-    assert adapter.deleted == [("chat", "note-8")]
-    assert store.get_restart_note(entry.session_key)[3] is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-8"
 
 
 @pytest.mark.asyncio
-async def test_user_message_recovery_turn_reconciles_note(tmp_path):
+async def test_user_message_recovery_turn_keeps_note(tmp_path):
     adapter = NoteAdapter()
     store, entry, _ = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-user")
@@ -518,12 +522,12 @@ async def test_user_message_recovery_turn_reconciles_note(tmp_path):
     await adapter._reconcile_restart_note_after_delivery(event, entry.session_key)
 
     assert adapter.edited == []
-    assert adapter.deleted == [("chat", "note-user")]
-    assert store.get_restart_note(entry.session_key)[3] is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-user"
 
 
 @pytest.mark.asyncio
-async def test_streamed_resumed_answer_deletes_note_before_marker_clear(tmp_path, monkeypatch):
+async def test_streamed_resumed_answer_keeps_note_before_marker_clear(tmp_path, monkeypatch):
     from gateway import run_turn
     from gateway.run_turn import GatewayTurnMixin
 
@@ -544,9 +548,9 @@ async def test_streamed_resumed_answer_deletes_note_before_marker_clear(tmp_path
     )
 
     assert delivered is None
-    assert adapter.deleted == [("chat", "note-stream")]
+    assert adapter.deleted == []
     assert store._entries[entry.session_key].resume_pending is True
-    assert store.get_restart_note(entry.session_key)[3] is None
+    assert store.get_restart_note(entry.session_key)[3] == "note-stream"
     assert store.clear_resume_pending(entry.session_key)
 
 
@@ -575,11 +579,33 @@ async def test_streamed_attachment_only_answer_reconciles_only_after_upload(tmp_
     assert delivered is None
     runner._deliver_media_from_response.assert_awaited_once()
     if upload_ok:
-        assert adapter.deleted == [("chat", "note-stream-media")]
-        assert store.get_restart_note(entry.session_key)[3] is None
+        assert adapter.deleted == []
+        assert store.get_restart_note(entry.session_key)[3] == "note-stream-media"
     else:
         assert adapter.deleted == []
         assert store.get_restart_note(entry.session_key)[3] == "note-stream-media"
+
+
+def test_append_only_note_records_round_trip_across_successor_interruption(tmp_path):
+    store = _store(tmp_path)
+    source = _source("append-only-round-trip")
+    entry = store.get_or_create_session(source)
+
+    store.mark_resume_pending(entry.session_key, turn_id="turn-one", human=True)
+    marker_one = store.get_resume_pending_marker(entry.session_key)
+    assert store.claim_restart_note(entry.session_key, expected_marker=marker_one)
+    assert store.set_restart_note_message_id(entry.session_key, "note-one", expected_marker=marker_one)
+    assert store.clear_resume_pending(entry.session_key, expected_marker=marker_one)
+
+    store.mark_resume_pending(entry.session_key, turn_id="turn-two", human=True)
+    marker_two = store.get_resume_pending_marker(entry.session_key)
+    assert store.claim_restart_note(entry.session_key, expected_marker=marker_two)
+    assert store.set_restart_note_message_id(entry.session_key, "note-two", expected_marker=marker_two)
+
+    payload = store._entries[entry.session_key].to_dict()
+    restored = SessionEntry.from_dict(payload)
+    assert [note["message_id"] for note in restored.restart_notes] == ["note-one", "note-two"]
+    assert restored.restart_notes[0]["marker_token"] != restored.restart_notes[1]["marker_token"]
 
 
 @pytest.mark.asyncio
@@ -605,11 +631,9 @@ async def test_crash_recovery_reclaims_unposted_note_once(tmp_path):
 
     assert await runner._send_interrupted_turn_notes(
         [entry.session_key], reclaim_pending=True,
-    ) == 1
-    assert len(adapter.sent) == 1
-    assert await runner._send_interrupted_turn_notes(
-        [entry.session_key], reclaim_pending=True,
     ) == 0
+    assert len(adapter.sent) == 0
+    assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
 
 
 @pytest.mark.asyncio
@@ -930,7 +954,7 @@ def test_pending_note_claim_is_atomic_and_recoverable(tmp_path):
     assert store.claim_restart_note(entry.session_key, expected_marker=marker)
     assert not store.claim_restart_note(entry.session_key, expected_marker=marker)
     assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
-    assert store.claim_restart_note(entry.session_key, expected_marker=marker, reclaim_pending=True)
+    assert not store.claim_restart_note(entry.session_key, expected_marker=marker, reclaim_pending=True)
 
 
 @pytest.mark.asyncio
@@ -969,8 +993,8 @@ async def test_ledger_redelivery_reconciles_note_left_by_failed_resumed_delete(t
         "attempts": 1,
     }
     assert await startup._redeliver_claimed_obligations([row]) == 1
-    assert adapter.deleted == [(source.chat_id, "note-ledger"), (source.chat_id, "note-ledger")]
-    assert store.get_restart_note(entry.session_key) is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "note-ledger"
     assert len(adapter.sent) == 2
 
 
@@ -1068,9 +1092,8 @@ async def test_detached_startup_note_deletes_itself_after_answer(tmp_path):
         pass
 
     assert len(adapter.sent) == 1
-    assert adapter.deleted == [(source.chat_id, "late-1")]
-    note = store.get_restart_note(entry.session_key)
-    assert note is None or note[3] is None
+    assert adapter.deleted == []
+    assert store.get_restart_note(entry.session_key)[3] == "late-1"
 
 
 @pytest.mark.asyncio

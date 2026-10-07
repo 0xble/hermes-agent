@@ -4651,8 +4651,6 @@ class BasePlatformAdapter(ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
-        if not hasattr(event, "_restart_note_marker_api_available"):
-            await self._capture_restart_note_marker(event, session_key)
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
@@ -4672,9 +4670,6 @@ class BasePlatformAdapter(ABC):
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
-        if (result.success and not is_ephemeral_response and not event.is_command()
-                and hasattr(delivery_adapter, "_reconcile_restart_note_after_delivery")):
-            await delivery_adapter._reconcile_restart_note_after_delivery(event, session_key)
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
@@ -4716,178 +4711,8 @@ class BasePlatformAdapter(ABC):
         await self._reconcile_restart_note_after_delivery(event, session_key)
 
     async def _reconcile_restart_note_after_delivery(self, event: MessageEvent, session_key: str) -> None:
-        """Delete and clear the durable restart note after a confirmed answer delivery.
-
-        A resumed answer is always sent as a fresh message. Editing a note far up a thread does not
-        notify the user or move the answer to the bottom, so reconciliation happens only after the
-        answer is confirmed delivered. The resume marker is a CAS fence against a successor turn.
-        """
-        if getattr(event, "_restart_note_reconciled", False):
-            return
-        runner = getattr(self, "gateway_runner", None)
-        store = getattr(runner, "async_session_store", None)
-        get_note = getattr(store, "get_restart_note", None)
-        if not callable(get_note):
-            return
-
-        # Final delivery must not pay for a store lookup when this session has no visible
-        # interruption note.  The live runner and AsyncSessionStore expose the routing index
-        # in memory; a missing/unmarked entry is a definitive fast negative.  If a test or
-        # alternate runner provides no recognizable index, only trust an explicitly async
-        # lookup and fail open for loose mocks (whose callable attributes are MagicMocks).
-        entries = None
-        for candidate in (
-            getattr(runner, "session_store", None),
-            getattr(store, "_store", None),
-            getattr(self, "_session_store", None),
-        ):
-            candidate_entries = getattr(candidate, "_entries", None)
-            if isinstance(candidate_entries, dict):
-                entries = candidate_entries
-                break
-        if entries is not None:
-            entry = entries.get(session_key)
-            if entry is None or not getattr(entry, "restart_note_message_id", None):
-                return
-        elif not inspect.iscoroutinefunction(get_note):
-            return
-
-        try:
-            note_result = get_note(session_key)
-            note = await note_result if inspect.isawaitable(note_result) else note_result
-            if not isinstance(note, (tuple, list)) or len(note) < 4:
-                return
-            expected_note = getattr(event, "_restart_note_expected", None)
-            marker_api_available = bool(getattr(event, "_restart_note_marker_api_available", False))
-            expected_marker = getattr(event, "_restart_note_expected_marker", None)
-            if expected_note is not None and tuple(note[:4]) != tuple(expected_note[:4]):
-                return
-            # Do not let an older resumed answer delete a successor's note. The marker check must
-            # happen before the network delete, not only in the clear CAS afterwards.
-            if marker_api_available and expected_marker is not None:
-                marker_reader = getattr(store, "get_resume_pending_marker", None)
-                if not callable(marker_reader):
-                    return
-                current_marker_result = marker_reader(session_key)
-                current_marker = (
-                    await current_marker_result
-                    if inspect.isawaitable(current_marker_result) else current_marker_result
-                )
-                if current_marker is not None and current_marker != expected_marker:
-                    return
-            note_id = note[3] if note else None
-        except Exception:
-            logger.warning("[%s] Restart-note lookup failed for %s; continuing normal delivery",
-                           self.name, session_key, exc_info=True)
-            return
-        if not note_id or str(note_id).startswith("pending:"):
-            if note_id and str(note_id).startswith("pending:"):
-                # Startup boot sends may detach while a resumed turn proceeds. Record that this
-                # turn owns the pending claim so a late transport completion can delete its own
-                # just-posted note instead of creating an orphan after the answer.
-                if runner is not None:
-                    answered = getattr(runner, "_s2_note_answered_keys", None)
-                    if answered is None:
-                        answered = runner._s2_note_answered_keys = {}
-                    answered[session_key] = expected_marker or tuple(note[:3])
-            return
-        if str(note_id).startswith("sent:"):
-            # Signal-like transports have no platform handle. The sentinel is reconciled only after
-            # the resumed answer has already been confirmed by the caller.
-            clear_kwargs = {}
-            if marker_api_available and expected_marker is not None:
-                clear_kwargs["expected_marker"] = expected_marker
-            if expected_note is not None:
-                clear_kwargs["expected_note"] = expected_note
-            try:
-                clear_result = store.clear_restart_note(session_key, **clear_kwargs)
-                cleared = await clear_result if inspect.isawaitable(clear_result) else clear_result
-                if cleared is not None:
-                    event._restart_note_reconciled = True
-            except Exception:
-                logger.warning("[%s] Failed to clear no-id restart note for %s", self.name, session_key,
-                               exc_info=True)
-            return
-
-        reconcile_claimed = False
-        claim_reconciliation = getattr(store, "claim_restart_note_reconciliation", None)
-        if callable(claim_reconciliation):
-            claim_result = claim_reconciliation(
-                session_key,
-                expected_marker=expected_marker if marker_api_available else None,
-                expected_note=expected_note or note,
-            )
-            reconcile_claimed = (
-                await claim_result if inspect.isawaitable(claim_result) else bool(claim_result)
-            )
-            if not reconcile_claimed:
-                return
-
-        async def _record_failed_reconciliation() -> None:
-            record_failure = getattr(store, "record_restart_note_reconcile_failure", None)
-            if not callable(record_failure):
-                return
-            try:
-                failure_result = record_failure(session_key)
-                dropped = await failure_result if inspect.isawaitable(failure_result) else failure_result
-                if dropped:
-                    logger.warning(
-                        "[%s] Dropping restart note for %s after bounded reconciliation failures",
-                        self.name, session_key,
-                    )
-            except Exception:
-                logger.warning("[%s] Failed to record restart-note reconciliation failure for %s",
-                               self.name, session_key, exc_info=True)
-
-        async def _release_reconciliation_claim() -> None:
-            if not reconcile_claimed:
-                return
-            release_claim = getattr(store, "release_restart_note_reconciliation", None)
-            if not callable(release_claim):
-                return
-            try:
-                release_result = release_claim(session_key, expected_note=expected_note or note)
-                if inspect.isawaitable(release_result):
-                    await release_result
-            except Exception:
-                logger.debug("[%s] Failed to release restart-note claim for %s",
-                             self.name, session_key, exc_info=True)
-
-        async def _clear_reconciled_note() -> Optional[bool]:
-            try:
-                clear_kwargs = {}
-                if marker_api_available and expected_marker is not None:
-                    clear_kwargs["expected_marker"] = expected_marker
-                if expected_note is not None:
-                    clear_kwargs["expected_note"] = expected_note
-                clear_result = store.clear_restart_note(session_key, **clear_kwargs)
-                return await clear_result if inspect.isawaitable(clear_result) else clear_result
-            except Exception:
-                # Do not block the user's answer on a bookkeeping write. The durable note is
-                # intentionally retained so a later final delivery can retry reconciliation.
-                logger.warning("[%s] Failed to clear reconciled restart note for %s",
-                               self.name, session_key, exc_info=True)
-                return None
-        # The answer has already been confirmed by the caller, so delete the old visible note now.
-        delete = getattr(self, "delete_message", None)
-        deleted = False
-        if callable(delete):
-            try:
-                delete_result = delete(event.source.chat_id, str(note_id))
-                delete_result = await delete_result if inspect.isawaitable(delete_result) else delete_result
-                deleted = bool(delete_result)
-            except Exception:
-                logger.warning("[%s] Failed to delete restart note for %s; retaining durable pointer",
-                               self.name, session_key, exc_info=True)
-        if deleted:
-            # A false CAS result is intentional when a successor owns the marker: never retry the
-            # old turn against that successor's note. Exceptions remain retryable.
-            clear_status = await _clear_reconciled_note()
-            if clear_status is not None:
-                event._restart_note_reconciled = True
-        else:
-            await _record_failed_reconciliation()
-        await _release_reconciliation_claim()
+        """Compatibility no-op: interrupted-turn notes are append-only and remain visible."""
+        return
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],

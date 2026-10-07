@@ -974,19 +974,10 @@ class GatewayShutdownMixin:
                     return 0
                 marker = await self.async_session_store.get_resume_pending_marker(session_key)
                 note = await self.async_session_store.get_restart_note(session_key)
-                note_id = note[3] if note else None
-                if note_id and str(note_id).startswith("pending:") and not reclaim_pending:
+                # A visible or in-flight note for this marker is terminal. Never delete or
+                # replace it, including during startup recovery.
+                if note and note[3]:
                     return 0
-                stale_note_id = None
-                current_marker = marker[1] if marker else None
-                if note_id and not str(note_id).startswith("pending:") and note[1] == current_marker:
-                    return 0
-                if note_id and str(note_id).startswith("sent:"):
-                    # No platform id exists for this transport; clear the sentinel before
-                    # allocating the one visible note for the new interruption.
-                    await self.async_session_store.clear_restart_note(session_key)
-                elif note_id and not str(note_id).startswith("pending:"):
-                    stale_note_id = str(note_id)
                 target = await self._shutdown_notification_target(session_key)
                 if target is None:
                     return 0
@@ -997,24 +988,6 @@ class GatewayShutdownMixin:
                     adapter = self._authorization_adapter(platform, profile)
                 if adapter is None:
                     return 0
-                if stale_note_id:
-                    deleted = False
-                    delete = getattr(adapter, "delete_message", None)
-                    if callable(delete):
-                        try:
-                            deleted = bool(await delete(chat_id, stale_note_id))
-                        except Exception:
-                            deleted = False
-                    if not deleted:
-                        # Some adapters cannot delete messages. Keep the old note visible, but clear its
-                        # durable record so every later cut human turn still gets its own new note.
-                        await self.async_session_store.clear_restart_note(session_key)
-                        logger.info(
-                            "Unable to delete stale restart note for %s; old note remains visible",
-                            session_key,
-                        )
-                    else:
-                        await self.async_session_store.clear_restart_note(session_key)
                 if not await self.async_session_store.claim_restart_note(
                     session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
                 ):
@@ -1023,11 +996,6 @@ class GatewayShutdownMixin:
                     await self.async_session_store.release_restart_note_claim(
                         session_key, expected_marker=marker,
                     )
-                answered = getattr(self, "_s2_note_answered_keys", {})
-                owner_marker = marker or tuple(note[:3])
-                if answered.get(session_key) == owner_marker:
-                    await release_claim()
-                    return 0
                 metadata = self._thread_metadata_for_target(
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,
@@ -1048,22 +1016,6 @@ class GatewayShutdownMixin:
                     await release_claim()
                     return 0
                 send_succeeded = True
-                answered = getattr(self, "_s2_note_answered_keys", {})
-                if answered.get(session_key) == owner_marker:
-                    late_note_id = getattr(result, "message_id", None)
-                    late_deleted = False
-                    delete = getattr(adapter, "delete_message", None)
-                    if late_note_id and callable(delete):
-                        try:
-                            late_deleted = bool(await delete(chat_id, str(late_note_id)))
-                        except Exception:
-                            late_deleted = False
-                    if late_deleted or not late_note_id:
-                        clear_kwargs = {"expected_marker": marker} if marker is not None else {}
-                        await self.async_session_store.clear_restart_note(session_key, **clear_kwargs)
-                    if answered.get(session_key) == owner_marker:
-                        answered.pop(session_key, None)
-                    return 0
                 note_id = getattr(result, "message_id", None) or "sent:no-id"
                 if await self.async_session_store.set_restart_note_message_id(
                     session_key, str(note_id), expected_marker=marker,
@@ -1071,7 +1023,10 @@ class GatewayShutdownMixin:
                     getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
                     claim_kept = True
                     return 1
-                claim_kept = send_succeeded
+                # The transport accepted the note but the local record could not be updated. Keep
+                # the claim and never retry: an ambiguous send is safer as one possible note than a
+                # duplicate visible note.
+                claim_kept = True
                 return 0
             except Exception:
                 if not send_succeeded:
@@ -2244,28 +2199,9 @@ class GatewayShutdownMixin:
         self._s2_note_delivered_keys = set()
         self._s2_note_claimed_keys = {}
         await self._send_interrupted_turn_notes(_marked_keys)
-        # Let a promptly-cancelled note task run its claim-release finally block before deciding which
-        # lanes need the ordinary fallback. A transport that swallows cancellation remains claimed.
-        await asyncio.sleep(0)
+        # S2 note misses stay fenced. An ordinary shutdown notice here could race a detached
+        # transport completion and produce two notes for the same interruption marker.
         self._s2_note_session_keys = set(self._s2_note_delivered_keys)
-        _s2_note_misses = _s2_candidates - self._s2_note_session_keys
-        if _s2_note_misses:
-            # A note task may still be running after the two-second bound (some transports swallow
-            # cancellation). Claim fallback lanes before awaiting the ordinary notifier so a late note
-            # task observes the same per-key fence and cannot create a second visible notice.
-            _note_claims = self._s2_note_claimed_keys
-            _fallback_misses = set()
-            for _session_key in _s2_note_misses:
-                if _session_key not in _note_claims:
-                    _note_claims[_session_key] = ("fallback",)
-                    _fallback_misses.add(_session_key)
-            # The initial broadcast was suppressed for every possible S2 lane. Once the bounded note
-            # batch tells us which lanes actually received a note, restore the ordinary notice for the
-            # remainder (including fenced lanes and lanes lost when the 2s batch bound expired).
-            if _fallback_misses:
-                await self._notify_active_sessions_of_shutdown(
-                    _fallback_misses, include_home_channels=False,
-                )
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)

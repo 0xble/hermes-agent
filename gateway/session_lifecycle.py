@@ -193,16 +193,9 @@ class SessionLifecycleMixin:
                     entry.resume_marker_token = uuid.uuid4().hex
                     entry.resume_turn_id = entry.active_turn_token
                     entry.resume_human = bool(entry.active_turn_human)
-                    if entry.restart_note_message_id and not str(entry.restart_note_message_id).startswith(("pending:", "sent:")):
-                        # Reuse the one visible note for the new marker; shutdown delivery will
-                        # delete it before posting a replacement, avoiding two visible notes.
-                        entry.restart_note_reconcile_attempts = 0
-                    else:
-                        entry.restart_note_message_id = None
-                        entry.restart_note_marker_token = None
-                        entry.restart_note_turn_id = None
-                        entry.restart_note_marked_at = None
-                        entry.restart_note_reconcile_attempts = 0
+                    # Notes are append-only: a newly discovered interruption gets a new marker
+                    # and never reuses, clears, or replaces a predecessor's visible note.
+                    entry.restart_note_reconcile_attempts = 0
                     entry.last_resume_marked_at = now  # freshness starts at discovery
                     promoted += 1
             entry.active_turn_token = None
@@ -239,30 +232,7 @@ class SessionLifecycleMixin:
             if not same_turn:
                 entry.resume_marker_token = uuid.uuid4().hex
                 entry.resume_turn_id = turn_id
-                reconcile_claims = getattr(self, "_restart_note_reconcile_claims", None)
-                if reconcile_claims is None:
-                    reconcile_claims = self._restart_note_reconcile_claims = {}
-                claimed_note = reconcile_claims.get(session_key)
-                if (claimed_note and entry.restart_note_message_id
-                        and claimed_note[3] == entry.restart_note_message_id):
-                    # The old turn has already won ownership of the old visible note. Detach that
-                    # pointer before publishing the successor marker so the old delivery can delete
-                    # only its own note while the successor allocates a fresh one.
-                    entry.restart_note_message_id = None
-                    entry.restart_note_marker_token = None
-                    entry.restart_note_turn_id = None
-                    entry.restart_note_marked_at = None
-                    entry.restart_note_reconcile_attempts = 0
-                if entry.restart_note_message_id and not str(entry.restart_note_message_id).startswith(("pending:", "sent:")):
-                    # A stale visible note is the single slot for this session. Shutdown delivery
-                    # removes it before claiming a replacement note, preserving one-visible-note.
-                    entry.restart_note_reconcile_attempts = 0
-                else:
-                    entry.restart_note_message_id = None
-                    entry.restart_note_marker_token = None
-                    entry.restart_note_turn_id = None
-                    entry.restart_note_marked_at = None
-                    entry.restart_note_reconcile_attempts = 0
+                # A successor owns a new note record; predecessor records remain durable and visible.
                 entry.last_resume_marked_at = _now()
         return self._update_entry(session_key, _apply)
 
@@ -274,184 +244,162 @@ class SessionLifecycleMixin:
                 return None
             return (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
 
-    def claim_restart_note(
-        self, session_key: str, *, expected_marker: Optional[tuple] = None,
-        reclaim_pending: bool = False,
-    ) -> bool:
-        """Atomically reserve the current turn's note send before touching the network."""
-        def _apply(entry: SessionEntry):
-            if not entry.resume_pending:
-                return False
-            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
-            if expected_marker is not None and expected_marker != current:
-                return False
-            existing = entry.restart_note_message_id
-            if existing and not (reclaim_pending and str(existing).startswith("pending:")):
-                return False
-            entry.restart_note_message_id = f"pending:{entry.resume_marker_token or uuid.uuid4().hex}"
-            entry.restart_note_marker_token = entry.resume_marker_token
-            entry.restart_note_turn_id = entry.resume_turn_id
-            entry.restart_note_marked_at = entry.last_resume_marked_at
-            entry.restart_note_reconcile_attempts = 0
-            return True
-        return self._update_entry(session_key, _apply)
+    def _note_records_locked(self, entry: SessionEntry) -> list[dict]:
+        """Return append-only note records, migrating the pre-policy single-note fields."""
+        records = getattr(entry, "restart_notes", None)
+        if not isinstance(records, list):
+            records = []
+            entry.restart_notes = records
+        if not records and entry.restart_note_message_id and entry.restart_note_marker_token:
+            records.append({
+                "session_id": entry.session_id,
+                "marker_token": entry.restart_note_marker_token,
+                "turn_id": entry.restart_note_turn_id,
+                "marked_at": entry.restart_note_marked_at or entry.last_resume_marked_at,
+                "message_id": entry.restart_note_message_id,
+            })
+        return records
 
-    def release_restart_note_claim(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
-        """Release a pre-send note reservation when no message was accepted by the adapter."""
-        def _apply(entry: SessionEntry):
-            claim = entry.restart_note_message_id
-            if not claim or not str(claim).startswith("pending:"):
-                return False
-            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
-            if expected_marker is not None and expected_marker != current:
-                return False
+    @staticmethod
+    def _note_tuple(entry: SessionEntry, record: dict) -> tuple:
+        return (
+            entry.session_id,
+            record.get("marker_token"),
+            record.get("marked_at"),
+            record.get("message_id"),
+        )
+
+    def _sync_legacy_note_fields(self, entry: SessionEntry) -> None:
+        """Keep old single-note attributes as a read-compatible view of the newest record."""
+        records = self._note_records_locked(entry)
+        if not records:
             entry.restart_note_message_id = None
             entry.restart_note_marker_token = None
             entry.restart_note_turn_id = None
             entry.restart_note_marked_at = None
-            entry.restart_note_reconcile_attempts = 0
+            return
+        latest = records[-1]
+        entry.restart_note_message_id = latest.get("message_id")
+        entry.restart_note_marker_token = latest.get("marker_token")
+        entry.restart_note_turn_id = latest.get("turn_id")
+        entry.restart_note_marked_at = latest.get("marked_at")
+
+    def _find_note_record_locked(self, entry: SessionEntry, marker: Optional[tuple]) -> Optional[dict]:
+        records = self._note_records_locked(entry)
+        if marker is None:
+            return records[-1] if records else None
+        for record in reversed(records):
+            if self._note_tuple(entry, record)[:3] == tuple(marker[:3]):
+                return record
+        return None
+
+    def claim_restart_note(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+        reclaim_pending: bool = False,
+    ) -> bool:
+        """Atomically reserve one append-only note send for an interruption marker.
+
+        A pending claim is deliberately not reclaimed: the transport may have accepted the request
+        before a process died, and retrying it would violate the at-most-one visible-note contract.
+        """
+        def _apply(entry: SessionEntry):
+            if not entry.resume_pending:
+                return False
+            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            marker = expected_marker or current
+            if marker != current:
+                return False
+            record = self._find_note_record_locked(entry, marker)
+            if record is not None and record.get("message_id"):
+                return False
+            records = self._note_records_locked(entry)
+            if record is None:
+                record = {
+                    "session_id": entry.session_id,
+                    "marker_token": marker[1],
+                    "turn_id": entry.resume_turn_id,
+                    "marked_at": marker[2],
+                    "message_id": f"pending:{entry.resume_marker_token or uuid.uuid4().hex}",
+                }
+                records.append(record)
+            else:
+                record["message_id"] = f"pending:{entry.resume_marker_token or uuid.uuid4().hex}"
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def release_restart_note_claim(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
+        """Release only an unposted pending claim; visible note records are never removed."""
+        def _apply(entry: SessionEntry):
+            marker = expected_marker or (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            )
+            record = self._find_note_record_locked(entry, marker)
+            if record is None or not str(record.get("message_id", "")).startswith("pending:"):
+                return False
+            self._note_records_locked(entry).remove(record)
+            self._sync_legacy_note_fields(entry)
             return True
         return self._update_entry(session_key, _apply)
 
     def set_restart_note_message_id(
         self, session_key: str, message_id: str, *, expected_marker: Optional[tuple] = None,
     ) -> bool:
-        """Persist the visible interruption note id exactly once for the current resume marker."""
+        """Persist a visible note id for its marker, even if a successor is now current."""
         def _apply(entry: SessionEntry):
-            if not entry.resume_pending:
-                return False
-            existing = entry.restart_note_message_id
+            marker = expected_marker
+            if marker is None and entry.resume_pending:
+                marker = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            record = self._find_note_record_locked(entry, marker)
+            records = self._note_records_locked(entry)
+            if record is None:
+                if marker is None or not marker[1]:
+                    return False
+                record = {
+                    "session_id": entry.session_id,
+                    "marker_token": marker[1],
+                    "turn_id": entry.resume_turn_id,
+                    "marked_at": marker[2],
+                    "message_id": None,
+                }
+                records.append(record)
+            existing = record.get("message_id")
             if existing and not str(existing).startswith("pending:"):
                 return False
-            if expected_marker is not None and expected_marker != (
-                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
-            ):
-                return False
-            entry.restart_note_message_id = str(message_id)
-            entry.restart_note_marker_token = entry.resume_marker_token
-            entry.restart_note_turn_id = entry.resume_turn_id
-            entry.restart_note_marked_at = entry.last_resume_marked_at
-            entry.restart_note_reconcile_attempts = 0
+            record["message_id"] = str(message_id)
+            self._sync_legacy_note_fields(entry)
             return True
         return self._update_entry(session_key, _apply)
 
     def get_restart_note(self, session_key: str) -> Optional[tuple]:
-        """Return ``(session_id, marker_token, marked_at, message_id)`` for note reconciliation."""
+        """Return the current marker's note, or the newest durable note after it resumes."""
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or (not entry.resume_pending and not entry.restart_note_message_id):
+            if entry is None:
                 return None
-            return (
-                entry.session_id,
-                entry.restart_note_marker_token or entry.resume_marker_token,
-                entry.restart_note_marked_at or entry.last_resume_marked_at,
-                entry.restart_note_message_id,
-            )
+            marker = (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            ) if entry.resume_pending else None
+            record = self._find_note_record_locked(entry, marker)
+            if record is None:
+                return None
+            return self._note_tuple(entry, record)
 
-    def claim_restart_note_reconciliation(
-        self, session_key: str, *, expected_marker: Optional[tuple] = None,
-        expected_note: Optional[tuple] = None,
-    ) -> bool:
-        """CAS-claim a visible note before awaiting its network deletion.
+    def claim_restart_note_reconciliation(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: S2 notes are append-only and are never reconciled."""
+        return False
 
-        A successor re-mark notices this claim and detaches the old pointer before publishing its
-        marker, so an old answer can never delete a successor-owned note.
-        """
-        with self._lock:
-            entry = self._entry_locked(session_key)
-            note_id = getattr(entry, "restart_note_message_id", None) if entry is not None else None
-            if entry is None or not note_id or str(note_id).startswith(("pending:", "sent:")):
-                return False
-            note = (
-                entry.session_id,
-                entry.restart_note_marker_token or entry.resume_marker_token,
-                entry.restart_note_marked_at or entry.last_resume_marked_at,
-                note_id,
-            )
-            if expected_note is not None and tuple(expected_note[:4]) != note:
-                return False
-            owner_marker = note[:3]
-            if expected_marker is not None:
-                if entry.resume_pending:
-                    if expected_marker != (
-                        entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
-                    ):
-                        return False
-                elif expected_marker != owner_marker:
-                    return False
-            claims = getattr(self, "_restart_note_reconcile_claims", None)
-            if claims is None:
-                claims = self._restart_note_reconcile_claims = {}
-            current_claim = claims.get(session_key)
-            if current_claim is not None and current_claim != note:
-                return False
-            claims[session_key] = note
-            return True
+    def release_restart_note_reconciliation(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: S2 notes are append-only and are never reconciled."""
+        return False
 
-    def release_restart_note_reconciliation(
-        self, session_key: str, *, expected_note: Optional[tuple] = None,
-    ) -> bool:
-        """Release a pre-delete note claim without changing the durable pointer."""
-        claims = getattr(self, "_restart_note_reconcile_claims", None)
-        if not claims:
-            return False
-        with self._lock:
-            current = claims.get(session_key)
-            if current is None or (expected_note is not None and tuple(expected_note[:4]) != current):
-                return False
-            claims.pop(session_key, None)
-            return True
+    def clear_restart_note(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: visible S2 notes are never deleted or cleared."""
+        return False
 
-    def clear_restart_note(
-        self, session_key: str, *, expected_marker: Optional[tuple] = None,
-        expected_note: Optional[tuple] = None,
-    ) -> bool:
-        """Clear the note id after its resumed answer was deleted or replaced."""
-        def _apply(entry: SessionEntry):
-            if not entry.restart_note_message_id:
-                return False
-            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
-            if expected_marker is not None:
-                if entry.resume_pending:
-                    if expected_marker != current:
-                        return False
-                elif expected_marker != (
-                    entry.session_id,
-                    entry.restart_note_marker_token or entry.resume_marker_token,
-                    entry.restart_note_marked_at or entry.last_resume_marked_at,
-                ):
-                    # The owning turn may have cleared resume_pending before final delivery. In that
-                    # case the note's captured marker is the only remaining ownership evidence.
-                    return False
-            if expected_note is not None and expected_note != (
-                entry.session_id,
-                entry.restart_note_marker_token or entry.resume_marker_token,
-                entry.restart_note_marked_at or entry.last_resume_marked_at,
-                entry.restart_note_message_id,
-            ):
-                return False
-            entry.restart_note_message_id = None
-            entry.restart_note_marker_token = None
-            entry.restart_note_turn_id = None
-            entry.restart_note_marked_at = None
-            entry.restart_note_reconcile_attempts = 0
-        return self._update_entry(session_key, _apply)
-
-    def record_restart_note_reconcile_failure(self, session_key: str, *, max_attempts: int = 3) -> bool:
-        """Count a failed edit/delete attempt; drop a permanently unreachable note after a bound."""
-        def _apply(entry: SessionEntry):
-            if not entry.restart_note_message_id or str(entry.restart_note_message_id).startswith(("pending:", "sent:")):
-                return False
-            entry.restart_note_reconcile_attempts += 1
-            if entry.restart_note_reconcile_attempts < max_attempts:
-                return False
-            entry.restart_note_message_id = None
-            entry.restart_note_marker_token = None
-            entry.restart_note_turn_id = None
-            entry.restart_note_marked_at = None
-            entry.restart_note_reconcile_attempts = 0
-            return True
-        return self._update_entry(session_key, _apply)
+    def record_restart_note_reconcile_failure(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: a failed answer never removes the interruption note."""
+        return False
 
     def clear_resume_pending(
         self, session_key: str, *, expected_marker: Optional[tuple] = None,

@@ -532,6 +532,9 @@ class SessionEntry:
     restart_note_turn_id: Optional[str] = None
     restart_note_marked_at: Optional[datetime] = None
     restart_note_reconcile_attempts: int = 0
+    # Append-only durable note records. A session can be interrupted more than once before a
+    # resumed answer finishes; each marker owns its own visible note, which is never reconciled away.
+    restart_notes: list[Dict[str, Any]] = field(default_factory=list)
     last_resume_marked_at: Optional[datetime] = None
     # Durable marker of the executing turn; CAS-cleared on normal unwind, left behind by
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
@@ -556,7 +559,7 @@ class SessionEntry:
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
         "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
         "resume_turn_id", "resume_human", "restart_note_message_id", "restart_note_marker_token",
-        "restart_note_turn_id", "restart_note_reconcile_attempts", "active_turn_human",
+        "restart_note_turn_id", "restart_note_reconcile_attempts", "restart_notes", "active_turn_human",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
@@ -572,6 +575,15 @@ class SessionEntry:
             "chat_type": self.chat_type, "metadata": self.metadata,
         }
         result.update((name, getattr(self, name)) for name in self._PLAIN_FIELDS)
+        if self.restart_notes:
+            result["restart_notes"] = [
+                {
+                    **note,
+                    "marked_at": _iso(note.get("marked_at"))
+                    if isinstance(note.get("marked_at"), datetime) else note.get("marked_at"),
+                }
+                for note in self.restart_notes
+            ]
         result["restart_note_marked_at"] = _iso(self.restart_note_marked_at)
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
         result["active_turn_token"] = self.active_turn_token
@@ -616,6 +628,26 @@ class SessionEntry:
         defaults = {f.name: f.default for f in fields(cls)}
         plain = {n: data.get(n, defaults[n]) for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS}
         plain["expiry_finalized"] = data.get("expiry_finalized", data.get("memory_flushed", False))
+        raw_notes = plain.get("restart_notes") or []
+        if not isinstance(raw_notes, list):
+            raw_notes = []
+        plain["restart_notes"] = [
+            {
+                **note,
+                "marked_at": _parse_iso(note.get("marked_at")),
+            }
+            for note in raw_notes
+            if isinstance(note, dict) and note.get("marker_token")
+        ]
+        if not plain["restart_notes"] and data.get("restart_note_message_id"):
+            plain["restart_notes"] = [{
+                "session_id": session_id,
+                "marker_token": data.get("restart_note_marker_token") or data.get("resume_marker_token"),
+                "turn_id": data.get("restart_note_turn_id") or data.get("resume_turn_id"),
+                "marked_at": _parse_iso(data.get("restart_note_marked_at"))
+                or _parse_iso(data.get("last_resume_marked_at")),
+                "message_id": data.get("restart_note_message_id"),
+            }]
         transport_profile = data.get("transport_profile")
         return cls(
             session_key=session_key, session_id=session_id,
