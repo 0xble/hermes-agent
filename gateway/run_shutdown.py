@@ -964,6 +964,7 @@ class GatewayShutdownMixin:
     async def _send_interrupted_turn_notes(
         self, session_keys, *, reclaim_pending: bool = False,
         cancel_on_timeout: bool = False, timeout: float = 2.0,
+        shutdown_fallback_keys=None,
     ) -> int:
         """Ensure one visible note for each interrupted human turn.
 
@@ -1016,6 +1017,8 @@ class GatewayShutdownMixin:
                         getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
                         return 0
                 target = await self._shutdown_notification_target(session_key)
+                if note_claims.get(session_key) == ("fallback",):
+                    return 0
                 if target is None:
                     note_failed.add(session_key)
                     return 0
@@ -1030,6 +1033,11 @@ class GatewayShutdownMixin:
                 if not await self.async_session_store.claim_restart_note(
                     session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
                 ):
+                    return 0
+                if note_claims.get(session_key) == ("fallback",):
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
                     return 0
                 async def release_claim():
                     await self.async_session_store.release_restart_note_claim(
@@ -1059,6 +1067,11 @@ class GatewayShutdownMixin:
                         session_key, expected_marker=marker,
                     )
                     if not send_started:
+                        return 0
+                    if note_claims.get(session_key) == ("fallback",):
+                        await self.async_session_store.release_restart_note_after_failed_send(
+                            session_key, expected_marker=marker,
+                        )
                         return 0
                     result = await adapter.send(
                         chat_id, text,
@@ -1124,6 +1137,45 @@ class GatewayShutdownMixin:
         if not unique_keys:
             return 0
 
+        async def _record_shutdown_misses(candidate_keys):
+            """Fence and record shutdown lanes whose note never entered ``sending:``.
+
+            The batch may be detached after cancellation, so task-local ``CancelledError`` handling
+            is not sufficient evidence. Read the durable claim state after the batch deadline instead:
+            a real id is delivered, ``sending:`` is ambiguous and terminal, and anything else is a
+            pre-send miss eligible for the one ordinary shutdown fallback.
+            """
+            note_claims = getattr(self, "_s2_note_claimed_keys", None)
+            if note_claims is None:
+                note_claims = self._s2_note_claimed_keys = {}
+            note_failed = getattr(self, "_s2_note_failed_keys", None)
+            if note_failed is None:
+                note_failed = self._s2_note_failed_keys = set()
+            delivered = getattr(self, "_s2_note_delivered_keys", None)
+            if delivered is None:
+                delivered = self._s2_note_delivered_keys = set()
+            for session_key in dict.fromkeys(candidate_keys or ()):
+                if session_key in delivered or note_claims.get(session_key) == ("fallback",):
+                    continue
+                try:
+                    note = await self.async_session_store.get_restart_note(session_key)
+                except Exception:
+                    note = None
+                note_id = str(note[3]) if note and note[3] else ""
+                if note_id.startswith("sending:"):
+                    continue
+                if note_id and not note_id.startswith("pending:"):
+                    delivered.add(session_key)
+                    continue
+                note_claims[session_key] = ("fallback",)
+                note_failed.add(session_key)
+                if note_id.startswith("pending:"):
+                    with suppress(Exception):
+                        marker = await self.async_session_store.get_resume_pending_marker(session_key)
+                        await self.async_session_store.release_restart_note_claim(
+                            session_key, expected_marker=marker,
+                        )
+
         async def _send_batch():
             return await asyncio.gather(*(_send_one(key) for key in unique_keys), return_exceptions=True)
 
@@ -1150,6 +1202,8 @@ class GatewayShutdownMixin:
                             unique_keys,
                             timeout,
                         )
+                    if shutdown_fallback_keys is not None:
+                        await _record_shutdown_misses(shutdown_fallback_keys)
                     return 0
             except asyncio.CancelledError:
                 await _cancel_task_with_grace(batch_task)
@@ -1174,8 +1228,12 @@ class GatewayShutdownMixin:
                     batch_task.add_done_callback(_consume)
             if not completed:
                 logger.warning("Interrupted-turn notes exceeded %.1fs total; continuing agent interruption", timeout)
+                if shutdown_fallback_keys is not None:
+                    await _record_shutdown_misses(shutdown_fallback_keys)
                 return 0
         results = batch_task.result()
+        if shutdown_fallback_keys is not None:
+            await _record_shutdown_misses(shutdown_fallback_keys)
         sent = sum(result for result in results if isinstance(result, int))
         if sent:
             logger.info("Shutdown: delivered %d interrupted human-turn note(s)", sent)
@@ -2333,7 +2391,12 @@ class GatewayShutdownMixin:
         self._s2_note_delivered_keys = set()
         self._s2_note_failed_keys = set()
         self._s2_note_claimed_keys = {}
-        await self._send_interrupted_turn_notes(_marked_keys)
+        if _s2_candidates:
+            await self._send_interrupted_turn_notes(
+                _marked_keys, shutdown_fallback_keys=_s2_candidates,
+            )
+        else:
+            await self._send_interrupted_turn_notes(_marked_keys)
         # S2 note misses need the ordinary shutdown notice, but only after the note sender has
         # returned: delivered lanes remain fenced so no session can receive both messages.
         self._s2_note_session_keys = set(self._s2_note_delivered_keys)

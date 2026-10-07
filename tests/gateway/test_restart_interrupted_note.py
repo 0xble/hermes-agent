@@ -1114,7 +1114,7 @@ async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_cancelled_note_task_detaches_after_grace_and_keeps_sending_claim(tmp_path):
+async def test_cancelled_note_task_detaches_after_grace_and_keeps_sending_claim(tmp_path, monkeypatch):
     store = _store(tmp_path)
     source = _source("detach-shutdown")
     entry = store.get_or_create_session(source)
@@ -1127,11 +1127,19 @@ async def test_cancelled_note_task_detaches_after_grace_and_keeps_sending_claim(
     async def send_notes():
         try:
             return await runner._send_interrupted_turn_notes(
-                [entry.session_key], cancel_on_timeout=True, timeout=0.5,
+                [entry.session_key], cancel_on_timeout=True, timeout=5.0,
             )
         finally:
             returned.set()
 
+    async def timeout_after_send_started(tasks, *, timeout=None, **kwargs):
+        if timeout == 5.0:
+            await adapter.started.wait()
+            return set(), set(tasks)
+        return await asyncio_wait(tasks, timeout=timeout, **kwargs)
+
+    asyncio_wait = asyncio.wait
+    monkeypatch.setattr("gateway.run_shutdown.asyncio.wait", timeout_after_send_started)
     note_task = asyncio.create_task(send_notes())
     await asyncio.wait_for(adapter.started.wait(), timeout=1.0)
     timed_out = False
@@ -1174,7 +1182,16 @@ async def test_reconnect_detaches_cancel_ignoring_note_before_resume(tmp_path, m
     scheduled = []
     runner._schedule_resume_pending_sessions = lambda **kwargs: scheduled.append(kwargs["restore_keys"].add(entry.session_key))
     monkeypatch.setattr(run_pending_recovery, "recover_pending_shutdown_flush", lambda *a, **k: None)
-    monkeypatch.setattr("gateway.run._startup_restore_drain_timeout_secs", lambda: 0.5)
+    monkeypatch.setattr("gateway.run._startup_restore_drain_timeout_secs", lambda: 5.0)
+
+    async def timeout_after_send_started(tasks, *, timeout=None, **kwargs):
+        if timeout == 5.0:
+            await adapter.started.wait()
+            return set(), set(tasks)
+        return await asyncio_wait(tasks, timeout=timeout, **kwargs)
+
+    asyncio_wait = asyncio.wait
+    monkeypatch.setattr("gateway.run_shutdown.asyncio.wait", timeout_after_send_started)
 
     returned = asyncio.Event()
 
@@ -1751,6 +1768,138 @@ async def test_late_s2_note_cannot_follow_fallback_notice(tmp_path, monkeypatch)
     assert len(adapter.sent) == 1
     assert "interrupted" in adapter.sent[0][1].lower()
     assert fallback_calls == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancelled_pre_send_note_gets_one_ordinary_fallback(tmp_path, monkeypatch):
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    runner, adapter = make_restart_runner()
+    store = _store(tmp_path)
+    source = _source("shutdown-pre-send")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-pre-send", human=True)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._s2_note_session_keys = {entry.session_key}
+    runner._running_agents = {}
+    target_started = asyncio.Event()
+    target_released = asyncio.Event()
+    target_cancelled = asyncio.Event()
+
+    async def target(_session_key):
+        target_started.set()
+        try:
+            await target_released.wait()
+        except asyncio.CancelledError:
+            target_cancelled.set()
+            raise
+
+    runner._shutdown_notification_target = target
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+
+    async def cancel_before_send(batch_task, _timeout):
+        await target_started.wait()
+        batch_task.cancel()
+        await target_cancelled.wait()
+        return False
+
+    runner._wait_or_detach = cancel_before_send
+    fallback_calls = []
+
+    async def fallback_notice(keys, *, include_home_channels):
+        fallback_calls.append((set(keys), include_home_channels))
+
+    runner._notify_active_sessions_of_shutdown = fallback_notice
+    monkeypatch.setattr(GatewayRunner, "_mark_running_sessions_resume_pending", staticmethod(
+        lambda _self, _prefix: asyncio.sleep(0, result=[entry.session_key])
+    ))
+    monkeypatch.setattr(GatewayRunner, "_shutdown_interrupt_reason", staticmethod(lambda _self: "test"))
+    monkeypatch.setattr(GatewayRunner, "_post_interrupt_grace_timeout", staticmethod(lambda _self: 0.0))
+    monkeypatch.setattr(GatewayRunner, "_stop_kill_tool_subprocesses_off_loop", staticmethod(
+        lambda _phase: asyncio.sleep(0, result=[])
+    ))
+    runner._notify_interrupted_cron_jobs = AsyncMock()
+
+    ctx = GatewayShutdownMixin._StopContext(lambda: 0, started_at=0.0)
+    await runner._stop_interrupt_remaining_work(ctx)
+
+    assert fallback_calls == [({entry.session_key}, False)]
+    assert adapter.sent == []
+    assert store.get_restart_note(entry.session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_batch_timeout_falls_back_only_before_sending(tmp_path, monkeypatch):
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    runner, _ = make_restart_runner(adapter=SwallowCancelNoteAdapter())
+    adapter = runner.adapters[Platform.TELEGRAM]
+    store = _store(tmp_path)
+    pre_source = _source("shutdown-batch-pre")
+    sending_source = _source("shutdown-batch-sending")
+    pre_entry = store.get_or_create_session(pre_source)
+    sending_entry = store.get_or_create_session(sending_source)
+    store.mark_resume_pending(pre_entry.session_key, turn_id="turn-pre", human=True)
+    store.mark_resume_pending(sending_entry.session_key, turn_id="turn-sending", human=True)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    keys = {pre_entry.session_key, sending_entry.session_key}
+    runner._s2_note_session_keys = keys
+    runner._running_agents = {}
+    target_started = asyncio.Event()
+    target_released = asyncio.Event()
+
+    async def target(session_key):
+        if session_key == pre_entry.session_key:
+            target_started.set()
+            await target_released.wait()
+            raise AssertionError("pre-send target should be cancelled")
+        return sending_source, "telegram", sending_source.chat_id, sending_source.thread_id, None
+
+    runner._shutdown_notification_target = target
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+    batch_task = None
+
+    async def cancel_batch_after_both_phases(task, _timeout):
+        nonlocal batch_task
+        batch_task = task
+        await target_started.wait()
+        await adapter.started.wait()
+        task.cancel()
+        return False
+
+    runner._wait_or_detach = cancel_batch_after_both_phases
+    fallback_calls = []
+
+    async def fallback_notice(keys, *, include_home_channels):
+        fallback_calls.append((set(keys), include_home_channels))
+
+    runner._notify_active_sessions_of_shutdown = fallback_notice
+    monkeypatch.setattr(GatewayRunner, "_mark_running_sessions_resume_pending", staticmethod(
+        lambda _self, _prefix: asyncio.sleep(0, result=list(keys))
+    ))
+    monkeypatch.setattr(GatewayRunner, "_shutdown_interrupt_reason", staticmethod(lambda _self: "test"))
+    monkeypatch.setattr(GatewayRunner, "_post_interrupt_grace_timeout", staticmethod(lambda _self: 0.0))
+    monkeypatch.setattr(GatewayRunner, "_stop_kill_tool_subprocesses_off_loop", staticmethod(
+        lambda _phase: asyncio.sleep(0, result=[])
+    ))
+    runner._notify_interrupted_cron_jobs = AsyncMock()
+
+    ctx = GatewayShutdownMixin._StopContext(lambda: 0, started_at=0.0)
+    await runner._stop_interrupt_remaining_work(ctx)
+    assert fallback_calls == [({pre_entry.session_key}, False)]
+    assert store.get_restart_note(pre_entry.session_key) is None
+    assert store.get_restart_note(sending_entry.session_key)[3].startswith("sending:")
+
+    target_released.set()
+    assert batch_task is not None
+    adapter.release.set()
+    await asyncio.gather(batch_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
