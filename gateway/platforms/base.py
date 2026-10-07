@@ -4701,6 +4701,12 @@ class BasePlatformAdapter(ABC):
             event._restart_note_expected_marker = (
                 await marker if inspect.isawaitable(marker) else marker
             )
+            get_note = getattr(store, "get_restart_note", None)
+            if callable(get_note):
+                note_result = get_note(session_key)
+                event._restart_note_expected = (
+                    await note_result if inspect.isawaitable(note_result) else note_result
+                )
             event._restart_note_marker_api_available = True
         except Exception:
             event._restart_note_marker_api_available = False
@@ -4756,12 +4762,34 @@ class BasePlatformAdapter(ABC):
             expected_marker = getattr(event, "_restart_note_expected_marker", None)
             if expected_note is not None and tuple(note[:4]) != tuple(expected_note[:4]):
                 return
+            # Do not let an older resumed answer delete a successor's note. The marker check must
+            # happen before the network delete, not only in the clear CAS afterwards.
+            if marker_api_available and expected_marker is not None:
+                marker_reader = getattr(store, "get_resume_pending_marker", None)
+                if not callable(marker_reader):
+                    return
+                current_marker_result = marker_reader(session_key)
+                current_marker = (
+                    await current_marker_result
+                    if inspect.isawaitable(current_marker_result) else current_marker_result
+                )
+                if current_marker is not None and current_marker != expected_marker:
+                    return
             note_id = note[3] if note else None
         except Exception:
             logger.warning("[%s] Restart-note lookup failed for %s; continuing normal delivery",
                            self.name, session_key, exc_info=True)
             return
         if not note_id or str(note_id).startswith("pending:"):
+            if note_id and str(note_id).startswith("pending:"):
+                # Startup boot sends may detach while a resumed turn proceeds. Record that this
+                # turn owns the pending claim so a late transport completion can delete its own
+                # just-posted note instead of creating an orphan after the answer.
+                if runner is not None:
+                    answered = getattr(runner, "_s2_note_answered_keys", None)
+                    if answered is None:
+                        answered = runner._s2_note_answered_keys = {}
+                    answered[session_key] = expected_marker or tuple(note[:3])
             return
         if str(note_id).startswith("sent:"):
             # Signal-like transports have no platform handle. The sentinel is reconciled only after
@@ -4781,6 +4809,20 @@ class BasePlatformAdapter(ABC):
                                exc_info=True)
             return
 
+        reconcile_claimed = False
+        claim_reconciliation = getattr(store, "claim_restart_note_reconciliation", None)
+        if callable(claim_reconciliation):
+            claim_result = claim_reconciliation(
+                session_key,
+                expected_marker=expected_marker if marker_api_available else None,
+                expected_note=expected_note or note,
+            )
+            reconcile_claimed = (
+                await claim_result if inspect.isawaitable(claim_result) else bool(claim_result)
+            )
+            if not reconcile_claimed:
+                return
+
         async def _record_failed_reconciliation() -> None:
             record_failure = getattr(store, "record_restart_note_reconcile_failure", None)
             if not callable(record_failure):
@@ -4796,6 +4838,20 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 logger.warning("[%s] Failed to record restart-note reconciliation failure for %s",
                                self.name, session_key, exc_info=True)
+
+        async def _release_reconciliation_claim() -> None:
+            if not reconcile_claimed:
+                return
+            release_claim = getattr(store, "release_restart_note_reconciliation", None)
+            if not callable(release_claim):
+                return
+            try:
+                release_result = release_claim(session_key, expected_note=expected_note or note)
+                if inspect.isawaitable(release_result):
+                    await release_result
+            except Exception:
+                logger.debug("[%s] Failed to release restart-note claim for %s",
+                             self.name, session_key, exc_info=True)
 
         async def _clear_reconciled_note() -> Optional[bool]:
             try:
@@ -4831,6 +4887,7 @@ class BasePlatformAdapter(ABC):
                 event._restart_note_reconciled = True
         else:
             await _record_failed_reconciliation()
+        await _release_reconciliation_claim()
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],

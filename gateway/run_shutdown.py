@@ -1023,6 +1023,11 @@ class GatewayShutdownMixin:
                     await self.async_session_store.release_restart_note_claim(
                         session_key, expected_marker=marker,
                     )
+                answered = getattr(self, "_s2_note_answered_keys", {})
+                owner_marker = marker or tuple(note[:3])
+                if answered.get(session_key) == owner_marker:
+                    await release_claim()
+                    return 0
                 metadata = self._thread_metadata_for_target(
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,
@@ -1043,6 +1048,22 @@ class GatewayShutdownMixin:
                     await release_claim()
                     return 0
                 send_succeeded = True
+                answered = getattr(self, "_s2_note_answered_keys", {})
+                if answered.get(session_key) == owner_marker:
+                    late_note_id = getattr(result, "message_id", None)
+                    late_deleted = False
+                    delete = getattr(adapter, "delete_message", None)
+                    if late_note_id and callable(delete):
+                        try:
+                            late_deleted = bool(await delete(chat_id, str(late_note_id)))
+                        except Exception:
+                            late_deleted = False
+                    if late_deleted or not late_note_id:
+                        clear_kwargs = {"expected_marker": marker} if marker is not None else {}
+                        await self.async_session_store.clear_restart_note(session_key, **clear_kwargs)
+                    if answered.get(session_key) == owner_marker:
+                        answered.pop(session_key, None)
+                    return 0
                 note_id = getattr(result, "message_id", None) or "sent:no-id"
                 if await self.async_session_store.set_restart_note_message_id(
                     session_key, str(note_id), expected_marker=marker,
@@ -2216,7 +2237,10 @@ class GatewayShutdownMixin:
         _marked_keys = await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
         # This is the last transport-connected phase for the interrupted human turn. It is intentionally
         # independent of the ordinary restart-notification opt-out and is durable/deduplicated by the row.
-        _s2_candidates = set(getattr(self, "_s2_note_session_keys", set()))
+        # Only turns still marked resume-pending after the drain can need an interruption note. A
+        # human turn may finish during the graceful drain and be removed from _running_agents before
+        # the timeout phase; do not resurrect the pre-drain candidate as a fallback notice.
+        _s2_candidates = set(getattr(self, "_s2_note_session_keys", set())) & set(_marked_keys)
         self._s2_note_delivered_keys = set()
         self._s2_note_claimed_keys = {}
         await self._send_interrupted_turn_notes(_marked_keys)

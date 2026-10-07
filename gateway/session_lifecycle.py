@@ -239,6 +239,20 @@ class SessionLifecycleMixin:
             if not same_turn:
                 entry.resume_marker_token = uuid.uuid4().hex
                 entry.resume_turn_id = turn_id
+                reconcile_claims = getattr(self, "_restart_note_reconcile_claims", None)
+                if reconcile_claims is None:
+                    reconcile_claims = self._restart_note_reconcile_claims = {}
+                claimed_note = reconcile_claims.get(session_key)
+                if (claimed_note and entry.restart_note_message_id
+                        and claimed_note[3] == entry.restart_note_message_id):
+                    # The old turn has already won ownership of the old visible note. Detach that
+                    # pointer before publishing the successor marker so the old delivery can delete
+                    # only its own note while the successor allocates a fresh one.
+                    entry.restart_note_message_id = None
+                    entry.restart_note_marker_token = None
+                    entry.restart_note_turn_id = None
+                    entry.restart_note_marked_at = None
+                    entry.restart_note_reconcile_attempts = 0
                 if entry.restart_note_message_id and not str(entry.restart_note_message_id).startswith(("pending:", "sent:")):
                     # A stale visible note is the single slot for this session. Shutdown delivery
                     # removes it before claiming a replacement note, preserving one-visible-note.
@@ -333,6 +347,60 @@ class SessionLifecycleMixin:
                 entry.restart_note_marked_at or entry.last_resume_marked_at,
                 entry.restart_note_message_id,
             )
+
+    def claim_restart_note_reconciliation(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+        expected_note: Optional[tuple] = None,
+    ) -> bool:
+        """CAS-claim a visible note before awaiting its network deletion.
+
+        A successor re-mark notices this claim and detaches the old pointer before publishing its
+        marker, so an old answer can never delete a successor-owned note.
+        """
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            note_id = getattr(entry, "restart_note_message_id", None) if entry is not None else None
+            if entry is None or not note_id or str(note_id).startswith(("pending:", "sent:")):
+                return False
+            note = (
+                entry.session_id,
+                entry.restart_note_marker_token or entry.resume_marker_token,
+                entry.restart_note_marked_at or entry.last_resume_marked_at,
+                note_id,
+            )
+            if expected_note is not None and tuple(expected_note[:4]) != note:
+                return False
+            owner_marker = note[:3]
+            if expected_marker is not None:
+                if entry.resume_pending:
+                    if expected_marker != (
+                        entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+                    ):
+                        return False
+                elif expected_marker != owner_marker:
+                    return False
+            claims = getattr(self, "_restart_note_reconcile_claims", None)
+            if claims is None:
+                claims = self._restart_note_reconcile_claims = {}
+            current_claim = claims.get(session_key)
+            if current_claim is not None and current_claim != note:
+                return False
+            claims[session_key] = note
+            return True
+
+    def release_restart_note_reconciliation(
+        self, session_key: str, *, expected_note: Optional[tuple] = None,
+    ) -> bool:
+        """Release a pre-delete note claim without changing the durable pointer."""
+        claims = getattr(self, "_restart_note_reconcile_claims", None)
+        if not claims:
+            return False
+        with self._lock:
+            current = claims.get(session_key)
+            if current is None or (expected_note is not None and tuple(expected_note[:4]) != current):
+                return False
+            claims.pop(session_key, None)
+            return True
 
     def clear_restart_note(
         self, session_key: str, *, expected_marker: Optional[tuple] = None,

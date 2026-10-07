@@ -343,7 +343,7 @@ async def test_successor_marker_keeps_restart_note_pointer(tmp_path):
     adapter._send_with_retry = _send_and_successor
     await adapter._send_final_text(event, entry.session_key, "answer", {}, False, 0, lambda _r: None)
 
-    assert adapter.deleted == [("chat", "note-successor")]
+    assert adapter.deleted == []
     assert store.get_restart_note(entry.session_key)[3] == "note-successor"
 
 
@@ -904,6 +904,105 @@ async def test_ledger_redelivery_reconciles_note_left_by_failed_resumed_delete(t
     assert adapter.deleted == [(source.chat_id, "note-ledger"), (source.chat_id, "note-ledger")]
     assert store.get_restart_note(entry.session_key) is None
     assert len(adapter.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_completion_removes_s2_fallback_candidate(tmp_path, monkeypatch):
+    """A turn that finishes during the graceful drain must not receive a fallback note."""
+    from gateway.run import GatewayRunner
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    runner, _ = make_restart_runner()
+    source = _source("drain-complete")
+    store = _store(tmp_path)
+    entry = store.get_or_create_session(source)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner._s2_note_session_keys = {entry.session_key}
+    runner._running_agents = {}
+    runner._active_api_run_count = lambda: 0
+    runner._running_agent_count = lambda: 0
+    runner._update_runtime_status = lambda *_args: None
+    runner._interrupt_running_agents = Mock()
+    runner._notify_active_sessions_of_shutdown = AsyncMock()
+    runner._send_interrupted_turn_notes = AsyncMock()
+    runner._notify_interrupted_cron_jobs = AsyncMock()
+    monkeypatch.setattr(GatewayRunner, "_mark_running_sessions_resume_pending", staticmethod(
+        lambda _self, _prefix: asyncio.sleep(0, result=[])
+    ))
+    monkeypatch.setattr(GatewayRunner, "_post_interrupt_grace_timeout", staticmethod(lambda _self: 0.0))
+    monkeypatch.setattr(GatewayRunner, "_stop_kill_tool_subprocesses_off_loop", staticmethod(
+        lambda _phase: asyncio.sleep(0, result=[])
+    ))
+
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=0.0)
+    await runner._stop_interrupt_remaining_work(ctx)
+
+    runner._send_interrupted_turn_notes.assert_awaited_once_with([])
+    runner._notify_active_sessions_of_shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_detached_startup_note_deletes_itself_after_answer(tmp_path):
+    """A late startup note completion cannot become visible after its resumed answer."""
+    store = _store(tmp_path)
+    source = _source("late-startup-note")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-late-startup", human=True)
+    adapter = NoteAdapter()
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def delayed_send(chat_id, content, reply_to=None, metadata=None):
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        adapter.sent.append((chat_id, content, metadata))
+        return SendResult(success=True, message_id=f"late-{len(adapter.sent)}")
+
+    adapter.send = delayed_send
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None)
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+    adapter.gateway_runner = runner
+    note_task = None
+
+    async def wait_or_detach(task, _timeout):
+        nonlocal note_task
+        note_task = task
+        await entered.wait()
+        task.cancel()
+        await cancelled.wait()
+        return False
+
+    runner._wait_or_detach = wait_or_detach
+    assert await runner._send_interrupted_turn_notes(
+        [entry.session_key], reclaim_pending=True,
+    ) == 0
+
+    event = MessageEvent(text="continue", message_type=MessageType.TEXT, source=source, internal=False)
+    await adapter._reconcile_restart_note_after_delivery(event, entry.session_key)
+    release.set()
+    try:
+        await note_task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(adapter.sent) == 1
+    assert adapter.deleted == [(source.chat_id, "late-1")]
+    note = store.get_restart_note(entry.session_key)
+    assert note is None or note[3] is None
 
 
 @pytest.mark.asyncio
