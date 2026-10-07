@@ -854,7 +854,8 @@ def _invoke_agent(
             loop_candidate = loop_hold["text"] + delta
             # Judge against everything already released so an open fence keeps it as content.
             if ends_with_partial_loop_complete_marker(loop_hold["seen"] + loop_candidate):
-                safe, partial = split_trailing_loop_complete_marker(loop_candidate)
+                safe, partial = split_trailing_loop_complete_marker(
+                    loop_candidate, context=loop_hold["seen"])
                 loop_hold["text"] = partial
                 if not safe:
                     return

@@ -335,7 +335,7 @@ class CLIStreamMixin:
         held = getattr(self, "_loop_complete_hold", "")
         candidate = held + text
         if ends_with_partial_loop_complete_marker(seen + candidate):
-            safe, partial = split_trailing_loop_complete_marker(candidate)
+            safe, partial = split_trailing_loop_complete_marker(candidate, context=seen)
             if safe:
                 self._emit_unheld(safe)
             self._loop_complete_hold = partial

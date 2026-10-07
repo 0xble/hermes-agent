@@ -192,15 +192,22 @@ def strip_trailing_loop_complete_marker(text: Any, *, respect_fences: bool = Tru
     )
 
 
-def split_trailing_loop_complete_marker(text: Any) -> tuple[Any, str]:
+def split_trailing_loop_complete_marker(text: Any, *, context: str = "") -> tuple[Any, str]:
     """Split safe prefix from a trailing top-level marker candidate for streaming.
 
     The held tail is the trailing candidate line plus every complete top-level marker line
     (and blank line) directly before it, so a repeated marker never flashes on screen.
+    ``context`` is the text already released this segment: fence state is judged over
+    ``context + text`` (a fence opened in an earlier chunk may close in this one), but only
+    ``text`` is ever split, since ``context`` is already on screen.
     """
-    if not isinstance(text, str) or not ends_with_partial_loop_complete_marker(text):
+    if not isinstance(text, str):
         return text, ""
-    lines = text.splitlines(keepends=True)
+    context = context if isinstance(context, str) else ""
+    full = context + text
+    if not ends_with_partial_loop_complete_marker(full):
+        return text, ""
+    lines = full.splitlines(keepends=True)
     end = len(lines)
     while end and not lines[end - 1].strip():
         end -= 1
@@ -216,7 +223,8 @@ def split_trailing_loop_complete_marker(text: Any) -> tuple[Any, str]:
             break
         probe -= 1
         start = probe
-    return "".join(lines[:start]), "".join(lines[start:])
+    cut = max(len("".join(lines[:start])) - len(context), 0)
+    return text[:cut], text[cut:]
 
 
 def ends_with_partial_loop_complete_marker(text: Any) -> bool:
