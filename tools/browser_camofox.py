@@ -18,7 +18,7 @@ import os
 import re
 import threading
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import requests
@@ -78,11 +78,14 @@ def classify_camofox_http_error(exc: BaseException, *, endpoint: str = "mandator
 def _clear_stale_tab(session: Dict[str, Any], exc: BaseException, *, endpoint: str = "mandatory") -> bool:
     if classify_camofox_http_error(exc, endpoint=endpoint) != "stale":
         return False
+    if session.get("tab_id"):  # the server's tab list may still show it
+        with _sessions_lock:
+            _stale_tab_ids.setdefault(session["user_id"], set()).add(session["tab_id"])
     session["tab_id"] = None
     from agent.redact import clear_vault_date_components
     clear_vault_date_components(session.get("task_id", "default"))
-    # A managed account may still list the destroyed tab; only explicit navigation creates anew.
-    session["adopt_existing_tab"] = False
+    # Page actions never continue on a replacement tab; only explicit navigation rebinds.
+    session["stale"] = True
     return True
 
 
@@ -292,6 +295,8 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str,
 
 
 # ---- Session management ----
+# Camofox's tab group for a shared identity's visible pages (``browser_handoff``).
+SHARED_IDENTITY_GROUP = "__shared_identity__"
 _sessions: Dict[str, Dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
 _sessions_lock = threading.Lock()
 # A managed tab containing a filled date must never be adopted under another task.
@@ -299,6 +304,9 @@ _protected_tab_ids: set[str] = set()
 # tab_id -> the task whose live protection covers it; only that task may keep the binding.
 # In memory only: after a restart no task holds protection, so every quarantined tab is refused.
 _protected_tab_owners: Dict[str, str] = {}
+# userId -> tabs the server reported destroyed; adoption never rebinds one. Pruned to the
+# server's current listing on each adoption, so it stays bounded.
+_stale_tab_ids: Dict[str, set[str]] = {}
 
 
 def _protected_tabs_path():
@@ -369,9 +377,31 @@ def _release_protected_tab_binding(task_id: str, session: Dict[str, Any]) -> Non
 
 
 
-def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
-    """Rehydrate tab_id from an already-open managed tab: gateway restarts empty the
-    in-memory cache while Camofox still holds the integration-owned tab."""
+def _url_origin(url: Any) -> str:
+    """Normalized ``scheme://host[:port]`` for an http(s) URL, else ``""``."""
+    try:
+        parsed = urlsplit(url) if isinstance(url, str) else None
+        if not parsed or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        port = parsed.port
+    except ValueError:
+        return ""
+    default_port = {"http": 80, "https": 443}[parsed.scheme]
+    return f"{parsed.scheme}://{parsed.hostname.lower()}" + (f":{port}" if port and port != default_port else "")
+
+
+def _adopt_existing_tab(session: Dict[str, Any], target_url: Optional[str] = None) -> Dict[str, Any]:
+    """Bind an unbound managed session to a safe existing tab of its userId instead of opening one.
+
+    Gateway restarts and session changes empty Hermes's bindings while Camofox keeps the tabs,
+    including the one a user logged into after ``browser_handoff``. Eligible tabs are not
+    protected or quarantined, not reported stale, and not bound to another task in this process
+    (``GET /tabs`` exposes no lock state, so a binding held by a live task is the busy signal).
+    Preference: ``target_url``'s origin, then the shared identity group, then this task's own
+    tab group; newest first (the server lists tabs oldest-first). Any other tab belongs to
+    another task and is left alone, except for an external identity that opted into adoption
+    (``adopt_existing_tab``), which may take any eligible tab. Selection and binding happen under the sessions lock so two
+    tasks cannot adopt the same tab."""
     if session.get("tab_id") or not session.get("adopt_existing_tab") or not get_camofox_url():
         return session
     try:
@@ -380,15 +410,34 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
         logger.debug("Camofox tab adoption failed for %s: %s", session.get("user_id"), exc)
         return session
     quarantined = _protected_tabs_on_disk()
-    if quarantined is None:
+    if quarantined is None or not isinstance(tabs, list):
         return session  # fail closed if persistent quarantine cannot be read
-    dict_tabs = [tab for tab in tabs if isinstance(tab, dict)] if isinstance(tabs, list) else []
-    dict_tabs = [tab for tab in dict_tabs if tab.get("tabId") not in (_protected_tab_ids | quarantined)]
-    candidates = [tab for tab in dict_tabs if tab.get("listItemId") == session.get("session_key")] or dict_tabs
-    tab_id = candidates[-1].get("tabId") if candidates else None
-    if isinstance(tab_id, str) and tab_id:
-        session["tab_id"] = tab_id
-        logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
+    target_origin = _url_origin(target_url)
+    task_id = session.get("task_id", "default")
+    with _sessions_lock:
+        if session.get("tab_id") or _sessions.get(task_id, session) is not session:
+            return session  # bound meanwhile, or replaced (account switch / release)
+        listed = {tab.get("tabId") for tab in tabs if isinstance(tab, dict)}
+        stale = _stale_tab_ids.get(session["user_id"])
+        if stale:
+            stale &= listed
+        refused = _protected_tab_ids | quarantined | (stale or set()) | {
+            other["tab_id"] for key, other in _sessions.items() if key != task_id and other.get("tab_id")}
+        ranked = []
+        for index, tab in enumerate(tabs):
+            tab_id = tab.get("tabId") if isinstance(tab, dict) else None
+            if not isinstance(tab_id, str) or not tab_id or tab_id in refused:
+                continue
+            rank = (bool(target_origin) and _url_origin(tab.get("url")) == target_origin,
+                    tab.get("listItemId") == SHARED_IDENTITY_GROUP,
+                    tab.get("listItemId") == session.get("session_key"),
+                    bool(session.get("adopt_any")))
+            if any(rank):
+                ranked.append((rank, index, tab_id))
+        if ranked:
+            session["tab_id"] = max(ranked)[2]
+            session.pop("stale", None)
+            logger.debug("Adopted existing Camofox tab %s for %s", session["tab_id"], session.get("user_id"))
     return session
 
 
@@ -423,41 +472,54 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
             session = _sessions[task_id]
             bound_account = session.get("account")
             if account is not None and bound_account != account:
-                if session.get("tab_id") or bound_account is not None:
+                # The account is fixed within a turn. A binding carried over from an earlier turn,
+                # or an empty one from a read-only preflight, yields to the requested account.
+                if not session.get("carried") and (session.get("tab_id") or bound_account is not None):
                     raise ValueError(
                         f"Camofox account is already bound to {bound_account or 'the default identity'} "
                         f"for this task; cannot switch to {account!r}. Start a new task instead."
                     )
-                # A read-only preflight may have created an empty local session. Bind it now.
-                _sessions.pop(task_id, None)
+                if session.get("tab_id"):
+                    _drop_session_locked(task_id)  # quarantines the old tab if it holds protected data
+                else:
+                    _sessions.pop(task_id, None)
             else:
+                session.pop("carried", None)
+                session.pop("carried_from", None)  # in use now: its own agent releases it
                 _release_protected_tab_binding(task_id, session)
-                return _adopt_existing_tab(session)
+                return session
         camofox_cfg = _get_camofox_config()
         identity = get_camofox_account_identity(account, task_id) if account is not None else None
+        managed, adopt, adopt_any = True, True, False  # Hermes-derived identities own their tabs
         if identity is None:
             identity = _camofox_identity_override(task_id, camofox_cfg)
+            if identity is not None:  # another app's userId: adopting its tabs stays opt-in
+                adopt = adopt_any = _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
         if identity is None and _managed_persistence_enabled(camofox_cfg):
             identity = get_camofox_identity(task_id)
         if identity is None:
             identity = {"user_id": f"hermes_{uuid.uuid4().hex[:10]}", "session_key": f"task_{task_id[:16]}"}
             managed, adopt = False, False
-        else:
-            managed, adopt = True, _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
         session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
-                   "task_id": task_id or "default", "managed": managed, "adopt_existing_tab": adopt, "account": account}
+                   "task_id": task_id or "default", "managed": managed, "adopt_existing_tab": adopt,
+                   "adopt_any": adopt_any, "account": account}
         _sessions[task_id] = session
-        return _adopt_existing_tab(session)
+        return session
 
 
-def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Optional[str] = None) -> Dict[str, Any]:
-    """Ensure a tab exists for the session, creating one if needed.
+def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Optional[str] = None,
+                *, target_url: Optional[str] = None) -> Dict[str, Any]:
+    """Ensure a tab exists for the session: adopt a safe existing tab of a managed identity
+    (preferring ``target_url``'s origin), else create one.
 
     Without ``url`` the tab is created blank: Camofox only accepts http(s) URLs on
     ``POST /tabs`` (it rejects ``about:blank`` with 400 after registering the tab) and skips
     navigation when the field is absent."""
     session = _get_session(task_id, account) if account is not None else _get_session(task_id)
     if not session["tab_id"]:
+        _adopt_existing_tab(session, target_url or url)
+    if not session["tab_id"]:
+        session.pop("stale", None)
         body = {"userId": session["user_id"], "listItemId": session["session_key"]}
         if url:
             body["url"] = url
@@ -466,30 +528,73 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Opti
     return session
 
 
-def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Remove session; quarantine a protected managed tab before dropping its scope."""
+def _drop_session_locked(key: str) -> Optional[Dict[str, Any]]:
+    """Remove a session (caller holds the lock); quarantine a protected managed tab before
+    dropping its scope."""
     from agent.redact import clear_vault_date_components, has_vault_date_components
-    key = task_id or "default"
-    with _sessions_lock:
-        session = _sessions.pop(key, None)
-        if session and session.get("tab_id") and has_vault_date_components(key):
-            _quarantine_protected_tab(session["tab_id"])
-        for tab_id in [t for t, owner in _protected_tab_owners.items() if owner == key]:
-            del _protected_tab_owners[tab_id]
+    session = _sessions.pop(key, None)
+    if session and session.get("tab_id") and has_vault_date_components(key):
+        _quarantine_protected_tab(session["tab_id"])
+    for tab_id in [t for t, owner in _protected_tab_owners.items() if owner == key]:
+        del _protected_tab_owners[tab_id]
     clear_vault_date_components(key)
     return session
 
 
+def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Remove session; quarantine a protected managed tab before dropping its scope."""
+    with _sessions_lock:
+        return _drop_session_locked(task_id or "default")
+
+
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
-    """Drop only the local tracking entry (``True``) for managed profiles, which must
-    survive across agent tasks; ``False`` for ephemeral sessions so the caller falls back
-    to :func:`camofox_close`."""
+    """End-of-turn cleanup. Managed profiles (``True``) keep the task's tab binding, account and
+    vault protection, so the next turn continues in the same tab (for example the one a user
+    logged into after ``browser_handoff``); the binding is marked carried so the next turn may
+    still choose another account. Agent close releases it (:func:`release_task_bindings`).
+    ``False`` for ephemeral sessions so the caller falls back to :func:`camofox_close`."""
     camofox_cfg = _get_camofox_config()
     if _managed_persistence_enabled(camofox_cfg) or _camofox_identity_override(task_id, camofox_cfg):
-        _drop_session(task_id)
+        key = task_id or "default"
+        with _sessions_lock:
+            session = _sessions.get(key)
+            if session is not None and session.get("superseded"):
+                _drop_session_locked(key)
+            elif session is not None:
+                session["carried"] = True
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
     return False
+
+
+def carry_task_binding(old_task_id: str, new_task_id: str) -> None:
+    """Hand a managed binding to a continuation task id. Compression rotates the session id that
+    gateway and CLI turns use as their task id; without this the next turn would find the tab
+    held by the old id. The old entry serves the rest of the current turn, then its soft cleanup
+    drops it. Vault protection stays with the old id, so a protected tab is quarantined then and
+    detached from the new id."""
+    if not old_task_id or not new_task_id or old_task_id == new_task_id:
+        return
+    with _sessions_lock:
+        old = _sessions.get(old_task_id)
+        if old is None or not old.get("managed") or new_task_id in _sessions:
+            return
+        old["superseded"] = True
+        _sessions[new_task_id] = {**old, "task_id": new_task_id, "carried": True, "superseded": False,
+                                  "carried_from": old_task_id}
+
+
+def release_task_bindings(task_ids: Iterable[str]) -> None:
+    """Agent close: forget these tasks' local tab bindings (the persistent profile and its tabs
+    stay on the server, and another task may adopt them)."""
+    with _sessions_lock:
+        keys = {key or "default" for key in task_ids}
+        # Include continuation ids carried from these tasks that no turn has used yet.
+        while carried := {key for key, session in _sessions.items()
+                          if key not in keys and session.get("carried_from") in keys}:
+            keys |= carried
+        for key in keys:
+            _drop_session_locked(key)
 
 
 # ---- HTTP helpers ----
@@ -578,7 +683,7 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[st
     (a create-with-URL followed by navigate would load one-time links twice)."""
     session = _get_session(task_id, account) if account is not None else _get_session(task_id)
     if not session["tab_id"]:
-        session = _ensure_tab(task_id, None, account)
+        session = _ensure_tab(task_id, None, account, target_url=browser_url)
     for attempt in range(2):
         try:
             data = _post(_tab_path(session, "navigate"),
@@ -589,7 +694,7 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[st
                 raise
             if attempt:
                 raise RuntimeError(_STALE_TAB_ERROR) from None
-            session = _ensure_tab(task_id, None, account)
+            session = _ensure_tab(task_id, None, account, target_url=browser_url)
     raise RuntimeError(_STALE_TAB_ERROR)  # unreachable
 
 
@@ -725,6 +830,8 @@ def _camofox_private_page_block(session: Dict[str, Any], task_id: Optional[str],
 def _require_tab(task_id: Optional[str], action: Optional[str] = None) -> tuple[Dict[str, Any], Optional[str]]:
     """Return ``(session, error_payload)``: error when no tab exists or, if ``action`` given, the page is private."""
     session = _get_session(task_id)
+    if not session["tab_id"] and not session.get("stale"):
+        _adopt_existing_tab(session)
     if not session["tab_id"]:
         return session, tool_error(_NO_SESSION_ERROR, success=False)
     return session, (_camofox_private_page_block(session, task_id, action) if action is not None else None)
