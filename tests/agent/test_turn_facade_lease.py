@@ -146,78 +146,78 @@ def test_refresh_tick_sqlite_lock_keeps_the_turn():
     assert lease.stop.is_set() is False
 
 
-def test_repeated_lock_misses_do_not_outlive_the_lease(monkeypatch):
-    now = [1000.0]
-    monkeypatch.setattr(time, "time", lambda: now[0])
-    db = _Db()
+class _MovingClock:
+    """Wall clock that runs at real speed from a chosen instant, so the store's expiry stamps and
+    the lease's deadline arithmetic see the same time while real lock waits elapse."""
 
-    def locked(session_id, holder, **kwargs):
-        raise sqlite3.OperationalError("database is locked")
+    def __init__(self, at):
+        self._at, self._anchor = at, time.monotonic()
 
-    db.refresh_session_turn_lease = locked
-    lease, calls = _active_lease(db)
-    result = None
-    for elapsed in (60, 120, 180, 240, 300):
-        now[0] = 1000.0 + elapsed
-        result = lease.refresh_tick()
-        if result is False:
-            break
-    assert result is False
-    assert calls == [
+    def time(self):
+        return self._at + (time.monotonic() - self._anchor)
+
+    def set(self, at):
+        self._at, self._anchor = at, time.monotonic()
+
+
+def test_lock_tolerance_never_outlives_the_committed_row_expiry(tmp_path, monkeypatch):
+    """Real SessionDB + a real second-connection write lock. The local deadline never runs past the
+    row's committed expiry (a renewal that waited for the lock), and a renewal blocked near expiry
+    gives up and stops the turn BEFORE the row becomes reclaimable, never after a successor could
+    take it. Control: the lock clearing lets the delayed renewal succeed with no interrupt."""
+    import hermes_state
+    import hermes_state_compression
+    from agent import turn_facade_lease
+
+    clock = _MovingClock(1000.0)
+    fake_time = SimpleNamespace(time=clock.time, monotonic=time.monotonic, sleep=time.sleep)
+    monkeypatch.setattr(turn_facade_lease, "time", fake_time)
+    monkeypatch.setattr(hermes_state_compression, "time", fake_time)
+
+    path = tmp_path / "state.db"
+    db = hermes_state.SessionDB(path)
+    db.create_session("s1", source="test")
+    assert db.try_acquire_session_turn_lease("s1", "h")
+    events = []
+    agent = SimpleNamespace(session_id="s1", interrupt=lambda msg, **kw: events.append((clock.time(), msg)))
+    lease = DurableTurnLease(agent, db, "s1", "h", expires_at=db.session_turn_lease_expires_at("s1", "h"))
+    lease.turn_active = True
+
+    def row_expiry():
+        return db.session_turn_lease_expires_at("s1", "h")
+
+    def write_lock():
+        conn = sqlite3.connect(path, timeout=0)
+        conn.execute("BEGIN IMMEDIATE")
+        return conn
+
+    # A renewal that waits on the lock still succeeds, and the deadline it adopts is not later than
+    # the expiry the store committed (stamped before the wait).
+    clock.set(1060.0)
+    blocker = write_lock()
+    worker = threading.Thread(target=lease.refresh_tick)
+    worker.start()
+    time.sleep(0.5)
+    blocker.rollback()
+    blocker.close()
+    worker.join(10)
+    assert events == []
+    assert lease._authority_deadline <= row_expiry()
+
+    # Near expiry with the lock held throughout: the renewal must give up and interrupt while the
+    # row is still unexpired, so no successor can reclaim it under a running turn.
+    clock.set(lease._authority_deadline - 3.0)
+    blocker = write_lock()
+    try:
+        assert lease.refresh_tick() is False
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert [msg for _, msg in events] == [
         "Session turn lease could not be refreshed; stopping to protect the transcript."
     ]
-    assert now[0] <= 1000.0 + LEASE_TTL_SECONDS
-
-
-def test_one_lock_then_renewal_opens_a_fresh_window(monkeypatch):
-    now = [1000.0]
-    monkeypatch.setattr(time, "time", lambda: now[0])
-    db = _Db()
-    locked = {"on": True}
-
-    def refresh(session_id, holder, **kwargs):
-        if locked["on"]:
-            raise sqlite3.OperationalError("database is locked")
-        return True
-
-    db.refresh_session_turn_lease = refresh
-    lease, calls = _active_lease(db)
-    now[0] = 1060.0
-    assert lease.refresh_tick() is None and calls == []
-    locked["on"] = False
-    now[0] = 1120.0
-    assert lease.refresh_tick() is None and calls == []
-    locked["on"] = True
-    # Original admission deadline was 1300. The renewal moved it to 1420.
-    now[0] = 1300.0
-    assert lease.refresh_tick() is None and calls == []
-    now[0] = 1360.0
-    assert lease.refresh_tick() is False
-    assert calls
-
-
-def test_refresh_tick_real_loss_still_interrupts():
-    db = _Db()
-    db.refresh_session_turn_lease = lambda session_id, holder, **kwargs: False
-    lease, calls = _active_lease(db)
-
-    assert lease.refresh_tick() is False
-    assert calls == ["Session turn lease lost; stopping to protect the transcript."]
-
-
-def test_refresh_tick_non_lock_error_still_interrupts():
-    db = _Db()
-
-    def broken(session_id, holder, **kwargs):
-        raise sqlite3.OperationalError("disk I/O error")
-
-    db.refresh_session_turn_lease = broken
-    lease, calls = _active_lease(db)
-
-    assert lease.refresh_tick() is False
-    assert calls == [
-        "Session turn lease could not be refreshed; stopping to protect the transcript."
-    ]
+    assert events[0][0] < row_expiry()
+    db.close()
 
 
 def test_interrupt_turn_only_while_active():
