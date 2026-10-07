@@ -980,3 +980,46 @@ def test_hidden_rows_count_only_with_a_runtime_delivery_identity(hermes_home):
                                   {"delegation_id": "deleg_9", "presentation_suppressed": True})
     real = goals.resolve_cited_evidence(sid, "Tests: `77 passed in 1.00s`.", since=mgr.state.created_at)
     assert not real["unresolved"] and real["cited"][0]["tool"].startswith("delegation result")
+
+
+def test_negated_replacement_instruction_cannot_authorize_new_goal(hermes_home):
+    sid = "replace-negated-action"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship original")
+    db.append_message(sid, "user", "Do not change the goal to Ship the new thing.")
+    result = mgr.replace(
+        reason="agent inferred a replacement", goal="Ship the new thing",
+        user_quote="change the goal to Ship the new thing",
+    )
+    assert result["error_code"] == "replacement_authority_required"
+    assert mgr.state.goal == "Ship original"
+    assert not mgr.state.revisions
+
+
+def test_replacement_action_and_goal_must_share_an_unnegated_clause(hermes_home):
+    sid = "replace-clause-boundary"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship original")
+    db.append_message(sid, "user", "Do not change the goal. The new goal is Ship the new thing.")
+    result = mgr.replace(
+        reason="agent inferred a replacement", goal="Ship the new thing",
+        user_quote="change the goal",
+    )
+    assert result["error_code"] == "replacement_authority_required"
+    assert mgr.state.goal == "Ship original"
+
+
+def test_explicit_replacement_clause_still_authorizes_new_goal(hermes_home):
+    sid = "replace-clause-explicit"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship original")
+    db.append_message(sid, "user", "Do not change the old plan. Replace the goal with Ship the new thing, and keep the turn budget.")
+    result = mgr.replace(
+        reason="the user requested the new goal", goal="Ship the new thing",
+        user_quote="Replace the goal with Ship the new thing, and keep the turn budget",
+    )
+    assert result["ok"]
+    assert mgr.state.goal == "Ship the new thing"

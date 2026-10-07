@@ -1854,6 +1854,7 @@ _REPLACEMENT_BUDGET_REMOVE_RE = re.compile(
     r"\b(?:remove|clear|drop|delete|disable|reset)\b|\bturn\s+budget\b)",
     re.IGNORECASE | re.DOTALL,
 )
+_REPLACEMENT_NEGATION_RE = re.compile(r"\b(?:do\s+not|don't|dont|never|not)\b", re.IGNORECASE)
 _AUTHORITY_PRESERVE_RE = re.compile(
     r"\b(?:do\s+not|don't|dont|never|not|keep|preserve|retain|leave|without\s+removing|"
     r"without\s+dropping|without\s+clearing)\b",
@@ -1871,7 +1872,38 @@ def _normalize_authority_text(text: Any) -> str:
 
 def _authority_units(text: str) -> List[str]:
     """Return sentence/clause-sized units so cues cannot authorize a neighboring clause."""
-    return [part for part in re.split(r"(?:[.!?;]|\n)+", text or "") if part.strip()]
+    return [part for part in re.split(r"[.!?;]+", text or "") if part.strip()]
+
+
+def _replacement_goal_is_negated(unit: str, goal: str) -> bool:
+    unit_norm = _normalize_authority_text(unit)
+    target = _normalize_authority_text(goal)
+    target_at = unit_norm.find(target)
+    if target_at < 0:
+        return False
+    for cue in _AUTHORITY_PRESERVE_RE.finditer(unit_norm):
+        if cue.start() >= target_at and cue.end() <= target_at + len(target):
+            continue
+        if cue.end() <= target_at:
+            return True
+    return False
+
+
+def _replacement_action_is_authorized(source: str, goal: str) -> bool:
+    """Require an un-negated replacement instruction in the same clause as the new goal."""
+    for unit in _authority_units(source):
+        action = _REPLACEMENT_ACTION_RE.search(unit)
+        if not action or not _recorded_text_contains(goal, unit):
+            continue
+        prefix = unit[:action.start()]
+        if _REPLACEMENT_NEGATION_RE.search(prefix):
+            continue
+        if re.search(r"\b(?:keep|preserve|retain|leave)\b.{0,24}\b(?:goal|objective)\b", prefix,
+                     re.IGNORECASE | re.DOTALL):
+            continue
+        if not _replacement_goal_is_negated(unit, goal):
+            return True
+    return False
 
 
 def _explicit_restriction_removals(source: str) -> Tuple[bool, bool]:
@@ -2222,10 +2254,11 @@ class GoalManager:
         if not _recorded_text_contains(goal, source):
             return "", "", None, {"error_code": "replacement_authority_required",
                                    "error": "quote the user's requested goal text; the new objective must appear in that recorded user message"}
-        if _contains_negated_text(source, quote) or _contains_negated_text(source, goal):
+        if _contains_negated_text(source, quote) or any(
+                _replacement_goal_is_negated(unit, goal) for unit in _authority_units(source)):
             return "", "", None, {"error_code": "replacement_authority_required",
                                    "error": "the recorded user instruction is negated or preserves the existing goal; replacement rejected"}
-        if not _REPLACEMENT_ACTION_RE.search(source):
+        if not _replacement_action_is_authorized(source, goal):
             return "", "", None, {"error_code": "replacement_authority_required",
                                    "error": "the latest user message must plainly instruct replacing, changing, or re-scoping the goal"}
         return quote, source, row.get("id"), None
