@@ -576,11 +576,17 @@ def launchd_plist_is_current(release_target: Path | None = None) -> bool:
 
 
 def _spawn_deferred_launchd_reload(
-    *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
+    *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int,
+    generation_id: str | None = None,
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
     helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
-    until ``launchctl list`` shows a positive PID or the drain budget elapses."""
+    until ``launchctl list`` shows a positive PID or the drain budget elapses.
+
+    The label is briefly unloaded and owned by the helper alone. A durable reload-pending record
+    fences generation cleanup and the guardian off it until the helper finishes or the record expires."""
+    from hermes_cli.gateway_launchd_records import (
+        clear_reload_pending, reload_pending_path, write_reload_pending)
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -592,7 +598,13 @@ def _spawn_deferred_launchd_reload(
         from hermes_cli.gateway_launchd_generation import refresh_generation_scope
         refresh_generation_scope(plist_path)
     _reload_budget = int(_launchd_reload_budget())
+    home = _gw().get_hermes_home()
+    # The helper's two bounded waits (old-PID exit, then bootstrap retries) plus its fixed sleeps.
+    nonce = write_reload_pending(home, label=label, generation_id=generation_id,
+                                 seconds=2 * _reload_budget + 15)
     q_target, q_label, q_log = shlex.quote(target), shlex.quote(label), shlex.quote(str(reload_log_path))
+    q_pending = shlex.quote(str(reload_pending_path(home)))
+    clear_fence = f"grep -q {nonce} {q_pending} 2>/dev/null && rm -f {q_pending}; "
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
     # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
@@ -609,13 +621,20 @@ def _spawn_deferred_launchd_reload(
         f"    break;   fi;   sleep 1; done; "
         # Let launchd finish unregistering the label after the process exits.
         f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
-        f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
+        # launchctl's own error line lands in the log just before ours.
+        f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>> {q_log}; _rc=$?; "
+        f"  if [ $_rc -ne 0 ]; then "
+        f"    echo \"[{stamp}] bootstrap of {q_target} exited $_rc\" >> {q_log}; fi; "
         f"  if {listed}; then break; fi; "
         f"  echo \"[{stamp}] bootstrap not yet registered for {q_target} — retrying\" >> {q_log}; "
         f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
-        f"if ! {listed}; then "
+        f"if {listed}; then "
+        f"  echo \"[{stamp}] Launchd reload helper succeeded: {q_target} is running\" >> {q_log}; "
+        f"else "
         f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
         f"fi; "
+        # Either outcome ends this reload's ownership: a failure is now the guardian's to repair.
+        f"{clear_fence}"
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
         f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
     )
@@ -641,6 +660,7 @@ def _spawn_deferred_launchd_reload(
         _gw()._append_launchd_reload_log(
             f"FAILED to spawn launchd reload helper for {target}: {e} — falling back to in-process bootout/bootstrap"
         )
+        clear_reload_pending(home, nonce)
         return False
     return True
 
@@ -801,8 +821,8 @@ def launchd_uninstall():
     subprocess.run(
         ["launchctl", "bootout", f"{_launchd_domain()}/{get_launchd_label()}"],
         check=False, timeout=90, **_gw()._CAPTURE_TEXT)
-    if plist_path.exists():
-        plist_path.unlink()
+    from hermes_cli.gateway_launchd_records import remove_definition
+    if remove_definition(plist_path, reason="explicit gateway uninstall", missing_ok=True):
         print(f"✓ Removed {plist_path}")
     print("✓ Service uninstalled")
 

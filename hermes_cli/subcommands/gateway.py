@@ -93,11 +93,12 @@ def build_gateway_parser(
     _add_compat_platform_flag(gateway_restart)
 
     guardian = gateway_subparsers.add_parser(
-        "guardian", help="Manage the opt-in macOS guardian (install, uninstall, status)",
+        "guardian", help="Manage the opt-in macOS guardian (install, uninstall, status, test-alert)",
         description="Manage the independent launchd guardian. Set gateway.guardian.enabled: true "
                     "for install; status reports enabled, installed and stopped intent. "
-                    "Inspect logs/guardian for bounded repair receipts and alerts.")
-    guardian.add_argument("guardian_command", choices=("install", "uninstall", "status"))
+                    "Inspect logs/guardian for bounded repair receipts and alerts. test-alert writes "
+                    "one drill alert through the out-of-band Telegram path (deduplicated hourly).")
+    guardian.add_argument("guardian_command", choices=("install", "uninstall", "status", "test-alert"))
 
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     _flag(gateway_status, "--deep", help="Deep status check")

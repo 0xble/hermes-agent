@@ -330,13 +330,19 @@ def defer_forward_launchd_restart(config) -> bool:
         return False
     from hermes_cli.gateway_launchd import _spawn_deferred_launchd_reload
     from hermes_cli.gateway import get_launchd_plist_path, get_launchd_label, _launchd_domain
-    label = GenerationCoordinator(Path(get_hermes_home())).service_label()
+    from gateway.status import _get_process_start_time
+    coordinator = GenerationCoordinator(Path(get_hermes_home()))
+    label = coordinator.service_label()
+    fingerprint = f'{os.getpid()}:{_get_process_start_time(os.getpid())}'
+    generation_id = next((row['id'] for row in coordinator.generations()
+                          if row['start_fingerprint'] == fingerprint), None)
     plist_path = get_launchd_plist_path()
     if label != get_launchd_label():
         plist_path = plist_path.with_name(f'{label}.plist')
     domain = _launchd_domain()
     if not _spawn_deferred_launchd_reload(domain=domain, label=label,
-            target=f'{domain}/{label}', plist_path=plist_path, gateway_pid=os.getpid()):
+            target=f'{domain}/{label}', plist_path=plist_path, gateway_pid=os.getpid(),
+            generation_id=generation_id):
         raise RuntimeError('forward-only planned restart could not submit launchd reload')
     return True
 

@@ -23,6 +23,7 @@ from gateway import deadline as gateway_deadline
 from gateway.deadline import begin_immediate, connect_sqlite, deadline_scope, with_deadline_scope
 from gateway.run_generation import handover_to_generation, _generation_request, HANDOVER_ABORT_RESERVE
 from hermes_cli.gateway_launchd_generation import generation_launchd_label, render_generation_launchd_plist, bootstrap_generation_plist
+from hermes_cli.gateway_launchd_records import reload_pending, remove_definition
 from hermes_cli.immutable_releases import ReleasePaths, read_pointer, _atomic_bytes, _atomic_json, _sync_dir, _release_is_ready, activate_release
 
 STARTUP_SECONDS = 45
@@ -351,7 +352,8 @@ class GenerationSupervisor:
             _sleep(min(.05, _remaining(deadline, .05)))
         if path.exists():
             self._definition(row['label'])
-            path.unlink()
+            remove_definition(path, home=self.home, generation_id=row['id'],
+                              reason=f"booted out exited generation (verdict={row['verdict']})")
             _sync_dir(self.directory)
         return True
 
@@ -580,7 +582,8 @@ def _refuse(db, row, supervisor, evidence, *, bootstrapped=True, bootstrap_scope
         path = supervisor.directory / f"{row['label']}.plist"
         if installed and path.exists():
             supervisor._definition(row['label'])
-            path.unlink()
+            remove_definition(path, home=supervisor.home, generation_id=row['id'],
+                              reason='unused definition of a refused standby')
             _sync_dir(supervisor.directory)
 
 
@@ -603,19 +606,28 @@ def _discard_reservation(db, info, supervisor, evidence, *, never_claimed_only=F
 
 
 def cleanup_exited(home, *, supervisor=None):
+    """Retire exited generations' launch agents, never the service's own label.
+
+    A clean planned restart leaves no live row on the service label until the reloaded process
+    claims one. That gap is not retirement: the lease still names the label, and a pending reload
+    owns it. Only an explicit uninstall removes the service definition.
+    """
     supervisor = supervisor or GenerationSupervisor(home)
     db = GenerationCoordinator(home)
     lease = next((item for item in db.leases() if item['resource'] == 'active_generation'), None)
     holder = lease['generation_id'] if lease else None
     rows = db.generations()
-    live_labels = {row['label'] for row in rows if row['state'] != 'exited'}
+    kept = {row['label'] for row in rows if row['state'] != 'exited'}  # A cold start may reuse a label.
+    kept.add(db.service_label())
+    pending = reload_pending(home)
+    if pending is not None:
+        kept.add(pending['label'])
     for row in rows:
         if row['state'] == 'exited' and row['id'] != holder:
             if row['pid'] is None:
                 continue  # Unclaimed bootstrap cleanup belongs to its durable intent.
             path = supervisor.directory / f"{row['label']}.plist"
-            # A cold start may have reused a historical label. Address its live row.
-            if row['label'] in live_labels:
+            if row['label'] in kept:
                 continue
             if path.exists():
                 supervisor.boot_active(row, False)

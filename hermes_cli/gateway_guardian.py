@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
+from hermes_cli import gateway_guardian_alert
+from hermes_cli.gateway_launchd_records import reload_pending, remove_definition
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
 from hermes_cli.gateway_forward_update import STARTUP_SECONDS
 from gateway.deadline import deadline_scope, with_deadline_scope
@@ -90,24 +92,77 @@ def set_intent(home: Path, *, stopped: bool) -> None:
         path.unlink(missing_ok=True)
 
 
+ALERTING = frozenset({"alert", "capped"})
+# Reasons can carry free text (an exception message), so dedupe alone cannot bound the chat.
+MAX_ALERTS_PER_HOUR = 4
+
+
+def _observed_generations(home: Path) -> dict | None:
+    """The coordinator rows behind a decision, without heartbeats so an unchanged outage dedupes."""
+    if not (home / "gateway-coordinator.db").is_file():
+        return None
+    try:
+        from gateway.generation import GenerationCoordinator
+        coordinator = GenerationCoordinator(home)
+        rows = sorted(coordinator.generations(), key=lambda row: row["started_at"])[-3:]
+        lease = next((row for row in coordinator.leases() if row["resource"] == "active_generation"), None)
+    except Exception as exc:  # noqa: BLE001 - observation must not mask the receipt it annotates
+        return {"error": type(exc).__name__}
+    return {"lease": lease and {key: lease[key] for key in ("generation_id", "epoch", "state")},
+            "rows": [{key: row[key] for key in ("id", "label", "state", "pid", "verdict")} for row in rows]}
+
+
+def _comparable(payload: dict) -> dict:
+    return {key: value for key, value in payload.items() if key not in {"at", "notify", "notify_chat"}}
+
+
 def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
+    """Write one receipt. An alert or capped outcome also sends one out-of-band Telegram alert per
+    action, outcome and reason per hour, at most MAX_ALERTS_PER_HOUR in all. An identical receipt
+    inside the hour is reused, not duplicated."""
     directory = home / "logs" / "guardian"
     directory.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc)
     cutoff = now.timestamp() - 3600
     payload = {"at": now.isoformat(), "action": action, "outcome": outcome, **detail}
+    generations = _observed_generations(home)
+    if generations is not None:
+        payload.setdefault("generations", generations)
+    key = (action, outcome, payload.get("reason"))
+    duplicate, notified, sent = None, False, 0
     for prior in directory.glob("*.json"):
         try:
             if prior.stat().st_mtime < cutoff:
                 prior.unlink()
-            elif outcome in {"alert", "capped"}:
-                old = json.loads(prior.read_text(encoding="utf-8-sig"))
-                if {k: v for k, v in old.items() if k != "at"} == {k: v for k, v in payload.items() if k != "at"}:
-                    return prior
+                continue
+            if outcome not in ALERTING:
+                continue
+            old = json.loads(prior.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             continue
-    path = directory / f"{now.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
+        attempted = old.get("notify") not in (None, "hourly-cap", *gateway_guardian_alert.DEFERRED)
+        sent += attempted
+        if (old.get("action"), old.get("outcome"), old.get("reason")) == key and attempted:
+            notified = True
+        if _comparable(old) == _comparable(payload):
+            duplicate = (prior, old)
+    send = outcome in ALERTING and not notified
+    if duplicate is not None:
+        path, payload = duplicate[0], dict(duplicate[1])
+        if (not send or (payload.get("notify") == "hourly-cap" and sent >= MAX_ALERTS_PER_HOUR)
+                or (payload.get("notify") == "flood"
+                    and gateway_guardian_alert.flood_active(home, payload.get("notify_chat")))):
+            return path  # Unchanged: its mtime keeps bounding the hourly window.
+    else:
+        path = directory / f"{now.strftime('%Y%m%dT%H%M%S%f')}-{uuid.uuid4().hex}.json"
+    if send:
+        # Written before sending: a tick killed mid-send leaves "pending", which is never resent.
+        payload["notify"] = "pending" if sent < MAX_ALERTS_PER_HOUR else "hourly-cap"
+        send = payload["notify"] == "pending"
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    if send:
+        payload["notify"] = gateway_guardian_alert.notify(home, payload)
+        path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 
@@ -296,9 +351,20 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
     from hermes_cli.immutable_releases import _verify_transaction
     if intent_path(home).exists():
         return "stopped"
+    regenerated = False
     if not plist.is_file():
-        receipt(home, "inspect", "alert", reason="gateway plist missing")
-        return "alert"
+        if not _installs_service(home, plist, label):
+            receipt(home, "inspect", "alert", reason="gateway plist missing", label=label)
+            return "alert"
+        if _repair_count(home, actions={"regenerate"}) >= MAX_REPAIRS:
+            receipt(home, "regenerate", "capped", reason="gateway plist missing", label=label)
+            return "capped"
+        receipt(home, "regenerate", "attempt", reason="gateway plist missing", label=label)
+        if not _regenerate_service_plist(home, plist):
+            receipt(home, "regenerate", "alert", reason="gateway plist could not be regenerated", label=label)
+            return "alert"
+        receipt(home, "regenerate", "written", label=label, plist=str(plist))
+        regenerated = True
     definition = plistlib.loads(plist.read_bytes())
     if (definition.get("Label") != label or
             Path(definition.get("EnvironmentVariables", {}).get("HERMES_HOME", "")).resolve() != home.resolve()):
@@ -342,7 +408,7 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
             if record.get("operation") in {"rollback", "first-migration-rollback"}:
                 from hermes_cli.immutable_releases import acknowledge_running_release
                 acknowledge_running_release(home)
-        return "healthy"
+        return "repaired" if regenerated else "healthy"
     if forward_only:
         if switch:
             # Parked repair is cold recovery. A pending update owns fresh A-prime.
@@ -384,6 +450,8 @@ def _run_bounded(home: Path, plist: Path, label: str, *, grace: float, domain: s
             return "waiting"
         from hermes_cli.gateway_launchd_generation import refresh_generation_scope
         refresh_generation_scope(plist)
+    if intent_path(home).exists() or reload_pending(home) is not None:
+        return "stopped" if intent_path(home).exists() else "waiting"  # Changed during this tick.
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
               timeout=_remaining(deadline, 10))
     while gateway_deadline.now() < deadline:
@@ -431,6 +499,8 @@ def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=N
         receipt(home, "bootout", "cleaned", label=label)
         return "cleaned"
     refresh_generation_scope(plist)
+    if intent_path(home).exists() or reload_pending(home) is not None:
+        return "stopped" if intent_path(home).exists() else "waiting"  # Changed during this tick.
     launchctl(["launchctl", "bootstrap", domain, str(plist)], check=True,
               timeout=_remaining(deadline, 10))
     while gateway_deadline.now() < deadline:
@@ -448,13 +518,37 @@ def _repair_parked(home, plist, label, domain, current, launchctl, *, deadline=N
     return "failed"
 
 
-def _repair_count(home: Path) -> int:
+def _installs_service(home: Path, plist: Path, label: str) -> bool:
+    """Only the home's own installed service is regenerated; a custom label keeps its own plist."""
+    from hermes_cli import gateway
+    return (home.resolve() == get_hermes_home().resolve() and label == gateway.get_launchd_label()
+            and Path(plist) == gateway.get_launchd_plist_path())
+
+
+def _regenerate_service_plist(home: Path, plist: Path) -> bool:
+    """Write the install renderer's definition pinned to ``current``, as the updater does; never load it."""
+    from hermes_cli import gateway
+    from hermes_cli.immutable_releases import _atomic_bytes
+    paths = ReleasePaths.for_home(home)
+    current = paths.current.resolve()
+    if not paths.current.is_symlink() or not _release_is_ready(current, current.name):
+        return False  # No source fallback: the pointer check below alerts on it.
+    body = gateway.generate_launchd_plist(release_target=current)
+    if gateway._refuse_temp_home_service_write(body, "launchd plist"):
+        return False
+    gateway._prepare_service_launcher()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_bytes(plist, body.encode("utf-8"))
+    return True
+
+
+def _repair_count(home: Path, *, actions: frozenset[str] | set[str] = frozenset({"bootstrap", "rollback"})) -> int:
     cutoff = time.time() - 3600
     count = 0
     for path in (home / "logs/guardian").glob("*.json"):
         try:
             row = json.loads(path.read_text(encoding="utf-8-sig"))
-            if row.get("action") in {"bootstrap", "rollback"} and row.get("outcome") == "attempt" and datetime.fromisoformat(row["at"]).timestamp() > cutoff:
+            if row.get("action") in actions and row.get("outcome") == "attempt" and datetime.fromisoformat(row["at"]).timestamp() > cutoff:
                 count += 1
         except (OSError, ValueError, KeyError):
             continue
@@ -475,6 +569,12 @@ def run_once(home: Path, plist: Path, label: str, *, grace: float | None = None,
         try:
             if intent_path(home).exists():
                 return 'stopped'
+            pending = reload_pending(home)
+            if pending is not None:
+                # A planned restart's helper owns the unloaded label until it finishes or expires.
+                receipt(home, "inspect", "waiting", reason="launchd reload pending",
+                        label=pending["label"], generation=pending.get("generation_id"))
+                return "waiting"
             from hermes_cli.config import _validate_updates
             from hermes_cli.config_effective import load_user_config_effective
             config: dict[str, Any]
@@ -570,7 +670,7 @@ def guardian_plist(home: Path, gateway_plist: Path, label: str, *, domain: str) 
 
 def cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Independent gateway guardian")
-    parser.add_argument("action", choices=["install", "uninstall", "status", "run"])
+    parser.add_argument("action", choices=["install", "uninstall", "status", "run", "test-alert"])
     parser.add_argument("--gateway-plist", type=Path)
     parser.add_argument("--gateway-label")
     parser.add_argument("--domain", default=None)
@@ -579,6 +679,11 @@ def cli(argv: list[str] | None = None) -> int:
         parser.error("gateway guardian requires macOS launchd")
     from hermes_cli import gateway
     home = get_hermes_home()
+    if args.action == "test-alert":
+        # Same receipt path, hourly dedupe and flood fence as a real alert; the reason names the drill.
+        written = receipt(home, "drill", "alert", reason="guardian alert drill")
+        print(f"{written}: notify={json.loads(written.read_text(encoding='utf-8-sig')).get('notify')}")
+        return 0
     target = args.gateway_plist or gateway.get_launchd_plist_path()
     label = args.gateway_label or gateway.get_launchd_label()
     args.domain = args.domain or _domain(GUARDIAN_LABEL if args.action == "uninstall" else label)
@@ -594,7 +699,7 @@ def cli(argv: list[str] | None = None) -> int:
         return 0
     if args.action == "uninstall":
         subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10)
-        path.unlink(missing_ok=True)
+        remove_definition(path, home=home, reason="explicit guardian uninstall", missing_ok=True)
         print("Guardian uninstalled")
         return 0
     if not enabled(home):
