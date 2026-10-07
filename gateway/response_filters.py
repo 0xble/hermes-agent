@@ -193,7 +193,11 @@ def strip_trailing_loop_complete_marker(text: Any, *, respect_fences: bool = Tru
 
 
 def split_trailing_loop_complete_marker(text: Any) -> tuple[Any, str]:
-    """Split safe prefix from a trailing top-level marker candidate for streaming."""
+    """Split safe prefix from a trailing top-level marker candidate for streaming.
+
+    The held tail is the trailing candidate line plus every complete top-level marker line
+    (and blank line) directly before it, so a repeated marker never flashes on screen.
+    """
     if not isinstance(text, str) or not ends_with_partial_loop_complete_marker(text):
         return text, ""
     lines = text.splitlines(keepends=True)
@@ -202,7 +206,17 @@ def split_trailing_loop_complete_marker(text: Any) -> tuple[Any, str]:
         end -= 1
     if not end:
         return text, ""
-    return "".join(lines[:end - 1]), "".join(lines[end - 1:])
+    fenced = _fenced_line_states(lines)
+    start = end - 1
+    probe = start
+    while probe:
+        while probe and not lines[probe - 1].strip():
+            probe -= 1
+        if not probe or fenced[probe - 1] or not is_loop_complete_marker(lines[probe - 1]):
+            break
+        probe -= 1
+        start = probe
+    return "".join(lines[:start]), "".join(lines[start:])
 
 
 def ends_with_partial_loop_complete_marker(text: Any) -> bool:
