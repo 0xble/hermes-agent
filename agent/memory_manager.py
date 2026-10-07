@@ -781,10 +781,23 @@ class MemoryManager:
             return
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
-        self._each_provider(
-            "on_session_switch failed",
-            lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs),
-        )
+
+        # A queued prefetch captured the previous session's query. Obsolete its token and switch the
+        # providers under the same lock its dispatch holds, so it either dispatches before the switch
+        # (whose reset then drops it) or sees the obsolete token and never reaches the new session.
+        def _switch_providers() -> None:
+            self._prefetch_queued_at = None
+            # Drop any buffer or in-flight worker keyed on the old session first; not every provider's
+            # on_session_switch does (Hindsight's does via the same hook).
+            self._each_provider("discard_prefetch failed (non-fatal)",
+                                lambda p: getattr(p, "discard_prefetch", lambda: None)())
+            self._each_provider(
+                "on_session_switch failed",
+                lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id,
+                                              reset=reset, **kwargs),
+            )
+
+        self._prefetch_generation.discard(_switch_providers)
 
     @staticmethod
     def _checkpoint_api_version(provider: MemoryProvider) -> Optional[int]:

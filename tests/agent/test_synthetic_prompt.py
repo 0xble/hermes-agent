@@ -773,3 +773,51 @@ def test_age_bound_discard_racing_a_dispatch_that_already_passed_its_check_leave
     assert manager.flush_pending(timeout=5) is True
     assert result["v"] == ""  # what the racing dispatch buffered was dropped by the discard
     assert provider.buffer == ""
+
+
+def test_session_switch_obsoletes_a_queued_prefetch_carrying_the_previous_sessions_query():
+    """Review of bf60338: a prefetch queued for session A behind a slow sync must not dispatch A's
+    query into the providers after they switched to session B."""
+    import threading
+
+    release = threading.Event()
+
+    class _SlowSync(_BufferingProvider):
+        def __init__(self):
+            super().__init__()
+            self.switched_to = []
+
+        def sync_turn(self, *args, **kwargs):
+            release.wait(5)
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            self.switched_to.append(new_session_id)
+
+    manager = MemoryManager(prefetch_max_age_seconds=1800.0)
+    provider = _SlowSync()
+    manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    manager.sync_all(HUMAN, "Done.", session_id="s-A")
+    manager.queue_prefetch_all(HUMAN, session_id="s-A")  # waits behind the slow sync
+    manager.on_session_switch("s-B", reset=True)
+    release.set()
+    assert manager.flush_pending(timeout=5) is True
+    assert provider.switched_to == ["s-B"]
+    assert provider.queued == []  # session A's query never reached the switched provider
+    assert manager.prefetch_all("New topic in session B", session_id="s-B") == ""
+
+
+def test_session_switch_drops_a_buffer_dispatched_just_before_it():
+    """A dispatch that won the race into the old session's buffer is dropped by the switch itself,
+    even for a provider whose on_session_switch does not clear its buffer."""
+    class _KeepsBufferOnSwitch(_BufferingProvider):
+        def on_session_switch(self, new_session_id, **kwargs):
+            pass
+
+    manager = MemoryManager(prefetch_max_age_seconds=1800.0)
+    provider = _KeepsBufferOnSwitch()
+    manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    manager.queue_prefetch_all(HUMAN, session_id="s-A")
+    assert manager.flush_pending(timeout=5) is True
+    assert provider.buffer  # session A's recall is buffered
+    manager.on_session_switch("s-B", reset=True)
+    assert manager.prefetch_all("New topic in session B", session_id="s-B") == ""
