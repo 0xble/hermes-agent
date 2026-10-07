@@ -6,14 +6,12 @@ registered at a time (tool-schema bloat, conflicting backends).
 
 from __future__ import annotations
 
-import contextvars
 import inspect
 import json
 import logging
 import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
