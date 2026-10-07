@@ -117,18 +117,22 @@ standalone sender's bot. Each metered request (any non-`get*` endpoint carrying 
 the chat's next slot. Deliveries (sends, final and over-cap edits, overflow continuations,
 media, controls, deletions, topic edits, reactions) wait FIFO and are never dropped. Typing and
 drafts are shed when no slot is free. Interim edits are skipped by the adapter inside the
-3.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
+10.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
 never eats a transport deadline. A request inside a durably recorded server penalty is refused
 locally with `RetryAfter` for every path. Any published `retry_after` widens that chat's gap
 2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
 floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
-`TurnRunner._PROGRESS_EDIT_INTERVAL` is 3.0s, the transport edit floor.
+`TelegramAdapter.PROGRESS_EDIT_INTERVAL` is 10.0s, the transport edit floor, and
+`TurnRunner._progress_edit_interval` uses it for Telegram progress bubbles. Other platforms keep
+the runner default (`TurnRunner._PROGRESS_EDIT_INTERVAL`, 3.0s). Telegram used 3.0s until
+2026-10-06, when the daily call counter showed progress-bubble edits were the largest share of
+typed-turn calls on a chat that hit a daily volume ban; Brian approved slower bubble updates.
 
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |
 | All metered calls to one chat (one shared slot) | 45/min (1.33s gap) | 15/min (4.0s gap) |
 | of which typing, at most | 15/min (4.0s) | 5/min (12.0s) |
-| of which interim edits and drafts, at most | 20/min (3.0s) | 15/min (4.0s) |
+| of which interim edits and drafts, at most | 6/min (10.0s) | 6/min (10.0s) |
 | After a published `retry_after` (10 min) | 22.5/min | 7.5/min |
 | Ceiling (community envelope) | ~60/min | ~20/min |
 
@@ -139,7 +143,7 @@ which the standalone lane now honours, so cron's standalone fallback can no long
 requests or sleep for hours inside a ban. Reads (`get*`) and chat-less calls such as
 `answerCallbackQuery` are unmetered. Visible effect: with many topics active at once, typing
 indicators refresh chat-wide at most every 4s, so not every topic shows "typing" continuously,
-and progress bubbles update at most every 3s.
+and progress bubbles update at most every 10s.
 
 **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
 pins the summed per-chat rate against each class ceiling with every path saturated at once,
@@ -227,8 +231,9 @@ shared one DM. The standalone sender then sent 0.8s later, inside the window.
 
 The live lane now sits out a `flood_control:<seconds>` refusal and retries on the
 live adapter, as long as the cumulative wait for that target stays within
-`_LIVE_FLOOD_WAIT_BUDGET_SECS` (15s). Longer penalties, repeated refusals past the
-budget, and every other error still fall back to standalone, as before. Source:
+`_LIVE_FLOOD_WAIT_BUDGET_SECS` (15s). Every other error still falls back to
+standalone. A flood refusal past that budget fails closed instead (see
+[Cron Flood Fail-Closed](#cron-flood-fail-closed)). Source:
 `cron/scheduler_delivery.py` (`_short_flood_wait`, `_live_send_text`). Proof:
 `TestShortFloodWaitStaysOnTheLiveLane` in
 `tests/cron/test_cron_live_delivery_confirmation.py`, which fails without the patch.
@@ -241,6 +246,31 @@ latency-sensitive. No upstream issue or PR covered this on 2026-10-03. Retire
 when the standalone lane can send Rich Messages, or upstream retries short live
 floods equivalently. Roll back by reverting the commit. There are no
 configuration or persistent-state changes.
+
+## Cron Flood Fail-Closed
+
+**Patch identity:** `cron-flood-fail-closed`. Once a Telegram live send is refused with an
+active flood-control deadline that the short wait above cannot sit out, cron delivery
+records the target as deferred and does not enter the standalone sender. A second
+sender during the same penalty can extend or obscure the ban, and the standalone lane
+also drops Rich Message features. Relay targets and non-Telegram platforms are
+unchanged, and non-flood errors still fall back to standalone. Source:
+`cron/scheduler_delivery.py` (`_live_flood_held`, `_deliver_standalone`,
+`_warn_live_lane_failure`). Proof: `test_long_flood_fails_closed_without_standalone`
+and `test_repeated_floods_stop_at_the_budget` in
+`tests/cron/test_cron_live_delivery_confirmation.py`.
+
+Landed as [#335](https://github.com/0xble/hermes-agent/pull/335), commit
+`90fdfcecf4f5`, without a `Fork-Patch` trailer. The backfill line below records its
+stable patch ID, so `main` keeps passing the trailer check without rewriting
+published history.
+
+Fork-Patch-Backfill: 3b2042b08305abd280088b719767fdec1cc3ed92; cron-flood-fail-closed
+
+Retire when upstream cron delivery stops falling back to a second sender during an
+active Telegram flood deadline. Roll back by reverting `90fdfcecf4f5` and restoring the
+`Cron Short Flood Wait` fallback text. There are no configuration or persistent-state
+changes.
 
 ## Replacement Adapter Egress
 
@@ -262,6 +292,31 @@ files) still refuse on a retired instance and remain a follow-up. Upstream has t
 same gap at `343500b354`. Retire when an upstream release forwards these calls.
 Roll back by reverting this patch's adapter and test changes. No state changes.
 
+## Transient Rich Delivery Recovery and Capability Latch
+
+**Patch identity:** `telegram-rich-delivery-recovery`. Cron delivery keeps a Telegram
+live-adapter send on the Rich Message path for a bounded 120-second exponential-backoff
+window after `send_path_degraded` or a short flood refusal. Only after that window does
+it use the legacy standalone sender. If that fallback succeeds after a transient live
+failure, the job records `last_delivery_formatting_degraded` with the affected target
+and emits a WARNING; non-Telegram targets are unchanged. The existing delivery ledger
+remains the recovery path when fallback cannot send.
+
+Rich capability rejection is WARNING-logged with the existing redaction helper and the
+adapter latch resets at the next polling generation. The latch still suppresses retries
+within one generation, so a genuine unsupported endpoint cannot create a retry storm.
+The current fork already contains the currency protection from `f9a4ab8558`; a direct
+payload reproduction for `costs $500 and $1,200` produces ``costs `$500` and `$1,200` ``
+and does not reproduce the reported LaTeX defect, so no currency source change is made.
+
+Source: `cron/scheduler_delivery.py` and `plugins/platforms/telegram/adapter.py`.
+Proof: `tests/cron/test_cron_reconnect_only_rejection.py` and
+`tests/gateway/test_telegram_rich_messages.py`. Upstream search on 2026-10-04 found no
+matching issue or pull request for these exact symbols. Retire when an upstream release
+keeps transient cron delivery on the rich live lane and resets capability latches by
+polling generation. Roll back the two source files and their regression tests together;
+there are no configuration or persistent-state migrations.
+
 ## Delivery Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_telegram_flood_coherence.py`,
@@ -279,3 +334,44 @@ while preserving the independently required local deltas. Retire flood
 coherence when upstream classifies media floods and shares one per-chat window. Retire
 emphasis when PR 106906 merges and the candidate tag includes it. Roll back by reverting
 the logical patch; no persistent data changes.
+
+## Daily call counter (measurement only)
+
+**Evidence (2026-10-06).** The last two bans were each a single 429 with a multi-hour wait:
+`editMessageText` at 2026-10-04 20:35 (23019s) and at 2026-10-05 17:23:52 PDT
+(`retry_after=34507.0s`, the first 429 that day). Both ended near 02:59 PDT (09:59 UTC). In the
+24 minutes before the second one the log shows only progress edits, a few `deleteMessages`
+bubble cleanups and sends, about 1 call every 4-6s, inside the 45/min budget above. So the
+per-minute budget cannot be the binding limit. The fixed end time points to a volume window.
+Its size, and whether it applies per chat or per bot, were not known because successful calls
+were only logged at debug level.
+
+**Contract.** `ChatBudgetRateLimiter` counts every metered call that reaches Telegram in
+`DailyCallCounter`, by chat, endpoint and trigger, in hourly buckets, after the request returns so
+measurement never shifts pacing. Local penalty refusals and shed typing or drafts are not counted.
+`TelegramAdapter._process_message_background` binds the trigger (`typed`, `goal`, `loop`, `relay`,
+`process`, `delegation`, `restart`, `heartbeat`, `internal`) in a ContextVar for the turn task, and
+`get_pending_message` rebinds it when the runner drains a queued event in-band, so a turn queued
+behind a busy session is never counted under its predecessor. Calls outside a turn (cron delivery, outbox
+replay, housekeeping) are `untagged`. Counts flush additively to `call_counts` in the profile's
+`telegram-flood-state.db` at most once a minute, are kept for 30 days, and log a 24h summary hourly
+(whole hourly buckets from the first hour at or after the cutoff, never reaching back before it).
+Each counter starts one long-lived daemon worker when it is created, so a quiet profile persists
+within a minute and no send pays for a thread start. Window reads include counts a locked database
+could not store yet. Any `retry_after` of 600s or more also logs every chat's window counts for the profile, so per-chat and per-bot limits can be told apart. Each profile directory gets its own counter, resolved on the caller's context, never on the worker thread. The send path
+only updates an in-memory dict. Persistence and summaries run on the counter's own daemon thread,
+so a slow or locked database cannot delay a call. The counter never sheds or refuses a call.
+Counter failures are logged at debug level and unflushed counts are kept for the next flush.
+
+**Reading it.** `sqlite3 ~/.hermes/telegram-flood-state.db "select chat_id, endpoint, trigger,
+sum(count) from call_counts where hour >= strftime('%s','now','-1 day') group by 1,2,3"`. The
+threshold is the window total logged with the next long `retry_after`. Comparing per-chat
+totals across chats at that moment shows whether the limit is per chat or per bot.
+
+**Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_daily_call_counter.py`.
+
+**Rollback:** Revert the `feat(telegram): count daily calls per chat` commit. The
+`call_counts` table can stay, because nothing else reads it.
+
+**Retirement:** Retire once the threshold is measured and upstream exposes equivalent per-chat
+call accounting, or once the early-warning cron reads another source.
