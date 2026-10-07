@@ -66,9 +66,11 @@ proc_ct() { # pid -> creation time (unix seconds, 3 decimals), or nothing
     # (seconds + microseconds), which extern_proc exposes at offset 0 of the sysctl buffer.
     # Perl is the only sub-second process-clock reader on a stock macOS and reports the
     # identical value psutil does; anything else falls back to the ps whole-second reading.
+    # Pin the system perl: a Homebrew perl first on PATH (GitHub's macOS images, many dev
+    # Macs) fails this syscall and silently put the hand-off back on whole seconds.
     prec=""
-    if command -v perl >/dev/null 2>&1; then
-      prec="$(perl -e '
+    if [ -x /usr/bin/perl ]; then
+      prec="$(/usr/bin/perl -e '
         my $pid = shift; my $want = shift;
         my @mib = (1, 14, 1, $pid);        # CTL_KERN, KERN_PROC, KERN_PROC_PID, pid
         my $buf = "\0" x 1024;
