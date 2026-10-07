@@ -1015,14 +1015,10 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
         if not any(p.pid == gateway_pid and Path(p.cwd()).resolve() == root.resolve()
                    for p in processes):
             return None
-        # ACK proves the incarnation and plist, not that it still serves the
-        # intended code. A stale or unreadable live identity cannot earn credit.
-        from hermes_cli.update_receipt import collect_fleet_versions
-        resolved_root = root.resolve()
-        rows = collect_fleet_versions(expected_sha_override=root.name, expected_root_override=resolved_root)
-        if not any(row.get("pid") == gateway_pid and row.get("state") == "current"
-                   and row.get("code_root") == str(resolved_root) for row in rows):
-            return None
+        # ACK proves the live incarnation and its loaded release root. Do not require a
+        # fleet-status row here: the gateway publishes that row after startup, so an
+        # otherwise valid ACK can briefly predate it. Post-restart fleet verification
+        # remains the authority for successor health.
         return label
     except (OSError, ValueError, KeyError, TypeError, psutil.Error):
         return None
@@ -1154,6 +1150,15 @@ def _restart_macos_launchd_gateways(
     # provably this install's, so the #41403 boundary (never touch another install's fleet) holds.
     # See #115254.
     legacy_labels = legacy_launchd_labels_for_install(exclude=set(derived_labels) | {current_label})
+    # The opt-in guardian has a gateway-looking label but is not a gateway fleet
+    # member. When disabled, its stale plist must not be kickstarted (it exits 2
+    # and only adds a second launchd action to the update). Enabled guardians keep
+    # their existing restart behavior.
+    if "ai.hermes.gateway-guardian" in legacy_labels:
+        from hermes_cli.gateway_guardian import enabled as guardian_enabled
+        from hermes_constants import get_hermes_home
+        if not guardian_enabled(get_hermes_home()):
+            legacy_labels.remove("ai.hermes.gateway-guardian")
     if legacy_labels:
         print(f"  ↻ legacy-labelled units of this install join the restart: {', '.join(legacy_labels)}")
     from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home

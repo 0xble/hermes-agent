@@ -195,7 +195,7 @@ def test_acknowledged_release_catchup_verifies_without_second_relaunch(release_j
 
 
 @pytest.mark.platforms("macos")
-def test_stale_credited_gateway_gets_one_relaunch(release_job, monkeypatch):
+def test_acknowledged_gateway_that_reports_stale_is_failed_without_second_relaunch(release_job, monkeypatch):
     job = release_job
     monkeypatch.setattr(update_cmd, "_require_immutable_launchd", lambda: None)
     worker = _ack_after_spawn(job, job.b, job.initial["pid"])
@@ -204,22 +204,25 @@ def test_stale_credited_gateway_gets_one_relaunch(release_job, monkeypatch):
     job.log.write_text("")
     monkeypatch.setattr(update_cmd_fleet, "_pending_fleet_restart_needed", lambda: True)
     identity = update_receipt._socket_identity
-    def stale_until_relaunch(home):
+
+    def stale_identity(home):
         observed = identity(home)
-        if observed and not any(line.startswith(("bootout ", "kickstart "))
-                                for line in job.log.read_text().splitlines()):
+        if observed:
             pid, status = observed
             return pid, {**status, "code_sha": job.a.name}
         return observed
-    monkeypatch.setattr(update_receipt, "_socket_identity", stale_until_relaunch)
+
+    monkeypatch.setattr(update_receipt, "_socket_identity", stale_identity)
     update_receipt.begin_update_receipt()
-    update_cmd._apply_pending_fleet_restart_catchup()
-    row = job.observed(job.b, job.initial["pid"])
-    assert row["pid"] != job.initial["pid"]
+    with pytest.raises(SystemExit) as exc:
+        update_cmd._apply_pending_fleet_restart_catchup()
+    assert exc.value.code == 1
     mutations = [line for line in job.log.read_text().splitlines()
-                 if line.startswith(("bootout ", "bootstrap ", "kickstart ")) and job.label in line]
-    assert [line.split()[0] for line in mutations] == ["kickstart"]
-    assert update_receipt.read_latest_receipt()["outcome"] == "success"
+                 if line.startswith(("bootout ", "kickstart ")) and job.label in line]
+    assert mutations == []
+    receipt = update_receipt.read_latest_receipt()
+    assert receipt is not None
+    assert receipt["outcome"] == "partial"
 
 
 @pytest.mark.platforms("macos")

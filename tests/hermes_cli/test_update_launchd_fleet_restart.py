@@ -20,13 +20,18 @@ in a domain it does not live in.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import plistlib
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import hermes_cli.gateway as gw
 import hermes_cli.profiles
+import hermes_cli.update_cmd_fleet as fleet
 from hermes_cli.gateway import (
     _locate_launchd_gateway_service,
     _probe_launchd_domain_for_label,
@@ -312,7 +317,101 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
     return rec
 
 
-class TestRestartMacosLaunchdGateways:
+class TestAckedReleaseWithoutFleetRow:
+    def test_live_ack_is_credited_before_first_fleet_status_row(self, monkeypatch, tmp_path):
+        """The durable ACK and live process tree are enough to skip the second reload."""
+        home = tmp_path / "home"
+        root = tmp_path / "release"
+        home.mkdir()
+        root.mkdir()
+        label = "ai.hermes.gateway"
+        installed = tmp_path / f"{label}.plist"
+        body = plistlib.dumps({
+            "Label": label,
+            "EnvironmentVariables": {"HERMES_HOME": str(home)},
+        })
+        installed.write_bytes(body)
+        digest = hashlib.sha256(body).hexdigest()
+        (home / "release-last-txn.json").write_text(json.dumps({
+            "requires_reload": True,
+            "reload_ack": {
+                "release_root": str(root), "plist_sha256": digest,
+                "launchd_pid": 111, "gateway_pid": 222,
+            },
+            "plist": {"path": str(installed), "intended_sha256": digest},
+        }))
+
+        supervisor = SimpleNamespace(
+            pid=111,
+            children=lambda recursive=True: [SimpleNamespace(pid=222, cwd=lambda: str(root))],
+        )
+        monkeypatch.setattr(gw, "get_launchd_label", lambda: label)
+        monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: installed)
+        monkeypatch.setattr("hermes_cli.gateway_launchd._launchctl_supervised_pid", lambda _: 111)
+        monkeypatch.setattr("psutil.Process", lambda _: supervisor)
+        monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **_: [])
+
+        assert fleet._acknowledged_release_launchd_label(home, root) == label
+
+        monkeypatch.setattr(gw, "launchd_gateway_labels_for_install", lambda: [label])
+        monkeypatch.setattr(gw, "legacy_launchd_labels_for_install", lambda exclude=(): [])
+        monkeypatch.setattr(gw, "launchd_restart", lambda: pytest.fail("ACKed gateway was relaunched"))
+        monkeypatch.setattr(gw, "_launchd_kickstart", lambda *args: pytest.fail("ACKed gateway was kickstarted"))
+        restarted, failed = [], []
+        fleet._restart_macos_launchd_gateways(
+            restarted, failed, drain_budget=0.0, acknowledged_label=label,
+        )
+        assert restarted == [label]
+        assert failed == []
+
+    def test_missing_ack_keeps_the_normal_current_profile_restart(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        root = tmp_path / "release"
+        home.mkdir()
+        root.mkdir()
+        assert fleet._acknowledged_release_launchd_label(home, root) is None
+        rec = _fleet(
+            monkeypatch, tmp_path, current="ai.hermes.gateway",
+            labels=["ai.hermes.gateway"],
+            located={"ai.hermes.gateway": (f"gui/{UID}", 100)},
+        )
+        restarted, failed = [], []
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=0.0, acknowledged_label=None)
+        assert rec.current_restarts == ["ai.hermes.gateway"]
+        assert restarted == ["ai.hermes.gateway"]
+        assert failed == []
+
+
+class TestGuardianRestartScope:
+    def test_disabled_guardian_is_not_kickstarted(self, monkeypatch, tmp_path):
+        guardian = "ai.hermes.gateway-guardian"
+        rec = _fleet(
+            monkeypatch, tmp_path, current="ai.hermes.gateway",
+            labels=["ai.hermes.gateway"], legacy_labels=[guardian],
+            located={"ai.hermes.gateway": (f"gui/{UID}", 100), guardian: (f"gui/{UID}", 200)},
+        )
+        monkeypatch.setattr("hermes_cli.gateway_guardian.enabled", lambda _home: False)
+        restarted, failed = [], []
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=0.0)
+        assert rec.kickstarts == []
+        assert restarted == ["ai.hermes.gateway"]
+        assert failed == []
+
+    def test_enabled_guardian_keeps_legacy_restart_behavior(self, monkeypatch, tmp_path):
+        guardian = "ai.hermes.gateway-guardian"
+        rec = _fleet(
+            monkeypatch, tmp_path, current="ai.hermes.gateway",
+            labels=["ai.hermes.gateway"], legacy_labels=[guardian],
+            located={"ai.hermes.gateway": (f"gui/{UID}", 100), guardian: (f"gui/{UID}", 200)},
+        )
+        monkeypatch.setattr("hermes_cli.gateway_guardian.enabled", lambda _home: True)
+        restarted, failed = [], []
+        _restart_macos_launchd_gateways(restarted, failed, drain_budget=0.0)
+        assert rec.kickstarts == [f"gui/{UID}/{guardian}"]
+        assert restarted == ["ai.hermes.gateway", guardian]
+        assert failed == []
+
+
     def test_current_delegates_and_siblings_kickstart_in_own_domains(
         self, monkeypatch, tmp_path
     ):
