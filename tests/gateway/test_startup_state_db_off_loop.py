@@ -114,7 +114,7 @@ async def test_reconnect_watcher_waits_until_resume_scheduling_signal(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_finish_wiring_opens_restore_gate_without_waiting_for_mcp(monkeypatch):
+async def test_finish_wiring_waits_for_mcp_before_boot_resume(monkeypatch):
     import gateway.run as gateway_run
 
     runner = object.__new__(GatewayRunner)
@@ -160,14 +160,27 @@ async def test_finish_wiring_opens_restore_gate_without_waiting_for_mcp(monkeypa
 
     from tools.process_registry import process_registry
     monkeypatch.setattr(process_registry, "pending_watchers", [])
-    await runner._start_finish_wiring(1)
-
+    wiring = asyncio.create_task(runner._start_finish_wiring(1))
     await discovery_started.wait()
-    assert "restore" in order
-    assert "mcp" not in order
-    release_discovery.set()
     await asyncio.sleep(0)
+    assert "restore" not in order
+    assert "schedule" not in order
+    release_discovery.set()
+    await wiring
+    assert order.index("mcp") < order.index("schedule")
     assert runner._mcp_discovery_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_mcp_discovery_wait_proceeds_after_startup_bound(monkeypatch, caplog):
+    runner = object.__new__(GatewayRunner)
+    runner._mcp_discovery_ready = asyncio.Event()
+    monkeypatch.setenv("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", "0.01")
+
+    with caplog.at_level("WARNING"):
+        await runner._await_mcp_discovery()
+
+    assert "MCP tool discovery still running" in caplog.text
 
 
 @pytest.mark.asyncio

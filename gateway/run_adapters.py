@@ -859,46 +859,45 @@ class GatewayAdapterLifecycleMixin:
         from gateway.run import _startup_restore_drain_timeout_secs
         if resume_scheduled is None:
             resume_scheduled = (getattr(self, "_reconnect_resume_events", None) or {}).get(platform)
-        candidates = await self._resume_pending_candidates_async(record_boot=False)
         tasks = []
         keys = set()
-        try:
-            recovered_events = await self._recover_pending_shutdown_flush_off_loop(
-                candidates=candidates,
-                platform=platform,
-                failure_message=(
-                    f"Pending follow-up recovery after {platform.value} reconnect failed; spools retained"
-                ),
-            )
-        except Exception:
-            # The helper logs and retains spools on worker failure; this guard preserves the reconnect
-            # path's fail-open scheduling if a lightweight test runner overrides the helper itself.
-            logger.warning("Pending follow-up recovery after %s reconnect failed; spools retained", platform.value,
-                           exc_info=True)
-            recovered_events = []
-        for event in recovered_events:
-            keys.add(self._session_key_for_source(self._normalize_source_for_session_key(event.source)))
-        try:
-            # Recovery scans all served homes, but only the newly available platform resumes.
-            self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
-                                                   restore_tasks=tasks, restore_keys=keys)
-        except Exception:
-            logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
-                           exc_info=True)
         counts = getattr(self, "_reconnect_restore_keys", None)
         if counts is None:
             counts = self._reconnect_restore_keys = {}
-        for key in keys:
-            counts[key] = counts.get(key, 0) + 1
-        self._release_reconnect_platform_fence(platform)
-        # The reconnect watcher must not release the adapter until the per-session gate is
-        # installed. Otherwise fresh inbound can overtake a claimed pre-restart follow-up
-        # during the small window between scheduling and publishing _reconnect_restore_keys.
-        if resume_scheduled is not None:
-            resume_scheduled.set()
-        if not keys and not tasks:
-            return
         try:
+            candidates = await self._resume_pending_candidates_async(record_boot=False)
+            try:
+                recovered_events = await self._recover_pending_shutdown_flush_off_loop(
+                    candidates=candidates,
+                    platform=platform,
+                    failure_message=(
+                        f"Pending follow-up recovery after {platform.value} reconnect failed; spools retained"
+                    ),
+                )
+            except Exception:
+                # The helper logs and retains spools on worker failure; this guard preserves the reconnect
+                # path's fail-open scheduling if a lightweight test runner overrides the helper itself.
+                logger.warning("Pending follow-up recovery after %s reconnect failed; spools retained", platform.value,
+                               exc_info=True)
+                recovered_events = []
+            for event in recovered_events:
+                keys.add(self._session_key_for_source(self._normalize_source_for_session_key(event.source)))
+            try:
+                # Recovery scans all served homes, but only the newly available platform resumes.
+                self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
+                                                       restore_tasks=tasks, restore_keys=keys)
+            except Exception:
+                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                               exc_info=True)
+            for key in keys:
+                counts[key] = counts.get(key, 0) + 1
+            # The reconnect watcher must not release the adapter until the per-session gate is
+            # installed. Otherwise fresh inbound can overtake a claimed pre-restart follow-up
+            # during the small window between scheduling and publishing _reconnect_restore_keys.
+            if resume_scheduled is not None:
+                resume_scheduled.set()
+            if not keys and not tasks:
+                return
             if tasks:
                 await self._wait_bounded_or_release(
                     set(tasks), _startup_restore_drain_timeout_secs(),
@@ -909,12 +908,21 @@ class GatewayAdapterLifecycleMixin:
             # keys held here, so skipping here too strands them after both gates open.
             await self._drain_startup_restore_queue(keys, owned_keys=keys)
         finally:
-            # The timeout deliberately fails open after a bounded wait; unfinished resume turns
-            # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
-            for key in keys:
-                counts[key] -= 1
-                if not counts[key]:
-                    del counts[key]
+            # Releasing this fence is paired with a platform-scoped drain so messages for sessions that
+            # recovery did not claim cannot remain stranded when the worker has no keys, raises, or is
+            # cancelled. Claimed keys stay fenced until their replay/resume path above has drained.
+            self._release_reconnect_platform_fence(platform)
+            if resume_scheduled is not None:
+                resume_scheduled.set()
+            try:
+                await self._drain_startup_restore_queue(platform=platform, exclude_keys=keys)
+            finally:
+                # The timeout deliberately fails open after a bounded wait; unfinished resume turns
+                # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
+                for key in keys:
+                    counts[key] -= 1
+                    if not counts[key]:
+                        del counts[key]
 
 
     async def _install_reconnected_adapter(self, platform, adapter) -> None:

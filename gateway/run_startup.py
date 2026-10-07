@@ -102,13 +102,20 @@ class GatewayStartupMixin:
                 source.chat_id if source else "unknown",
             )
 
-    async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
+    async def _drain_startup_restore_queue(
+        self, keys=None, *, owned_keys=None, platform=None, exclude_keys=None,
+    ) -> int:
         """Replay ready inbound, leaving sessions owned by another restore in order."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
         def ready(event):
-            key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+            source = getattr(event, "source", None)
+            if platform is not None and getattr(source, "platform", None) != platform:
+                return False
+            key = self._session_key_for_source(self._normalize_source_for_session_key(source))
             if keys is not None and key not in keys:
+                return False
+            if exclude_keys and key in exclude_keys:
                 return False
             # Our own gate permits one claimant; every other owner's gate must be fully open.
             limit = 1 if owned_keys and key in owned_keys else 0
@@ -224,6 +231,20 @@ class GatewayStartupMixin:
             "Turn-machinery warm-up still running after %.0fs; opening inbound gate anyway — the "
             "first turn may see lazily initialized machinery (#99373). Warm-up continues in the background.",
             "boot turn-machinery warm-up failed after gate release", level=logging.DEBUG,
+        )
+
+    async def _await_mcp_discovery(self) -> None:
+        """Bound boot auto-resume until MCP discovery has published the tools it may need."""
+        from gateway.run import _startup_restore_drain_timeout_secs
+        ready = getattr(self, "_mcp_discovery_ready", None)
+        if not isinstance(ready, asyncio.Event) or ready.is_set():
+            return
+        wait_task = asyncio.create_task(ready.wait())
+        await self._wait_bounded_or_release(
+            {wait_task}, _startup_restore_drain_timeout_secs(),
+            "MCP tool discovery still running after %.0fs; starting boot auto-resume without late MCP tools",
+            "background MCP discovery wait failed before boot auto-resume",
+            level=logging.WARNING,
         )
 
     async def _wait_bounded_or_release(
@@ -1818,8 +1839,8 @@ class GatewayStartupMixin:
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
         # MCP discovery is independent of restore admission. It stays off the event loop and may finish
-        # later; inbound turns admitted after the restore gate opens simply run without MCP tools until
-        # discovery publishes them. API admission has its own short wait and returns 503 on the boundary.
+        # later; boot auto-resume waits for its readiness event below, while API admission has its own
+        # short wait and returns 503 on the boundary.
         from gateway.run import _discover_gateway_mcp_tools
         async def _discover_mcp_in_background() -> None:
             try:
@@ -1837,6 +1858,9 @@ class GatewayStartupMixin:
             candidates=candidates,
             failure_message="Pending-message recovery failed; spools retained",
         )
+        # Resume turns must not start before background MCP discovery has published the tool set they may
+        # rely on. This wait is bounded so a wedged discovery cannot stall gateway availability.
+        await self._await_mcp_discovery()
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions(candidates=candidates)
