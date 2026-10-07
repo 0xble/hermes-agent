@@ -45,10 +45,12 @@ def _label_hermes_home(label: str, *, runner=None) -> Path | None:
     """
     import os
 
+    if sys.platform != "darwin":
+        return None
     runner = runner or subprocess.run
     try:
         result = runner(
-            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],  # windows-footgun: ok (darwin-gated above)
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
