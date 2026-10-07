@@ -2179,7 +2179,13 @@ class GatewayTurnMixin:
         source, session_entry, session_key = resolved
         # Snapshot the interruption marker before preparation/delivery can yield to a successor turn.
         _resume_pending_marker = None
-        _resume_marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+        _resume_marker_reader = None
+        try:
+            # Lightweight runners (tests, plugins) may have no session store at all; the
+            # ``async_session_store`` property itself raises AttributeError then.
+            _resume_marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+        except AttributeError:
+            pass
         _resume_marker_reader_available = callable(_resume_marker_reader)
         if _resume_marker_reader_available:
             try:
