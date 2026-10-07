@@ -1560,7 +1560,8 @@ class GatewayStartupMixin:
         from tools.process_registry import process_registry as _pr
         # The launch profile's durable completions replay here, not at import (#123265); the
         # secondaries' ledgers are replayed by _restore_secondary_completion_ledgers below.
-        _pr.restore_completions()
+        # Off the loop: the replay writes state.db, and the liveness watchdog is already armed.
+        await asyncio.to_thread(_pr.restore_completions)
         # Secondary-profile adapters connect under their own home + credential scope.
         try:
             connected_count += await self._start_secondary_profile_adapters()
@@ -1746,7 +1747,7 @@ class GatewayStartupMixin:
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
         # The async delegation watcher performs the route/authorization preflight and durable
         # trigger claim; this startup hook never reconstructs a child process.
-        self._schedule_auto_resume_delegations()
+        await asyncio.to_thread(self._schedule_auto_resume_delegations)  # reads every profile's state.db
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.
         await self._send_session_db_warning_notifications()
