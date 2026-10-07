@@ -1186,6 +1186,11 @@ def _completion_notice_pending(session_id: str) -> bool:
         return False
 
 
+# Opens every barrier-lift note. The note is generated, so memory gates drop it with the
+# continuation it is appended to (agent.synthetic_prompt).
+GOAL_WAIT_LIFTED_NOTE_OPEN = "[Goal wait lifted: "
+
+
 def _barrier_lift_note(state: Optional["GoalState"]) -> str:
     """One factual line appended to an idle-woken continuation, so the agent does not assume the
     awaited work succeeded. Never asks for a rerun: interrupted work may have side effects."""
@@ -1195,26 +1200,26 @@ def _barrier_lift_note(state: Optional["GoalState"]) -> str:
         sid = state.waiting_on_session
         outcome = _process_outcome(sid)
         if outcome is None:
-            return (f"[Goal wait lifted: background process {sid} is no longer tracked, most likely because "
+            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} is no longer tracked, most likely because "
                     "the gateway restarted. Its outcome is unknown; verify the real state before relying on it "
                     "and do not assume it succeeded.]")
         if outcome.get("running"):
-            return (f"[Goal wait lifted: background process {sid} is still running after "
+            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} is still running after "
                     f"{_MAX_BARRIER_WAIT_S // 60} minutes. Check its progress before waiting again.]")
         if outcome.get("completion_reason") == "killed":
             cause = ("a gateway restart or shutdown" if outcome.get("termination_source") == "kill_all"
                      else "an explicit kill")
-            return (f"[Goal wait lifted: background process {sid} was killed by {cause} before it finished "
+            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} was killed by {cause} before it finished "
                     f"(exit {outcome.get('exit_code')}). Its result is incomplete; check it with the process "
                     "tool and verify the real state before deciding whether to restart that work.]")
-        return (f"[Goal wait lifted: background process {sid} finished "
+        return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} finished "
                 f"({outcome.get('completion_reason') or 'exited'}, exit {outcome.get('exit_code')}). "
                 "Read its output with the process tool before continuing.]")
     if state.waiting_on_pid:
         if _pid_alive(state.waiting_on_pid):
-            return (f"[Goal wait lifted: pid {state.waiting_on_pid} is still running after "
+            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}pid {state.waiting_on_pid} is still running after "
                     f"{_MAX_BARRIER_WAIT_S // 60} minutes. Check its progress before waiting again.]")
-        return f"[Goal wait lifted: pid {state.waiting_on_pid} has exited. Verify its result before continuing.]"
+        return f"{GOAL_WAIT_LIFTED_NOTE_OPEN}pid {state.waiting_on_pid} has exited. Verify its result before continuing.]"
     return ""
 
 

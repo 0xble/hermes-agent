@@ -149,15 +149,24 @@ class GatewayGoalsMixin:
         return await self._manager_for_event(event, "heartbeat", _load)
 
     @staticmethod
-    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
+    def _synthetic_prompt_event(
+        source: Any, text: str, *, internal: bool = False, reply_expected: Optional[bool] = None,
+    ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
         The stored source's ``message_id`` is the message that registered the watch; a synthetic
         prompt is not a reply to it, so it is dropped or every progress bubble and final reply
         would quote that stale message (Telegram DM topics route anchorless via the topic id).
+
+        ``reply_expected=False`` marks a gateway-authored wake that may end silently (a goal
+        continuation on a no-change tick). A typed message absorbed into the same turn still
+        restores the human contract through ``MessageEvent.absorb_reply_expected``.
         """
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
-        return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
+        return MessageEvent(
+            text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+            reply_expected=reply_expected,
+        )
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -533,7 +542,10 @@ class GatewayGoalsMixin:
             adapter = self._delivery_adapter_for(source)
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
+                # A goal continuation is gateway-authored: a no-change tick may answer NO_REPLY.
+                self._enqueue_fifo(
+                    _quick_key, self._synthetic_prompt_event(source, prompt, reply_expected=False), adapter,
+                )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
@@ -582,6 +594,11 @@ class GatewayGoalsMixin:
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
         """Text for /goal and /loop after a gateway turn. Streamed turns return None from
         _handle_message_with_agent (already_sent); the delivered reply is stashed on the event."""
+        # Delivery strips display-only control markers (LOOP_COMPLETE) from the returned text;
+        # the raw reply it stashed is authoritative for /loop completion detection.
+        raw = getattr(event, "_raw_final_response", None)
+        if isinstance(raw, str) and raw.strip():
+            return raw
         text = ""
         if isinstance(agent_result, dict):
             text = str(agent_result.get("final_response") or "")
@@ -763,7 +780,7 @@ class GatewayGoalsMixin:
         since = mgr.state.waiting_since
         logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
-        event = self._synthetic_prompt_event(source, prompt)
+        event = self._synthetic_prompt_event(source, prompt, reply_expected=False)
         event.metadata["gateway_session_key"] = key
         if resume_marker is not None:
             cleared = await self.async_session_store.clear_resume_pending(

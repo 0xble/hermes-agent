@@ -4125,8 +4125,7 @@ class GatewayRunner(
     # Values are catalog keys; ``run_busy._dispatch_busy_slash_command`` resolves them with ``t()``.
     _BUSY_REJECT_TEXT: Dict[str, str] = {
         "model": "gateway.busy.reject_model",
-        "codex-runtime": "gateway.busy.reject_codex_runtime",
-        "moa": "gateway.busy.reject_moa"}
+        "codex-runtime": "gateway.busy.reject_codex_runtime"}
 
     def _active_profile_name(self) -> str:
         """Return the profile name this gateway represents."""
@@ -4475,7 +4474,8 @@ class GatewayRunner(
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
-        ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
+        ("memory", "provider"), ("memory", "recall_synthetic_turns"), ("memory", "prefetch_max_age_seconds"),
+        ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 
     @staticmethod

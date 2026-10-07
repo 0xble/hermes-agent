@@ -55,7 +55,7 @@ function Harness({
   enabled?: boolean
   runtimeMap: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: string | null
-  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean | 'dropped'> | boolean | 'dropped'
 }) {
   useBackgroundQueueDrain({
     enabled,
@@ -112,6 +112,25 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
+  })
+
+  it('drops a cancelled background MoA token and continues with the next entry', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn<
+      (text: string, options?: SubmitTextOptions) => Promise<boolean | 'dropped'>
+    >()
+      .mockResolvedValueOnce('dropped')
+      .mockResolvedValueOnce(true)
+
+    enqueueQueuedPrompt('stored-session-a', { text: '!cancelled', attachments: [], moaToken: 'cancelled-moa' })
+    enqueueQueuedPrompt('stored-session-a', { text: 'next', attachments: [] })
+    setSessions([lineageSession({ id: 'stored-session-a' })])
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => expect(submitText).toHaveBeenCalledTimes(2))
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+    expect($notifications.get().some(item => item.message.includes('queue'))).toBe(true)
   })
 
   it('submits a queued entry once when two idle windows both drain it', async () => {

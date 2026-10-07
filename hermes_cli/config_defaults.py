@@ -486,7 +486,9 @@ DEFAULT_CONFIG = {
             # Externally managed Camofox identity, for when another app owns the visible browser.
             "user_id": "",
             "session_key": "",
-            "adopt_existing_tab": False,  # rehydrate tab_id from Camofox before creating a tab
+            # External user_id only: reuse its existing tab before creating one. Hermes-managed
+            # identities (accounts, managed_persistence) always reuse their own tabs.
+            "adopt_existing_tab": False,
             # Camofox's CAMOFOX_UPLOADS_DIR as seen from this host; browser_upload stages files here.
             # Empty = Camofox's default ~/.camofox/uploads.
             "uploads_dir": "",
@@ -1339,6 +1341,18 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
         "provider": "",
+        # Let Hermes-generated turns (process and delegation notices, goal continuations, heartbeat
+        # and /loop wakeups, cron job runs, recovery notes) key the external provider's automatic
+        # recall. Off: their generated text is a poor query and repeats verbatim across turns, while
+        # the session's own context already carries what they need. Text a person merged into such a
+        # turn still recalls. Explicit memory tools are unaffected.
+        "recall_synthetic_turns": False,
+        # Oldest provider recall (in seconds) still injected. A provider that recalls in the background
+        # after each turn buffers a result keyed on that turn's message; generated and trivial turns
+        # neither use nor replace it, so it can wait hours for the next human message. 30 minutes keeps
+        # the human-to-human follow-ups that dominate real sessions and drops recall about a topic the
+        # session has moved past. 0 = no limit.
+        "prefetch_max_age_seconds": 1800,
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
@@ -1394,8 +1408,11 @@ DEFAULT_CONFIG = {
         # parent still wins: children follow an explicit choice, this is only their default.
         "reasoning_effort": "",
         # Max parallel children per batch AND max concurrent background delegation units; async
-        # dispatches beyond it run synchronously. Floor 1, no ceiling.
+        # dispatches beyond it enter a bounded pending queue. Floor 1, no ceiling.
         "max_concurrent_children": 10,
+        # Maximum pending background delegation calls while the async pool is full.
+        # Zero rejects at capacity without blocking the parent turn.
+        "max_queued_delegations": 8,
         # Background fan-outs return as ONE message when the whole call finishes. true = each task
         # (or `group`) returns on its own as it finishes — more new turns for the orchestrator.
         "independent_completions": False,

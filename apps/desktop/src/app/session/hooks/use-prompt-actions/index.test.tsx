@@ -33,7 +33,7 @@ import type { SessionInfo } from '@/types/hermes'
 
 import { clearSingleFlightSessionResumeState } from './single-flight-resume'
 import { SESSION_COMPRESS_TIMEOUT_MS } from './slash'
-import type { SubmitTextOptions } from './utils'
+import type { SubmitTextOptions, SubmitTextResult } from './utils'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
 
@@ -112,8 +112,8 @@ interface HarnessHandle {
   redirectPrompt: (text: string) => Promise<boolean>
   /** @deprecated Use `redirectPrompt`. */
   steerPrompt: (text: string) => Promise<boolean>
-  submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<boolean>
-  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean>
+  submitTextRaw: (text: string, options?: SubmitTextOptions) => Promise<SubmitTextResult>
+  submitText: (text: string, options?: SubmitTextOptions) => Promise<SubmitTextResult>
 }
 
 function Harness({
@@ -241,7 +241,7 @@ function Harness({
         act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
       submitTextRaw: actions.submitText,
       submitText: (...args: Parameters<typeof actions.submitText>) =>
-        act(async () => actions.submitText(...args)) as Promise<boolean>
+        act(async () => actions.submitText(...args)) as Promise<SubmitTextResult>
     })
   }, [
     actions.cancelRun,
@@ -966,7 +966,7 @@ describe('usePromptActions /compress', () => {
     // helper cannot be used here: this test intentionally keeps its promise
     // pending while the user switches sessions, which would leave React's
     // async act scope open and overlap the wait below.
-    let submitted: Promise<boolean>
+    let submitted: Promise<SubmitTextResult>
     act(() => {
       submitted = handle!.submitTextRaw('/compress')
     })
@@ -1027,7 +1027,7 @@ describe('usePromptActions /compress', () => {
 
     // Keep the RPC pending while the selected stored session changes without
     // leaving an async React act scope open (see the foreground-race test).
-    let submitted: Promise<boolean>
+    let submitted: Promise<SubmitTextResult>
     act(() => {
       submitted = handle!.submitTextRaw('/compress')
     })
@@ -3297,7 +3297,7 @@ describe('usePromptActions file attachment sync', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = handle!.submitTextRaw('describe this')
     })
@@ -3347,7 +3347,7 @@ describe('usePromptActions file attachment sync', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    let submitted!: Promise<boolean>
+    let submitted!: Promise<SubmitTextResult>
     act(() => {
       submitted = handle!.submitTextRaw('read this')
     })

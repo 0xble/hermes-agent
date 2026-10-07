@@ -252,6 +252,30 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
+    # A queued background unit has no child-agent record yet, but it is still
+    # controllable by its delegation handle and must remain visible to its owner.
+    try:
+        from tools.async_delegation import list_async_delegations
+        parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+        for r in list_async_delegations():
+            if r.get("status") != "queued":
+                continue
+            if not _owns_durable_delegation(r, parent_agent):
+                continue
+            entries.append({
+                "subagent_id": r.get("delegation_id"),
+                "delegation_id": r.get("delegation_id"),
+                "parent_id": parent_sid,
+                "goal": r.get("goal"),
+                "model": r.get("model"),
+                "status": "queued",
+                "running_seconds": round(time.time() - (r.get("queued_at") or r.get("dispatched_at") or time.time()), 1),
+                "accepting_steer": False,
+                "live_transcript": None,
+                "queue_reason": r.get("queue_reason", "async pool capacity"),
+            })
+    except Exception:
+        logger.debug("Could not list queued async delegations", exc_info=True)
     payload: Dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
     if not entries:
         payload["note"] = (
@@ -375,6 +399,18 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
         return tool_error(f"action='{action}' requires subagent_id (from the spawn dispatch response or action='list').")
     with _active_subagents_lock:
         record = _active_subagents.get(sid)
+    if record is None and action == "stop":
+        try:
+            from tools.async_delegation import interrupt_delegation, list_async_delegations
+            owned = next((r for r in list_async_delegations()
+                          if r.get("delegation_id") == sid
+                          and _owns_durable_delegation(r, parent_agent)), None)
+            if owned is not None and interrupt_delegation(sid, reason="stopped via delegate_task"):
+                return json.dumps({"action": "stop", "subagent_id": sid, "status": "interrupt_requested",
+                                   "note": "Queued background delegation cancelled; no child was started."}, ensure_ascii=False)
+        except Exception:
+            logger.debug("Could not stop queued async delegation %s", sid, exc_info=True)
+
     if record is None or not _owns_subagent_record(record, parent_agent):
         return tool_error(
             f"No live subagent '{sid}' in this conversation's spawn tree. It "
