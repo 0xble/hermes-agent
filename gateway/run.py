@@ -952,9 +952,10 @@ def _auto_continue_freshness_window() -> float:
 
 
 def _startup_restore_drain_timeout_secs() -> float:
-    """Max seconds ``_finish_startup_restore`` holds the inbound gate for boot auto-resume; <=0 disables.
+    """Maximum seconds a startup or reconnect restore fence waits before releasing inbound traffic.
 
-    Duplicate-agent safety does NOT depend on it: ``_schedule_resume_pending_sessions`` claims SYNCHRONOUSLY.
+    A non-positive value keeps the fence unbounded. Resume-slot claims and scheduler admission remain
+    independent of this timeout, so releasing a fence cannot create a duplicate agent.
     """
     return _float_env("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
 
@@ -3578,7 +3579,7 @@ class GatewayRunner(
 
     def _enqueue_replay(
         self, *, priority: int, kind: str, session_key: Optional[str],
-        dispatch: Callable[[], Any], profile_home: Any = None,
+        dispatch: Callable[[], Any], profile_home: Any = None, on_drop: Optional[Callable[[], Any]] = None,
     ) -> ReplayHandle:
         """Queue one replay with its owning profile captured at enqueue time."""
         captured_home = profile_home
@@ -3597,6 +3598,7 @@ class GatewayRunner(
             session_key=session_key,
             profile_home=captured_home,
             dispatch=_scoped_dispatch,
+            on_drop=on_drop,
         )
 
     def _init_replay_scheduler(self) -> None:
@@ -3707,6 +3709,8 @@ class GatewayRunner(
         # queue instead of competing with the synthetic resume turns; drained after all resume tasks end.
         self._startup_restore_in_progress = False
         self._startup_restore_queue: List[MessageEvent] = []
+        self._startup_restore_keys: Dict[str, int] = {}
+        self._startup_restore_tasks: List[asyncio.Task] = []
         # Startup replay tasks are retained by the scheduler and _replay_resume_tasks;
         # this list is no longer a lifecycle owner.  Keep no duplicate task registry here.
         # Set by start_gateway() only for an explicit ``--replace`` launch; scoped to each adapter's

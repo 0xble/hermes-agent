@@ -490,6 +490,10 @@ async def test_reconnect_restore_fence_releases_after_bounded_resume_wait(tmp_pa
         return 1
 
     runner._schedule_resume_pending_sessions = schedule_resume
+    monkeypatch.setattr(
+        "gateway.run_pending_recovery.recover_pending_shutdown_flush",
+        lambda *args, **kwargs: None,
+    )
     recovery = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
     await asyncio.wait_for(recovery, timeout=2)
 

@@ -2283,6 +2283,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return task
         task = asyncio.create_task(self._run_missed_message_backfill())
         self._missed_message_backfill_task = task
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None and getattr(runner, "_startup_restore_in_progress", False):
+            tasks = getattr(runner, "_startup_restore_tasks", None)
+            if tasks is None:
+                tasks = []
+                runner._startup_restore_tasks = tasks
+            tasks.append(task)
         return task
 
     async def _finish_recovery_scan(self, scan_id: str, status: str, counts: dict, error: Optional[str] = None) -> None:

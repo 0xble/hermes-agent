@@ -78,6 +78,11 @@ class GatewayStartupMixin:
         until it finishes, else a user message can race it)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         try:
+            state = self._peek_session_state(session_key)
+            if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
+                # /stop can release a queued replay's sentinel before the scheduler
+                # gets to it. Do not run the stale queued item after the user asked us to stop.
+                return
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -94,6 +99,14 @@ class GatewayStartupMixin:
         if queue is None:
             queue = self._startup_restore_queue = []
         queue.append(event)
+        key = session_key or self._session_key_for_source(
+            self._normalize_source_for_session_key(event.source)
+        )
+        restore_keys = getattr(self, "_startup_restore_keys", None)
+        if restore_keys is None:
+            restore_keys = self._startup_restore_keys = {}
+        if getattr(self, "_startup_restore_in_progress", False):
+            restore_keys[key] = restore_keys.get(key, 0) + 1
         with suppress(Exception):
             source = event.source
             kind = (
@@ -106,6 +119,22 @@ class GatewayStartupMixin:
                 kind,
                 session_key or self._session_key_for_source(self._normalize_source_for_session_key(source)),
                 extra={"replay_scheduler": "source_queued", "kind": kind},
+            )
+
+    def _release_startup_restore_key(self, session_key: str) -> None:
+        restore_keys = getattr(self, "_startup_restore_keys", None)
+        if not restore_keys or session_key not in restore_keys:
+            return
+        remaining = restore_keys[session_key] - 1
+        if remaining > 0:
+            restore_keys[session_key] = remaining
+            return
+        restore_keys.pop(session_key, None)
+        if getattr(self, "_startup_restore_queue", None):
+            task = asyncio.create_task(self._drain_startup_restore_queue(wait=False))
+            self._retain_background_task(task)
+            task.add_done_callback(
+                self._late_failure_callback("background startup restore drain failed", level=logging.DEBUG)
             )
 
     async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None, wait: bool = True) -> int:
@@ -127,6 +156,7 @@ class GatewayStartupMixin:
                 break
             event = queue.pop(index)
             source = getattr(event, "source", None)
+            key = self._session_key_for_source(self._normalize_source_for_session_key(source))
             adapter = self._intake_adapter_for(source)
             if adapter is None and getattr(event, "_hermes_recovered_followup", False):
                 adapter = self._delivery_adapter_for(source)
@@ -135,6 +165,7 @@ class GatewayStartupMixin:
                     "Dropping startup-restore queued message: adapter unavailable for %s",
                     getattr(getattr(source, "platform", None), "value", None),
                 )
+                self._release_startup_restore_key(key)
                 continue
 
             # Mark the replay so _handle_message does not re-queue it while any
@@ -152,21 +183,51 @@ class GatewayStartupMixin:
                 getattr(self, "_replay_resume_tasks", {}) or {}
             ).get(key) if kind == "recovered_followup" else None
 
-            async def _dispatch(event=event, adapter=adapter, resume_task=resume_task):
-                # A recovered follow-up is a second turn, not a competing replay:
-                # wait for this session's synthetic resume to finish before handing
-                # the user message to the adapter.  The wait is per-session, so the
-                # scheduler can still admit unrelated replays concurrently.
-                if resume_task is not None:
-                    await resume_task
-                await adapter.handle_message(event)
-                if getattr(event, "_gateway_accepted", False) is True:
-                    spool = getattr(event, "_hermes_recovery_spool", None)
-                    if spool is not None:
-                        spool.unlink(missing_ok=True)
-                return getattr(event, "_gateway_accepted", False) is True
+            async def _dispatch(event=event, adapter=adapter):
+                try:
+                    await adapter.handle_message(event)
+                    if getattr(event, "_gateway_accepted", False) is True:
+                        spool = getattr(event, "_hermes_recovery_spool", None)
+                        if spool is not None:
+                            spool.unlink(missing_ok=True)
+                    return getattr(event, "_gateway_accepted", False) is True
+                finally:
+                    self._release_startup_restore_key(key)
 
             profile_home = self._resolve_profile_home_for_source(source)
+            if keys is None and resume_task is not None and not resume_task.done():
+                async def _defer_until_resume(
+                    event=event, adapter=adapter, key=key, profile_home=profile_home,
+                    resume_task=resume_task, dispatch_now=_dispatch,
+                ):
+                    try:
+                        await resume_task
+                    except BaseException:
+                        self._release_startup_restore_key(key)
+                        return
+                    handle = self._enqueue_replay(
+                        priority=REPLAY_PRIORITY_SYNTHETIC,
+                        kind="recovered_followup",
+                        session_key=key,
+                        dispatch=lambda: dispatch_now(),
+                        profile_home=profile_home,
+                    )
+                    waiter = self._retain_background_task(asyncio.create_task(
+                        self._get_replay_scheduler().wait_for(handle)
+                    ))
+                    waiter.add_done_callback(
+                        self._late_failure_callback(
+                            "background recovered follow-up replay failed", level=logging.DEBUG,
+                        )
+                    )
+
+                deferred = self._retain_background_task(asyncio.create_task(_defer_until_resume()))
+                deferred.add_done_callback(
+                    self._late_failure_callback(
+                        "background recovered follow-up scheduling failed", level=logging.DEBUG,
+                    )
+                )
+                continue
             handles.append(self._enqueue_replay(
                 priority=(REPLAY_PRIORITY_SYNTHETIC if kind == "recovered_followup" else REPLAY_PRIORITY_STARTUP),
                 kind=kind,
@@ -302,7 +363,18 @@ class GatewayStartupMixin:
         drained = 0
         try:
             await self._await_startup_warmup()
-            # Replay turns run under the shared scheduler, not under the inbound gate.  Queue the
+            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
+            self._startup_restore_tasks = []
+            if tasks:
+                from gateway.run import _startup_restore_drain_timeout_secs
+                await self._wait_bounded_or_release(
+                    set(tasks), _startup_restore_drain_timeout_secs(),
+                    "Startup restore backfill still running after %.0fs; releasing inbound gate; "
+                    "older backfill turns continue in the background.",
+                    "background startup restore backfill failed after gate release",
+                    level=logging.DEBUG,
+                )
+            # Replay turns run under the shared scheduler, not under the inbound gate. Queue the
             # complete batch first so humans retain priority over resumes, then let the gate open;
             # recovered follow-ups still await their own session's resume task in _dispatch.
             drained = await self._drain_startup_restore_queue(wait=False)
@@ -662,7 +734,7 @@ class GatewayStartupMixin:
         return adapter, source
 
     def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
-                                          candidates=_NOT_SUPPLIED) -> int:
+                                          candidates=_NOT_SUPPLIED, start_scheduler: Optional[bool] = None) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
@@ -671,6 +743,8 @@ class GatewayStartupMixin:
         candidates = self._resume_pending_candidates(platform) if candidates is _NOT_SUPPLIED else candidates
         if candidates is None:
             return 0
+        if start_scheduler is None:
+            start_scheduler = not getattr(self, "_startup_restore_in_progress", False)
         scheduled = 0
         resume_tasks = getattr(self, "_replay_resume_tasks", None)
         if resume_tasks is None:
@@ -703,6 +777,7 @@ class GatewayStartupMixin:
                     self._run_startup_resume_event(adapter, event, key)
                 ),
                 profile_home=profile_home,
+                on_drop=lambda key=entry.session_key: self._drop_queued_resume(key),
             )
             task = self._retain_background_task(asyncio.create_task(
                 self._get_replay_scheduler().wait_for(handle)
@@ -719,10 +794,22 @@ class GatewayStartupMixin:
             if restore_keys is not None:
                 restore_keys.add(entry.session_key)
             scheduled += 1
-        if scheduled:
+        if scheduled and start_scheduler:
             self._get_replay_scheduler().start()
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
+
+    async def _drop_queued_resume(self, session_key: str) -> None:
+        """Release a shutdown-dropped resume sentinel and keep the durable marker recoverable."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        state = self._peek_session_state(session_key)
+        if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
+            return
+        self._release_running_agent_state(session_key)
+        store = getattr(self, "async_session_store", None)
+        if store is not None:
+            with suppress(Exception):
+                await store.mark_resume_pending(session_key, "restart_replay_shutdown")
 
     def _schedule_auto_resume_delegations(self) -> int:
         """Queue bounded parent notices for eligible abandoned single-task rows.
