@@ -222,6 +222,26 @@ class GatewayStartupMixin:
             "boot turn-machinery warm-up failed after gate release", level=logging.DEBUG,
         )
 
+    def _start_mcp_discovery(self) -> None:
+        """Start MCP discovery before adapter connects so it overlaps transport startup."""
+        from gateway.run import _discover_gateway_mcp_tools
+
+        async def _discover_mcp_in_background() -> None:
+            try:
+                await _discover_gateway_mcp_tools(self.config)
+            except Exception as exc:
+                logger.debug("MCP tool discovery failed: %s", exc)
+            finally:
+                self._mcp_discovery_ready.set()
+
+        # Not in ``_background_tasks``: stop() cancels those, but cancelling cannot stop the executor
+        # thread mid-connect. Shutdown waits on this handle before MCP teardown instead.
+        task = asyncio.create_task(_discover_mcp_in_background())
+        self._mcp_discovery_task = task
+        task.add_done_callback(
+            self._late_failure_callback("background MCP tool discovery failed", level=logging.DEBUG)
+        )
+
     async def _await_mcp_discovery(self) -> None:
         """Bound boot auto-resume until MCP discovery has published the tools it may need."""
         from gateway.run import _startup_restore_drain_timeout_secs
@@ -1808,19 +1828,6 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
-        # MCP discovery is independent of restore admission. It stays off the event loop and may finish
-        # later; boot auto-resume waits for its readiness event below, while API admission has its own
-        # short wait and returns 503 on the boundary.
-        from gateway.run import _discover_gateway_mcp_tools
-        async def _discover_mcp_in_background() -> None:
-            try:
-                await _discover_gateway_mcp_tools(self.config)
-            except Exception as exc:
-                logger.debug("MCP tool discovery failed: %s", exc)
-            finally:
-                self._mcp_discovery_ready.set()
-        mcp_task = self._retain_background_task(asyncio.create_task(_discover_mcp_in_background()))
-        mcp_task.add_done_callback(self._late_failure_callback("background MCP tool discovery failed", level=logging.DEBUG))
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
         candidates = await self._resume_pending_candidates_async()
@@ -1915,6 +1922,16 @@ class GatewayStartupMixin:
             result = await self._start_impl()
             startup_succeeded = bool(result and getattr(self, "_running", False))
             return result
+        except Exception:
+            # Fail closed through the normal stop path: adapters may already be connected and inbound
+            # may be queued behind restore, so spool it and disconnect before the error propagates. A
+            # failed boot never writes a clean receipt: the next start must still recover this run.
+            self._suppress_clean_shutdown_receipt = True
+            try:
+                await self.stop()
+            except Exception:
+                logger.exception("Gateway cleanup failed after startup error")
+            raise
         finally:
             # Early startup aborts can return before the normal finish-wiring discovery phase; release any
             # API requests waiting on the readiness barrier when the runner is no longer starting.
@@ -1956,6 +1973,7 @@ class GatewayStartupMixin:
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        self._start_mcp_discovery()
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()

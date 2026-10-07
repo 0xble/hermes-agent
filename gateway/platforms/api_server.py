@@ -949,7 +949,6 @@ def _invalid_request(message: str) -> "web.Response":
     return web.json_response({"error": {"message": message, "type": "invalid_request_error"}}, status=400)
 
 
-_MCP_DISCOVERY_ADMISSION_TIMEOUT = 3.0
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None)
 
@@ -976,15 +975,19 @@ def _admit_api_agent_request(handler):
             runner = self.gateway_runner or request.app.get("gateway_runner")
             mcp_ready = getattr(runner, "_mcp_discovery_ready", None)
             if isinstance(mcp_ready, asyncio.Event) and not mcp_ready.is_set():
+                # Discovery starts before adapters connect; a turn waits for it up to the same bound boot
+                # auto-resume uses. Only a discovery wedged past that bound gets the retryable 503.
+                from gateway.run import _startup_restore_drain_timeout_secs
+                timeout = _startup_restore_drain_timeout_secs()
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(mcp_ready.wait()),
-                        timeout=_MCP_DISCOVERY_ADMISSION_TIMEOUT,
+                        timeout=None if timeout <= 0 else timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "API request refused while MCP discovery remains pending after %.1fs",
-                        _MCP_DISCOVERY_ADMISSION_TIMEOUT,
+                        timeout,
                     )
                     return _error_response(
                         "MCP tool discovery is still in progress; retry shortly",

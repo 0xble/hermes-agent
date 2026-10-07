@@ -1438,19 +1438,20 @@ class GatewayShutdownMixin:
         if counts is None:
             return 0
         suspended = 0
-        for session_key in [k for k, v in counts.items() if v >= self._STUCK_LOOP_THRESHOLD]:
-            with suppress(Exception):
-                entry = self.session_store._entries.get(session_key)
-                if entry and not entry.suspended:
-                    entry.suspended = True
-                    suspended += 1
-                    logger.warning(
-                        "Auto-suspended stuck session %s (active across %d consecutive restarts — likely a stuck loop)",
-                        session_key, counts[session_key],
-                    )
-        if suspended:
-            with suppress(Exception):
-                self.session_store._save()
+        with self.session_store._lock:
+            for session_key in [k for k, v in counts.items() if v >= self._STUCK_LOOP_THRESHOLD]:
+                with suppress(Exception):
+                    entry = self.session_store._entries.get(session_key)
+                    if entry and not entry.suspended:
+                        entry.suspended = True
+                        suspended += 1
+                        logger.warning(
+                            "Auto-suspended stuck session %s (active across %d consecutive restarts — likely a stuck loop)",
+                            session_key, counts[session_key],
+                        )
+            if suspended:
+                with suppress(Exception):
+                    self.session_store._save()
         # Clear the file — counters start fresh after suspension
         with suppress(Exception):
             path.unlink(missing_ok=True)

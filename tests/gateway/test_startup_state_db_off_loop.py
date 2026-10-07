@@ -139,6 +139,7 @@ async def test_finish_wiring_waits_for_mcp_before_boot_resume(monkeypatch):
 
     from tools.process_registry import process_registry
     monkeypatch.setattr(process_registry, "pending_watchers", [])
+    runner._start_mcp_discovery()
     wiring = asyncio.create_task(runner._start_finish_wiring(1))
     await discovery_started.wait()
     await asyncio.sleep(0)

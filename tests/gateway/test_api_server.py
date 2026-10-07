@@ -307,7 +307,7 @@ class TestApiAdmissionMcpReadiness:
             called.append(True)
             return web.Response(status=200)
 
-        monkeypatch.setattr(api_module, "_MCP_DISCOVERY_ADMISSION_TIMEOUT", 0.01)
+        monkeypatch.setenv("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", "0.01")
         monkeypatch.setattr(api_module._api_runs, "_uses_room_run_auth", lambda *_args: False)
         wrapped = _admit_api_agent_request(handler)
 
@@ -317,6 +317,26 @@ class TestApiAdmissionMcpReadiness:
         assert response.headers["Retry-After"] == "1"
         assert json.loads(response.body)["error"]["code"] == "mcp_discovery_pending"
         assert called == []
+
+    @pytest.mark.asyncio
+    async def test_admission_waits_for_discovery_within_startup_bound(self, monkeypatch):
+        """A turn arriving while discovery is still finishing is admitted once it publishes, not refused."""
+        from gateway.platforms import api_server as api_module
+
+        adapter = _make_adapter()
+        runner = types.SimpleNamespace(_mcp_discovery_ready=asyncio.Event())
+        adapter.gateway_runner = runner
+        request = types.SimpleNamespace(headers={}, app={"gateway_runner": runner})
+
+        async def handler(_self, _request):
+            return web.Response(status=200)
+
+        monkeypatch.setattr(api_module._api_runs, "_uses_room_run_auth", lambda *_args: False)
+        asyncio.get_running_loop().call_later(3.5, runner._mcp_discovery_ready.set)
+
+        response = await _admit_api_agent_request(handler)(adapter, request)
+
+        assert response.status == 200
 
 
 

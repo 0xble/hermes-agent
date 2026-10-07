@@ -4971,6 +4971,23 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+async def _settle_mcp_discovery(runner: Any) -> None:
+    """Settle startup MCP discovery before MCP teardown, within the adapter-teardown bound.
+
+    Discovery connects on an executor thread that task cancellation cannot interrupt, so cancelling
+    first would let a connect land after ``shutdown_mcp_servers`` and orphan its stdio child. Wait
+    for it, bounded; past the bound cancel the task and let teardown proceed.
+    """
+    task = getattr(runner, "_mcp_discovery_task", None)
+    if task is None or task.done():
+        return
+    timeout = _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT
+    _done, pending = await asyncio.wait({task}, timeout=timeout)
+    if pending:
+        task.cancel()
+        logger.warning("MCP discovery still running after %.1fs at shutdown; tearing MCP down anyway", timeout)
+
+
 async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0, config: Any = None) -> bool:
     """Close MCP servers off-loop with a bounded wait; True when done within ``timeout``.
     ``shutdown_mcp_servers()`` can block ~15s; on the loop thread short-grace supervisors (s6 3s)
@@ -5879,6 +5896,9 @@ async def _start_gateway_shutdown_tail(
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
+    # Settle startup discovery before MCP teardown so a late connect cannot outlive the server shutdown.
+    await _settle_mcp_discovery(runner)
+
     # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
     # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
     try:
@@ -6097,6 +6117,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     try:
         success = await runner.start()
     except BaseException:
+        # start() already ran the normal stop/flush path; MCP discovery began before the failure.
+        await _settle_mcp_discovery(runner)
+        try:
+            await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
+        except Exception:
+            logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
         _shutdown_gateway_health_export(runner)
         await _close_active_generation()
         raise
@@ -6118,6 +6144,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
         try:
             await runner.wait_for_shutdown()
+            await _settle_mcp_discovery(runner)
             try:
                 await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
             except Exception:

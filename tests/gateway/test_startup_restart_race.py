@@ -400,3 +400,72 @@ async def test_failure_exit_still_stops_cron_housekeeping_and_mcp(monkeypatch):
     for thread in threads + [watcher]:
         thread.join(timeout=2)
         assert not thread.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_clean_marker_failure_spools_queued_inbound_and_disconnects(tmp_path, monkeypatch):
+    """Fail-closed clean-marker cleanup must not drop inbound already acknowledged by a transport."""
+    import json
+    from dataclasses import replace
+    from gateway.platforms.event import MessageEvent
+    from tests.gateway.restart_test_helpers import make_restart_source
+
+    patch_startup_side_effects(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.run_pending_recovery.get_routing_process_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    (tmp_path / ".clean_shutdown").write_text("clean", encoding="utf-8")
+    runner = make_startup_runner(tmp_path)
+    runner.config.platforms.pop(Platform.SLACK)
+    source = replace(make_restart_source(), message_id="7")
+    inbound = MessageEvent(text="arrived during restore", source=source, user_id="u1")
+    telegram = StartupRaceAdapter(
+        Platform.TELEGRAM, on_connect=lambda: runner._queue_startup_restore_event(inbound),
+    )
+    runner._create_adapter = MagicMock(return_value=telegram)
+
+    async def cleanup_fails(_marker):
+        raise OSError("state store unavailable")
+
+    runner._consume_clean_shutdown_marker = cleanup_fails
+    monkeypatch.setattr(gateway_run, "_discover_gateway_mcp_tools", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="clean-start recovery cleanup failed"):
+        await asyncio.wait_for(runner.start(), timeout=30)
+
+    assert telegram.disconnected is True
+    spooled = [json.loads(p.read_text(encoding="utf-8"))["data"]["text"]
+               for p in (tmp_path / "pending_messages").glob("*.json")]
+    assert spooled == ["arrived during restore"]
+    assert (tmp_path / ".clean_shutdown").exists()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_settles_startup_mcp_discovery_before_mcp_teardown(monkeypatch):
+    """A discovery connect still landing at shutdown must finish before teardown, or its child leaks."""
+    import threading
+
+    order = []
+    cron_stop = threading.Event()
+    idle = [threading.Thread(target=lambda: None, daemon=True) for _ in range(3)]
+    for thread in idle:
+        thread.start()
+
+    async def late_discovery():
+        await asyncio.sleep(0.2)
+        order.append("discovery connected")
+
+    async def fake_mcp_shutdown(*_args, **_kwargs):
+        order.append("mcp teardown")
+
+    monkeypatch.setattr(gateway_run, "_shutdown_mcp_servers_nonblocking", fake_mcp_shutdown)
+    monkeypatch.setattr(gateway_run, "_stop_cron_provider", lambda provider: None)
+    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.stop_nous_auth_keepalive", lambda: None)
+    runner = MagicMock(should_exit_with_failure=True, exit_reason="boom", exit_code=None)
+    runner._mcp_discovery_task = asyncio.create_task(late_discovery())
+
+    await gateway_run._start_gateway_shutdown_tail(
+        runner, None, cron_stop, object(), idle[0], idle[1], threading.Event(), idle[2], [False])
+
+    assert order == ["discovery connected", "mcp teardown"]
