@@ -527,20 +527,12 @@ class GatewayTurnPersistenceMixin:
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
-        raw_response=None,
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
         if diagnostic_wake_muted(event):
             return None
-        raw_response = response if raw_response is None else raw_response
-        # LOOP_COMPLETE is a /loop control marker, not assistant content. The non-streamed
-        # return value is the stripped display text, so stash the raw reply for the
-        # post-turn hooks (see _final_text_for_post_turn_hooks).
-        with suppress(Exception):
-            event._raw_final_response = str(raw_response or "")
-        from gateway.response_filters import strip_trailing_loop_complete_marker
-        response = strip_trailing_loop_complete_marker(response)
+        # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
@@ -571,7 +563,7 @@ class GatewayTurnPersistenceMixin:
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
-                event._streamed_final_response = str(raw_response or "")
+                event._streamed_final_response = str(response or "")
             return None
 
         return response
