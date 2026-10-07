@@ -73,6 +73,20 @@ def _store(tmp_path):
     return SessionStore(tmp_path, GatewayConfig(restart_resume_policy="continue"))
 
 
+def _note_runner(store, source, adapter):
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None),
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {}
+    return runner
+
+
 @pytest.mark.asyncio
 async def test_human_restart_note_is_visible_once_even_when_broadcast_is_disabled(tmp_path):
     store = _store(tmp_path)
@@ -223,6 +237,70 @@ async def test_failed_s2_transport_releases_real_store_claim_for_retry(tmp_path)
     assert attempts == 2
     assert len(adapter.sent) == 1
     assert store.get_restart_note(entry.session_key)[3] == "m2"
+
+
+@pytest.mark.asyncio
+async def test_claim_cancelled_before_send_is_reclaimable_on_startup(tmp_path):
+    store = _store(tmp_path)
+    source = _source("cancel-before-send")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-cancel-before", human=True)
+    adapter = NoteAdapter()
+    runner = _note_runner(store, source, adapter)
+    original_mark_sending = runner.async_session_store.mark_restart_note_sending
+
+    async def cancel_before_send(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    runner.async_session_store.mark_restart_note_sending = cancel_before_send
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 0
+    assert adapter.sent == []
+    assert store.get_restart_note(entry.session_key) is None
+
+    runner.async_session_store.mark_restart_note_sending = original_mark_sending
+    assert await runner._send_interrupted_turn_notes(
+        [entry.session_key], reclaim_pending=True,
+    ) == 1
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_send_is_terminal_and_not_replayed_on_startup(tmp_path):
+    store = _store(tmp_path)
+    source = _source("cancel-during-send")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-cancel-during", human=True)
+    adapter = NoteAdapter()
+
+    async def cancel_during_send(chat_id, content, reply_to=None, metadata=None):
+        adapter.sent.append((chat_id, content, metadata))
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+    adapter.send = cancel_during_send
+    runner = _note_runner(store, source, adapter)
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 0
+    assert len(adapter.sent) == 1
+    note = store.get_restart_note(entry.session_key)
+    assert note is not None and note[3].startswith("sending:")
+
+    assert await runner._send_interrupted_turn_notes(
+        [entry.session_key], reclaim_pending=True,
+    ) == 0
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_send_transitions_sending_marker_to_message_id(tmp_path):
+    store = _store(tmp_path)
+    source = _source("sending-success")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-success", human=True)
+    adapter = NoteAdapter()
+    runner = _note_runner(store, source, adapter)
+
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "m1"
 
 
 @pytest.mark.asyncio
@@ -485,7 +563,7 @@ async def test_missed_s2_note_gets_one_shutdown_fallback_only_on_send_failure(
     runner._thread_metadata_for_target = lambda *args, **kwargs: {}
     if not note_succeeds:
         async def failed_send(*_args, **_kwargs):
-            raise RuntimeError("transport down")
+            return SendResult(success=False, error="transport down")
         adapter.send = failed_send
     fallback_calls = []
 
@@ -959,9 +1037,9 @@ async def test_crash_recovery_reclaims_unposted_note_once(tmp_path):
 
     assert await runner._send_interrupted_turn_notes(
         [entry.session_key], reclaim_pending=True,
-    ) == 0
-    assert len(adapter.sent) == 0
-    assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
+    ) == 1
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "m1"
 
 
 @pytest.mark.asyncio
@@ -1054,7 +1132,7 @@ async def test_shutdown_note_batch_is_bounded_before_interrupting_agents(tmp_pat
 
     assert elapsed < 2.7
     runner._interrupt_running_agents.assert_called()
-    assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
+    assert store.get_restart_note(entry.session_key)[3].startswith("sending:")
 
 
 def test_startup_note_candidates_reject_legacy_and_stale_rows():
@@ -1286,7 +1364,8 @@ def test_pending_note_claim_is_atomic_and_recoverable(tmp_path):
     assert store.claim_restart_note(entry.session_key, expected_marker=marker)
     assert not store.claim_restart_note(entry.session_key, expected_marker=marker)
     assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
-    assert not store.claim_restart_note(entry.session_key, expected_marker=marker, reclaim_pending=True)
+    assert store.claim_restart_note(entry.session_key, expected_marker=marker, reclaim_pending=True)
+    assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
 
 
 @pytest.mark.asyncio

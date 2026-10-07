@@ -297,10 +297,12 @@ class SessionLifecycleMixin:
         self, session_key: str, *, expected_marker: Optional[tuple] = None,
         reclaim_pending: bool = False,
     ) -> bool:
-        """Atomically reserve one append-only note send for an interruption marker.
+        """Atomically reserve one note send for an interruption marker.
 
-        A pending claim is deliberately not reclaimed: the transport may have accepted the request
-        before a process died, and retrying it would violate the at-most-one visible-note contract.
+        A missing record is claimed as ``pending:<token>``.  A pending claim may be
+        reclaimed only when ``reclaim_pending`` is true, because no send has started
+        yet.  ``sending:<token>`` and real message ids are terminal: the transport may
+        have seen the request, so neither may be reclaimed or sent again.
         """
         def _apply(entry: SessionEntry):
             if not entry.resume_pending:
@@ -310,8 +312,16 @@ class SessionLifecycleMixin:
             if marker != current:
                 return False
             record = self._find_note_record_locked(entry, marker)
-            if record is not None and record.get("message_id"):
-                return False
+            if record is not None:
+                message_id = str(record.get("message_id") or "")
+                if message_id.startswith("sending:"):
+                    logger.warning(
+                        "Not reclaiming interrupted-turn note for %s: send is already in progress or ambiguous",
+                        session_key,
+                    )
+                    return False
+                if message_id and not (reclaim_pending and message_id.startswith("pending:")):
+                    return False
             records = self._note_records_locked(entry)
             if record is None:
                 record = {
@@ -328,6 +338,23 @@ class SessionLifecycleMixin:
             return True
         return self._update_entry(session_key, _apply)
 
+    def mark_restart_note_sending(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+    ) -> bool:
+        """Atomically mark a claimed note as having entered the ambiguous send phase."""
+        def _apply(entry: SessionEntry):
+            marker = expected_marker or (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            )
+            record = self._find_note_record_locked(entry, marker)
+            if record is None or not str(record.get("message_id", "")).startswith("pending:"):
+                return False
+            token = str(record["message_id"])[len("pending:"):]
+            record["message_id"] = f"sending:{token}"
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
     def release_restart_note_claim(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
         """Release only an unposted pending claim; visible note records are never removed."""
         def _apply(entry: SessionEntry):
@@ -340,6 +367,26 @@ class SessionLifecycleMixin:
             self._note_records_locked(entry).remove(record)
             # Clear the legacy compatibility view before syncing. Otherwise an empty record list
             # re-migrates the just-released pending claim as a legacy record.
+            entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def release_restart_note_after_failed_send(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+    ) -> bool:
+        """Release a send marker after the adapter explicitly reports a failed send."""
+        def _apply(entry: SessionEntry):
+            marker = expected_marker or (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            )
+            record = self._find_note_record_locked(entry, marker)
+            if record is None or not str(record.get("message_id", "")).startswith("sending:"):
+                return False
+            self._note_records_locked(entry).remove(record)
             entry.restart_note_message_id = None
             entry.restart_note_marker_token = None
             entry.restart_note_turn_id = None
@@ -370,7 +417,9 @@ class SessionLifecycleMixin:
                 }
                 records.append(record)
             existing = record.get("message_id")
-            if existing and not str(existing).startswith("pending:"):
+            if existing and not (
+                str(existing).startswith("pending:") or str(existing).startswith("sending:")
+            ):
                 return False
             record["message_id"] = str(message_id)
             self._sync_legacy_note_fields(entry)

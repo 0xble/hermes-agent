@@ -954,8 +954,9 @@ class GatewayShutdownMixin:
         """
         async def _send_one(session_key) -> int:
             marker = None
-            send_succeeded = False
+            send_started = False
             claim_kept = False
+            release_claim = None
             note_claims = getattr(self, "_s2_note_claimed_keys", None)
             if note_claims is None:
                 note_claims = self._s2_note_claimed_keys = {}
@@ -980,11 +981,20 @@ class GatewayShutdownMixin:
                     return 0
                 marker = await self.async_session_store.get_resume_pending_marker(session_key)
                 note = await self.async_session_store.get_restart_note(session_key)
-                # A visible or in-flight note for this marker is terminal. Never delete or
-                # replace it, including during startup recovery.
+                # A visible note is terminal. A pending claim is reclaimable only during startup
+                # recovery; a sending marker is ambiguous and must never be retried or converted
+                # into an ordinary notice.
                 if note and note[3]:
-                    getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
-                    return 0
+                    note_id = str(note[3])
+                    if not (reclaim_pending and note_id.startswith("pending:")):
+                        if note_id.startswith("sending:"):
+                            logger.warning(
+                                "Not retrying interrupted-turn note for %s: durable send is ambiguous",
+                                session_key,
+                            )
+                            return 0
+                        getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
+                        return 0
                 target = await self._shutdown_notification_target(session_key)
                 if target is None:
                     note_failed.add(session_key)
@@ -1025,6 +1035,11 @@ class GatewayShutdownMixin:
                               or getattr(self, "_restart_requested", False))
                               else "gateway.shutdown.notice_shutdown")
                     )
+                    send_started = await self.async_session_store.mark_restart_note_sending(
+                        session_key, expected_marker=marker,
+                    )
+                    if not send_started:
+                        return 0
                     result = await adapter.send(
                         chat_id, text,
                         metadata={**(metadata or {}), "_interim_send": True},
@@ -1032,9 +1047,13 @@ class GatewayShutdownMixin:
 
                 if not result or not getattr(result, "success", False):
                     note_failed.add(session_key)
-                    await release_claim()
+                    if send_started:
+                        await self.async_session_store.release_restart_note_after_failed_send(
+                            session_key, expected_marker=marker,
+                        )
+                    elif callable(release_claim):
+                        await release_claim()
                     return 0
-                send_succeeded = True
                 note_id = getattr(result, "message_id", None) or "sent:no-id"
                 if await self.async_session_store.set_restart_note_message_id(
                     session_key, str(note_id), expected_marker=marker,
@@ -1047,16 +1066,35 @@ class GatewayShutdownMixin:
                 # duplicate visible note.
                 claim_kept = True
                 return 0
+            except asyncio.CancelledError:
+                if send_started:
+                    # The transport may have accepted the request; keep the terminal sending marker.
+                    claim_kept = True
+                else:
+                    # Cancellation before the transport boundary leaves a reclaimable pending claim.
+                    if callable(release_claim):
+                        try:
+                            await asyncio.wait_for(asyncio.shield(release_claim()), timeout=0.5)
+                        except Exception:
+                            pass
+                raise
             except Exception:
-                if not send_succeeded:
+                if send_started:
+                    # An adapter exception is ambiguous: the request may have reached the transport.
+                    claim_kept = True
+                    logger.warning(
+                        "Interrupted-turn note send became ambiguous for %s; preserving terminal sending claim",
+                        session_key,
+                        exc_info=True,
+                    )
+                else:
                     note_failed.add(session_key)
-                    try:
-                        await self.async_session_store.release_restart_note_claim(
-                            session_key, expected_marker=marker,
-                        )
-                    except Exception:
-                        pass
-                logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
+                    if callable(release_claim):
+                        try:
+                            await release_claim()
+                        except Exception:
+                            pass
+                    logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
                 return 0
             finally:
                 if not claim_kept:
