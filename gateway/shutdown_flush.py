@@ -263,6 +263,19 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
         return 0
     flush_files = sorted(entries, key=lambda entry: entry[0])
     own_db = session_db is None
+    # Recovery callers that provide a session resolver normally route every ordinary pending
+    # message to its profile-owned SessionDB. Do not open the shared default state.db just to
+    # discover that fact: on a loaded gateway the registry acquisition can take several seconds,
+    # delaying claim-and-queue of follow-ups. Payloads that inherently need the ambient DB (legacy
+    # session_id rows and transcript-cap drops) still opt into the existing eager path.
+    if own_db and session_resolver is not None:
+        needs_ambient_db = any(
+            payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON
+            or bool((payload.get("data") or {}).get("session_id"))
+            for _order, _path, payload in flush_files
+        )
+        if not needs_ambient_db:
+            own_db = False
     if own_db:
         from hermes_state_registry import acquire
         session_db = acquire()
@@ -288,7 +301,7 @@ def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_fo
             except Exception as exc:
                 logger.warning("Failed to recover pending message from %s: %s", path, exc)
     finally:
-        if own_db:  # shutdown cancellation/interrupt must not strand an owned DB
+        if own_db and session_db is not None:  # shutdown cancellation/interrupt must not strand an owned DB
             with contextlib.suppress(Exception):
                 from hermes_state_registry import release_or_close
                 release_or_close(session_db)

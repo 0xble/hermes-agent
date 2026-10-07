@@ -114,13 +114,15 @@ async def test_reconnect_watcher_waits_until_resume_scheduling_signal(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_finish_wiring_discovers_mcp_before_restore_gate(monkeypatch):
+async def test_finish_wiring_opens_restore_gate_without_waiting_for_mcp(monkeypatch):
     import gateway.run as gateway_run
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig()
     runner._mcp_discovery_ready = asyncio.Event()
     runner._startup_restore_in_progress = True
+    discovery_started = asyncio.Event()
+    release_discovery = asyncio.Event()
     order = []
 
     async def post_connect(_connected_count):
@@ -130,7 +132,9 @@ async def test_finish_wiring_discovers_mcp_before_restore_gate(monkeypatch):
         order.append("boot_sends")
 
     async def discover(_config):
-        order.append(("mcp", runner._startup_restore_in_progress, runner._mcp_discovery_ready.is_set()))
+        discovery_started.set()
+        await release_discovery.wait()
+        order.append("mcp")
 
     async def no_candidates(*_args, **_kwargs):
         return []
@@ -152,12 +156,17 @@ async def test_finish_wiring_discovers_mcp_before_restore_gate(monkeypatch):
     runner._finish_startup_restore = finish_restore
     runner._schedule_auto_resume_delegations = lambda: order.append("delegations")
     runner._send_session_db_warning_notifications = no_candidates
+    runner._retain_background_task = lambda task: task
 
     from tools.process_registry import process_registry
     monkeypatch.setattr(process_registry, "pending_watchers", [])
     await runner._start_finish_wiring(1)
 
-    assert order.index(("mcp", True, False)) < order.index("restore")
+    await discovery_started.wait()
+    assert "restore" in order
+    assert "mcp" not in order
+    release_discovery.set()
+    await asyncio.sleep(0)
     assert runner._mcp_discovery_ready.is_set()
 
 

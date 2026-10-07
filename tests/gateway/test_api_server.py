@@ -292,7 +292,33 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
-class TestConcurrencyCap:
+class TestApiAdmissionMcpReadiness:
+    @pytest.mark.asyncio
+    async def test_pending_mcp_discovery_returns_bounded_503(self, monkeypatch):
+        from gateway.platforms import api_server as api_module
+
+        adapter = _make_adapter()
+        runner = types.SimpleNamespace(_mcp_discovery_ready=asyncio.Event())
+        adapter.gateway_runner = runner
+        request = types.SimpleNamespace(headers={}, app={"gateway_runner": runner})
+        called = []
+
+        async def handler(_self, _request):
+            called.append(True)
+            return web.Response(status=200)
+
+        monkeypatch.setattr(api_module, "_MCP_DISCOVERY_ADMISSION_TIMEOUT", 0.01)
+        monkeypatch.setattr(api_module._api_runs, "_uses_room_run_auth", lambda *_args: False)
+        wrapped = _admit_api_agent_request(handler)
+
+        response = await wrapped(adapter, request)
+
+        assert response.status == 503
+        assert response.headers["Retry-After"] == "1"
+        assert json.loads(response.body)["error"]["code"] == "mcp_discovery_pending"
+        assert called == []
+
+
 
 
 

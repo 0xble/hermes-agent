@@ -4851,48 +4851,49 @@ def _start_gateway_housekeeping(
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
-    chores: list[tuple[int, str, Any]] = [
+    chores: list[tuple[int, str, Any, bool]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
         # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
         # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
-        (1, "Runtime heartbeat", _write_runtime_status_quiet)]
+        (1, "Runtime heartbeat", _write_runtime_status_quiet, False)]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
-        chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
+        chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
     if runner is not None and loop is not None:
-        chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop)))
+        chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False))
     chores += [
-        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
-        (60, "Media cache cleanup", _housekeeping_media_caches),
-        (60, "Paste sweep", _housekeeping_paste_sweep)]
+        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop), False),
+        (60, "Media cache cleanup", _housekeeping_media_caches, False),
+        (60, "Paste sweep", _housekeeping_paste_sweep, False)]
     if cron_provider is not None:
-        chores.append((5, "Misfire catch-up sweep", lambda: _housekeeping_misfire_catch_up(cron_provider, adapters, loop)))
+        chores.append((5, "Misfire catch-up sweep", lambda: _housekeeping_misfire_catch_up(cron_provider, adapters, loop), False))
     if cron_thread is not None:
         # The ticker's own guards keep its loop alive; this is the outer layer for a thread that has
         # already ended (#111010). Runs every tick so the outage is bounded by one housekeeping interval.
-        chores.append((1, "Cron ticker supervisor", cron_thread.restart_if_dead))
+        chores.append((1, "Cron ticker supervisor", cron_thread.restart_if_dead, False))
     chores += [
         # Per served profile: each profile has its own skills tree, curator state, Nous login
         # and state.db.
-        (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator)),
-        (60, "Sync pull tick", profile_scoped_chore(runner, _housekeeping_skill_sync)),
-        (60, "Org sync pull tick", profile_scoped_chore(runner, _housekeeping_org_skill_sync)),
+        (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator), False),
+        (60, "Sync pull tick", profile_scoped_chore(runner, _housekeeping_skill_sync), False),
+        (60, "Org sync pull tick", profile_scoped_chore(runner, _housekeeping_org_skill_sync), False),
         (60, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
-                _housekeeping_state_db_maintenance(_launch))),
+                _housekeeping_state_db_maintenance(_launch),
+        ), True),
         # Due-gated inside: the first tick after startup runs an overdue check, not tick 60.
         # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
-        (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
-        (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
-        (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
-        (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
+        (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check), False),
+        (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry, False),
+        (1, "gateway housekeeping memory trim", _housekeeping_memory_trim, False),
+        (1, "MCP config reconcile", _mcp_config_reconciler(runner), False),
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.
-        (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune)]
+        (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune, False)]
 
     # Between ticks the queue file is watched so a worker's send goes out when it is queued,
     # not up to ``interval`` later (#117307); the tick's drain above remains the fallback.
@@ -4906,19 +4907,18 @@ def _start_gateway_housekeeping(
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
-    first_tick_labels = {"state.db maintenance tick"}
     while not stop_event.is_set():
         tick_count += 1
         deferred_after_watch = []
-        for every, label, fn in chores:
-            if label in first_tick_labels:
-                due = tick_count == 1 or (tick_count > 1 and (tick_count - 1) % every == 0)
-            else:
-                due = tick_count % every == 0
+        for every, label, fn, first_tick in chores:
+            due = (
+                (tick_count == 1 or (tick_count > 1 and (tick_count - 1) % every == 0))
+                if first_tick else tick_count % every == 0
+            )
             if due:
                 # Give the delivery queue watcher its first window before the potentially blocking
                 # state.db prune/VACUUM. Later maintenance runs follow a completed watch window too.
-                if label in first_tick_labels and tick_count == 1:
+                if first_tick and tick_count == 1:
                     deferred_after_watch.append((label, fn))
                 else:
                     _housekeeping_chore(label, fn)

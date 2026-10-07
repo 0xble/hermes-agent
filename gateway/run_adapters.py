@@ -856,24 +856,27 @@ class GatewayAdapterLifecycleMixin:
 
     async def _recover_spool_after_reconnect(self, platform, resume_scheduled=None) -> None:
         """Claim owed follow-ups before resume and drain them as separate turns."""
-        from gateway.run_pending_recovery import recover_pending_shutdown_flush
         from gateway.run import _startup_restore_drain_timeout_secs
         if resume_scheduled is None:
             resume_scheduled = (getattr(self, "_reconnect_resume_events", None) or {}).get(platform)
         candidates = await self._resume_pending_candidates_async(record_boot=False)
-        recovered_events = []
         tasks = []
         keys = set()
         try:
-            await asyncio.to_thread(
-                recover_pending_shutdown_flush,
-                self, candidates=candidates, platform=platform, recovered_events=recovered_events,
+            recovered_events = await self._recover_pending_shutdown_flush_off_loop(
+                candidates=candidates,
+                platform=platform,
+                failure_message=(
+                    f"Pending follow-up recovery after {platform.value} reconnect failed; spools retained"
+                ),
             )
         except Exception:
+            # The helper logs and retains spools on worker failure; this guard preserves the reconnect
+            # path's fail-open scheduling if a lightweight test runner overrides the helper itself.
             logger.warning("Pending follow-up recovery after %s reconnect failed; spools retained", platform.value,
                            exc_info=True)
+            recovered_events = []
         for event in recovered_events:
-            self._queue_startup_restore_event(event)
             keys.add(self._session_key_for_source(self._normalize_source_for_session_key(event.source)))
         try:
             # Recovery scans all served homes, but only the newly available platform resumes.

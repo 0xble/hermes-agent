@@ -245,6 +245,36 @@ class GatewayStartupMixin:
                     self._retain_background_task(task)
         return done
 
+    async def _recover_pending_shutdown_flush_off_loop(
+        self, *, candidates, platform=None, failure_message: str,
+    ) -> list[MessageEvent]:
+        """Claim pending follow-ups off-loop and publish them before another pass may start.
+
+        The lock deliberately covers both the worker-thread scan and loop-side queue publication.
+        A lock around only ``to_thread`` leaves a duplicate-claim window while the caller transfers
+        its local event list into ``_startup_restore_queue``.
+        """
+        from gateway.run_pending_recovery import recover_pending_shutdown_flush
+
+        lock = getattr(self, "_pending_recovery_lock", None)
+        if lock is None:
+            # Bare test runners do not execute GatewayRunner.__init__; creation is synchronous before
+            # the first await, so two callers on this loop cannot create separate locks.
+            lock = self._pending_recovery_lock = asyncio.Lock()
+        async with lock:
+            recovered_events: list[MessageEvent] = []
+            try:
+                await asyncio.to_thread(
+                    recover_pending_shutdown_flush,
+                    self, candidates=candidates, platform=platform,
+                    recovered_events=recovered_events,
+                )
+            except Exception:
+                logger.warning(failure_message, exc_info=True)
+            for event in recovered_events:
+                self._queue_startup_restore_event(event)
+            return recovered_events
+
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED by ``_startup_restore_drain_timeout_secs``) for startup auto-resume, then
         release + drain inbound. On timeout the gate opens and resume turns finish in the background
@@ -1782,30 +1812,26 @@ class GatewayStartupMixin:
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
         )
-        # MCP discovery stays off the event loop (the helper uses executor threads), but it must finish
-        # before the startup restore gate opens so the first inbound turn sees the complete tool surface.
-        # Adapters are already polling by this point, so slow MCP servers cannot delay adapter readiness.
+        # MCP discovery is independent of restore admission. It stays off the event loop and may finish
+        # later; inbound turns admitted after the restore gate opens simply run without MCP tools until
+        # discovery publishes them. API admission has its own short wait and returns 503 on the boundary.
         from gateway.run import _discover_gateway_mcp_tools
-        try:
-            await _discover_gateway_mcp_tools(self.config)
-        except Exception as exc:
-            logger.debug("MCP tool discovery failed: %s", exc)
-        finally:
-            self._mcp_discovery_ready.set()
+        async def _discover_mcp_in_background() -> None:
+            try:
+                await _discover_gateway_mcp_tools(self.config)
+            except Exception as exc:
+                logger.debug("MCP tool discovery failed: %s", exc)
+            finally:
+                self._mcp_discovery_ready.set()
+        mcp_task = self._retain_background_task(asyncio.create_task(_discover_mcp_in_background()))
+        mcp_task.add_done_callback(self._late_failure_callback("background MCP tool discovery failed", level=logging.DEBUG))
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
-        from gateway.run_pending_recovery import recover_pending_shutdown_flush
         candidates = await self._resume_pending_candidates_async()
-        recovered_events = []
-        try:
-            await asyncio.to_thread(
-                recover_pending_shutdown_flush,
-                self, candidates=candidates, recovered_events=recovered_events,
-            )
-            for event in recovered_events:
-                self._queue_startup_restore_event(event)
-        except Exception:
-            logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
+        await self._recover_pending_shutdown_flush_off_loop(
+            candidates=candidates,
+            failure_message="Pending-message recovery failed; spools retained",
+        )
         # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions(candidates=candidates)
