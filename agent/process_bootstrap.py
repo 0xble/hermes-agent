@@ -355,7 +355,6 @@ def _install_safe_stdio() -> None:
                 continue
             setattr(sys, stream_name, _SafeWriter(real))
 
-
 # Drop-in for ``openai.OpenAI``.
 OpenAI = _OpenAIProxy()
 
