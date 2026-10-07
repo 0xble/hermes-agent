@@ -3677,13 +3677,19 @@ class GatewayRunner(
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
-        # Agent-triggered terminal completions from one conversation often land in the same scheduler
-        # tick; hold them briefly so the agent gets one synthetic turn instead of one per process.
-        # See #70300.
+        # Per-conversation completion fan-in (see GatewayNotificationsMixin._completion_hold_seconds):
+        # routine results for a busy or recently woken session are held so the agent gets one
+        # synthetic turn per window instead of one per result. Failures never wait.
         self._completion_notification_batches: dict[tuple[str, ...], list[tuple[str, dict, asyncio.Future]]] = {}
         self._completion_notification_batch_tasks: dict[tuple[str, ...], asyncio.Task] = {}
         self._completion_notification_batch_flush_tasks: set[asyncio.Task] = set()
-        self._completion_notification_batch_window = 0.1
+        self._completion_notification_batch_releases: dict[tuple[str, ...], asyncio.Event] = {}
+        # None: read gateway.completion_notification_batch_window_seconds per owning profile.
+        self._completion_notification_batch_window: Optional[float] = None
+        self._async_delegation_batches: dict[tuple[str, ...], list[dict]] = {}
+        self._async_delegation_batch_tasks: dict[tuple[str, ...], asyncio.Task] = {}
+        self._async_delegation_batch_releases: dict[tuple[str, ...], asyncio.Event] = {}
+        self._async_delegation_batch_flush_tasks: set[asyncio.Task] = set()
         self._completion_notification_batches_stopping = False
 
     def _init_runtime_caches(self) -> None:
@@ -4119,8 +4125,7 @@ class GatewayRunner(
     # Values are catalog keys; ``run_busy._dispatch_busy_slash_command`` resolves them with ``t()``.
     _BUSY_REJECT_TEXT: Dict[str, str] = {
         "model": "gateway.busy.reject_model",
-        "codex-runtime": "gateway.busy.reject_codex_runtime",
-        "moa": "gateway.busy.reject_moa"}
+        "codex-runtime": "gateway.busy.reject_codex_runtime"}
 
     def _active_profile_name(self) -> str:
         """Return the profile name this gateway represents."""
@@ -4336,6 +4341,10 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
+            # Bind the turn's own session id. Only agent construction published it before, so a
+            # turn served by a CACHED agent ran with HERMES_SESSION_ID bound to "" and anything that
+            # needs the caller (MCP caller_identity, process/kanban ownership) saw no session.
+            session_id=getattr(context, "session_id", "") or "",
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
@@ -4469,7 +4478,8 @@ class GatewayRunner(
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
-        ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
+        ("memory", "provider"), ("memory", "recall_synthetic_turns"), ("memory", "prefetch_max_age_seconds"),
+        ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 
     @staticmethod

@@ -64,6 +64,7 @@ import {
   markSessionRecentlyInterrupted,
   shouldInterruptBeforeRewind,
   type SubmitTextOptions,
+  type SubmitTextResult,
   withSessionNotFoundResume
 } from '../session/hooks/use-prompt-actions/utils'
 import { upsertOptimisticSession } from '../session/hooks/use-session-actions/utils'
@@ -318,13 +319,14 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   })
 
   const submitText = useCallback(
-    async (rawText: string, options?: SubmitTextOptions) => {
-      const visibleText = rawText.trim()
-      const attachments = options?.attachments ?? scope.attachments.$attachments.get()
+    async (rawText: string, options?: SubmitTextOptions): Promise<SubmitTextResult> => {
+      const tokenPayload = Boolean(options?.moaToken)
+      const visibleText = tokenPayload ? rawText : rawText.trim()
+      const attachments = tokenPayload ? (options?.attachments ?? []) : (options?.attachments ?? scope.attachments.$attachments.get())
 
       listTileSession(visibleText)
 
-      if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
+      if (!tokenPayload && !attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
         await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current)
 

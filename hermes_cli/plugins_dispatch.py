@@ -234,6 +234,11 @@ class PluginDispatchMixin:
             try:
                 spec = getattr(cb, "hermes_shell_hook_spec", None)
                 if spec is not None:
+                    from agent import shell_hooks
+                    # Applicability and fail-open cooldowns are checked before the bounded worker,
+                    # so an inapplicable or unhealthy shell hook costs neither a thread nor a fork.
+                    if shell_hooks.shell_hook_should_skip(spec):
+                        continue
                     # A shell hook gates itself (#132096). Its matcher — not the dispatcher —
                     # decides whether this tool is its business, so an unmatched tool must bypass
                     # the wrapper entirely; otherwise one timeout's 60 s suppression would block

@@ -73,6 +73,7 @@ import {
   renderRpcResult,
   slashStatusText,
   type SubmitTextOptions,
+  type SubmitTextResult,
   withSessionNotFoundResume
 } from './utils'
 
@@ -156,7 +157,7 @@ interface SlashCommandDeps {
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
-  submitPromptText: (rawText: string, options?: SubmitTextOptions) => Promise<boolean>
+  submitPromptText: (rawText: string, options?: SubmitTextOptions) => Promise<SubmitTextResult>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -354,6 +355,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // dispatch and this branch would otherwise queue the kickoff on
           // whichever chat is now in front (#63352).
           const queued = queueKickoffIfSessionBusy({
+            ...(dispatch.type === 'send' && dispatch.moaToken ? { moaToken: dispatch.moaToken } : {}),
             displayText,
             foregroundBusy: busyRef.current,
             sessionId,

@@ -225,6 +225,42 @@ async def test_queued_relay_origin_stays_silent_and_queue_event_keeps_metadata(m
 
 
 @pytest.mark.asyncio
+async def test_queued_first_response_strips_loop_complete_but_keeps_raw_result():
+    """The queued-follow-up lane sends before the normal completion filter, so it strips the
+    /loop marker itself; the result dict keeps it for loop completion detection."""
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    turn_ctx = SimpleNamespace(
+        session_key="session", stream_consumer_holder=[None], mute_notification_reply=False,
+        persist_user_display_kind=None, reply_expected=True, source=_source(),
+        _status_thread_metadata=None, event_message_id=None, inbound_message_id="loop-msg-1",
+        run_generation=1,
+    )
+    runner._deliver_queued_first_response = AsyncMock(return_value=True)
+    result = {"final_response": "CI is green.\nLOOP_COMPLETE", "failed": False}
+
+    assert await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
+    sent = runner._deliver_queued_first_response.await_args.args[0]
+    assert sent == "CI is green."
+    assert result["final_response"].endswith("LOOP_COMPLETE")
+
+
+@pytest.mark.asyncio
+async def test_queued_bare_loop_complete_sends_nothing():
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    turn_ctx = SimpleNamespace(
+        session_key="session", stream_consumer_holder=[None], mute_notification_reply=False,
+        persist_user_display_kind=None, reply_expected=True, source=_source(),
+        _status_thread_metadata=None, event_message_id=None, inbound_message_id="loop-msg-2",
+        run_generation=1,
+    )
+    runner._deliver_queued_first_response = AsyncMock(return_value=True)
+    result = {"final_response": "LOOP_COMPLETE", "failed": False}
+
+    assert await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
+    runner._deliver_queued_first_response.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_addressed_relay_queue_keeps_its_ack():
     runner = gateway_run.GatewayRunner(GatewayConfig())
     queued = []

@@ -314,6 +314,9 @@ export interface SessionSteerResponse {
 
 export interface PromptSubmitResponse {
   ok?: boolean
+  status?: 'dropped' | 'queued' | 'redirected' | 'steered' | 'streaming'
+  reason?: string
+  message?: string
   /** Set when the submitted text was a bare voice stop phrase consumed
    *  server-side to end the voice chat instead of starting a turn. */
   voice_stopped?: boolean

@@ -14,6 +14,7 @@ Sync fallbacks preserved:
 """
 import json
 import threading
+import time
 from unittest.mock import patch
 
 from tools.cronjob_tools import (
@@ -200,6 +201,59 @@ class TestSyncFallbacks:
         rows = executions.list_executions(job_id="job-bg-07")
         assert len(rows) == 1 and rows[0]["status"] == "completed"
         assert seen == [rows[0]["id"]]
+
+    def test_real_registry_capacity_rejects_without_queuing(self, tmp_path, monkeypatch):
+        """Cron's inline fallback must not leave a duplicate queued run behind.
+
+        This deliberately uses the real async registry.  With the old low-level
+        queue default, the second dispatch was admitted as ``queued`` and the
+        inline fallback then ran the same execution a second time when the
+        occupied slot was released.
+        """
+        from tools import async_delegation as ad
+        from cron import executions
+
+        ad._reset_for_tests()
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "executions.db")
+        release = threading.Event()
+        inline_runs = []
+
+        occupied = ad.dispatch_async_delegation(
+            goal="occupy", context=None, toolsets=None, role="leaf", model="m",
+            session_key="capacity-owner", runner=lambda: (release.wait(10), {"status": "completed"})[1],
+            max_async_children=1,
+        )
+        assert occupied["status"] == "dispatched"
+
+        job = _job("job-bg-real-capacity")
+
+        def run_one_job(claimed, **kw):
+            inline_runs.append(claimed["execution_id"])
+            executions.mark_execution_running(claimed["execution_id"])
+            executions.finish_execution(claimed["execution_id"], success=True)
+            return True
+
+        try:
+            with _bound_session_key("agent:main:telegram:dm:real-capacity"):
+                with patch("tools.cronjob_tools.claim_job_for_fire",
+                           side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+                     patch("tools.delegate_tool._get_max_async_children", return_value=1), \
+                     patch("cron.scheduler.run_one_job", side_effect=run_one_job), \
+                     patch("tools.cronjob_tools.get_job",
+                           return_value={"last_status": "ok", "last_error": None}):
+                    result = _try_dispatch_background_run(job)
+
+            assert result["dispatched"] is False
+            assert result["success"] is True
+            assert len(inline_runs) == 1
+            assert not any(item.get("status") == "queued"
+                           for item in ad.list_async_delegations())
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while ad.active_count() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            ad._reset_for_tests()
 
 
     def test_refused_claim_terminalizes_manual_execution(self, tmp_path, monkeypatch):

@@ -1,4 +1,5 @@
 import asyncio
+import time
 import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -96,9 +97,11 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 
 
 @pytest.mark.asyncio
-async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect():
+async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner, adapter = make_restart_runner()
     runner._completion_notification_batch_window = 3600
+    runner._session_state("telegram:dm:123456:u1").conversation.last_turn_started_at = time.time()
     event = {
         "session_id": "shutdown-batch",
         "started_at": 1.0,
@@ -133,7 +136,8 @@ async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect()
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
         await runner.stop()
 
-    assert await asyncio.wait_for(pending, timeout=1.0) is False
+    # The held result was released before teardown and preserved (drain FIFO or spool), not dropped.
+    assert await asyncio.wait_for(pending, timeout=1.0) is True
     assert call_order == ["batch_cancel_start", "batch_cancel_done", "disconnect"]
     assert runner._completion_notification_batch_flush_tasks == set()
 
