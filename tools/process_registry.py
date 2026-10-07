@@ -6,6 +6,7 @@ Nothing runs on the host unless TERMINAL_ENV=local; other backends run in their 
 
 import codecs
 from contextlib import suppress
+import inspect
 import json
 import logging
 import os
@@ -462,7 +463,7 @@ def restart_safe_gateway_child_argv(
     return GatewayChildDispatch("scoped", scoped)
 
 
-def _stop_systemd_unit(unit_name: str) -> bool:
+def _stop_systemd_unit(unit_name: str, *, timeout: Optional[float] = 15.0) -> bool:
     """Stop a transient systemd user scope by unit name.
     Reaps the *entire* cgroup — catching double-forked descendants reparented to init
     inside the scope that survive a plain PID signal (SIGTERM all, SIGKILL after
@@ -480,7 +481,7 @@ def _stop_systemd_unit(unit_name: str) -> bool:
         result = subprocess.run(
             [binary, "--user", "stop", unit_name],
             capture_output=True,
-            timeout=15,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
             env=systemd_user_bus_env(),
         )
@@ -2655,12 +2656,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 kwargs["deadline"] = deadline
             return self.kill_process(session.id, **kwargs).get("status") in {"killed", "already_exited"}
 
-        def _signal_group(session: ProcessSession, sig: int) -> bool:
+        def _signal_group(session: ProcessSession, sig: int, *, pgid: Optional[int] = None) -> bool:
             """Signal one owned local process group without waiting for it."""
-            if session.systemd_unit:
-                if sig == getattr(signal, "SIGKILL", signal.SIGTERM):
-                    return _stop_systemd_unit(session.systemd_unit)
-                return True
+            # A systemd scope is an additional cgroup boundary, not a reason to
+            # skip the host process group. Direct signalling remains the bounded
+            # fallback when the user bus has disappeared.
             pid = getattr(getattr(session, "process", None), "pid", None) or session.pid
             if not pid or session.pid_scope != "host":
                 if session.env_ref and session.pid:
@@ -2668,13 +2668,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         session.env_ref.execute(f"kill -{int(sig)} {session.pid} 2>/dev/null", timeout=5)
                         return True
                 return False
-            if session.host_start_time is not None and not self._host_pid_is_ours(pid, session.host_start_time):
+            if session.host_start_time is not None and pgid is None and not self._host_pid_is_ours(pid, session.host_start_time):
                 return False
             try:
                 killpg = getattr(os, "killpg", None)
                 if killpg is None:
                     return False
-                pgid = os.getpgid(pid)
+                pgid = pgid if pgid is not None else os.getpgid(pid)
                 # Test/legacy Popen callers may not create a new session. Never
                 # signal our own process group; fall back to the owned PID there.
                 if pgid == os.getpgrp():
@@ -2699,6 +2699,26 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return self._is_host_pid_alive(session.pid)
             return False
 
+        def _sweep_snapshot(session: ProcessSession) -> tuple[Optional[int], tuple[int, ...]]:
+            """Capture the group and descendants before TERM can reap the root."""
+            pid = getattr(getattr(session, "process", None), "pid", None) or session.pid
+            if session.pid_scope != "host" or not pid:
+                return None, ()
+            if session.host_start_time is not None and not self._host_pid_is_ours(pid, session.host_start_time):
+                return None, ()
+            try:
+                pgid = os.getpgid(pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pgid = None
+            return pgid, tuple(self._live_descendants(pid))
+
+        def _snapshot_alive(session: ProcessSession, snapshot) -> bool:
+            """Include descendants whose root disappeared after SIGTERM."""
+            if _alive(session):
+                return True
+            _pgid, descendants = snapshot
+            return any(self._is_host_pid_alive(pid) for pid in descendants)
+
         # Real local workers are killed in one bounded sweep: TERM every process group,
         # one shared grace, KILL every survivor, then a short reap/poll. This deliberately
         # has no sequential-under-deadline path: bash -lic wrappers commonly ignore TERM.
@@ -2709,9 +2729,33 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 or session._pty is not None or (session.detached and session.pid)
             )
         ]
+        # Snapshot each tree before TERM. Once a root exits, psutil cannot reliably
+        # rediscover a same-group child that ignored TERM.
+        snapshots = {session.id: _sweep_snapshot(session) for session in signalable}
+
+        def _systemd_stop_async(session: ProcessSession) -> None:
+            if not session.systemd_unit:
+                return
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return
+            # systemctl may block on a dead user bus; keep it off the serial sweep
+            # and bound its subprocess by the same restart deadline.
+            def _stop() -> None:
+                with suppress(Exception):
+                    stop = _stop_systemd_unit
+                    if "timeout" in inspect.signature(stop).parameters:
+                        stop(session.systemd_unit, timeout=remaining)
+                    else:
+                        # Preserve simple test/embedding seams that predate the
+                        # bounded timeout keyword.
+                        stop(session.systemd_unit)
+            threading.Thread(target=_stop, name="process-systemd-stop", daemon=True).start()
+
         if signalable:
             for session in signalable:
                 _signal_group(session, signal.SIGTERM)
+                _systemd_stop_async(session)
             started = time.monotonic()
             configured_grace = self._daemon_term_grace_seconds()
             remaining = None if deadline is None else max(0.0, deadline - started)
@@ -2720,20 +2764,33 @@ class ProcessRegistry(ProcessCheckpointMixin):
             while time.monotonic() < grace_deadline:
                 if stop_event is not None and stop_event.is_set():
                     break
-                if not any(_alive(session) for session in signalable):
+                if not any(
+                    _snapshot_alive(session, snapshots[session.id]) for session in signalable
+                ):
                     break
                 time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
             for session in signalable:
-                if _alive(session):
-                    _signal_group(session, getattr(signal, "SIGKILL", signal.SIGTERM))
+                if _snapshot_alive(session, snapshots[session.id]):
+                    _signal_group(
+                        session, getattr(signal, "SIGKILL", signal.SIGTERM),
+                        pgid=snapshots[session.id][0],
+                    )
             reap_deadline = time.monotonic() + 0.2
             if deadline is not None:
                 reap_deadline = min(reap_deadline, deadline)
-            while time.monotonic() < reap_deadline and any(_alive(session) for session in signalable):
+            while time.monotonic() < reap_deadline and any(
+                _snapshot_alive(session, snapshots[session.id]) for session in signalable
+            ):
                 time.sleep(0.02)
             killed = 0
             for session in signalable:
-                if _alive(session):
+                if _snapshot_alive(session, snapshots[session.id]):
+                    # Do not report a clean kill, or move the live session out of
+                    # the registry, while a snapshotted descendant survived.
+                    continue
+                if stop_event is not None and stop_event.is_set():
+                    continue
+                if deadline is not None and time.monotonic() >= deadline:
                     continue
                 with session._lock:
                     if not session.exited:
@@ -2760,7 +2817,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             for session in targets:
                 if _fallback_kill_one(session):
                     killed += 1
-        self._write_checkpoint()
+        if (stop_event is None or not stop_event.is_set()) and (
+            deadline is None or time.monotonic() < deadline
+        ):
+            self._write_checkpoint()
         return killed
 
     # ----- Cleanup / Pruning -----

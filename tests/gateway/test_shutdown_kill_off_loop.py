@@ -74,6 +74,23 @@ async def test_post_interrupt_kill_runs_off_event_loop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mark_running_cron_jobs_runs_off_event_loop(monkeypatch):
+    """The cron jobs-store write must not block the shutdown event loop."""
+    events = []
+    runner, loop_thread = _make_phase_runner(monkeypatch, events)
+
+    monkeypatch.setattr(
+        "cron.scheduler.mark_running_jobs_interrupted",
+        lambda *args, **kwargs: events.append(("mark_cron", threading.current_thread())) or [],
+    )
+    await runner._stop_interrupt_remaining_work(_make_ctx())
+
+    mark_threads = [thread for name, thread in events if name == "mark_cron"]
+    assert mark_threads
+    assert all(thread is not loop_thread for thread in mark_threads)
+
+
+@pytest.mark.asyncio
 async def test_post_interrupt_kill_preserves_phase_order(monkeypatch):
     """Offloading must not reorder the teardown sequence within the phase."""
     events: list = []

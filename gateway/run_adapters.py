@@ -97,7 +97,10 @@ class GatewayAdapterLifecycleMixin:
                     timeout, label,
                 )
 
-    async def _bounded_adapter_teardown(self, adapter, platform, *, profile: Optional[str] = None) -> None:
+    async def _bounded_adapter_teardown(
+        self, adapter, platform, *, profile: Optional[str] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
         """Tear down one adapter on the shutdown path with bounded awaits (never raises). Unbounded,
         a half-dead transport stalls past systemd's ``TimeoutStopSec``; the SIGKILL skips ``atexit``
         PID-file cleanup and the next start dies with "PID file race lost".
@@ -106,6 +109,11 @@ class GatewayAdapterLifecycleMixin:
         network state is half-dead (e.g. a wedged Feishu/Lark WebSocket thread waiting on I/O). See #14128.
         """
         timeout = self._adapter_disconnect_timeout_secs()
+        if deadline is not None:
+            timeout = min(timeout, max(0.0, deadline - time.monotonic()))
+        if timeout <= 0:
+            logger.warning("Skipping adapter teardown after shutdown deadline for %s", platform.value)
+            return
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
         try:

@@ -2160,7 +2160,8 @@ class GatewayShutdownMixin:
         # Record interrupted cron runs independently of the tool sweep. A blocked registry kill must not
         # turn a truncated cron run into a plausible success or lose its interruption notice.
         from cron.scheduler import mark_running_jobs_interrupted
-        _interrupted_cron_jobs = GatewayRunner._quiet_step(
+        _interrupted_cron_jobs = await asyncio.to_thread(
+            GatewayRunner._quiet_step,
             "mark_running_jobs_interrupted (post-interrupt) error",
             lambda: mark_running_jobs_interrupted(
                 "Gateway shutdown (post-interrupt) interrupted the job before tool cleanup completed."
@@ -2279,6 +2280,7 @@ class GatewayShutdownMixin:
         self, ctx: "GatewayShutdownMixin._StopContext",
         *, stop_event: Optional[threading.Event] = None,
         deadline: Optional[float] = None,
+        agent_deadline: Optional[float] = None,
     ) -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
         if stop_event is not None and stop_event.is_set():
@@ -2302,9 +2304,17 @@ class GatewayShutdownMixin:
         if "stop_event" in parameters:
             finalize_kwargs["stop_event"] = stop_event
         if "deadline" in parameters:
-            finalize_kwargs["deadline"] = deadline
-        await finalize(ctx.active_agents, **finalize_kwargs)
-        if stop_event is not None and stop_event.is_set():
+            finalize_kwargs["deadline"] = agent_deadline if agent_deadline is not None else deadline
+        finalize_cancelled = False
+        try:
+            await finalize(ctx.active_agents, **finalize_kwargs)
+        except asyncio.CancelledError:
+            if stop_event is None:
+                raise
+            # A timed-out restart still must reach adapter disconnect so platform
+            # token locks are released before the successor starts.
+            finalize_cancelled = True
+        if stop_event is not None and stop_event.is_set() and not finalize_cancelled:
             return
         # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -2314,7 +2324,7 @@ class GatewayShutdownMixin:
                 _idle_agents = list(_cache.items())
                 _cache.clear()
             for _key, _entry in _idle_agents:
-                if stop_event is not None and stop_event.is_set():
+                if stop_event is not None and stop_event.is_set() and not finalize_cancelled:
                     return
                 # Bounded + off-loop: a wedged memory provider here once made SIGTERM hang forever.
                 await self._cleanup_agent_resources_off_loop(
@@ -2345,7 +2355,7 @@ class GatewayShutdownMixin:
             if not isinstance(pending, Mapping) or not pending:
                 continue
             for key, value in list(pending.items()):
-                if stop_event is not None and stop_event.is_set():
+                if stop_event is not None and stop_event.is_set() and not finalize_cancelled:
                     return
                 try:
                     if self._flush_owned_pending(key, value, reason="adapter_shutdown"):
@@ -2355,11 +2365,12 @@ class GatewayShutdownMixin:
                     logger.exception("Failed to preserve %s adapter pending message for %s", platform.value, key)
         # Only network notices share the 3s budget. Adapter teardown has its own bounded
         # per-operation timeouts and must run through disconnect (token-lock release).
-        if stop_event is not None and stop_event.is_set():
+        if stop_event is not None and stop_event.is_set() and not finalize_cancelled:
             return
         if adapters:
-            await asyncio.gather(*(self._bounded_adapter_teardown(adapter, platform, profile=profile)
-                                   for platform, adapter, profile in adapters))
+            await asyncio.gather(*(self._bounded_adapter_teardown(
+                adapter, platform, profile=profile, deadline=deadline
+            ) for platform, adapter, profile in adapters))
         for _amap in _profile_adapters.values():
             _amap.clear()
         _profile_adapters.clear()
@@ -2624,19 +2635,27 @@ class GatewayShutdownMixin:
             _finalize_stop_event = threading.Event()
             self._shutdown_finalize_stop_event = _finalize_stop_event
             _finalize_bound = self._restart_shutdown_bound() if ctx.timed_out and self._restart_requested else None
-            _finalize_deadline = None if _finalize_bound is None else time.monotonic() + _finalize_bound
+            _finalize_started = time.monotonic()
+            _finalize_deadline = None if _finalize_bound is None else _finalize_started + _finalize_bound
+            _agent_finalize_bound = None if _finalize_bound is None else max(
+                0.1, _finalize_bound - min(0.75, max(0.25, _finalize_bound * 0.25))
+            )
+            _agent_finalize_deadline = None if _agent_finalize_bound is None else _finalize_started + _agent_finalize_bound
             _finalize_task = asyncio.create_task(
                 GatewayRunner._stop_finalize_agents_and_adapters(
-                    self, ctx, stop_event=_finalize_stop_event, deadline=_finalize_deadline,
+                    self, ctx, stop_event=_finalize_stop_event,
+                    deadline=_finalize_deadline, agent_deadline=_agent_finalize_deadline,
                 )
             )
             if _finalize_bound is not None:
-                if not await GatewayRunner._wait_or_detach(_finalize_task, _finalize_bound):
+                if not await GatewayRunner._wait_or_detach(_finalize_task, _agent_finalize_bound):
                     # Do not leave finalization touching adapters or profile DBs while the
                     # following phases release/close them. The event stops between-agent
                     # work; cancellation stops the asyncio coordinator immediately.
                     _finalize_stop_event.set()
                     _finalize_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await _finalize_task
                     logger.warning(
                         "Shutdown finalization exceeded %.1fs; cancelling remaining cleanup",
                         _finalize_bound,

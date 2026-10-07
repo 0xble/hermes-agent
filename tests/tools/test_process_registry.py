@@ -1,5 +1,6 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
+import contextlib
 import json
 import os
 import shlex
@@ -7,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import psutil
@@ -160,6 +162,53 @@ def test_kill_all_deadline_stops_followup_targets_and_checkpoint_writes(registry
     checkpoint.assert_not_called()
 
 
+def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
+    """A TERM-exiting root cannot hide a same-group child that ignores TERM."""
+    pytest.importorskip("psutil")
+    pidfile = os.path.join(tempfile.gettempdir(), f"hermes-child-{os.getpid()}.pid")
+    if os.path.exists(pidfile):
+        os.unlink(pidfile)
+    command = (
+        f"{sys.executable} -c \"import subprocess,sys,time,signal,os; "
+        f"subprocess.Popen([sys.executable,'-c','import signal,time,os; "
+        f"signal.signal(signal.SIGTERM, signal.SIG_IGN); open(\\'{pidfile}\\',\\'w\\').write(str(os.getpid())); time.sleep(60)']); "
+        f"signal.signal(signal.SIGTERM, signal.SIG_DFL); time.sleep(60)\""
+    )
+    session = registry.spawn_local(command, task_id="descendant-test")
+    try:
+        assert _wait_until(lambda: os.path.exists(pidfile))
+        child_pid = int(open(pidfile).read())
+        assert registry.kill_all("descendant-test", deadline=time.monotonic() + 3.0) == 1
+        assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+    finally:
+        registry.kill_all("descendant-test", source="test-cleanup")
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pidfile)
+
+
+def test_kill_all_scoped_session_falls_back_to_direct_signal(registry, monkeypatch):
+    """A failed systemctl stop must not prevent direct process-group signalling."""
+    session = registry.spawn_local("exec sleep 30", task_id="scoped-test")
+    session.systemd_unit = "hermes-worker-scoped-test.scope"
+    monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda *a, **k: False)
+    try:
+        assert registry.kill_all("scoped-test", deadline=time.monotonic() + 2.0) == 1
+        assert session.process is not None and session.process.returncode is not None
+    finally:
+        registry.kill_all("scoped-test", source="test-cleanup")
+
+
+def test_kill_all_past_deadline_skips_checkpoint_write(registry):
+    session = _make_session(sid="proc_deadline")
+    session._pty = MagicMock()
+    session._pty.isalive.return_value = False
+    registry._running[session.id] = session
+    checkpoint = MagicMock()
+    registry._write_checkpoint = checkpoint
+    stop_event = threading.Event()
+    stop_event.set()
+    assert registry.kill_all(deadline=time.monotonic() - 1, stop_event=stop_event) == 0
+    checkpoint.assert_not_called()
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     """Poll a predicate until it returns truthy or the timeout elapses."""
     deadline = time.monotonic() + timeout
