@@ -1031,6 +1031,7 @@ class GatewayShutdownMixin:
                 if await self.async_session_store.set_restart_note_message_id(
                     session_key, str(note_id), expected_marker=marker,
                 ):
+                    getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
                     return 1
                 return 0
             except Exception:
@@ -1052,6 +1053,9 @@ class GatewayShutdownMixin:
             return await asyncio.gather(*(_send_one(key) for key in unique_keys), return_exceptions=True)
 
         batch_task = asyncio.create_task(_send_batch())
+        # A transport may accept a send just before the local 2s deadline while the durable claim
+        # remains pending; startup recovery can then post one duplicate note. This late-note window
+        # applies whether the configured waiter detaches or the fallback path cancels the batch.
         wait_or_detach = getattr(self, "_wait_or_detach", None)
         if callable(wait_or_detach):
             completed = await wait_or_detach(batch_task, 2.0)
@@ -1059,9 +1063,6 @@ class GatewayShutdownMixin:
             done, _pending = await asyncio.wait({batch_task}, timeout=2.0)
             completed = batch_task in done
             if not completed:
-                # A transport may accept the send just before this local cancellation while the
-                # durable claim remains pending; startup recovery can then post one duplicate note.
-                # This low-probability 2s deadline window is accepted rather than guessing success.
                 batch_task.cancel()
 
                 def _consume(task):
@@ -1196,10 +1197,13 @@ class GatewayShutdownMixin:
             return False
         return True
 
-    async def _notify_active_sessions_of_shutdown(self) -> None:
+    async def _notify_active_sessions_of_shutdown(
+        self, session_keys=None, *, include_home_channels: bool = True,
+    ) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
+        A targeted call is used after S2 note delivery to notify only lanes whose note was not sent.
         """
         from gateway.update_notifications import notice, read_pending
         update_record = read_pending(self._update_paths().pending.parent) if self._restart_requested else None
@@ -1249,7 +1253,7 @@ class GatewayShutdownMixin:
                     str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id"),
                     profile=update_profile,
                 ))
-        for session_key in self._snapshot_running_agents():
+        for session_key in (self._snapshot_running_agents() if session_keys is None else list(session_keys)):
             if session_key in getattr(self, "_s2_note_session_keys", set()):
                 continue
             target = await self._shutdown_notification_target(session_key)
@@ -1305,6 +1309,8 @@ class GatewayShutdownMixin:
                 presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
+        if not include_home_channels:
+            return
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
@@ -2189,7 +2195,18 @@ class GatewayShutdownMixin:
         _marked_keys = await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
         # This is the last transport-connected phase for the interrupted human turn. It is intentionally
         # independent of the ordinary restart-notification opt-out and is durable/deduplicated by the row.
+        _s2_candidates = set(getattr(self, "_s2_note_session_keys", set()))
+        self._s2_note_delivered_keys = set()
         await self._send_interrupted_turn_notes(_marked_keys)
+        self._s2_note_session_keys = set(self._s2_note_delivered_keys)
+        _s2_note_misses = _s2_candidates - self._s2_note_session_keys
+        if _s2_note_misses:
+            # The initial broadcast was suppressed for every possible S2 lane. Once the bounded note
+            # batch tells us which lanes actually received a note, restore the ordinary notice for the
+            # remainder (including fenced lanes and lanes lost when the 2s batch bound expired).
+            await self._notify_active_sessions_of_shutdown(
+                _s2_note_misses, include_home_channels=False,
+            )
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)

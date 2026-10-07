@@ -365,15 +365,23 @@ class SessionLifecycleMixin:
             return True
         return self._update_entry(session_key, _apply)
 
-    def clear_resume_pending(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
-        """Clear the resume-pending flag after a successful resumed turn; True if cleared."""
+    def clear_resume_pending(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+        expected_turn_id: Optional[str] = None,
+    ) -> bool:
+        """Clear the resume-pending flag after a successful resumed turn; True if cleared.
+
+        A shutdown drain may re-mark the same turn with a fresh marker after the turn
+        started. ``expected_turn_id`` permits that owner to clear its replacement
+        marker while still refusing a marker belonging to a later turn.
+        """
         def _apply(entry: SessionEntry):
             if not entry.resume_pending:
                 return False
-            if expected_marker is not None and expected_marker != (
-                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
-            ):
-                return False
+            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            if expected_marker is not None and expected_marker != current:
+                if expected_turn_id is None or entry.resume_turn_id != expected_turn_id:
+                    return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.resume_marker_token = None

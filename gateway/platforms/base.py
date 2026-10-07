@@ -4651,7 +4651,8 @@ class BasePlatformAdapter(ABC):
         supplies the source and the ledger identity (``ledger_message_id`` or ``message_id``).
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
-        await self._reconcile_restart_note(event, session_key)
+        if not is_ephemeral_response and not event.is_command():
+            await self._reconcile_restart_note(event, session_key)
         delivery_adapter = self._final_delivery_adapter(event.source)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
@@ -4818,7 +4819,7 @@ class BasePlatformAdapter(ABC):
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
             if content is None:
                 return _thread_metadata
-            if session_key:
+            if session_key and not event.is_command():
                 await self._reconcile_restart_note(event, session_key)
             await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
         except Exception as notify_err:
@@ -4828,11 +4829,12 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
-                                   record_delivery: Callable, session_key: Optional[str] = None) -> None:
+                                   record_delivery: Callable, session_key: Optional[str] = None,
+                                   is_ephemeral_response: bool = False) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them."""
-        if session_key:
+        if session_key and not is_ephemeral_response and not event.is_command():
             await self._reconcile_restart_note(event, session_key)
         human_delay = self._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
@@ -5019,9 +5021,11 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
-            if response and hasattr(self, "_reconcile_restart_note"):
-                # This is the common final-delivery entry for text, TTS captions, and attachments;
-                # specialized streamed/queued/error lanes reconcile before their own sends.
+            if response and not is_ephemeral_response and not event.is_command() \
+                    and hasattr(self, "_reconcile_restart_note"):
+                # This is the common final-delivery entry for agent text, TTS captions, and attachments;
+                # specialized streamed/queued/error lanes reconcile before their own sends. Gateway
+                # command replies and ephemeral control replies are not answers to interrupted work.
                 await self._reconcile_restart_note(event, session_key)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
@@ -5069,7 +5073,8 @@ class BasePlatformAdapter(ABC):
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery, session_key=session_key)
+                    record_delivery=_record_delivery, session_key=session_key,
+                    is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.

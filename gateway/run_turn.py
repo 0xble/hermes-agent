@@ -2178,7 +2178,19 @@ class GatewayTurnMixin:
             return
         source, session_entry, session_key = resolved
         # Snapshot the interruption marker before preparation/delivery can yield to a successor turn.
-        _resume_pending_marker = await self.async_session_store.get_resume_pending_marker(session_key)
+        _resume_pending_marker = None
+        _resume_marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+        _resume_marker_reader_available = callable(_resume_marker_reader)
+        if _resume_marker_reader_available:
+            try:
+                _resume_pending_marker = _resume_marker_reader(session_key)
+                if inspect.isawaitable(_resume_pending_marker):
+                    _resume_pending_marker = await _resume_pending_marker
+            except Exception as _e:
+                # Lightweight runners and plugins may expose only the older store surface. Keep
+                # their historical unconditional clear rather than making marker lookup required.
+                _resume_marker_reader_available = False
+                logger.debug("resume marker snapshot unavailable for %s: %s", session_key, _e)
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2295,9 +2307,14 @@ class GatewayTurnMixin:
             event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(agent_result)
             if event._agent_turn_succeeded:
                 try:
-                    await self.async_session_store.clear_resume_pending(
-                        session_key, expected_marker=_resume_pending_marker,
-                    )
+                    if _resume_marker_reader_available:
+                        _clear_kwargs = {"expected_marker": _resume_pending_marker}
+                        _own_turn_token = getattr(event, "_gateway_active_turn_token", None)
+                        if _own_turn_token is not None:
+                            _clear_kwargs["expected_turn_id"] = _own_turn_token
+                        await self.async_session_store.clear_resume_pending(session_key, **_clear_kwargs)
+                    else:
+                        await self.async_session_store.clear_resume_pending(session_key)
                 except Exception as _e:
                     logger.debug("clear_resume_pending after delivery failed for %s: %s", session_key, _e)
             return delivered_response

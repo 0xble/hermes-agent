@@ -146,6 +146,46 @@ async def test_cut_human_turn_uses_one_note_when_broadcast_enabled(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_shutdown_broadcast_skips_only_lanes_that_received_s2_note(tmp_path):
+    store = _store(tmp_path)
+    delivered_source = _source("s2-delivered")
+    missed_source = _source("s2-missed")
+    delivered = store.get_or_create_session(delivered_source)
+    missed = store.get_or_create_session(missed_source)
+    adapter = NoteAdapter()
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    runner.async_session_store = runner._async_session_store
+    runner.config = GatewayConfig(
+        restart_resume_policy="continue",
+        platforms={Platform.TELEGRAM: PlatformConfig(
+            enabled=True, token="***", gateway_restart_notification=True,
+        )},
+    )
+    runner._s2_note_session_keys = {delivered.session_key}
+    runner._shutdown_notification_target = AsyncMock(side_effect={
+        delivered.session_key: (delivered_source, "telegram", delivered_source.chat_id, delivered_source.thread_id, None),
+        missed.session_key: (missed_source, "telegram", missed_source.chat_id, missed_source.thread_id, None),
+    }.get)
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._owning_profile = lambda *_args: (True, None)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": args[2]}
+    runner._served_home_channel_configs = lambda: []
+    runner._restart_requested = False
+    runner._restart_command_source = None
+    runner._restart_reason = None
+
+    await runner._notify_active_sessions_of_shutdown(
+        {delivered.session_key, missed.session_key}, include_home_channels=False,
+    )
+
+    assert [item[0] for item in adapter.sent] == [missed_source.chat_id]
+
+
+@pytest.mark.asyncio
 async def test_user_message_after_note_keeps_new_turn_resumable(tmp_path):
     adapter = NoteAdapter()
     store, entry, _ = _pending_store(tmp_path, adapter)
@@ -503,8 +543,6 @@ async def test_non_continue_policy_uses_restart_notice_and_keeps_marker(tmp_path
     assert store._entries[entry.session_key].resume_pending is True
 
 
-
-
 @pytest.mark.asyncio
 async def test_shutdown_note_batch_is_bounded_before_interrupting_agents(tmp_path, monkeypatch):
     """A wedged transport cannot hold the real interrupt phase beyond the note deadline."""
@@ -619,7 +657,6 @@ async def test_startup_claims_ledger_answer_before_resume_snapshot(tmp_path, mon
     entry = store.get_or_create_session(source)
     entry.session_key = "answered-session"
     store._entries["answered-session"] = entry
-    store._entries.pop(entry.session_key, None) if entry.session_key != "answered-session" else None
     store.mark_resume_pending("answered-session", turn_id="turn-answered", human=True)
 
     runner = object.__new__(GatewayStartupMixin)
@@ -655,8 +692,6 @@ async def test_startup_claims_ledger_answer_before_resume_snapshot(tmp_path, mon
     assert entry.resume_pending is False
     assert note_calls == []
     assert scheduled == [[]]
-
-
 
 
 @pytest.mark.asyncio
@@ -701,6 +736,69 @@ async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monke
     assert await runner._handle_message_with_agent(event, source, entry.session_key, 1) == "done"
     clear_resume_pending.assert_awaited_once_with(entry.session_key, expected_marker=marker)
 
+
+@pytest.mark.asyncio
+async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_successor(tmp_path, monkeypatch):
+    from gateway import run_heartbeat_acceptance
+    from gateway.run_startup import GatewayStartupMixin
+    from gateway.run_turn import GatewayTurnMixin
+
+    store = _store(tmp_path)
+    source = _source("marker-drain")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-interrupted", human=True)
+    marker_a = store.get_resume_pending_marker(entry.session_key)
+    runner = object.__new__(GatewayTurnMixin)
+    runner.async_session_store = AsyncSessionStore(store)
+    runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
+    runner._hmwa_prepare_turn = AsyncMock(
+        return_value=(runner._PreparedTurn([], "", "message", True, None, None), []),
+    )
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._revive_blocked_goal_for_user_turn = AsyncMock()
+    runner._persist_prompt_pins = AsyncMock()
+    runner._pinned_channel_inputs = lambda *_args, **_kwargs: (None, source)
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._run_agent = AsyncMock(return_value={"final_response": "done"})
+    runner._hmwa_stop_typing_for_turn = AsyncMock()
+    runner._is_user_turn_event = lambda _event: False
+    runner._is_session_run_current = lambda *_args: True
+    runner._hmwa_shape_agent_response = AsyncMock(return_value=("done", False, []))
+    runner._hmwa_prepend_reasoning = lambda _result, response, *_args: response
+    runner._hmwa_runtime_footer_line = lambda *_args: None
+    runner._hmwa_post_turn_hooks = AsyncMock()
+    runner._hmwa_classify_turn_failure = lambda *_args: (False, False, False)
+    runner._hmwa_compression_exhaustion_reset = AsyncMock(return_value=("done", entry))
+    runner._hmwa_persist_turn_transcript = AsyncMock()
+    runner._hmwa_deliver_turn_response = AsyncMock(return_value="done")
+    runner._clear_session_env = lambda _tokens: None
+    monkeypatch.setattr(run_heartbeat_acceptance, "heartbeat_owner_is_current", lambda *_args: True)
+
+    event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+    event._gateway_active_turn_token = "turn-own"
+
+    async def remark_during_drain(*_args):
+        assert store.mark_resume_pending(entry.session_key, turn_id="turn-own", human=True)
+        return "done"
+
+    runner._hmwa_deliver_turn_response = remark_during_drain
+    assert await runner._handle_message_with_agent(event, source, entry.session_key, 1) == "done"
+    assert store._entries[entry.session_key].resume_pending is False
+    assert store.get_resume_pending_marker(entry.session_key) is None
+
+    # A later turn's re-mark remains protected by the turn-id ownership check.
+    store.mark_resume_pending(entry.session_key, turn_id="turn-successor", human=True)
+    marker_successor = store.get_resume_pending_marker(entry.session_key)
+    assert store.clear_resume_pending(
+        entry.session_key, expected_marker=marker_a, expected_turn_id="turn-own",
+    ) is False
+    assert store.get_resume_pending_marker(entry.session_key) == marker_successor
+
+    startup = object.__new__(GatewayStartupMixin)
+    startup._auto_resume_ready = lambda _entry: object()
+    assert startup._startup_interrupted_note_candidates([entry]) == [entry.session_key]
+    assert store.clear_resume_pending(entry.session_key)
+    assert startup._startup_interrupted_note_candidates([entry]) == []
 
 
 def test_pending_note_claim_is_atomic_and_recoverable(tmp_path):
