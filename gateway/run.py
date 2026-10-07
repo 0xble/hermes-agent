@@ -4909,14 +4909,24 @@ def _start_gateway_housekeeping(
     first_tick_labels = {"state.db maintenance tick"}
     while not stop_event.is_set():
         tick_count += 1
+        deferred_after_watch = []
         for every, label, fn in chores:
             if label in first_tick_labels:
                 due = tick_count == 1 or (tick_count > 1 and (tick_count - 1) % every == 0)
             else:
                 due = tick_count % every == 0
             if due:
-                _housekeeping_chore(label, fn)
+                # Give the delivery queue watcher its first window before the potentially blocking
+                # state.db prune/VACUUM. Later maintenance runs follow a completed watch window too.
+                if label in first_tick_labels and tick_count == 1:
+                    deferred_after_watch.append((label, fn))
+                else:
+                    _housekeeping_chore(label, fn)
         wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
+        if stop_event.is_set():
+            break
+        for label, fn in deferred_after_watch:
+            _housekeeping_chore(label, fn)
     logger.info("Gateway housekeeping stopped")
 
 

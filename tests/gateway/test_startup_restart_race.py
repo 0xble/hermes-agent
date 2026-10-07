@@ -166,6 +166,51 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     )
 
 
+@pytest.mark.asyncio
+async def test_unclean_startup_abort_does_not_write_clean_receipt(tmp_path, monkeypatch):
+    """An abort before previous-run recovery must not make the next boot skip that recovery."""
+    from unittest.mock import patch
+
+    patch_startup_side_effects(monkeypatch, tmp_path)
+    runner = make_startup_runner(tmp_path)
+    telegram = StartupRaceAdapter(
+        Platform.TELEGRAM,
+        on_connect=lambda: runner.request_restart(detached=False, via_service=True),
+    )
+    runner._create_adapter = MagicMock(return_value=telegram)
+
+    assert await asyncio.wait_for(runner.start(), timeout=30) is True
+    assert runner._suppress_clean_shutdown_receipt is True
+
+    runner._restart_command_source = "test"
+    ctx = gateway_run.GatewayRunner._StopContext(
+        deferred_count=lambda: 0, started_at=0, timed_out=False,
+    )
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.release_gateway_runtime_lock"), \
+         patch("gateway.status.flush_runtime_status_async", new=AsyncMock(return_value=True)), \
+         patch("gateway.run._shutdown_gateway_health_export"):
+        await runner._stop_persist_exit_state(ctx)
+
+    marker = tmp_path / ".clean_shutdown"
+    assert not marker.exists()
+
+    next_runner = make_startup_runner(tmp_path)
+    recovered = []
+
+    async def recover_unclean():
+        recovered.append(True)
+        return 1, 0
+
+    next_runner._recover_unclean_sessions = recover_unclean
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.recover_from_checkpoint", lambda: 0,
+    )
+    monkeypatch.setattr(next_runner, "_recover_secondary_process_checkpoints", lambda _registry: 0)
+    await next_runner._start_recover_previous_run()
+    assert recovered == [True]
+
+
 def _patch_aborted_startup(monkeypatch, runner_cls):
     """Run start_gateway() against a runner that aborts before running mode."""
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)

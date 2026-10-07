@@ -1899,6 +1899,10 @@ class GatewayStartupMixin:
 
     async def _start_impl(self) -> bool:
         logger.info("Starting Hermes Gateway...")
+        # Until the previous-run recovery decision completes, shutdown must not write a fresh
+        # clean receipt: an abort during adapter startup would otherwise turn an unclean boot into
+        # a clean one on the next restart.
+        self._suppress_clean_shutdown_receipt = True
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
         # Spools remain on disk on early aborts: only a boot with an initialized session
@@ -1958,6 +1962,9 @@ class GatewayStartupMixin:
         if await self._abort_startup_if_shutdown_requested():
             return True
         await self._start_recover_previous_run()
+        # From here on shutdown may write a clean receipt: this boot has made the crash/clean
+        # decision and processed the previous run's recovery state.
+        self._suppress_clean_shutdown_receipt = False
         await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
         if getattr(self.config, "durable_outbox_enabled", False):

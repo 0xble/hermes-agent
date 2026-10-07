@@ -2277,9 +2277,14 @@ class GatewayShutdownMixin:
         release_gateway_runtime_lock()
         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
         # half-finished sessions, so no marker — the next startup recovers their turn markers.
-        if not ctx.timed_out:
+        if not ctx.timed_out and not getattr(self, "_suppress_clean_shutdown_receipt", False):
             with suppress(Exception):
                 (_hermes_home / ".clean_shutdown").touch()
+        elif not ctx.timed_out:
+            logger.info(
+                "Skipping .clean_shutdown marker — startup recovery did not complete; "
+                "the next startup must recover the previous run."
+            )
         else:
             logger.info(
                 "Skipping .clean_shutdown marker — drain timed out with "
