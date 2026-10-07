@@ -2813,7 +2813,7 @@ browser:
     managed_persistence: false   # When true, Camofox sessions persist cookies/logins across restarts
     user_id: ""                  # Optional externally managed Camofox userId
     session_key: ""              # Optional session key sent when Hermes creates a tab
-    adopt_existing_tab: false    # Reuse an existing tab for this identity before creating one
+    adopt_existing_tab: false    # External user_id only: reuse its existing tab before creating one
 ```
 
 **Dialog policies:**

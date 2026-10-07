@@ -19,7 +19,8 @@ the browser vault fill tool, or the 1Password backends.
   derived IDs; Hermes does not dual-read, map, or migrate profiles.
   `browser_handoff(account=...)` opens/focuses that account's shared identity, restarts
   its headless-by-default browser as visible, adopts the returned tabId for subsequent
-  browser actions, and never returns the userId. The restart restores the last URL but
+  browser actions (across turns, see [Camofox tab reuse](camofox-tab-reuse.md)), and never
+  returns the userId. The restart restores the last URL but
   can lose page-only state such as half-filled forms; logins persist. Confirm no other
   work is using the account, then call handoff before the step whose page state matters
   (for example, before submitting a password when an OTP is likely). A server-side 404
