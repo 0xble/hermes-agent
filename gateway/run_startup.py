@@ -905,7 +905,9 @@ class GatewayStartupMixin:
         images, rest = BasePlatformAdapter.extract_images(rest)
         if media or images or BasePlatformAdapter.extract_local_files(rest)[0]:
             return None
-        return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        return _strip_media_directives(_sanitize_gateway_final_response(
+            origin.platform, strip_trailing_loop_complete_marker(last["content"]))).strip() or None
 
     @staticmethod
     def _start_hosted_room_worker_sync():

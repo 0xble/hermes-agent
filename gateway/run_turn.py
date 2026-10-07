@@ -3791,6 +3791,10 @@ class GatewayTurnMixin:
             turn_ctx.source.platform, _delivery_result.get("final_response", ""),
             interrupted=bool(_delivery_result.get("interrupted") or (result or {}).get("interrupted")),
         )
+        # LOOP_COMPLETE is /loop control text: this lane sends before the normal completion
+        # filter runs, so strip it here too. Loop detection reads the untouched result dict.
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        first_response = strip_trailing_loop_complete_marker(first_response)
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )

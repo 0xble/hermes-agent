@@ -42,3 +42,11 @@ def test_bare_local_file_reply_resumes(tmp_path):
 
 def test_text_reply_is_still_redelivered():
     assert _reply("Done, no attachment.") == "Done, no attachment."
+
+
+def test_redelivered_reply_hides_loop_complete_marker():
+    assert _reply("CI is green.\nLOOP_COMPLETE") == "CI is green."
+
+
+def test_bare_loop_complete_reply_redelivers_nothing():
+    assert _reply("LOOP_COMPLETE") is None
