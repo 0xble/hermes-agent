@@ -703,7 +703,6 @@ gateway:
     action_shutting_down: "in arresto"
     reject_model: "L'agente è in esecuzione — attendi o usa prima /stop, poi cambia modello."
     reject_codex_runtime: "L'agente è in esecuzione — attendi o usa prima /stop, poi cambia runtime."
-    reject_moa: "L'agente è in esecuzione — attendi o usa prima /stop, poi esegui /moa."
     drain_queued: "⏳ Gateway {action} — messo in coda per il prossimo turno, quando tornerà disponibile."
     drain_rejected: "⏳ Il gateway è {action} e al momento non accetta un altro turno."
     drain_rejected_new_work: "⏳ Il gateway è {action} e al momento non accetta nuovo lavoro."

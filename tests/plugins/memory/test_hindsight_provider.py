@@ -1307,7 +1307,8 @@ class TestSyncTurn:
                 "- v3 (agent, agent, no user authority): reason — changed: constraints"
             )
         )
-        assert filter_retain_messages(revised_multiline + "\n\n" + marker_quote, "[SILENT]") == (marker_quote, None)
+        # A revised continuation has no provable end, so it is generated through its end.
+        assert filter_retain_messages(revised_multiline + "\n\n" + marker_quote, "[SILENT]") == (None, None)
         assert filter_retain_messages("human text", plain) == ("human text", plain)
 
     def test_retain_filter_drops_recalled_context_and_status_only_assistant(self):

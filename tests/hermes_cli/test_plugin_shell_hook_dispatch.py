@@ -21,15 +21,187 @@ def _spawn_result(**overrides):
     return result
 
 
-def _shell_hook_callback(*, fail_closed: bool, matcher: str = "terminal", timeout: float = 0.1):
+def _shell_hook_callback(
+    *,
+    fail_closed: bool,
+    matcher: str = "terminal",
+    timeout: float = 0.1,
+    requires_env=(),
+):
     spec = shell_hooks.ShellHookSpec(
         event="pre_tool_call",
         command="python hook.py",
         matcher=matcher,
         timeout=timeout,
         fail_closed=fail_closed,
+        requires_env=requires_env,
     )
     return shell_hooks._make_callback(spec)
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestShellHookBackoff:
+    def test_fail_open_timeout_backs_off_then_retries(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+        import hermes_cli.plugins_dispatch as dispatch_mod
+
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        monkeypatch.setattr(dispatch_mod, "_SHELL_HOOK_WRAPPER_MARGIN_SECS", 0.2, raising=False)
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+        monkeypatch.setattr(shell_hooks, "_SHELL_HOOK_BACKOFF_BASE_SECONDS", 10.0)
+        calls = []
+
+        def spawn(spec, stdin_json):
+            calls.append(spec.command)
+            if len(calls) == 1:
+                return _spawn_result(timed_out=True)
+            return _spawn_result(returncode=0)
+
+        monkeypatch.setattr(shell_hooks, "_spawn", spawn)
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [_shell_hook_callback(fail_closed=False)]
+
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+        assert calls == ["python hook.py"]
+
+        clock.advance(10.1)
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+        assert calls == ["python hook.py", "python hook.py"]
+
+    def test_fail_closed_timeout_is_never_backed_off(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+        import hermes_cli.plugins_dispatch as dispatch_mod
+
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        monkeypatch.setattr(dispatch_mod, "_SHELL_HOOK_WRAPPER_MARGIN_SECS", 0.2, raising=False)
+        monkeypatch.setattr(shell_hooks, "_spawn", lambda spec, stdin_json: _spawn_result(timed_out=True))
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [_shell_hook_callback(fail_closed=True)]
+
+        first = mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}, tool_call_id="t1")
+        second = mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}, tool_call_id="t2")
+        assert first == second == [{"action": "block", "message": "hook python hook.py failed closed: timed out after 0.1s"}]
+
+    def test_requires_env_skips_before_spawn(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.delenv("HERMES_SHELL_HOOK_REQUIRED", raising=False)
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        def unexpected_spawn(*_args):
+            raise AssertionError("requires_env hook must not spawn")
+
+        monkeypatch.setattr(shell_hooks, "_spawn", unexpected_spawn)
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [
+            _shell_hook_callback(
+                fail_closed=False,
+                requires_env=("HERMES_SHELL_HOOK_REQUIRED",),
+            ),
+        ]
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+
+    def test_success_resets_exponential_backoff(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+        import hermes_cli.plugins_dispatch as dispatch_mod
+
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        monkeypatch.setattr(dispatch_mod, "_SHELL_HOOK_WRAPPER_MARGIN_SECS", 0.2, raising=False)
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+        monkeypatch.setattr(shell_hooks, "_SHELL_HOOK_BACKOFF_BASE_SECONDS", 10.0)
+        calls = []
+
+        def spawn(spec, stdin_json):
+            calls.append(len(calls) + 1)
+            if calls in ([1], [1, 2, 3]):
+                return _spawn_result(timed_out=True)
+            return _spawn_result(returncode=0)
+
+        monkeypatch.setattr(shell_hooks, "_spawn", spawn)
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [_shell_hook_callback(fail_closed=False)]
+
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+        clock.advance(10.1)
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+        clock.advance(10.1)
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+        clock.advance(10.1)
+        assert mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={}) == []
+        assert calls == [1, 2, 3, 4]
+
+    def test_backoff_doubles_to_cap_and_survives_long_failure_streaks(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+        spec = shell_hooks.ShellHookSpec(event="pre_llm_call", command="python hook.py")
+        windows = []
+        for _ in range(1100):  # past 2**1024, where an uncapped float exponent overflows
+            shell_hooks._record_shell_hook_failure(spec, "timed out")
+            windows.append(round(shell_hooks._shell_hook_backoff[shell_hooks._shell_hook_key(spec)][1] - clock.now, 6))
+            clock.advance(windows[-1] + 0.1)
+        assert windows[:5] == [60.0, 120.0, 240.0, 480.0, 900.0]
+        assert set(windows[4:]) == {shell_hooks._SHELL_HOOK_BACKOFF_MAX_SECONDS}
+
+    def test_backoff_is_scoped_to_matcher_and_home(self, monkeypatch):
+        """One failing hook must not silence a sibling with the same command (#353 review)."""
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+
+        def spec(matcher, home):
+            return shell_hooks.ShellHookSpec(
+                event="pre_tool_call", command="python hook.py", matcher=matcher, home=home,
+            )
+
+        failing = spec("terminal", "/profiles/a")
+        shell_hooks._record_shell_hook_failure(failing, "timed out")
+        assert shell_hooks.shell_hook_should_skip(spec("terminal", "/profiles/a"))
+        assert not shell_hooks.shell_hook_should_skip(spec("web_search", "/profiles/a"))
+        assert not shell_hooks.shell_hook_should_skip(spec("terminal", "/profiles/b"))
+
+    def test_spawn_error_backs_off_like_a_timeout(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        clock = _FakeClock()
+        monkeypatch.setattr(shell_hooks, "_monotonic", clock.monotonic)
+        calls = []
+
+        def spawn(spec, stdin_json):
+            calls.append(1)
+            return _spawn_result(error="command not found")
+
+        monkeypatch.setattr(shell_hooks, "_spawn", spawn)
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [_shell_hook_callback(fail_closed=False)]
+        mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+        mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+        assert calls == [1]
+
+    def test_requires_env_present_runs_hook(self, monkeypatch):
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setenv("HERMES_SHELL_HOOK_REQUIRED", "surface-1")
+        monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 1.0)
+        calls = []
+        monkeypatch.setattr(shell_hooks, "_spawn", lambda spec, stdin_json: calls.append(1) or _spawn_result(returncode=0))
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [
+            _shell_hook_callback(fail_closed=False, requires_env=("HERMES_SHELL_HOOK_REQUIRED",)),
+        ]
+        mgr.invoke_hook("pre_tool_call", tool_name="terminal", args={})
+        assert calls == [1]
 
 
 class TestShellHookWrapperTimeout:
