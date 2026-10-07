@@ -444,11 +444,20 @@ browser_navigate(url="https://example.com", account="lpg")
 ```
 
 The selected alias is bound to the task on its first navigation. A task cannot
-switch aliases after its browser tab exists, and the `personal` alias is not
-accepted. Each alias maps to a separate stable, profile-scoped Camofox identity;
-the underlying `userId` is never exposed to the model. Ending a named-account
-task drops Hermes' local handle and does not delete the Camofox profile, so its
-cookies remain available to a later task using the same alias.
+switch aliases within a turn after its browser tab exists; a later turn may pick
+another alias. The `personal` alias is not accepted. Each alias maps to a separate
+stable, profile-scoped Camofox identity; the underlying `userId` is never exposed
+to the model. Ending a named-account task drops Hermes' local handle and does not
+delete the Camofox profile, so its cookies remain available to a later task using
+the same alias.
+
+With a named account or `managed_persistence: true`, a conversation keeps its tab
+across turns, including the tab shown by `browser_handoff`, so the agent continues
+where the user logged in. When a task has no tab yet (a new conversation or a
+gateway restart), Hermes reuses an existing tab of the same identity before
+opening one: a tab on the requested site first, otherwise the newest handoff tab.
+It never takes a tab another live task holds, a tab with protected vault data, or
+a tab the server reported closed.
 
 Account selection is advertised only when Camofox is the active browser backend.
 The aliases are intentionally separate from vault credentials. A vault item can
@@ -465,7 +474,7 @@ Three knobs control the behavior:
 |---------|---------|--------|
 | `browser.camofox.user_id` | `CAMOFOX_USER_ID` | Camofox `userId` Hermes uses when creating tabs. Setting this opts the session into "externally managed" mode. |
 | `browser.camofox.session_key` | `CAMOFOX_SESSION_KEY` | `sessionKey` (a.k.a. `listItemId`) sent on tab creation. Used to match an existing tab during adoption. Defaults to a per-task value if unset. |
-| `browser.camofox.adopt_existing_tab` | `CAMOFOX_ADOPT_EXISTING_TAB` | When true, Hermes calls `GET /tabs?userId=<user_id>` on first use and reuses an existing tab before creating a new one. |
+| `browser.camofox.adopt_existing_tab` | `CAMOFOX_ADOPT_EXISTING_TAB` | When true, Hermes calls `GET /tabs?userId=<user_id>` when it needs a tab and reuses an existing one before creating a new one. Hermes-managed identities (named accounts, `managed_persistence`) always reuse their own tabs; this setting only governs an external `user_id`. |
 
 Env vars take precedence over `config.yaml`. Either form works:
 
@@ -490,12 +499,12 @@ CAMOFOX_ADOPT_EXISTING_TAB=true
 
 **How tab adoption works (when `adopt_existing_tab: true`):**
 
-1. On the first browser tool call after a process start, Hermes issues `GET /tabs?userId=<user_id>` (5-second timeout).
-2. If any tab in the response has `listItemId == session_key`, Hermes adopts the most recently created one in that group.
-3. Otherwise, Hermes adopts the most recently created tab for the user (any `listItemId`).
-4. If no tabs exist or the request fails, Hermes falls back to creating a new tab on the next operation.
+1. When a browser tool call needs a tab and the task has none, Hermes issues `GET /tabs?userId=<user_id>` (5-second timeout).
+2. It skips tabs another live Hermes task holds, tabs quarantined for protected vault data, and tabs the server reported closed.
+3. It prefers a tab already on the navigation target's origin, then the newest tab in the shared identity group (`__shared_identity__`), then the newest tab with `listItemId == session_key`, then the newest remaining tab.
+4. If no tab qualifies or the request fails, Hermes creates a new tab.
 
-Adoption only fires until `tab_id` is populated for the session. If the external app closes the adopted tab mid-run, the next browser tool call will surface a Camofox error — Hermes does not re-poll for a fresh tab on every call.
+The task keeps the adopted tab across turns. If the external app closes it, the next page action reports that the tab is gone, and the next `browser_navigate` adopts or creates a replacement.
 
 **Picking `session_key`:** if you want Hermes to reliably attach to a *specific* existing tab, set `session_key` to the `listItemId` the external app used when creating it. If you leave `session_key` unset and only set `user_id`, Hermes generates a per-task `session_key` (`task_<id>`) — Hermes will share cookies and the profile with the external app, but will open its own tab alongside instead of reusing one.
 
