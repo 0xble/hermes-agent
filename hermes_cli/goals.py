@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -32,6 +33,12 @@ logger = logging.getLogger(__name__)
 # ── Constants & defaults ──────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+# Autonomous goal continuations are deliberately sparse: a real user message or a
+# process/delegation result is fresh evidence and continues immediately, while a
+# continuation-only chain dispatches at most one turn per this interval. Gateway
+# sessions resolve ``goals.min_continuation_gap_seconds`` (0 disables it).
+DEFAULT_MIN_CONTINUATION_GAP_SECONDS = 15 * 60
+_MIN_CONTINUATION_GAP_REASON = "minimum gap between autonomous goal continuations"
 
 # Stable opening used by every standing-goal continuation prompt. Consumers that need to
 # distinguish synthetic turns (for example durable-memory filters) should match this exact
@@ -47,6 +54,28 @@ def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> in
     except (TypeError, ValueError):
         return int(default)
     return parsed if parsed >= 0 else int(default)
+
+
+def is_continuation_gap_wait(state: Optional["GoalState"]) -> bool:
+    """True when the active barrier is only the minimum-gap hold between autonomous turns."""
+    return bool(
+        state is not None and state.waiting_until and state.waiting_on_pid is None
+        and state.waiting_on_session is None and state.waiting_on_delegations == 0
+        and state.waiting_reason == _MIN_CONTINUATION_GAP_REASON
+    )
+
+
+def normalize_goal_continuation_gap(value: Any, default: float = DEFAULT_MIN_CONTINUATION_GAP_SECONDS) -> float:
+    """Normalize the minimum autonomous-continuation interval in seconds.
+
+    Zero explicitly disables the throttle. Invalid or negative values use the
+    configured default rather than silently turning the guard off.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if math.isfinite(parsed) and parsed >= 0 else float(default)
 
 
 def _goal_budget_label(turns_used: int, max_turns: int) -> str:
@@ -608,6 +637,9 @@ class GoalState:
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
     last_turn_at: float = 0.0
+    # When the last autonomous continuation turn was dispatched (judge CONTINUE or an idle wake
+    # lifting a wait). The minimum continuation gap is measured from here. Old rows load as 0.
+    last_continuation_at: float = 0.0
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
@@ -678,7 +710,8 @@ class GoalState:
         ints = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_disputes",
             "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
-        floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
+        floats = {k: float(data.get(k) or 0.0) for k in (
+            "created_at", "last_turn_at", "last_continuation_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
             mutation_id=str(data.get("mutation_id") or ""),
@@ -951,6 +984,9 @@ def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[boo
         if state.status != "active" or not has_wait or state.waiting_since != waiting_since:
             return False, state
         state.clear_wait(preserve_notice_key=True)
+        # The idle surface just admitted the continuation this wait was holding back: that is
+        # an autonomous continuation dispatch, so the minimum gap restarts from here.
+        state.last_continuation_at = time.time()
         state.mutation_id = uuid.uuid4().hex
         conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), key))
         return True, state
@@ -2058,9 +2094,17 @@ class GoalManager:
     canonical user-role message to feed back into ``run_conversation``.
     """
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
+    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS,
+                 min_continuation_gap_seconds: Optional[float] = None):
         self.session_id = session_id
         self.default_max_turns = normalize_goal_max_turns(default_max_turns)
+        if min_continuation_gap_seconds is None:
+            # Callers that own the gateway/config boundary pass the resolved
+            # default explicitly. Keeping the manager's library default disabled
+            # preserves direct CLI/TUI and test callers that intentionally drive
+            # turns synchronously without a wall-clock scheduler.
+            min_continuation_gap_seconds = 0
+        self.min_continuation_gap_seconds = normalize_goal_continuation_gap(min_continuation_gap_seconds)
         self._state: Optional[GoalState] = load_goal(session_id)
 
     # --- introspection ------------------------------------------------
@@ -2698,7 +2742,7 @@ class GoalManager:
 
     def _apply_wait_directive(
         self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0,
-        automatic: bool = False,
+        automatic: bool = False, min_seconds: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
@@ -2724,7 +2768,7 @@ class GoalManager:
                 requested = max(requested, _MIN_AUTOMATIC_JUDGE_WAIT_S, _NO_PROGRESS_BACKOFF_S[level])
                 state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
             delegation_floor = 10 * 60 if active_delegations else 0
-            seconds = min(_MAX_BARRIER_WAIT_S, max(requested, delegation_floor))
+            seconds = min(_MAX_BARRIER_WAIT_S, max(requested, delegation_floor, min_seconds))
             # Assign the durable escalation before _park() writes the state. Direct manager callers
             # must persist the same level as optimistic evaluator callers.
             self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
@@ -2734,11 +2778,19 @@ class GoalManager:
             message=f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
         )
 
-    def _no_progress_wait(self, state: GoalState, reason: str, *, active_delegations: int = 0) -> Dict[str, Any]:
+    def _continuation_gap_remaining(self, state: GoalState) -> int:
+        """Seconds until the minimum continuation gap allows another autonomous dispatch."""
+        if self.min_continuation_gap_seconds <= 0 or state.last_continuation_at <= 0:
+            return 0
+        return max(0, math.ceil(self.min_continuation_gap_seconds - (time.time() - state.last_continuation_at)))
+
+    def _no_progress_wait(
+        self, state: GoalState, reason: str, *, active_delegations: int = 0, min_seconds: int = 0,
+    ) -> Dict[str, Any]:
         """Park after repeated automatic no-op continuations as a deterministic backstop."""
         level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
         state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
-        seconds = _NO_PROGRESS_BACKOFF_S[level]
+        seconds = max(_NO_PROGRESS_BACKOFF_S[level], min_seconds)
         self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
         return self._wait_notice_decision(
             state, verdict="wait",
@@ -2748,10 +2800,12 @@ class GoalManager:
             ),
         )
 
-    def _delegation_no_progress_wait(self, state: GoalState, reason: str, active_delegations: int) -> Dict[str, Any]:
+    def _delegation_no_progress_wait(
+        self, state: GoalState, reason: str, active_delegations: int, *, min_seconds: int = 0,
+    ) -> Dict[str, Any]:
         """Park immediately when live delegations leave an automatic turn with no action."""
         level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
-        seconds = max(10 * 60, _NO_PROGRESS_BACKOFF_S[level])
+        seconds = max(10 * 60, _NO_PROGRESS_BACKOFF_S[level], min_seconds)
         seconds = min(_MAX_BARRIER_WAIT_S, seconds)
         state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
         self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
@@ -2769,20 +2823,27 @@ class GoalManager:
 
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
+        external_event: bool = False,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Evaluate an isolated snapshot and atomically commit against its durable state."""
+        """Evaluate an isolated snapshot and atomically commit against its durable state.
+
+        ``external_event`` marks a watched-process/delegation notification. These
+        events are allowed to pierce a timed continuation gap because they carry
+        new evidence; ordinary continuation-only turns are throttled.
+        """
         from hermes_cli.goals_evaluation import evaluate_goal_snapshot
         return evaluate_goal_snapshot(
-            self, last_response, user_initiated=user_initiated,
+            self, last_response, user_initiated=user_initiated, external_event=external_event,
             background_processes=background_processes, active_delegations=active_delegations,
             evidence_session_id=evidence_session_id,
         )
 
     def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
+        external_event: bool = False,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -2797,6 +2858,10 @@ class GoalManager:
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
 
+        if is_continuation_gap_wait(state) and not self._barrier_holds():
+            # The gap elapsed, so the idle ticker dispatched (or is dispatching) this continuation
+            # at the deadline. Pace the next one from there even if its CAS clear has not landed.
+            state.last_continuation_at = max(state.last_continuation_at, state.waiting_until)
         # Live barriers are maintained by idle surfaces through the CAS re-arm path. In an
         # evaluator snapshot, stage the same transition locally so a due notice or hard-cap
         # pause commits atomically with the turn and never invokes the judge.
@@ -2809,7 +2874,12 @@ class GoalManager:
                 return self._waiting_decision(state, notice=age_notice)
         elif state.waiting_until:
             if self._barrier_holds():
-                return self._waiting_decision(state)
+                # A user turn or a process/delegation result is fresh evidence and may pierce only
+                # the continuation-gap hold (silently); judge and explicit waits stay authoritative.
+                if not is_continuation_gap_wait(state):
+                    return self._waiting_decision(state)
+                if not (user_initiated or external_event):
+                    return _decision("active", False, None, "waiting", state.waiting_reason or "", "")
             # Timed waits and delegation waits lift in the evaluator snapshot; the normal
             # optimistic commit persists the clear without a side-channel write.
             state.clear_wait(preserve_notice_key=True)
@@ -2890,10 +2960,13 @@ class GoalManager:
             state.consecutive_disputes = 1 if (state.consecutive_disputes and fresh) else state.consecutive_disputes + 1
             state.last_dispute_evidence = ",".join(sorted(seen | current, key=_evidence_id_order)[-_DISPUTE_SEEN_MAX:])
 
+        # Any automatic park must hold at least as long as the pacing gap, or a shorter backoff
+        # would undercut it; fresh evidence (user turn, process/delegation result) is not paced.
+        gap_floor = 0 if (user_initiated or external_event) else self._continuation_gap_remaining(state)
         if verdict == "wait" and wait_directive:
             parked = self._apply_wait_directive(
                 wait_directive, reason, active_delegations=active_delegations,
-                automatic=not user_initiated,
+                automatic=not user_initiated, min_seconds=gap_floor,
             )
             if parked is not None:
                 return parked
@@ -2949,11 +3022,24 @@ class GoalManager:
         if verdict == "continue" and not user_initiated and active_delegations > 0 and (
             not new_progress or _evidence_only_read_only_status(turn_evidence)
         ):
-            return self._delegation_no_progress_wait(state, reason, active_delegations)
+            return self._delegation_no_progress_wait(state, reason, active_delegations, min_seconds=gap_floor)
 
         if state.consecutive_no_progress >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
-            return self._no_progress_wait(state, reason, active_delegations=active_delegations)
+            return self._no_progress_wait(
+                state, reason, active_delegations=active_delegations, min_seconds=gap_floor)
 
+        # An autonomous chain (continuation, /loop tick, heartbeat or other wake with no new
+        # evidence) dispatches at most one continuation per gap. The hold is the ordinary durable
+        # timed wait, so a restart keeps it and the idle goal ticker releases it. It is silent: a
+        # parked/resumed notice pair every cycle would double the chat traffic it exists to cut.
+        if not user_initiated and not external_event and self.min_continuation_gap_seconds > 0 \
+                and state.last_continuation_at > 0:
+            remaining = self.min_continuation_gap_seconds - (time.time() - state.last_continuation_at)
+            if remaining > 0:
+                self.wait_for_seconds(max(1, math.ceil(remaining)), reason=_MIN_CONTINUATION_GAP_REASON)
+                return _decision("active", False, None, "waiting", _MIN_CONTINUATION_GAP_REASON, "")
+
+        state.last_continuation_at = time.time()
         reason_text = (reason or "").strip()
         # Reuse S1's durable notice identity so continuation and parked-state notices
         # remain coordinated across internal turns and gateway restarts.

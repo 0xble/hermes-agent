@@ -2265,6 +2265,10 @@ class GatewayTurnMixin:
                     event.ledger_message_id = str(_terminal_inbound)
                 if "queued_terminal_notification_category" in agent_result:
                     event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
+                if agent_result.get("queued_terminal_notification_origin"):
+                    # A completion drained behind this turn is fresh goal evidence for the
+                    # chain's single post-turn judge (see _run_post_turn_hooks).
+                    event.metadata["notification_origin"] = agent_result["queued_terminal_notification_origin"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
 
@@ -4035,6 +4039,9 @@ class GatewayTurnMixin:
                 "queued_terminal_notification_category": (
                     (pending_event.metadata or {}).get("notification_category", "result")
                     if pending_event is not None and pending_event.internal else "result"),
+                "queued_terminal_notification_origin": (
+                    (pending_event.metadata or {}).get("notification_origin")
+                    if pending_event is not None and pending_event.internal else None),
             }
         return merged
 

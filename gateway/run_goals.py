@@ -76,6 +76,22 @@ class GatewayGoalsMixin:
         except Exception:
             return 20
 
+    def _goal_min_continuation_gap_from_config(self) -> float:
+        """Configured minimum interval between autonomous goal continuations."""
+        try:
+            goals_cfg = (
+                (self.config or {}).get("goals", {})
+                if isinstance(self.config, dict)
+                else getattr(self.config, "goals", {}) or {}
+            )
+            if not goals_cfg:
+                from hermes_cli.config import load_config
+                goals_cfg = (load_config() or {}).get("goals") or {}
+            from hermes_cli.goals import normalize_goal_continuation_gap
+            return normalize_goal_continuation_gap(goals_cfg.get("min_continuation_gap_seconds", 15 * 60))
+        except Exception:
+            return 15 * 60
+
     async def _warm_goals_session_db(self, label: str) -> None:
         """Warm the goals SessionDB cache off-loop (best-effort): a cold cache runs the state.db
         init on the loop thread and freezes the loop. The executor hop keeps the profile home
@@ -119,7 +135,10 @@ class GatewayGoalsMixin:
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
-            return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
+            min_gap = self._goal_min_continuation_gap_from_config()
+            return lambda sid: GoalManager(
+                session_id=sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
+            )
         return await self._manager_for_event(event, "goal", _load)
 
     async def _get_heartbeat_manager_for_event(self, event: "MessageEvent"):
@@ -403,7 +422,11 @@ class GatewayGoalsMixin:
         from hermes_cli.goals import GoalManager
 
         def _pause() -> Optional[str]:
-            mgr = GoalManager(session_id=str(session_id), default_max_turns=self._goal_max_turns_from_config())
+            mgr = GoalManager(
+                session_id=str(session_id),
+                default_max_turns=self._goal_max_turns_from_config(),
+                min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config(),
+            )
             if not mgr.has_goal():
                 return None
             if mgr.state.status == "paused" and mgr.state.paused_reason == _GOAL_STOP_PAUSE_REASON:
@@ -445,7 +468,11 @@ class GatewayGoalsMixin:
 
         with self._profile_scope_for_source(source):
             await self._warm_goals_session_db("goal recovery")
-            mgr = GoalManager(session_entry.session_id, default_max_turns=self._goal_max_turns_from_config())
+            mgr = GoalManager(
+                session_entry.session_id,
+                default_max_turns=self._goal_max_turns_from_config(),
+                min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config(),
+            )
             if not mgr.resume_for_user_input():
                 return
             try:
@@ -457,7 +484,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
-        user_initiated: bool = False,
+        user_initiated: bool = False, external_event: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -465,7 +492,10 @@ class GatewayGoalsMixin:
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
-            return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
+            min_gap = self._goal_min_continuation_gap_from_config()
+            return lambda sid: GoalManager(
+                session_id=sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
+            )
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None:
@@ -486,7 +516,8 @@ class GatewayGoalsMixin:
         # without which aux credential resolution fails under multiplexing.
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=user_initiated, background_processes=_bg_procs,
+                final_response or "", user_initiated=user_initiated, external_event=external_event,
+                background_processes=_bg_procs,
                 active_delegations=_active_deleg,
             ),
         )
@@ -526,10 +557,17 @@ class GatewayGoalsMixin:
         # still needs to be released and rescheduled.
         hooks = [("loop completion", self._post_turn_loop_completion, {})]
         if final_text.strip():
+            # A process or delegation result injected by the completion path is new evidence and
+            # may pierce the continuation gap, including one drained behind a goal continuation
+            # (the chain's terminal origin is copied onto the head event). Other autonomous wakes
+            # (/loop ticks, goal continuations, heartbeats) are paced. The marker is gateway-set
+            # metadata, never derived from message text.
+            metadata = getattr(event, "metadata", None) or {}
+            external_event = metadata.get("notification_origin") == "process_registry_synthetic"
             turn_is_user = self._is_user_turn_event(event) if event is not None else not is_internal
             hooks.insert(0, (
                 "goal continuation", self._post_turn_goal_continuation,
-                {"user_initiated": turn_is_user},
+                {"user_initiated": turn_is_user, "external_event": external_event},
             ))
         for label, hook, hook_kwargs in hooks:
             try:
@@ -702,9 +740,12 @@ class GatewayGoalsMixin:
                 return  # restart auto-resume still owns this chat
 
         max_turns = self._goal_max_turns_from_config()
+        min_gap = self._goal_min_continuation_gap_from_config()
 
         def _check():
-            mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+            mgr = GoalManager(
+                session_id=sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
+            )
             notice = mgr.rearm_live_barrier()
             return mgr, notice, mgr.lifted_barrier_prompt()
 
@@ -751,7 +792,11 @@ class GatewayGoalsMixin:
         except WakeNotAccepted:
             logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
             return
+        from hermes_cli.goals import is_continuation_gap_wait
+        gap_wait = is_continuation_gap_wait(mgr.state)
         await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
+        if gap_wait:
+            return  # the routine pacing hold was never announced, so its end is not either
         with suppress(Exception):
             await self._send_goal_status_notice(source, "▶ Goal wait ended — resuming.", notice_kind="wait-ended")
 
