@@ -49,13 +49,13 @@ def test_sweep_stale_pid_heartbeats_removes_dead_pid_files(tmp_path, monkeypatch
     for path in (live, dead, malformed):
         path.write_text("{}", encoding="utf-8")
 
-    def kill(pid, sig):
-        assert sig == 0
-        if pid == 101:
-            return None
-        raise ProcessLookupError
+    import psutil
+
+    def kill(*_args):
+        raise AssertionError("os.kill(pid, 0) signals the target on Windows; use psutil.pid_exists")
 
     monkeypatch.setattr(shutdown_watchdog_module.os, "kill", kill)
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 101)
     sweep_stale_pid_heartbeats(tmp_path)
 
     assert live.exists()

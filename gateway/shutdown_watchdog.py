@@ -191,11 +191,16 @@ def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
 def sweep_stale_pid_heartbeats(home: Optional[Path] = None) -> None:
     """Best-effort one-shot cleanup of per-PID heartbeat files from older gateway versions."""
     try:
+        import psutil
+
         for stale in get_loop_heartbeat_path(home).parent.glob("gateway.heartbeat.*"):
             try:
                 pid = int(stale.name.rsplit(".", 1)[1])
-                os.kill(pid, 0)
-            except (ValueError, IndexError, OSError):
+            except (ValueError, IndexError):
+                pid = None
+            # psutil, not os.kill(pid, 0): that probe signals the target on Windows (bpo-14484), and
+            # an EPERM from a live process owned by another user must not count as dead.
+            if pid is None or not psutil.pid_exists(pid):
                 stale.unlink(missing_ok=True)
     except Exception:
         logger.debug("stale per-PID heartbeat sweep failed", exc_info=True)
