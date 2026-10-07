@@ -111,6 +111,14 @@ class TestLogicalLineStreaming:
         assert "Done." in plain
         assert "LOOP_COMPLETE" not in plain
 
+    def test_marker_after_cross_chunk_fence_close_is_hidden(self, cli_stub):
+        cli, emitted = cli_stub
+        cli._stream_delta("Example:\n```text\nLOOP_COMPLETE\n")
+        cli._stream_delta("```\nLOOP_COMPLETE")
+        cli._flush_stream()
+        plain = _strip_ansi("\n".join(emitted))
+        assert plain.count("LOOP_COMPLETE") == 1  # only the fenced example
+
     def test_held_partial_marker_is_released_at_tool_boundary(self, cli_stub):
         """A held prefix is content when tools run next; it must not be lost or split."""
         cli, emitted = cli_stub

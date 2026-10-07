@@ -108,3 +108,23 @@ def test_live_stream_keeps_marker_inside_open_fence(monkeypatch):
     srv._invoke_agent("sid", session, st, "ping", "ping", None, [], None, None)
     streamed = "".join(p["text"] for e, p in events if e == "message.delta")
     assert "LOOP_COMPLETE" in streamed
+
+
+def test_live_stream_hides_marker_after_cross_chunk_fence_close(monkeypatch):
+    """A fence opened in one chunk and closed in the next; the trailing marker is control text."""
+    events = []
+    monkeypatch.setattr(srv, "_emit", lambda event, _sid, payload=None: events.append((event, payload)))
+    monkeypatch.setattr(srv, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(srv, "_start_usage_ticker", lambda _sid, _agent: (SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda: None)))
+
+    def run_conversation(_message, **kwargs):
+        for chunk in ["Example:\n```text\nLOOP_COMPLETE\n", "```\nLOOP_COMPLETE"]:
+            kwargs["stream_callback"](chunk)
+        return {"final_response": "Example:\n```text\nLOOP_COMPLETE\n```\nLOOP_COMPLETE"}
+
+    agent = SimpleNamespace(_session_title_hint="Bot Chat", run_conversation=run_conversation)
+    session = {"pending_title": None, "session_key": "k", "history_lock": contextlib.nullcontext(), "agent": agent}
+    st = srv._TurnRun(agent=agent, one_turn_restore=None, terminal_callback=None, receipt_committed=True)
+    srv._invoke_agent("sid", session, st, "ping", "ping", None, [], None, None)
+    streamed = "".join(p["text"] for e, p in events if e == "message.delta")
+    assert streamed.count("LOOP_COMPLETE") == 1
