@@ -331,6 +331,7 @@ def test_agent_close_releases_unused_continuations_only(camofox):
     _carry_session_state_to_child(SimpleNamespace(session_id="s3", _session_db=None), "s1", None)
     _end_turn("s1")
     assert _dispatch("browser_snapshot", {}, "s3")["success"]  # a newer agent's turn uses s3
+    _end_turn("s3")  # its own turn end marks it carried again; it still belongs to that agent
     with patch("run_agent.cleanup_vm"), patch("run_agent.cleanup_browser"):
         ClientLifecycleMixin._close_task_resources(SimpleNamespace(_process_owner_task_ids={"s1"}), "s1")
     assert "s2" not in cf._sessions  # never used: released with its origin
@@ -411,3 +412,26 @@ def test_handoff_detaches_another_task_bound_to_the_visible_tab(camofox):
     assert cf._sessions["second"]["tab_id"] == "visible-tab"
     assert cf._sessions["first"]["tab_id"] is None
     assert not _dispatch("browser_snapshot", {}, "first")["success"]  # rebinds only by navigating
+
+
+def test_a_protected_binding_does_not_move_to_a_continuation(camofox):
+    from agent.redact import clear_vault_date_components, register_vault_date_component
+    from agent.turn_context import _bind_turn_identity
+
+    cf = camofox.cf
+    agent = SimpleNamespace(session_id="s", _relay_pending_turn_id=None)
+    with patch("agent.agent_runtime_helpers.note_turn_start"):
+        first, _ = _bind_turn_identity(agent, None, None, None, None, None)
+        assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, first)["success"]
+        tab = cf._sessions[first]["tab_id"]
+        cf.quarantine_current_protected_tab(first)
+        register_vault_date_component("bday-year", "1990", tab=first, origin="https://a.example.test")
+        try:
+            _end_turn(first)
+            second, _ = _bind_turn_identity(agent, None, None, None, None, None)
+        finally:
+            clear_vault_date_components(first)
+    assert cf._sessions[second]["tab_id"] is None
+    assert not _dispatch("browser_snapshot", {}, second)["success"]
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, second)["success"]
+    assert cf._sessions[second]["tab_id"] not in {tab, None}

@@ -583,13 +583,17 @@ def carry_task_binding(old_task_id: str, new_task_id: str, *, move: bool = False
     and is detached from the new id."""
     if not old_task_id or not new_task_id or old_task_id == new_task_id:
         return
+    from agent.redact import has_vault_date_components
     with _sessions_lock:
         old = _sessions.get(old_task_id)
         if old is None or not old.get("managed") or new_task_id in _sessions:
             return
+        protected = bool(old.get("tab_id")) and has_vault_date_components(old_task_id)
         old["superseded"] = True
+        # A protected tab stays with the id that holds its protection; the continuation keeps
+        # only the account and rebinds by navigating.
         _sessions[new_task_id] = {**old, "task_id": new_task_id, "carried": True, "superseded": False,
-                                  "carried_from": old_task_id}
+                                  "carried_from": old_task_id, "tab_id": None if protected else old.get("tab_id")}
         if move:
             _drop_session_locked(old_task_id)
 
@@ -600,9 +604,11 @@ def release_task_bindings(task_ids: Iterable[str]) -> None:
     cleanup, or headed mode) is deleted as :func:`camofox_close` would."""
     with _sessions_lock:
         keys = {key or "default" for key in task_ids}
-        # Include continuation ids carried from these tasks that no turn has used yet.
+        # Include continuation ids carried from these tasks that no turn has used yet (a used one
+        # lost ``carried_from`` on first use and belongs to the agent now running it).
         while carried := {key for key, session in _sessions.items()
-                          if key not in keys and session.get("carried_from") in keys}:
+                          if key not in keys and session.get("carried")
+                          and session.get("carried_from") in keys}:
             keys |= carried
         dropped = [_drop_session_locked(key) for key in keys]
     for session in dropped:
