@@ -230,7 +230,7 @@ Any real message you send while a goal is active takes priority over the continu
 
 ### Pacing between automatic turns (gateway)
 
-On the gateway, a continuation that follows another automatic turn (a previous continuation, a `/loop` tick, a heartbeat) waits until `goals.min_continuation_gap_seconds` (default 900, 15 minutes) have passed since the last automatic continuation. Your own messages and the results of background processes or delegations the agent started are new evidence, so they continue the goal immediately. The hold is a silent timed wait that survives restarts. `/goal status` shows it, and `/goal unwait` ends it early. Set the value to `0` to disable pacing.
+On the gateway, a continuation that follows another automatic turn (a previous continuation, a `/loop` tick, a heartbeat) waits until `goals.min_continuation_gap_seconds` (default 900, 15 minutes) have passed since the last automatic continuation. Your own messages and the results of background processes or delegations the agent started are new evidence, so they continue the goal immediately. The hold is a silent timed wait that survives restarts. `/goal status` shows it, and `/goal unwait` ends it early. Set the value to `0` to disable pacing. Values above 1800 (the longest goal wait) are capped at 1800.
 
 ### Answering a blocked goal
 
