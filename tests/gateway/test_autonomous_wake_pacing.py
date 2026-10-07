@@ -125,6 +125,8 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
     runner, adapter, entry, src = _goal_runner()
     clock = [10_000.0]
     monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    # Each turn here does real work; the no-progress backoff (#302) has its own coverage.
+    monkeypatch.setattr(goals, "_evidence_only_read_only_status", lambda evidence: False)
     mgr = goals.GoalManager(entry.session_id)
     mgr.set("ship the release")
     continuation = mgr.next_continuation_prompt()

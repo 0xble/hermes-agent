@@ -59,8 +59,17 @@ _SELF_INJECTED_TURN_PREFIXES = (
 
 
 def _is_self_injected_turn(text: Any) -> bool:
-    # This release renders delegation notifications as framed strings.
-    return isinstance(text, str) and text.lstrip().startswith(_SELF_INJECTED_TURN_PREFIXES)
+    # Standing-goal prompt forms are registered centrally; the remaining frames are
+    # runtime-specific notifications that never represent user input.
+    if not isinstance(text, str):
+        return False
+    try:
+        from hermes_cli.goals import is_goal_continuation_text
+        if is_goal_continuation_text(text):
+            return True
+    except Exception:
+        pass
+    return text.lstrip().startswith(_SELF_INJECTED_TURN_PREFIXES)
 
 
 class CLILoopsMixin:
@@ -571,7 +580,9 @@ class CLILoopsMixin:
             mgr = self._get_goal_manager()
             if mgr is None or not mgr.is_parked():
                 return
-            # None while the barrier holds (the age cap applies); the prompt notes a killed process.
+            if notice := mgr.rearm_live_barrier():
+                from cli import _cprint
+                _cprint(f"  {notice}")
             prompt = mgr.lifted_barrier_prompt()
             if prompt:
                 from cli import _DIM, _RST, _cprint
@@ -591,14 +602,20 @@ class CLILoopsMixin:
         """
         from cli import _DIM, _RST, _cprint
         mgr = self._get_loop_manager()
-        if mgr is None or not mgr.is_due():
+        if mgr is None:
             return
-        # The idle poll runs at ~10 Hz; a due-but-deferred tick would otherwise hit the
-        # DB (goal_blocks_loop_tick) on every poll. Throttle the re-check.
+        # The idle poll runs at ~10 Hz; refresh the cached manager at most every 2s so a
+        # revision made by a tool during a wakeup is visible without turning the poll into a DB loop.
         now = time.time()
         if now - getattr(self, "_last_loop_tick_check", 0.0) < 2.0:
             return
         self._last_loop_tick_check = now
+        try:
+            mgr.refresh()
+        except Exception:
+            return
+        if not mgr.is_due():
+            return
         try:
             if not self._pending_input.empty():
                 return
@@ -662,6 +679,10 @@ class CLILoopsMixin:
         from cli import _DIM, _RST, _cprint
         mgr = self._get_loop_manager()
         if mgr is None:
+            return
+        try:
+            mgr.refresh()
+        except Exception:
             return
         state = mgr.state
         if state is None or not state.awaiting_response:
@@ -744,7 +765,8 @@ class CLILoopsMixin:
         except Exception:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
-            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg)
+            last_response, user_initiated=getattr(self, "_goal_turn_user_initiated", True),
+            background_processes=_bg_procs, active_delegations=_active_deleg)
         _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")

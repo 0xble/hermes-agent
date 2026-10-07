@@ -548,21 +548,27 @@ class TestWaitBarrier:
             proc.terminate()
             proc.wait(timeout=10)
 
-    def test_barrier_on_a_process_that_never_exits_expires(self, hermes_home):
-        """A poller that outlives the work parked one run for 3h22m; a live barrier ages out."""
+    def test_barrier_on_a_process_that_never_exits_rearms_after_age_cap(self, hermes_home):
+        """A live poller must rearm after the probe window, not wake the agent into busy-work."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         proc = self._spawn_sleeper()
         try:
-            mgr = GoalManager(session_id="wb-expire")
+            mgr = GoalManager(session_id="wb-rearm")
             mgr.set("g")
             mgr.wait_on(proc.pid, reason="poller")
             assert mgr.is_waiting() is True
             mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+            mgr.state.barrier_recheck_at = 0.0
             mgr._save()
-            assert mgr.is_waiting() is False
-            assert mgr.state.waiting_on_pid is None
+            before = time.time()
+            mgr.rearm_live_barrier()
+            assert mgr.is_waiting() is True
+            assert mgr.state.waiting_on_pid == proc.pid
+            assert mgr.state.barrier_recheck_at > before
+            assert mgr.state.waiting_until == 0.0
+            assert mgr.state.barrier_rearms == 1
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -758,6 +764,7 @@ class TestJudgeDrivenWait:
         # Force the deadline into the past → barrier auto-clears.
         mgr.state.waiting_until = time.time() - 1
         assert mgr.is_waiting() is False
+        mgr.stop_waiting()
         assert mgr.state.waiting_until == 0.0
 
     def test_continue_verdict_still_continues_with_background(self, hermes_home):
@@ -1252,22 +1259,25 @@ def test_continuation_gap_paces_autonomous_chain_and_yields_to_fresh_evidence(he
         # Silent: the routine pacing hold must not add chat notices of its own.
         assert (parked["should_continue"], parked["verdict"], parked["message"]) == (False, "waiting", "")
         assert load_goal("continuation-gap").waiting_until == pytest.approx(1900.0)
+        # A real user turn pierces the pacing hold and continues at once.
+        clock[0] += 5
+        assert mgr.evaluate_after_turn("user asked", user_initiated=True)["should_continue"]
+        clock[0] += 60
+        assert not mgr.evaluate_after_turn("continued", user_initiated=False)["should_continue"]
+        assert mgr.state.waiting_until == pytest.approx(1015.0 + 900)
         # A completion result is fresh evidence: it pierces the hold and continues at once.
         clock[0] += 60
         resumed = mgr.evaluate_after_turn("build passed", user_initiated=False, external_event=True)
         assert resumed["should_continue"] is True and mgr.state.waiting_until == 0
-        # Its continuation turn is itself autonomous, so the gap restarts from that dispatch.
+        # Its continuation turn is autonomous. It is also the third automatic no-progress turn, so
+        # the no-progress backoff parks it; that park never undercuts the gap from the dispatch.
         clock[0] += 30
         assert not mgr.evaluate_after_turn("next", user_initiated=False)["should_continue"]
-        assert mgr.state.waiting_until == pytest.approx(1070.0 + 900)
+        assert mgr.state.waiting_until == pytest.approx(1135.0 + 900)
         # Repeated autonomous turns while parked stay silent and keep the deadline.
         clock[0] += 100
         again = mgr.evaluate_after_turn("loop tick", user_initiated=False)
-        assert (again["message"], mgr.state.waiting_until) == ("", pytest.approx(1970.0))
-        # A real user turn always continues.
-        clock[0] += 5
-        assert mgr.evaluate_after_turn("user asked", user_initiated=True)["should_continue"]
-
+        assert (again["message"], mgr.state.waiting_until) == ("", pytest.approx(2035.0))
 
 def test_continuation_gap_elapsed_wait_paces_from_lift_without_cas_clear(hermes_home, monkeypatch):
     """The idle ticker's continuation is judged before its CAS clear lands: pace from the deadline."""
@@ -1304,3 +1314,4 @@ def test_continuation_gap_zero_disables_and_library_default_is_off(hermes_home):
     with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
         assert mgr.evaluate_after_turn("one", user_initiated=True)["should_continue"]
         assert mgr.evaluate_after_turn("two", user_initiated=False)["should_continue"]
+

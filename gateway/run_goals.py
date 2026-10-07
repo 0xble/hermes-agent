@@ -484,7 +484,7 @@ class GatewayGoalsMixin:
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
-        user_initiated: bool = True, external_event: bool = False,
+        user_initiated: bool = False, external_event: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -564,12 +564,10 @@ class GatewayGoalsMixin:
             # metadata, never derived from message text.
             metadata = getattr(event, "metadata", None) or {}
             external_event = metadata.get("notification_origin") == "process_registry_synthetic"
+            turn_is_user = self._is_user_turn_event(event) if event is not None else not is_internal
             hooks.insert(0, (
                 "goal continuation", self._post_turn_goal_continuation,
-                {
-                    "user_initiated": self._is_user_turn_event(event) if event is not None else not is_internal,
-                    "external_event": external_event,
-                },
+                {"user_initiated": turn_is_user, "external_event": external_event},
             ))
         for label, hook, hook_kwargs in hooks:
             try:
@@ -743,9 +741,13 @@ class GatewayGoalsMixin:
             mgr = GoalManager(
                 session_id=sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
             )
-            return mgr, mgr.lifted_barrier_prompt()
+            notice = mgr.rearm_live_barrier()
+            return mgr, notice, mgr.lifted_barrier_prompt()
 
-        mgr, prompt = await self._run_in_executor_with_context(_check)
+        mgr, barrier_notice, prompt = await self._run_in_executor_with_context(_check)
+        if barrier_notice:
+            with suppress(Exception):
+                await self._send_goal_status_notice(source, barrier_notice, notice_kind="wait-age")
         if not prompt:
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.

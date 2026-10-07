@@ -1439,6 +1439,7 @@ DEFAULT_CONFIG = {
     "loops": {
         "min_interval_seconds": 30,  # smallest fixed interval; tighter cadences raised to it
         "max_ticks": 100,  # auto-pause after this many wakeups unless --times set; 0 = unlimited
+        "auto_notices": True,  # show agent loop_set receipts (set/revise/replace) to the user
         "self_paced_floor_seconds": 60,  # Self-paced cadence bounds (seconds).
         "self_paced_ceiling_seconds": 900,
     },
