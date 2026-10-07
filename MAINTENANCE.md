@@ -175,6 +175,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream marks synthetic goal continuations as non-human for silence decisions.
 - **Rollback:** Revert the goal-continuation-silence fix commit.
 
+## Active patch record: turn session id binding
+
+- **Patch identity:** `mcp-caller-cached-agent`.
+- **Behavior:** `GatewayRunner._set_session_env` binds the turn's own `session_id` with the other per-turn session vars. Before, only agent construction published it, so a turn served by a cached agent ran with `HERMES_SESSION_ID` bound to `""`: MCP servers opted into `caller_identity` (relay) got no `_meta["hermes/caller"]` and refused with `caller_identity_required`.
+- **Source surfaces:** `gateway/run.py` (`_set_session_env`) and `tests/gateway/test_session_env_session_id.py`.
+- **Upstream status:** no upstream equivalent; upstream `_set_session_env` omits `session_id`.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_session_env_session_id.py tests/tools/test_mcp_caller_identity.py`.
+- **Retirement:** Remove when upstream binds the session id in the gateway turn's session context.
+- **Rollback:** Revert the mcp-caller-cached-agent fix commit.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

@@ -4337,6 +4337,10 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
+            # Bind the turn's own session id. Only agent construction published it before, so a
+            # turn served by a CACHED agent ran with HERMES_SESSION_ID bound to "" and anything that
+            # needs the caller (MCP caller_identity, process/kanban ownership) saw no session.
+            session_id=getattr(context, "session_id", "") or "",
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
