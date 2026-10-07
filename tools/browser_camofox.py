@@ -418,10 +418,10 @@ def _adopt_existing_tab(session: Dict[str, Any], target_url: Optional[str] = Non
         if session.get("tab_id") or _sessions.get(task_id, session) is not session:
             return session  # bound meanwhile, or replaced (account switch / release)
         listed = {tab.get("tabId") for tab in tabs if isinstance(tab, dict)}
-        stale = _stale_tab_ids.get(session["user_id"])
+        stale = _stale_tab_ids.pop(session["user_id"], set()) & listed
         if stale:
-            stale &= listed
-        refused = _protected_tab_ids | quarantined | (stale or set()) | {
+            _stale_tab_ids[session["user_id"]] = stale
+        refused = _protected_tab_ids | quarantined | stale | {
             other["tab_id"] for key, other in _sessions.items() if key != task_id and other.get("tab_id")}
         ranked = []
         for index, tab in enumerate(tabs):
@@ -585,16 +585,22 @@ def carry_task_binding(old_task_id: str, new_task_id: str) -> None:
 
 
 def release_task_bindings(task_ids: Iterable[str]) -> None:
-    """Agent close: forget these tasks' local tab bindings (the persistent profile and its tabs
-    stay on the server, and another task may adopt them)."""
+    """Agent close: forget these tasks' local tab bindings. A managed profile and its tabs stay on
+    the server for another task to adopt; an ephemeral session still open (a turn cut before its
+    cleanup, or headed mode) is deleted as :func:`camofox_close` would."""
     with _sessions_lock:
         keys = {key or "default" for key in task_ids}
         # Include continuation ids carried from these tasks that no turn has used yet.
         while carried := {key for key, session in _sessions.items()
                           if key not in keys and session.get("carried_from") in keys}:
             keys |= carried
-        for key in keys:
-            _drop_session_locked(key)
+        dropped = [_drop_session_locked(key) for key in keys]
+    for session in dropped:
+        if session and not session.get("managed"):
+            try:
+                _delete(f"/sessions/{session['user_id']}")
+            except Exception as exc:
+                logger.debug("Camofox ephemeral session close failed for %s: %s", session.get("user_id"), exc)
 
 
 # ---- HTTP helpers ----

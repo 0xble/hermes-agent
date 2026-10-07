@@ -335,3 +335,31 @@ def test_agent_close_releases_unused_continuations_only(camofox):
         ClientLifecycleMixin._close_task_resources(SimpleNamespace(_process_owner_task_ids={"s1"}), "s1")
     assert "s2" not in cf._sessions  # never used: released with its origin
     assert "s3" in cf._sessions  # in use by another agent: kept
+
+
+def test_agent_close_deletes_an_ephemeral_session_left_open(camofox):
+    """A turn cut before its cleanup leaves an ephemeral session; agent close must still delete it."""
+    from agent.client_lifecycle import ClientLifecycleMixin
+
+    (camofox.home / "config.yaml").write_text("browser:\n  cloud_provider: camofox\n", encoding="utf-8")
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "cut-turn")["success"]
+    user_id = _user_id(camofox.cf, "cut-turn")
+    deleted = []
+    with patch("tools.browser_camofox._delete", side_effect=lambda path, *a, **k: deleted.append(path) or {}), \
+         patch("run_agent.cleanup_vm"), patch("run_agent.cleanup_browser"):
+        ClientLifecycleMixin._close_task_resources(SimpleNamespace(_process_owner_task_ids={"cut-turn"}), "other")
+    assert "cut-turn" not in camofox.cf._sessions
+    assert deleted == [f"/sessions/{user_id}"]
+
+
+def test_stale_tab_record_is_pruned_once_the_server_forgets_the_tab(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    tab = cf._sessions["chat"]["tab_id"]
+    user_id = _user_id(cf, "chat")
+    camofox.server.gone.add(tab)
+    assert not _dispatch("browser_snapshot", {}, "chat")["success"]
+    assert cf._stale_tab_ids[user_id] == {tab}
+    camofox.server.tabs[user_id] = [t for t in camofox.server.tabs[user_id] if t["tabId"] != tab]
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    assert user_id not in cf._stale_tab_ids
