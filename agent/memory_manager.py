@@ -559,11 +559,16 @@ class MemoryManager:
         if queued_at is None or max_age is None or _now() - queued_at <= max_age:
             return
         self._prefetch_queued_at = None
-        self._prefetch_generation.discard()
         logger.debug("Discarding buffered memory prefetch queued %.0fs ago (limit %.0fs)", _now() - queued_at, max_age)
+        # Obsolete the manager token and drop provider buffers under the same lock a queued dispatch
+        # holds, so a dispatch that passed its check either finishes first (and its provider-level
+        # generation is then discarded here) or sees the discarded token and never reaches a provider.
         # Duck-typed providers that predate the hook have nothing to call.
-        self._each_provider("discard_prefetch failed (non-fatal)",
-                            lambda p: getattr(p, "discard_prefetch", lambda: None)())
+        def _discard_providers() -> None:
+            self._each_provider("discard_prefetch failed (non-fatal)",
+                                lambda p: getattr(p, "discard_prefetch", lambda: None)())
+
+        self._prefetch_generation.discard(_discard_providers)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
@@ -575,11 +580,15 @@ class MemoryManager:
         self._prefetch_queued_at, generation = _now(), self._prefetch_generation.begin()
 
         def _queue() -> None:
+            # Dispatch while holding the token's lock: a concurrent age-bound discard waits for the
+            # dispatch to finish and then drops what it queued, or runs first and this check fails.
+            # providers' queue_prefetch only spawns their worker, so the hold is short.
             with self._prefetch_generation.publishing(generation) as current:
                 if not current:  # expired (or superseded) while waiting behind a slow sync
                     return
-            self._each_provider("queue_prefetch failed (non-fatal)",
-                                lambda p: p.queue_prefetch(clean_query, session_id=session_id), providers=providers)
+                self._each_provider("queue_prefetch failed (non-fatal)",
+                                    lambda p: p.queue_prefetch(clean_query, session_id=session_id),
+                                    providers=providers)
 
         self._submit_background(_queue, kind="prefetch")
 

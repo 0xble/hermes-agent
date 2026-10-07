@@ -738,3 +738,38 @@ def test_queued_recall_still_waiting_behind_a_slow_sync_is_dropped_with_the_expi
     release.set()
     assert manager.flush_pending(timeout=5) is True
     assert provider.queued == []  # the expired request never reached the provider
+
+
+def test_age_bound_discard_racing_a_dispatch_that_already_passed_its_check_leaves_no_stale_buffer(clock):
+    """Review of a76f67d: the queued task's validity check must not release the lock before the
+    provider dispatch, or a discard landing in between lets the expired request reach the provider
+    and publish after the age-bound discard."""
+    import threading
+
+    in_dispatch, finish_dispatch = threading.Event(), threading.Event()
+
+    class _SlowDispatch(_BufferingProvider):
+        def queue_prefetch(self, query, *, session_id=""):
+            in_dispatch.set()
+            finish_dispatch.wait(5)
+            super().queue_prefetch(query, session_id=session_id)
+
+    manager = MemoryManager(prefetch_max_age_seconds=1800.0)
+    provider = _SlowDispatch()
+    manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    manager.queue_prefetch_all(HUMAN, session_id="s-1")
+    assert in_dispatch.wait(5)  # the dispatch passed its generation check and is inside the provider
+    clock[0] += 1801
+
+    result: dict = {}
+    consumer = threading.Thread(target=lambda: result.setdefault(
+        "v", manager.prefetch_all("And what about the rollback plan?", session_id="s-1")))
+    consumer.start()
+    consumer.join(0.3)
+    assert consumer.is_alive()  # the discard waits for the in-flight dispatch instead of racing it
+    finish_dispatch.set()
+    consumer.join(5)
+    assert not consumer.is_alive()
+    assert manager.flush_pending(timeout=5) is True
+    assert result["v"] == ""  # what the racing dispatch buffered was dropped by the discard
+    assert provider.buffer == ""
