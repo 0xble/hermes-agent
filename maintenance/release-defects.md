@@ -16,6 +16,14 @@ records its patch identity and guard test. Offer upstream-origin fixes upstream 
 drop each once upstream carries an equivalent fix. Append new defects as sections
 here; move a section into a behavior-specific unit when that unit starts owning it.
 
+`production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
+
+## Production-only unused imports
+
+- Fork patch identity: `production-unused-imports`.
+- The maintained fork had four imports that Ruff proved unused on the fork's current release baseline. Removing them changes no runtime behavior or public interface.
+- Guard: `ruff check --select F401 agent/agent_init.py agent/codex_runtime.py agent/memory_manager.py` and `python3 -m py_compile` on the three files.
+
 ## Relay close-failure abort ordering
 
 - Fork patch identity: `relay-close-failure-test-race`.
