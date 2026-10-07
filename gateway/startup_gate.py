@@ -489,9 +489,6 @@ def _worker_main(payload: dict) -> dict:
             # Readiness must not install software, even in its private home.
             pass
 
-        def _init_session_db(self):
-            super()._init_session_db()
-
         def _init_registries_and_clocks(self):
             super()._init_registries_and_clocks()
             from gateway.hooks import HookRegistry

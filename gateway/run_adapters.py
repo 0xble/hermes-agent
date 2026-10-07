@@ -890,6 +890,7 @@ class GatewayAdapterLifecycleMixin:
             counts = self._reconnect_restore_keys = {}
         for key in keys:
             counts[key] = counts.get(key, 0) + 1
+        self._release_reconnect_platform_fence(platform)
         # The reconnect watcher must not release the adapter until the per-session gate is
         # installed. Otherwise fresh inbound can overtake a claimed pre-restart follow-up
         # during the small window between scheduling and publishing _reconnect_restore_keys.
@@ -957,7 +958,24 @@ class GatewayAdapterLifecycleMixin:
             and getattr(recovery_hook, "__func__", None)
             is GatewayAdapterLifecycleMixin._recover_spool_after_reconnect
         ):
-            await resume_scheduled.wait()
+            from gateway.run import _startup_restore_drain_timeout_secs
+            timeout = _startup_restore_drain_timeout_secs()
+            if timeout <= 0:
+                await resume_scheduled.wait()
+            else:
+                try:
+                    await asyncio.wait_for(resume_scheduled.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Reconnect %s recovery scheduling exceeded %.0fs; continuing while recovery runs "
+                        "in the background",
+                        platform.value, timeout,
+                    )
+
+    def _release_reconnect_platform_fence(self, platform) -> None:
+        fences = getattr(self, "_reconnect_restore_platforms", None)
+        if fences is not None:
+            fences.discard(platform)
 
     def _start_reconnect_spool_recovery(self, platform):
         """One retained recovery worker per platform, independent of the reconnect watcher."""
@@ -966,6 +984,10 @@ class GatewayAdapterLifecycleMixin:
             pending = self._reconnect_spool_tasks = {}
         if platform in pending and not pending[platform].done():
             return None
+        fences = getattr(self, "_reconnect_restore_platforms", None)
+        if fences is None:
+            fences = self._reconnect_restore_platforms = set()
+        fences.add(platform)
         resume_scheduled = asyncio.Event()
         resume_events = getattr(self, "_reconnect_resume_events", None)
         if resume_events is None:
@@ -988,6 +1010,7 @@ class GatewayAdapterLifecycleMixin:
             finally:
                 # Fail-open for the watcher if candidate snapshotting itself failed before the scheduling
                 # phase; the retained worker has already logged the failure and will not lose the spool.
+                self._release_reconnect_platform_fence(platform)
                 resume_scheduled.set()
                 asyncio.get_running_loop().call_soon(cleanup)
         task_ref = self._retain_background_task(asyncio.create_task(recover()))

@@ -291,14 +291,17 @@ class GatewayInboundMixin:
             return None
 
         reconnect_keys = getattr(self, "_reconnect_restore_keys", None)
+        reconnect_platforms = getattr(self, "_reconnect_restore_platforms", None)
+        reconnect_platform_fenced = bool(reconnect_platforms and source.platform in reconnect_platforms)
         # Session-key normalization precedes the turn's key derivation. The
         # pre_gateway_dispatch hook runs only after this gate and must not rewrite
         # the routing identity of an already admitted event.
         reconnect_key = None
-        if reconnect_keys and not is_internal:
+        if (reconnect_keys or reconnect_platform_fenced) and not is_internal:
             reconnect_key = self._session_key_for_source(self._normalize_source_for_session_key(source))
         if (
             (getattr(self, "_startup_restore_in_progress", False)
+             or reconnect_platform_fenced
              or (reconnect_keys and reconnect_keys.get(reconnect_key, 0)))
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)

@@ -171,6 +171,23 @@ async def test_finish_wiring_opens_restore_gate_without_waiting_for_mcp(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_start_keeps_mcp_gate_closed_until_successful_discovery(monkeypatch):
+    """The public start() success path must not release the MCP readiness barrier early."""
+    runner = object.__new__(GatewayRunner)
+    runner._mcp_discovery_ready = asyncio.Event()
+    runner._running = True
+
+    async def start_impl():
+        return True
+
+    runner._start_impl = start_impl
+    monkeypatch.setattr(GatewayRunner, "_start_flush_runtime_status", staticmethod(_async_noop))
+
+    assert await runner.start() is True
+    assert not runner._mcp_discovery_ready.is_set()
+
+
+@pytest.mark.asyncio
 async def test_startup_recovery_snapshot_does_not_block_gateway_loop():
     """A blocking recovery read must run in a worker, not on the event-loop thread."""
     runner = object.__new__(GatewayRunner)

@@ -293,6 +293,26 @@ async def test_offline_followup_retried_on_primary_reconnect(tmp_path, monkeypat
     db.append_message.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_reconnect_recovery_scheduling_wait_is_bounded(tmp_path, monkeypatch, caplog):
+    runner, adapter, source, _, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._failed_platforms = {source.platform: {}}
+    runner._publish_primary_adapter = lambda platform, adapter: runner.adapters.__setitem__(
+        platform, adapter
+    )
+    runner._update_platform_runtime_status = MagicMock()
+    runner._schedule_planned_restart_replay = MagicMock()
+    runner._redeliver_failed_obligations_for_platform = AsyncMock()
+    resume_scheduled = asyncio.Event()
+    runner._start_reconnect_spool_recovery = MagicMock(return_value=resume_scheduled)
+    monkeypatch.setenv("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", "0.01")
+
+    with caplog.at_level("WARNING"):
+        await runner._install_reconnected_adapter(source.platform, adapter)
+
+    assert "recovery scheduling exceeded" in caplog.text
+
+
 def test_direct_session_id_spool_skips_resolver_and_queues(tmp_path, monkeypatch):
     runner, _, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
     path = tmp_path / "pending_messages" / "direct.json"
@@ -516,6 +536,45 @@ async def test_reconnect_live_inbound_waits_until_older_followup_finishes(tmp_pa
     assert seen == []
     release_older.set()
     await asyncio.wait_for(recovery, 5)
+    assert seen == ["older", "live"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_fences_inbound_during_off_loop_scan(tmp_path, monkeypatch):
+    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
+    runner._await_startup_warmup = AsyncMock()
+    assert flush_pending_to_file({key: MessageEvent(text="older", source=source, user_id="u1")}) == 1
+    candidates = runner._resume_pending_candidates()
+    scan_started, release_scan = asyncio.Event(), asyncio.Event()
+    seen = []
+
+    async def delayed_scan(*_args, **_kwargs):
+        scan_started.set()
+        await release_scan.wait()
+        return candidates
+
+    async def handle(event):
+        seen.append(event.text)
+        event._gateway_accepted = True
+
+    runner._resume_pending_candidates_async = delayed_scan
+    runner._scale_to_zero_note_real_inbound = MagicMock()
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._admit_bot_message_for_source = MagicMock(return_value=True)
+    adapter.handle_message = handle
+
+    runner._start_reconnect_spool_recovery(source.platform)
+    await asyncio.wait_for(scan_started.wait(), 5)
+
+    live = MessageEvent(text="live", source=source, user_id="u1")
+    assert await runner._hm_admit_event(live) is None
+    assert seen == []
+
+    release_scan.set()
+    await asyncio.wait_for(runner._reconnect_spool_tasks[source.platform], 5)
     assert seen == ["older", "live"]
     assert not runner._reconnect_restore_keys
 

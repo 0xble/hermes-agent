@@ -86,11 +86,14 @@ class GatewayStartupMixin:
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
 
-    def _queue_startup_restore_event(self, event: MessageEvent) -> None:
+    def _queue_startup_restore_event(self, event: MessageEvent, *, front: bool = False) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
-        queue.append(event)
+        if front:
+            queue.insert(0, event)
+        else:
+            queue.append(event)
         with suppress(Exception):
             source = event.source
             logger.info(
@@ -271,8 +274,10 @@ class GatewayStartupMixin:
                 )
             except Exception:
                 logger.warning(failure_message, exc_info=True)
-            for event in recovered_events:
-                self._queue_startup_restore_event(event)
+            # A reconnect fence queues fresh inbound while the worker scans. Put the older recovered
+            # follow-ups ahead of that queue so replay cannot be overtaken after the fence publishes.
+            for event in reversed(recovered_events):
+                self._queue_startup_restore_event(event, front=True)
             return recovered_events
 
     async def _finish_startup_restore(self) -> None:
@@ -1911,13 +1916,16 @@ class GatewayStartupMixin:
 
     async def start(self) -> bool:
         """Start the gateway and all configured platform adapters."""
+        startup_succeeded = False
         try:
-            return await self._start_impl()
+            result = await self._start_impl()
+            startup_succeeded = bool(result and getattr(self, "_running", False))
+            return result
         finally:
             # Early startup aborts can return before the normal finish-wiring discovery phase; release any
             # API requests waiting on the readiness barrier when the runner is no longer starting.
             mcp_ready = getattr(self, "_mcp_discovery_ready", None)
-            if isinstance(mcp_ready, asyncio.Event):
+            if isinstance(mcp_ready, asyncio.Event) and not startup_succeeded:
                 mcp_ready.set()
             # Every startup path (early aborts included) ends here: bound startup on the latest
             # diagnostic snapshot once, instead of flushing at each return.

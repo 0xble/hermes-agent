@@ -324,6 +324,7 @@ class TestApiAdmissionMcpReadiness:
 
 
 
+class TestConcurrencyCap:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("at_cap", [True, False], ids=["at-cap", "under-cap"])
     @pytest.mark.parametrize(
