@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
+from plugins.platforms.telegram.daily_volume import DailyVolume
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 
 logger = logging.getLogger(__name__)
@@ -284,8 +285,10 @@ class ChatBudgetRateLimiter:
         *,
         penalty_remaining: Optional[Callable[[str], Optional[float]]] = None,
         on_retry_after: Optional[Callable[[str, float], None]] = None,
+        volume: Optional["DailyVolume"] = None,
     ):
         self.budget = budget
+        self.volume = volume
         self._penalty_remaining = penalty_remaining
         self._on_retry_after = on_retry_after
         self.shed_count = 0
@@ -314,12 +317,16 @@ class ChatBudgetRateLimiter:
                 return True  # sendChatAction and draft endpoints return a bare boolean
         else:
             await self.budget.take(key)
+        if self.volume is not None:
+            self.volume.record(key, endpoint, data)
         try:
             return await callback(*args, **kwargs)
         except Exception as error:
             wait = _retry_after_seconds(error)
             if wait is not None:
                 self.budget.note_retry_after(key, wait)
+                if self.volume is not None:
+                    self.volume.note_retry_after(key, wait)
                 logger.warning("Telegram chat %s: %s refused with retry_after=%.1fs", key, endpoint, wait)
                 if self._on_retry_after is not None:
                     try:

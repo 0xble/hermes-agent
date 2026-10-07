@@ -159,6 +159,50 @@ migration is involved.
 call, sized by chat class, shedding cosmetic traffic and widening on `retry_after`, and passes
 the regression above.
 
+## Daily Volume Ledger
+
+**Patch identity:** `telegram-daily-volume`. Measurement only: nothing is shed or delayed.
+
+**Why.** The per-chat rate budget (`telegram-chat-budget`) did not prevent the 2026-10-05 ban.
+At 17:23:52 PDT the DM was refused for 34507s while traffic was 0-6 sends/min. Every long ban in
+`gateway.error.log` since 2026-09-28 has ended at a fixed time of day:
+
+| Refused at (PDT) | retry_after | Ends (UTC) |
+| --- | --- | --- |
+| 2026-09-28 00:33 | 7202s | 09-28 09:33:24 |
+| 2026-09-28 21:30 | 18198s | 09-29 09:33:23 |
+| 2026-10-04 01:10 | 5485s | 10-04 09:41:23 |
+| 2026-10-04 20:14 | 24231s | 10-05 09:58:45 |
+| 2026-10-05 17:23 | 34507s | 10-06 09:58:59 |
+
+The outbox recorded 1929 in-turn sends between the previous reset and the refusal in both of the
+last two windows (17.6h and 14.4h). Full days with 498-1103 sends were not banned. That points to a
+daily volume cap that Telegram does not document, rather than a rate limit. The outbox misses
+out-of-turn sends, edits, typing and deletes, so the threshold is not yet known.
+A bot-scoped `setMyCommands` succeeded during the ban, so the refusal is not a bot-wide write
+freeze. Whether the cap is keyed per chat or per bot is untested.
+
+**Contract.** `plugins/platforms/telegram/daily_volume.py` counts every metered request, by
+endpoint and messages created, per chat and per rolling 24h window. It runs in the gateway's
+request-layer limiter and in the standalone sender.
+- The window anchors at UTC midnight. A published `retry_after` of an hour or more re-anchors it
+  at the moment the penalty ends, carrying the current counts into that window.
+- Counts persist in `telegram-flood-state.db` (`daily_volume`, `daily_anchor`, 14-day retention).
+  The gateway flushes every 60s and reads the shared totals back. The standalone lane writes per call.
+- INFO logs the window's totals hourly. WARNING logs them with every `retry_after`, so the next
+  refusal is directly comparable to the volume that preceded it.
+
+Shedding against a daily ceiling was built and parked on `park/telegram-daily-volume-shedding`
+(`f8ff9996`). Decide on it after this ledger has recorded at least one refusal.
+
+**Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_daily_volume.py`.
+
+**Rollback:** Revert `fix(telegram): count daily Bot API volume per chat`. The two tables can
+remain unused.
+
+**Retirement:** Retire when Telegram documents the cap, or when a shedding policy replaces the
+measurement.
+
 ## Provenance and patches
 
 - Fork patch identities: `slice-10-flood-coherence`, `slice-10-telegram-delivery`,

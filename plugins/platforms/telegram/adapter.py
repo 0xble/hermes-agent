@@ -28,6 +28,7 @@ from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood
 from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.chat_budget import (
     KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget)
+from plugins.platforms.telegram.daily_volume import DailyVolume
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -6710,7 +6711,8 @@ class TelegramAdapter(BasePlatformAdapter):
             limiter = self.__dict__["_telegram_chat_rate_limiter"] = ChatBudgetRateLimiter(
                 self._chat_budget(),
                 penalty_remaining=self._send_flood_cooldown_remaining,
-                on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait))
+                on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait),
+                volume=DailyVolume(profile_dir=getattr(self, "_update_receipt_dir", None)))
         return limiter
 
     def _flood_inline_wait_cap(self, chat_id: Any) -> float:
