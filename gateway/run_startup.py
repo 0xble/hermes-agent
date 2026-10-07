@@ -74,8 +74,11 @@ class GatewayStartupMixin:
     async def _run_startup_resume_event(
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
     ) -> None:
-        """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
-        until it finishes, else a user message can race it)."""
+        """Run one synthetic resume to completion before its session's queued follow-up.
+
+        The replay scheduler can continue admitting unrelated sessions while this
+        per-session ordering fence is held.
+        """
         from gateway.run import _AGENT_PENDING_SENTINEL
         try:
             state = self._peek_session_state(session_key)
@@ -121,30 +124,66 @@ class GatewayStartupMixin:
                 extra={"replay_scheduler": "source_queued", "kind": kind},
             )
 
+    def _requeue_startup_restore_event(self, event: MessageEvent, *, session_key: str) -> None:
+        """Return a replay item to the restore queue without creating a second claim.
+
+        Scheduler shutdown can cancel an item after it has been removed from the
+        restore queue but before its turn starts.  The existing restore-key claim
+        remains outstanding so the shutdown flush sees this copy exactly once.
+        """
+        queue = getattr(self, "_startup_restore_queue", None)
+        if queue is None:
+            queue = self._startup_restore_queue = []
+        if not any(existing is event for existing in queue):
+            queue.append(event)
+        with suppress(Exception):
+            logger.info(
+                "Returned dropped replay to restore queue: session_key=%s",
+                session_key,
+                extra={"replay_scheduler": "source_requeued", "session_key": session_key},
+            )
+
+    def _schedule_startup_restore_drain(self) -> None:
+        if not getattr(self, "_startup_restore_queue", None):
+            return
+        scheduler = getattr(self, "_replay_scheduler", None)
+        if scheduler is not None and getattr(scheduler, "_closed", False):
+            return
+        task = asyncio.create_task(self._drain_startup_restore_queue(wait=False))
+        self._retain_background_task(task)
+        task.add_done_callback(
+            self._late_failure_callback("background startup restore drain failed", level=logging.DEBUG)
+        )
+
     def _release_startup_restore_key(self, session_key: str) -> None:
         restore_keys = getattr(self, "_startup_restore_keys", None)
-        if not restore_keys or session_key not in restore_keys:
-            return
-        remaining = restore_keys[session_key] - 1
-        if remaining > 0:
-            restore_keys[session_key] = remaining
-            return
-        restore_keys.pop(session_key, None)
-        if getattr(self, "_startup_restore_queue", None):
-            task = asyncio.create_task(self._drain_startup_restore_queue(wait=False))
-            self._retain_background_task(task)
-            task.add_done_callback(
-                self._late_failure_callback("background startup restore drain failed", level=logging.DEBUG)
-            )
+        claimed = getattr(self, "_startup_restore_claimed_keys", None)
+        if claimed is not None:
+            claimed.discard(session_key)
+        if restore_keys and session_key in restore_keys:
+            remaining = restore_keys[session_key] - 1
+            if remaining > 0:
+                restore_keys[session_key] = remaining
+            else:
+                restore_keys.pop(session_key, None)
+        self._schedule_startup_restore_drain()
 
     async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None, wait: bool = True) -> int:
         """Submit ready startup/recovered events to the shared priority scheduler."""
         handles = []
         queue = getattr(self, "_startup_restore_queue", None) or []
+        claimed = getattr(self, "_startup_restore_claimed_keys", None)
+        if claimed is None:
+            claimed = self._startup_restore_claimed_keys = set()
 
         def ready(event):
             key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
             if keys is not None and key not in keys:
+                return False
+            # A session may have one claimed replay at a time.  This applies to
+            # both startup and reconnect fences: an older recovered follow-up
+            # that is waiting on its resume must keep a newer live event queued.
+            if key in claimed:
                 return False
             # Our own gate permits one claimant; every other owner's gate must be fully open.
             limit = 1 if owned_keys and key in owned_keys else 0
@@ -157,6 +196,7 @@ class GatewayStartupMixin:
             event = queue.pop(index)
             source = getattr(event, "source", None)
             key = self._session_key_for_source(self._normalize_source_for_session_key(source))
+            claimed.add(key)
             adapter = self._intake_adapter_for(source)
             if adapter is None and getattr(event, "_hermes_recovered_followup", False):
                 adapter = self._delivery_adapter_for(source)
@@ -173,7 +213,6 @@ class GatewayStartupMixin:
             with suppress(Exception):
                 setattr(event, "_hermes_startup_restore_replay", True)
             event._gateway_accepted = False
-            key = self._session_key_for_source(self._normalize_source_for_session_key(source))
             kind = (
                 "recovered_followup"
                 if getattr(event, "_hermes_recovered_followup", False)
@@ -183,7 +222,7 @@ class GatewayStartupMixin:
                 getattr(self, "_replay_resume_tasks", {}) or {}
             ).get(key) if kind == "recovered_followup" else None
 
-            async def _dispatch(event=event, adapter=adapter):
+            async def _dispatch(event=event, adapter=adapter, key=key):
                 try:
                     await adapter.handle_message(event)
                     if getattr(event, "_gateway_accepted", False) is True:
@@ -195,7 +234,7 @@ class GatewayStartupMixin:
                     self._release_startup_restore_key(key)
 
             profile_home = self._resolve_profile_home_for_source(source)
-            if keys is None and resume_task is not None and not resume_task.done():
+            if resume_task is not None and not resume_task.done():
                 async def _defer_until_resume(
                     event=event, adapter=adapter, key=key, profile_home=profile_home,
                     resume_task=resume_task, dispatch_now=_dispatch,
@@ -203,15 +242,24 @@ class GatewayStartupMixin:
                     try:
                         await resume_task
                     except BaseException:
+                        self._requeue_startup_restore_event(event, session_key=key)
                         self._release_startup_restore_key(key)
                         return
-                    handle = self._enqueue_replay(
-                        priority=REPLAY_PRIORITY_SYNTHETIC,
-                        kind="recovered_followup",
-                        session_key=key,
-                        dispatch=lambda: dispatch_now(),
-                        profile_home=profile_home,
-                    )
+                    try:
+                        handle = self._enqueue_replay(
+                            priority=REPLAY_PRIORITY_SYNTHETIC,
+                            kind="recovered_followup",
+                            session_key=key,
+                            dispatch=lambda: dispatch_now(),
+                            profile_home=profile_home,
+                            on_drop=lambda event=event, key=key: self._requeue_startup_restore_event(
+                                event, session_key=key,
+                            ),
+                        )
+                    except BaseException:
+                        self._requeue_startup_restore_event(event, session_key=key)
+                        self._release_startup_restore_key(key)
+                        return
                     waiter = self._retain_background_task(asyncio.create_task(
                         self._get_replay_scheduler().wait_for(handle)
                     ))
@@ -234,6 +282,9 @@ class GatewayStartupMixin:
                 session_key=key,
                 dispatch=_dispatch,
                 profile_home=profile_home,
+                on_drop=lambda event=event, key=key: self._requeue_startup_restore_event(
+                    event, session_key=key,
+                ),
             ))
 
         drained = 0
@@ -363,20 +414,9 @@ class GatewayStartupMixin:
         drained = 0
         try:
             await self._await_startup_warmup()
-            tasks = list(getattr(self, "_startup_restore_tasks", []) or [])
-            self._startup_restore_tasks = []
-            if tasks:
-                from gateway.run import _startup_restore_drain_timeout_secs
-                await self._wait_bounded_or_release(
-                    set(tasks), _startup_restore_drain_timeout_secs(),
-                    "Startup restore backfill still running after %.0fs; releasing inbound gate; "
-                    "older backfill turns continue in the background.",
-                    "background startup restore backfill failed after gate release",
-                    level=logging.DEBUG,
-                )
-            # Replay turns run under the shared scheduler, not under the inbound gate. Queue the
-            # complete batch first so humans retain priority over resumes, then let the gate open;
-            # recovered follow-ups still await their own session's resume task in _dispatch.
+            # Replay turns run under the shared scheduler, not under the inbound gate. Queue one
+            # claimant per session so the per-session fence remains ordered while unrelated sessions
+            # retain concurrency; recovered follow-ups await their own resume task before admission.
             drained = await self._drain_startup_restore_queue(wait=False)
         finally:
             self._startup_restore_in_progress = False

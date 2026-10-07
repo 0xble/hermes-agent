@@ -14,6 +14,7 @@ from gateway.run import _prepare_resume_pending_message, _profile_runtime_scope
 from gateway.session import SessionEntry
 from gateway.shutdown_flush import flush_pending_to_file
 from gateway.run_pending_recovery import recover_pending_shutdown_flush
+from gateway.replay_scheduler import ReplayScheduler
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -471,6 +472,131 @@ async def test_reconnect_live_inbound_waits_until_older_followup_finishes(tmp_pa
     await asyncio.wait_for(recovery, 5)
     assert seen == ["older", "live"]
     assert not runner._reconnect_restore_keys
+
+
+@pytest.mark.asyncio
+async def test_reconnect_followup_waits_for_real_resume_turn(tmp_path, monkeypatch):
+    """Reconnect recovery must not run the recovered follow-up beside its resume."""
+    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    assert flush_pending_to_file({key: MessageEvent(text="human:older", source=source, user_id="u1")}) == 1
+
+    resume_started = asyncio.Event()
+    release_resume = asyncio.Event()
+    followup_started = asyncio.Event()
+    seen = []
+
+    async def handle(event):
+        if event.internal:
+            seen.append("resume-start")
+            resume_started.set()
+            await release_resume.wait()
+            seen.append("resume-end")
+        else:
+            followup_started.set()
+            seen.append(event.text)
+        event._gateway_accepted = True
+
+    adapter.handle_message = handle
+    recovery = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(resume_started.wait(), 5)
+    await asyncio.sleep(0)
+    assert not followup_started.is_set(), "reconnect follow-up raced its own resume turn"
+    assert seen == ["resume-start"]
+
+    release_resume.set()
+    await asyncio.wait_for(recovery, 5)
+    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
+    assert seen == ["resume-start", "resume-end", "human:older"]
+
+
+@pytest.mark.asyncio
+async def test_startup_release_does_not_overtake_other_session_deferred_followup(tmp_path, monkeypatch):
+    """A session release must not admit a sibling's live event over its older follow-up."""
+    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = True
+    other = replace(source, chat_id="other")
+    other_key = runner._session_key_for_source(other)
+    resume_b = asyncio.get_running_loop().create_future()
+    runner._replay_resume_tasks = {other_key: resume_b}
+    runner._startup_restore_queue = []
+
+    older_a = MessageEvent(text="human:A-older", source=source, user_id="u1")
+    older_b = MessageEvent(text="human:B-older", source=other, user_id="u1")
+    setattr(older_b, "_hermes_recovered_followup", True)
+    live_b = MessageEvent(text="human:B-live", source=other, user_id="u1")
+    runner._queue_startup_restore_event(older_a, session_key=key)
+    runner._queue_startup_restore_event(older_b, session_key=other_key)
+    runner._queue_startup_restore_event(live_b, session_key=other_key)
+
+    seen = []
+
+    async def handle(event):
+        seen.append(event.text)
+        event._gateway_accepted = True
+
+    adapter.handle_message = handle
+    assert await runner._drain_startup_restore_queue(
+        keys={key}, owned_keys={key}, wait=True,
+    ) == 1
+    await asyncio.sleep(0.05)
+    assert seen == ["human:A-older"]
+
+    resume_b.set_result(None)
+    await asyncio.sleep(0)
+    await asyncio.gather(*(tuple(runner._background_tasks)), return_exceptions=True)
+    assert seen == ["human:A-older", "human:B-older", "human:B-live"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_spools_restore_items_dropped_behind_replay_cap(tmp_path, monkeypatch):
+    """Scheduler close must return every not-started inbound item for shutdown flush."""
+    runner, adapter, source, _key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = True
+    runner._startup_restore_queue = []
+    runner._replay_scheduler = ReplayScheduler(1)
+    events = [
+        MessageEvent(text=f"queued-{i}", source=replace(source, chat_id=f"chat-{i}"), user_id="u1")
+        for i in range(3)
+    ]
+    for event in events:
+        runner._queue_startup_restore_event(event)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(event):
+        started.set()
+        await release.wait()
+        event._gateway_accepted = True
+
+    adapter.handle_message = handle
+    await runner._drain_startup_restore_queue(wait=False)
+    await asyncio.wait_for(started.wait(), 5)
+    await runner._replay_scheduler.close(timeout=0)
+
+    assert sorted(event.text for event in runner._startup_restore_queue) == [
+        "queued-1", "queued-2",
+    ]
+    assert events[0] not in runner._startup_restore_queue
+
+    # Exercise the real final shutdown spool step, not just the scheduler callback.
+    runner._background_tasks = set()
+    runner._stop_task = runner._restart_task = None
+    runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_approvals = {}
+    runner._shutdown_event = asyncio.Event()
+    runner._active_api_run_count = MagicMock(return_value=0)
+    runner._stop_kill_tool_subprocesses_off_loop = AsyncMock()
+    ctx = MagicMock()
+    ctx.elapsed.return_value = 0
+    await runner._stop_release_runtime_state(ctx)
+    payloads = [json.loads(path.read_text(encoding="utf-8"))["data"]["text"]
+                for path in (tmp_path / "pending_messages").glob("*.json")]
+    assert sorted(payloads) == ["queued-1", "queued-2"]
 
 
 @pytest.mark.asyncio
