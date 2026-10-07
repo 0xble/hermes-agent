@@ -124,6 +124,19 @@ def registry_state(tmp_path, monkeypatch):
     async_delegation._reset_for_tests()
 
 
+def test_sync_fallback_serializes_unexpected_result_values(monkeypatch):
+    parent, child = _Parent(), _ControlledChild()
+    batch = _batch(parent, child)
+    monkeypatch.setattr(
+        dispatch_module,
+        "_execute_and_aggregate",
+        lambda _batch: {"results": [{"summary": object()}]},
+    )
+
+    result = json.loads(dispatch_module._run_sync_with_note(batch, "schedule_failure"))
+
+    assert isinstance(result["results"][0]["summary"], str)
+    assert result["note"] == dispatch_module._SYNC_FALLBACK_NOTES["schedule_failure"]
 
 
 def test_early_terminal_unit_is_handled_without_sync_rerun(registry_state, monkeypatch):

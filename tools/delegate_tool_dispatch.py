@@ -236,7 +236,7 @@ def _run_sync_with_note(batch: _Batch, reason: str) -> str:
     result = _execute_and_aggregate(batch)
     if isinstance(result, dict):
         result["note"] = _SYNC_FALLBACK_NOTES[reason]
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, default=str)
 
 def _resolve_async_wake_sid(origin_wake_sid: str, origin_session_history_delivery: bool = False) -> Optional[str]:
     """Detached result target: empty for push, a resumable API id, or None for inline.
