@@ -16,6 +16,32 @@ records its patch identity and guard test. Offer upstream-origin fixes upstream 
 drop each once upstream carries an equivalent fix. Append new defects as sections
 here; move a section into a behavior-specific unit when that unit starts owning it.
 
+`production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
+
+## Production-only unused imports
+
+- Fork patch identity: `production-unused-imports`.
+- The maintained fork had four imports that Ruff proved unused on the fork's current release baseline. Removing them changes no runtime behavior or public interface.
+- Guard: `ruff check --select F401 agent/agent_init.py agent/codex_runtime.py agent/memory_manager.py` and `python3 -m py_compile` on the three files.
+
+## Relay close-failure abort ordering
+
+- Fork patch identity: `relay-close-failure-test-race`.
+- Relay's managed stream can observe either deterministic abort ordering. In the
+  worker-first ordering, the worker closes the stream, records
+  `interrupt_stream_close_failed`, and poisons the request-client slot before the
+  monitor enters its interrupt-abort path. In the monitor-first ordering, the
+  monitor records `stream_interrupt_abort` and poisons the slot before Relay
+  closes the stream; the resulting close failure can surface as
+  `RuntimeError: internal error: RuntimeError: close failed` while the worker is
+  advancing the managed iterator, skipping the worker's body-level branch. Both
+  orderings are safe for request reuse because the first abort poisons the real
+  slot, and any later abort targets the same client. The regression tests force
+  each ordering with event synchronization and assert every wait succeeds.
+- Guard: `tests/agent/test_request_client_reuse_abort_races.py`
+  (`test_relay_managed_close_failure_poisons_request_client`,
+  `test_relay_managed_close_failure_preserves_poison_when_monitor_wins`).
+
 ## Parked status hides a live gateway
 
 - Fork patch identity: `parked-status-live-gateway`.

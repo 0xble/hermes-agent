@@ -685,7 +685,7 @@ gateway:
     stopped_before_finishing: "⚠️ I had to stop before finishing{reason}. Use /retry to try again, or /compress if this conversation has grown very long."
     no_response: "⚠️ Processing completed but no response was generated. This may be a transient error — try sending your message again."
     previous_turn_cleanup: "⚠️ Your message wasn't processed (the previous turn was still being cleaned up). Please send it again."
-    unexpected_silence: "⚠️ The model returned only a silence marker for a message that needed a reply. Try again or rephrase."
+    unexpected_silence: "⚠️ No reply was written for this message. Send it again if you expected one."
     empty_response_model_label: "The model"
     hint_auth: " Your sign-in to the AI model service has expired or the API key is wrong. Use /login here, or run `{relogin}` on the host."
     hint_quota: " Your AI model service balance or quota is used up. Top it up on the service's website, or use /model to switch models."
@@ -712,7 +712,6 @@ gateway:
     action_shutting_down: "shutting down"
     reject_model: "Agent is running — wait or /stop first, then switch models."
     reject_codex_runtime: "Agent is running — wait or /stop first, then change runtime."
-    reject_moa: "Agent is running — wait or /stop first, then run /moa."
     drain_queued: "⏳ Gateway {action} — queued for the next turn after it comes back."
     drain_rejected: "⏳ Gateway is {action} and is not accepting another turn right now."
     drain_rejected_new_work: "⏳ Gateway is {action} and is not accepting new work right now."
@@ -758,7 +757,7 @@ gateway:
 
   queue:
     usage: "Usage: /queue <prompt>"
-    queued: "Queued for the next turn."
+    queued: "⏳ Queued for the next turn."
     queued_depth: " ({depth} queued)"
 
   steer:

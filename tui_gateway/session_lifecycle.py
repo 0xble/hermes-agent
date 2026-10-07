@@ -9,6 +9,7 @@ import logging
 
 import contextlib
 
+from . import pending_moa
 from .method_ctx import bind_module
 
 
@@ -355,6 +356,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     Ctrl-C, terminal close, SIGHUP) loses nothing."""
     if not session or session.get("_finalized"):
         return
+    pending_moa.cancel_all(session)
     session["_finalized"] = True
     _lock_vault_managers(session)
     if (history_ready := session.get("resume_history_ready")) is not None and not history_ready.is_set():
@@ -688,6 +690,7 @@ def _interrupt_session_turn(
             _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
     else:
         run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
+    pending_moa.cancel_all(session)
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None

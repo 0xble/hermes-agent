@@ -288,6 +288,29 @@ class TestParseHooksBlock:
         })
         assert specs[0].timeout == shell_hooks.MAX_TIMEOUT_SECONDS
 
+    @pytest.mark.parametrize(
+        "requires_env, expected",
+        [
+            ("CMUX_SURFACE_ID", ("CMUX_SURFACE_ID",)),
+            (["CMUX_SURFACE_ID", "OTHER_FLAG"], ("CMUX_SURFACE_ID", "OTHER_FLAG")),
+        ],
+    )
+    def test_requires_env_accepts_name_or_list(self, requires_env, expected):
+        specs = shell_hooks._parse_hooks_block({
+            "on_session_start": [{"command": "/tmp/hook.sh", "requires_env": requires_env}],
+        })
+        assert specs[0].requires_env == expected
+
+    def test_requires_env_bad_type_warns_and_ignores(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger=shell_hooks.logger.name):
+            specs = shell_hooks._parse_hooks_block({
+                "on_session_start": [{"command": "/tmp/hook.sh", "requires_env": {"name": "X"}}],
+            })
+        assert specs[0].requires_env == ()
+        assert "requires_env" in caplog.text
+
 
     def test_none_hooks_block(self):
         assert shell_hooks._parse_hooks_block(None) == []

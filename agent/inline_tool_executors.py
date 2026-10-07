@@ -29,19 +29,21 @@ def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) ->
 
 
 GOAL_RECEIPT_NOTICE_KEY = "goal.receipt"
+_TOOL_RECEIPTS = {
+    "goal_set": {"config_section": "goals", "config_key": "auto_notices", "notice_key": GOAL_RECEIPT_NOTICE_KEY},
+    "loop_set": {"config_section": "loops", "config_key": "auto_notices", "notice_key": "loop.receipt"},
+}
 
 
 def _goal_receipt_text(function_name: str, result: Any) -> str:
-    """The user-facing receipt carried by a committed ``goal_set`` mutation, else ``""``.
-
-    Fork patch: the goal-lifecycle plugin has no send path of its own, so the receipt rides on the
-    tool result and is surfaced here at the moment the change commits. Gated on the persisted
-    read-back (``success`` and ``persisted``) so a failed or read-only call never announces."""
-    if function_name != "goal_set":
+    """Return a committed mutation receipt for a registered state-changing tool."""
+    receipt_spec = _TOOL_RECEIPTS.get(function_name)
+    if receipt_spec is None:
         return ""
     try:
         from hermes_cli.config import load_config_readonly
-        if not (load_config_readonly().get("goals") or {}).get("auto_notices", True):
+        config = load_config_readonly()
+        if not (config.get(receipt_spec["config_section"]) or {}).get(receipt_spec["config_key"], True):
             return ""
         receipt = json.loads(result) if isinstance(result, str) else result
     except Exception:
@@ -57,6 +59,8 @@ def _emit_goal_receipt(agent, function_name: str, result: Any) -> None:
     if not text:
         return
     try:
+        receipt_spec = _TOOL_RECEIPTS[function_name]
+        notice_key = receipt_spec["notice_key"]
         from agent.credits_tracker import AgentNotice, CREDITS_RESTORED_TTL_MS
         if getattr(agent, "notice_callback", None):
             # Finite TTL plus a stable key so the receipt expires and is clearable instead of sitting
@@ -66,7 +70,7 @@ def _emit_goal_receipt(agent, function_name: str, result: Any) -> None:
             # goal and contract); single-line drivers show only the headline.
             agent._emit_notice(AgentNotice(
                 text=text, level="info", kind="ttl", ttl_ms=CREDITS_RESTORED_TTL_MS,
-                key=GOAL_RECEIPT_NOTICE_KEY, id=GOAL_RECEIPT_NOTICE_KEY,
+                key=notice_key, id=notice_key,
             ))
         else:
             agent._vprint(text, force=True)

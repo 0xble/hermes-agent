@@ -30,11 +30,14 @@ from gateway.delivery_ledger import (
     short_flood_wait as _short_flood_wait,
 )
 
-# A live-lane send refused with a short ``flood_control:<seconds>`` penalty is retried on the live
-# lane after the wait instead of falling back to the standalone sender, which cannot send Telegram
 # Rich Messages. Keep the shared budget and parser beside the call site so cron and goal notices
 # use the same bounded recovery contract. Longer penalties, or repeated refusals past the budget,
 # still fall back.
+# A reconnect-only refusal is emitted before the request reaches Telegram. Keep the rich live lane
+# authoritative through a short, bounded recovery window instead of immediately degrading to the
+# standalone sender. Exhaustion still falls through to the existing ledger-backed fallback.
+_LIVE_RECONNECT_WAIT_BUDGET_SECS = 120.0
+_LIVE_RECONNECT_BACKOFF_SECS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0)
 
 
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
@@ -1299,6 +1302,7 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
               if receipt["status"] in ("queued", "claimed")} or None
     values = {key: value for key, value in {
         "last_delivery_unverified": new_value, "last_delivery_queued": queued,
+        "last_delivery_formatting_degraded": list(job.get("_formatting_degraded_targets") or []) or None,
     }.items() if (job.get(key) or None) != value}
     if not values:
         return
@@ -1355,12 +1359,25 @@ def _note_target_error(job: dict, msg: str, errors: list) -> None:
     errors.append(msg)
 
 
-def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool) -> None:
-    """Relay targets have no standalone fallback, so the log line must not promise one."""
-    if is_relay:
+def _warn_live_lane_failure(job: dict, msg: str, is_relay: bool, *, flood_held: bool = False) -> None:
+    """Log a live-lane failure without promising an unsafe Telegram fallback."""
+    if is_relay or flood_held:
         logger.warning("Job '%s': %s", job["id"], msg)
     else:
         logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
+
+
+def _live_flood_held(t: _TargetDelivery) -> bool:
+    """Return whether the live rejection is a Telegram flood refusal.
+
+    The standalone lane has its own durable flood guard, but entering it after a live
+    rejection still creates a misleading fallback attempt and can bypass richer delivery
+    semantics. Keep the scheduler fail-closed at the same boundary.
+    """
+    if str(t.platform_name).lower() != "telegram":
+        return False
+    from gateway.delivery_ledger import is_flood_error
+    return is_flood_error(t.live_error)
 
 
 def _resolve_target_transport(
@@ -1482,6 +1499,19 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
     return route_thread_id, route_metadata, media_metadata
 
 
+def _short_reconnect_wait(error: BaseException, already_waited: float, attempt: int) -> Optional[float]:
+    """Seconds to keep a reconnect-only live send on the rich path, or ``None`` to fall back."""
+    from gateway.delivery_ledger import is_reconnect_only
+    if not is_reconnect_only(error):
+        return None
+    if already_waited >= _LIVE_RECONNECT_WAIT_BUDGET_SECS:
+        return None
+    backoff = _LIVE_RECONNECT_BACKOFF_SECS[min(attempt, len(_LIVE_RECONNECT_BACKOFF_SECS) - 1)]
+    # Clamp the last wait to the remaining budget so a reconnect anywhere inside the budget stays
+    # on the rich path; rejecting an overshooting backoff would fall back up to a minute early.
+    return min(backoff, _LIVE_RECONNECT_WAIT_BUDGET_SECS - already_waited)
+
+
 def _live_send_text(
     t: _TargetDelivery, text_to_send: str, route_thread_id: Optional[str], route_metadata: dict, *,
     target_errors: list, delivery_errors: list, unverified_targets: list,
@@ -1500,6 +1530,8 @@ def _live_send_text(
     # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
     # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
     flood_waited = 0.0
+    reconnect_waited = 0.0
+    reconnect_attempt = 0
     while True:
         future = safe_schedule_threadsafe(
             router._deliver_to_platform(
@@ -1536,8 +1568,23 @@ def _live_send_text(
                 time.sleep(wait)
                 flood_waited += wait
                 continue
+            # send_path_degraded is a pre-send rejection while Telegram polling reconnects. Keep
+            # retrying the live rich adapter with bounded backoff; only exhaustion reaches the
+            # standalone fallback. Other platforms keep their immediate fallback.
+            wait = (_short_reconnect_wait(ex, reconnect_waited, reconnect_attempt)
+                    if str(t.platform_name).lower() == "telegram" else None)
+            if wait is not None:
+                logger.warning(
+                    "Job '%s': live adapter send to %s is reconnecting (%s); "
+                    "waiting %.1fs before retrying the rich path",
+                    job["id"], t.where, ex, wait)
+                time.sleep(wait)
+                reconnect_waited += wait
+                reconnect_attempt += 1
+                continue
             # Real send error (not a slow confirmation): fall through to standalone. The router raises
-            # a failed SendResult's error string, so this is where send_path_degraded arrives.
+            # a failed SendResult's error string, so this is where send_path_degraded arrives after its
+            # bounded recovery window.
             t.live_error = str(ex)
             target_errors.append(f"live adapter send failed: {ex}")
             raise
@@ -1563,7 +1610,7 @@ def _live_send_text(
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
         t.live_error = str(err) if err else None
-        _warn_live_lane_failure(job, msg, t.is_relay)
+        _warn_live_lane_failure(job, msg, t.is_relay, flood_held=_live_flood_held(t))
         target_errors.append(msg)
         return False, False, None
     if send_raw_response and t.thread_id and send_raw_response.get("thread_fallback"):
@@ -1707,7 +1754,7 @@ def _deliver_via_live_adapter(
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
         if not any(err_msg in err for err in target_errors):
             target_errors.append(err_msg)
-        _warn_live_lane_failure(job, err_msg, t.is_relay)
+        _warn_live_lane_failure(job, err_msg, t.is_relay, flood_held=_live_flood_held(t))
     return delivered
 
 
@@ -1807,6 +1854,23 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
     delivery_errors.append(note)
 
 
+def _mark_formatting_degraded(t: _TargetDelivery) -> None:
+    """Record when Telegram had to use standalone after a transient live-path rejection."""
+    if t.platform_name.lower() != "telegram":
+        return
+    from gateway.delivery_ledger import is_flood_error, is_reconnect_only
+    if not (is_reconnect_only(t.live_error) or is_flood_error(t.live_error)):
+        return
+    targets = t.job.setdefault("_formatting_degraded_targets", [])
+    if t.where not in targets:
+        targets.append(t.where)
+    logger.warning(
+        "Job '%s': Telegram standalone fallback used for %s after transient live failure (%s); "
+        "formatting_degraded=true",
+        t.job.get("id"), t.where, t.live_error,
+    )
+
+
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
 ) -> None:
@@ -1817,6 +1881,14 @@ def _deliver_standalone(
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
+        return
+    if _live_flood_held(t):
+        # The live adapter already recorded the platform deadline. Do not enter the standalone
+        # sender at all: it cannot improve the outcome and a future fallback implementation must
+        # never get a second chance to issue a request during the same penalty.
+        msg = f"Telegram delivery deferred for {t.where}: flood-control deadline is active"
+        logger.warning("Job '%s': %s", job["id"], msg)
+        delivery_errors.extend([*target_errors, msg])
         return
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
@@ -1830,6 +1902,7 @@ def _deliver_standalone(
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.
         _queue_for_live_reconnect(t, content, media_files, delivery_errors)
         return
+    _mark_formatting_degraded(t)
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1991,6 +2064,7 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
+    job.pop("_formatting_degraded_targets", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])

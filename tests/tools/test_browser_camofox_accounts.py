@@ -113,7 +113,10 @@ def test_navigation_title_lookup_uses_bound_named_account_and_exact_tab(tmp_path
     assert brian["title"] == "Brian title"
     assert lpg["title"] == "LPG title"
     assert seen[0] != seen[1]
-    assert [call.kwargs["params"]["userId"] for call in lookup.call_args_list] == seen
+    # Each navigation lists only its own account's tabs: once to look for an adoptable tab
+    # (none here: the listed tabs belong to other tasks), once for the title.
+    assert [call.kwargs["params"]["userId"] for call in lookup.call_args_list] == [
+        seen[0], seen[0], seen[1], seen[1]]
 
 
 def test_unknown_alias_is_refused_without_http(tmp_path, monkeypatch):

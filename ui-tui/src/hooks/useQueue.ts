@@ -5,10 +5,16 @@ import { $uiState, getUiState } from '../app/uiStore.js'
 
 export interface QueueItem {
   display: string
+  /** Opaque backend identity for a deferred one-shot command. */
+  moaToken?: string
   text: string
 }
 
-export const queueItem = (text: string, display = text): QueueItem => ({ display, text })
+export const queueItem = (text: string, display = text, moaToken?: string): QueueItem => ({
+  ...(moaToken ? { moaToken } : {}),
+  display,
+  text
+})
 
 export function prependQueueItem(queue: QueueItem[], item: QueueItem): void {
   queue.unshift(item)
@@ -26,6 +32,7 @@ export function takeQueueItem(queue: QueueItem[], index: number, editedDisplay?:
   }
 
   return {
+    ...(item.moaToken ? { moaToken: item.moaToken } : {}),
     display: editedDisplay,
     text: editedDisplay.includes(item.display) ? editedDisplay.replace(item.display, item.text) : editedDisplay
   }
@@ -121,8 +128,8 @@ export function useQueue() {
   )
 
   const enqueue = useCallback(
-    (text: string, display = text) => {
-      queueRef.current.push(queueItem(text, display))
+    (text: string, display = text, moaToken?: string) => {
+      queueRef.current.push(queueItem(text, display, moaToken))
       syncQueue()
     },
     [queueRef, syncQueue]
@@ -137,7 +144,7 @@ export function useQueue() {
   )
 
   const dequeue = useCallback(() => {
-    const head = queueRef.current.shift()?.text
+    const head = queueRef.current.shift()
     syncQueue()
 
     return head

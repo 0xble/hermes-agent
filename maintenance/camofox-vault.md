@@ -3,6 +3,8 @@
 Load this unit when changing named Camofox browser accounts, vault login classification,
 the browser vault fill tool, or the 1Password backends.
 
+- Fork patch identity: `vault-origin-aliases`.
+
 ## Required behavior
 
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.
@@ -17,7 +19,8 @@ the browser vault fill tool, or the 1Password backends.
   derived IDs; Hermes does not dual-read, map, or migrate profiles.
   `browser_handoff(account=...)` opens/focuses that account's shared identity, restarts
   its headless-by-default browser as visible, adopts the returned tabId for subsequent
-  browser actions, and never returns the userId. The restart restores the last URL but
+  browser actions (across turns, see [Camofox tab reuse](camofox-tab-reuse.md)), and never
+  returns the userId. The restart restores the last URL but
   can lose page-only state such as half-filled forms; logins persist. Confirm no other
   work is using the account, then call handoff before the step whose page state matters
   (for example, before submitting a password when an OTP is likely). A server-side 404
@@ -30,10 +33,18 @@ the browser vault fill tool, or the 1Password backends.
   it was already stopped. Successful release invalidates only Hermes's local tab ID,
   retaining the task's account binding. Busy (409) leaves it intact for retry; neither
   action exposes userId.
-- Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are
-  minted from Connect one-time-password fields, automatic 2FA is announced only when a code
-  can really be minted, an unusable OTP field never hides a usable one, and upstream
-  multi-origin metadata is preserved for Connect.
+- Login origin aliases are an agent-writable, exact-origin registry under `vault.origin_aliases`.
+  On `origin_mismatch`, the agent may run `hermes config set vault.origin_aliases.<item-id> '["https://origin.example"]'`;
+  `set` replaces that item's full alias list, so existing entries must be included. The active config is read on each
+  vault list/fill call, so this does not require a restart. Alias-only login fills prompt once per session with the
+  full origin and item label; cross-registrable-domain aliases warn with both domains when the advisory fallback recognizes
+  those suffixes. The warning is advisory, has partial suffix coverage and never authorizes a fill; the full origin is
+  always shown. Declines and unanswered prompts
+  remain fail-closed for retries in the same session. Never rewrite a 1Password item to add a URL because template
+  rewrites can delete passkeys.
+- Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are minted from Connect
+  one-time-password fields, automatic 2FA is announced only when a code can really be minted, an unusable OTP field
+  never hides a usable one, and upstream multi-origin metadata is preserved for Connect.
 - Login forms inside open shadow roots (web-component inputs) are discovered and filled.
 - Service-account `op item get` passes `--vault`; the Connect read path stays ahead of the
   CLI selector.

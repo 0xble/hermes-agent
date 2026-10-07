@@ -437,6 +437,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+import contextvars as _contextvars
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -1445,6 +1446,8 @@ def _real_media_tag_spans(masked: str) -> list:
 
 _FENCED_CODE_RE = re.compile(r'```[^\n]*\n.*?```', re.DOTALL)
 _INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
+# A tool preview that is exactly one http(s) URL stays plain text so platform auto-linking keeps it tappable.
+_BARE_HTTP_URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
 
 
 def _code_spans(content: str) -> list:
@@ -1662,6 +1665,28 @@ class ExecApprovalPrompt:
     @property
     def choices(self) -> List[str]:
         return [choice for _, choice, _ in self.actions]
+
+
+# The task currently running a platform's serial update consumer (PTB's update fetcher awaits each
+# handler before taking the next update, and Telegram's controlled poller does not poll again until
+# that batch drains). Ingress handlers check it so they never await outbound pacing on that task.
+_INGRESS_CONSUMER: "_contextvars.ContextVar[Optional[asyncio.Task]]" = _contextvars.ContextVar(
+    "gateway_ingress_consumer", default=None)
+
+
+def ingress_consumer_scope() -> "_contextvars.Token":
+    """Mark the current task as the update consumer; reset with :func:`leave_ingress_consumer`."""
+    return _INGRESS_CONSUMER.set(asyncio.current_task())
+
+
+def leave_ingress_consumer(token: "_contextvars.Token") -> None:
+    _INGRESS_CONSUMER.reset(token)
+
+
+def in_ingress_consumer() -> bool:
+    """True only on the consumer task itself; tasks spawned from it inherit the variable, not the role."""
+    consumer = _INGRESS_CONSUMER.get()
+    return consumer is not None and consumer is asyncio.current_task()
 
 
 @dataclass
@@ -2189,18 +2214,21 @@ class BasePlatformAdapter(ABC):
         from gateway.stream_events import ToolCallChunk
         if not isinstance(event, ToolCallChunk):
             return None
-        from agent.display import get_tool_emoji, prepare_tool_preview
-        emoji, tool = get_tool_emoji(event.tool_name, default='⚙️'), event.tool_name
+        from agent.display import prepare_tool_preview, progress_tool_label
+        emoji, label = progress_tool_label(event.tool_name, default='⚙️')
+        literal = self.format_progress_literal
+        tool = literal(label)
         if mode == "verbose" and event.args:
             import json
             args_str = json.dumps(event.args, ensure_ascii=False, default=str)
             if preview_max_len > 0 and len(args_str) > preview_max_len:
                 args_str = args_str[:preview_max_len - 3] + "..."
-            return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool, keys=list(event.args.keys()), args=args_str)
+            return t("gateway.progress.tool_verbose", emoji=emoji, tool=tool,
+                     keys=literal(str(list(event.args.keys()))), args=literal(args_str))
         if not event.preview:
             return t("gateway.progress.tool_pending", emoji=emoji, tool=tool)
         if mode == "verbose":
-            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=event.preview)
+            return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=literal(event.preview))
         # "all" / "new": short capped preview (default 40; progress bubbles persist as messages).
         cap = preview_max_len if preview_max_len > 0 else 40
         prepared = prepare_tool_preview(
@@ -2208,10 +2236,19 @@ class BasePlatformAdapter(ABC):
         return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=self.format_tool_preview(prepared))
 
 
+    def format_progress_literal(self, text: str) -> str:
+        """Markup that shows ``text`` (a tool name, argument preview or args dump) verbatim in a
+        tool-progress line. Identity here; adapters that parse progress text as Markdown override it
+        so ``mcp__a__b``, ``**/*.md`` or ``\\s+`` are not read as formatting."""
+        return text
+
     def format_tool_preview(self, preview: "ToolPreview") -> str:
         """Platform-native formatting of a compact tool preview; rich-text adapters may use
-        the preview's metadata (e.g. a URL shortened for display)."""
-        return preview.text
+        the preview's metadata (e.g. a URL shortened for display). A URL preview stays plain text so
+        platform auto-linking keeps it tappable; anything else goes through ``format_progress_literal``."""
+        if preview.url or _BARE_HTTP_URL_RE.fullmatch(preview.text):
+            return preview.text
+        return self.format_progress_literal(preview.text)
 
     has_fatal_error = property(lambda self: self._fatal_error_message is not None)
     fatal_error_message = property(lambda self: self._fatal_error_message)
@@ -2811,6 +2848,8 @@ class BasePlatformAdapter(ABC):
 
     # Surfaces needing an explicit finalize edit (DingTalk AI Cards): the consumer never skips it.
     REQUIRES_EDIT_FINALIZE: bool = False
+    # Minimum seconds between progress-bubble edits for this platform; None keeps the runner's default.
+    PROGRESS_EDIT_INTERVAL: Optional[float] = None
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a fresh thread under ``parent_chat_id`` for a CLI→platform session handoff; its id
@@ -3703,10 +3742,14 @@ class BasePlatformAdapter(ABC):
 
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
-        ephemeral deletion — no session lifecycle (active-session bypass paths)."""
+        ephemeral deletion — no session lifecycle (active-session bypass paths).
+
+        Called from a platform's update consumer, the command runs here but its reply is handed
+        to a background task: the send waits for the chat's outbound budget, and a serial consumer
+        awaiting it holds every later update (and the next poll) behind that wait."""
         thread_meta = _thread_metadata_for_event(event)
         response = await self._message_handler(event)
-        from gateway.outbox import bind_event_turn, restore_turn
+        from gateway.outbox import active_turn, bind_event_turn, restore_turn, run_turn_child
         token = bind_event_turn(event)
         try:
             text, eph_ttl = self._unwrap_ephemeral(response)
@@ -3715,13 +3758,39 @@ class BasePlatformAdapter(ABC):
             if log_cmd is not None:
                 logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
                             len(text), event.source.chat_id)
-            result = await self._send_with_retry(
-                chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-                metadata=_mark_notify_metadata(thread_meta))
-            if eph_ttl > 0 and result.success and result.message_id:
-                self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+
+            async def deliver() -> None:
+                result = await self._send_with_retry(
+                    chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+                    metadata=_mark_notify_metadata(thread_meta))
+                if eph_ttl > 0 and result.success and result.message_id:
+                    self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+
+            if in_ingress_consumer():
+                self.spawn_ingress_reply(run_turn_child(deliver(), active_turn()), label="command reply")
+            else:
+                await deliver()
         finally:
             restore_turn(token)
+
+    def spawn_ingress_reply(self, coro: Awaitable[Any], *, label: str) -> "asyncio.Task":
+        """Run an ingress-path reply (command reply, busy ack, retry notice) off the update consumer.
+
+        The task is tracked with the adapter's background tasks and its failure is logged, matching
+        the best-effort contract these replies already had when awaited inline."""
+        async def run() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("[%s] Offloaded %s failed", self.name, label, exc_info=True)
+
+        task = asyncio.get_running_loop().create_task(run(), name=f"{self.name}-ingress-{label.replace(' ', '-')}")
+        tasks = self.__dict__.setdefault("_background_tasks", set())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
