@@ -459,6 +459,33 @@ class GatewayStartupMixin:
         for row in await asyncio.to_thread(pending_retries):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
+    async def _redelivery_restart_note_event(self, row: dict) -> Optional[MessageEvent]:
+        """Snapshot the note owned by this delivery before its network await.
+
+        A resumed final may have failed both its note deletion and answer send. Ledger recovery must
+        reconcile that note too, but not a successor interruption arriving while the send is in flight.
+        Lookup failures are best-effort and never prevent redelivery.
+        """
+        session_key = row.get("session_key") or ""
+        if not session_key:
+            return None
+        try:
+            entry = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+            source = getattr(entry, "origin", None)
+            if (source is None or str(source.chat_id) != str(row.get("chat_id", ""))
+                    or source.platform.value != row.get("platform")
+                    or source.thread_id != row.get("thread_id")):
+                return None
+            note = await self.async_session_store.get_restart_note(session_key)
+            if not note or not note[3] or note[0] != entry.session_id:
+                return None
+            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event._restart_note_expected = note
+            return event
+        except Exception:
+            logger.debug("Restart-note snapshot failed for recovered %s", session_key, exc_info=True)
+            return None
+
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
@@ -479,6 +506,7 @@ class GatewayStartupMixin:
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
+            note_event = await self._redelivery_restart_note_event(row)
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
@@ -491,6 +519,16 @@ class GatewayStartupMixin:
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    if note_event is not None:
+                        reconcile = getattr(adapter, "_reconcile_restart_note", None)
+                        if callable(reconcile):
+                            try:
+                                await reconcile(note_event, row["session_key"])
+                            except Exception:
+                                logger.debug(
+                                    "Recovered obligation %s: restart-note reconciliation failed",
+                                    row["obligation_id"], exc_info=True,
+                                )
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",

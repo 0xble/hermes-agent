@@ -4724,6 +4724,9 @@ class BasePlatformAdapter(ABC):
             note = await note_result if inspect.isawaitable(note_result) else note_result
             if not isinstance(note, (tuple, list)) or len(note) < 4:
                 return
+            expected_note = getattr(event, "_restart_note_expected", None)
+            if expected_note is not None and tuple(note[:4]) != tuple(expected_note[:4]):
+                return
             note_id = note[3] if note else None
         except Exception:
             logger.warning("[%s] Restart-note lookup failed for %s; continuing normal delivery",
@@ -4762,7 +4765,8 @@ class BasePlatformAdapter(ABC):
 
         async def _clear_reconciled_note() -> None:
             try:
-                clear_result = store.clear_restart_note(session_key)
+                clear_kwargs = ({"expected_note": expected_note} if expected_note is not None else {})
+                clear_result = store.clear_restart_note(session_key, **clear_kwargs)
                 await clear_result if inspect.isawaitable(clear_result) else clear_result
             except Exception:
                 # Do not block the user's answer on a bookkeeping write. The durable note is

@@ -334,13 +334,23 @@ class SessionLifecycleMixin:
                 entry.restart_note_message_id,
             )
 
-    def clear_restart_note(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
+    def clear_restart_note(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+        expected_note: Optional[tuple] = None,
+    ) -> bool:
         """Clear the note id after its resumed answer was deleted or replaced."""
         def _apply(entry: SessionEntry):
             if not entry.restart_note_message_id:
                 return False
             current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
             if expected_marker is not None and expected_marker != current:
+                return False
+            if expected_note is not None and expected_note != (
+                entry.session_id,
+                entry.restart_note_marker_token or entry.resume_marker_token,
+                entry.restart_note_marked_at or entry.last_resume_marked_at,
+                entry.restart_note_message_id,
+            ):
                 return False
             entry.restart_note_message_id = None
             entry.restart_note_marker_token = None

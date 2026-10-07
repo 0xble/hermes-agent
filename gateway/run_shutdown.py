@@ -952,6 +952,22 @@ class GatewayShutdownMixin:
         async def _send_one(session_key) -> int:
             marker = None
             send_succeeded = False
+            claim_kept = False
+            note_claims = getattr(self, "_s2_note_claimed_keys", None)
+            if note_claims is None:
+                note_claims = self._s2_note_claimed_keys = {}
+            entry_snapshot = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+            claim_token = (
+                getattr(entry_snapshot, "resume_marker_token", None),
+                getattr(entry_snapshot, "last_resume_marked_at", None),
+            )
+            existing_claim = note_claims.get(session_key)
+            if existing_claim in (claim_token, ("fallback",)):
+                return 0
+            # This in-memory claim fences the late note task against the ordinary shutdown fallback.
+            # It is taken before the first await, so a fallback that wins the race prevents a late
+            # transport completion from posting a second visible notice.
+            note_claims[session_key] = claim_token
             try:
                 entry = self.session_store._entries.get(session_key)
                 if entry is None or not getattr(entry, "resume_pending", False) or not getattr(entry, "resume_human", True):
@@ -1032,7 +1048,9 @@ class GatewayShutdownMixin:
                     session_key, str(note_id), expected_marker=marker,
                 ):
                     getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
+                    claim_kept = True
                     return 1
+                claim_kept = send_succeeded
                 return 0
             except Exception:
                 if not send_succeeded:
@@ -1044,6 +1062,9 @@ class GatewayShutdownMixin:
                         pass
                 logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
                 return 0
+            finally:
+                if not claim_kept:
+                    note_claims.pop(session_key, None)
 
         unique_keys = list(dict.fromkeys(session_keys or ()))
         if not unique_keys:
@@ -2197,16 +2218,30 @@ class GatewayShutdownMixin:
         # independent of the ordinary restart-notification opt-out and is durable/deduplicated by the row.
         _s2_candidates = set(getattr(self, "_s2_note_session_keys", set()))
         self._s2_note_delivered_keys = set()
+        self._s2_note_claimed_keys = {}
         await self._send_interrupted_turn_notes(_marked_keys)
+        # Let a promptly-cancelled note task run its claim-release finally block before deciding which
+        # lanes need the ordinary fallback. A transport that swallows cancellation remains claimed.
+        await asyncio.sleep(0)
         self._s2_note_session_keys = set(self._s2_note_delivered_keys)
         _s2_note_misses = _s2_candidates - self._s2_note_session_keys
         if _s2_note_misses:
+            # A note task may still be running after the two-second bound (some transports swallow
+            # cancellation). Claim fallback lanes before awaiting the ordinary notifier so a late note
+            # task observes the same per-key fence and cannot create a second visible notice.
+            _note_claims = self._s2_note_claimed_keys
+            _fallback_misses = set()
+            for _session_key in _s2_note_misses:
+                if _session_key not in _note_claims:
+                    _note_claims[_session_key] = ("fallback",)
+                    _fallback_misses.add(_session_key)
             # The initial broadcast was suppressed for every possible S2 lane. Once the bounded note
             # batch tells us which lanes actually received a note, restore the ordinary notice for the
             # remainder (including fenced lanes and lanes lost when the 2s batch bound expired).
-            await self._notify_active_sessions_of_shutdown(
-                _s2_note_misses, include_home_channels=False,
-            )
+            if _fallback_misses:
+                await self._notify_active_sessions_of_shutdown(
+                    _fallback_misses, include_home_channels=False,
+                )
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)

@@ -12,6 +12,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult, _ExtractedRe
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.run_shutdown import GatewayShutdownMixin
+from gateway.run_startup import GatewayStartupMixin
 from gateway.session import AsyncSessionStore, SessionSource, SessionStore
 
 
@@ -811,3 +812,131 @@ def test_pending_note_claim_is_atomic_and_recoverable(tmp_path):
     assert not store.claim_restart_note(entry.session_key, expected_marker=marker)
     assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
     assert store.claim_restart_note(entry.session_key, expected_marker=marker, reclaim_pending=True)
+
+
+@pytest.mark.asyncio
+async def test_ledger_redelivery_reconciles_note_left_by_failed_resumed_delete(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    source = _source("ledger-reconcile")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-ledger", human=True)
+    store.set_restart_note_message_id(entry.session_key, "note-ledger")
+    assert store.clear_resume_pending(entry.session_key)
+
+    adapter = NoteAdapter(delete_result=False)
+    runner_for_adapter = SimpleNamespace(async_session_store=AsyncSessionStore(store))
+    adapter.gateway_runner = runner_for_adapter
+    _configure_real_final_delivery(adapter, store)
+    event = MessageEvent(text="continue", message_type=MessageType.TEXT, source=source, internal=False)
+    await adapter._send_final_text(event, entry.session_key, "resumed answer", {}, False, 0, lambda _r: None)
+    assert store.get_restart_note(entry.session_key)[3] == "note-ledger"
+
+    adapter.delete_result = True
+    startup = object.__new__(GatewayStartupMixin)
+    startup.session_store = store
+    startup.async_session_store = AsyncSessionStore(store)
+    startup.adapters = {Platform.TELEGRAM: adapter}
+    startup._arm_flood_timers_for_waiting_rows = AsyncMock()
+    adapter.gateway_runner = startup
+    monkeypatch.setattr("gateway.delivery_ledger.mark_delivered", lambda _obligation_id: None)
+
+    row = {
+        "obligation_id": "obligation-ledger",
+        "session_key": entry.session_key,
+        "platform": "telegram",
+        "chat_id": source.chat_id,
+        "thread_id": source.thread_id,
+        "content": "resumed answer",
+        "attempts": 1,
+    }
+    assert await startup._redeliver_claimed_obligations([row]) == 1
+    assert adapter.deleted == [(source.chat_id, "note-ledger"), (source.chat_id, "note-ledger")]
+    assert store.get_restart_note(entry.session_key) is None
+    assert len(adapter.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_late_s2_note_cannot_follow_fallback_notice(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    source = _source("late-note")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-late", human=True)
+    adapter = NoteAdapter()
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    note_task = None
+
+    async def delayed_send(chat_id, content, reply_to=None, metadata=None):
+        if "interrupted" in content.lower():
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                # The transport accepted the request and swallows cancellation while its ACK is late.
+                cancelled.set()
+                await release.wait()
+        adapter.sent.append((chat_id, content, metadata))
+        return SendResult(success=True, message_id=f"late-{len(adapter.sent)}")
+
+    adapter.send = delayed_send
+    runner = object.__new__(GatewayShutdownMixin)
+    runner.session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.config = GatewayConfig(restart_resume_policy="continue")
+    runner._s2_note_session_keys = {entry.session_key}
+    runner._running_agents = {}
+    runner._active_api_run_count = lambda: 0
+    runner._running_agent_count = lambda: 0
+    runner._update_runtime_status = lambda *_args: None
+    runner._interrupt_running_agents = lambda *_args: None
+    runner._restart_requested = False
+    runner._restart_reason = None
+    runner._restart_command_source = None
+    runner._shutdown_notification_target = AsyncMock(
+        return_value=(source, "telegram", source.chat_id, source.thread_id, None)
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._authorization_adapter = lambda *_args: adapter
+    runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": args[2]}
+
+    async def wait_or_detach(task, _timeout):
+        nonlocal note_task
+        note_task = task
+        assert _timeout == 2.0
+        await entered.wait()
+        task.cancel()
+        await cancelled.wait()
+        return False
+
+    runner._wait_or_detach = wait_or_detach
+    fallback_calls = []
+
+    async def fallback_notice(keys, *, include_home_channels):
+        fallback_calls.append(set(keys))
+        for key in keys:
+            assert key == entry.session_key
+            adapter.sent.append((source.chat_id, "ordinary fallback notice", None))
+
+    runner._notify_active_sessions_of_shutdown = fallback_notice
+    monkeypatch.setattr(GatewayRunner, "_mark_running_sessions_resume_pending", staticmethod(
+        lambda _self, _prefix: asyncio.sleep(0, result=[entry.session_key])
+    ))
+    monkeypatch.setattr(GatewayRunner, "_shutdown_interrupt_reason", staticmethod(lambda _self: "test"))
+    monkeypatch.setattr(GatewayRunner, "_post_interrupt_grace_timeout", staticmethod(lambda _self: 0.0))
+    monkeypatch.setattr(GatewayRunner, "_stop_kill_tool_subprocesses_off_loop", staticmethod(
+        lambda _phase: asyncio.sleep(0, result=[])
+    ))
+    runner._notify_interrupted_cron_jobs = AsyncMock()
+
+    ctx = GatewayShutdownMixin._StopContext(lambda: 0, started_at=0.0)
+    await runner._stop_interrupt_remaining_work(ctx)
+    assert adapter.sent == []
+    release.set()
+    try:
+        await note_task
+    except asyncio.CancelledError:
+        pass
+    assert len(adapter.sent) == 1
+    assert "interrupted" in adapter.sent[0][1].lower()
+    assert fallback_calls == []
