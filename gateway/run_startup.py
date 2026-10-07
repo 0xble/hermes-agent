@@ -905,7 +905,11 @@ class GatewayStartupMixin:
         images, rest = BasePlatformAdapter.extract_images(rest)
         if media or images or BasePlatformAdapter.extract_local_files(rest)[0]:
             return None
-        return _strip_media_directives(_sanitize_gateway_final_response(origin.platform, last["content"])).strip() or None
+        from gateway.response_filters import strip_trailing_loop_complete_marker
+        # Sanitize first (provider terminal tokens), then hide the /loop marker, matching the
+        # normal and queued delivery lanes.
+        return _strip_media_directives(strip_trailing_loop_complete_marker(
+            _sanitize_gateway_final_response(origin.platform, last["content"]))).strip() or None
 
     @staticmethod
     def _start_hosted_room_worker_sync():
