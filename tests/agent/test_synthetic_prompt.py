@@ -821,3 +821,29 @@ def test_session_switch_drops_a_buffer_dispatched_just_before_it():
     assert provider.buffer  # session A's recall is buffered
     manager.on_session_switch("s-B", reset=True)
     assert manager.prefetch_all("New topic in session B", session_id="s-B") == ""
+
+
+def test_prefetch_for_the_session_just_left_never_starts_after_the_switch():
+    """Review of 489f721: a prefetch for session A that reaches queue_prefetch_all after the switch to
+    B must not start a fresh generation and dispatch A's query into the switched providers."""
+    manager = MemoryManager(prefetch_max_age_seconds=1800.0)
+    provider = _BufferingProvider()
+    manager._providers = [provider]  # type: ignore[list-item]  # duck-typed provider
+    manager.initialize_all("s-A")
+    manager.on_session_switch("s-B", reset=True)
+    manager.queue_prefetch_all("old", session_id="s-A")
+    assert manager.flush_pending(timeout=5) is True
+    assert provider.queued == []
+    manager.queue_prefetch_all(HUMAN, session_id="s-B")  # the current session still prefetches
+    assert manager.flush_pending(timeout=5) is True
+    assert provider.queued == [HUMAN]
+
+
+def test_human_suffix_quoting_the_revision_header_is_kept():
+    """Review of 489f721 (P2): the revised-continuation guard must anchor on the generated seam, not
+    on the revision header appearing anywhere, or a quoting human suffix is dropped."""
+    from hermes_cli.goals import CONTINUATION_REVISIONS_TEMPLATE
+
+    header = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0].strip()
+    suffix = f'Why does it say "{header}"? I never revised it.'
+    assert human_prompt_text(_goal_prompt() + "\n" + suffix) == suffix

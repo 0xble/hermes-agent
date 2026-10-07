@@ -126,7 +126,14 @@ _INJECTED_TURN_PATTERNS = tuple((kind, template, _TemplateMatcher(template)) for
 # Opens the revision history GoalManager appends after a revised goal's continuation. Its lines
 # carry earlier goal text, revision reasons and quoted user messages, any of which may span lines
 # or paragraphs, and it has no closing marker, so no text after it can be proven human.
-_REVISION_BLOCK_OPEN = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0].strip()
+_REVISION_BLOCK_OPEN = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0]
+# GoalManager appends the block directly to a continuation's terminal literal, so a revised
+# continuation always contains terminal + block opening verbatim. Anchoring on that pair keeps a
+# human suffix that merely quotes the revision header from being dropped as generated.
+_REVISED_CONTINUATION_SEAMS = tuple(
+    matcher.terminal + _REVISION_BLOCK_OPEN
+    for kind, _template, matcher in _INJECTED_TURN_PATTERNS if kind == "goal"
+)
 
 
 def _unwrap_steer(suffix: str) -> str:
@@ -156,7 +163,7 @@ def _user_after_injected_turn(content: str) -> str | None:
             match_kind, marker_end = kind, end
     if marker_end < 0:
         return content
-    if match_kind == "goal" and _REVISION_BLOCK_OPEN in content:
+    if match_kind == "goal" and any(seam in content for seam in _REVISED_CONTINUATION_SEAMS):
         # A revised continuation is generated through its end. Its revision block may also hold a
         # copy of the terminal, which would otherwise move the last-copy boundary inside it.
         return None

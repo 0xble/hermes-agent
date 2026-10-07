@@ -104,6 +104,17 @@ class PrefetchGeneration:
                 reset()
             return self._token
 
+    def begin_if(self, accept: Callable[[], bool]) -> Optional[int]:
+        """:meth:`begin` only when ``accept()`` holds, checked under the same lock; else ``None``.
+
+        For a request whose validity (for example its session) can be revoked by a concurrent
+        :meth:`discard`: checking and starting in one critical section leaves no window between them."""
+        with self.lock:
+            if not accept():
+                return None
+            self._token += 1
+            return self._token
+
     def discard(self, reset: Optional[Callable[[], None]] = None) -> None:
         """Obsolete every outstanding token and run ``reset`` (drop buffered state) under the lock."""
         self.begin(reset)

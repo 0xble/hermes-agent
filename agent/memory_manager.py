@@ -375,6 +375,12 @@ class MemoryManager:
         # memory.prefetch_max_age_seconds (None = unbounded) and when the buffered recall was queued.
         self._prefetch_max_age = prefetch_max_age_seconds
         self._prefetch_queued_at: Optional[float] = None
+        # Session the providers are on (initialize_all / on_session_switch) and the one they last
+        # switched away from, both guarded by the generation lock. A prefetch for the session just
+        # left cannot start after the switch. Only that session is refused, so a session id that
+        # rotates without a switch notice keeps its recall.
+        self._session_id = ""
+        self._left_session_id = ""
         # A queued task that has not reached its providers yet skips once a discard (or a newer
         # queue) has superseded it.
         self._prefetch_generation = PrefetchGeneration()
@@ -576,8 +582,20 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query:
             return
-        # The result's age is measured from its query's turn, which is now.
-        self._prefetch_queued_at, generation = _now(), self._prefetch_generation.begin()
+        # The result's age is measured from its query's turn, which is now. Checking the session and
+        # starting the token is one critical section with on_session_switch, so a request for a
+        # session the providers already left never starts a fresh token after the switch.
+        def _accept() -> bool:
+            if session_id and session_id == self._left_session_id and session_id != self._session_id:
+                return False
+            self._prefetch_queued_at = _now()
+            return True
+
+        generation = self._prefetch_generation.begin_if(_accept)
+        if generation is None:
+            logger.debug("Skipping memory prefetch queued for session %s after switching to %s",
+                         session_id, self._session_id)
+            return
 
         def _queue() -> None:
             # Dispatch while holding the token's lock: a concurrent age-bound discard waits for the
@@ -787,6 +805,9 @@ class MemoryManager:
         # (whose reset then drops it) or sees the obsolete token and never reaches the new session.
         def _switch_providers() -> None:
             self._prefetch_queued_at = None
+            if self._session_id != new_session_id:
+                self._left_session_id = self._session_id
+            self._session_id = new_session_id
             # Drop any buffer or in-flight worker keyed on the old session first; not every provider's
             # on_session_switch does (Hindsight's does via the same hook).
             self._each_provider("discard_prefetch failed (non-fatal)",
@@ -986,5 +1007,10 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+
+        def _record_session() -> None:
+            self._session_id = session_id or ""
+
+        self._prefetch_generation.discard(_record_session)
         self._each_provider("initialize failed", lambda p: p.initialize(session_id=session_id, **kwargs),
                             level=logging.WARNING)
