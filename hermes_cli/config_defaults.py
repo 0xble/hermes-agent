@@ -1425,6 +1425,10 @@ DEFAULT_CONFIG = {
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
+        # Minimum seconds between autonomous continuation turns (continuation after continuation,
+        # /loop or heartbeat wakes). A user message or a process/delegation result continues at
+        # once. 0 disables the gap.
+        "min_continuation_gap_seconds": 900,
         # Fork patch: agent-initiated goal_set receipts (goal set / subgoal added) surface as a
         # notice when they commit. /goal and /subgoal replies and judge verdicts are unaffected.
         "auto_notices": True,
@@ -2135,6 +2139,12 @@ DEFAULT_CONFIG = {
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
+        # Fan-in for routine background results. While a conversation is mid-turn or started a turn
+        # less than this many seconds ago, successful process/delegation completions are held and
+        # delivered together as one synthetic turn. Failures, non-zero exits and results a parked
+        # goal is waiting on are delivered at once. 0 disables holding (same-tick fan-in only);
+        # values are capped at 3600. Held results are never dropped.
+        "completion_notification_batch_window_seconds": 300,
         # Opt-in, per-profile admission and ordered outbound receipt ledger. Existing delivery
         # behavior remains unchanged until explicitly enabled.
         "durable_outbox": {"enabled": False, "retention_days": 7},
