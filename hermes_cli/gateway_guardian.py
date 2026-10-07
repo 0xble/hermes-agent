@@ -119,7 +119,9 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
     return "none", None
 
 
-def healthy(home: Path, label: str, expected: Path) -> bool:
+def healthy(home: Path, label: str, expected: Path, deadline: float | None = None) -> bool:
+    """Running-release proof. ``deadline`` caps the ``launchctl list`` probe so a stalled launchctl
+    cannot carry the guardian past its startup or rollback bound."""
     from gateway.status import read_runtime_status, runtime_status_is_stale
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
     import psutil
@@ -129,7 +131,9 @@ def healthy(home: Path, label: str, expected: Path) -> bool:
         return False
     if state.get("code_sha") != expected.name or runtime_status_is_stale(state):
         return False
-    supervised = _launchctl_supervised_pid(label)
+    if deadline is not None and deadline - time.monotonic() <= 0:
+        return False
+    supervised = _launchctl_supervised_pid(label, timeout=_bounded_timeout(10, deadline))
     if supervised is None:
         return False
     try:
@@ -189,7 +193,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
     def reload_target():
         import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
-        old_pid = _launchctl_supervised_pid(label)
+        old_pid = _launchctl_supervised_pid(label, timeout=_bounded_timeout(10, deadline))
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
                        timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         if old_pid is not None:
@@ -197,7 +201,9 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
                 psutil.Process(old_pid).wait(timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
             except psutil.NoSuchProcess:
                 pass
-        _launchctl_bootstrap(domain, plist, label, timeout=max(1, int(_bounded_timeout(ROLLBACK_SECONDS, deadline))))
+        # The exact remaining budget: flooring it to a whole second would hand the bootstrap a fresh
+        # second past the rollback deadline.
+        _launchctl_bootstrap(domain, plist, label, timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         return True
     result = rollback(home, plist_path=plist, plist_body=body, reload_callback=reload_target)
     if result.get("reload_pending"):
@@ -206,7 +212,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         wait_for_release_acknowledgement(home, timeout_seconds=_bounded_timeout(5, deadline))
     deadline = deadline or time.monotonic() + 12
     while time.monotonic() < deadline:
-        if healthy(home, label, old):
+        if healthy(home, label, old, deadline):
             return True
         time.sleep(.25)
     return False
@@ -251,7 +257,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         return "waiting"
     domain = _gateway_domain(label, domain)
     state = _launch_state(domain, label, deadline=deadline)
-    if state == "loaded" and healthy(home, label, current):
+    if state == "loaded" and healthy(home, label, current, deadline):
         pending = home / "release-txn.json"
         if pending.exists():
             record = json.loads(pending.read_text(encoding="utf-8-sig"))
@@ -295,7 +301,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
                    timeout=_bounded_timeout(10, deadline))
     deadline = deadline or time.monotonic() + 12
     while time.monotonic() < deadline:
-        if _launch_state(domain, label, deadline=deadline) == "loaded" and healthy(home, label, current):
+        if _launch_state(domain, label, deadline=deadline) == "loaded" and healthy(home, label, current, deadline):
             receipt(home, "bootstrap", "repaired", label=label, release=str(current))
             return "repaired"
         time.sleep(.25)

@@ -311,9 +311,51 @@ def test_stale_runtime_status_is_not_healthy(tmp_path, monkeypatch):
         "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
         "updated_at": "2020-01-01T00:00:00+00:00",
     }), encoding="utf-8")
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: os.getpid())
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: os.getpid())
     monkeypatch.setattr(psutil.Process, "cwd", lambda self: str(b))
     assert not guardian.healthy(home, label, b)
+
+
+@pytest.mark.platforms("macos")
+def test_health_probe_spends_only_the_remaining_guardian_budget(tmp_path, monkeypatch):
+    # A stalled ``launchctl list`` inside the health proof must not carry the guardian past its
+    # startup/rollback bound: the probe gets what is left of the deadline, not a fixed 10s.
+    from hermes_cli import gateway_launchd
+    import psutil
+    home, plist, label, a, b = layout(tmp_path)
+    (home / "gateway_state.json").write_text(json.dumps({
+        "pid": os.getpid(), "gateway_state": "running", "code_sha": b.name,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: 100.0)
+    seen = []
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid",
+                        lambda name, *, timeout=10: seen.append(timeout) or os.getpid())
+    monkeypatch.setattr(psutil.Process, "cwd", lambda self: str(b))
+    assert guardian.healthy(home, label, b, 102.5)
+    assert seen == [2.5]
+    seen.clear()
+    assert not guardian.healthy(home, label, b, 100.0)
+    assert seen == []
+
+
+@pytest.mark.platforms("macos")
+def test_rollback_bootstrap_gets_exact_remaining_budget_not_a_whole_second(tmp_path, monkeypatch):
+    home, plist, label, a, _ = layout(tmp_path)
+    from hermes_cli import gateway_launchd
+    import psutil
+    monkeypatch.setattr(guardian.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: None)
+    bootstrap_timeouts = []
+    monkeypatch.setattr(gateway_launchd, "_launchctl_bootstrap",
+                        lambda *args, timeout: bootstrap_timeouts.append(timeout))
+    monkeypatch.setattr(guardian.subprocess, "run",
+                        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+    monkeypatch.setattr(guardian, "rollback", lambda *args, **kwargs:
+                        kwargs["reload_callback"]() and {"reload_pending": False})
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    guardian.rollback_switch(home, plist, label, a, domain=f"gui/{os.getuid()}", deadline=100.4)
+    assert bootstrap_timeouts == [pytest.approx(0.4)]
 
 
 @pytest.mark.platforms("macos")
@@ -372,7 +414,7 @@ def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeyp
     calls = []
     from hermes_cli import gateway_launchd
     import psutil
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: 123)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
     class Previous:
         def __init__(self, pid):
             assert pid == 123
@@ -401,7 +443,7 @@ def test_slow_bootout_does_not_exhaust_rollback_repair_budget(tmp_path, monkeypa
     monkeypatch.setattr(guardian.time, "monotonic", lambda: clock[0])
     from hermes_cli import gateway_launchd
     import psutil
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name: 123)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
 
     class Previous:
         def __init__(self, pid):
