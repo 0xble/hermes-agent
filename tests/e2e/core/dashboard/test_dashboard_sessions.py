@@ -30,8 +30,8 @@ pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PO
 SEEDED = 40
 WRITE_SECONDS = 8.0
 
-# Writes sessions + messages in the agent's own persistence layer; prints the committed count after
-# every session so the harness knows an upper bound at any instant.
+# Writes sessions + messages in the agent's own persistence layer; prints progress after every
+# session so the harness can wait for the contention window to open.
 _WRITER = r"""
 import sys, time
 from hermes_state import SessionDB
@@ -56,7 +56,7 @@ class Writer:
             [sys.executable, "-c", _WRITER, str(WRITE_SECONDS)], env=sb.env({"HERMES_HOME": str(p.home)}),
             cwd=str(sb.home), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True)
-        self.committed = 0
+        self.progress = 0
         self.done: int | None = None
         threading.Thread(target=self._pump, daemon=True, name="dash-writer").start()
 
@@ -67,7 +67,7 @@ class Writer:
             if parts[:1] == ["DONE"]:
                 self.done = int(parts[1])
             elif parts and parts[0].isdigit():
-                self.committed = int(parts[0])
+                self.progress = int(parts[0])
 
 
 @pytest.fixture(scope="module")
@@ -83,18 +83,24 @@ def env(tmp_path_factory: pytest.TempPathFactory):
         sb.finish()
 
 
-def _read_round(d: H.Dashboard, committed: Callable[[], int]) -> list[str]:
+def _committed_roots(db) -> int:
+    """Root sessions visible in SQLite, the scope /api/sessions counts with exclude_children."""
+    return H.db_rows(db, "SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NULL")[0][0]
+
+
+def _read_round(d: H.Dashboard, committed_total: Callable[[], int]) -> list[str]:
     """One list read + detail/messages consistency for its newest rows. The upper bound is read
-    AFTER the response: everything the writer reported by then, plus the one session in flight."""
+    from SQLite AFTER the response, so it acknowledges rows actually visible to the database
+    rather than relying on the writer's lagging stdout progress counter."""
     problems: list[str] = []
     r = d.request("GET", "/api/sessions", params={"limit": 100, "order": "recent"})
-    upper_bound = committed() + 1
+    upper_bound = committed_total()
     if r.status_code != 200:
         return [f"GET /api/sessions -> {r.status_code} {r.text[:200]}"]
     body = r.json()
     total = body["total"]
-    if not SEEDED <= total <= SEEDED + upper_bound:
-        problems.append(f"total {total} outside [{SEEDED}, {SEEDED + upper_bound}] (writer committed {upper_bound})")
+    if not SEEDED <= total <= upper_bound:
+        problems.append(f"total {total} outside [{SEEDED}, {upper_bound}] (database committed {upper_bound})")
     for row in body["sessions"][:2]:
         sid = row["id"]
         det = d.request("GET", f"/api/sessions/{sid}")
@@ -116,14 +122,14 @@ def _read_round(d: H.Dashboard, committed: Callable[[], int]) -> list[str]:
 def test_session_routes_stay_consistent_under_a_concurrent_writer(env) -> None:
     sb, p, d = env
     w = Writer(sb, p)
-    H.poll(lambda: w.committed > 0, 60, "the writer's first commit")
+    H.poll(lambda: w.progress > 0, 60, "the writer's first commit")
     totals: list[int] = []
     problems: list[str] = []
 
     def reader() -> list[str]:
         out: list[str] = []
         while w.done is None and w.proc.poll() is None:
-            got = _read_round(d, lambda: w.committed)
+            got = _read_round(d, lambda: _committed_roots(p.db))
             out += [g for g in got if not g.startswith("@")]
             totals.extend(int(g[7:]) for g in got if g.startswith("@total="))
         return out
@@ -154,7 +160,7 @@ def test_session_routes_stay_consistent_under_a_concurrent_writer(env) -> None:
     backwards = [(a, b) for a, b in zip(series, series[1:]) if b < a]
     assert not backwards, f"session total went backwards between sequential reads: {backwards[:5]}"
 
-    raw = H.db_rows(p.db, "SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NULL")[0][0]
+    raw = _committed_roots(p.db)
     final = d.ok("GET", "/api/sessions", params={"limit": 1})["total"]
     assert final == raw == SEEDED + w.done, f"api total {final}, sqlite {raw}, expected {SEEDED + w.done}"
     newest = d.ok("GET", f"/api/sessions/live-{w.done - 1:05d}/messages")["messages"]

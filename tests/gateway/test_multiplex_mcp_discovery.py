@@ -64,6 +64,7 @@ async def test_reload_mcp_only_touches_requesting_profile(
     runner._agent_cache_lock = None
     runner._async_session_store = SimpleNamespace(
         get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
+        get_resume_pending_marker=lambda _key: None,
     )
 
     monkeypatch.setattr(mcp_tool, "_servers", {"default-srv": object(), "worker-srv": object()})
@@ -125,6 +126,7 @@ async def test_reload_mcp_formats_scoped_connection_keys_before_refreshing_cache
     runner._mcp_reload_refresh_cached_agents = MagicMock()
     runner._async_session_store = SimpleNamespace(
         get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
+        get_resume_pending_marker=lambda _key: None,
     )
 
     monkeypatch.setattr(mcp_tool, "_servers", {launch_key: object(), worker_key: object()})
@@ -172,6 +174,7 @@ async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
     runner._agent_cache_lock = None
     runner._async_session_store = SimpleNamespace(
         get_or_create_session=MagicMock(side_effect=RuntimeError("skip transcript")),
+        get_resume_pending_marker=lambda _key: None,
     )
 
     from tools import mcp_tool_registration as _mcp_registration

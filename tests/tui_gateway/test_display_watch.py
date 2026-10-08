@@ -80,6 +80,23 @@ def test_release_in_another_process_is_broadcast_and_local_transition_not_duplic
     assert len(_lease_events(events, holder="agent")) == 1
 
 
+def test_watched_lease_homes_deduplicates_profile_aliases(tmp_path, monkeypatch):
+    import tui_gateway.server as server
+    from hermes_constants import hermes_home_key
+
+    home = tmp_path / "home"
+    home.mkdir()
+    alias = tmp_path / "profiles" / "alias"
+    alias.parent.mkdir()
+    alias.symlink_to(home, target_is_directory=True)
+    monkeypatch.setattr(server, "_hermes_home", home)
+    monkeypatch.setattr(server, "_served_profile_homes", {alias})
+
+    watched = server._watched_lease_homes()
+
+    assert [hermes_home_key(path) for path in watched] == [hermes_home_key(home)]
+
+
 def test_screen_started_or_stopped_by_another_process_is_broadcast_as_status(tmp_path, monkeypatch):
     """A start/stop made by the CLI or gateway process must reach an open Desktop: the portal's
     status was otherwise one-shot (fetched once, then only lease events)."""

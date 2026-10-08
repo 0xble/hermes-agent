@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import faulthandler
+import inspect
 import logging
 import os
 import signal
@@ -361,7 +362,10 @@ class GatewayStartupMixin:
                 logger.log(level, message, exc_info=(type(exc), exc, exc.__traceback__))
         return _report
 
-    async def _await_startup_boot_sends(self, *, planned_restart_notification_pending: bool) -> None:
+    async def _await_startup_boot_sends(
+        self, *, planned_restart_notification_pending: bool, interrupted_note_keys=(),
+        claimed=None,
+    ) -> None:
         """Run boot-path sends without letting them pin the inbound restore gate (one Telegram
         flood-control sleep must not freeze inbound on every platform): same bounded wait as the
         resume gate, sends finish in the background on timeout. The ledger claim + ``resume_pending``
@@ -372,14 +376,24 @@ class GatewayStartupMixin:
         *before* ``_finish_startup_restore`` released the gate. See #91969.
         """
         from gateway.run import _startup_restore_drain_timeout_secs
-        claimed = await self._claim_pending_obligations()
+        claimed_rows: list = (await self._claim_pending_obligations() if claimed is None else claimed)
+
+        # S2 interruption notes have a stricter lifecycle than the other boot sends: a resumed turn
+        # must not be scheduled until this bounded, cancel-on-timeout step has completed. The sender
+        # owns its timeout and _cancel_task_with_grace behavior, so keep it outside the detachable
+        # boot-send task below.
+        if interrupted_note_keys:
+            await self._send_interrupted_turn_notes(
+                interrupted_note_keys, reclaim_pending=True,
+                cancel_on_timeout=True, timeout=_startup_restore_drain_timeout_secs(),
+            )
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
             self._schedule_update_notification_watch()
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
-            await self._redeliver_claimed_obligations(claimed)
+            await self._redeliver_claimed_obligations(claimed_rows)
 
         boot_task = asyncio.create_task(_boot_sends())
         timeout = _startup_restore_drain_timeout_secs()
@@ -396,9 +410,10 @@ class GatewayStartupMixin:
     async def _clear_resume_pending_for_claimed_obligations(
         self, claimed: list, *, require_success: bool = False
     ) -> list:
-        """Clear resume flags and return rows safe to redeliver. Startup recovery is best-effort;
-        runtime reconnect recovery (``require_success``) is stricter: if the session-store write
-        fails the response must not be sent, or the turn could be resumed too."""
+        """Clear only the resume owner answered by each row and return rows safe to redeliver.
+        Startup recovery is best-effort, so an ownership mismatch leaves a successor marker in place
+        while its predecessor remains sendable. Runtime reconnect recovery (``require_success``) is
+        stricter: if the session-store compare-and-swap fails the response must not be sent."""
         sendable = []
         for row in claimed:
             session_key = row.get("session_key") or ""
@@ -406,7 +421,35 @@ class GatewayStartupMixin:
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                expected_marker = row.get("resume_marker")
+                expected_turn_id = row.get("resume_turn_id")
+                # Rows written before ownership fields existed get a marker snapshot immediately
+                # before the compare-and-swap. This keeps a successor marked after the snapshot from
+                # being cleared, while new rows carry the exact owner captured at record time.
+                if expected_marker is None and expected_turn_id is None:
+                    marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+                    if callable(marker_reader):
+                        marker = marker_reader(session_key)
+                        if inspect.isawaitable(marker):
+                            marker = await marker
+                        if isinstance(marker, tuple) and len(marker) == 3:
+                            expected_marker = marker
+                clear_kwargs = {}
+                if expected_marker is not None:
+                    clear_kwargs["expected_marker"] = expected_marker
+                if expected_turn_id is not None:
+                    clear_kwargs["expected_turn_id"] = expected_turn_id
+                cleared = await self.async_session_store.clear_resume_pending(session_key, **clear_kwargs)
+                if require_success and not cleared:
+                    # False is also the normal result when this row's session has no resume marker.
+                    # Re-read after the CAS attempt so a successor marker still blocks delivery,
+                    # while an already-cleared session remains sendable on reconnect.
+                    marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+                    marker = marker_reader(session_key) if callable(marker_reader) else None
+                    if inspect.isawaitable(marker):
+                        marker = await marker
+                    if marker is not None:
+                        continue
             except Exception:
                 logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
                 if require_success:
@@ -523,6 +566,40 @@ class GatewayStartupMixin:
         for row in await asyncio.to_thread(pending_retries):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
+    async def _redelivery_restart_note_event(self, row: dict) -> Optional[MessageEvent]:
+        """Snapshot the note owned by this delivery before its network await.
+
+        A resumed final may have failed both its note deletion and answer send. Ledger recovery must
+        reconcile that note too, but not a successor interruption arriving while the send is in flight.
+        Lookup failures are best-effort and never prevent redelivery.
+        """
+        session_key = row.get("session_key") or ""
+        if not session_key:
+            return None
+        try:
+            entry = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+            source = getattr(entry, "origin", None)
+            if (source is None or str(source.chat_id) != str(row.get("chat_id", ""))
+                    or source.platform.value != row.get("platform")
+                    or source.thread_id != row.get("thread_id")):
+                return None
+            note = await self.async_session_store.get_restart_note(session_key)
+            if not note or not note[3] or note[0] != entry.session_id:
+                return None
+            marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+            marker_available = callable(marker_reader)
+            marker = await marker_reader(session_key) if marker_available else None
+            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event._restart_note_expected = note
+            event._restart_note_marker_api_available = marker_available
+            # A recovered turn normally cleared resume_pending before its ledger row was written;
+            # retain the note's owner marker for the cleared-state CAS fallback.
+            event._restart_note_expected_marker = marker or tuple(note[:3])
+            return event
+        except Exception:
+            logger.debug("Restart-note snapshot failed for recovered %s", session_key, exc_info=True)
+            return None
+
     async def _redeliver_claimed_obligations(self, claimed: list) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
@@ -543,6 +620,7 @@ class GatewayStartupMixin:
             adapter = await self._obligation_adapter(row)
             if adapter is None:
                 continue
+            note_event = await self._redelivery_restart_note_event(row)
             content = row["content"]
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
@@ -555,6 +633,16 @@ class GatewayStartupMixin:
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
+                    if note_event is not None:
+                        reconcile = getattr(adapter, "_reconcile_restart_note_after_delivery", None)
+                        if callable(reconcile):
+                            try:
+                                await reconcile(note_event, row["session_key"])
+                            except Exception:
+                                logger.debug(
+                                    "Recovered obligation %s: restart-note reconciliation failed",
+                                    row["obligation_id"], exc_info=True,
+                                )
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
@@ -687,6 +775,8 @@ class GatewayStartupMixin:
             _resume_pending_marker_timestamp,
         )
         marker = _resume_pending_marker_timestamp(entry)
+        if not getattr(entry, "resume_pending", True):
+            return None
         if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
             return None
         if self._is_session_running(entry.session_key):
@@ -696,6 +786,18 @@ class GatewayStartupMixin:
         if not self._resume_owner_authorized(entry.session_key, source) or (require_adapter and adapter is None):
             return None
         return adapter, source
+
+    def _startup_interrupted_note_candidates(self, candidates) -> list[str]:
+        """Return fresh, eligible feature-version rows that may receive a startup note.
+
+        ``resume_pending`` predates S2 and is not sufficient evidence for a note: legacy rows have no
+        ``resume_turn_id``. Keep the note admission identical to auto-resume so stale or unavailable
+        sessions remain recoverable without producing an orphan notice.
+        """
+        return [
+            entry.session_key for entry in (candidates or [])
+            if getattr(entry, "resume_turn_id", None) and self._auto_resume_ready(entry) is not None
+        ]
 
     def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
                                           candidates=_NOT_SUPPLIED) -> int:
@@ -933,7 +1035,8 @@ class GatewayStartupMixin:
                     record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile,
+                    resume_turn_id=token)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
@@ -1804,12 +1907,18 @@ class GatewayStartupMixin:
         # One-shot signal for _is_stale_restart_redelivery.
         if _restart_notification_pending():
             self._booted_from_restart = True
-        # Boot-path adapter.send() calls must not pin the inbound restore gate (a Telegram flood-
-        # control sleep here once froze every platform).
-        # Restart notification, home-channel startup notice, and obligation redelivery all call
-        # adapter.send(). Bound them the same way _finish_startup_restore bounds resume turns. See #91969.
+        # Claim delivery-ledger obligations before snapshotting resume-pending sessions. Claiming an
+        # answered turn clears its live resume flag; taking this snapshot first replays the turn (#91969).
+        claimed = await self._claim_pending_obligations()
+        candidates = self._resume_pending_candidates()
+        # Only this version's durable turn markers may create a startup interruption note. Legacy
+        # resume_pending rows have no resume_turn_id; apply the same freshness/authorization/adapter
+        # admission as auto-resume before routing note sends through the bounded boot-send task.
+        interrupted_note_keys = self._startup_interrupted_note_candidates(candidates)
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=_planned_restart_notification_pending(),
+            interrupted_note_keys=interrupted_note_keys,
+            claimed=claimed,
         )
         # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
         # interrupted session must wait as a distinct event, not enter that turn's history.
@@ -1821,8 +1930,7 @@ class GatewayStartupMixin:
         # Resume turns must not start before background MCP discovery has published the tool set they may
         # rely on. This wait is bounded so a wedged discovery cannot stall gateway availability.
         await self._await_mcp_discovery()
-        # Auto-resume restart-interrupted sessions (ledger-answered ones were cleared above); a failed
-        # auto-resume stays visible on the next user message.
+        # Auto-resume only the live snapshot: ledger-answered sessions were cleared before it was taken.
         self._schedule_resume_pending_sessions(candidates=candidates)
         await self._finish_startup_restore()
         # Queue bounded parent-facing recovery notices after adapters/session restore are ready.

@@ -668,3 +668,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `watchdog-main-thread-dump`.
 - CPython's `faulthandler.dump_traceback(all_threads=True)` stops after 100 threads, so a busy gateway can omit the event-loop thread from watchdog diagnostics. Each shutdown, loop-liveness, and startup watchdog dump now writes the main thread's Python stack and live thread count first, then retains the existing faulthandler dump and exit path.
 - Guard: `tests/gateway/test_shutdown_watchdog.py` (`test_main_thread_stack_is_written_before_faulthandler_thread_limit`). Retire when equivalent upstream behavior is available.
+
+
+
+## Display watcher duplicate profile homes
+
+- Fork patch identity: `display-watch-duplicate-homes`.
+- The Bot Desktop watcher combined the launch home with served profile homes without canonical-key deduplication. A served profile represented by an alias of the launch home could therefore be visited twice by each watcher pass and duplicate status delivery. Watched homes now deduplicate by `hermes_home_key`, while the test fixture clears process-global watcher maps between tests.
+- Upstream status: no equivalent fix found on `upstream/main` or in upstream issue/PR searches for the display-watch duplicate symptom.
+- Guard: `scripts/run_tests.sh tests/tui_gateway/test_display_watch.py`.
+

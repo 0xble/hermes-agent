@@ -11,7 +11,10 @@ from gateway.run_turn import GatewayTurnMixin
 
 class _Runner(GatewayTurnMixin):
     def __init__(self):
-        self.async_session_store = SimpleNamespace(clear_resume_pending=self._noop)
+        self.async_session_store = SimpleNamespace(
+            clear_resume_pending=self._noop,
+            get_resume_pending_marker=lambda _key: None,
+        )
 
     async def _noop(self, *_a, **_k):
         return None

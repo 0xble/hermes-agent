@@ -84,6 +84,7 @@ def _make_multiplex_runner():
         _store=store,
         get_or_create_session=store.get_or_create_session,
         switch_session=store.switch_session,
+        get_resume_pending_marker=lambda _key: None,
     )
     runner._evict_cached_agent = MagicMock()
     runner._release_running_agent_state = MagicMock()
