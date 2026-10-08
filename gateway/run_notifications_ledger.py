@@ -40,9 +40,10 @@ async def settle_durable_claims(
 ) -> None:
     """Settle ``(kind, delegation_id, claim_id)`` claims in ONE worker-thread hop.
 
-    ``to_thread`` copies the context, so the caller's profile scope still selects the ledger. One
-    hop keeps a batch whole: cancelling the awaiting task cannot strand siblings mid-loop, because
-    the thread finishes every settle regardless. Operations without a claim id are skipped.
+    The copied context ensures the caller's profile scope still selects the ledger. One hop keeps a
+    batch whole: the worker future is shielded so cancellation of the awaiting task cannot cancel a
+    queued settle before the thread starts, and the thread finishes every settle regardless.
+    Operations without a claim id are skipped.
     """
     pending = [op for op in operations if op[2]]
     if not pending:
@@ -52,7 +53,10 @@ async def settle_durable_claims(
         for kind, delegation_id, claim_id in pending:
             settle(kind, delegation_id, claim_id)
 
-    await asyncio.to_thread(_settle_all)
+    loop = asyncio.get_running_loop()
+    settle_ctx = contextvars.copy_context()
+    future = loop.run_in_executor(None, settle_ctx.run, _settle_all)
+    await asyncio.shield(future)
 
 
 async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None]) -> _T:
