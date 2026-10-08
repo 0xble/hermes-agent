@@ -49,3 +49,10 @@ where the loop stalled 2.60 s behind a 1.2 s fake transaction close.
 
 **Retire** the shared part once an upstream release includes the contribution and passes
 that regression. Keep only the fork-only auto-resume hops.
+
+## Follow-up race fix
+
+The completion pre-flight marks a claim settled before awaiting a terminal `drop` or transient
+`release`. The delivery `finally` block skips that primary claim, so cancellation while the
+worker-thread settle is blocked cannot issue a competing `release` and strand the completion.
+The regression `test_cancelled_preflight_settle_is_not_released_again` covers both dispositions.
