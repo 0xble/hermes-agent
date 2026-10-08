@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import faulthandler
+import inspect
 import logging
 import os
 import signal
@@ -409,9 +410,10 @@ class GatewayStartupMixin:
     async def _clear_resume_pending_for_claimed_obligations(
         self, claimed: list, *, require_success: bool = False
     ) -> list:
-        """Clear resume flags and return rows safe to redeliver. Startup recovery is best-effort;
-        runtime reconnect recovery (``require_success``) is stricter: if the session-store write
-        fails the response must not be sent, or the turn could be resumed too."""
+        """Clear only the resume owner answered by each row and return rows safe to redeliver.
+        Startup recovery is best-effort, so an ownership mismatch leaves a successor marker in place
+        while its predecessor remains sendable. Runtime reconnect recovery (``require_success``) is
+        stricter: if the session-store compare-and-swap fails the response must not be sent."""
         sendable = []
         for row in claimed:
             session_key = row.get("session_key") or ""
@@ -419,7 +421,27 @@ class GatewayStartupMixin:
                 sendable.append(row)
                 continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                expected_marker = row.get("resume_marker")
+                expected_turn_id = row.get("resume_turn_id")
+                # Rows written before ownership fields existed get a marker snapshot immediately
+                # before the compare-and-swap. This keeps a successor marked after the snapshot from
+                # being cleared, while new rows carry the exact owner captured at record time.
+                if expected_marker is None and expected_turn_id is None:
+                    marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+                    if callable(marker_reader):
+                        marker = marker_reader(session_key)
+                        if inspect.isawaitable(marker):
+                            marker = await marker
+                        if isinstance(marker, tuple) and len(marker) == 3:
+                            expected_marker = marker
+                clear_kwargs = {}
+                if expected_marker is not None:
+                    clear_kwargs["expected_marker"] = expected_marker
+                if expected_turn_id is not None:
+                    clear_kwargs["expected_turn_id"] = expected_turn_id
+                cleared = await self.async_session_store.clear_resume_pending(session_key, **clear_kwargs)
+                if require_success and not cleared:
+                    continue
             except Exception:
                 logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
                 if require_success:
@@ -1005,7 +1027,8 @@ class GatewayStartupMixin:
                     record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile,
+                    resume_turn_id=token)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered

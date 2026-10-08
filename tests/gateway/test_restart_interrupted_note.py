@@ -1471,6 +1471,63 @@ async def test_startup_claims_ledger_answer_before_resume_snapshot(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_ledger_clear_keeps_successor_marker_and_note(tmp_path):
+    """A claimed answer for turn A must not consume turn B's interruption marker."""
+    from gateway.run_startup import GatewayStartupMixin
+
+    store = _store(tmp_path)
+    source = _source("ledger-successor")
+    entry = store.get_or_create_session(source)
+    assert store.mark_resume_pending(entry.session_key, turn_id="turn-a", human=True)
+    marker_a = store.get_resume_pending_marker(entry.session_key)
+    row = {
+        "session_key": entry.session_key,
+        "resume_marker": marker_a,
+        "resume_turn_id": "turn-a",
+    }
+    assert store.mark_resume_pending(entry.session_key, turn_id="turn-b", human=True)
+    marker_b = store.get_resume_pending_marker(entry.session_key)
+
+    startup = object.__new__(GatewayStartupMixin)
+    startup.async_session_store = AsyncSessionStore(store)
+    assert await startup._clear_resume_pending_for_claimed_obligations([row]) == [row]
+    assert store.get_resume_pending_marker(entry.session_key) == marker_b
+    assert store._entries[entry.session_key].resume_pending is True
+    assert await startup._clear_resume_pending_for_claimed_obligations(
+        [row], require_success=True,
+    ) == []
+    assert store.get_resume_pending_marker(entry.session_key) == marker_b
+
+    adapter = NoteAdapter()
+    shutdown = _note_runner(store, source, adapter)
+    await shutdown._send_interrupted_turn_notes([entry.session_key], timeout=5)
+    await shutdown._send_interrupted_turn_notes([entry.session_key], timeout=5)
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3].startswith("m")
+
+
+@pytest.mark.asyncio
+async def test_ledger_clear_still_clears_its_owned_marker(tmp_path):
+    from gateway.run_startup import GatewayStartupMixin
+
+    store = _store(tmp_path)
+    source = _source("ledger-owned")
+    entry = store.get_or_create_session(source)
+    assert store.mark_resume_pending(entry.session_key, turn_id="turn-a", human=True)
+    marker_a = store.get_resume_pending_marker(entry.session_key)
+    row = {
+        "session_key": entry.session_key,
+        "resume_marker": marker_a,
+        "resume_turn_id": "turn-a",
+    }
+
+    startup = object.__new__(GatewayStartupMixin)
+    startup.async_session_store = AsyncSessionStore(store)
+    assert await startup._clear_resume_pending_for_claimed_obligations([row]) == [row]
+    assert store.get_resume_pending_marker(entry.session_key) is None
+
+
+@pytest.mark.asyncio
 async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monkeypatch):
     from gateway import run_heartbeat_acceptance
     from gateway.run_turn import GatewayTurnMixin
