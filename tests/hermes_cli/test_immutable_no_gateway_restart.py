@@ -36,7 +36,7 @@ def test_pending_release_no_restart_does_not_replay_or_mutate(tmp_path, monkeypa
     before_pointers = (releases.read_pointer(home / "current"),
                        releases.read_pointer(home / "previous"))
     monkeypatch.setattr(uc, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(releases, "acknowledge_running_release", lambda _: False)
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda _, **_kw: False)
     with (
         patch.object(uc, "_finish_pending_release_transaction", side_effect=AssertionError("replayed")),
         patch.object(uc, "_activate_immutable_release", side_effect=AssertionError("activated")),

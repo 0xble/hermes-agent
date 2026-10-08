@@ -29,6 +29,7 @@ from gateway.shutdown_watchdog import (
     get_shutdown_watchdog_dump_path,
     loop_heartbeat_forever,
     resolve_shutdown_watchdog_delay,
+    sweep_stale_pid_heartbeats,
     write_loop_heartbeat,
 )
 
@@ -37,6 +38,29 @@ def test_resolve_shutdown_watchdog_delay_adds_grace():
     assert resolve_shutdown_watchdog_delay(0) == DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
     assert resolve_shutdown_watchdog_delay("bad") == DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
     assert resolve_shutdown_watchdog_delay(10, grace_s=5) == 15.0
+
+
+def test_sweep_stale_pid_heartbeats_removes_dead_pid_files(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    live = state / "gateway.heartbeat.101"
+    dead = state / "gateway.heartbeat.202"
+    malformed = state / "gateway.heartbeat.not-a-pid"
+    for path in (live, dead, malformed):
+        path.write_text("{}", encoding="utf-8")
+
+    import psutil
+
+    def kill(*_args):
+        raise AssertionError("os.kill(pid, 0) signals the target on Windows; use psutil.pid_exists")
+
+    monkeypatch.setattr(shutdown_watchdog_module.os, "kill", kill)
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 101)
+    sweep_stale_pid_heartbeats(tmp_path)
+
+    assert live.exists()
+    assert not dead.exists()
+    assert not malformed.exists()
 
 
 def test_arm_shutdown_watchdog_fires_with_dump_and_exit(tmp_path):

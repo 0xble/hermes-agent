@@ -178,16 +178,6 @@ async def _one_scan(runner, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_old_generation_does_not_wake_parked_goal_after_transfer(hermes_home, monkeypatch):
-    _park_killed(hermes_home)
-    adapter = _Adapter()
-    runner = _runner(adapter, _entry())
-    runner._overlap_draining = True
-    await _one_scan(runner, monkeypatch)
-    assert adapter.handled == []
-    assert goals.load_goal(SID).waiting_on_session == PROC
-
-@pytest.mark.asyncio
 async def test_watcher_resumes_goal_parked_on_restart_killed_process(hermes_home, monkeypatch):
     _park_killed(hermes_home)
     adapter = _Adapter()

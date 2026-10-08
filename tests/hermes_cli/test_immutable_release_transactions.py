@@ -80,7 +80,7 @@ pathlib.Path.unlink = watched_unlink
 r._source_python_valid = lambda *args: True  # fixture has no installed Hermes package
 if real != 'real':
     original_ack = r.acknowledge_running_release
-    def observed_ack(path):
+    def observed_ack(path, **_kw):
         record = r._read_txn(r.ReleasePaths.for_home(path))
         if not record or (path / 'loaded').read_bytes() != pathlib.Path(plist).read_bytes():
             return False
@@ -246,7 +246,7 @@ def _retry(home, source, plist, scenario, a, b, source_sha, original, intended, 
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(releases, "_source_python_valid", lambda *args: True)
     if not real:
-        def observed_ack(path):
+        def observed_ack(path, **_kw):
             paths = releases.ReleasePaths.for_home(path)
             record = releases._read_txn(paths)
             if not record or (home / "loaded").read_bytes() != plist.read_bytes():
@@ -511,7 +511,7 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
             raise subprocess.CalledProcessError(1, args)
         return subprocess.CompletedProcess(args, 0)
     monkeypatch.setattr(gateway_launchd.subprocess, "run", submit)
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: None)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **_kw: None)
     def reload():
         submitted = gateway_launchd._spawn_deferred_launchd_reload(
             domain=f"gui/{os.getuid()}", label=plist.stem,
@@ -531,12 +531,12 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
     assert txn.exists() and not json.loads(txn.read_text()).get("reload_done")
     assert releases.read_pointer(home / "current") == b
     assert releases.read_pointer(home / "previous") == a
-    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_: False)
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_, **_kw: False)
     if reason == "unobserved":
         repeated = []
         again = releases.recover_pending_transaction(home, reload_callback=lambda: repeated.append(1) or "deferred")
         assert again is not None and again["reload_pending"] and txn.exists() and repeated == []
-    def observed_ack(path):
+    def observed_ack(path, **_kw):
         paths = releases.ReleasePaths.for_home(path)
         record = releases._read_txn(paths)
         releases._verify_transaction(paths, record)
@@ -557,7 +557,7 @@ def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeyp
     home, source, plist, a, b, _, original, intended = _fixture(tmp_path, scenario)
     calls = []
     callback = lambda: calls.append(1) or "deferred"
-    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_: False)
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_, **_kw: False)
     if scenario == "promote":
         assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
                                          reload_callback=callback)["reload_pending"]
@@ -589,7 +589,7 @@ def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
     from hermes_cli import gateway, gateway_launchd, update_cmd
     home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote")
     calls = []
-    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_: False)
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_, **_kw: False)
     assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
                                      reload_callback=lambda: calls.append(1) or "deferred")["reload_pending"]
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
@@ -674,7 +674,7 @@ def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong)
     home, _, plist, _, b, _, _, intended = _fixture(tmp_path, "promote")
     assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
                                      reload_callback=lambda: "deferred")["reload_pending"]
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: 31415)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **_kw: 31415)
     gateway = SimpleNamespace(
         pid=31416 if wrong == "pid" else 31415,
         cmdline=lambda: (["python", "-m", "hermes_cli.stderr_timestamp", "--", "python",
@@ -766,7 +766,7 @@ def test_release_manager_wait_observes_delayed_ack_without_reloading(tmp_path, m
     observations = iter([False, True])
     seen = []
 
-    def acknowledge(home):
+    def acknowledge(home, **_kw):
         seen.append(home)
         acknowledged = next(observations)
         if acknowledged:

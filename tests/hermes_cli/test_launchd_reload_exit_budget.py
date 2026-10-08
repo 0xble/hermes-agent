@@ -40,7 +40,6 @@ def test_deferred_helper_waits_the_exit_budget_not_the_bootstrap_budget(tmp_path
     submitted = []
     monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 30.0)
     monkeypatch.setattr(gateway_launchd, "_launchd_reload_log_path", lambda: tmp_path / "reload.log")
-    monkeypatch.setattr(gateway_launchd, "_forward_only_plist", lambda _: False)
     monkeypatch.setattr(gateway_launchd, "_gw", lambda: SimpleNamespace(_append_launchd_reload_log=lambda *_: None))
     monkeypatch.setattr(gateway_launchd.subprocess, "run",
                         lambda args, **_: submitted.append(args) or subprocess.CompletedProcess(args, 0))
@@ -76,7 +75,6 @@ def test_helper_supervision_probe_matches_real_launchctl_output(tmp_path, monkey
     submitted = []
     monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 30.0)
     monkeypatch.setattr(gateway_launchd, "_launchd_reload_log_path", lambda: tmp_path / "reload.log")
-    monkeypatch.setattr(gateway_launchd, "_forward_only_plist", lambda _: False)
     monkeypatch.setattr(gateway_launchd, "_gw", lambda: SimpleNamespace(_append_launchd_reload_log=lambda *_: None))
     monkeypatch.setattr(gateway_launchd.subprocess, "run",
                         lambda args, **_: submitted.append(args) or subprocess.CompletedProcess(args, 0))

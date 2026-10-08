@@ -152,38 +152,6 @@ class TestAuthorization:
         assert "recognize" in response_text.lower() or "pair" in response_text.lower() or "ABC123" in response_text
 
     @pytest.mark.asyncio
-    async def test_unauthorized_telegram_dm_with_owned_routing_gets_one_pairing_reply(
-        self, adapter, runner, platform, tmp_path, monkeypatch
-    ):
-        if platform != Platform.TELEGRAM:
-            pytest.skip("Owned routing is Telegram-only")
-        from gateway.generation import GenerationCoordinator, GenerationIdentity
-        from gateway.owned_routing import OwnedRouting
-        store = GenerationCoordinator(tmp_path)
-        owner = GenerationIdentity.create(release_sha="test", label="test")
-        store.register(owner, state="serving")
-        epoch = store.acquire_lease("active_generation", owner.id)
-        runner._is_user_authorized = lambda source: False
-        monkeypatch.setattr(adapter, "_is_sender_authorized", lambda *a, **kw: False)
-        routing = OwnedRouting(MagicMock(coordinator=store, identity=owner, epoch=epoch,
-                                          runner=runner))
-        adapter._owned_routing = routing
-        event = make_event(platform, "/help")
-        from gateway.session_identity import RoutingIdentity
-        setattr(event.source, "_identity", RoutingIdentity("default", "default", tmp_path, tmp_path))
-        event.platform_update_id = 42
-        await adapter.handle_message(event)
-        for _ in range(40):
-            if adapter.send.called:
-                break
-            await asyncio.sleep(0.05)
-        assert adapter.send.await_count == 1
-        response_text = adapter.send.call_args[0][1]
-        assert "recognize" in response_text.lower() or "pair" in response_text.lower()
-        with store.connect() as db:
-            assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 0
-
-    @pytest.mark.asyncio
     async def test_unauthorized_user_does_not_get_help(self, adapter, runner, platform):
         """Unauthorized user should NOT see the help command output."""
         runner._is_user_authorized = lambda _source: False

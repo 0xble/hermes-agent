@@ -260,39 +260,6 @@ def record_release_transition(*, from_sha: str | None, to_sha: str, from_path: s
     })
 
 
-def record_forward_generation(proof: dict[str, Any]) -> None:
-    """Retain generation identities, epochs, timing and poller/rollback proof."""
-    current = _current.get()
-    if current is not None:
-        current.data['forward_generation'] = dict(proof)
-        polling = (proof.get('rollback') or {}).get('poller') if proof.get('outcome') == 'rolled_back' else proof.get('poller')
-        polling = polling or proof.get('poller') or {}
-        if (proof.get('outcome') in {'success', 'rolled_back'} and polling.get('polling') is True
-                and polling.get('healthy') is True and polling.get('poller_started_at') is not None
-                and all(polling.get(key) is not None for key in ('pid', 'generation_id', 'label', 'epoch', 'release_sha', 'release_root'))):
-            from hermes_cli.profiles import get_active_profile_name
-            row = _fleet_row(get_active_profile_name(), polling['pid'], polling['release_sha'], None,
-                             polling['release_sha'], code_root=Path(polling['release_root']),
-                             expected_root=Path(polling['release_root']))
-            row.update({key: polling[key] for key in ('generation_id', 'label', 'epoch')})
-            current.data['fleet'] = [row]
-        else:
-            current.data['fleet'] = []
-
-
-def record_forward_inventory(other_runtimes: list[dict[str, Any]]) -> None:
-    """Record non-gateway observers without qualifying them as polling owners."""
-    current = _current.get()
-    if current is not None:
-        current.data['forward_inventory'] = {'other_runtimes': other_runtimes}
-
-
-def current_forward_generation() -> Optional[dict[str, Any]]:
-    current = _current.get()
-    proof = current.data.get('forward_generation') if current is not None else None
-    return dict(proof) if isinstance(proof, dict) else None
-
-
 def record_skip(name: str, reason: str) -> None:
     """Record a skipped step WITH the reason it was skipped."""
     _record("skip", f"update skip {name}", name, reason)
@@ -311,12 +278,6 @@ def record_fact(key: str, value: Any) -> None:
 def record_gateway_restart(**kwargs: Any) -> None:
     """Record the gateway restart phase outcome (see UpdateReceipt)."""
     _record("gateway_restart_result", "gateway restart result", **kwargs)
-
-
-def forward_receipt_outcome(outcome: str) -> str:
-    """Forward protocol details stay nested. Receipts retain their existing vocabulary."""
-    return {'rolled_back': 'partial', 'aborted': 'refused', 'blocked': 'failed',
-            'locked': 'refused'}.get(outcome, outcome)
 
 
 def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason: str = "") -> Optional[Path]:
@@ -343,10 +304,6 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
         # pop THIS context only, so exactly-once still holds.
         _current.set(None)
     try:
-        outcome = forward_receipt_outcome(outcome)
-        forward = receipt.data.get('forward_generation') or {}
-        if not stop_reason and outcome != 'success' and forward:
-            stop_reason = forward.get('failure') or f"Forward update outcome: {forward['outcome']} ({outcome})"
         receipt.finalize(outcome)
         if stop_reason:
             receipt.data["stop_reason"] = stop_reason

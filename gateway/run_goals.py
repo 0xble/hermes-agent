@@ -858,27 +858,18 @@ class GatewayGoalsMixin:
             active_loops = await self._run_in_executor_with_context(list_active_loops)
             now = time.time()
             for sid, state in active_loops:
-                if getattr(self, "_overlap_draining", False):
-                    return
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
             for sid, _state in await self._run_in_executor_with_context(list_parked_goals):
-                if getattr(self, "_overlap_draining", False):
-                    return
                 try:
                     await self._goal_wakeup_fire_one(sid)
                 except Exception as exc:
                     logger.warning("goal wakeup failed for %s: %s", sid, exc)
 
         while self._running:
-            if getattr(self, "_overlap_draining", False):
-                await asyncio.sleep(interval)
-                continue
             try:
                 # Multiplex resolution walks the filesystem off-loop; a stalled walk on the loop
                 # trips the loop-liveness watchdog (exit 75).
                 for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
-                    if getattr(self, "_overlap_draining", False):
-                        break
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
                     # no active loop or parked goal. The root scan (None) is unscoped and stays cheap.
                     if profile_home is not None and not await self._run_in_executor_with_context(
