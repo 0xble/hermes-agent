@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.immutable_releases import promote, stage_release
+from tests.hermes_cli.immutable_test_helpers import _build_test_venv
 
 
 @pytest.mark.platforms("macos")
@@ -37,6 +38,13 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
         revisions.append(subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"],
                                                text=True).strip())
     from hermes_cli import immutable_releases as releases
+    # This test verifies immutable Python/cron worker identity, not the optional web bundle.
+    # Building npm assets for each disposable revision dominated the native-file budget on
+    # shared macOS runners and could consume the whole 300-second file deadline.
+    monkeypatch.setattr(releases, "_build_candidate_web", lambda _staging: None)
+    # Dependency isolation is out of scope here: the .pth reuses the runner's
+    # site-packages. Real _build_venv coverage lives in test_immutable_releases.py:354 and :913.
+    monkeypatch.setattr(releases, "_build_venv", _build_test_venv)
     monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
     a, _ = stage_release(source, home, sha=revisions[0], uv=uv)
     b, _ = stage_release(source, home, sha=revisions[1], uv=uv)
