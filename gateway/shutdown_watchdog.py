@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
 from hermes_constants import get_hermes_home, get_process_hermes_home
+from hermes_watchdog_dump import write_main_thread_stack
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ def start_loop_liveness_watchdog(
                     "stacks and exiting with code %d so the service supervisor can restart it.",
                     strikes, exit_code)
             try:
+                write_main_thread_stack(sys.stderr)
                 faulthandler.dump_traceback(all_threads=True)
             except Exception:
                 logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
@@ -267,6 +269,7 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float,
         fh.write(json.dumps(header, default=str) + "\n--- faulthandler dump (all threads) ---\n")
         fh.flush()
         try:
+            write_main_thread_stack(fh)
             faulthandler.dump_traceback(file=fh, all_threads=True)
         except Exception:
             fh.write("(faulthandler.dump_traceback failed)\n")
@@ -276,6 +279,7 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float,
         sys.stderr.write(f"Gateway shutdown watchdog fired after {delay_s:.0f}s "
                          f"(pid={os.getpid()}); dumping all thread stacks.\n")
         sys.stderr.flush()
+        write_main_thread_stack(sys.stderr)
         faulthandler.dump_traceback(all_threads=True)
 
 
