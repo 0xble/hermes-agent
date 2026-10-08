@@ -105,6 +105,7 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
 
 
 async def _admit_outbox_event(runner, event, source):
+    """Durably admit Telegram events, including internal notices and delegation completions."""
     if not getattr(getattr(runner, "config", None), "durable_outbox_enabled", False) or source.platform != Platform.TELEGRAM:
         return
     from gateway.outbox import (
@@ -136,10 +137,6 @@ async def _admit_outbox_event(runner, event, source):
         logger.info("Telegram redelivery of admitted outbox turn %s; no second turn", turn_id)
     else:
         bind_turn(home, turn_id)
-    # A restore-queued event keeps its owned placeholder until it reaches
-    # this admission boundary, rather than losing it when a task is spawned.
-    if getattr(event, "_owned_local_pending", None) is not None:
-        event._owned_local_pending = None
 
 
 class GatewayInboundMixin:
@@ -1489,9 +1486,6 @@ class GatewayInboundMixin:
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
-        if getattr(source, "_startup_gate_capability", None) is not None:
-            from gateway.startup_gate import note_gate_guard
-            note_gate_guard(source, "runner_guard")
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
             return _result

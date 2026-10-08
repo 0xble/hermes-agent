@@ -623,19 +623,72 @@ try {
         with patch.object(ci, 'python_tests', side_effect=fake):
             with self.assertRaises(subprocess.CalledProcessError):
                 ci.e2e_tests({}, 3)
-        (ordinary, ordinary_timeout), (upgrade, upgrade_timeout) = calls
         expected = sorted(
             path.relative_to(ci.ROOT).as_posix() for path in (ci.ROOT / 'tests/e2e').rglob('test_*.py')
             if not {'integration', 'docker'} & set(path.relative_to(ci.ROOT).parts)
         )
         upgrade_files = [f for f in expected if f.startswith(ci.E2E_UPGRADE_ROOT + '/')]
         self.assertTrue(upgrade_files)
+        (upgrade, upgrade_timeout) = calls[-1]
+        ordinary = [(roots, timeout) for roots, timeout in calls[:-1]]
+        ordinary_files = [f for roots, _ in ordinary for f in roots]
         # Every e2e file runs exactly once: the upgrade suite in its own bounded run.
-        self.assertEqual(sorted(ordinary + upgrade_files), expected)
-        self.assertFalse(set(ordinary) & set(upgrade_files))
-        self.assertIsNone(ordinary_timeout)
+        self.assertEqual(sorted(ordinary_files + upgrade_files), expected)
+        self.assertFalse(set(ordinary_files) & set(upgrade_files))
+        # Ordinary e2e files keep the default unless FILE_TIMEOUTS names them.
+        for roots, timeout in ordinary:
+            self.assertEqual({ci.FILE_TIMEOUTS.get(f) for f in roots}, {timeout})
         self.assertEqual((upgrade, upgrade_timeout), ([ci.E2E_UPGRADE_ROOT], ci.E2E_UPGRADE_FILE_TIMEOUT))
         self.assertGreater(ci.E2E_UPGRADE_FILE_TIMEOUT, 300)
+
+    def test_shard_gives_listed_slow_files_their_bound_and_every_other_file_the_default(self):
+        soak = 'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py'
+        self.assertTrue((ci.ROOT / soak).is_file())
+        self.assertGreater(ci.FILE_TIMEOUTS[soak], 300)
+        for path in ci.FILE_TIMEOUTS:
+            self.assertTrue((ci.ROOT / path).is_file(), path)
+        owner = next(i for i, bucket in enumerate(ci.shard_files(ci.ROOT, 10), 1) if soak in bucket)
+        calls = []
+
+        def fake(env, roots, workers, file_timeout=None):
+            calls.append((list(roots), file_timeout))
+            if file_timeout is None:
+                raise subprocess.CalledProcessError(1, ['run_tests.sh'])
+
+        with patch.object(ci, 'python_tests', side_effect=fake):
+            with self.assertRaises(subprocess.CalledProcessError):
+                ci.python_shard({}, 4, owner, 10)
+        # A default-bound failure does not hide the slow-file run, and nothing is lost.
+        self.assertEqual(calls[1], ([soak], ci.FILE_TIMEOUTS[soak]))
+        default_roots, default_timeout = calls[0]
+        self.assertIsNone(default_timeout)
+        self.assertNotIn(soak, default_roots)
+        self.assertEqual(sorted(default_roots + [soak]), sorted(ci.shard_files(ci.ROOT, 10)[owner - 1]))
+
+        calls.clear()
+        other = next(i for i in range(1, 11) if i != owner)
+        with patch.object(ci, 'python_tests', side_effect=fake):
+            with self.assertRaises(subprocess.CalledProcessError):
+                ci.python_shard({}, 4, other, 10)
+        self.assertEqual(calls, [(ci.shard_files(ci.ROOT, 10)[other - 1], None)])
+
+    def test_an_environment_error_in_one_group_still_runs_the_others(self):
+        soak = 'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py'
+        calls = []
+
+        def fake(env, roots, workers, file_timeout=None):
+            calls.append(file_timeout)
+            if file_timeout is None:
+                raise RuntimeError('checkout Python environment missing')
+
+        with patch.object(ci, 'python_tests', side_effect=fake):
+            with self.assertRaises(RuntimeError):
+                ci.python_files({}, ['tests/test_a.py', soak], 4)
+            self.assertEqual(calls, [None, ci.FILE_TIMEOUTS[soak]])
+            calls.clear()
+            with self.assertRaises(RuntimeError):
+                ci.e2e_tests({}, 3)
+            self.assertEqual(calls[-1], ci.E2E_UPGRADE_FILE_TIMEOUT)  # upgrade suite still ran
 
     def test_python_tests_forwards_only_an_explicit_file_timeout(self):
         seen = []

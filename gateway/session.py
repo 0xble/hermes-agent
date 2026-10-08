@@ -692,11 +692,6 @@ def build_session_key(
     session per platform. Groups add the participant id only when ``group_sessions_per_user`` and
     not in a thread (threads are shared unless ``thread_sessions_per_user``).
     """
-    if getattr(source, "_startup_gate_capability", None) is not None:
-        from gateway.startup_gate import gate_for_source
-        gate = gate_for_source(source)
-        if gate is not None:
-            return "startup-gate:" + gate.nonce
     is_dm = source.chat_type == "dm"
     chat_id = source.chat_id
     if is_dm and source.platform == Platform.WHATSAPP:

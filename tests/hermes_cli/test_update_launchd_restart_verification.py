@@ -217,7 +217,7 @@ def _patch_launchd_env(
     )
     # Hermetic supervision and ancestry: the host's real LaunchAgent pid is an ancestor of pytest
     # when the suite runs under the gateway, which takes the in-gateway self-restart branch.
-    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label, **kwargs: 4242)
+    monkeypatch.setattr(gateway_cli, "_launchctl_supervised_pid", lambda label: 4242)
     monkeypatch.setattr(
         gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: ancestor
     )

@@ -177,11 +177,6 @@ class GatewayTurnMixin:
 
         Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
         (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
-        if getattr(source, "_startup_gate_capability", None) is not None:
-            from gateway.startup_gate import gate_for_source
-            gate = gate_for_source(source)
-            if gate is not None:
-                return gate.model, dict(gate.runtime)
         from gateway.run import (
             _credential_pool_for_provider, _get_channel_override, _resolve_gateway_model,
             _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
@@ -2457,10 +2452,6 @@ class GatewayTurnMixin:
 
     def _resolve_turn_toolsets(self, user_config: dict, source: "SessionSource", platform_key: str):
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""
-        if getattr(source, "_startup_gate_capability", None) is not None:
-            from gateway.startup_gate import gate_for_source
-            if gate_for_source(source) is not None:
-                return [], None
         from agent.skill_utils import parse_config_string_list
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None

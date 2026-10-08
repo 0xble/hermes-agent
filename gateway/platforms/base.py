@@ -1689,6 +1689,33 @@ def in_ingress_consumer() -> bool:
     return consumer is not None and consumer is asyncio.current_task()
 
 
+# Outbound class of the sends made in the current context. Unlabelled sends are finals, which a
+# platform's volume budget never sheds. Non-final notices and progress bubbles are labelled at their
+# call sites so a platform near a quota can spend its remaining volume on answers.
+OUTBOUND_FINAL = "final"
+# ``SendResult.error`` for a notice or progress send a platform's volume budget dropped on purpose:
+# final, so no retry, plain-text fallback or delivery-failure notice may spend the budget again.
+SEND_SHED_BY_BUDGET = "daily_budget_shed"
+OUTBOUND_NOTICE = "notice"
+OUTBOUND_PROGRESS = "progress"
+_OUTBOUND_CLASS: "_contextvars.ContextVar[Optional[str]]" = _contextvars.ContextVar(
+    "gateway_outbound_class", default=None)
+
+
+@contextlib.contextmanager
+def outbound_class(kind: str):
+    """Label sends made inside this block as ``notice`` or ``progress``."""
+    token = _OUTBOUND_CLASS.set(kind)
+    try:
+        yield
+    finally:
+        _OUTBOUND_CLASS.reset(token)
+
+
+def current_outbound_class() -> Optional[str]:
+    return _OUTBOUND_CLASS.get()
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -3991,8 +4018,9 @@ class BasePlatformAdapter(ABC):
 
     def _send_retry_is_final(self, result: "SendResult") -> bool:
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
-        fallback can fix it (a structured auth/target refusal). Default: never."""
-        return False
+        fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
+        volume budget shed on purpose)."""
+        return getattr(result, "error", None) == SEND_SHED_BY_BUDGET
 
     @staticmethod
     def _is_partial_delivery(result: "SendResult") -> bool:
@@ -4169,6 +4197,9 @@ class BasePlatformAdapter(ABC):
         self._discard_text_debounce(session_key)
         return True
 
+    def _on_session_handoff(self, event: MessageEvent) -> None:
+        """Hook called immediately before ``event`` is handed to session processing."""
+
     def _start_session_processing(self, event: MessageEvent, session_key: str, *,
                                   interrupt_event: Optional[asyncio.Event] = None) -> bool:
         """Spawn a background processing task under the session guard; True on success. If
@@ -4309,29 +4340,15 @@ class BasePlatformAdapter(ABC):
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
-        owned = getattr(self, "_owned_routing", None)
-        if owned is not None and self.platform == Platform.TELEGRAM and not event.internal \
-                and not getattr(event, "_owned_replay", False):
-            if await owned.route_message(self, event, session_key):
-                event._gateway_accepted = True
-                return
-            # Owned admission completed. Any later cancellation belongs to a
-            # handed-off native dispatch, not an unadmitted update to reopen.
-            accept_update = getattr(self, "_accept_update", None)
-            if callable(accept_update):
-                accept_update()
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
-            if getattr(event, "_owned_replay", False):
-                event._gateway_accepted = True
             return
-        if getattr(event.source, "_startup_gate_capability", None) is not None:
-            from gateway.startup_gate import note_gate_guard
-            note_gate_guard(event.source, "adapter_guard")
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
+        # Entering session processing is the handoff: a failure after this point must not replay.
+        self._on_session_handoff(event)
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
