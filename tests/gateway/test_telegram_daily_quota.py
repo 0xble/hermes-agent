@@ -247,6 +247,8 @@ async def test_cosmetic_pressure_sheds_typing_interim_edits_progress_and_cleanup
     with outbound_class(OUTBOUND_PROGRESS):
         shed = await adapter.send(CHAT, "⚙️ progress")
     assert shed.error == "daily_budget_shed"
+    # Mid-turn commentary is progress too: shed at the cosmetic threshold, before the notice ceiling.
+    assert (await adapter.send(CHAT, "commentary", metadata={"_interim_send": True})).error == "daily_budget_shed"
     with outbound_class(OUTBOUND_NOTICE):
         assert (await adapter.send(CHAT, "status")).success  # notices still go below the ceiling
     assert (await adapter.edit_message(CHAT, "5", "final answer", finalize=True)).success

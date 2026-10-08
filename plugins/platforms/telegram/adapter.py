@@ -4553,7 +4553,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         content = _normalize_dollar_entities(content)
         outbound = current_outbound_class() or (
-            OUTBOUND_NOTICE if isinstance(metadata, dict) and metadata.get("_interim_send") else None)
+            OUTBOUND_PROGRESS if isinstance(metadata, dict) and metadata.get("_interim_send") else None)
         if self._daily_sheds(chat_id, outbound):
             return SendResult(success=False, error=SEND_SHED_BY_BUDGET)
         if not self._bot:
