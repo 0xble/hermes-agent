@@ -1528,6 +1528,24 @@ async def test_ledger_clear_still_clears_its_owned_marker(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ledger_clear_without_resume_marker_is_sendable_on_reconnect(tmp_path):
+    """A failed reply from a live gateway has no marker and remains deliverable."""
+    from gateway.run_startup import GatewayStartupMixin
+
+    store = _store(tmp_path)
+    source = _source("ledger-no-marker")
+    entry = store.get_or_create_session(source)
+    row = {"session_key": entry.session_key}
+
+    startup = object.__new__(GatewayStartupMixin)
+    startup.async_session_store = AsyncSessionStore(store)
+    assert await startup._clear_resume_pending_for_claimed_obligations(
+        [row], require_success=True,
+    ) == [row]
+    assert store.get_resume_pending_marker(entry.session_key) is None
+
+
+@pytest.mark.asyncio
 async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monkeypatch):
     from gateway import run_heartbeat_acceptance
     from gateway.run_turn import GatewayTurnMixin

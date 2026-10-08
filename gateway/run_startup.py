@@ -441,7 +441,15 @@ class GatewayStartupMixin:
                     clear_kwargs["expected_turn_id"] = expected_turn_id
                 cleared = await self.async_session_store.clear_resume_pending(session_key, **clear_kwargs)
                 if require_success and not cleared:
-                    continue
+                    # False is also the normal result when this row's session has no resume marker.
+                    # Re-read after the CAS attempt so a successor marker still blocks delivery,
+                    # while an already-cleared session remains sendable on reconnect.
+                    marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+                    marker = marker_reader(session_key) if callable(marker_reader) else None
+                    if inspect.isawaitable(marker):
+                        marker = await marker
+                    if marker is not None:
+                        continue
             except Exception:
                 logger.debug("clear_resume_pending failed for %s", session_key, exc_info=True)
                 if require_success:
