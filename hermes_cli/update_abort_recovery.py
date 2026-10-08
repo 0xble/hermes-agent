@@ -125,7 +125,7 @@ def _run_fresh_recovery_process(
     else:
         kwargs["start_new_session"] = True
     try:
-        return subprocess.run(command, **kwargs)
+        return subprocess.run(command, **kwargs, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("Fresh gateway restart recovery failed: %s", exc)
         return None

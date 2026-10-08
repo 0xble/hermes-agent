@@ -1083,7 +1083,7 @@ dt.delegate_task(tasks=[{"goal": "fast member of the group task", "group": "g"},
 time.sleep(2.0)
 sys.stdout.flush(); os._exit(1)
 '''
-    subprocess.run([sys.executable, "-c", producer], cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+    subprocess.run([sys.executable, "-c", producer], cwd=repo, env=env, text=True, capture_output=True, timeout=30, check=False)
     consumer = r'''
 import json, queue
 from tools import async_delegation as ad

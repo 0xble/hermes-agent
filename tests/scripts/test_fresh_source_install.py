@@ -57,7 +57,7 @@ def test_current_installer_publishes_real_dependencies_and_warm_path(tmp_path, s
             env[key] = os.environ[key]
 
     def run(argv, *, cwd=tmp_path, expected=0):
-        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=180)
+        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=180, check=False)
         assert result.returncode == expected, result.stdout + result.stderr
         return result
 

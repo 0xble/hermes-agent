@@ -253,7 +253,7 @@ def _fs_git_branch(cwd: str) -> str:
                                       "errors": "replace", "timeout": 2, "check": False}
         if sys.platform == "win32":
             run_kwargs["creationflags"] = windows_hide_flags()
-        result = subprocess.run(["git", "-C", cwd, "branch", "--show-current"], **run_kwargs)
+        result = subprocess.run(["git", "-C", cwd, "branch", "--show-current"], **run_kwargs, check=False)
         return result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
         return ""

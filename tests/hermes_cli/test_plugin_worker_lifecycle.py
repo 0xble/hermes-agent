@@ -54,7 +54,7 @@ def test_declaration_consent_admission_and_resync(plugin_world, monkeypatch, cap
     import subprocess
     python = world.selected() / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     result = subprocess.run([str(python), "-I", "-c", "import plugin_proof_dep; assert plugin_proof_dep.__version__ == '2.0'"],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
 
 

@@ -258,6 +258,7 @@ def test_killed_replacement_recovers_on_next_install(pm_env, route, interruption
     child = subprocess.run(
         [sys.executable, "-c", code, str(env["lockfile_path"]), route, interruption],
         env=dict(os.environ), capture_output=True, text=True, timeout=30,
+        check=False,
     )
     assert child.returncode == 17, child.stderr
     assert Facts(paths.facts_path()).get("faketool") == old_fact

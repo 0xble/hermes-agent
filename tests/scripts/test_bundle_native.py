@@ -285,14 +285,14 @@ def test_bundle_stages_git_tree_and_runs_native_children_before_manifest(tmp_pat
     moved = tmp_path / "installed elsewhere"
     output.rename(moved)
     try:
-        run = subprocess.run([str(moved / command)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+        run = subprocess.run([str(moved / command)], cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False)
         assert run.returncode == 7, run.stderr
         assert run.stdout.strip() == "1.0"
         from pm import runtime as runtime_api, paths
         with monkeypatch.context() as patch:
             patch.setattr(paths, "repo_root", lambda: moved / "hermes-agent")
             run = subprocess.run(runtime_api.runtime_command(moved / "hermes-agent/pm/launch.py", ["status"]),
-                                 cwd=tmp_path, env=runtime_api.runtime_environment(), capture_output=True, text=True, timeout=30)
+                                 cwd=tmp_path, env=runtime_api.runtime_environment(), capture_output=True, text=True, timeout=30, check=False)
         assert run.returncode == 0, run.stderr
         assert "no pm sync receipt" in run.stdout
     finally:
@@ -509,16 +509,19 @@ def test_staged_cache_ships_full_wheel_set_and_rebuilds_offline(tmp_path):
              "--no-deps", "--index-url", index_url,
              "cache-proof==1.0.0", "wheel-proof==1.0"],
             env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
+            check=False,
         )
         assert warm.returncode == 0, warm.stderr + warm.stdout
         locked = subprocess.run(
             [uv, "lock", "--python", sys.executable, "--index-url", index_url],
             env=env, cwd=project, capture_output=True, text=True, timeout=60,
+            check=False,
         )
         assert locked.returncode == 0, locked.stderr
         warmed = subprocess.run(
             [uv, "sync", "--python", sys.executable, "--frozen", "--index-url", index_url],
             env=env, cwd=project, capture_output=True, text=True, timeout=60,
+            check=False,
         )
         assert warmed.returncode == 0, warmed.stderr
 
@@ -543,6 +546,7 @@ def test_staged_cache_ships_full_wheel_set_and_rebuilds_offline(tmp_path):
             [uv, "sync", "--python", sys.executable, "--frozen", "--offline"],
             env={**env, "UV_CACHE_DIR": str(shipped)}, cwd=project,
             capture_output=True, text=True, timeout=60,
+            check=False,
         )
         assert result.returncode == 0, result.stderr
         assert "Building" not in result.stderr and "Built" not in result.stdout, result.stderr + result.stdout

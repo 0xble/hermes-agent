@@ -221,6 +221,7 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
             capture_output=True,
             input=(stdin_data.encode("utf-8", "surrogateescape")
                    if is_windows and stdin_data is not None else stdin_data),
+                   check=False,
         )
         output = (
             completed.stdout.decode("utf-8", "replace")

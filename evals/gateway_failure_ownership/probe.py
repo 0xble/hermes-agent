@@ -164,6 +164,7 @@ class ControlledAgent(AIAgent):
                 [sys.executable, str(Path(__file__).with_name("foreign_writer.py")),
                  str(ROOT), str(HOME / "state.db"), sid],
                 capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20,
+                check=False,
             )
             assert result.returncode == 0, result.stderr
             faults.append("foreign-writer-committed")
