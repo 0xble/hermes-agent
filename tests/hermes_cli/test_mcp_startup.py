@@ -278,7 +278,7 @@ def test_background_mcp_discovery_propagates_profile_secret_scope(monkeypatch):
     assert seen == [expected_scope]
 
 
-def test_portable_only_mcp_configuration_opens_startup_gate(monkeypatch):
+def test_portable_only_mcp_configuration_opens_ready_path(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",

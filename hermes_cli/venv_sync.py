@@ -138,11 +138,13 @@ def collect_superseded_generations(project_root: Path) -> None:
 
     from hermes_cli.runtime_state import collect_generations
     from pm.environments import install_state_dir
+    from pm.install_gc import collect_install_orphans
     from pm.runtime import collect_runtime_generations
 
     try:
         removed = collect_generations(project_root) + collect_runtime_generations(
             install_state_dir(project_root) / "pm-runtime")
+        removed += collect_install_orphans((project_root,))
     except (OSError, ValueError) as exc:
         # Reclaiming space must never turn a committed update into a failure.
         logging.getLogger(__name__).warning("dependency generation cleanup skipped: %s", exc)

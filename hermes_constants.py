@@ -963,16 +963,20 @@ def apply_scratch_tmp_env(env: MutableMapping[str, str]) -> bool:
     the vars were (re)written.
     """
     ours = env.get(SCRATCH_DIR_MARKER_ENV, "")
-    for key in SCRATCH_TMP_ENV_VARS:
-        value = env.get(key, "").strip()
-        if value and value != ours:
-            return False
+    user_temp = any(
+        (value := env.get(key, "").strip()) and value != ours
+        for key in SCRATCH_TMP_ENV_VARS
+    )
     home = env.get("HERMES_HOME", "").strip()
     try:
         scratch = str(get_scratch_dir(_expand_hermes_home(home) if home else get_process_hermes_home()))
     except (RuntimeError, OSError):
         # No HERMES_HOME and no resolvable user home (a child env built from nothing on
         # Windows): there is no scratch dir to point at; the child keeps the OS default.
+        return False
+    if user_temp:
+        # An OS/user-selected TMPDIR must remain authoritative, but it must not disable
+        # maintenance of Hermes' own scratch tree on macOS where TMPDIR is exported by launchd.
         return False
     for key in SCRATCH_TMP_ENV_VARS:
         env[key] = scratch

@@ -111,6 +111,34 @@ def expected_revision(home: Path, receipt: dict) -> tuple[str | None, str | None
     return release.name, None
 
 
+def update_receipt_path(home: Path) -> Path:
+    """The update's receipt: ``latest.json`` unless a ``pm`` receipt replaced it.
+
+    ``pm`` sync and plugin-check receipts (they carry ``kind``) also replace the shared
+    ``latest.json`` pointer, so a sync that finishes after the update would otherwise be
+    read as the update's own outcome. Then fall back to the newest per-run
+    ``update_*.json``, which only the updater writes. An update-owned ``latest.json`` stays
+    authoritative because a live-fleet settle rewrites only that pointer.
+    """
+    directory = home / "logs" / "update_receipts"
+    latest = directory / "latest.json"
+    try:
+        data = json.loads(latest.read_text(encoding="utf-8-sig"))
+        if not (isinstance(data, dict) and data.get("kind")):
+            return latest
+    except (OSError, ValueError):
+        return latest
+    newest: tuple[float, Path] | None = None
+    for path in directory.glob("update_*.json"):
+        try:
+            stamp = path.stat().st_mtime
+        except OSError:
+            continue
+        if newest is None or stamp > newest[0]:
+            newest = (stamp, path)
+    return newest[1] if newest else latest
+
+
 def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
     """None means still waiting; success needs process completion AND runtime proof.
 
@@ -126,7 +154,7 @@ def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
         exit_code = int(exit_path.read_text(encoding="utf-8-sig").strip())
         if exit_code:
             return False, f"The updater exited with code {exit_code}. Runtime state is unverified; see the update output."
-        receipt_path = home / "logs" / "update_receipts" / "latest.json"
+        receipt_path = update_receipt_path(home)
         if not receipt_path.exists() and pending.get("notification_version") != 2:
             # Legacy gateway markers predate runtime receipts. Preserve their terminal
             # notification contract while v2 markers remain fail-closed.

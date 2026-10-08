@@ -31,7 +31,7 @@ from gateway.restart import (
 #: gives up and parks with the fatal-config code instead. Bounds the one regression the
 #: restartable exit introduces: a permanently dead backend looping forever unnoticed.
 _TRANSIENT_EXIT_STREAK_LIMIT = 5
-from gateway.run_shutdown import _cancel_task_with_grace, _log_suppressed, _send_error
+from gateway.run_shutdown import _log_suppressed, _send_error
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES, DEFAULT_LOOP_WATCHDOG_TIMEOUT_S, loop_heartbeat_forever,
@@ -82,11 +82,14 @@ class GatewayStartupMixin:
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
 
-    def _queue_startup_restore_event(self, event: MessageEvent) -> None:
+    def _queue_startup_restore_event(self, event: MessageEvent, *, front: bool = False) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
             queue = self._startup_restore_queue = []
-        queue.append(event)
+        if front:
+            queue.insert(0, event)
+        else:
+            queue.append(event)
         with suppress(Exception):
             source = event.source
             logger.info(
@@ -219,6 +222,40 @@ class GatewayStartupMixin:
             "boot turn-machinery warm-up failed after gate release", level=logging.DEBUG,
         )
 
+    def _start_mcp_discovery(self) -> None:
+        """Start MCP discovery before adapter connects so it overlaps transport startup."""
+        from gateway.run import _discover_gateway_mcp_tools
+
+        async def _discover_mcp_in_background() -> None:
+            try:
+                await _discover_gateway_mcp_tools(self.config)
+            except Exception as exc:
+                logger.debug("MCP tool discovery failed: %s", exc)
+            finally:
+                self._mcp_discovery_ready.set()
+
+        # Not in ``_background_tasks``: stop() cancels those, but cancelling cannot stop the executor
+        # thread mid-connect. Shutdown waits on this handle before MCP teardown instead.
+        task = asyncio.create_task(_discover_mcp_in_background())
+        self._mcp_discovery_task = task
+        task.add_done_callback(
+            self._late_failure_callback("background MCP tool discovery failed", level=logging.DEBUG)
+        )
+
+    async def _await_mcp_discovery(self) -> None:
+        """Bound boot auto-resume until MCP discovery has published the tools it may need."""
+        from gateway.run import _startup_restore_drain_timeout_secs
+        ready = getattr(self, "_mcp_discovery_ready", None)
+        if not isinstance(ready, asyncio.Event) or ready.is_set():
+            return
+        wait_task = asyncio.create_task(ready.wait())
+        await self._wait_bounded_or_release(
+            {wait_task}, _startup_restore_drain_timeout_secs(),
+            "MCP tool discovery still running after %.0fs; starting boot auto-resume without late MCP tools",
+            "background MCP discovery wait failed before boot auto-resume",
+            level=logging.WARNING,
+        )
+
     async def _wait_bounded_or_release(
         self, tasks: set, timeout: float, warn_fmt: str, late_msg: str, *,
         level: int = logging.WARNING, track: bool = False,
@@ -240,6 +277,43 @@ class GatewayStartupMixin:
                 if track:
                     self._retain_background_task(task)
         return done
+
+    async def _recover_pending_shutdown_flush_off_loop(
+        self, *, candidates, platform=None, failure_message: str,
+    ) -> list[MessageEvent]:
+        """Claim pending follow-ups off-loop and publish them before another pass may start.
+
+        The lock deliberately covers both the worker-thread scan and loop-side queue publication.
+        A lock around only ``to_thread`` leaves a duplicate-claim window while the caller transfers
+        its local event list into ``_startup_restore_queue``.
+        """
+        from gateway.run_pending_recovery import recover_pending_shutdown_flush
+
+        completion = getattr(self, "_pending_recovery_complete", None)
+        if completion is None or completion.is_set():
+            completion = self._pending_recovery_complete = asyncio.Event()
+        lock = getattr(self, "_pending_recovery_lock", None)
+        if lock is None:
+            # Bare test runners do not execute GatewayRunner.__init__; creation is synchronous before
+            # the first await, so two callers on this loop cannot create separate locks.
+            lock = self._pending_recovery_lock = asyncio.Lock()
+        try:
+            async with lock:
+                recovered_events: list[MessageEvent] = []
+                try:
+                    await asyncio.to_thread(
+                        recover_pending_shutdown_flush,
+                        self, candidates=candidates, platform=platform,
+                        recovered_events=recovered_events,
+                    )
+                except Exception:
+                    logger.warning(failure_message, exc_info=True)
+                # Recovered follow-ups precede inbound messages queued during startup restore.
+                for event in reversed(recovered_events):
+                    self._queue_startup_restore_event(event, front=True)
+                return recovered_events
+        finally:
+            completion.set()
 
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED by ``_startup_restore_drain_timeout_secs``) for startup auto-resume, then
@@ -619,12 +693,11 @@ class GatewayStartupMixin:
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
         try:
-            owned = getattr(self, "_startup_owned_recovery_keys", frozenset())
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.session_key not in owned and entry.resume_pending
+                    if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
@@ -644,6 +717,12 @@ class GatewayStartupMixin:
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
+
+    async def _resume_pending_candidates_async(self, platform=None, *, record_boot=True) -> Optional[list]:
+        """Snapshot resume-pending entries without running the state.db load on the gateway loop."""
+        return await asyncio.to_thread(
+            self._resume_pending_candidates, platform, record_boot=record_boot,
+        )
 
     def _resume_owner_authorized(self, session_key: str, source) -> bool | None:
         """True for an authorized owner, False for denial, None when checking failed."""
@@ -867,14 +946,13 @@ class GatewayStartupMixin:
                     getattr(guard, method)()
 
     async def _consume_clean_shutdown_marker(self, marker_path) -> int:
-        """Discard orphan turn markers before consuming a clean-exit receipt. Raises (fail closed):
-        continuing with the old receipt would let a later unclean exit masquerade as clean."""
-        from gateway.run_startup_recovery import startup_recovery_fences
-        live, owned = await asyncio.to_thread(startup_recovery_fences, self)
-        self._startup_live_recovery_keys = live
-        self._startup_owned_recovery_keys = owned
-        kwargs = {"exclude_session_keys": live} if live else {}
-        discarded = await self.async_session_store.discard_active_turn_markers(**kwargs)
+        """Discard orphan turn markers before consuming a clean-exit receipt.
+
+        The receipt is consumed only after the marker cleanup succeeds. Callers that need to
+        continue serving after a cleanup failure must retire the receipt first, otherwise a
+        later crash could be misclassified as clean.
+        """
+        discarded = await self.async_session_store.discard_active_turn_markers()
         marker_path.unlink()
         return discarded
 
@@ -885,39 +963,34 @@ class GatewayStartupMixin:
         the old 120 s recency sweep re-answered every recently active chat. Returns (resumed,
         ledgered)."""
         from gateway.run import _float_env
-        from gateway.run_startup_recovery import startup_recovery_fences
-        live, owned = await asyncio.to_thread(startup_recovery_fences, self)
-        self._startup_live_recovery_keys = live
-        self._startup_owned_recovery_keys = owned
         resumed = ledgered = 0
         max_age = max(60 * 60, int(max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800)) * 2))
         with _log_suppressed(logging.WARNING, "Crash-left reply recovery on startup failed: %s"):
-            ledgered = await self._ledger_crash_left_replies(max_age, exclude_session_keys=live)
+            ledgered = await self._ledger_crash_left_replies(max_age)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
-            kwargs = {"exclude_session_keys": owned} if owned else {}
-            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age, **kwargs)
+            resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
         return resumed, ledgered
 
-    async def _ledger_crash_left_replies(self, max_age_seconds: int, *, exclude_session_keys=None) -> int:
+    def _snapshot_active_turns_for_recovery(self) -> list:
+        """Read active-turn recovery rows under the store lock off the gateway loop."""
+        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+            self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            return [
+                (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
+                 e.transport_profile)
+                for e in self.session_store._entries.values()  # noqa: SLF001
+                if e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
+            ]
+
+    async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
         """Settle every marked turn whose final reply was persisted and clear its marker, so
         auto-resume does not regenerate it: a reply live delivery would have suppressed is owed
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
-        if exclude_session_keys is None:
-            from gateway.run_startup_recovery import startup_recovery_fences
-            exclude_session_keys, _owned = await asyncio.to_thread(startup_recovery_fences, self)
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
-        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-            self.session_store._ensure_loaded_locked()  # noqa: SLF001
-            marked = [
-                (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
-                 e.transport_profile)
-                for e in self.session_store._entries.values()  # noqa: SLF001
-                if e.session_key not in exclude_session_keys
-                and e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
-            ]
+        marked = await asyncio.to_thread(self._snapshot_active_turns_for_recovery)
         ledgered = 0
         for key, session_id, token, started_at, origin, profile in marked:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
@@ -1299,15 +1372,24 @@ class GatewayStartupMixin:
                 logger.warning("Process checkpoint recovery for profile %r failed", profile_name, exc_info=True)
         return recovered
 
+    async def _start_prime_session_db_after_ready(self) -> None:
+        """Open the shared state.db handles only after adapters are ready, never on the loop."""
+        store = getattr(self, "session_store", None)
+        open_store = getattr(store, "_open_session_db_for_active_scope", None)
+        open_runner = getattr(self, "_open_session_db_for_active_scope", None)
+        if not callable(open_store) or not callable(open_runner):
+            return
+        try:
+            await asyncio.to_thread(open_store)
+            await asyncio.to_thread(open_runner, True)
+        except Exception as exc:
+            # First-use async callers retain the existing recoverable fallback/backoff behavior.
+            logger.warning("SQLite session store not available after adapter readiness: %s", exc)
+            self._session_db_init_error = str(exc)
+
     async def _start_recover_previous_run(self) -> None:
-        """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
+        """Recover prior processes and sessions after adapters are ready."""
         from gateway.run import _hermes_home
-        self._start_register_plugins_relay_hooks()
-        # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
-        with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
-            from hermes_cli.plugins import get_plugin_manager
-            self._subscribe_plugin_rewire(get_plugin_manager())
-        self.hooks.discover_and_load()
         # Recover background processes from checkpoint (crash recovery). ``_checkpoint_path`` is
         # scope-relative, so a served secondary's turn wrote ITS home's processes.json; recover each
         # served profile's file under its scope or those processes are never re-adopted.
@@ -1322,6 +1404,7 @@ class GatewayStartupMixin:
         _clean_marker = _hermes_home / ".clean_shutdown"
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
+            discarded = 0
             try:
                 discarded = await self._consume_clean_shutdown_marker(_clean_marker)
             except Exception as exc:
@@ -1342,11 +1425,7 @@ class GatewayStartupMixin:
         # Stuck-loop detection: a session active across 3+ consecutive restarts is auto-suspended.
         with _log_suppressed(logging.DEBUG, "Stuck-loop detection failed: %s"):
             # Auto-suspend it so the user gets a clean slate on the next message. See #7536.
-            # A's counters and cached routing rows still belong to A while it
-            # drains. Defer this global legacy sweep rather than suspending A
-            # or bulk-saving B's stale snapshot over its living owner's state.
-            stuck = (0 if getattr(self, "_startup_live_recovery_keys", frozenset())
-                     else self._suspend_stuck_loop_sessions())
+            stuck = await asyncio.to_thread(self._suspend_stuck_loop_sessions)
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
 
@@ -1799,7 +1878,6 @@ class GatewayStartupMixin:
             self._booted_from_restart = True
         # Claim delivery-ledger obligations before snapshotting resume-pending sessions. Claiming an
         # answered turn clears its live resume flag; taking this snapshot first replays the turn (#91969).
-        from gateway.run_pending_recovery import recover_pending_shutdown_flush
         claimed = await self._claim_pending_obligations()
         candidates = self._resume_pending_candidates()
         # Only this version's durable turn markers may create a startup interruption note. Legacy
@@ -1811,10 +1889,16 @@ class GatewayStartupMixin:
             interrupted_note_keys=interrupted_note_keys,
             claimed=claimed,
         )
-        try:
-            recover_pending_shutdown_flush(self, candidates=candidates)
-        except Exception:
-            logger.warning("Pending-message recovery failed; spools retained", exc_info=True)
+        # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
+        # interrupted session must wait as a distinct event, not enter that turn's history.
+        candidates = await self._resume_pending_candidates_async()
+        await self._recover_pending_shutdown_flush_off_loop(
+            candidates=candidates,
+            failure_message="Pending-message recovery failed; spools retained",
+        )
+        # Resume turns must not start before background MCP discovery has published the tool set they may
+        # rely on. This wait is bounded so a wedged discovery cannot stall gateway availability.
+        await self._await_mcp_discovery()
         # Auto-resume only the live snapshot: ledger-answered sessions were cleared before it was taken.
         self._schedule_resume_pending_sessions(candidates=candidates)
         await self._finish_startup_restore()
@@ -1893,15 +1977,37 @@ class GatewayStartupMixin:
 
     async def start(self) -> bool:
         """Start the gateway and all configured platform adapters."""
+        startup_succeeded = False
         try:
-            return await self._start_impl()
+            result = await self._start_impl()
+            startup_succeeded = bool(result and getattr(self, "_running", False))
+            return result
+        except Exception:
+            # Fail closed through the normal stop path: adapters may already be connected and inbound
+            # may be queued behind restore, so spool it and disconnect before the error propagates. A
+            # failed boot never writes a clean receipt: the next start must still recover this run.
+            self._suppress_clean_shutdown_receipt = True
+            try:
+                await self.stop()
+            except Exception:
+                logger.exception("Gateway cleanup failed after startup error")
+            raise
         finally:
+            # Early startup aborts can return before the normal finish-wiring discovery phase; release any
+            # API requests waiting on the readiness barrier when the runner is no longer starting.
+            mcp_ready = getattr(self, "_mcp_discovery_ready", None)
+            if isinstance(mcp_ready, asyncio.Event) and not startup_succeeded:
+                mcp_ready.set()
             # Every startup path (early aborts included) ends here: bound startup on the latest
             # diagnostic snapshot once, instead of flushing at each return.
             await self._start_flush_runtime_status()
 
     async def _start_impl(self) -> bool:
         logger.info("Starting Hermes Gateway...")
+        # Until the previous-run recovery decision completes, shutdown must not write a fresh
+        # clean receipt: an abort during adapter startup would otherwise turn an unclean boot into
+        # a clean one on the next restart.
+        self._suppress_clean_shutdown_receipt = True
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
         # Spools remain on disk on early aborts: only a boot with an initialized session
@@ -1910,18 +2016,24 @@ class GatewayStartupMixin:
             return True
         if self._start_check_access_policy():
             return True
-        await self._start_recover_previous_run()
-        # The gateway is a boot owner of the Nous free tier, beside `cmd_chat` and `hermes serve`: every
-        # demand-time site (provider resolution, /login, the connector token) is a read that needs the
-        # identity to already exist. Blocking here, before any adapter connects, is what keeps a fast
-        # first DM from arriving with nothing to resolve. With the launch gate unset this is a local
-        # inventory and no network.
+        # Register plugins, the relay adapter, and hooks before creating platform adapters. Relay
+        # self-provisioning may disable direct platforms, leaving Platform.RELAY as the only ingress.
+        self._start_register_plugins_relay_hooks()
+        # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
+        with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
+            from hermes_cli.plugins import get_plugin_manager
+            self._subscribe_plugin_rewire(get_plugin_manager())
+        self.hooks.discover_and_load()
+        # The free-tier bootstrap resolves demand-time identity locally before inbound admission; it does
+        # not touch state.db.
         await self._run_free_tier_bootstrap()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
+        self._mcp_discovery_ready = asyncio.Event()
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        self._start_mcp_discovery()
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
         self._start_startup_warmup()
@@ -1954,6 +2066,11 @@ class GatewayStartupMixin:
             return True
         if await self._abort_startup_if_shutdown_requested():
             return True
+        await self._start_recover_previous_run()
+        # From here on shutdown may write a clean receipt: this boot has made the crash/clean
+        # decision and processed the previous run's recovery state.
+        self._suppress_clean_shutdown_receipt = False
+        await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
         if getattr(self.config, "durable_outbox_enabled", False):
             from gateway.outbox import open_outbox, recover

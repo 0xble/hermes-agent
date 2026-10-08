@@ -16,8 +16,7 @@ import threading
 from typing import Any, Iterator, TextIO
 
 __all__ = [
-    "thread_scoped_silence", "adopt_routing_proxy", "delegate_getattr", "is_stdio_wrapper", "resolve_stdio", "stdio_chain", "stdio_install_lock",
-]
+    "thread_scoped_silence", "is_routing_stream", "adopt_routing_proxy", "delegate_getattr", "is_stdio_wrapper", "resolve_stdio", "stdio_chain", "stdio_install_lock", ]
 
 _install_lock = threading.Lock()
 # Every installer that rebinds sys.stdout/sys.stderr holds this, so a concurrent agent build
@@ -170,6 +169,22 @@ def adopt_routing_proxy(attr: str, current: object, fallback: object = None) -> 
             _routing_states[attr] = layer._state
             return layer
     return None
+
+
+def _routing_stream_under(stream: object) -> "_ThreadRoutingStream | None":
+    """The routing proxy at ``stream`` or directly under a single transparent wrapper."""
+    if isinstance(stream, _ThreadRoutingStream):
+        return stream
+    try:
+        inner = object.__getattribute__(stream, "_inner")
+    except AttributeError:
+        return None
+    return inner if isinstance(inner, _ThreadRoutingStream) else None
+
+
+def is_routing_stream(stream: object) -> bool:
+    """True when ``stream`` is this module's routing proxy (which already tolerates a dead target)."""
+    return isinstance(stream, _ThreadRoutingStream)
 
 
 def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":

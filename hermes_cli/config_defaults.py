@@ -1444,7 +1444,7 @@ DEFAULT_CONFIG = {
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,
         # /loop or heartbeat wakes). A user message or a process/delegation result continues at
-        # once. 0 disables the gap.
+        # once. 0 disables the gap; values above 1800 (the goal wait ceiling) are capped.
         "min_continuation_gap_seconds": 900,
         # Fork patch: agent-initiated goal_set receipts (goal set / subgoal added) surface as a
         # notice when they commit. /goal and /subgoal replies and judge verdicts are unaffected.
@@ -2143,9 +2143,6 @@ DEFAULT_CONFIG = {
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "guardian": {"enabled": False},
-        # Generation overlap is opt-in. When disabled, the legacy singleton files and lifecycle remain unchanged.
-        "overlap_handover": {"enabled": False},
-        "forward_only_handover": {"enabled": False},
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,

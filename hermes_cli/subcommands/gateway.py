@@ -45,9 +45,8 @@ def build_gateway_parser(
     gateway_run.add_argument("-v", "--verbose", action="count", default=0,
         help="Increase stderr log verbosity (-v=INFO, -vv=DEBUG)")
     _flag(gateway_run, "-q", "--quiet", help="Suppress all stderr log output")
-    _flag(gateway_run, "--replace", help="Replace any existing gateway instance (useful for systemd)")
-    _flag(gateway_run, "--standby",
-        help="Register an overlap generation without polling or claiming the singleton gateway")
+    _flag(
+        gateway_run, "--replace", help="Replace any existing gateway instance (useful for systemd)")
     _flag(gateway_run, "--force",
         help="Start a foreground gateway even when a systemd/launchd/s6 service "
             "already supervises this profile. Without --force, the command "

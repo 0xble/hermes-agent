@@ -32,7 +32,7 @@ def pending_home_for_key(runner, session_key: str) -> Path | None:
 
 
 def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
-                    breaker_tripped=False, reconnect_recovery=False):
+                    breaker_tripped=False, reconnect_recovery=False, recovered_events=None):
     # A queued message is a future turn; appending it to the interrupted transcript
     # makes the recovery note answer that message instead.
     if platform is not None and key in eligible and eligible[key].origin.platform != platform:
@@ -115,12 +115,20 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     )
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)
-    runner._queue_startup_restore_event(event)
+    if recovered_events is not None:
+        recovered_events.append(event)
+    else:
+        # Compatibility for direct callers that are already on the gateway loop.
+        runner._queue_startup_restore_event(event)
     return True
 
 
-def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform=None) -> int:
-    """Visit the launch home and every served home; leave failed spools for a later boot."""
+def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform=None, recovered_events=None) -> int:
+    """Visit the launch home and every served home; leave failed spools for a later boot.
+
+    When *recovered_events* is supplied, worker-thread recovery only returns events through that
+    list; the caller owns queue mutation on the gateway loop.
+    """
     from gateway.run import _profile_runtime_scope
 
     # Snapshot once per recovery pass: the loop breaker must not be counted per payload.
@@ -150,7 +158,8 @@ def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform
                     session_resolver=resolve_here,
                     deferred_followup=partial(_defer_followup, runner, eligible, platform,
                                               breaker_tripped=candidates is None,
-                                              reconnect_recovery=platform is not None))
+                                              reconnect_recovery=platform is not None,
+                                              recovered_events=recovered_events))
         except Exception:
             logger.warning("Pending-message recovery failed for profile home %s; spool retained", home,
                            exc_info=True)

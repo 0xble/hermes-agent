@@ -103,18 +103,15 @@ class SessionLifecycleMixin:
             self._save()
             return True
 
-    def _update_all_entries_locked(self, mutate, *, exclude_session_keys=frozenset()) -> int:
-        """Mutate eligible entries; never bulk-save over a concurrently owned lane."""
+    def _update_all_entries_locked(self, mutate) -> int:
+        """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; save once if any
+        returned True. Returns the count that did."""
         with self._lock:
             self._ensure_loaded_locked()
-            changed = [key for key, entry in self._entries.items()
-                       if key not in exclude_session_keys and mutate(entry)]
-            if exclude_session_keys:
-                for key in changed:
-                    self._save_entry(key, lock_held=True, allow_full_rewrite=False)
-            elif changed:
+            changed = sum(1 for entry in self._entries.values() if mutate(entry))
+            if changed:
                 self._save()
-        return len(changed)
+        return changed
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session suspended so it auto-resets on next access (/stop). True if it existed.
@@ -166,7 +163,7 @@ class SessionLifecycleMixin:
             self._set_turn_marker_locked(session_key, entry, None, None)
         return True
 
-    def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60, *, exclude_session_keys=frozenset()) -> int:
+    def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).
         Old/invalid markers are cleared without resuming; suspended sessions are never re-armed.
         Returns the number of newly promoted sessions."""
@@ -202,10 +199,10 @@ class SessionLifecycleMixin:
             entry.active_turn_started_at = None
             return True
 
-        self._update_all_entries_locked(_promote, exclude_session_keys=exclude_session_keys)
+        self._update_all_entries_locked(_promote)
         return promoted
 
-    def discard_active_turn_markers(self, *, exclude_session_keys=frozenset()) -> int:
+    def discard_active_turn_markers(self) -> int:
         """Clear orphan turn markers after a verified clean shutdown."""
         def _discard(entry: SessionEntry) -> bool:
             if not entry.active_turn_token and entry.active_turn_started_at is None:
@@ -213,7 +210,7 @@ class SessionLifecycleMixin:
             entry.active_turn_token = None
             entry.active_turn_started_at = None
             return True
-        return self._update_all_entries_locked(_discard, exclude_session_keys=exclude_session_keys)
+        return self._update_all_entries_locked(_discard)
 
     def mark_resume_pending(
         self, session_key: str, reason: str = "restart_timeout", *,

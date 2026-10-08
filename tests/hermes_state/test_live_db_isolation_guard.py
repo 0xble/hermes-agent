@@ -123,8 +123,11 @@ class TestSessionStoreLoudFailure:
             )
 
         monkeypatch.setattr(hermes_state, "SessionDB", _boom)
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        # SessionStore construction is intentionally DB-free; the guard must still be loud at
+        # the first lazy state.db access rather than degrading to the JSONL fallback.
         with pytest.raises(RuntimeError, match="live-system guard"):
-            SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+            store._ensure_loaded()
 
     def test_ordinary_db_failure_still_degrades_to_jsonl(
         self, tmp_path, monkeypatch

@@ -102,7 +102,9 @@ class SessionPersistenceMixin:
             if home is None:
                 return self._db
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
-        except Exception:
+        except Exception as exc:
+            if _is_live_system_guard(exc):
+                raise
             return None
 
     def _named_profile_for_key(self, session_key: Optional[str]) -> Optional[str]:
@@ -162,7 +164,9 @@ class SessionPersistenceMixin:
                 return self._db
             try:
                 return self._open_session_db_for_active_scope(db_path=routing_home / "state.db")
-            except Exception:
+            except Exception as exc:
+                if _is_live_system_guard(exc):
+                    raise
                 return None
         home = self._profile_home_for_key(session_key)
         if home is None:
@@ -174,7 +178,9 @@ class SessionPersistenceMixin:
             return None
         try:
             return self._open_session_db_for_active_scope(db_path=home / "state.db")
-        except Exception:
+        except Exception as exc:
+            if _is_live_system_guard(exc):
+                raise
             return None  # same contract as ``_db``: a failed open degrades to JSONL fallback
 
     def _owner_key_for_session_id(self, session_id: Optional[str]) -> Optional[str]:
@@ -339,6 +345,8 @@ class SessionPersistenceMixin:
                     self._entries[key] = verdict
                     recovered_keys += 1
         except Exception as exc:
+            if _is_live_system_guard(exc):
+                raise
             logger.warning("gateway.session: stale-entry pruning skipped due to DB error: %s", exc)
             return
         for key in stale_keys:
@@ -489,7 +497,7 @@ class SessionPersistenceMixin:
 
     def _save_entry(
         self, session_key: str, *, entry_data: Optional[Dict[str, Any]] = None,
-        lock_held: bool = False, allow_full_rewrite: bool = True) -> None:
+        lock_held: bool = False) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). The key -> session_id mapping never changes here: structural
         transitions use the full rewrite (which also refreshes the sessions.json mirror; it may lag
@@ -520,13 +528,9 @@ class SessionPersistenceMixin:
                     fast_persisted[session_key] = (revision, entry_json)
                 return
             except Exception as exc:
-                if not allow_full_rewrite:
-                    raise RuntimeError("scoped routing save failed; full rewrite would clobber a live owner") from exc
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r (%s); falling back "
                     "to full index rewrite", session_key, exc)
-        if not allow_full_rewrite:
-            raise RuntimeError("scoped routing save unavailable; full rewrite would clobber a live owner")
         if entry_data is not None:
             # Full-snapshot fallback carrying the candidate transition.
             with guard:

@@ -11,12 +11,10 @@ import logging
 import shlex
 import sys
 from contextlib import contextmanager, suppress
-from contextvars import ContextVar
 from dataclasses import dataclass, field, asdict, fields as dataclass_fields
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
-_strict_inventory = ContextVar('strict_runtime_inventory', default=False)
 
 
 @dataclass
@@ -138,12 +136,10 @@ def _runtime(
 
 @contextmanager
 def _probe(label: str):
-    """Keep best-effort collectors, except when forward qualification requires proof."""
+    """Run one inventory collector; a failure is logged at debug and yields fewer rows, never an exception."""
     try:
         yield
     except Exception as exc:
-        if _strict_inventory.get():
-            raise RuntimeError(f'{label} could not be qualified') from exc
         logger.debug("%s failed: %s", label, exc)
 
 
@@ -308,17 +304,8 @@ def _collect_ledger_runtimes(plan: UpdatePlan, seen: set[int]) -> None:
             ))
 
 
-def collect_runtime_inventory(*, strict: bool = False) -> UpdatePlan:
-    """Keep ordinary best-effort inventory, or require every collector to finish."""
-    token = _strict_inventory.set(strict)
-    try:
-        return _build_runtime_inventory()
-    finally:
-        _strict_inventory.reset(token)
-
-
-def _build_runtime_inventory() -> UpdatePlan:
-    """Build the pre-update plan. Read-only, with independently scoped collectors.
+def collect_runtime_inventory() -> UpdatePlan:
+    """Build the pre-update plan. Read-only; never raises — every collector degrades independently.
 
     The result is embeddable in the update receipt and printable via :func:`print_update_plan`.
     """

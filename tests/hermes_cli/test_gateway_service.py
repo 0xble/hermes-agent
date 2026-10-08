@@ -2529,6 +2529,43 @@ class TestLaunchctlBootstrapEioRetry:
             gateway_cli._launchctl_bootstrap(self.DOMAIN, self.PLIST, self.LABEL)
         assert excinfo.value.returncode == 5
 
+    def test_stale_label_recovery_shares_one_timeout_budget(self, monkeypatch):
+        # The guardian's rollback passes its remaining deadline as ``timeout``. The EIO bootout and
+        # retry must spend what is left of that one budget, not a fresh ``timeout`` each, or a stale
+        # registration can overrun the bounded rollback by up to 3x.
+        clock = {"now": 1000.0}
+        timeouts = []
+        monkeypatch.setattr(gateway_cli.time, "monotonic", lambda: clock["now"])
+
+        def fake_run(cmd, check=True, timeout=None, **kwargs):
+            timeouts.append((cmd[1], timeout))
+            clock["now"] += 4.0
+            if cmd[1] == "bootstrap" and len([t for t in timeouts if t[0] == "bootstrap"]) == 1:
+                raise subprocess.CalledProcessError(5, cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli._launchctl_bootstrap(self.DOMAIN, self.PLIST, self.LABEL, timeout=10)
+
+        assert timeouts == [("bootstrap", 10.0), ("bootout", 6.0), ("bootstrap", 2.0)]
+
+    def test_exhausted_budget_raises_timeout_instead_of_starting_another_call(self, monkeypatch):
+        clock = {"now": 1000.0}
+        calls = []
+        monkeypatch.setattr(gateway_cli.time, "monotonic", lambda: clock["now"])
+
+        def fake_run(cmd, check=True, timeout=None, **kwargs):
+            calls.append(cmd[1])
+            clock["now"] += 10.0
+            raise subprocess.CalledProcessError(5, cmd)
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            gateway_cli._launchctl_bootstrap(self.DOMAIN, self.PLIST, self.LABEL, timeout=10)
+        assert calls == ["bootstrap"]
+
 
 class TestLaunchdUnloadedJobStderrStaysOffTerminal:
     """#106273: against an UNLOADED job, ``launchctl bootout`` / ``kickstart -k`` exit 3 and print

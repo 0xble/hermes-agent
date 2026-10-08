@@ -230,3 +230,18 @@ def test_whatsapp_reply_prefix_isolated_across_profile_scopes(
         load_gateway_config().platforms[Platform.WHATSAPP]
     )
     assert launch_after._bridge_env()["WHATSAPP_REPLY_PREFIX"] == "Launch Bot: "
+
+
+def test_retired_handover_keys_are_ignored(homes):
+    launch, _ = homes
+    (launch / "config.yaml").write_text(
+        "gateway:\n"
+        "  forward_only_handover:\n"
+        "    enabled: false\n"
+        "  overlap_handover:\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+    config = load_gateway_config()
+    assert not hasattr(config, "forward_only_handover_enabled")
+    assert not hasattr(config, "overlap_handover_enabled")

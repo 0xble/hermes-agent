@@ -667,15 +667,21 @@ _EARLY_CORE_INSTALL_MAX_ATTEMPTS = 3
 
 
 def _claim_recovery_lock(root: Path) -> int | None:
-    """Hold a kernel lock in writable state; process exit releases it."""
-    from pm.environments import install_state_dir
+    """Hold a kernel lock in writable state; process exit releases it.
+
+    Not the install-state lock: the repair's PM worker takes that one, and would
+    wait forever on a lock its own launcher holds. Orphan collection checks both.
+    """
+    from pm.environments import install_recovery_lock_path, install_state_dir
     from hermes_cli.runtime_state import _lock
 
     state = install_state_dir(root)
-    state.mkdir(parents=True, exist_ok=True)
-    fd = os.open(state / ".recovery.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    lock_path = install_recovery_lock_path(state)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         if _lock(fd, wait=False):
+            state.mkdir(parents=True, exist_ok=True)
             return fd
     except BaseException:
         os.close(fd)

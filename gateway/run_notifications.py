@@ -373,6 +373,7 @@ class GatewayNotificationsMixin:
         claim_id: str = ""
         proceed: bool = True
         early_result: Optional[bool] = None
+        settled: bool = False
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
@@ -887,9 +888,8 @@ class GatewayNotificationsMixin:
         if exit_code:
             return "❌ Update Failed", f"The updater exited with code {exit_code}. Runtime state is unverified."
         try:
-            receipt_path = home / "logs" / "update_receipts" / "latest.json"
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
-            from gateway.update_notifications import expected_revision
+            from gateway.update_notifications import expected_revision, update_receipt_path
+            receipt = json.loads(update_receipt_path(home).read_text(encoding="utf-8-sig"))
             pre_sha = str((receipt.get("pre_update") or {}).get("sha") or "")
             raw_post_sha = str((receipt.get("post_update") or {}).get("sha") or "")
             same_revision = bool(pre_sha and raw_post_sha and pre_sha == raw_post_sha)
@@ -1182,6 +1182,20 @@ class GatewayNotificationsMixin:
             target = self._resolve_update_target(paths)
             marker, pending = current
             original = original if original is not None else pending.copy()
+            if target is None and not (pending.get("platform") and pending.get("chat_id")):
+                # Cron and CLI requests carry no chat to report back to. Hold the admission
+                # until the updater process has really exited, then release it; raising here
+                # kept the marker forever and refused every later update. Only the real
+                # process-exit sentinel proves the updater is gone (the launcher's own
+                # admission rule): a legacy marker's ``.update_exit_code`` is written before the
+                # gateway restart, and a watcher timeout says nothing about the process.
+                if not (paths.pending.parent / ".update_process_exit_code").exists():
+                    return False
+                if final_outcome(paths.pending.parent, pending) is None and not timed_out:
+                    return False
+                logger.info("Update %s finished with no notification route; releasing its admission",
+                            pending.get("request_id") or "<legacy>")
+                return self._clear_update_markers(paths, pending.get("session_key"), pending)
             if target is None:
                 # Expire only a valid destination whose adapter never returned. Malformed
                 # metadata must not be mistaken for a confirmed transport outage.
@@ -2043,6 +2057,7 @@ class GatewayNotificationsMixin:
                     "terminally dropping delivery (result remains in the delegation records).",
                     claim.delegation_id or "<legacy>", parent_session_id,
                 )
+                claim.settled = True
                 await self._settle_durable_claims([("drop", claim.delegation_id, claim.claim_id)])
             else:
                 logger.warning(
@@ -2054,6 +2069,7 @@ class GatewayNotificationsMixin:
             claim.proceed = False
         elif verdict == "retry":
             # Transient uncertainty: tell the watcher to re-poll rather than drop or misroute.
+            claim.settled = True
             await self._settle_durable_claims([("release", claim.delegation_id, claim.claim_id)])
             claim.proceed, claim.early_result = False, False
         return claim
@@ -2137,11 +2153,15 @@ class GatewayNotificationsMixin:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
+            operations = []
+            if not claim.settled:
+                operation = "complete" if accepted else "defer" if refused else "release"
+                operations.append((operation, claim.delegation_id, claim.claim_id))
             operation = "complete" if accepted else "defer" if refused else "release"
-            await self._settle_durable_claims([
-                (operation, claim.delegation_id, claim.claim_id),
-                *((operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims),
-            ])
+            operations.extend(
+                (operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
+            )
+            await self._settle_durable_claims(operations)
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 

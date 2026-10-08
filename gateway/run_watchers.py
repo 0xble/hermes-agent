@@ -187,10 +187,12 @@ class GatewaySessionWatchersMixin:
                 nonlocal result
                 # Bound the send: a wedged adapter transport (network hang, dead websocket) must not
                 # block the watcher pass — siblings would go unevaluated and the watcher stop.
-                result = await asyncio.wait_for(
-                    adapter.send(str(source.chat_id), notice, metadata=metadata),
-                    timeout=_STALL_NOTIFY_SEND_TIMEOUT_SECONDS,
-                )
+                from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+                with outbound_class(OUTBOUND_NOTICE):
+                    result = await asyncio.wait_for(
+                        adapter.send(str(source.chat_id), notice, metadata=metadata),
+                        timeout=_STALL_NOTIFY_SEND_TIMEOUT_SECONDS,
+                    )
             async with _async_profile_runtime_scope(self._resolve_profile_home_for_source(source)):
                 presented = await present_notification(send_notice, platform=source.platform)
             if not presented:

@@ -67,11 +67,6 @@ def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bo
     """Resolve the process verdict after either startup abort or normal shutdown."""
     if _exit_with_failure_verdict(runner):
         return False
-    if getattr(runner, '_restart_requested', False) and (runner.exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
-                                      or runner._restart_via_service):
-        from gateway.run_generation import defer_forward_launchd_restart
-        if defer_forward_launchd_restart(getattr(runner, 'config', None)):
-            return True  # Clean exit parks KeepAlive until the fresh bootstrap.
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
     if signal_initiated_shutdown and not runner._restart_requested:
@@ -922,8 +917,6 @@ class GatewayShutdownMixin:
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
         """Mark every non-pending running session resume_pending; returns the keys marked."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        if getattr(self, "_overlap_cap_interrupted", False):
-            return []  # Fenced generation: never schedule replay of an interrupted side effect.
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         marked: list[str] = []
         # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
@@ -1779,19 +1772,20 @@ class GatewayShutdownMixin:
         if counts is None:
             return 0
         suspended = 0
-        for session_key in [k for k, v in counts.items() if v >= self._STUCK_LOOP_THRESHOLD]:
-            with suppress(Exception):
-                entry = self.session_store._entries.get(session_key)
-                if entry and not entry.suspended:
-                    entry.suspended = True
-                    suspended += 1
-                    logger.warning(
-                        "Auto-suspended stuck session %s (active across %d consecutive restarts — likely a stuck loop)",
-                        session_key, counts[session_key],
-                    )
-        if suspended:
-            with suppress(Exception):
-                self.session_store._save()
+        with self.session_store._lock:
+            for session_key in [k for k, v in counts.items() if v >= self._STUCK_LOOP_THRESHOLD]:
+                with suppress(Exception):
+                    entry = self.session_store._entries.get(session_key)
+                    if entry and not entry.suspended:
+                        entry.suspended = True
+                        suspended += 1
+                        logger.warning(
+                            "Auto-suspended stuck session %s (active across %d consecutive restarts — likely a stuck loop)",
+                            session_key, counts[session_key],
+                        )
+            if suspended:
+                with suppress(Exception):
+                    self.session_store._save()
         # Clear the file — counters start fresh after suspension
         with suppress(Exception):
             path.unlink(missing_ok=True)
@@ -2656,9 +2650,14 @@ class GatewayShutdownMixin:
         release_gateway_runtime_lock()
         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
         # half-finished sessions, so no marker — the next startup recovers their turn markers.
-        if not ctx.timed_out:
+        if not ctx.timed_out and not getattr(self, "_suppress_clean_shutdown_receipt", False):
             with suppress(Exception):
                 (_hermes_home / ".clean_shutdown").touch()
+        elif not ctx.timed_out:
+            logger.info(
+                "Skipping .clean_shutdown marker — startup recovery did not complete; "
+                "the next startup must recover the previous run."
+            )
         else:
             logger.info(
                 "Skipping .clean_shutdown marker — drain timed out with "
