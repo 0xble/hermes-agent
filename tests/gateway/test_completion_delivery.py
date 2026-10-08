@@ -1198,3 +1198,63 @@ def test_cancelled_preflight_settle_is_not_released_again(
 
     asyncio.run(_exercise())
     assert [operation[0] for operation in operations] == [expected_operation]
+
+
+def test_cancelled_settle_waits_for_queued_worker():
+    """Cancellation cannot cancel a durable settle that is queued behind a busy worker."""
+    import concurrent.futures
+    import threading
+
+    from gateway.run_notifications_ledger import settle_durable_claims
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    entered = threading.Event()
+    unblock = threading.Event()
+    submitted = threading.Event()
+    settled = threading.Event()
+    operations = []
+
+    async def _exercise():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(pool)
+        blocker = loop.run_in_executor(None, lambda: (entered.set(), unblock.wait(5)))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+
+        real_run_in_executor = loop.run_in_executor
+        calls = 0
+
+        def _track_submission(executor, func, *args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                submitted.set()
+            return real_run_in_executor(executor, func, *args)
+
+        def _settle(*operation) -> None:
+            operations.append(operation)
+            settled.set()
+
+        loop.run_in_executor = _track_submission
+        task = asyncio.create_task(
+            settle_durable_claims(
+                [("drop", "delegation", "claim")],
+                _settle,
+            )
+        )
+        while not submitted.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        unblock.set()
+        await asyncio.shield(blocker)
+        while not settled.is_set():
+            await asyncio.sleep(0)
+
+    try:
+        asyncio.run(_exercise())
+    finally:
+        pool.shutdown(wait=True)
+    assert operations == [("drop", "delegation", "claim")]
