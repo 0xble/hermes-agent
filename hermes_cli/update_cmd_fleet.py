@@ -1738,6 +1738,11 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
         for proc in find_profile_gateway_processes(exclude_pids=service_pids)
         if proc.pid in candidate_pids
     }
+    # Only a supervisor child that appeared after the restart snapshot is outside
+    # this sweep. A pre-existing externally supervised gateway still has to leave
+    # its old process so the supervisor can relaunch it on the new modules (#88654).
+    pre_restart_pids = getattr(out, "pre_restart_gateway_pids", None)
+    pre_restart_pids = set(pre_restart_pids) if pre_restart_pids is not None else None
     externally_supervised_pids = set()
     for pid in candidate_pids:
         proc = mapped_processes.get(pid)
@@ -1745,11 +1750,18 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
             # A mapped process gets the control-socket/state-file check as well as
             # the live argv fallback, scoped to that profile's home.
             try:
-                if gateway_declares_external_supervisor(pid, proc.path):
-                    externally_supervised_pids.add(pid)
-            except Exception:
+                declares_external_supervisor = gateway_declares_external_supervisor(pid, proc.path)
+            except Exception as exc:
                 # An unreadable identity is ambiguous; never turn it into a
-                # destructive manual-stop decision.
+                # destructive manual-stop decision. Report the skipped process so
+                # the update summary/receipt is not silently incomplete.
+                print(
+                    f"  ⚠ Could not determine external-supervisor ownership for "
+                    f"gateway PID {pid} ({proc.profile}): {exc}; "
+                    "protecting it if it appeared after the restart snapshot"
+                )
+                declares_external_supervisor = True
+            if declares_external_supervisor and (pre_restart_pids is None or pid not in pre_restart_pids):
                 externally_supervised_pids.add(pid)
             continue
         # Unmapped gateways have no profile home to query. The explicit argv
@@ -1758,7 +1770,7 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
             argv = _capture_gateway_argv(pid)
         except Exception:
             argv = None
-        if argv and "--external-supervisor" in argv:
+        if argv and "--external-supervisor" in argv and (pre_restart_pids is None or pid not in pre_restart_pids):
             externally_supervised_pids.add(pid)
     manual_pids = [pid for pid in candidate_pids if pid not in externally_supervised_pids]
     profile_processes = {
