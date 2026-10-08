@@ -52,28 +52,52 @@ _HOME_LINE = re.compile(r"^\s*HERMES_HOME\s*=>\s*(.+?)\s*$", re.MULTILINE)
 
 
 def _label_hermes_home(label: str, *, runner=None, timeout_for: TimeoutFor = _fixed) -> Path | None:
-    """HERMES_HOME a loaded generation job was rendered for, or None when it cannot be read.
+    """HERMES_HOME a loaded generation job was rendered for, or None when its owner is unreadable.
 
     Generation plists pin ``EnvironmentVariables.HERMES_HOME`` to the resolved home, and
-    ``launchctl print`` echoes it in the job's ``environment`` block.
+    ``launchctl print`` echoes it in the job's ``environment`` block. A label can be managed by
+    either the Aqua ``gui/<uid>`` domain or the background ``user/<uid>`` domain, so inspect both.
     """
     import os
 
     if sys.platform != "darwin":
         return None
     runner = runner or subprocess.run
-    timeout = timeout_for(5)
-    try:
-        result = runner(
-            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],  # windows-footgun: ok (darwin-gated above)
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
+    uid = os.getuid()  # windows-footgun: ok (darwin-gated above)
+    domains = (f"gui/{uid}", f"user/{uid}")
+    failures = []
+    nonzero = []
+    owners = []
+    missing_home = False
+    for domain in domains:
+        timeout = timeout_for(5)
+        try:
+            result = runner(
+                ["launchctl", "print", f"{domain}/{label}"],  # windows-footgun: ok (darwin-gated above)
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append(f"{domain}: {exc}")
+            continue
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+            nonzero.append(f"{domain}: {detail}")
+            continue
+        match = _HOME_LINE.search(result.stdout or "")
+        if match:
+            owners.append(Path(match.group(1)).expanduser())
+        else:
+            missing_home = True
+
+    if failures:
+        detail = "; ".join(failures)
+        raise LeftoverInspectionError(f"could not inspect launchd owner for {label}: {detail}")
+    if len(nonzero) == len(domains):
+        detail = "; ".join(nonzero)
+        raise LeftoverInspectionError(f"could not inspect launchd owner for {label} in both domains: {detail}")
+    if missing_home:
         return None
-    if result.returncode != 0:
-        return None
-    match = _HOME_LINE.search(result.stdout or "")
-    return Path(match.group(1)).expanduser() if match else None
+    return owners[0] if owners else None
 
 
 def _same_home(a: Path, b: Path) -> bool:

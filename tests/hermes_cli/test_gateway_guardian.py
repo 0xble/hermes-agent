@@ -662,7 +662,7 @@ def test_leftover_inspection_spends_only_the_guardian_deadline(tmp_path, monkeyp
     seen = []
 
     def run(argv, **kwargs):
-        seen.append((argv[1], kwargs.get("timeout")))
+        seen.append((argv[1], argv[2] if len(argv) > 2 else None, kwargs.get("timeout")))
         clock["now"] += 1.0
         if argv[1] == "list":
             return subprocess.CompletedProcess(argv, 0, stdout="-\t0\tai.hermes.gateway.g-" + "a" * 32 + "\n", stderr="")
@@ -670,7 +670,12 @@ def test_leftover_inspection_spends_only_the_guardian_deadline(tmp_path, monkeyp
 
     monkeypatch.setattr(guardian.subprocess, "run", run)
     guardian._refuse_leftovers_before_launch(tmp_path, 102.5)
-    assert seen == [("list", 2.5), ("print", 1.5)]
+    uid = os.getuid()
+    assert seen == [
+        ("list", None, 2.5),
+        ("print", f"gui/{uid}/ai.hermes.gateway.g-{'a' * 32}", 1.5),
+        ("print", f"user/{uid}/ai.hermes.gateway.g-{'a' * 32}", 0.5),
+    ]
 
 
 @pytest.mark.platforms("macos")
