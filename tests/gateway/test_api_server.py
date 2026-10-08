@@ -29,6 +29,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    _admit_api_agent_request,
     _api_request_profile,
     _IdempotencyCache,
     _derive_chat_session_id,
@@ -291,12 +292,59 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
+class TestApiAdmissionMcpReadiness:
+    @pytest.mark.asyncio
+    async def test_pending_mcp_discovery_returns_bounded_503(self, monkeypatch):
+        from gateway.platforms import api_server as api_module
+
+        adapter = _make_adapter()
+        runner = types.SimpleNamespace(_mcp_discovery_ready=asyncio.Event())
+        adapter.gateway_runner = runner
+        request = types.SimpleNamespace(headers={}, app={"gateway_runner": runner})
+        called = []
+
+        async def handler(_self, _request):
+            called.append(True)
+            return web.Response(status=200)
+
+        monkeypatch.setenv("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", "0.01")
+        monkeypatch.setattr(api_module._api_runs, "_uses_room_run_auth", lambda *_args: False)
+        wrapped = _admit_api_agent_request(handler)
+
+        response = await wrapped(adapter, request)
+
+        assert response.status == 503
+        assert response.headers["Retry-After"] == "1"
+        assert json.loads(response.body)["error"]["code"] == "mcp_discovery_pending"
+        assert called == []
+
+    @pytest.mark.asyncio
+    async def test_admission_waits_for_discovery_within_startup_bound(self, monkeypatch):
+        """A turn arriving while discovery is still finishing is admitted once it publishes, not refused."""
+        from gateway.platforms import api_server as api_module
+
+        adapter = _make_adapter()
+        runner = types.SimpleNamespace(_mcp_discovery_ready=asyncio.Event())
+        adapter.gateway_runner = runner
+        request = types.SimpleNamespace(headers={}, app={"gateway_runner": runner})
+
+        async def handler(_self, _request):
+            return web.Response(status=200)
+
+        monkeypatch.setattr(api_module._api_runs, "_uses_room_run_auth", lambda *_args: False)
+        asyncio.get_running_loop().call_later(3.5, runner._mcp_discovery_ready.set)
+
+        response = await _admit_api_agent_request(handler)(adapter, request)
+
+        assert response.status == 200
+
+
+
+
+
+
+
 class TestConcurrencyCap:
-
-
-
-
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize("at_cap", [True, False], ids=["at-cap", "under-cap"])
     @pytest.mark.parametrize(
@@ -3167,3 +3215,43 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="s2", gateway_session_key="ch")
         assert captured[1]["model"] == "anthropic/claude-opus-4.6"
+
+
+@pytest.mark.asyncio
+async def test_api_admission_waits_for_mcp_discovery(monkeypatch):
+    """Authenticated API turns cannot enter a handler before startup tool discovery completes."""
+    import gateway.platforms.api_server as api_server
+
+    ready = asyncio.Event()
+    calls = []
+
+    class Adapter:
+        gateway_runner = types.SimpleNamespace(_mcp_discovery_ready=ready)
+        _pending_agent_requests = 0
+
+        @staticmethod
+        def _check_auth(request):
+            del request
+            return None
+
+        @staticmethod
+        def _draining_response():
+            return None
+
+    monkeypatch.setattr(api_server._api_runs, "_uses_room_run_auth", lambda *_args: False)
+
+    @_admit_api_agent_request
+    async def handler(self, request):
+        del request
+        calls.append(True)
+        return "ok"
+
+    adapter = Adapter()
+    task = asyncio.create_task(handler(adapter, types.SimpleNamespace(app={})))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert calls == []
+    assert adapter._pending_agent_requests == 1
+    ready.set()
+    assert await task == "ok"
+    assert adapter._pending_agent_requests == 0

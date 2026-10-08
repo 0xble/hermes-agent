@@ -900,6 +900,11 @@ class GatewayAdapterLifecycleMixin:
 
     async def _recover_spool_after_reconnect(self, platform) -> None:
         """Claim owed follow-ups before resume and drain them as separate turns."""
+        completion = getattr(self, "_pending_recovery_complete", None)
+        if completion is not None and not completion.is_set():
+            # Boot recovery publishes claimed events on the loop after its worker scan. Wait at the
+            # asyncio level rather than taking a thread lock here, which would deadlock that publish.
+            await completion.wait()
         from gateway.run_pending_recovery import recover_pending_shutdown_flush
         from gateway.run import _startup_restore_drain_timeout_secs
         candidates = self._resume_pending_candidates(record_boot=False)

@@ -818,19 +818,9 @@ class SessionStore(
         self._has_active_processes_fn = has_active_processes_fn
         self._write_sessions_json = bool(getattr(config, "write_sessions_json", True))
 
-        # SQLite handles are cached per path and resolved through ``_db`` per call, never bound
-        # once: a multiplexed gateway serves every profile from ONE process and a handle frozen to
-        # the root home would land every profile's rows in the root state.db.
-        # Initialize SQLite session database. A multiplexed gateway serves every profile from a SINGLE
-        # process, so a handle bound during __init__ is frozen to the process's own root home; every
-        # profile's rows then land in the root state.db even though ``_profile_runtime_scope`` has already
-        # redirected ``get_hermes_home()`` for the turn (its docstring lists "sessions" among what it
-        # scopes). The row still carries the right ``profile_name``, so the damage is invisible in the data
-        # and shows up only as the desktop listing a profile's session under the default bot --
-        # ``_open_session_db_for_profile`` reads ``profiles/<name>/state.db``, which never received the
-        # write. See #88532. Priming the handle for the current scope here keeps the startup diagnostics
-        # exactly where they were: the live-DB isolation guard still raises during construction, and the
-        # JSONL-fallback warning is still printed once at startup rather than on first use.
+        # Construction only initializes the cache and makes no state.db probe. The expensive routing load,
+        # stale-row recovery, archive/prune and VACUUM remain demand-time/off-loop; AsyncSessionStore and
+        # startup recovery offload those operations before admitting restored turns.
         self._db_pinned = _DB_UNPINNED
         self._db_handles: Dict[Path, Any] = {}
         self._db_handles_lock = threading.Lock()
@@ -851,7 +841,9 @@ class SessionStore(
             self._routing_home: Optional[Path] = Path(get_hermes_home())
         except Exception:
             self._routing_home = None
-        self._open_session_db_for_active_scope()
+        # Do not probe state.db during construction: another Hermes process may hold its writer lock.
+        # First use resolves the active profile lazily, and async callers cross the thread boundary
+        # before invoking blocking SQLite work.
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via

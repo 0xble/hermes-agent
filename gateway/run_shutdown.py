@@ -1531,19 +1531,20 @@ class GatewayShutdownMixin:
         if counts is None:
             return 0
         suspended = 0
-        for session_key in [k for k, v in counts.items() if v >= self._STUCK_LOOP_THRESHOLD]:
-            with suppress(Exception):
-                entry = self.session_store._entries.get(session_key)
-                if entry and not entry.suspended:
-                    entry.suspended = True
-                    suspended += 1
-                    logger.warning(
-                        "Auto-suspended stuck session %s (active across %d consecutive restarts — likely a stuck loop)",
-                        session_key, counts[session_key],
-                    )
-        if suspended:
-            with suppress(Exception):
-                self.session_store._save()
+        with self.session_store._lock:
+            for session_key in [k for k, v in counts.items() if v >= self._STUCK_LOOP_THRESHOLD]:
+                with suppress(Exception):
+                    entry = self.session_store._entries.get(session_key)
+                    if entry and not entry.suspended:
+                        entry.suspended = True
+                        suspended += 1
+                        logger.warning(
+                            "Auto-suspended stuck session %s (active across %d consecutive restarts — likely a stuck loop)",
+                            session_key, counts[session_key],
+                        )
+            if suspended:
+                with suppress(Exception):
+                    self.session_store._save()
         # Clear the file — counters start fresh after suspension
         with suppress(Exception):
             path.unlink(missing_ok=True)
@@ -2650,9 +2651,14 @@ class GatewayShutdownMixin:
         release_gateway_runtime_lock()
         # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
         # half-finished sessions, so no marker — the next startup recovers their turn markers.
-        if not ctx.timed_out:
+        if not ctx.timed_out and not getattr(self, "_suppress_clean_shutdown_receipt", False):
             with suppress(Exception):
                 (_hermes_home / ".clean_shutdown").touch()
+        elif not ctx.timed_out:
+            logger.info(
+                "Skipping .clean_shutdown marker — startup recovery did not complete; "
+                "the next startup must recover the previous run."
+            )
         else:
             logger.info(
                 "Skipping .clean_shutdown marker — drain timed out with "
