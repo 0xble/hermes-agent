@@ -14,7 +14,7 @@ import shutil
 import time
 import uuid
 
-from pm.environments import dependency_home_root, install_state_dir, install_state_lock, runtime_facts_path
+from pm.environments import dependency_home_root, install_state_dir, install_state_lock, install_state_lock_path, runtime_facts_path
 # Private aliases: this module calls them through its globals (tests patch ``_atomic_bytes``
 # here) and updaters shipped before PM import them by these names mid-swap
 # (tests/compat/old_updater_surface.json). New code imports the pm.filesystem names.
@@ -48,7 +48,7 @@ def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_
         if not held:
             LOG.warning(
                 "dependency lock still held after %ss; continuing without it (%s)",
-                timeout, state / ".install.lock")
+                timeout, install_state_lock_path(state))
         yield held
 
 

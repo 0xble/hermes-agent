@@ -129,7 +129,8 @@ def test_locked_install_keeps_orphan_install(monkeypatch, tmp_path):
     record_install_use(checkout)
     _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
     checkout.rmdir()
-    fd = os.open(state / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    from pm.environments import install_state_lock_path
+    fd = os.open(install_state_lock_path(state), os.O_CREAT | os.O_RDWR, 0o600)
     assert lock_fd(fd, wait=True)
     try:
         assert collect_install_orphans(now=time.time()) == []

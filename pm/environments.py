@@ -15,13 +15,20 @@ from pathlib import Path
 from hermes_constants import get_default_hermes_root, project_venv_dir
 
 
+def install_state_lock_path(state: Path) -> Path:
+    """Stable lock outside the deletable install directory."""
+    state = Path(state)
+    return state.parent / ".locks" / f"{state.name}.lock"
+
+
 @contextmanager
 def install_state_lock(state: Path, *, timeout: float | None = None):
     """Hold the shared lock fencing every install-state reader and writer."""
     from pm.filesystem import lock_fd
 
-    state.mkdir(parents=True, exist_ok=True)
-    fd = os.open(state / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    lock_path = install_state_lock_path(state)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         yield lock_fd(fd, wait=True, timeout=timeout)
     finally:
@@ -53,8 +60,9 @@ def install_state_permission_message(project_root: Path, exc: PermissionError) -
     """Describe an access failure inside this install's dependency state."""
     if not exc.filename:
         return None
+    state = install_state_dir(project_root).resolve()
     denied = Path(exc.filename).resolve()
-    if not denied.is_relative_to(install_state_dir(project_root).resolve()):
+    if not (denied.is_relative_to(state) or denied == install_state_lock_path(state).resolve()):
         return None
     return (f"install state is not writable by this user ({denied}); "
             "run as the install owner or grant write access")

@@ -10,16 +10,15 @@ from types import ModuleType
 
 import pytest
 
-from pm.environments import install_state_dir, install_state_permission_message
+from pm.environments import install_state_dir, install_state_lock_path, install_state_permission_message
 
 
 @pytest.mark.parametrize("phase", ["preparation", "activation"])
 def test_bootstrap_reports_unwritable_install_once(tmp_path, monkeypatch, phase):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     root = Path(__file__).resolve().parents[2]
-    target = install_state_dir(root) / (
-        "pm-runtime/.prepare.lock" if phase == "preparation" else ".install.lock"
-    )
+    target = (install_state_dir(root) / "pm-runtime/.prepare.lock"
+              if phase == "preparation" else install_state_lock_path(install_state_dir(root)))
     code = """
 import errno
 import sys

@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from pm.environments import install_state_dir, runtime_facts_path, site_packages
+from pm.environments import install_state_dir, install_state_lock_path, runtime_facts_path, site_packages
 
 _HOLDER = """
 import sys
@@ -66,9 +66,8 @@ def test_runtime_lock_reports_a_lost_race(locked_install):
     # The blocked-install symptom: a bounded wait, then carry on — never the holder's rebuild.
 
 
-def test_boot_activation_proceeds_while_the_install_is_locked(locked_install, monkeypatch):
-    """The issue's symptom, inverted: the backend reaches its dependency environment and can bind
-    while a sibling holds the lock. Recovery belongs to whoever holds it, so it is skipped."""
+def test_boot_activation_skips_while_the_install_is_locked(locked_install, monkeypatch):
+    """A timed-out reader must not inspect or lease install state under a concurrent writer."""
     import pm.environments as runtime_paths
     import hermes_cli.runtime_state as runtime_state
 
@@ -82,7 +81,7 @@ def test_boot_activation_proceeds_while_the_install_is_locked(locked_install, mo
     saved_path = sys.path[:]
     try:
         runtime_paths.activate_dependencies(repo)
-        assert str(site) in sys.path
+        assert str(site) not in sys.path
     finally:
         sys.path[:] = saved_path
     assert recovered == []
