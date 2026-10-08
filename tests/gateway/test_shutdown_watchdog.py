@@ -64,6 +64,21 @@ def test_main_thread_stack_is_written_before_faulthandler_thread_limit():
             thread.join(timeout=5)
 
 
+def test_shutdown_watchdog_dump_file_writes_main_thread_before_faulthandler(tmp_path):
+    from gateway import shutdown_watchdog
+
+    dump_path = tmp_path / "watchdog.dump"
+    with patch.object(shutdown_watchdog.sys, "stderr", StringIO()) as stderr:
+        shutdown_watchdog._write_watchdog_dump(dump_path, delay_s=1.0, snapshot=None)
+    text = dump_path.read_text(encoding="utf-8")
+
+    main_at = text.index("Main thread (written first: faulthandler stops after 100 threads)")
+    faulthandler_at = min(i for i in (text.find("Current thread"), text.find("Thread 0x")) if i >= 0)
+    assert main_at < faulthandler_at
+    assert "test_shutdown_watchdog_dump_file_writes_main_thread_before_faulthandler" in text[main_at:faulthandler_at]
+    assert "Main thread (written first" in stderr.getvalue()
+
+
 def test_resolve_shutdown_watchdog_delay_adds_grace():
     assert resolve_shutdown_watchdog_delay(180) == 180 + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
     assert resolve_shutdown_watchdog_delay(0) == DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
