@@ -1316,4 +1316,3 @@ def test_continuation_gap_zero_disables_and_library_default_is_off(hermes_home):
     with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
         assert mgr.evaluate_after_turn("one", user_initiated=True)["should_continue"]
         assert mgr.evaluate_after_turn("two", user_initiated=False)["should_continue"]
-

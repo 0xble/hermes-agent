@@ -139,33 +139,3 @@ async def test_consumer_role_is_not_inherited_by_spawned_tasks():
 
     await _on_consumer(check())
     assert not in_ingress_consumer()
-
-
-@pytest.mark.asyncio
-async def test_reconnect_waits_for_the_old_poller_to_release_the_token():
-    from plugins.platforms.telegram import polling_transfer
-
-    async def stopping():
-        await asyncio.sleep(0.05)
-
-    task = asyncio.get_running_loop().create_task(stopping())
-    polling_transfer._active_pollers["tok"] = task
-    task.add_done_callback(lambda t: asyncio.get_running_loop().call_soon(
-        polling_transfer._active_pollers.pop, "tok", None))
-    try:
-        assert await polling_transfer.wait_for_poller_release("tok", 5.0)
-    finally:
-        polling_transfer._active_pollers.pop("tok", None)
-
-
-@pytest.mark.asyncio
-async def test_a_poller_that_never_stops_still_refuses_the_token():
-    from plugins.platforms.telegram import polling_transfer
-
-    task = asyncio.get_running_loop().create_task(asyncio.sleep(10))
-    polling_transfer._active_pollers["tok2"] = task
-    try:
-        assert not await polling_transfer.wait_for_poller_release("tok2", 0.05)
-    finally:
-        task.cancel()
-        polling_transfer._active_pollers.pop("tok2", None)

@@ -397,6 +397,16 @@ async def test_non_json_metadata_is_defensively_stored(tmp_path):
         clear_turn()
 
 
+def test_status_excludes_legacy_synthetic_rows(tmp_path):
+    store = Outbox(tmp_path)
+    with sqlite3.connect(store.path) as db:
+        db.execute("INSERT INTO outbox (turn_id, sequence, type, idempotency_key, payload, owner_epoch, state, created_at, send_status) "
+                   "VALUES ('legacy', 1, 'send', 'legacy-key', '{}', 1, 'pending', 1, 'synthetic')")
+        db.execute("INSERT INTO outbox (turn_id, sequence, type, idempotency_key, payload, owner_epoch, state, created_at) "
+                   "VALUES ('real', 1, 'send', 'real-key', '{}', 1, 'pending', 2)")
+    assert [row["turn_id"] for row in store.status()] == ["real"]
+
+
 def test_ambiguous_expires_without_replay_and_is_visible(tmp_path):
     store = Outbox(tmp_path)
     row = store.enqueue("turn", "send", {"content": "uncertain"})

@@ -142,19 +142,6 @@ class TestPsFallbackBsdCompat:
         assert "-o" in ps_call and "pid=,command=" in ps_call, ps_call
 
 
-def test_scan_ignores_only_gateway_run_standby_flag(monkeypatch):
-    """A flag-shaped top-level value cannot hide an active gateway."""
-    from types import SimpleNamespace
-    monkeypatch.setattr(gateway_mod, "_get_ancestor_pids", lambda: set())
-    monkeypatch.setattr(os.path, "isdir", lambda p: False if p == "/proc" else True)
-    result = SimpleNamespace(returncode=0, stdout=(
-        "12345 python -m hermes_cli.main --reasoning --standby gateway run\n"
-        "12346 python -m hermes_cli.main gateway run --standby\n"
-    ))
-    monkeypatch.setattr(gateway_mod.subprocess, "run", lambda *a, **kw: result)
-    assert gateway_mod._scan_gateway_pids(set(), all_profiles=True) == [12345]
-
-
 class TestGetServicePidsAllProfiles:
     """_get_service_pids(all_profiles=...) discovery across profiles."""
 

@@ -307,20 +307,7 @@ def _get_gateway_lock_path(pid_path: Optional[Path] = None) -> Path:
     return (pid_path or _get_pid_path()).with_name(_GATEWAY_LOCK_FILENAME)
 
 
-_generation_status_id: Optional[str] = None
-
-
-def set_generation_runtime_status(generation_id: Optional[str]) -> None:
-    """Send this gateway's status writes to its own record during an overlap."""
-    global _generation_status_id
-    _generation_status_id = generation_id
-
-
 def _get_runtime_status_path() -> Path:
-    if _generation_status_id is not None:
-        # Runtime status has its own writer; the generation record is written
-        # exclusively by ActiveGeneration and retains id/socket metadata.
-        return _get_process_hermes_home() / f"gateway_runtime.{_generation_status_id}.json"
     return _get_process_hermes_home() / _RUNTIME_STATUS_FILE
 
 
@@ -1204,21 +1191,11 @@ def _is_gateway_runtime_lock_active_strict(lock_path: Path) -> bool:
         raise RuntimeError(f"gateway runtime lock probe failed: {exc}") from exc
 
 
-def write_pid_file(*, projected_identity=None) -> None:
-    """Claim the PID path after acquiring the runtime lock. A promoted generation may
-    replace only its own matching projection; all other existing records retain O_EXCL."""
+def write_pid_file() -> None:
+    """Write this process's PID record via O_CREAT|O_EXCL; a racing gateway's FileExistsError
+    propagates for the caller to decide."""
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if projected_identity is not None:
-        existing = _read_pid_record(path)
-        if (existing is not None and existing.get("pid") == os.getpid()
-                and existing.get("id") == projected_identity.id
-                and existing.get("start_fingerprint") == projected_identity.start_fingerprint
-                and _get_process_start_time(os.getpid()) is not None
-                and existing.get("start_time") == _get_process_start_time(os.getpid())):
-            _write_json_file(path, _build_pid_record())
-            _clear_running_pid_cache()
-            return
     _write_json_excl(path, _build_pid_record())
     _clear_running_pid_cache()
 
