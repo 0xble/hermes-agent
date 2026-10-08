@@ -660,6 +660,10 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
+    from gateway.warning_notifications import DiagnosticText, warning_notifications_enabled
+    if isinstance(message, DiagnosticText) and not warning_notifications_enabled(platform, _load_gateway_config()):
+        return None
+
     text = _redact_gateway_user_facing_secrets(text)
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (

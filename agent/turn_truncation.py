@@ -206,7 +206,7 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
         f"{agent.log_prefix}🛡️  Content filter terminated stream — activating fallback provider...",
         force=True,
     )
-    agent._emit_status("Content filter terminated stream; switching to fallback...")
+    agent._emit_diagnostic_status("Content filter terminated stream; switching to fallback...")
     if agent._try_activate_fallback():
         # Roll partial content back to the last clean turn so the fallback gets a
         # coherent continuation point; unmark survivors (their text left the partial).

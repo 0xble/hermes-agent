@@ -72,6 +72,11 @@ class StatusOutputMixin:
             pass
         self._call_callback("status_callback", kind, message, origin=origin)
 
+    def _emit_diagnostic_status(self, message: str) -> None:
+        """Emit status text classified as engine diagnostics for gateway delivery policy."""
+        from gateway.warning_notifications import DiagnosticText
+        self._emit_status(DiagnosticText(message))
+
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message (CLI + gateway ``status_callback``)."""
         self._emit_status_kind("lifecycle", message, origin="_emit_status")
@@ -149,6 +154,10 @@ class StatusOutputMixin:
     def _buffer_status(self, message: str) -> None:
         self._buffer_retry_message("status", message)
 
+    def _buffer_diagnostic_status(self, message: str) -> None:
+        from gateway.warning_notifications import DiagnosticText
+        self._buffer_status(DiagnosticText(message))
+
     def _buffer_vprint(self, message: str) -> None:
         self._buffer_retry_message("vprint", message)
 
@@ -169,7 +178,7 @@ class StatusOutputMixin:
         self._pending_fallback_notice = None
         for item in notice if isinstance(notice, list) else [notice]:
             try:
-                self._emit_status(str(item))
+                self._emit_diagnostic_status(str(item))
             except Exception:
                 # One surface failure must not hide later switches from the same chain.
                 continue
