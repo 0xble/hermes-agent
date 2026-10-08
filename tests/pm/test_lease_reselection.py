@@ -1,4 +1,4 @@
-"""A reader that lost the install lock still ends up leasing the generation it imports from."""
+"""A reader that loses the install lock does not touch install state unprotected."""
 import contextlib
 import json
 import os
@@ -30,28 +30,19 @@ def generations(tmp_path, monkeypatch):
     return repo, state, select
 
 
-def test_unlocked_reader_releases_a_lease_the_installer_moved_away_from(generations, monkeypatch):
+def test_lock_timeout_reader_skips_activation_without_lease(generations, monkeypatch):
     from hermes_cli import runtime_state
     from pm.environments import activate_dependencies
 
     repo, state, select = generations
     first = select("first")
-    real_lease = runtime_state.lease_generation
-    leased = []
-
-    def racing_lease(environment):
-        # The installer commits between the reader's selection read and its lease.
-        if not leased:
-            select("second")
-        leased.append(environment)
-        return real_lease(environment)
 
     @contextlib.contextmanager
     def lost_lock(project, **kwargs):
         yield False
 
     monkeypatch.setattr(runtime_state, "runtime_lock", lost_lock)
-    monkeypatch.setattr(runtime_state, "lease_generation", racing_lease)
+    monkeypatch.setattr(runtime_state, "lease_generation", pytest.fail)
     # Activation rewrites this process's import path and environment; keep it scoped.
     monkeypatch.setattr(sys, "path", list(sys.path))
     for key in ("PYTHONPATH", "PATH", "VIRTUAL_ENV"):
@@ -59,9 +50,9 @@ def test_unlocked_reader_releases_a_lease_the_installer_moved_away_from(generati
 
     activate_dependencies(repo)
 
-    assert leased[0] == first and leased[-1] == state / "environments" / "second" / "venv"
-    assert not any((first.parent / ".leases").iterdir()), "the stale lease must be released"
-    assert len(list((state / "environments" / "second" / ".leases").iterdir())) == 1
+    assert json.loads((state / "facts.json").read_text(encoding="utf-8"))["packages"]["venv"]["environment"] == str(first)
+    assert not any((generation / ".leases").exists() and any((generation / ".leases").iterdir())
+                   for generation in (first.parent, state / "environments" / "second"))
 
 
 def test_release_removes_the_lease_file(generations):

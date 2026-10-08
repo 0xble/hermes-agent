@@ -9,9 +9,40 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_constants import get_default_hermes_root, project_venv_dir
+
+
+def install_state_lock_path(state: Path) -> Path:
+    """Stable lock outside the deletable install directory."""
+    state = Path(state)
+    return state.parent / ".locks" / f"{state.name}.lock"
+
+
+def install_recovery_lock_path(state: Path) -> Path:
+    """Startup recovery's single-flight lock, distinct from the install-state lock.
+
+    Recovery holds it across a repair whose PM worker takes the install-state lock
+    itself; sharing one file would deadlock the launcher against its own worker.
+    """
+    state = Path(state)
+    return state.parent / ".locks" / f"{state.name}.recovery.lock"
+
+
+@contextmanager
+def install_state_lock(state: Path, *, timeout: float | None = None):
+    """Hold the shared lock fencing every install-state reader and writer."""
+    from pm.filesystem import lock_fd
+
+    lock_path = install_state_lock_path(state)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        yield lock_fd(fd, wait=True, timeout=timeout)
+    finally:
+        os.close(fd)
 
 
 def install_key(project_root: Path) -> str:
@@ -39,15 +70,44 @@ def install_state_permission_message(project_root: Path, exc: PermissionError) -
     """Describe an access failure inside this install's dependency state."""
     if not exc.filename:
         return None
+    state = install_state_dir(project_root).resolve()
     denied = Path(exc.filename).resolve()
-    if not denied.is_relative_to(install_state_dir(project_root).resolve()):
+    if not (denied.is_relative_to(state) or denied in (
+            install_state_lock_path(state).resolve(), install_recovery_lock_path(state).resolve())):
         return None
     return (f"install state is not writable by this user ({denied}); "
             "run as the install owner or grant write access")
 
 
+INSTALL_METADATA_FILENAME = "install.json"
+INSTALL_METADATA_SCHEMA = 1
+
+
 def runtime_facts_path(project_root: Path) -> Path:
     return install_state_dir(project_root) / "facts.json"
+
+
+def install_metadata_path(project_root: Path) -> Path:
+    return install_state_dir(project_root) / INSTALL_METADATA_FILENAME
+
+
+def record_install_use(project_root: Path) -> Path:
+    """Record the canonical checkout for this install and refresh its last-use time.
+
+    Callers hold the per-install lock while provisioning or selecting an environment.
+    The small sidecar keeps orphan collection independent from the package facts schema,
+    whose read-modify-write paths must remain compatible with shipped payloads.
+    """
+    root = Path(project_root).resolve()
+    path = install_metadata_path(root)
+    from pm.filesystem import durable_write_bytes
+
+    durable_write_bytes(
+        path,
+        (json.dumps({"schema": INSTALL_METADATA_SCHEMA, "project_root": str(root)},
+                    sort_keys=True) + "\n").encode("utf-8"),
+    )
+    return path
 
 
 # The files that decide the dependency set. `scripts/_hermes-python` re-activates
@@ -313,21 +373,17 @@ def activate_dependencies(project_root: Path) -> None:
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
-        # The lock's holder may be another profile's backend running a full dependency rebuild;
-        # this process only reads the committed selection, so it proceeds without waiting rather
-        # than leaving the backend unbound (see runtime_lock).
+        # A reader that cannot take the install lock must not inspect or lease state underneath
+        # maintenance; it skips activation and keeps the caller's original interpreter.
         with runtime_lock(project_root) as held:
-            if held:
-                recover_publication(project_root)
+            if not held:
+                return
+            record_install_use(project_root)
+            recover_publication(project_root)
             environment = committed_venv(project_root)
             if environment is None:
                 return _require_own_dependencies(project_root)
-            release = lease_generation(environment)
-            # Without the lock, an installer may commit a new generation between the
-            # read and the lease, leaving the leased one unselected and collectable.
-            while not held and (current := committed_venv(project_root)) not in (None, environment):
-                release()
-                environment, release = current, lease_generation(current)
+            release = lease_generation(environment, install_locked=True)
             selected = site_packages(environment)
             if not selected.is_dir() and not runtime_facts_path(project_root).is_file():
                 return

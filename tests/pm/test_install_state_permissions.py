@@ -10,16 +10,15 @@ from types import ModuleType
 
 import pytest
 
-from pm.environments import install_state_dir, install_state_permission_message
+from pm.environments import install_state_dir, install_state_lock_path, install_state_permission_message
 
 
 @pytest.mark.parametrize("phase", ["preparation", "activation"])
 def test_bootstrap_reports_unwritable_install_once(tmp_path, monkeypatch, phase):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     root = Path(__file__).resolve().parents[2]
-    target = install_state_dir(root) / (
-        "pm-runtime/.prepare.lock" if phase == "preparation" else ".install.lock"
-    )
+    target = (install_state_dir(root) / "pm-runtime/.prepare.lock"
+              if phase == "preparation" else install_state_lock_path(install_state_dir(root)))
     code = """
 import errno
 import sys
@@ -87,7 +86,7 @@ raise SystemExit(main(["repair"]))
     project = tmp_path / "source"
     project.mkdir()
     (project / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
-    denied_path = install_state_dir(project) / ".install.lock"
+    denied_path = install_state_lock_path(install_state_dir(project))
     recovery = ModuleType("pm.recovery")
 
     def fail_repair(*_):
