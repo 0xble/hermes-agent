@@ -162,10 +162,10 @@ def test_currency_probe_preserves_union_and_candidate_inputs(client, tmp_path, m
 
 
 def _assert_worker_holds_lock(repo):
-    from pm.environments import install_state_dir
+    from pm.environments import install_state_dir, install_state_lock_path
     from pm.filesystem import lock_fd
 
-    with (install_state_dir(repo) / ".install.lock").open("a+b") as lock:
+    with install_state_lock_path(install_state_dir(repo)).open("a+b") as lock:
         assert not lock_fd(lock.fileno(), wait=False), "callback escaped the worker's runtime lock"
 
 
@@ -241,9 +241,8 @@ def test_lazy_disabled_sync_does_not_bootstrap_tools(client, tmp_path, monkeypat
 
 def test_invalid_selection_waits_for_failed_receipt_and_lock_release(client, tmp_path, monkeypatch):
     import json
-    from pm.environments import install_state_dir
+    from pm.environments import install_state_dir, install_state_lock_path
     from pm.filesystem import lock_fd
-
     repo = _current_environment(tmp_path, monkeypatch, [])
     home = tmp_path / "home"
     (home / "config.yaml").write_text("plugins: []\n")
@@ -252,7 +251,7 @@ def test_invalid_selection_waits_for_failed_receipt_and_lock_release(client, tmp
     receipts = list((home / "logs" / "update_receipts").glob("pm_*.json"))
     assert len(receipts) == 1
     assert json.loads(receipts[0].read_text())["outcome"] == "failed"
-    with (install_state_dir(repo) / ".install.lock").open("a+b") as lock:
+    with install_state_lock_path(install_state_dir(repo)).open("a+b") as lock:
         assert lock_fd(lock.fileno(), wait=False)
 
 
