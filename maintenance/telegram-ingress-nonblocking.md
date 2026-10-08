@@ -61,6 +61,17 @@ tests/plugins/test_telegram_ingress_consumer_ptb.py`. It covers:
 - a reconnect waiting for the old poller to release, while a poller that never stops still
   refuses.
 
+## 2026-10-08 Dispatcher-stall diagnostics
+
+When the once-per-stall healthy-but-deaf warning fires, the adapter also emits one bounded
+`[Telegram] deaf-dispatcher diagnostics:` warning with the PTB update queue depth, concurrency
+and semaphore state when available, time since the last dispatched update, and up to five matching
+PTB fetcher or update-processing task stacks. Collection is best-effort and cannot alter recovery.
+
+**Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_ingress_delivery_gap.py` covers a
+blocked PTB-named processing task, bounded output, once-per-stall emission, and diagnostic failure
+isolation.
+
 On the base source, the same probe sequence triggered a polling restart, and the inline reply
 blocked its caller on the budget wait.
 

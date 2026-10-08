@@ -4,7 +4,9 @@ The transport probes prove getUpdates round-trips complete; these pin the one si
 give — whether PTB's dispatcher hands the fetched updates to a handler — and the once-per-adapter
 report for an adapter with no gateway message handler at all.
 """
+import asyncio
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -91,6 +93,46 @@ def test_new_generation_restarts_backlog_and_ignores_fenced_polls(caplog):
     assert adapter._updates_received_total == 0
     _heartbeats(adapter, 3)
     assert _deaf_reports(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_stall_logs_bounded_ptb_await_chain_and_survives_collection_error(caplog, monkeypatch):
+    adapter = _polling_adapter()
+    caplog.set_level(logging.WARNING)
+    event = asyncio.Event()
+
+    async def blocked_dispatcher():
+        await event.wait()
+
+    blocked = asyncio.create_task(
+        blocked_dispatcher(), name="Application:123:process_concurrent_update"
+    )
+    adapter._app = SimpleNamespace(
+        update_queue=asyncio.Queue(), concurrent_updates=1,
+        update_processor=SimpleNamespace(max_concurrent_updates=1, current_concurrent_updates=1),
+    )
+    try:
+        await asyncio.sleep(0)
+        _receive(adapter, 1)
+        _heartbeats(adapter, 2)
+        diagnostics = [
+            record.getMessage() for record in caplog.records
+            if record.getMessage().startswith("[Telegram] deaf-dispatcher diagnostics:")
+        ]
+        assert len(diagnostics) == 1
+        assert "blocked_dispatcher" in diagnostics[0]
+        assert len(diagnostics[0]) <= 8_000
+
+        caplog.clear()
+        monkeypatch.setattr(adapter, "_log_ingress_dispatch_diagnostics", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        adapter._ingress_stalled_heartbeats = 0
+        adapter._ingress_dispatched_seen = adapter._updates_dispatched_total
+        _heartbeats(adapter, 2)
+        assert len(_deaf_reports(caplog)) == 1
+        assert not any("deaf-dispatcher diagnostics:" in record.getMessage() for record in caplog.records)
+    finally:
+        blocked.cancel()
+        await asyncio.gather(blocked, return_exceptions=True)
 
 
 @pytest.mark.asyncio
