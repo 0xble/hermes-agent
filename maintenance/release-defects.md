@@ -644,3 +644,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `stdio-wrapper-chain`.
 - `agent.process_bootstrap._install_safe_stdio` (run on every `AIAgent` init) wrapped the thread-routing proxy that `thread_scoped_silence` installs in a `_SafeWriter`. The next silence then saw a non-proxy `sys.stdout` and installed a new proxy over the wrapper. Every agent init followed by background review or code-execution RPC therefore added two layers. In a long-lived gateway the alternating `__getattr__` chain reached the recursion limit. On 2026-10-05 `review_candidate` and subagent construction failed at `agent_init._setup_logging` with `maximum recursion depth exceeded` across many sessions. Safe stdio now leaves the routing proxy unwrapped, since it already tolerates a dead target, and the proxy installer adopts a proxy directly under one transparent wrapper. Upstream `main` has the same code.
 - Guard: `tests/agent/test_thread_scoped_output.py` (`test_safe_stdio_and_silence_do_not_grow_a_wrapper_chain`).
+
+## Update notice wedged on a routeless marker and a pm-overwritten receipt
+
+- Fork patch identity: `update-lifecycle`.
+- A `request_update` issued from cron or the CLI writes a pending marker with no `platform` or
+  `chat_id`. When no target resolved, the final notice called `Platform(None)`, raised, and retried
+  forever, so the admission marker never cleared and every later update was refused as already
+  pending (2026-10-08, six attempts after the 05:22 promotion). A routeless marker now waits for the
+  update to finalize, then releases its admission without sending anything.
+- The notice also read `logs/update_receipts/latest.json`, which `pm` sync and plugin-check
+  receipts replace. A sync finishing after the update made a successful update read as
+  `Updater outcome: ok. Runtime completion is unverified.` When `latest.json` holds a `pm` receipt
+  (it carries `kind`), the notice now reads the newest per-run `update_*.json` instead. An
+  update-owned `latest.json` stays authoritative because the live-fleet settle rewrites only it.
+- Regression coverage: `test_update_lifecycle_notifications.py`
+  (`test_unroutable_marker_waits_for_the_outcome_then_clears`,
+  `test_final_outcome_reads_the_update_receipt_after_a_pm_sync_overwrites_latest`), both red on the
+  base. A replay of the real 2026-10-08 marker and receipts reports success on `fa95c7c4`.

@@ -636,3 +636,42 @@ async def test_inflight_old_notice_cannot_mutate_superseding_request(tmp_path, s
     assert not current[1].get("output_offset")
     assert not current[1].get("notice_retry_at")
     assert len(messages) == 1
+
+
+def _overwrite_latest_with_pm_sync(home):
+    """``pm`` sync finishes after the update and replaces the shared ``latest.json`` pointer."""
+    path = home / "logs" / "update_receipts" / "latest.json"
+    path.write_text(json.dumps({
+        "schema": 1, "kind": "sync", "outcome": "ok", "update_id": None,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }))
+
+
+def test_final_outcome_reads_the_update_receipt_after_a_pm_sync_overwrites_latest(tmp_path):
+    data = pending(tmp_path)
+    finalize_update(tmp_path)
+    _overwrite_latest_with_pm_sync(tmp_path)
+    with patch("gateway.status.live_gateway_pid_for_home", return_value=1234):
+        result = final_outcome(tmp_path, data)
+    assert result is not None and result[0] is True, result
+
+
+def _unroutable_pending(home):
+    """A request_update from cron or the CLI has no chat to report back to."""
+    launch_native_update(home=home, hermes_cmd=["hermes"], spawn=Mock(), pending={
+        "reason": "Promote the merged fix.", "timestamp": datetime.now(timezone.utc).isoformat()})
+    return read_pending(home)[1]
+
+
+@pytest.mark.asyncio
+async def test_unroutable_marker_waits_for_the_outcome_then_clears(tmp_path):
+    _unroutable_pending(tmp_path)
+    runner = _make_runner()
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is False
+        assert read_pending(tmp_path) is not None, "an unfinished update must keep its admission"
+        finalize_update(tmp_path)
+        with patch("gateway.status.live_gateway_pid_for_home", return_value=1234):
+            assert await runner._send_update_notification() is True
+    assert read_pending(tmp_path) is None
