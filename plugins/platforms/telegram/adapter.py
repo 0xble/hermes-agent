@@ -26,9 +26,10 @@ from gateway.deadline import detached_context
 from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
+from plugins.platforms.telegram.daily_quota import DEFAULT_SOFT_CEILING, DailyQuota
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
-    reset_trigger)
+    current_trigger, reset_trigger)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -154,6 +155,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, in_ingress_consumer,
+    OUTBOUND_NOTICE, OUTBOUND_PROGRESS, SEND_SHED_BY_BUDGET, current_outbound_class,
 )
 
 # Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
@@ -4231,6 +4233,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
+        # Persist the day's volume first, so a restart cannot forget the last minute of calls.
+        quota = self.__dict__.get("_telegram_daily_quota")
+        if quota is not None:
+            try:
+                # SQLite stays off the event loop.
+                await asyncio.to_thread(quota.flush)
+            except Exception:
+                logger.debug("[%s] daily volume flush on disconnect failed", self.name, exc_info=True)
         # Mark disconnected first so the drop guard short-circuits any flush that wins the race.
         self._mark_disconnected()
         self._polling_teardown_started = True
@@ -4542,6 +4552,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
         content = _normalize_dollar_entities(content)
+        outbound = current_outbound_class() or (
+            OUTBOUND_PROGRESS if isinstance(metadata, dict) and metadata.get("_interim_send") else None)
+        if self._daily_sheds(chat_id, outbound):
+            return SendResult(success=False, error=SEND_SHED_BY_BUDGET)
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
@@ -4808,7 +4822,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if (
             not finalize
             and utf16_len(content) <= self.MAX_MESSAGE_LENGTH
-            and self._chat_budget().interim_blocked(chat_id)
+            and (self._chat_budget().interim_blocked(chat_id) or self._daily_sheds(chat_id, OUTBOUND_PROGRESS))
         ):
             logger.debug(
                 "[%s] skipping interim edit for chat %s (shared send+edit budget: slot busy)",
@@ -5054,6 +5068,8 @@ class TelegramAdapter(BasePlatformAdapter):
         Bot API ``deleteMessage`` works for bot-posted messages in the last 48 hours. Failures are non-fatal
         — the caller leaves the preview in place and logs at debug level.
         """
+        if self._daily_sheds(chat_id, OUTBOUND_PROGRESS):
+            return False  # the bubble stays; cleanup is cosmetic
         if not self._bot:
             live = self._replacement_telegram_adapter()
             return await live.delete_message(chat_id, message_id) if live is not None else False
@@ -5073,7 +5089,7 @@ class TelegramAdapter(BasePlatformAdapter):
         any other batch failure falls back to single deletes, which report per id."""
         ids = [str(mid) for mid in dict.fromkeys(message_ids)]
         results: Dict[str, bool] = {mid: False for mid in ids}
-        if not ids:
+        if not ids or self._daily_sheds(chat_id, OUTBOUND_PROGRESS):
             return results
         if not self._bot:
             live = self._replacement_telegram_adapter()
@@ -6766,8 +6782,40 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._chat_budget(),
                 penalty_remaining=self._send_flood_cooldown_remaining,
                 on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait),
-                counter=call_counter(getattr(self, "_update_receipt_dir", None)))
+                counter=call_counter(getattr(self, "_update_receipt_dir", None)),
+                daily=self._daily_quota(),
+            )
         return limiter
+
+    def _daily_quota(self) -> DailyQuota:
+        """Per-chat daily volume ledger; ``daily_message_soft_ceiling`` in the platform extra sets the
+        budget (0 disables shedding, counting continues)."""
+        quota = self.__dict__.get("_telegram_daily_quota")
+        if quota is None:
+            extra = getattr(getattr(self, "config", None), "extra", None) or {}
+            raw = extra.get("daily_message_soft_ceiling", DEFAULT_SOFT_CEILING) if isinstance(extra, dict) else None
+            try:
+                ceiling = int(raw) if raw is not None else DEFAULT_SOFT_CEILING
+            except (TypeError, ValueError):
+                logger.warning("[%s] Invalid daily_message_soft_ceiling %r; using %d", self.name, raw,
+                               DEFAULT_SOFT_CEILING)
+                ceiling = DEFAULT_SOFT_CEILING
+            quota = self.__dict__["_telegram_daily_quota"] = DailyQuota(
+                soft_ceiling=ceiling, profile_dir=getattr(self, "_update_receipt_dir", None))
+        return quota
+
+    def _daily_sheds(self, chat_id: Any, kind: Optional[str]) -> bool:
+        """True when the chat's daily volume says this outbound class must not spend a call."""
+        if kind is None:
+            return False
+        try:
+            shed = self._daily_quota().sheds(str(normalize_telegram_chat_id(chat_id)), kind, current_trigger())
+        except Exception:
+            logger.debug("[%s] daily volume check failed", self.name, exc_info=True)
+            return False
+        if shed:
+            logger.debug("[%s] shedding %s traffic for chat %s: daily volume budget", self.name, kind, chat_id)
+        return shed
 
     def _flood_inline_wait_cap(self, chat_id: Any) -> float:
         """Longest server ``retry_after`` slept inline. Floored at the chat's own routine gap so a
@@ -6796,7 +6844,7 @@ class TelegramAdapter(BasePlatformAdapter):
         key = str(normalize_telegram_chat_id(chat_id))
         # Typing is cosmetic: one chat-wide budget for every session's loop, shed (never queued)
         # when the chat's slot or its typing share is spent.
-        if self._chat_budget().typing_blocked(key):
+        if self._chat_budget().typing_blocked(key) or self._daily_sheds(key, OUTBOUND_PROGRESS):
             return
         lock = self.__dict__.get("_telegram_chat_send_locks", {}).get(key)
         owner = self.__dict__.get("_telegram_chat_send_lock_owners", {}).get(key)
