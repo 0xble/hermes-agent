@@ -662,3 +662,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_unroutable_marker_waits_for_the_outcome_then_clears`,
   `test_final_outcome_reads_the_update_receipt_after_a_pm_sync_overwrites_latest`), both red on the
   base. A replay of the real 2026-10-08 marker and receipts reports success on `fa95c7c4`.
+
+## Watchdog Dumps Preserve the Main Thread
+
+- Fork patch identity: `watchdog-main-thread-dump`.
+- CPython's `faulthandler.dump_traceback(all_threads=True)` stops after 100 threads, so a busy gateway can omit the event-loop thread from watchdog diagnostics. Each shutdown, loop-liveness, and startup watchdog dump now writes the main thread's Python stack and live thread count first, then retains the existing faulthandler dump and exit path.
+- Guard: `tests/gateway/test_shutdown_watchdog.py` (`test_main_thread_stack_is_written_before_faulthandler_thread_limit`). Retire when equivalent upstream behavior is available.
