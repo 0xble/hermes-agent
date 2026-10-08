@@ -13,6 +13,7 @@ from pm.environments import (
     INSTALL_METADATA_FILENAME,
     INSTALL_METADATA_SCHEMA,
     install_key,
+    install_recovery_lock_path,
     install_state_lock,
     installs_root,
 )
@@ -78,9 +79,19 @@ def _tree_touched_since(path: Path, cutoff: float) -> bool:
 
 @contextmanager
 def _install_lock(state: Path):
-    """Yield whether the shared install-state lock was acquired without waiting."""
+    """Yield whether the install-state and recovery locks were both acquired without waiting."""
+    from pm.filesystem import lock_fd
+
     with install_state_lock(state, timeout=0) as held:
-        yield held
+        if not held:
+            yield False
+            return
+        recovery = install_recovery_lock_path(state)
+        fd = os.open(recovery, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            yield lock_fd(fd, wait=False)
+        finally:
+            os.close(fd)
 
 
 def _generations(state: Path) -> list[Path] | None:

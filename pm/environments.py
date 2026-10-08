@@ -21,6 +21,16 @@ def install_state_lock_path(state: Path) -> Path:
     return state.parent / ".locks" / f"{state.name}.lock"
 
 
+def install_recovery_lock_path(state: Path) -> Path:
+    """Startup recovery's single-flight lock, distinct from the install-state lock.
+
+    Recovery holds it across a repair whose PM worker takes the install-state lock
+    itself; sharing one file would deadlock the launcher against its own worker.
+    """
+    state = Path(state)
+    return state.parent / ".locks" / f"{state.name}.recovery.lock"
+
+
 @contextmanager
 def install_state_lock(state: Path, *, timeout: float | None = None):
     """Hold the shared lock fencing every install-state reader and writer."""
@@ -62,7 +72,8 @@ def install_state_permission_message(project_root: Path, exc: PermissionError) -
         return None
     state = install_state_dir(project_root).resolve()
     denied = Path(exc.filename).resolve()
-    if not (denied.is_relative_to(state) or denied == install_state_lock_path(state).resolve()):
+    if not (denied.is_relative_to(state) or denied in (
+            install_state_lock_path(state).resolve(), install_recovery_lock_path(state).resolve())):
         return None
     return (f"install state is not writable by this user ({denied}); "
             "run as the install owner or grant write access")

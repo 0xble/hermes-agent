@@ -159,8 +159,13 @@ def test_early_recovery_lock_fences_install_gc(monkeypatch, tmp_path):
     try:
         assert collect_install_orphans(now=time.time()) == []
         assert state.is_dir()
+        # The repair it guards takes the install-state lock; recovery must not hold it.
+        from pm.environments import install_state_lock
+        with install_state_lock(state, timeout=0) as held:
+            assert held
     finally:
         os.close(fd)
+    assert collect_install_orphans(now=time.time()) == [state]
 
 
 def test_legacy_install_stays_until_long_threshold(monkeypatch, tmp_path):
