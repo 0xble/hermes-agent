@@ -32,11 +32,14 @@ import faulthandler
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from hermes_watchdog_dump import write_main_thread_stack
 
 logger = logging.getLogger(__name__)
 
@@ -300,11 +303,16 @@ class StartupWatchdogHandle:
         )
         # Write the durable copy first. A detached service can have a blocked
         # stderr, and the exit escort bounds the whole forensic path to 10s.
+        def _dump_file(fh) -> None:
+            write_main_thread_stack(fh)
+            faulthandler.dump_traceback(file=fh, all_threads=True)
+
         _append_dump(
-            lambda fh: faulthandler.dump_traceback(file=fh, all_threads=True),
+            _dump_file,
             "Startup watchdog file-based faulthandler dump failed",
         )
         try:
+            write_main_thread_stack(sys.stderr)
             faulthandler.dump_traceback(all_threads=True)
         except Exception:
             logger.debug("Startup watchdog faulthandler dump failed", exc_info=True)

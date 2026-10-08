@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import threading
 import time
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,6 +33,36 @@ from gateway.shutdown_watchdog import (
     sweep_stale_pid_heartbeats,
     write_loop_heartbeat,
 )
+from hermes_watchdog_dump import write_main_thread_stack
+
+
+def test_main_thread_stack_is_written_before_faulthandler_thread_limit():
+    stop = threading.Event()
+    blocked = [threading.Thread(target=stop.wait, name=f"blocked-{i}") for i in range(110)]
+    worker_done = threading.Event()
+    output = StringIO()
+
+    for thread in blocked:
+        thread.start()
+
+    def dump_from_non_main_thread() -> None:
+        write_main_thread_stack(output)
+        worker_done.set()
+
+    worker = threading.Thread(target=dump_from_non_main_thread, name="dump-worker")
+    worker.start()
+    try:
+        assert worker_done.wait(timeout=5), "dump worker did not finish"
+        text = output.getvalue()
+        assert "Main thread (written first: faulthandler stops after 100 threads)" in text
+        assert "active threads:" in text
+        assert "test_main_thread_stack_is_written_before_faulthandler_thread_limit" in text
+    finally:
+        stop.set()
+        worker.join(timeout=5)
+        for thread in blocked:
+            thread.join(timeout=5)
+
 
 def test_resolve_shutdown_watchdog_delay_adds_grace():
     assert resolve_shutdown_watchdog_delay(180) == 180 + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
