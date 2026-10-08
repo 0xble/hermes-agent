@@ -341,8 +341,10 @@ class GatewayGoalsMixin:
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
         try:
-            result = await adapter.send(source.chat_id, message, metadata=metadata)
+            with outbound_class(OUTBOUND_NOTICE):
+                result = await adapter.send(source.chat_id, message, metadata=metadata)
         except Exception as exc:
             error = exc
             result = None

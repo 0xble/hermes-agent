@@ -1689,6 +1689,33 @@ def in_ingress_consumer() -> bool:
     return consumer is not None and consumer is asyncio.current_task()
 
 
+# Outbound class of the sends made in the current context. Unlabelled sends are finals, which a
+# platform's volume budget never sheds. Non-final notices and progress bubbles are labelled at their
+# call sites so a platform near a quota can spend its remaining volume on answers.
+OUTBOUND_FINAL = "final"
+# ``SendResult.error`` for a notice or progress send a platform's volume budget dropped on purpose:
+# final, so no retry, plain-text fallback or delivery-failure notice may spend the budget again.
+SEND_SHED_BY_BUDGET = "daily_budget_shed"
+OUTBOUND_NOTICE = "notice"
+OUTBOUND_PROGRESS = "progress"
+_OUTBOUND_CLASS: "_contextvars.ContextVar[Optional[str]]" = _contextvars.ContextVar(
+    "gateway_outbound_class", default=None)
+
+
+@contextlib.contextmanager
+def outbound_class(kind: str):
+    """Label sends made inside this block as ``notice`` or ``progress``."""
+    token = _OUTBOUND_CLASS.set(kind)
+    try:
+        yield
+    finally:
+        _OUTBOUND_CLASS.reset(token)
+
+
+def current_outbound_class() -> Optional[str]:
+    return _OUTBOUND_CLASS.get()
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -3991,8 +4018,9 @@ class BasePlatformAdapter(ABC):
 
     def _send_retry_is_final(self, result: "SendResult") -> bool:
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
-        fallback can fix it (a structured auth/target refusal). Default: never."""
-        return False
+        fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
+        volume budget shed on purpose)."""
+        return getattr(result, "error", None) == SEND_SHED_BY_BUDGET
 
     @staticmethod
     def _is_partial_delivery(result: "SendResult") -> bool:

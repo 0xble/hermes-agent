@@ -637,9 +637,11 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
-        result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-        )
+        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+        with outbound_class(OUTBOUND_PROGRESS):
+            result = await st.adapter.send(
+                chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            )
         self._track_progress_result(result)
         return result
 

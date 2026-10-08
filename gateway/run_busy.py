@@ -499,11 +499,19 @@ class GatewayBusySessionMixin:
     async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False) -> None:
         """Send a busy-path reply anchored to the event (thread metadata included)."""
         reply_anchor = self._reply_anchor_for_event(event)
-        send = adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=content,
-            reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
-            metadata=self._thread_metadata_for_source(event.source, reply_anchor),
-        )
+        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+
+        async def labelled_send():
+            # A busy reply is a non-final notice: the first shed after cosmetics when the chat's
+            # daily volume runs low. The label is set where the send runs, including a spawned task.
+            with outbound_class(OUTBOUND_NOTICE):
+                return await adapter._send_with_retry(
+                    chat_id=event.source.chat_id, content=content,
+                    reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
+                    metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+                )
+
+        send = labelled_send()
         # On the platform's update consumer, never wait out the chat's outbound budget: every later
         # update (and the next poll) would queue behind this acknowledgement.
         from gateway.platforms.base import in_ingress_consumer
