@@ -54,6 +54,44 @@ async def test_teardown_bounds_hanging_cancel(bare_runner, monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_teardown_reuses_one_shared_deadline_after_cancel_consumes_budget(bare_runner, monkeypatch):
+    """Disconnect gets only the shutdown time left after cancellation."""
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.05")
+    adapter = MagicMock()
+
+    async def hang():
+        await asyncio.sleep(0.2)
+
+    adapter.cancel_background_tasks = AsyncMock(side_effect=hang)
+    adapter.disconnect = AsyncMock(side_effect=hang)
+    started = asyncio.get_running_loop().time()
+    await bare_runner._bounded_adapter_teardown(adapter, Platform.FEISHU)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    # The old implementation spent a second full 50ms timeout in disconnect.
+    assert elapsed < 0.075
+    await asyncio.sleep(0)
+    adapter.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_teardown_attempts_bounded_disconnect_after_expired_deadline(bare_runner, monkeypatch):
+    """An expired outer deadline must not skip the adapter lock-release path."""
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0.05")
+    adapter = MagicMock()
+    adapter.cancel_background_tasks = AsyncMock()
+    adapter.disconnect = AsyncMock()
+
+    await bare_runner._bounded_adapter_teardown(
+        adapter, Platform.FEISHU, deadline=asyncio.get_running_loop().time() - 1.0,
+    )
+    await asyncio.sleep(0)
+
+    adapter.cancel_background_tasks.assert_not_awaited()
+    adapter.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_teardown_continues_after_cancellation_swallowing_background_cancel(
     bare_runner, monkeypatch
 ):

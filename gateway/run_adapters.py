@@ -76,10 +76,13 @@ class GatewayAdapterLifecycleMixin:
 
     async def _await_adapter_cleanup_with_timeout(self, awaitable: Awaitable[Any], timeout: float) -> bool:
         """Await adapter cleanup with a detach-on-deadline bound; True when it completed."""
-        if timeout <= 0:
-            await awaitable
-            return True
         task = asyncio.ensure_future(awaitable)
+        if timeout <= 0:
+            task.add_done_callback(consume_detached_task_result)
+            # Give an immediate cleanup coroutine one turn to release synchronous
+            # resources while still detaching anything that runs past the deadline.
+            await asyncio.sleep(0)
+            return False
         if not await self._wait_or_detach(task, timeout):
             return False
         await task
@@ -108,34 +111,48 @@ class GatewayAdapterLifecycleMixin:
         Both ``cancel_background_tasks()`` and ``disconnect()`` can block indefinitely when a platform's
         network state is half-dead (e.g. a wedged Feishu/Lark WebSocket thread waiting on I/O). See #14128.
         """
-        timeout = self._adapter_disconnect_timeout_secs()
+        budget = self._adapter_disconnect_timeout_secs()
+        teardown_deadline = time.monotonic() + max(0.0, budget)
         if deadline is not None:
-            timeout = min(timeout, max(0.0, deadline - time.monotonic()))
-        if timeout <= 0:
-            logger.warning("Skipping adapter teardown after shutdown deadline for %s", platform.value)
-            return
+            teardown_deadline = min(teardown_deadline, deadline)
+
+        def remaining() -> float:
+            return max(0.0, teardown_deadline - time.monotonic())
+
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
-        try:
-            if not await self._await_adapter_cleanup_with_timeout(adapter.cancel_background_tasks(), timeout):
-                logger.warning(
-                    "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
-                    platform.value, timeout, suffix,
-                )
-        except Exception as e:
-            logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
+        cancel_timeout = remaining()
+        if cancel_timeout > 0:
+            try:
+                if not await self._await_adapter_cleanup_with_timeout(
+                    adapter.cancel_background_tasks(), cancel_timeout,
+                ):
+                    logger.warning(
+                        "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
+                        platform.value, cancel_timeout, suffix,
+                    )
+            except Exception as e:
+                logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
+        else:
+            logger.warning(
+                "✗ %s background-task cancel skipped after shutdown deadline%s",
+                platform.value, suffix,
+            )
+        disconnect_timeout = remaining()
         with _log_suppressed(
             logging.ERROR, "✗ %s disconnect error after %.2fs%s: %s",
             platform.value, time.monotonic() - started_at, suffix,
         ):
-            if await self._await_adapter_cleanup_with_timeout(adapter.disconnect(), timeout):
+            if await self._await_adapter_cleanup_with_timeout(
+                adapter.disconnect(), disconnect_timeout,
+            ):
                 logger.info(
                     "✓ %s disconnected (%.2fs)%s", platform.value, time.monotonic() - started_at, suffix,
                 )
             else:
                 logger.warning(
                     "✗ %s disconnect timed out after %.1fs - forcing continue%s",
-                    platform.value, timeout, suffix,
+                    platform.value, disconnect_timeout, suffix,
                 )
 
     @staticmethod

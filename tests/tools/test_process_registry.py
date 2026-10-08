@@ -179,6 +179,38 @@ def test_kill_all_clears_deadline_for_surviving_session_before_later_completion(
     checkpoint.assert_called_once()
 
 
+def test_kill_all_reconciles_reader_race_with_killed_completion_metadata(registry):
+    """A reader exit racing the bounded sweep still becomes a killed completion."""
+    session = _make_session(sid="proc_kill_race")
+    session._pty = MagicMock()
+    raced = False
+
+    def reader_observes_exit():
+        nonlocal raced
+        if not raced:
+            raced = True
+            session.exited = True
+            session.exit_code = 0
+            session.completion_reason = "exited"
+            session.termination_source = ""
+            registry._move_to_finished(session)
+        return False
+
+    session._pty.isalive.side_effect = reader_observes_exit
+    registry._running[session.id] = session
+    with patch("tools.process_registry.save_completed_result"), \
+         patch.object(registry, "_write_checkpoint"):
+        assert registry.kill_all(
+            deadline=time.monotonic() + 1.0,
+            source="gateway_shutdown",
+            consume_output=True,
+        ) == 1
+
+    assert session.completion_reason == "killed"
+    assert session.termination_source == "gateway_shutdown"
+    assert session.id in registry._completion_consumed
+
+
 def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
     """A TERM-exiting root cannot hide a same-group child that ignores TERM."""
     pytest.importorskip("psutil")

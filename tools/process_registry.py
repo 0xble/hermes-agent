@@ -2867,16 +2867,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     if deadline is not None and time.monotonic() >= deadline:
                         continue
                     with session._lock:
-                        if not session.exited:
-                            session.exited = True
-                            session.exit_code = -getattr(
-                                signal, "SIGKILL", signal.SIGTERM
-                            ) if session.id in escalated_ids else -signal.SIGTERM
-                            session.completion_reason = "killed"
-                            session.termination_source = source
-                            if consume_output:
-                                self._completion_consumed.add(session.id)
-                    self._move_to_finished(session)
+                        session.exited = True
+                        session.exit_code = -getattr(
+                            signal, "SIGKILL", signal.SIGTERM
+                        ) if session.id in escalated_ids else -signal.SIGTERM
+                        session.completion_reason = "killed"
+                        session.termination_source = source
+                        if consume_output:
+                            self._completion_consumed.add(session.id)
+                    moved = self._move_to_finished(session)
+                    if not moved and (deadline is None or time.monotonic() < deadline):
+                        save_completed_result(session)
                     if session.id not in exited_before_sweep:
                         killed += 1
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
