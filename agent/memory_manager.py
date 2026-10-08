@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -43,13 +44,18 @@ _now = time.time
 
 def parse_prefetch_max_age(value: Any) -> Optional[float]:
     """``memory.prefetch_max_age_seconds`` -> seconds, or None for no bound (``0`` or negative).
-    Unset or unparseable values fall back to the default."""
+    Unset, unparseable or non-finite values (``nan``, ``inf``) fall back to the default: ``nan > 0``
+    is false, so NaN would otherwise read as "no bound" and silently disable the age check."""
     if value is None or value == "" or isinstance(value, bool):
         return DEFAULT_PREFETCH_MAX_AGE_S
     try:
         seconds = float(value)
     except (TypeError, ValueError):
         logger.warning("memory.prefetch_max_age_seconds=%r is not a number; using %.0f",
+                       value, DEFAULT_PREFETCH_MAX_AGE_S)
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    if not math.isfinite(seconds):
+        logger.warning("memory.prefetch_max_age_seconds=%r is not finite; using %.0f",
                        value, DEFAULT_PREFETCH_MAX_AGE_S)
         return DEFAULT_PREFETCH_MAX_AGE_S
     return seconds if seconds > 0 else None
