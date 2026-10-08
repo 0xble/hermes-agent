@@ -130,8 +130,32 @@ def test_locked_install_keeps_orphan_install(monkeypatch, tmp_path):
     _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
     checkout.rmdir()
     from pm.environments import install_state_lock_path
-    fd = os.open(install_state_lock_path(state), os.O_CREAT | os.O_RDWR, 0o600)
+    lock_path = install_state_lock_path(state)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     assert lock_fd(fd, wait=True)
+    try:
+        assert collect_install_orphans(now=time.time()) == []
+        assert state.is_dir()
+    finally:
+        os.close(fd)
+
+
+def test_early_recovery_lock_fences_install_gc(monkeypatch, tmp_path):
+    """Startup recovery holds the same stable lock as orphan collection."""
+    import time
+
+    from hermes_cli._early_recovery import _claim_recovery_lock
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = home / "installs" / install_key(checkout)
+    record_install_use(checkout)
+    _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
+    checkout.rmdir()
+    fd = _claim_recovery_lock(checkout)
+    assert fd is not None
     try:
         assert collect_install_orphans(now=time.time()) == []
         assert state.is_dir()

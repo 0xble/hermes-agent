@@ -254,7 +254,6 @@ def _ensure_generation(
     Build at the final path: Windows launchers and scripts embed that path.
     The prior generation survives both successful replacement and failed builds.
     """
-    from pm.filesystem import lock_fd
     from pm._uv import _toolchain
     from pm.install import _refuse_lazy, lazy_installs_allowed
     from pm.lock import Lockfile, _write
@@ -286,18 +285,16 @@ def _ensure_generation(
             return python
         return None
 
-    existing = current(selected_python())
-    if existing is not None:
-        return existing
-    if not explicit and not lazy_installs_allowed():
-        raise _refuse_lazy(name, "isolated Python environment is missing or outdated")
-    root.mkdir(parents=True, exist_ok=True)
-    with (root / ".install.lock").open("a+b") as mutex:
-        lock_fd(mutex.fileno(), wait=True)
+    from pm.environments import install_state_lock
+
+    with install_state_lock(root.parent, timeout=None):
+        root.mkdir(parents=True, exist_ok=True)
         base_python = selected_python()
         existing = current(base_python)
         if existing is not None:
             return existing
+        if not explicit and not lazy_installs_allowed():
+            raise _refuse_lazy(name, "isolated Python environment is missing or outdated")
         if base_python is None:
             tools = _toolchain(explicit=explicit)
             if tools is None:

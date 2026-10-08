@@ -86,7 +86,7 @@ raise SystemExit(main(["repair"]))
     project = tmp_path / "source"
     project.mkdir()
     (project / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
-    denied_path = install_state_dir(project) / ".install.lock"
+    denied_path = install_state_lock_path(install_state_dir(project))
     recovery = ModuleType("pm.recovery")
 
     def fail_repair(*_):
