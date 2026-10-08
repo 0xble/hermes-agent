@@ -1414,12 +1414,14 @@ exit 3
     }
     $returnedAt = [System.Diagnostics.Stopwatch]::GetTimestamp()
     $elapsed = [double]::PositiveInfinity
+    $leakAfterSpawnElapsed = $null
     $leakPid = 0
     if (Test-Path -LiteralPath $pidFile) {
         $leakReceipt = @(Get-Content -LiteralPath $pidFile)
         [void][int]::TryParse($leakReceipt[0].Trim(), [ref]$leakPid)
         if ($leakReceipt.Count -eq 2) {
-            $elapsed = [Math]::Round(($returnedAt - [long]$leakReceipt[1]) / [double][System.Diagnostics.Stopwatch]::Frequency, 2)
+            $leakAfterSpawnElapsed = [Math]::Round(($returnedAt - [long]$leakReceipt[1]) / [double][System.Diagnostics.Stopwatch]::Frequency, 2)
+            $elapsed = $leakAfterSpawnElapsed
         }
     }
     $leakAlive = $false

@@ -75,7 +75,9 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-function New-StubShortcut {
+# The installer calls New-Object from a nested function after this wrapper
+# dot-sources it, so keep the interception and its helpers in global scope.
+function global:New-StubShortcut {
     $sc = [pscustomobject]@{
         TargetPath       = ""
         WorkingDirectory = ""
@@ -89,7 +91,7 @@ function New-StubShortcut {
     return $sc
 }
 
-function New-StubShell {
+function global:New-StubShell {
     $shell = [pscustomobject]@{}
     $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
         return New-StubShortcut
@@ -97,7 +99,7 @@ function New-StubShell {
     return $shell
 }
 
-function New-Object {
+function global:New-Object {
     param([string]$ComObject, [string]$TypeName, [object[]]$ArgumentList)
     if ($ComObject -eq "WScript.Shell") {
         return New-StubShell
