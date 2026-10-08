@@ -994,6 +994,10 @@ class GatewayShutdownMixin:
                 if entry is None or not getattr(entry, "resume_pending", False) or not getattr(entry, "resume_human", True):
                     return 0
                 marker = await self.async_session_store.get_resume_pending_marker(session_key)
+                async def release_claim():
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
                 note = await self.async_session_store.get_restart_note(session_key)
                 # A visible note is terminal. A pending claim is reclaimable only during startup
                 # recovery; a sending marker is ambiguous and must never be retried or converted
@@ -1032,10 +1036,6 @@ class GatewayShutdownMixin:
                         session_key, expected_marker=marker,
                     )
                     return 0
-                async def release_claim():
-                    await self.async_session_store.release_restart_note_claim(
-                        session_key, expected_marker=marker,
-                    )
                 metadata = self._thread_metadata_for_target(
                     platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,

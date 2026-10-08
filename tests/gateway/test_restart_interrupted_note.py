@@ -306,6 +306,32 @@ async def test_claim_cancelled_before_send_is_reclaimable_on_startup(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_claim_cancelled_after_durable_claim_is_released(tmp_path):
+    store = _store(tmp_path)
+    source = _source("cancel-after-claim")
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, turn_id="turn-cancel-after-claim", human=True)
+    adapter = NoteAdapter()
+    runner = _note_runner(store, source, adapter)
+    original_claim = runner.async_session_store.claim_restart_note
+
+    async def claim_then_cancel(*args, **kwargs):
+        assert await original_claim(*args, **kwargs)
+        raise asyncio.CancelledError
+
+    runner.async_session_store.claim_restart_note = claim_then_cancel
+
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 0
+    assert store.get_restart_note(entry.session_key) is None
+
+    runner.async_session_store.claim_restart_note = original_claim
+    assert await runner._send_interrupted_turn_notes(
+        [entry.session_key], reclaim_pending=False,
+    ) == 1
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
 async def test_cancelled_send_is_terminal_and_not_replayed_on_startup(tmp_path):
     store = _store(tmp_path)
     source = _source("cancel-during-send")
