@@ -4233,6 +4233,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
+        # Persist the day's volume first, so a restart cannot forget the last minute of calls.
+        quota = self.__dict__.get("_telegram_daily_quota")
+        if quota is not None:
+            try:
+                # SQLite stays off the event loop.
+                await asyncio.to_thread(quota.flush)
+            except Exception:
+                logger.debug("[%s] daily volume flush on disconnect failed", self.name, exc_info=True)
         # Mark disconnected first so the drop guard short-circuits any flush that wins the race.
         self._mark_disconnected()
         self._polling_teardown_started = True

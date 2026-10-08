@@ -198,8 +198,8 @@ class DailyQuota:
     def _load(self, key: str) -> None:
         if key in self._loaded:
             return
-        self._loaded.add(key)
         if self._profile_dir is None:
+            self._loaded.add(key)
             return
         try:
             with self._db() as conn:
@@ -210,14 +210,24 @@ class DailyQuota:
                 rows = conn.execute("SELECT endpoint, count FROM daily_volume WHERE chat_id=? AND window_start=?",
                                     (key, start)).fetchall()
         except (OSError, sqlite3.Error):
+            # Not marked loaded: the next call retries, so a transient lock cannot hide the day's counts.
             logger.warning("Could not load Telegram daily volume for chat %s", key, exc_info=True)
             return
-        window = self._windows[key] = _Window(start)
+        self._loaded.add(key)
+        window = _Window(start)
         for endpoint, count in rows:
             if endpoint == "__messages__":
                 window.messages = int(count)
             else:
                 window.calls[endpoint] = int(count)
+        # Calls counted in memory while the store was unreadable are not in the rows yet: keep them.
+        pending = self._windows.get(key)
+        if pending is not None and pending.start == start:
+            window.dirty, window.dirty_messages = pending.dirty, pending.dirty_messages
+            window.messages += pending.dirty_messages
+            for endpoint, count in pending.dirty.items():
+                window.calls[endpoint] = window.calls.get(endpoint, 0) + count
+        self._windows[key] = window
 
     def _flush_key(self, key: str, window: _Window) -> None:
         if self._profile_dir is None:

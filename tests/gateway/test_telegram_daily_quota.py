@@ -126,6 +126,41 @@ def test_disabled_ceiling_counts_but_never_sheds(tmp_path):
     assert quota.messages(CHAT) == 5000 and not quota.sheds(CHAT, OUTBOUND_PROGRESS)
 
 
+def test_failed_load_is_retried_and_keeps_counts_made_meanwhile(tmp_path, monkeypatch):
+    wall = Wall(_utc("2026-10-05 12:00:00"))
+    writer = DailyQuota(profile_dir=tmp_path, wall=wall)
+    for _ in range(5):
+        writer.record(CHAT, "sendMessage")
+    writer.flush()
+
+    reader = DailyQuota(profile_dir=tmp_path, wall=wall)
+    real_db = reader._db
+    monkeypatch.setattr(reader, "_db", lambda: (_ for _ in ()).throw(dq.sqlite3.OperationalError("database is locked")))
+    reader.record(CHAT, "sendMessage")  # store locked: counted in memory only
+    monkeypatch.setattr(reader, "_db", real_db)
+    assert reader.messages(CHAT) == 6  # the retried load sees the persisted 5 plus the in-memory 1
+    reader.flush()
+    assert DailyQuota(profile_dir=tmp_path, wall=wall).messages(CHAT) == 6
+
+
+@pytest.mark.asyncio
+async def test_goal_notice_retry_stays_labelled_as_a_notice():
+    from gateway.platforms.base import current_outbound_class
+    from gateway.run import GatewayRunner
+
+    seen = []
+
+    class Adapter:
+        async def send(self, chat_id, message, metadata=None):
+            seen.append(current_outbound_class())
+            return SendResult(success=True)
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._goal_notice_adapter = lambda source: Adapter()
+    await runner._retry_goal_status_notice(SimpleNamespace(chat_id=CHAT), "↻ continuing", None, 0, 0, attempts=1)
+    assert seen == [OUTBOUND_NOTICE]
+
+
 @pytest.mark.asyncio
 async def test_limiter_records_every_wire_call_and_sheds_cosmetics_under_pressure(tmp_path):
     from telegram.error import RetryAfter
