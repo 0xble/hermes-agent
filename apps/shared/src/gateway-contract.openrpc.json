@@ -8076,6 +8076,30 @@
             ],
             "default": null,
             "title": "Status"
+          },
+          "queued": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Queued"
+          },
+          "moa_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Moa Token"
           }
         },
         "required": [
@@ -26176,6 +26200,18 @@
             "default": null,
             "title": "Queued"
           },
+          "moa_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Moa Token"
+          },
           "surface": {
             "anyOf": [
               {
@@ -26388,6 +26424,30 @@
             ],
             "default": null,
             "title": "Turn Isolation"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message"
           }
         },
         "title": "PromptSubmitResult",
@@ -26398,7 +26458,8 @@
           "streaming",
           "queued",
           "steered",
-          "redirected"
+          "redirected",
+          "dropped"
         ],
         "title": "PromptSubmitStatus",
         "type": "string"
@@ -33684,6 +33745,30 @@
             ],
             "default": null,
             "title": "Status"
+          },
+          "queued": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Queued"
+          },
+          "moa_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Moa Token"
           }
         },
         "title": "SlashExecResult",

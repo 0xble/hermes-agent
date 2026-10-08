@@ -6,17 +6,18 @@ registered at a time (tool-schema bloat, conflicting backends).
 
 from __future__ import annotations
 
-import contextvars
 import inspect
 import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_provider import (
+    MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, PrefetchGeneration, ctx_bound, spawn_context_thread,
+)
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
@@ -30,6 +31,28 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+# memory.prefetch_max_age_seconds default: recall buffered by the previous turn's queue_prefetch_all
+# is injected only within this window. Generated and trivial turns neither consume nor replace the
+# buffer, so without a bound the next human turn could inject a result keyed on a message hours old.
+DEFAULT_PREFETCH_MAX_AGE_S = 1800.0
+# Wall clock, not monotonic: macOS's monotonic clock stops while the host sleeps, which would let a
+# buffer survive an overnight sleep as "fresh". Module-level so tests can move time.
+_now = time.time
+
+
+def parse_prefetch_max_age(value: Any) -> Optional[float]:
+    """``memory.prefetch_max_age_seconds`` -> seconds, or None for no bound (``0`` or negative).
+    Unset or unparseable values fall back to the default."""
+    if value is None or value == "" or isinstance(value, bool):
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        logger.warning("memory.prefetch_max_age_seconds=%r is not a number; using %.0f",
+                       value, DEFAULT_PREFETCH_MAX_AGE_S)
+        return DEFAULT_PREFETCH_MAX_AGE_S
+    return seconds if seconds > 0 else None
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -340,8 +363,25 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
+                 recall_synthetic_turns: bool = False,
+                 prefetch_max_age_seconds: Optional[float] = DEFAULT_PREFETCH_MAX_AGE_S) -> None:
         self._providers: List[MemoryProvider] = []
+        # Host policy (memory.recall_synthetic_turns): whether Hermes-generated turns may key
+        # automatic recall. Read by the turn-start and post-turn prefetch gates.
+        self.recall_synthetic_turns = recall_synthetic_turns
+        # memory.prefetch_max_age_seconds (None = unbounded) and when the buffered recall was queued.
+        self._prefetch_max_age = prefetch_max_age_seconds
+        self._prefetch_queued_at: Optional[float] = None
+        # Session the providers are on (initialize_all / on_session_switch) and the one they last
+        # switched away from, both guarded by the generation lock. A prefetch for the session just
+        # left cannot start after the switch. Only that session is refused, so a session id that
+        # rotates without a switch notice keeps its recall.
+        self._session_id = ""
+        self._left_session_id = ""
+        # A queued task that has not reached its providers yet skips once a discard (or a newer
+        # queue) has superseded it.
+        self._prefetch_generation = PrefetchGeneration()
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[Dict[str, Any]] = None
         self._has_external: bool = False
@@ -449,6 +489,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
+        self._discard_stale_prefetch()
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
         )
@@ -513,16 +554,64 @@ class MemoryManager:
             segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
+    def _discard_stale_prefetch(self) -> None:
+        """Drop provider recall buffered by an earlier ``queue_prefetch_all`` once it is older than
+        ``prefetch_max_age_seconds``. The buffer is keyed on the last turn that queued, which can be a
+        human message many generated or trivial turns back. Within the bound that result is still the
+        latest human intent and is kept; past it, injecting nothing beats injecting an old topic."""
+        # Check the age, clear the timestamp, obsolete the manager token and drop provider buffers in
+        # one critical section, the one queue_prefetch_all starts its token in and a queued dispatch
+        # holds. A fresh request is then either seen by the check (and kept) or starts after the
+        # discard, and a dispatch that passed its check either finishes first (and is dropped here)
+        # or sees the obsolete token and never reaches a provider.
+        # Duck-typed providers that predate the hook have nothing to call.
+        def _discard_if_stale() -> bool:
+            queued_at, max_age = self._prefetch_queued_at, self._prefetch_max_age
+            if queued_at is None or max_age is None or _now() - queued_at <= max_age:
+                return False
+            self._prefetch_queued_at = None
+            logger.debug("Discarding buffered memory prefetch queued %.0fs ago (limit %.0fs)",
+                         _now() - queued_at, max_age)
+            self._each_provider("discard_prefetch failed (non-fatal)",
+                                lambda p: getattr(p, "discard_prefetch", lambda: None)())
+            return True
+
+        if self._prefetch_max_age is not None:
+            self._prefetch_generation.discard_if(_discard_if_stale)
+
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
         providers = list(self._providers)
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query:
             return
-        self._submit_background(lambda: self._each_provider(
-            "queue_prefetch failed (non-fatal)", lambda p: p.queue_prefetch(clean_query, session_id=session_id),
-            providers=providers,
-        ), kind="prefetch")
+        # The result's age is measured from its query's turn, which is now. Checking the session and
+        # starting the token is one critical section with on_session_switch, so a request for a
+        # session the providers already left never starts a fresh token after the switch.
+        def _accept() -> bool:
+            if session_id and session_id == self._left_session_id and session_id != self._session_id:
+                return False
+            self._prefetch_queued_at = _now()
+            return True
+
+        generation = self._prefetch_generation.begin_if(_accept)
+        if generation is None:
+            logger.debug("Skipping memory prefetch queued for session %s after switching to %s",
+                         session_id, self._session_id)
+            return
+
+        def _queue() -> None:
+            # Dispatch while holding the token's lock: a concurrent age-bound discard waits for the
+            # dispatch to finish and then drops what it queued, or runs first and this check fails.
+            # providers' queue_prefetch only spawns their worker, so the hold is short.
+            with self._prefetch_generation.publishing(generation) as current:
+                if not current:  # expired (or superseded) while waiting behind a slow sync
+                    return
+                self._each_provider("queue_prefetch failed (non-fatal)",
+                                    lambda p: p.queue_prefetch(clean_query, session_id=session_id),
+                                    providers=providers)
+
+        self._submit_background(_queue, kind="prefetch")
 
     @staticmethod
     def _provider_sync_accepts(provider: MemoryProvider, keyword: str) -> bool:
@@ -532,18 +621,21 @@ class MemoryManager:
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "",
                  messages: Optional[List[Dict[str, Any]]] = None,
-                 turn_author: Optional[Dict[str, Any]] = None) -> None:
+                 turn_author: Optional[Dict[str, Any]] = None,
+                 display_kind: Optional[str] = None, platform: Optional[str] = None) -> None:
         """Sync a completed turn to all providers on the background worker.
 
         Never inline: a provider's ``sync_turn`` may block for minutes, which kept ``run_conversation``
         open after the user saw the response. The single worker also serializes writes (turn N before N+1).
-        ``turn_author`` reaches only providers whose ``sync_turn`` accepts it.
+        ``turn_author`` and the turn's provenance (``display_kind``, ``platform``) reach only providers
+        whose ``sync_turn`` accepts them.
         """
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content:
             return
-        optional_kwargs = {"messages": messages, "turn_author": turn_author}
+        optional_kwargs = {"messages": messages, "turn_author": turn_author,
+                           "display_kind": display_kind, "platform": platform}
 
         def _sync(provider: MemoryProvider) -> None:
             kwargs: Dict[str, Any] = {"session_id": session_id}
@@ -710,10 +802,26 @@ class MemoryManager:
             return
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
-        self._each_provider(
-            "on_session_switch failed",
-            lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs),
-        )
+
+        # A queued prefetch captured the previous session's query. Obsolete its token and switch the
+        # providers under the same lock its dispatch holds, so it either dispatches before the switch
+        # (whose reset then drops it) or sees the obsolete token and never reaches the new session.
+        def _switch_providers() -> None:
+            self._prefetch_queued_at = None
+            if self._session_id != new_session_id:
+                self._left_session_id = self._session_id
+            self._session_id = new_session_id
+            # Drop any buffer or in-flight worker keyed on the old session first; not every provider's
+            # on_session_switch does (Hindsight's does via the same hook).
+            self._each_provider("discard_prefetch failed (non-fatal)",
+                                lambda p: getattr(p, "discard_prefetch", lambda: None)())
+            self._each_provider(
+                "on_session_switch failed",
+                lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id,
+                                              reset=reset, **kwargs),
+            )
+
+        self._prefetch_generation.discard(_switch_providers)
 
     @staticmethod
     def _checkpoint_api_version(provider: MemoryProvider) -> Optional[int]:
@@ -902,5 +1010,10 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+
+        def _record_session() -> None:
+            self._session_id = session_id or ""
+
+        self._prefetch_generation.discard(_record_session)
         self._each_provider("initialize failed", lambda p: p.initialize(session_id=session_id, **kwargs),
                             level=logging.WARNING)

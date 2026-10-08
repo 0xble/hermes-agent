@@ -228,6 +228,10 @@ Default is 20 continuation turns (`goals.max_turns` in `config.yaml`). Set `goal
 
 Any real message you send while a goal is active takes priority over the continuation loop. On the CLI your message lands in `_pending_input` ahead of the queued continuation; on the gateway it goes through the adapter FIFO the same way. The judge runs again after your turn — so if your message happens to complete the goal, the judge will catch it and stop.
 
+### Pacing between automatic turns (gateway)
+
+On the gateway, a continuation that follows another automatic turn (a previous continuation, a `/loop` tick, a heartbeat) waits until `goals.min_continuation_gap_seconds` (default 900, 15 minutes) have passed since the last automatic continuation. Your own messages and the results of background processes or delegations the agent started are new evidence, so they continue the goal immediately. The hold is a silent timed wait that survives restarts. `/goal status` shows it, and `/goal unwait` ends it early. Set the value to `0` to disable pacing. Values above 1800 (the longest goal wait) are capped at 1800.
+
 ### Answering a blocked goal
 
 If the judge pauses a goal as `blocked`, your next normal message resumes that same goal **before the agent starts working**, without resetting its turn budget. For example, “I fixed the environment; continue” needs no separate `/goal resume`. The judge checks progress after the reply and can block again if more input is needed.
@@ -260,6 +264,9 @@ goals:
   # /goal resume. Default 20. Lower this if you want tighter loops;
   # raise it for long-running refactors.
   max_turns: 20
+  # Gateway only: minimum seconds between automatic continuation turns.
+  # User messages and background results continue at once. 0 disables.
+  min_continuation_gap_seconds: 900
 ```
 
 ### Choosing the judge model

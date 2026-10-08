@@ -548,21 +548,27 @@ class TestWaitBarrier:
             proc.terminate()
             proc.wait(timeout=10)
 
-    def test_barrier_on_a_process_that_never_exits_expires(self, hermes_home):
-        """A poller that outlives the work parked one run for 3h22m; a live barrier ages out."""
+    def test_barrier_on_a_process_that_never_exits_rearms_after_age_cap(self, hermes_home):
+        """A live poller must rearm after the probe window, not wake the agent into busy-work."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         proc = self._spawn_sleeper()
         try:
-            mgr = GoalManager(session_id="wb-expire")
+            mgr = GoalManager(session_id="wb-rearm")
             mgr.set("g")
             mgr.wait_on(proc.pid, reason="poller")
             assert mgr.is_waiting() is True
             mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
+            mgr.state.barrier_recheck_at = 0.0
             mgr._save()
-            assert mgr.is_waiting() is False
-            assert mgr.state.waiting_on_pid is None
+            before = time.time()
+            mgr.rearm_live_barrier()
+            assert mgr.is_waiting() is True
+            assert mgr.state.waiting_on_pid == proc.pid
+            assert mgr.state.barrier_recheck_at > before
+            assert mgr.state.waiting_until == 0.0
+            assert mgr.state.barrier_rearms == 1
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -758,6 +764,7 @@ class TestJudgeDrivenWait:
         # Force the deadline into the past → barrier auto-clears.
         mgr.state.waiting_until = time.time() - 1
         assert mgr.is_waiting() is False
+        mgr.stop_waiting()
         assert mgr.state.waiting_until == 0.0
 
     def test_continue_verdict_still_continues_with_background(self, hermes_home):
@@ -1234,3 +1241,79 @@ def test_judge_does_not_overwrite_concurrent_goal_mutation(hermes_home, mutation
     assert persisted.status == expected_status
     assert decision["should_continue"] is False
     assert decision["status"] == expected_status
+
+
+def test_continuation_gap_paces_autonomous_chain_and_yields_to_fresh_evidence(hermes_home, monkeypatch):
+    """One autonomous continuation per gap; a user turn or a completion result is never paced."""
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager, load_goal
+
+    clock = [1000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = GoalManager(session_id="continuation-gap", min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+        assert mgr.evaluate_after_turn("started", user_initiated=True)["should_continue"]
+        clock[0] += 10
+        parked = mgr.evaluate_after_turn("continued", user_initiated=False)
+        # Silent: the routine pacing hold must not add chat notices of its own.
+        assert (parked["should_continue"], parked["verdict"], parked["message"]) == (False, "waiting", "")
+        assert load_goal("continuation-gap").waiting_until == pytest.approx(1900.0)
+        # A real user turn pierces the pacing hold and continues at once.
+        clock[0] += 5
+        assert mgr.evaluate_after_turn("user asked", user_initiated=True)["should_continue"]
+        clock[0] += 60
+        assert not mgr.evaluate_after_turn("continued", user_initiated=False)["should_continue"]
+        assert mgr.state.waiting_until == pytest.approx(1015.0 + 900)
+        # A completion result is fresh evidence: it pierces the hold and continues at once.
+        clock[0] += 60
+        resumed = mgr.evaluate_after_turn("build passed", user_initiated=False, external_event=True)
+        assert resumed["should_continue"] is True and mgr.state.waiting_until == 0
+        # Its continuation turn is autonomous. It is also the third automatic no-progress turn, so
+        # the no-progress backoff parks it; that park never undercuts the gap from the dispatch.
+        clock[0] += 30
+        assert not mgr.evaluate_after_turn("next", user_initiated=False)["should_continue"]
+        assert mgr.state.waiting_until == pytest.approx(1135.0 + 900)
+        # Repeated autonomous turns while parked stay silent and keep the deadline.
+        clock[0] += 100
+        again = mgr.evaluate_after_turn("loop tick", user_initiated=False)
+        assert (again["message"], mgr.state.waiting_until) == ("", pytest.approx(2035.0))
+
+def test_continuation_gap_elapsed_wait_paces_from_lift_without_cas_clear(hermes_home, monkeypatch):
+    """The idle ticker's continuation is judged before its CAS clear lands: pace from the deadline."""
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    clock = [1000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    mgr = GoalManager(session_id="continuation-gap-lift", min_continuation_gap_seconds=900)
+    mgr.set("ship the release")
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+        mgr.evaluate_after_turn("started", user_initiated=True)
+        clock[0] += 10
+        mgr.evaluate_after_turn("continued", user_initiated=False)
+        assert mgr.lifted_barrier_prompt() is None
+        clock[0] = 1901.0
+        assert mgr.lifted_barrier_prompt()  # the idle ticker would inject this now
+        clock[0] = 1950.0
+        decision = mgr.evaluate_after_turn("paced turn", user_initiated=False)
+    assert decision["should_continue"] is False
+    assert mgr.state.waiting_until == pytest.approx(1900.0 + 900)
+
+
+def test_continuation_gap_zero_disables_and_library_default_is_off(hermes_home):
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager, normalize_goal_continuation_gap
+
+    assert GoalManager(session_id="gap-default").min_continuation_gap_seconds == 0
+    assert normalize_goal_continuation_gap(0) == 0
+    assert normalize_goal_continuation_gap("bad") == 900
+    assert normalize_goal_continuation_gap(-1) == 900
+    # Capped at the barrier ceiling every floored automatic park uses, so parks honor it fully.
+    assert normalize_goal_continuation_gap(86400) == goals._MAX_BARRIER_WAIT_S
+    mgr = GoalManager(session_id="gap-off", min_continuation_gap_seconds=0)
+    mgr.set("ship the release")
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):
+        assert mgr.evaluate_after_turn("one", user_initiated=True)["should_continue"]
+        assert mgr.evaluate_after_turn("two", user_initiated=False)["should_continue"]
+

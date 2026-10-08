@@ -6,7 +6,7 @@ import { blurComposerInput } from '@/app/chat/composer/focus'
 import { useComposerSurfaceId } from '@/app/chat/composer/scope'
 import { useSessionView } from '@/app/chat/session-view'
 import { AGENTS_ROUTE } from '@/app/routes'
-import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
+import type { SubmitTextOptions, SubmitTextResult } from '@/app/session/hooks/use-prompt-actions/utils'
 import { BillingBanner } from '@/components/billing-banner'
 import { composerDockCard } from '@/components/chat/composer-dock'
 import { StatusSection } from '@/components/chat/status-section'
@@ -98,7 +98,7 @@ const hasRunningTodo = (group: StatusGroup) =>
   group.type === 'todo' && group.items.some(item => item.todoStatus === 'in_progress' && item.state === 'running')
 
 interface ComposerStatusStackProps {
-  onSubmit?: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+  onSubmit?: (value: string, options?: SubmitTextOptions) => Promise<SubmitTextResult> | SubmitTextResult
   /** The queue, built by the composer (it owns the queue's callbacks). */
   queue: ReactNode
   sessionId: null | string

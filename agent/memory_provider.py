@@ -7,13 +7,14 @@ prefetch / sync_turn per turn -> tool dispatch -> shutdown, plus optional ``on_*
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import re
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,57 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
     return bool(TRIVIAL_PROMPT_RE.match(stripped))
 
 
+class PrefetchGeneration:
+    """Invalidation token for background recall workers, shared by the manager and providers.
+
+    A worker takes a token when its request starts and publishes only while that token is still
+    current, checked under the same lock that guards the published state. :meth:`begin` (a newer
+    request) and :meth:`discard` obsolete every earlier token, so a worker that finishes after a
+    discard can never restore what the discard dropped. ``lock`` is the caller's existing lock for
+    that state, so one lock orders publishing, consuming and discarding.
+    """
+
+    def __init__(self, lock: Optional[threading.Lock] = None) -> None:
+        self.lock = lock if lock is not None else threading.Lock()
+        self._token = 0
+
+    def begin(self, reset: Optional[Callable[[], None]] = None) -> int:
+        """Start a request: obsolete earlier tokens, run ``reset`` under the lock, return the new token."""
+        with self.lock:
+            self._token += 1
+            if reset is not None:
+                reset()
+            return self._token
+
+    def begin_if(self, accept: Callable[[], bool]) -> Optional[int]:
+        """:meth:`begin` only when ``accept()`` holds, checked under the same lock; else ``None``.
+
+        For a request whose validity (for example its session) can be revoked by a concurrent
+        :meth:`discard`: checking and starting in one critical section leaves no window between them."""
+        with self.lock:
+            if not accept():
+                return None
+            self._token += 1
+            return self._token
+
+    def discard(self, reset: Optional[Callable[[], None]] = None) -> None:
+        """Obsolete every outstanding token and run ``reset`` (drop buffered state) under the lock."""
+        self.begin(reset)
+
+    def discard_if(self, stale: Callable[[], bool]) -> bool:
+        """:meth:`discard` only when ``stale()`` holds, checked under the same lock.
+
+        ``stale`` decides and drops the state in one critical section, so a request that starts
+        concurrently is either seen (and kept) by the check or starts after the discard."""
+        return self.begin_if(stale) is not None
+
+    @contextlib.contextmanager
+    def publishing(self, token: int) -> Iterator[bool]:
+        """Hold the lock and yield whether ``token`` is still current. Publish only when it is."""
+        with self.lock:
+            yield token == self._token
+
+
 class MemoryProvider(ABC):
     """Abstract base class for memory providers."""
 
@@ -125,6 +177,14 @@ class MemoryProvider(ABC):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall after each turn; prefetch() consumes it next turn."""
 
+    def discard_prefetch(self) -> None:
+        """Drop any recall buffered by :meth:`queue_prefetch`, including one still in flight, so the
+        next :meth:`prefetch` returns only what it computes for its own query. The manager calls this
+        when the buffer is older than ``memory.prefetch_max_age_seconds``. Providers that recall live
+        in :meth:`prefetch` (or key their buffer on the query) need not override it. Buffering
+        providers gate their workers on a :class:`PrefetchGeneration` so a late worker cannot
+        republish after the discard."""
+
     def recall_status(self) -> Optional[RecallStatus]:
         """What the most recent :meth:`prefetch` injected (``None`` = no indicator). Must reflect
         only the LAST prefetch, never a stale prior count."""
@@ -134,9 +194,12 @@ class MemoryProvider(ABC):
         self, user_content: str, assistant_content: str, *,
         session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None,
         turn_author: Optional[Dict[str, Any]] = None,
+        display_kind: Optional[str] = None, platform: Optional[str] = None,
     ) -> None:
         """Persist a completed turn (non-blocking). ``messages`` is the OpenAI-style list so far.
-        ``turn_author`` (``{"id", "name", "is_bot"}``) is who wrote the user side; the manager sends it only to signatures that accept it."""
+        ``turn_author`` (``{"id", "name", "is_bot"}``) is who wrote the user side. ``display_kind`` (the
+        user row's persisted kind) and ``platform`` are the turn's provenance for
+        ``agent.synthetic_prompt.human_prompt_text``. The manager sends each only to signatures that accept it."""
 
     @abstractmethod
     def get_tool_schemas(self) -> List[Dict[str, Any]]:

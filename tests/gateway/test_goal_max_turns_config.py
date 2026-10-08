@@ -79,6 +79,19 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_gateway_goal_uses_configured_continuation_gap(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "goals:\n  min_continuation_gap_seconds: 37\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner = _make_runner()
+
+    assert runner._goal_min_continuation_gap_from_config() == 37.0
+
+
+@pytest.mark.asyncio
 async def test_gateway_goal_preserves_zero_as_unlimited(tmp_path, monkeypatch):
     """Gateway config propagation must not turn the unlimited sentinel into the default."""
     home = tmp_path / ".hermes"

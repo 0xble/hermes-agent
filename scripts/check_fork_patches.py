@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +43,7 @@ def _resolve_repo() -> Path:
 
 
 REPO = _resolve_repo()
-EXTENSION_TOOLS = ("goal_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
+EXTENSION_TOOLS = ("goal_set", "loop_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
 # key -> (expected, or None meaning "must be set")
 EXPECTED_CONFIG = {
     "memory.write_approval": "false",
@@ -263,6 +264,39 @@ def check_config(home: Path) -> list[str]:
     return failures
 
 
+def _newest_update_receipt(home: Path) -> Path | None:
+    """Choose the newest updater receipt without trusting the shared latest pointer.
+
+    PM syncs rotate ``latest.json`` in this directory too, so an updater receipt
+    named ``update_*.json`` is authoritative whenever one exists. Its filename
+    stamp is local time, which repeats an hour when DST ends, so order by mtime
+    and use the name only to break ties. A lone ``latest.json`` remains supported
+    for older installations unless it is a PM receipt (PM receipts always carry
+    ``kind``, updater receipts never do). That case means no update has run yet.
+    Any other ``latest.json`` is still schema-checked by ``check_receipt`` below.
+    """
+    directory = home / "logs" / "update_receipts"
+    update_receipts: list[tuple[float, str, Path]] = []
+    for path in directory.glob("update_*.json"):
+        try:
+            # The updater prunes old receipts; one can vanish between glob() and stat().
+            info = path.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):  # a directory or FIFO is not a receipt (a FIFO would block read)
+            update_receipts.append((info.st_mtime, path.name, path))
+    if update_receipts:
+        return max(update_receipts)[2]
+    latest = directory / "latest.json"
+    if not latest.is_file():
+        return None
+    try:
+        data = json.loads(latest.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return latest  # unreadable is reported by check_receipt, never skipped
+    return None if isinstance(data, dict) and "kind" in data else latest
+
+
 def check_receipt(home: Path) -> list[str]:
     """Compare the last native ``hermes update`` receipt with the checkout and the running fleet.
 
@@ -271,8 +305,8 @@ def check_receipt(home: Path) -> list[str]:
     whose rows record each running profile's ``code_sha`` and a ``state`` of current/stale/unknown.
     A receipt with none of those is not a native receipt and is reported, not ignored.
     """
-    latest = home / "logs" / "update_receipts" / "latest.json"
-    if not latest.is_file():
+    latest = _newest_update_receipt(home)
+    if latest is None:
         return []  # no promotion has happened through hermes update yet; nothing to compare
     try:
         receipt = json.loads(latest.read_text(encoding="utf-8-sig"))

@@ -486,7 +486,9 @@ DEFAULT_CONFIG = {
             # Externally managed Camofox identity, for when another app owns the visible browser.
             "user_id": "",
             "session_key": "",
-            "adopt_existing_tab": False,  # rehydrate tab_id from Camofox before creating a tab
+            # External user_id only: reuse its existing tab before creating one. Hermes-managed
+            # identities (accounts, managed_persistence) always reuse their own tabs.
+            "adopt_existing_tab": False,
             # Camofox's CAMOFOX_UPLOADS_DIR as seen from this host; browser_upload stages files here.
             # Empty = Camofox's default ~/.camofox/uploads.
             "uploads_dir": "",
@@ -1339,6 +1341,18 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
         "provider": "",
+        # Let Hermes-generated turns (process and delegation notices, goal continuations, heartbeat
+        # and /loop wakeups, cron job runs, recovery notes) key the external provider's automatic
+        # recall. Off: their generated text is a poor query and repeats verbatim across turns, while
+        # the session's own context already carries what they need. Text a person merged into such a
+        # turn still recalls. Explicit memory tools are unaffected.
+        "recall_synthetic_turns": False,
+        # Oldest provider recall (in seconds) still injected. A provider that recalls in the background
+        # after each turn buffers a result keyed on that turn's message; generated and trivial turns
+        # neither use nor replace it, so it can wait hours for the next human message. 30 minutes keeps
+        # the human-to-human follow-ups that dominate real sessions and drops recall about a topic the
+        # session has moved past. 0 = no limit.
+        "prefetch_max_age_seconds": 1800,
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
@@ -1394,8 +1408,11 @@ DEFAULT_CONFIG = {
         # parent still wins: children follow an explicit choice, this is only their default.
         "reasoning_effort": "",
         # Max parallel children per batch AND max concurrent background delegation units; async
-        # dispatches beyond it run synchronously. Floor 1, no ceiling.
+        # dispatches beyond it enter a bounded pending queue. Floor 1, no ceiling.
         "max_concurrent_children": 10,
+        # Maximum pending background delegation calls while the async pool is full.
+        # Zero rejects at capacity without blocking the parent turn.
+        "max_queued_delegations": 8,
         # Background fan-outs return as ONE message when the whole call finishes. true = each task
         # (or `group`) returns on its own as it finishes — more new turns for the orchestrator.
         "independent_completions": False,
@@ -1425,6 +1442,10 @@ DEFAULT_CONFIG = {
         # Max continuation turns before auto-pause (/goal resume) — guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
+        # Minimum seconds between autonomous continuation turns (continuation after continuation,
+        # /loop or heartbeat wakes). A user message or a process/delegation result continues at
+        # once. 0 disables the gap; values above 1800 (the goal wait ceiling) are capped.
+        "min_continuation_gap_seconds": 900,
         # Fork patch: agent-initiated goal_set receipts (goal set / subgoal added) surface as a
         # notice when they commit. /goal and /subgoal replies and judge verdicts are unaffected.
         "auto_notices": True,
@@ -1435,6 +1456,7 @@ DEFAULT_CONFIG = {
     "loops": {
         "min_interval_seconds": 30,  # smallest fixed interval; tighter cadences raised to it
         "max_ticks": 100,  # auto-pause after this many wakeups unless --times set; 0 = unlimited
+        "auto_notices": True,  # show agent loop_set receipts (set/revise/replace) to the user
         "self_paced_floor_seconds": 60,  # Self-paced cadence bounds (seconds).
         "self_paced_ceiling_seconds": 900,
     },
@@ -2134,6 +2156,12 @@ DEFAULT_CONFIG = {
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
+        # Fan-in for routine background results. While a conversation is mid-turn or started a turn
+        # less than this many seconds ago, successful process/delegation completions are held and
+        # delivered together as one synthetic turn. Failures, non-zero exits and results a parked
+        # goal is waiting on are delivered at once. 0 disables holding (same-tick fan-in only);
+        # values are capped at 3600. Held results are never dropped.
+        "completion_notification_batch_window_seconds": 300,
         # Opt-in, per-profile admission and ordered outbound receipt ledger. Existing delivery
         # behavior remains unchanged until explicitly enabled.
         "durable_outbox": {"enabled": False, "retention_days": 7},

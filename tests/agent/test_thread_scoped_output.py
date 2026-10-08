@@ -292,3 +292,45 @@ def test_an_existing_long_chain_collapses_on_the_next_install(monkeypatch, insta
         for sink in thread_output._sinks.values():
             sink.close()
         sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
+def _wrapper_depth(stream) -> int:
+    from agent.process_bootstrap import _SafeWriter
+
+    depth = 0
+    while True:
+        if isinstance(stream, _SafeWriter):
+            stream = object.__getattribute__(stream, "_inner")
+        elif isinstance(stream, thread_output._ThreadRoutingStream):
+            stream = stream._passthrough
+        else:
+            return depth
+        depth += 1
+
+
+def test_safe_stdio_and_silence_do_not_grow_a_wrapper_chain(monkeypatch):
+    """Every agent init installs safe stdio and background work installs the routing proxy.
+    Alternating them must stay bounded: an unbounded __getattr__ chain hit the recursion
+    limit in a long-lived gateway (review_candidate, subagent construction)."""
+    from agent.process_bootstrap import _install_safe_stdio
+
+    monkeypatch.setattr(thread_output, "_installed", {})
+    monkeypatch.setattr(thread_output, "_routing_states", {})
+    real = io.StringIO()
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = real, io.StringIO()
+    try:
+        depths = []
+        for _ in range(50):
+            _install_safe_stdio()
+            with thread_scoped_silence():
+                sys.stdout.write("hidden\n")
+            sys.stdout.write("kept\n")
+            depths.append(_wrapper_depth(sys.stdout))
+        assert max(depths) <= 2
+        assert depths[-1] == depths[1]
+        sys.stdout.flush  # attribute delegation resolves without recursion
+        assert "hidden" not in real.getvalue()
+        assert real.getvalue().count("kept") == 50
+    finally:
+        sys.stdout, sys.stderr = original_stdout, original_stderr

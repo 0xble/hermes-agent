@@ -36,9 +36,32 @@ contributes the separate shutdown and respawn windows. The 2026-09-26 audit
 updated its host PID/ancestry test isolation and validation, with 40 tests passing
 across the verifier and fleet-restart files. The PR remains open.
 
+## Plist reload path
+
+Fork patch identity: `launchd-reload-exit-budget`.
+
+When the update also rewrites the plist, the restart runs through the deferred
+reload helper instead of SIGUSR1. On 2026-10-06 three updates in a row
+(06:22, 10:15, 10:39 PDT) reported the same `✗ ai.hermes.gateway restarted but
+launchd is not supervising a new process` with a `partial` receipt, although
+each new release was serving. The helper booted out the old gateway, waited only
+the 30s reload budget for it to exit, and bootstrapped while teardown was still
+running (38s: interrupt agents, kill 17 tool subprocesses, disconnect adapters).
+The early replacement exited with "A gateway already owns this host". launchd
+then held the next relaunch for `ThrottleInterval` (30s), which landed past the
+20s respawn window.
+
+The helper now waits for the old PID until launchd must have SIGKILLed it
+(`ExitTimeOut` clamp plus 5s, or the reload budget when larger), before the
+first bootstrap. The respawn window is derived from the generated
+`ThrottleInterval`, so a replacement that still exits early and is relaunched
+one throttle later passes instead of failing. Regression:
+`tests/hermes_cli/test_launchd_reload_exit_budget.py`.
+
 ## Verification and retirement
 
 Run scripts/run_tests.sh for
+tests/hermes_cli/test_launchd_reload_exit_budget.py,
 tests/hermes_cli/test_update_launchd_restart_verification.py,
 tests/hermes_cli/test_update_launchd_fleet_restart.py, and
 tests/hermes_cli/test_gateway_service.py. The regressions replay the field
