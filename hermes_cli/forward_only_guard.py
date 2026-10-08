@@ -51,8 +51,8 @@ def _loaded_forward_labels(*, runner=None, timeout_for: TimeoutFor = _fixed) -> 
 _HOME_LINE = re.compile(r"^\s*HERMES_HOME\s*=>\s*(.+?)\s*$", re.MULTILINE)
 
 
-def _label_hermes_home(label: str, *, runner=None, timeout_for: TimeoutFor = _fixed) -> Path | None:
-    """HERMES_HOME a loaded generation job was rendered for, or None when its owner is unreadable.
+def _label_hermes_homes(label: str, *, runner=None, timeout_for: TimeoutFor = _fixed) -> list[Path] | None:
+    """HERMES_HOME values a loaded generation job was rendered for, or None when unreadable.
 
     Generation plists pin ``EnvironmentVariables.HERMES_HOME`` to the resolved home, and
     ``launchctl print`` echoes it in the job's ``environment`` block. A label can be managed by
@@ -97,7 +97,7 @@ def _label_hermes_home(label: str, *, runner=None, timeout_for: TimeoutFor = _fi
         raise LeftoverInspectionError(f"could not inspect launchd owner for {label} in both domains: {detail}")
     if missing_home:
         return None
-    return owners[0] if owners else None
+    return owners
 
 
 def _same_home(a: Path, b: Path) -> bool:
@@ -127,12 +127,13 @@ def leftover_forward_only_state(home: Path, *, timeout_for: TimeoutFor = _fixed)
     findings = [f"file {home / 'forward-update.json'}"
                 ] if _forward_update_leftover(home) else []
     for label in _loaded_forward_labels(timeout_for=timeout_for):
-        owner = _label_hermes_home(label, timeout_for=timeout_for)
-        # Another installation's generation job is not this home's leftover. An unreadable
-        # owner stays fail-closed: refusing is recoverable, a second poller on one token is not.
-        if owner is not None and not _same_home(owner, home):
+        owners = _label_hermes_homes(label, timeout_for=timeout_for)
+        # Another installation's generation job is not this home's leftover only when every
+        # readable domain points elsewhere. An unreadable owner stays fail-closed: refusing is
+        # recoverable, a second poller on one token is not.
+        if owners is not None and all(not _same_home(owner, home) for owner in owners):
             continue
-        suffix = "" if owner is not None else " (owner HERMES_HOME unreadable)"
+        suffix = "" if owners is not None else " (owner HERMES_HOME unreadable)"
         findings.append(f"loaded launchd label {label}{suffix}")
     return findings
 

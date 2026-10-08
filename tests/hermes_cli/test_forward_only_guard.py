@@ -61,6 +61,41 @@ def test_other_installations_generation_label_does_not_block_this_home(tmp_path,
 
 
 @pytest.mark.platforms("macos")
+def test_gui_other_user_this_home_is_a_leftover(tmp_path, monkeypatch):
+    monkeypatch.setattr(guard.sys, "platform", "darwin")
+    other = tmp_path / "other-home"
+    other.mkdir()
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=other, user=mine))
+    assert guard.leftover_forward_only_state(mine) == [f"loaded launchd label {_LABEL}"]
+
+
+@pytest.mark.platforms("macos")
+def test_gui_this_home_user_other_is_a_leftover(tmp_path, monkeypatch):
+    monkeypatch.setattr(guard.sys, "platform", "darwin")
+    other = tmp_path / "other-home"
+    other.mkdir()
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=mine, user=other))
+    assert guard.leftover_forward_only_state(mine) == [f"loaded launchd label {_LABEL}"]
+
+
+@pytest.mark.platforms("macos")
+def test_both_other_domain_owners_do_not_block_this_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(guard.sys, "platform", "darwin")
+    other_gui = tmp_path / "other-gui-home"
+    other_gui.mkdir()
+    other_user = tmp_path / "other-user-home"
+    other_user.mkdir()
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=other_gui, user=other_user))
+    assert guard.leftover_forward_only_state(mine) == []
+
+
+@pytest.mark.platforms("macos")
 def test_nonzero_print_in_both_domains_is_inspection_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(guard.sys, "platform", "darwin")
     monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=113, user=113))
