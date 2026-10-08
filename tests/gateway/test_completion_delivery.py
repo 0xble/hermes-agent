@@ -1120,3 +1120,56 @@ def test_cancelled_primary_claim_is_refunded_not_released(monkeypatch, isolated_
     assert asyncio.run(_exercise()), "cancelled primary claim stranded its lease"
     row = async_delegation.get_durable_delegation(event["delegation_id"])
     assert row["delivery_attempts"] == 1, f"cancellation spent an attempt: {row['delivery_attempts']}"
+
+
+@pytest.mark.parametrize(("verdict", "expected_operation"), [("terminal", "drop"), ("retry", "release")])
+def test_cancelled_preflight_settle_is_not_released_again(
+    monkeypatch, isolated_registry, verdict, expected_operation,
+):
+    """Cancellation during a pre-flight settle must not race a second finally settle."""
+    import threading
+
+    from gateway import run_notifications
+
+    entered = threading.Event()
+    unblock = threading.Event()
+    operations = []
+
+    async def _settle(ops):
+        def _settle_in_worker():
+            for operation in ops:
+                operations.append(operation)
+                if operation[0] == expected_operation:
+                    entered.set()
+                    assert unblock.wait(5)
+
+        await asyncio.to_thread(_settle_in_worker)
+
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._completion_delivery_ready = AsyncMock(return_value=True)
+    runner._classify_completion_target = AsyncMock(return_value=verdict)
+    runner._settle_durable_claims = _settle
+    monkeypatch.setattr(run_notifications, "claim_off_loop", AsyncMock(return_value=True))
+    event = _async_event("deleg_terminal_drop_race")
+    event["parent_session_id"] = "gone-session"
+
+    async def _exercise():
+        task = asyncio.create_task(
+            runner._deliver_completion_notification_scoped("completion", event)
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        unblock.set()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if not any(operation[0] == expected_operation for operation in operations):
+                continue
+            if len(operations) == 1:
+                return
+        raise AssertionError(f"terminal claim was settled more than once: {operations!r}")
+
+    asyncio.run(_exercise())
+    assert [operation[0] for operation in operations] == [expected_operation]
