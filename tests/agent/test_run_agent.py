@@ -4004,9 +4004,13 @@ class TestRunConversation:
             if calls == 1:
                 agent._fire_reasoning_delta("Following the original approach.")
                 entered.set()
-                deadline = time.time() + 2
-                while not agent._interrupt_requested and time.time() < deadline:
+                # Block until the input thread's redirect lands. The bound is only a
+                # hang guard: the success path returns as soon as the flag is set.
+                deadline = time.monotonic() + 30
+                while not agent._interrupt_requested and time.monotonic() < deadline:
                     time.sleep(0.01)
+                if not agent._interrupt_requested:
+                    raise AssertionError("redirect never reached the live model request")
                 raise InterruptedError("request cancelled by redirect")
             return final
 
@@ -4022,11 +4026,13 @@ class TestRunConversation:
                 )
             )
             worker.start()
-            assert entered.wait(timeout=2)
+            assert entered.wait(timeout=30), (
+                "mocked model request did not become ready within 30 seconds"
+            )
             assert agent.redirect("Use the corrected approach.") is True
-            worker.join(timeout=5)
+            worker.join(timeout=30)
 
-        assert worker.is_alive() is False
+        assert worker.is_alive() is False, "conversation did not finish after the redirect"
         assert calls == 2
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
