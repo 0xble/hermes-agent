@@ -469,8 +469,8 @@ def build_catalog_md_bundled(entries: list[tuple[dict[str, Any], dict[str, Any]]
         if meta["source_kind"] != "bundled":
             continue
         by_cat[meta["category"]].append((meta, parsed))
-    for k in by_cat:
-        by_cat[k].sort(key=lambda e: e[0]["slug"])
+    for entries in by_cat.values():
+        entries.sort(key=lambda e: e[0]["slug"])
 
     lines = [
         "---",
@@ -515,8 +515,8 @@ def build_catalog_md_optional(entries: list[tuple[dict[str, Any], dict[str, Any]
         if meta["source_kind"] != "optional":
             continue
         by_cat[meta["category"]].append((meta, parsed))
-    for k in by_cat:
-        by_cat[k].sort(key=lambda e: e[0]["slug"])
+    for entries in by_cat.values():
+        entries.sort(key=lambda e: e[0]["slug"])
 
     lines = [
         "---",

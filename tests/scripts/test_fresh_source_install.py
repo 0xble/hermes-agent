@@ -18,7 +18,7 @@ import tomllib
 import pytest
 
 from pm.store import current_target
-from tests.pm._fixtures import _wheel, served as served
+from tests.pm._fixtures import _wheel, served as served  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
 
 ROOT = Path(__file__).resolve().parents[2]
 

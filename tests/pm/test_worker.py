@@ -17,9 +17,9 @@ from tests.pm._range_server import RangeHandler, dl_server, url
 from tests.pm.test_runtime_wheelhouse import locked_wheelhouse
 from tests.pm._fixtures import (
     _wheel,
-    build_worker as build_worker,
-    client as client,
-    isolated_python as isolated_python,
+    build_worker as build_worker,  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
+    client as client,  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
+    isolated_python as isolated_python,  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
 )
 
 # Spawns children with a home it builds itself; the parent's must stay real.

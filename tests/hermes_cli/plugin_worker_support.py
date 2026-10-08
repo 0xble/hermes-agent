@@ -18,7 +18,7 @@ import sys
 import pytest
 import hermes_yaml as yaml
 
-from tests.pm._fixtures import _wheel, isolated_python as isolated_python
+from tests.pm._fixtures import _wheel, isolated_python as isolated_python  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
 
 
 def worker_command(worker: Path, uv: str, python: str, *, prelude: str = "", runtime_python: str | None = None) -> list[str]:

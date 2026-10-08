@@ -155,7 +155,7 @@ def run(arm: str, model: str, reps: int, pythonpath: str, only=None):
             except (ValueError, KeyError):
                 continue
     for rep in range(reps):
-        for name in TASKS:
+        for name, task in TASKS.items():
             if only and name not in only:
                 continue
             run_id = f"{name}-r{rep}"
@@ -194,7 +194,7 @@ mode = "overwrite"
                 "HERMES_HOME": str(HOME),
                 "HERMES_NEMO_RELAY_PLUGINS_TOML": str(relay_config),
             })
-            q = TASKS[name].replace("{WORK}", str(work))
+            q = task.replace("{WORK}", str(work))
             t0 = time.time()
             try:
                 p = subprocess.run(

@@ -19,7 +19,7 @@ from pm import paths
 from pm import registry
 from pm.lock import Facts, Lockfile
 from pm.store import Store, current_target, tree_digest
-from tests.pm._fixtures import make_tar, served as served
+from tests.pm._fixtures import make_tar, served as served  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
 from tests.pm.test_pm_core import FakeTool, pm_env as core_env
 
 
