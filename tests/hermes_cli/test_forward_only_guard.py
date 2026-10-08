@@ -32,7 +32,8 @@ def _domain_launchctl(*, gui=None, user=None, no_home=False):
         if isinstance(value, BaseException):
             raise value
         if isinstance(value, int):
-            return subprocess.CompletedProcess(argv, value, stdout="", stderr="Could not find service")
+            stderr = "Could not find service" if value == 113 else "Input/output error"
+            return subprocess.CompletedProcess(argv, value, stdout="", stderr=stderr)
         if no_home:
             stdout = f"{_LABEL} = {{\n\tenvironment = {{\n\t\tPATH => /usr/bin\n\t}}\n}}\n"
         else:
@@ -96,11 +97,26 @@ def test_both_other_domain_owners_do_not_block_this_home(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("macos")
-def test_nonzero_print_in_both_domains_is_inspection_failure(tmp_path, monkeypatch):
+def test_absent_print_in_both_domains_is_not_a_leftover(tmp_path, monkeypatch):
     monkeypatch.setattr(guard.sys, "platform", "darwin")
     monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=113, user=113))
-    with pytest.raises(guard.LeftoverInspectionError, match="both domains"):
+    assert guard.leftover_forward_only_state(tmp_path) == []
+
+
+@pytest.mark.platforms("macos")
+def test_unknown_print_failure_is_inspection_failure_and_supervised_run_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(guard.sys, "platform", "darwin")
+    other = tmp_path / "other-home"
+    other.mkdir()
+    monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=5, user=other))
+    with pytest.raises(guard.LeftoverInspectionError, match="gui/"):
         guard.leftover_forward_only_state(tmp_path)
+
+    from hermes_cli import gateway
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        gateway._refuse_forward_only_leftovers(retry_on_inspection_error=True)
+    assert exc.value.code == 75
 
 
 @pytest.mark.platforms("macos")

@@ -49,6 +49,17 @@ def _loaded_forward_labels(*, runner=None, timeout_for: TimeoutFor = _fixed) -> 
 
 
 _HOME_LINE = re.compile(r"^\s*HERMES_HOME\s*=>\s*(.+?)\s*$", re.MULTILINE)
+_LAUNCHCTL_SERVICE_NOT_FOUND = "Could not find service"
+
+
+def _classify_launchctl_print(result) -> str:
+    """Classify one ``launchctl print`` result as FOUND, ABSENT, or ERROR."""
+    if result.returncode == 0:
+        return "FOUND"
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    if result.returncode == 113 or _LAUNCHCTL_SERVICE_NOT_FOUND in output:
+        return "ABSENT"
+    return "ERROR"
 
 
 def _label_hermes_homes(label: str, *, runner=None, timeout_for: TimeoutFor = _fixed) -> list[Path] | None:
@@ -57,6 +68,8 @@ def _label_hermes_homes(label: str, *, runner=None, timeout_for: TimeoutFor = _f
     Generation plists pin ``EnvironmentVariables.HERMES_HOME`` to the resolved home, and
     ``launchctl print`` echoes it in the job's ``environment`` block. A label can be managed by
     either the Aqua ``gui/<uid>`` domain or the background ``user/<uid>`` domain, so inspect both.
+    Each domain probe is classified as FOUND (return code 0), ABSENT (return code 113 or
+    ``Could not find service`` in its output), or ERROR (an exception or any other nonzero result).
     """
     import os
 
@@ -65,8 +78,7 @@ def _label_hermes_homes(label: str, *, runner=None, timeout_for: TimeoutFor = _f
     runner = runner or subprocess.run
     uid = os.getuid()  # windows-footgun: ok (darwin-gated above)
     domains = (f"gui/{uid}", f"user/{uid}")
-    failures = []
-    nonzero = []
+    errors = []
     owners = []
     missing_home = False
     for domain in domains:
@@ -76,12 +88,15 @@ def _label_hermes_homes(label: str, *, runner=None, timeout_for: TimeoutFor = _f
                 ["launchctl", "print", f"{domain}/{label}"],  # windows-footgun: ok (darwin-gated above)
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             )
-        except (OSError, subprocess.SubprocessError) as exc:
-            failures.append(f"{domain}: {exc}")
+            classification = _classify_launchctl_print(result)
+        except Exception as exc:
+            errors.append(f"{domain}: {exc}")
             continue
-        if result.returncode != 0:
+        if classification == "ERROR":
             detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
-            nonzero.append(f"{domain}: {detail}")
+            errors.append(f"{domain}: {detail}")
+            continue
+        if classification == "ABSENT":
             continue
         match = _HOME_LINE.search(result.stdout or "")
         if match:
@@ -89,12 +104,9 @@ def _label_hermes_homes(label: str, *, runner=None, timeout_for: TimeoutFor = _f
         else:
             missing_home = True
 
-    if failures:
-        detail = "; ".join(failures)
+    if errors:
+        detail = "; ".join(errors)
         raise LeftoverInspectionError(f"could not inspect launchd owner for {label}: {detail}")
-    if len(nonzero) == len(domains):
-        detail = "; ".join(nonzero)
-        raise LeftoverInspectionError(f"could not inspect launchd owner for {label} in both domains: {detail}")
     if missing_home:
         return None
     return owners
