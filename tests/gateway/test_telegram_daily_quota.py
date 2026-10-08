@@ -178,6 +178,26 @@ def test_ceiling_comes_from_platform_extra(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_installed_request_limiter_shares_the_adapter_quota(tmp_path):
+    """The PTB limiter built for the live bot must meter and shed with the adapter's own ledger."""
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    limiter = adapter._chat_rate_limiter()
+    assert limiter.daily is adapter._daily_quota()
+    wire = AsyncMock(return_value=True)
+    for _ in range(7):
+        await limiter.process_request(wire, (), {}, "sendMessage", {"chat_id": CHAT}, None)
+    assert adapter._daily_quota().messages(CHAT) == 7
+    token = bind_trigger(SimpleNamespace(text="[ASYNC DELEGATION BATCH COMPLETE]", internal=True))
+    try:
+        await limiter.process_request(wire, (), {}, "sendChatAction", {"chat_id": CHAT}, None)
+    finally:
+        reset_trigger(token)
+    assert wire.await_count == 7  # background typing shed through the installed limiter
+
+
+@pytest.mark.asyncio
 async def test_cosmetic_pressure_sheds_typing_interim_edits_progress_and_cleanup(tmp_path):
     adapter = _adapter(tmp_path)
     _spend(adapter, 7)

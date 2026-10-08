@@ -6775,7 +6775,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 penalty_remaining=self._send_flood_cooldown_remaining,
                 on_retry_after=lambda key, wait: self._record_send_flood_cooldown(key, wait),
                 counter=call_counter(getattr(self, "_update_receipt_dir", None)),
-                daily=getattr(self, "_telegram_daily_quota", None),
+                daily=self._daily_quota(),
             )
         return limiter
 
