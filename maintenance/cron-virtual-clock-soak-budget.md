@@ -21,7 +21,7 @@ from the ticker thread. No scheduler behavior, scenario, hold step, replica
 round, or assertion changed.
 
 The proof surface is `tests/e2e/core/delivery/test_cron_virtual_clock_soak.py`
-in `python:3.14-bookworm` with two CPUs and a tmpfs `/tmp`. Baseline runs were
+in `python:3.14-bookworm` with two CPUs and a tmpfs temp directory. Baseline runs were
 58.42s, 55.87s, and 55.55s; candidate runs were 53.69s, 57.87s, and 52.77s.
 All runs reported `5 passed, 1 xfailed`; the C13 stats and replica assertions
 were unchanged. The xfail is the pre-existing, separately owned open schedule
