@@ -464,6 +464,20 @@ class TestTickLifecycle:
         assert decision["status"] == "paused"
         assert "unachievable" in decision["message"]
 
+    def test_until_judge_is_not_called_for_a_silent_tick(self, hermes_home):
+        """A bare [SILENT] is the wakeup prompt's no-change reply: no evidence, so no model call."""
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t11c")
+        state = mgr.set("poll", interval_seconds=300, until="the suite is green")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        with patch("hermes_cli.goals.judge_goal", side_effect=AssertionError("judge called")) as judge:
+            decision = mgr.complete_tick("[SILENT]")
+        judge.assert_not_called()
+        assert decision["stopped"] is False
+        assert decision["status"] == "active"
+
     def test_until_judge_error_fails_open(self, hermes_home):
         from hermes_cli.loops import LoopManager
 

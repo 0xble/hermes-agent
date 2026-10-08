@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_cli.heartbeat import SILENCE_MARKER
+from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,49 @@ WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
     "longer fits, revise the loop with the loop_set tool (action=revise) "
     "instead of stopping it."
 )
+
+# Wording before the silence contract. Stored rows still carry it, so the generated-turn
+# classifier (agent/synthetic_prompt.py) keeps recognizing it; never render these.
+_PREVIOUS_WAKEUP_PROMPT_TEMPLATE = (
+    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "Recurring task: {prompt}\n\n"
+    "This is an automatic wakeup from the /loop the user set. Perform the "
+    "task now against the CURRENT state (re-check files, processes, or "
+    "services fresh — do not assume anything from earlier iterations still "
+    "holds). Report concisely what you found or did this iteration.\n"
+    "If the task is now complete, no longer applicable, or the thing you "
+    "were watching has finished, say so and end your reply with "
+    f"{LOOP_COMPLETE_MARKER} on its own line — that stops the loop. "
+    "If the cadence, run count, or stop condition no longer fits, revise "
+    "the loop with the loop_set tool (action=revise) instead of stopping it."
+)
+_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
+    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "Recurring task: {prompt}\n\n"
+    "Stop condition: {until}\n\n"
+    "This is an automatic wakeup from the /loop the user set. Perform the "
+    "task now against the CURRENT state (re-check files, processes, or "
+    "services fresh — do not assume anything from earlier iterations still "
+    "holds). Report concisely what you found or did this iteration, and "
+    "show concrete evidence of the stop condition's status.\n"
+    "If the stop condition is met, or the task is no longer applicable, say "
+    f"so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — "
+    "that stops the loop. If the cadence, run count, or stop condition no "
+    "longer fits, revise the loop with the loop_set tool (action=revise) "
+    "instead of stopping it."
+)
+
+
+def is_quiet_wakeup_prompt(text: Any) -> bool:
+    """Whether ``text`` is a heartbeat or prompt-form /loop wakeup, the turns whose prompt asks
+    for a bare silence marker when nothing changed. Surfaces without the gateway's machinery
+    display kind (CLI, TUI, Desktop) use this to hide that marker."""
+    return isinstance(text, str) and text.startswith((WAKEUP_PROMPT_PREFIX, HEARTBEAT_PROMPT_PREFIX))
+
+
+def _is_silence_reply(response: Any) -> bool:
+    from gateway.response_filters import is_intentional_silence_response
+    return is_intentional_silence_response(response)
 
 
 def parse_interval_token(token: str) -> Optional[int]:
@@ -882,8 +925,9 @@ class LoopManager:
             return self._stop("done", "agent signaled the task is complete",
                               f"✓ Loop finished after {ticks} — task complete.")
 
-        # 2. Evidence-based --until judge (reuses the /goal judge; fail-open).
-        if s.until and (last_response or "").strip():
+        # 2. Evidence-based --until judge (reuses the /goal judge; fail-open). A bare silence
+        # marker is the prompt's "nothing changed" reply: no evidence to judge, so no model call.
+        if s.until and (last_response or "").strip() and not _is_silence_reply(last_response):
             try:
                 from hermes_cli.goals import judge_goal
 
@@ -1039,5 +1083,5 @@ __all__ = [
     "response_signals_complete", "goal_blocks_loop_tick", "load_loop", "save_loop", "clear_loop",
     "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "LOOP_COMPLETE_MARKER",
     "WAKEUP_PROMPT_TEMPLATE", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "DEFAULT_MIN_INTERVAL_SECONDS",
-    "DEFAULT_MAX_TICKS",
+    "DEFAULT_MAX_TICKS", "is_quiet_wakeup_prompt",
 ]

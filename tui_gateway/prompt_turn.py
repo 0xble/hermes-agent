@@ -30,6 +30,13 @@ def _bot_mode_delivery_text(response: Any, *, successful: bool) -> Any:
     return "" if successful and is_intentional_silence_response(response) else response
 
 
+def _silence_hidden_turn(session: dict, prompt: Any) -> bool:
+    """Whether a successful bare silence marker stays invisible for this turn: every Bot Chat turn,
+    and heartbeat or /loop wakeups, whose prompt asks for ``[SILENT]`` when nothing changed."""
+    from hermes_cli.loops import is_quiet_wakeup_prompt
+    return is_quiet_wakeup_prompt(prompt) or _is_bot_mode_session(session)
+
+
 def _is_bot_mode_session(session: dict) -> bool:
     """Whether this completion belongs to the canonical Bot Chat surface.
 
@@ -830,7 +837,8 @@ def _invoke_agent(
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
-    hold = {"buf": "", "held": ""} if _is_bot_mode_session(session) else None
+    # Heartbeat and /loop wakeups ask for a bare [SILENT] on a no-change tick: hold it the same way.
+    hold = {"buf": "", "held": ""} if _silence_hidden_turn(session, prompt) else None
     loop_hold = {"text": "", "seen": ""}
 
     def _deliver_delta(delta):
@@ -1018,10 +1026,15 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         except Exception:
             _error_surface = None
     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
+    delivered = raw
+    if _silence_hidden_turn(session, st.prompt_text):
+        delivered = _bot_mode_delivery_text(raw, successful=status == "complete")
     if _is_bot_mode_session(session):
-        raw = _bot_mode_delivery_text(raw, successful=status == "complete")
+        raw = delivered
+    # A wakeup keeps its raw marker for the post-turn /loop hook (self-paced backoff, judge skip);
+    # only the rendered text is emptied.
     from gateway.response_filters import strip_trailing_loop_complete_marker
-    visible_raw = strip_trailing_loop_complete_marker(raw)
+    visible_raw = strip_trailing_loop_complete_marker(delivered)
     payload = {"text": visible_raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt

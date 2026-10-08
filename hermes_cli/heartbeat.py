@@ -28,6 +28,13 @@ HEARTBEAT_PROMPT_TEMPLATE = (
     "If there is nothing meaningful to do or report for this instruction "
     f"right now, reply with exactly {SILENCE_MARKER} and nothing else — do not invent work."
 )
+# Wording before the silence contract. Stored rows still carry it, so the generated-turn
+# classifier (agent/synthetic_prompt.py) keeps recognizing it; never render it.
+_PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE = (
+    f"{HEARTBEAT_PROMPT_PREFIX}{{interval}}]\n{{prompt}}\n\n"
+    "If there is nothing meaningful to do or report for this instruction "
+    "right now, reply briefly that nothing has changed and stop — do not invent work."
+)
 
 _INTERVAL_RE = re.compile(
     r"^\s*(?:every\s+)?(\d+(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)\s*$", re.IGNORECASE)

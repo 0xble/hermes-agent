@@ -64,6 +64,9 @@ class CLIChatTurnMixin:
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
         self._last_turn_interrupted = False
+        # Heartbeat and /loop wakeups may end with a bare [SILENT]; that turn renders nothing.
+        from hermes_cli.loops import is_quiet_wakeup_prompt
+        self._quiet_wakeup_turn = is_quiet_wakeup_prompt(message)
 
         if not self._ensure_runtime_credentials():
             return None
@@ -126,6 +129,7 @@ class CLIChatTurnMixin:
                 return None
             finally:
                 self._chat_release_turn_audio(turn)
+                self._quiet_wakeup_turn = False
 
     def _chat_release_turn_audio(self, turn):
         """Every exit path: stop the thinking sound, send the TTS sentinel, cut TTS only if abnormal."""
@@ -533,6 +537,11 @@ class CLIChatTurnMixin:
             if self._voice_continuous:
                 self._voice_continuous = False
                 _cprint(f"\n{_DIM}{t('cli.chat.continuous_voice_stopped')}{_RST}")
+
+        if getattr(self, "_quiet_wakeup_turn", False):
+            from gateway.response_filters import is_intentional_silence_agent_result
+            if is_intentional_silence_agent_result(turn.result, response):
+                response = ""  # quiet no-change tick: no panel, no speech; history keeps the row
 
         pending_message, _show_interrupt_marker = self._chat_resolve_interrupt(
             turn, agent_thread, interrupt_msg, response)
