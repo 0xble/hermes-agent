@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from agent.i18n import t
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult, _ExtractedResponse
 from gateway.platforms.event import MessageEvent, MessageType
@@ -131,6 +132,7 @@ async def test_human_restart_note_is_visible_once_even_when_broadcast_is_disable
     runner._delivery_adapter_for = lambda _source: adapter
     runner._authorization_adapter = lambda *_args: adapter
     runner._thread_metadata_for_target = lambda *args, **kwargs: {"thread_id": source.thread_id}
+    runner._restart_requested = True
 
     first = await runner._send_interrupted_turn_notes([entry.session_key])
     second = await runner._send_interrupted_turn_notes([entry.session_key])
@@ -138,8 +140,27 @@ async def test_human_restart_note_is_visible_once_even_when_broadcast_is_disable
     assert first == 1
     assert second == 0
     assert len(adapter.sent) == 1
+    assert adapter.sent[0][1] == t("gateway.shutdown.interrupted_turn", lang="en")
     assert adapter.sent[0][2]["thread_id"] == source.thread_id
     assert store.get_restart_note(entry.session_key)[3] == "m1"
+
+
+@pytest.mark.asyncio
+async def test_manual_shutdown_continue_policy_uses_generic_interrupted_note(tmp_path):
+    store = _store(tmp_path)
+    source = _source("manual-shutdown")
+    entry = store.get_or_create_session(source)
+    assert store.mark_resume_pending(entry.session_key, turn_id="turn-shutdown", human=True)
+
+    adapter = NoteAdapter()
+    runner = _note_runner(store, source, adapter)
+    runner._restart_requested = False
+
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0][1]
+    assert "restart" not in text.lower()
+    assert text == t("gateway.shutdown.interrupted_turn", lang="en")
 
 
 @pytest.mark.asyncio
@@ -422,7 +443,7 @@ async def test_failed_s2_note_uses_one_ordinary_home_fallback(tmp_path):
     async def fail_once(chat_id, content, reply_to=None, metadata=None):
         nonlocal attempts
         attempts += 1
-        if "Interrupted by a restart" in content:
+        if content == t("gateway.shutdown.interrupted_turn", lang="en"):
             raise RuntimeError("transport down")
         adapter.sent.append((chat_id, content, metadata))
         return SendResult(success=True, message_id=f"m{attempts}")
