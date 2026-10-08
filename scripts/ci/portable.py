@@ -106,11 +106,21 @@ def python_files(env: dict[str, str], files: list[str], workers: int) -> None:
     groups: dict[int | None, list[str]] = {}
     for path in files:
         groups.setdefault(FILE_TIMEOUTS.get(path), []).append(path)
+    run_all([lambda roots=roots, timeout=timeout: python_tests(env, roots, workers, file_timeout=timeout)
+             for timeout, roots in sorted(groups.items(), key=lambda item: item[0] or 0)])
+
+
+# A failing part must not stop the parts after it: environment and tool errors raise OSError or
+# RuntimeError, not just CalledProcessError, and the first failure is re-raised once all have run.
+_PART_ERRORS = (OSError, RuntimeError, subprocess.CalledProcessError)
+
+
+def run_all(parts) -> None:
     failures = []
-    for timeout, roots in sorted(groups.items(), key=lambda item: item[0] or 0):
+    for part in parts:
         try:
-            python_tests(env, roots, workers, file_timeout=timeout)
-        except subprocess.CalledProcessError as error:
+            part()
+        except _PART_ERRORS as error:
             failures.append(error)
     if failures:
         raise failures[0]
@@ -551,15 +561,8 @@ def e2e_tests(env: dict[str, str], workers: int) -> None:
         if not path.is_relative_to(upgrade)
         and not {'integration', 'docker'} & set(path.relative_to(ROOT).parts)
     )
-    failures = []
-    for run_part in (lambda: python_files(env, files, workers),
-                     lambda: python_tests(env, [E2E_UPGRADE_ROOT], workers, file_timeout=E2E_UPGRADE_FILE_TIMEOUT)):
-        try:
-            run_part()
-        except subprocess.CalledProcessError as error:
-            failures.append(error)
-    if failures:
-        raise failures[0]
+    run_all((lambda: python_files(env, files, workers),
+             lambda: python_tests(env, [E2E_UPGRADE_ROOT], workers, file_timeout=E2E_UPGRADE_FILE_TIMEOUT)))
 
 
 def native_os(env: dict[str, str], workers: int) -> None:

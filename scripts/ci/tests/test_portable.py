@@ -672,6 +672,24 @@ try {
                 ci.python_shard({}, 4, other, 10)
         self.assertEqual(calls, [(ci.shard_files(ci.ROOT, 10)[other - 1], None)])
 
+    def test_an_environment_error_in_one_group_still_runs_the_others(self):
+        soak = 'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py'
+        calls = []
+
+        def fake(env, roots, workers, file_timeout=None):
+            calls.append(file_timeout)
+            if file_timeout is None:
+                raise RuntimeError('checkout Python environment missing')
+
+        with patch.object(ci, 'python_tests', side_effect=fake):
+            with self.assertRaises(RuntimeError):
+                ci.python_files({}, ['tests/test_a.py', soak], 4)
+            self.assertEqual(calls, [None, ci.FILE_TIMEOUTS[soak]])
+            calls.clear()
+            with self.assertRaises(RuntimeError):
+                ci.e2e_tests({}, 3)
+            self.assertEqual(calls[-1], ci.E2E_UPGRADE_FILE_TIMEOUT)  # upgrade suite still ran
+
     def test_python_tests_forwards_only_an_explicit_file_timeout(self):
         seen = []
         with patch.object(ci, 'python', return_value=sys.executable), \
