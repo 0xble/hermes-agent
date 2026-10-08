@@ -19,6 +19,7 @@ from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAM
 from agent.sdk_transform_bypass import bypass_sdk_request_transform
 from agent.stream_diag import buffer_connect_exhausted_notice
 from agent.usage_anchor import set_usage_anchor
+from agent.skill_review_gate import consume_skill_review_if_due, note_human_turn_for_skill_review
 
 logger = logging.getLogger(__name__)
 _codex_watchdog_state_var: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
@@ -638,11 +639,10 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
     agent._iters_since_skill = getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn, messages=messages)
-    # Skill nudge check AFTER iters were incremented (same as chat_completions).
-    should_review_skills = (0 < agent._skill_nudge_interval <= agent._iters_since_skill
-                            and "skill_manage" in agent.valid_tool_names)
-    if should_review_skills:
-        agent._iters_since_skill = 0
+    # Skill nudge check AFTER iters were incremented (same as chat_completions). A human-authored
+    # turn is required since the previous automatic skill review.
+    note_human_turn_for_skill_review(agent, original_user_message)
+    should_review_skills = consume_skill_review_if_due(agent)
     # External memory sync skipped on interrupt/error (no partial transcripts).
     if not turn.interrupted and turn.error is None:
         _call_guarded(getattr(agent, "_sync_external_memory_for_turn", None), "external memory sync raised", kwargs=dict(
