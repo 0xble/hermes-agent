@@ -1192,19 +1192,28 @@ class ProcessRegistry(ProcessCheckpointMixin):
     # escalated kill as incomplete.
     _KILL_SETTLE_SECONDS = 1.0
 
-    def _post_kill_survivors(self, session: "ProcessSession") -> List[int]:
+    def _post_kill_survivors(
+        self, session: "ProcessSession", deadline: Optional[float] = None,
+    ) -> List[int]:
         """Host PIDs still alive once the kill signals have had time to land (#115490).
 
         Fail-closed: anything unverifiable counts as a survivor, so a kill
         that leaves a live tree can never write a killed receipt. Sandbox
         (env) sessions have no host-visible tree and are unverifiable by
-        design — they return no survivors, preserving existing behavior."""
-        deadline = time.monotonic() + self._KILL_SETTLE_SECONDS
+        design — they return no survivors, preserving existing behavior.
+
+        A bounded caller owns the full kill budget: the settle probe may use the
+        shorter of the normal settle window and that caller's deadline, but it
+        never extends the operation past the deadline.
+        """
+        settle_deadline = time.monotonic() + self._KILL_SETTLE_SECONDS
+        if deadline is not None:
+            settle_deadline = min(settle_deadline, deadline)
         while True:
             survivors = self._probe_survivors(session)
-            if not survivors or time.monotonic() >= deadline:
+            if not survivors or time.monotonic() >= settle_deadline:
                 return survivors
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, settle_deadline - time.monotonic())))
 
     def _probe_survivors(self, session: "ProcessSession") -> List[int]:
         survivors: List[int] = []
@@ -2318,7 +2327,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 signal_race_exited = session.exited
             # A reader that finalised the session mid-signal already proved
             # real exit; only a still-running session needs tree-death proof.
-            survivors = [] if signal_race_exited else self._post_kill_survivors(session)
+            survivors = [] if signal_race_exited else self._post_kill_survivors(session, deadline=deadline)
             if survivors:
                 alive = ", ".join(map(str, survivors))
                 logger.warning(
@@ -2811,6 +2820,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 for session in targets:
                     session._kill_deadline = deadline
             escalated_ids: set[str] = set()
+            systemd_stops: dict[str, tuple[threading.Thread, threading.Event, dict[str, bool]]] = {}
 
             def _systemd_stop_async(session: ProcessSession) -> None:
                 if not session.systemd_unit:
@@ -2819,17 +2829,34 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 if remaining is not None and remaining <= 0:
                     return
                 # systemctl may block on a dead user bus; keep it off the serial sweep
-                # and bound its subprocess by the same restart deadline.
+                # and bound its subprocess by the same restart deadline. The caller
+                # must synchronize with this worker before retiring the session: a
+                # reparented descendant can outlive the PID snapshot until the scope
+                # teardown completes.
+                done = threading.Event()
+                outcome = {"ok": False, "completed": False}
+
                 def _stop() -> None:
-                    with suppress(Exception):
+                    try:
                         stop = _stop_systemd_unit
-                        if "timeout" in inspect.signature(stop).parameters:
-                            stop(session.systemd_unit, timeout=remaining)
+                        if "timeout" in inspect.signature(stop).parameters and remaining is not None:
+                            outcome["ok"] = bool(stop(session.systemd_unit, timeout=remaining))
                         else:
                             # Preserve simple test/embedding seams that predate the
-                            # bounded timeout keyword.
-                            stop(session.systemd_unit)
-                threading.Thread(target=_stop, name="process-systemd-stop", daemon=True).start()
+                            # bounded timeout keyword, and retain the helper's default
+                            # timeout for unbounded teardown.
+                            outcome["ok"] = bool(stop(session.systemd_unit))
+                    except Exception:
+                        # Direct process-group signalling remains the fallback when
+                        # systemd is unavailable or the user bus is unhealthy.
+                        pass
+                    finally:
+                        outcome["completed"] = True
+                        done.set()
+
+                thread = threading.Thread(target=_stop, name="process-systemd-stop", daemon=True)
+                systemd_stops[session.id] = (thread, done, outcome)
+                thread.start()
 
             if signalable:
                 # Signal every snapshotted root/descendant group in one parallel pass. A
@@ -2897,8 +2924,35 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     _snapshot_alive(session, snapshots[session.id]) for session in signalable
                 ):
                     time.sleep(0.02)
+                systemd_ready: dict[str, bool] = {}
+                for session_id, (_thread, done, outcome) in systemd_stops.items():
+                    # A bounded shutdown may wait only for its remaining budget. If
+                    # the scope teardown is still pending, or completed unsuccessfully,
+                    # leave the session in _running so a detached descendant remains
+                    # addressable for a later kill/retry. A stop_event-only sweep uses
+                    # the existing fixed settle window rather than any configured
+                    # teardown timeout, so a quick systemd stop can still be observed.
+                    if deadline is None:
+                        wait_timeout = self._KILL_SETTLE_SECONDS
+                    else:
+                        wait_timeout = max(0.0, deadline - time.monotonic())
+                    completed = done.wait(timeout=wait_timeout)
+                    systemd_ready[session_id] = completed and outcome["completed"] and outcome["ok"]
+                    if not completed:
+                        logger.warning(
+                            "Systemd scope teardown for %s did not finish before kill deadline; "
+                            "session remains tracked",
+                            session_id,
+                        )
+                    elif not outcome["ok"]:
+                        logger.warning(
+                            "Systemd scope teardown for %s failed; session remains tracked",
+                            session_id,
+                        )
                 killed = 0
                 for session in signalable:
+                    if session.id in systemd_stops and not systemd_ready.get(session.id, False):
+                        continue
                     if _snapshot_alive(session, snapshots[session.id]):
                         # Do not report a clean kill, or move the live session out of
                         # the registry, while a snapshotted descendant survived.

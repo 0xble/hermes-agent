@@ -289,8 +289,9 @@ def test_kill_all_scoped_session_falls_back_to_direct_signal(registry, monkeypat
     session.systemd_unit = "hermes-worker-scoped-test.scope"
     monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda *a, **k: False)
     try:
-        assert registry.kill_all("scoped-test", deadline=time.monotonic() + 2.0) == 1
+        assert registry.kill_all("scoped-test", deadline=time.monotonic() + 2.0) == 0
         assert session.process is not None and session.process.returncode is not None
+        assert registry.get(session.id) is session
     finally:
         registry.kill_all("scoped-test", source="test-cleanup")
 
@@ -333,6 +334,110 @@ def test_sandbox_kill_uses_remaining_deadline_not_fixed_timeout(registry):
     assert result["status"] == "killed"
     timeout = session.env_ref.execute.call_args.kwargs["timeout"]
     assert 0 < timeout <= 0.2
+
+
+def test_kill_process_survivor_settle_honors_caller_deadline(registry, monkeypatch):
+    """Post-kill survivor verification must not add its fixed 1s wait to a bounded kill."""
+    session = _make_session(sid="proc_survivor_deadline")
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_probe_survivors", lambda _session: [4242])
+    monkeypatch.setattr(registry, "_signal_kill", lambda *args, **kwargs: None)
+    deadline = time.monotonic() + 0.05
+
+    started = time.monotonic()
+    result = registry.kill_process(session.id, deadline=deadline)
+    elapsed = time.monotonic() - started
+
+    assert result["status"] == "error"
+    assert result["survivors"] == [4242]
+    assert elapsed < 0.3
+
+
+def test_bounded_kill_all_keeps_systemd_session_tracked_until_teardown_finishes(
+    registry, monkeypatch
+):
+    """A detached systemd descendant must not become untracked while stop is pending."""
+    session = _make_session(sid="proc_pending_scope")
+    session._pty = MagicMock()
+    session._pty.isalive.return_value = False
+    session.systemd_unit = "hermes-worker-proc_pending_scope.scope"
+    registry._running[session.id] = session
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_stop(_unit, *, timeout=None):
+        entered.set()
+        release.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr("tools.process_registry._stop_systemd_unit", blocked_stop)
+
+    try:
+        deadline = time.monotonic() + 1.0
+        result_holder = {}
+        finished = threading.Event()
+
+        def run_kill_all():
+            result_holder["value"] = registry.kill_all(deadline=deadline)
+            finished.set()
+
+        worker = threading.Thread(target=run_kill_all)
+        worker.start()
+        assert entered.wait(timeout=0.2)
+        assert not finished.wait(timeout=0.05)
+        assert session.id in registry._running
+
+        release.set()
+        assert finished.wait(timeout=0.5)
+        worker.join(timeout=0.5)
+        assert result_holder["value"] == 1
+        assert session.id not in registry._running
+        assert session.exited
+    finally:
+        release.set()
+
+
+def test_stop_event_kill_all_waits_for_quick_systemd_teardown(registry, monkeypatch):
+    """A stop_event-only sweep uses its settle budget to observe systemd success."""
+    session = _make_session(sid="proc_stop_event_scope")
+    session._pty = MagicMock()
+    session._pty.isalive.return_value = False
+    session.systemd_unit = "hermes-worker-proc_stop_event_scope.scope"
+    registry._running[session.id] = session
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    result_holder = {}
+    stop_event = threading.Event()
+    monkeypatch.setattr(registry, "_KILL_SETTLE_SECONDS", 1.0)
+
+    def blocked_stop(_unit, *, timeout=None):
+        assert timeout is None
+        entered.set()
+        release.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr("tools.process_registry._stop_systemd_unit", blocked_stop)
+
+    def run_kill_all():
+        result_holder["value"] = registry.kill_all(stop_event=stop_event)
+        finished.set()
+
+    worker = threading.Thread(target=run_kill_all)
+    worker.start()
+    try:
+        assert entered.wait(timeout=0.2)
+        assert not finished.wait(timeout=0.05)
+        assert session.id in registry._running
+
+        release.set()
+        assert finished.wait(timeout=0.5)
+        assert result_holder["value"] == 1
+        assert session.id not in registry._running
+        assert session.exited
+    finally:
+        release.set()
+        worker.join(timeout=1.0)
 
 
 def test_bounded_kill_validates_descendant_identity_before_signaling(registry, monkeypatch):
