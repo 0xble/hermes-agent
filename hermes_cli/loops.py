@@ -443,9 +443,9 @@ def _digest_response(response: str) -> str:
     """Digest for self-paced change detection; whitespace-normalized with clock/timestamp/duration
     tokens stripped so 'checked at 14:02:33' doesn't defeat the backoff."""
     text = (response or "").strip().lower()
-    if text == SILENCE_MARKER.lower():
-        # Repeated no-op wakeups are semantically identical; keep the sentinel explicit so this
-        # remains true if the marker wording changes later.
+    if _is_silence_reply(response):
+        # Every silence marker form (NO_REPLY, "[SILENT].") is the same "nothing changed" reply,
+        # matching the --until judge skip, so repeated quiet ticks back off.
         return SILENCE_MARKER.lower()
     text = re.sub(r"\d{1,2}:\d{2}(:\d{2})?", "", text)
     text = re.sub(r"\d{4}-\d{2}-\d{2}", "", text)

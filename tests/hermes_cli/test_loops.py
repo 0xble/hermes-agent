@@ -537,6 +537,21 @@ class TestSelfPacedBackoff:
 
         assert mgr.state.current_delay == floor * 2
 
+    def test_backoff_treats_every_silence_marker_form_as_unchanged(self, hermes_home):
+        """The digest uses the judge skip's marker set, so NO_REPLY and '[SILENT].' back off too."""
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="sp-silent-forms")
+        state = mgr.set("watch the queue")
+        floor = state.current_delay
+
+        for reply in ("[SILENT]", "NO_REPLY", "[SILENT].", " no reply "):
+            mgr.state.next_due_at = time.time() - 1
+            mgr.fire_tick()
+            mgr.complete_tick(reply)
+
+        assert mgr.state.current_delay == floor * 8
+
     def test_timestamp_only_changes_do_not_reset(self, hermes_home):
         from hermes_cli.loops import LoopManager
 

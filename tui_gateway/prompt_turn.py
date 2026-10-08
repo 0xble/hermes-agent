@@ -438,10 +438,14 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
         except Exception:
             pass  # transient DB failure — keep pending_title for retry
     # Voice fallback when the streaming pipeline couldn't start (tts_queue already spoke
-    # everything otherwise); barge-aware.
+    # everything otherwise); barge-aware. Speaks the delivered text: a quiet wakeup's bare
+    # [SILENT] stays in ``raw`` for the /loop hook above but is never spoken.
     if st.tts_queue is None and isinstance(raw, str) and raw.strip() and _voice_tts_enabled():
+        spoken = (_bot_mode_delivery_text(raw, successful=True)
+                  if _silence_hidden_turn(session, getattr(st, "prompt_text", "")) else raw)
         try:
-            threading.Thread(target=_speak_text_with_barge, args=(raw,), daemon=True).start()
+            if spoken.strip():
+                threading.Thread(target=_speak_text_with_barge, args=(spoken,), daemon=True).start()
         except ImportError:
             logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
         except Exception as e:
@@ -873,12 +877,9 @@ def _invoke_agent(
                 loop_hold["text"] = ""
             loop_hold["seen"] += delta
         if hold is not None and isinstance(delta, str):
-            from gateway.response_filters import is_partial_silence_marker
-            hold["buf"] += delta
-            if is_partial_silence_marker(hold["buf"]):
-                hold["held"] += delta
+            from gateway.response_filters import hold_silence_delta
+            if not (delta := hold_silence_delta(hold, delta)):
                 return
-            delta, hold["held"] = hold["held"] + delta, ""
         _deliver_delta(delta)
 
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed

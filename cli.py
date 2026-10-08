@@ -875,6 +875,9 @@ class _ChatTurn:
     text_queue: Optional[queue.Queue] = None
     tts_thread: Optional[threading.Thread] = None
     stream_callback: Optional[Any] = None
+    # Streaming-TTS feed and its quiet-wakeup silence hold (see _chat_setup_turn_audio).
+    speak: Optional[Any] = None
+    silence_hold: Optional[dict] = None
     stop_event: Optional[threading.Event] = None
     tts_normal_exit: bool = False
     voice_prefix: str = ""

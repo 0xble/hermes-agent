@@ -298,11 +298,24 @@ class CLIChatTurnMixin:
             # Barge-in paths (voice key, full-duplex listener) cut playback via this event.
             self._voice_tts_stop = turn.stop_event
 
-            def stream_callback(delta: str):
+            def speak(delta: str):
                 turn.text_queue.put(delta)
                 # Track what is being spoken so a playback-phase barge capture can be
                 # checked against it (echo guard).
                 self._voice_last_tts_text = (self._voice_last_tts_text or "") + delta
+
+            # TTS gets raw deltas, not _stream_delta's display hold: a wakeup turn's bare
+            # [SILENT] must not be spoken either (the held tail settles in _chat_settle_turn).
+            if getattr(self, "_quiet_wakeup_turn", False):
+                turn.silence_hold = {"buf": "", "held": ""}
+
+            def stream_callback(delta: str):
+                if turn.silence_hold is not None and isinstance(delta, str):
+                    from gateway.response_filters import hold_silence_delta
+                    delta = hold_silence_delta(turn.silence_hold, delta)
+                if delta:
+                    speak(delta)
+            turn.speak = speak
             turn.stream_callback = stream_callback
 
         # API-call-local only — run_conversation persists the original clean user message.
@@ -492,6 +505,12 @@ class CLIChatTurnMixin:
             pass
         self._flush_stream()
         if turn.use_streaming_tts and turn.text_queue is not None:
+            # A held bare silence marker is dropped; a prefix that never completed one is speech.
+            held = turn.silence_hold["held"] if turn.silence_hold else ""
+            if held and turn.speak is not None:
+                from gateway.response_filters import is_intentional_silence_response
+                if not is_intentional_silence_response(held):
+                    turn.speak(held)
             turn.text_queue.put(None)  # end-of-text sentinel
             if turn.tts_thread is not None:
                 turn.tts_thread.join(timeout=120)

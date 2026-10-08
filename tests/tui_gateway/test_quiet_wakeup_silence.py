@@ -91,6 +91,32 @@ def test_tui_wakeup_stream_never_shows_the_marker(monkeypatch):
     assert "".join(_run(LOOP_WAKEUP, "Queue is 2.", ["Queue", " is 2."])) == "Queue is 2."
     # Ordinary turns stream unchanged.
     assert _run("check the queue", "[SILENT]", ["[SIL", "ENT]"]) == ["[SIL", "ENT]"]
+    # Commentary before a tool call, then a bare marker: the hold re-arms at the tool-round break
+    # ("\n\n" opens the next segment), so the marker never streams.
+    assert "".join(_run(LOOP_WAKEUP, "[SILENT]", ["Checking the queue.", "\n\n[SILENT]"])) == "Checking the queue."
+    assert "".join(_run(LOOP_WAKEUP, "[SILENT]", ["Checking the queue.", "\n\n[SIL", "ENT]"])) == "Checking the queue."
+    # A held prefix followed by a new segment was content after all, and a real reply still streams.
+    assert "".join(_run(LOOP_WAKEUP, "Done.", ["NO", "\n\nDone."])) == "NO\n\nDone."
+    assert "".join(_run(LOOP_WAKEUP, "Queue is 2.", ["Checking.", "\n\nQueue is 2."])) == "Checking.\n\nQueue is 2."
+
+
+def test_tui_voice_fallback_speaks_delivered_text_not_the_marker(monkeypatch):
+    spoken = []
+    monkeypatch.setattr(srv, "_voice_tts_enabled", lambda: True)
+    monkeypatch.setattr(srv, "_speak_text_with_barge", spoken.append)
+    monkeypatch.setattr(srv, "threading", SimpleNamespace(
+        Thread=lambda target, args, daemon: SimpleNamespace(start=lambda: target(*args))))
+    session = {"session_key": "", "pending_title": None}
+
+    def _after(prompt, raw):
+        spoken.clear()
+        srv._after_complete_turn("sid", session, SimpleNamespace(tts_queue=None, prompt_text=prompt), raw)
+        return spoken[:]
+
+    assert _after(LOOP_WAKEUP, "[SILENT]") == []
+    assert _after(HEARTBEAT, "NO_REPLY") == []
+    assert _after(LOOP_WAKEUP, "Queue is 2.") == ["Queue is 2."]
+    assert _after("check the queue", "[SILENT]") == ["[SILENT]"]
 
 
 # -- interactive CLI ---------------------------------------------------------------------------
@@ -168,3 +194,42 @@ def test_cli_wakeup_turn_renders_no_panel_for_a_bare_marker():
     failed = _RenderStub(quiet=True)
     failed._chat_render_turn(_finished_turn({"final_response": "[SILENT]", "failed": True}), MagicMock(), None)
     assert failed.panels == ["[SILENT]"]
+
+
+def _cli_streaming_tts_turn(monkeypatch, *, quiet, chunks):
+    """Drive the real CLI streaming-TTS setup and settle; returns everything queued for speech."""
+    import threading
+    from cli import _ChatTurn
+    import tools.tts_tool as tts_tool
+    import tools.tts_tool_speaker as tts_speaker
+
+    monkeypatch.setattr(tts_tool, "_import_sounddevice", lambda: None)
+    monkeypatch.setattr(tts_tool, "check_tts_requirements", lambda: True)
+    monkeypatch.setattr(tts_speaker, "stream_tts_to_speaker", lambda *a, **k: None)
+    stub = _RenderStub(quiet=quiet)
+    stub._voice_mode, stub._voice_tts, stub.streaming_enabled = False, True, True
+    stub._voice_tts_done, stub._voice_last_tts_text = threading.Event(), ""
+    stub._prompt_start_time = None
+    stub._flush_stream = lambda: None
+    stub.agent = None
+    turn = _ChatTurn()
+    stub._chat_setup_turn_audio(turn, "msg", False)
+    for chunk in chunks:
+        turn.stream_callback(chunk)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    stub._chat_settle_turn(turn)
+    spoken = []
+    while (item := turn.text_queue.get_nowait()) is not None:
+        spoken.append(item)
+    return "".join(spoken)
+
+
+def test_cli_streaming_tts_never_speaks_a_wakeup_marker(monkeypatch):
+    assert _cli_streaming_tts_turn(monkeypatch, quiet=True, chunks=["[SIL", "ENT]"]) == ""
+    assert _cli_streaming_tts_turn(
+        monkeypatch, quiet=True, chunks=["Checking the queue.", "\n\n[SILENT]"]) == "Checking the queue."
+    assert _cli_streaming_tts_turn(monkeypatch, quiet=True, chunks=["NO"]) == "NO"
+    assert _cli_streaming_tts_turn(
+        monkeypatch, quiet=True, chunks=["Queue", " is 2."]) == "Queue is 2."
+    # A typed turn speaks exactly what streamed.
+    assert _cli_streaming_tts_turn(monkeypatch, quiet=False, chunks=["[SIL", "ENT]"]) == "[SILENT]"
