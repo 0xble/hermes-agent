@@ -311,7 +311,10 @@ class GatewayGoalsMixin:
                 )
                 return
             try:
-                result = await adapter.send(source.chat_id, message, metadata=metadata)
+                from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+                # The retry task runs after the first send's label exited: re-label it as a notice.
+                with outbound_class(OUTBOUND_NOTICE):
+                    result = await adapter.send(source.chat_id, message, metadata=metadata)
             except Exception as exc:
                 error = exc
                 result = None
@@ -341,8 +344,10 @@ class GatewayGoalsMixin:
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
+        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
         try:
-            result = await adapter.send(source.chat_id, message, metadata=metadata)
+            with outbound_class(OUTBOUND_NOTICE):
+                result = await adapter.send(source.chat_id, message, metadata=metadata)
         except Exception as exc:
             error = exc
             result = None
