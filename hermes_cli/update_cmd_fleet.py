@@ -1722,16 +1722,47 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     """
     import signal as _signal
     from hermes_cli.gateway import (
-        find_gateway_pids, find_profile_gateway_processes, _prepare_profile_gateway_update_restart, _get_service_pids,
+        find_gateway_pids, find_profile_gateway_processes, _capture_gateway_argv,
+        _prepare_profile_gateway_update_restart, _get_service_pids,
         _wait_for_gateway_exit,
     )
-    # Exclude just-restarted service PIDs so we don't kill what systemd/launchd spawned.
+    # launchd can report the service PID asynchronously after a KeepAlive respawn. A
+    # live gateway's own external-supervisor declaration is the authoritative fallback;
+    # otherwise the new child is indistinguishable from a manual process and the sweep
+    # SIGTERMs it before launchd's throttle window can settle.
+    from hermes_cli.gateway_supervised_restart import gateway_declares_external_supervisor
     service_pids = _get_service_pids(all_profiles=True)
-    manual_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
-    profile_processes = {
+    candidate_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+    mapped_processes = {
         proc.pid: proc
         for proc in find_profile_gateway_processes(exclude_pids=service_pids)
-        if proc.pid in manual_pids
+        if proc.pid in candidate_pids
+    }
+    externally_supervised_pids = set()
+    for pid in candidate_pids:
+        proc = mapped_processes.get(pid)
+        if proc is not None:
+            # A mapped process gets the control-socket/state-file check as well as
+            # the live argv fallback, scoped to that profile's home.
+            try:
+                if gateway_declares_external_supervisor(pid, proc.path):
+                    externally_supervised_pids.add(pid)
+            except Exception:
+                # An unreadable identity is ambiguous; never turn it into a
+                # destructive manual-stop decision.
+                externally_supervised_pids.add(pid)
+            continue
+        # Unmapped gateways have no profile home to query. The explicit argv
+        # marker is still enough to identify a supervisor-owned launch.
+        try:
+            argv = _capture_gateway_argv(pid)
+        except Exception:
+            argv = None
+        if argv and "--external-supervisor" in argv:
+            externally_supervised_pids.add(pid)
+    manual_pids = [pid for pid in candidate_pids if pid not in externally_supervised_pids]
+    profile_processes = {
+        pid: proc for pid, proc in mapped_processes.items() if pid in manual_pids
     }
     # ``all_profiles`` is host-wide: a sibling install's gateway matches too. Only this update's
     # homes are stopped; the profile-mapped PIDs come from this install's own PID files (#93349).
