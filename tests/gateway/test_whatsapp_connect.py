@@ -14,7 +14,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 
 import asyncio
 import signal
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -472,7 +472,14 @@ class TestHttpSessionLifecycle:
             errors="replace",
             timeout=10,
         )
-        assert mock_run.mock_calls.count(expected_taskkill) == 1
+        # subprocess.run is patched on the shared module, so runtime-status/provenance `git`
+        # probes from elsewhere in the process land here too. Everything else must be exactly
+        # the one tree-kill: no second taskkill, no plain kill of the parent PID.
+        non_git = [
+            c for c in mock_run.mock_calls
+            if not (c.args and c.args[0] and PureWindowsPath(str(c.args[0][0])).stem.lower() == "git")
+        ]
+        assert non_git == [expected_taskkill]
         mock_proc.terminate.assert_not_called()
         mock_proc.kill.assert_not_called()
 
