@@ -1309,6 +1309,8 @@ def test_continuation_gap_zero_disables_and_library_default_is_off(hermes_home):
     assert normalize_goal_continuation_gap(0) == 0
     assert normalize_goal_continuation_gap("bad") == 900
     assert normalize_goal_continuation_gap(-1) == 900
+    # Capped at the barrier ceiling every floored automatic park uses, so parks honor it fully.
+    assert normalize_goal_continuation_gap(86400) == goals._MAX_BARRIER_WAIT_S
     mgr = GoalManager(session_id="gap-off", min_continuation_gap_seconds=0)
     mgr.set("ship the release")
     with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)):

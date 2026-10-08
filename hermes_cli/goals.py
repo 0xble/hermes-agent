@@ -69,13 +69,17 @@ def normalize_goal_continuation_gap(value: Any, default: float = DEFAULT_MIN_CON
     """Normalize the minimum autonomous-continuation interval in seconds.
 
     Zero explicitly disables the throttle. Invalid or negative values use the
-    configured default rather than silently turning the guard off.
+    configured default rather than silently turning the guard off. Values are capped at
+    the goal barrier ceiling (``_MAX_BARRIER_WAIT_S``) every other automatic park uses, so
+    a floored judge or backoff park can always honor the full gap.
     """
     try:
         parsed = float(value)
     except (TypeError, ValueError):
         return float(default)
-    return parsed if math.isfinite(parsed) and parsed >= 0 else float(default)
+    if not (math.isfinite(parsed) and parsed >= 0):
+        return float(default)
+    return min(parsed, float(_MAX_BARRIER_WAIT_S))
 
 
 def _goal_budget_label(turns_used: int, max_turns: int) -> str:
