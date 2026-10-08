@@ -36,7 +36,12 @@ def _lease_event_payload(profile_key: str, lease) -> dict:
 
 
 def _watched_lease_homes() -> list[Path]:
-    return [Path(_hermes_home), *_served_profile_homes]
+    from hermes_constants import hermes_home_key
+
+    watched: dict[str, Path] = {}
+    for home in (Path(_hermes_home), *_served_profile_homes):
+        watched.setdefault(hermes_home_key(home), home)
+    return list(watched.values())
 
 
 def _mtime(path: Path):

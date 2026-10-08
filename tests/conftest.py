@@ -351,6 +351,14 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     tui_server_mod = sys.modules.get("tui_gateway.server")
     if tui_server_mod is not None and hasattr(tui_server_mod, "_served_profile_homes"):
         monkeypatch.setattr(tui_server_mod, "_served_profile_homes", set())
+    if tui_server_mod is not None:
+        # Watcher state is process-global, while each test owns a fresh home.
+        for _watcher_state in ("_lease_epochs", "_lease_mtimes", "_runtime_marks"):
+            _state = getattr(tui_server_mod, _watcher_state, None)
+            if isinstance(_state, dict):
+                _state.clear()
+        if hasattr(tui_server_mod, "_last_idle_check"):
+            monkeypatch.setattr(tui_server_mod, "_last_idle_check", 0.0)
 
     hermes_state_mod = sys.modules.get("hermes_state")
     if hermes_state_mod is not None and hasattr(hermes_state_mod, "DEFAULT_DB_PATH"):
