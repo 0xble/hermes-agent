@@ -303,6 +303,89 @@ def test_existing_resume_reason_and_freshness_are_preserved(tmp_path):
     assert recovered.active_turn_started_at is None
 
 
+def test_successor_active_turn_gets_a_new_resume_marker(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source("successor-turn")
+    entry = store.get_or_create_session(source)
+    predecessor_marked_at = datetime.now() - timedelta(minutes=1)
+
+    with store._lock:
+        current = store._entries[entry.session_key]
+        current.resume_pending = True
+        current.resume_reason = "restart_interrupted"
+        current.resume_marker_token = "marker-a"
+        current.resume_turn_id = "turn-a"
+        current.resume_human = True
+        current.last_resume_marked_at = predecessor_marked_at
+        current.restart_notes = [{
+            "session_id": current.session_id,
+            "marker_token": "marker-a",
+            "turn_id": "turn-a",
+            "marked_at": predecessor_marked_at,
+            "message_id": "message-a",
+        }]
+        current.restart_note_message_id = "message-a"
+        current.restart_note_marker_token = "marker-a"
+        current.restart_note_turn_id = "turn-a"
+        current.restart_note_marked_at = predecessor_marked_at
+        current.active_turn_token = "turn-b"
+        current.active_turn_started_at = datetime.now()
+        current.active_turn_human = False
+        store._save()
+
+    assert store.recover_interrupted_turns() == 1
+
+    recovered = _entry_for(store, source)
+    assert recovered.resume_pending is True
+    assert recovered.resume_reason == "restart_interrupted"
+    assert recovered.resume_turn_id == "turn-b"
+    assert recovered.resume_marker_token not in (None, "marker-a")
+    assert recovered.resume_human is False
+    assert recovered.restart_note_reconcile_attempts == 0
+    assert recovered.last_resume_marked_at is not None
+    assert recovered.last_resume_marked_at > predecessor_marked_at
+    assert recovered.active_turn_token is None
+    assert recovered.active_turn_started_at is None
+    assert recovered.restart_notes == [{
+        "session_id": recovered.session_id,
+        "marker_token": "marker-a",
+        "turn_id": "turn-a",
+        "marked_at": predecessor_marked_at,
+        "message_id": "message-a",
+    }]
+
+
+def test_same_turn_drain_timeout_marker_is_preserved(tmp_path):
+    store = _make_store(tmp_path)
+    source = _make_source("same-turn-drain")
+    entry = store.get_or_create_session(source)
+    marked_at = datetime.now() - timedelta(minutes=1)
+
+    with store._lock:
+        current = store._entries[entry.session_key]
+        current.resume_pending = True
+        current.resume_reason = "shutdown_timeout"
+        current.resume_marker_token = "drain-marker"
+        current.resume_turn_id = "turn-drain"
+        current.resume_human = True
+        current.last_resume_marked_at = marked_at
+        current.active_turn_token = "turn-drain"
+        current.active_turn_started_at = datetime.now()
+        current.active_turn_human = True
+        store._save()
+
+    assert store.recover_interrupted_turns() == 0
+
+    recovered = _entry_for(store, source)
+    assert recovered.resume_pending is True
+    assert recovered.resume_reason == "shutdown_timeout"
+    assert recovered.resume_marker_token == "drain-marker"
+    assert recovered.resume_turn_id == "turn-drain"
+    assert recovered.last_resume_marked_at == marked_at
+    assert recovered.active_turn_token is None
+    assert recovered.active_turn_started_at is None
+
+
 def test_ancient_active_marker_is_cleared_without_auto_resume(tmp_path):
     store = _make_store(tmp_path)
     source = _make_source()

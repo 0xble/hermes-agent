@@ -181,9 +181,24 @@ class SessionLifecycleMixin:
             )
             if not marker_is_stale and not entry.suspended:
                 if entry.resume_pending:
-                    # A drain-timeout marker is more specific; keep it.
-                    if entry.last_resume_marked_at is None:
+                    # A drain-timeout marker is more specific when it belongs to this same turn.
+                    # An auto-resumed successor owns a new active token, so it needs its own
+                    # append-only interruption marker while the predecessor's note remains intact.
+                    same_turn = (
+                        entry.resume_turn_id is None
+                        or entry.resume_turn_id == entry.active_turn_token
+                    )
+                    if same_turn:
+                        if entry.last_resume_marked_at is None:
+                            entry.last_resume_marked_at = now
+                    else:
+                        entry.resume_reason = "restart_interrupted"
+                        entry.resume_marker_token = uuid.uuid4().hex
+                        entry.resume_turn_id = entry.active_turn_token
+                        entry.resume_human = bool(entry.active_turn_human)
+                        entry.restart_note_reconcile_attempts = 0
                         entry.last_resume_marked_at = now
+                        promoted += 1
                 else:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"

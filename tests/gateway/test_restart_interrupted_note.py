@@ -3,7 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -1541,6 +1541,52 @@ def test_pending_note_claim_is_atomic_and_recoverable(tmp_path):
     assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
     assert store.claim_restart_note(entry.session_key, expected_marker=marker, reclaim_pending=True)
     assert store.get_restart_note(entry.session_key)[3].startswith("pending:")
+
+
+@pytest.mark.asyncio
+async def test_successor_interruption_sends_one_new_note_without_resending_predecessor(tmp_path):
+    store = _store(tmp_path)
+    source = _source("successor-note")
+    entry = store.get_or_create_session(source)
+    predecessor_marked_at = datetime.now() - timedelta(minutes=1)
+
+    with store._lock:
+        current = store._entries[entry.session_key]
+        current.resume_pending = True
+        current.resume_reason = "restart_interrupted"
+        current.resume_marker_token = "marker-a"
+        current.resume_turn_id = "turn-a"
+        current.resume_human = True
+        current.last_resume_marked_at = predecessor_marked_at
+        current.restart_notes = [{
+            "session_id": current.session_id,
+            "marker_token": "marker-a",
+            "turn_id": "turn-a",
+            "marked_at": predecessor_marked_at,
+            "message_id": "message-a",
+        }]
+        current.restart_note_message_id = "message-a"
+        current.restart_note_marker_token = "marker-a"
+        current.restart_note_turn_id = "turn-a"
+        current.restart_note_marked_at = predecessor_marked_at
+        current.active_turn_token = "turn-b"
+        current.active_turn_started_at = datetime.now(timezone.utc)
+        current.active_turn_human = True
+        store._save()
+
+    assert store.recover_interrupted_turns() == 1
+    recovered = store._entries[entry.session_key]
+    marker_b = store.get_resume_pending_marker(entry.session_key)
+    assert recovered.resume_turn_id == "turn-b"
+    assert marker_b is not None and marker_b[1] != "marker-a"
+
+    adapter = NoteAdapter()
+    runner = _note_runner(store, source, adapter)
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1
+    assert await runner._send_interrupted_turn_notes([entry.session_key]) == 0
+    assert len(adapter.sent) == 1
+    assert store.get_restart_note(entry.session_key)[3] == "m1"
+    assert [record["message_id"] for record in recovered.restart_notes] == ["message-a", "m1"]
 
 
 @pytest.mark.asyncio
