@@ -181,6 +181,27 @@ def test_skill_review_requires_a_human_turn_since_the_previous_review(
         assert agent._iters_since_skill == 10
 
 
+@pytest.mark.parametrize("path", ["chat", "codex"])
+def test_multimodal_turns_count_only_their_text_and_never_fail_finalization(path, monkeypatch):
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    agent = _make_agent()
+    _stub_agent_for_finalize(agent)
+    agent._iters_since_skill = 0
+
+    # An image-only turn has no human text: iterations accumulate, no review, no exception.
+    _finish_review_turn(agent, path, monkeypatch, [image], iterations=10)
+    agent._spawn_background_review.assert_not_called()
+    assert agent._iters_since_skill == 10
+
+    # A text part makes the turn human-authored.
+    _finish_review_turn(
+        agent, path, monkeypatch,
+        [{"type": "text", "text": "Use my naming convention here"}, image], iterations=0,
+    )
+    agent._spawn_background_review.assert_called_once()
+    assert agent._spawn_background_review.call_args.kwargs["review_skills"] is True
+
+
 def test_finalize_turn_skips_review_when_flag_set() -> None:
     """finalize_turn must NOT call _spawn_background_review when skip_background_review=True.
 
