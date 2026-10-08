@@ -114,7 +114,11 @@ function New-Item {
     param([string]$ItemType, [switch]$Force, [string]$Path)
     if (-not [IO.Path]::GetFullPath($Path).StartsWith(
         [IO.Path]::GetFullPath($env:FAKE_INSTALL_DIR), [StringComparison]::OrdinalIgnoreCase)) {
-        throw "test blocked directory creation outside temporary install: $Path"
+        # New-DesktopShortcuts asks for the real Programs/Desktop parents before
+        # handing the path to the fake WScript.Shell.  Do not create those known
+        # folders on the runner; return a virtual directory so the shortcut stub
+        # can record the call and keep the boundary hermetic.
+        return [pscustomobject]@{ FullName = $Path }
     }
     Microsoft.PowerShell.Management\New-Item -ItemType $ItemType -Force:$Force -Path $Path
 }
