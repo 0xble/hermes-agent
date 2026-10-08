@@ -489,7 +489,7 @@ class SessionPersistenceMixin:
 
     def _save_entry(
         self, session_key: str, *, entry_data: Optional[Dict[str, Any]] = None,
-        lock_held: bool = False, allow_full_rewrite: bool = True) -> None:
+        lock_held: bool = False) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). The key -> session_id mapping never changes here: structural
         transitions use the full rewrite (which also refreshes the sessions.json mirror; it may lag
@@ -520,13 +520,9 @@ class SessionPersistenceMixin:
                     fast_persisted[session_key] = (revision, entry_json)
                 return
             except Exception as exc:
-                if not allow_full_rewrite:
-                    raise RuntimeError("scoped routing save failed; full rewrite would clobber a live owner") from exc
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r (%s); falling back "
                     "to full index rewrite", session_key, exc)
-        if not allow_full_rewrite:
-            raise RuntimeError("scoped routing save unavailable; full rewrite would clobber a live owner")
         if entry_data is not None:
             # Full-snapshot fallback carrying the candidate transition.
             with guard:

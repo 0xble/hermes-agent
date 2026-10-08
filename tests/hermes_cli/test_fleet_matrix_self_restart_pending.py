@@ -121,7 +121,7 @@ def test_launchd_wrapper_pid_still_marks_the_gateway_below_it_pending(monkeypatc
 
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: _Plist())
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
-    monkeypatch.setattr(gateway, "_launchctl_supervised_pid", lambda label, **kwargs: wrapper)
+    monkeypatch.setattr(gateway, "_launchctl_supervised_pid", lambda label: wrapper)
     monkeypatch.setattr(gateway, "launchd_restart", lambda: None)
     monkeypatch.setattr(gateway, "wait_for_launchd_gateway_supervision", lambda **k: pytest.fail("must not wait on itself"))
 

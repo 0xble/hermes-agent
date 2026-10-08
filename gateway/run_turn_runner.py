@@ -637,9 +637,11 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
-        result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-        )
+        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
+        with outbound_class(OUTBOUND_PROGRESS):
+            result = await st.adapter.send(
+                chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            )
         self._track_progress_result(result)
         return result
 
@@ -1238,42 +1240,29 @@ class TurnRunner:
         ctx = self._ctx
         runner = self._runner
         src = ctx.source
-        gate = None
-        if getattr(src, "_startup_gate_capability", None) is not None:
-            from gateway.startup_gate import gate_for_source
-            gate = gate_for_source(src)
-        checkpoint_kwargs = {"checkpoints_enabled": False} if gate is not None else _checkpoint_agent_kwargs(ctx.user_config)
-        gate_kwargs = {"skip_memory": True, "skip_background_review": True, "side_agent": True} if gate is not None else {}
         agent = ctx.AIAgent(
-            model=turn_route["model"], **turn_route["runtime"], **checkpoint_kwargs, **gate_kwargs,
-            max_iterations=1 if gate is not None else max_iterations, quiet_mode=True, verbose_logging=False,
+            model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
+            max_iterations=max_iterations, quiet_mode=True, verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
-            prefill_messages=None if gate is not None else (runner._prefill_messages or None),
+            prefill_messages=runner._prefill_messages or None,
             reasoning_config=reasoning_config, service_tier=runner._service_tier,
             request_overrides=turn_route.get("request_overrides"),
             providers_allowed=pr.get("only"), providers_ignored=pr.get("ignore"), providers_order=pr.get("order"),
             provider_sort=pr.get("sort"), provider_require_parameters=pr.get("require_parameters", False),
             provider_data_collection=pr.get("data_collection"),
-            session_id=ctx.session_id, platform="subagent" if gate is not None else platform_key,
+            session_id=ctx.session_id, platform=platform_key,
             user_id=src.user_id, user_id_alt=src.user_id_alt, user_name=src.user_name,
             chat_id=src.chat_id, chat_name=src.chat_name, chat_type=src.chat_type, thread_id=src.thread_id,
             gateway_session_key=ctx.session_key,
             session_db=getattr(runner._session_db, "_db", runner._session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
-            fallback_model=None if gate is not None else self._runner._refresh_fallback_model(),
-            skip_context_files=skip_context_files or gate is not None,
+            fallback_model=self._runner._refresh_fallback_model(),
+            skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
-            load_soul_identity=gate is None,
+            load_soul_identity=True,
         )
-        if gate is not None:
-            if agent.tools or agent.valid_tool_names:
-                runner._cleanup_agent_resources(agent)
-                raise RuntimeError("startup gate agent did not resolve zero tools")
-            from gateway.startup_gate import install_gate_tool_refusal
-            install_gate_tool_refusal(gate, agent)
-            gate.evidence["zero_tools"] = True
         base_overrides = turn_route.get("base_request_overrides")
         if base_overrides is not None:
             agent._gateway_base_request_overrides = dict(base_overrides)
@@ -2103,11 +2092,6 @@ class TurnRunner:
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
-        if getattr(ctx.source, "_startup_gate_capability", None) is not None:
-            from gateway.startup_gate import gate_for_source, record_model_result
-            gate = gate_for_source(ctx.source)
-            if gate is not None:
-                record_model_result(gate, result)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.

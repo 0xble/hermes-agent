@@ -486,34 +486,15 @@ def _build_candidate_web(staging: Path) -> None:
         raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
 
 
-def _validate_handover_config(home: Path) -> None:
-    from gateway.generation import forward_only_handover_enabled
-    from hermes_cli.config_effective import load_user_config_effective
-    forward_only_handover_enabled(load_user_config_effective(Path(home) / "config.yaml", fail_closed=True))
-
-
-def _validate_release_handover(home: Path, candidate: Path) -> None:
-    from hermes_cli.gateway_forward_update import capable
-    from hermes_cli.config_effective import load_user_config_effective
-    from gateway.config import _coerce_bool
-    if capable(candidate):
-        config = load_user_config_effective(Path(home) / 'config.yaml', fail_closed=True)
-        legacy = ((config.get('gateway') or {}).get('overlap_handover') or {})
-        if _coerce_bool(legacy.get('enabled', False), False):
-            raise ValueError('gateway.overlap_handover.enabled must be false to stage or activate a forward-only release')
-
-
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
                   uv: str = "uv", plugin_dir: Path | None = None,
                   source_python: Path | None = None) -> tuple[Path, str]:
-    _validate_handover_config(home)
     paths = ReleasePaths.for_home(home)
     sha = sha or release_sha(source)
     target = paths.release(sha)
     if target.is_symlink():
         raise RuntimeError(f"release target is a symlink, refusing to follow or replace: {target}")
     if _release_is_ready(target, sha):
-        _validate_release_handover(home, target)
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
         return target, "existing"
     if target.exists() or target.is_symlink():
@@ -528,7 +509,6 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
             _copy_tree(source, staging, home=paths.home)
         if not (staging / "hermes_cli" / "immutable_releases.py").is_file():
             raise RuntimeError(f"revision {sha} predates immutable releases and cannot be staged")
-        _validate_release_handover(home, staging)
         if (source / ".git").exists():
             _build_candidate_web(staging)
         prepare_venv(staging, previous=read_pointer(paths.current), uv=uv,
@@ -717,7 +697,8 @@ def _runs_hermes_main(argv: list[str], root: Path) -> bool:
     return argv[1:4] == runtime_command(root, (), module="hermes_cli.main", python=argv[0])[1:4]
 
 
-def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -> bool:
+def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None,
+                                probe_timeout: float = 10) -> bool:
     """Finish a pending reload only after observing its supervised gateway."""
     paths = ReleasePaths.for_home(home)
     record = _read_txn(paths)
@@ -742,7 +723,7 @@ def acknowledge_running_release(home: Path, *, gateway_pid: int | None = None) -
         return False
     import psutil
     from hermes_cli.gateway_launchd import _launchctl_supervised_pid
-    supervisor_pid = _launchctl_supervised_pid(label)
+    supervisor_pid = _launchctl_supervised_pid(label, timeout=probe_timeout)
     if not supervisor_pid:
         return False
     try:
@@ -804,7 +785,10 @@ def wait_for_release_acknowledgement(home: Path, *, timeout_seconds: float = 180
     pending = ReleasePaths.for_home(home).home / "release-txn.json"
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     while pending.exists():
-        if acknowledge_running_release(home) or not pending.exists():
+        # The launchd probe spends only what is left of this bounded wait.
+        probe = max(0.0, min(10.0, deadline - time.monotonic()))
+        if (probe > 0 and (acknowledge_running_release(home, probe_timeout=probe) if probe < 10
+                           else acknowledge_running_release(home))) or not pending.exists():
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -950,10 +934,8 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
     bytes atomically; reload_callback only reloads launchd and returns False on
     failure. It must tolerate retry after a crash before reload_done is durable.
     """
-    _validate_handover_config(home)
     paths = ReleasePaths.for_home(home)
     candidate = Path(candidate).resolve()
-    _validate_release_handover(home, candidate)
     if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
         raise ValueError(f"candidate is not a complete release under {paths.releases}: {candidate}")
     if operation not in {"promote", "rollback"}:
@@ -1085,18 +1067,6 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     keep.update(p.resolve() for p in extra_pins)
     keep.update(_live_process_pins(paths.home))
     keep.update(_receipt_pins(paths.home))
-    # A dead claimant can still be unretired. Process scans alone do not pin it,
-    # and a draining generation may have obligations on a release older than previous.
-    coordinator_path = paths.home / 'gateway-coordinator.db'
-    from gateway.generation import GenerationCoordinator
-    if coordinator_path.exists():
-        keep.update(paths.release(row['release_sha']).resolve()
-                    for row in GenerationCoordinator(paths.home).generations() if row['state'] != 'exited')
-    intent = paths.home / 'forward-update.json'
-    if intent.exists():
-        record = json.loads(intent.read_text(encoding='utf-8-sig'))
-        if record.get('outcome') in {'running', 'blocked'}:
-            keep.update(Path(record[key]).resolve() for key in ('previous', 'current') if record.get(key))
     current_previous = {p.resolve() for p in (read_pointer(paths.current), read_pointer(paths.previous)) if p}
     keep.update(p.resolve() for p in [p for p in releases if p.resolve() not in current_previous][:rollback_count])
     removed = []

@@ -539,6 +539,9 @@ def test_zero_prefetch_max_age_disables_the_bound(clock):
     assert parse_prefetch_max_age("not a number") == DEFAULT_PREFETCH_MAX_AGE_S
     assert parse_prefetch_max_age("600") == 600.0
     assert parse_prefetch_max_age(0) is None
+    # Non-finite values must not disable the bound: nan > 0 is False.
+    for value in ("nan", "NaN", float("nan"), "inf", float("inf"), "-inf"):
+        assert parse_prefetch_max_age(value) == DEFAULT_PREFETCH_MAX_AGE_S, value
 
     agent, _ = _session_with_buffering_provider(max_age=parse_prefetch_max_age(0))
     _run_turn(agent, HUMAN)
