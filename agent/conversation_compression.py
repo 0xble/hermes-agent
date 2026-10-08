@@ -3802,6 +3802,7 @@ def _commit_compaction(
                 _leading_rewritten = next(
                     (i for i, m in enumerate(_tail_rows) if _tail_row_is_still_verbatim(m)), len(_tail_rows))
                 tail_count = len(_tail_rows) - _leading_rewritten
+                _tail_held = messages[max(0, len(messages) - tail_count):]
                 # The rewind takes the newest `tail_count` durable rows as the tail's originals, so a tail row
                 # with none (this turn's user row, which the CLI and gateway persist after preflight; unflushed
                 # scaffolding) would flag a summarized row superseded instead: gone from display and search.

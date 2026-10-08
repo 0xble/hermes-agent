@@ -529,7 +529,8 @@ from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    record_delivery_outcome, recover_interrupted_executions, terminalize_dead_owner)
+    record_delivery_outcome, recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
+from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"

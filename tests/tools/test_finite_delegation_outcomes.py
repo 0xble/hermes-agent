@@ -169,16 +169,6 @@ def test_finite_batch_returns_parent_interruption(harness, monkeypatch):
     parent, children, dispatch = harness
     children.extend([_Child(), _Child("slow")])
     slow = children[1]
-    first_reported = threading.Event()
-    from tools import delegate_tool_dispatch as dispatch_module
-    original_report = dispatch_module._report_child_done
-
-    def report_completion(*args, **kwargs):
-        original_report(*args, **kwargs)
-        if args[2]["task_index"] == 0:
-            first_reported.set()
-
-    monkeypatch.setattr(dispatch_module, "_report_child_done", report_completion)
     stop_errors = []
     # The child's own close() runs inside its worker before the future resolves, so stopping the
     # parent then can catch the sibling still pending and report it interrupted. Wait until the
@@ -188,7 +178,7 @@ def test_finite_batch_returns_parent_interruption(harness, monkeypatch):
     report = dispatch_mod._report_child_done
 
     def report_and_signal(*args, **kwargs):
-        original_report(*args, **kwargs)
+        report(*args, **kwargs)
         collected.set()
 
     monkeypatch.setattr(dispatch_mod, "_report_child_done", report_and_signal)
@@ -196,7 +186,7 @@ def test_finite_batch_returns_parent_interruption(harness, monkeypatch):
     def stop_parent():
         try:
             assert slow.started.wait(3)
-            assert first_reported.wait(3), "first child result was not collected"
+            assert collected.wait(3)
             parent.hard_interrupt("test parent stop")
         except Exception as exc:
             stop_errors.append(exc)

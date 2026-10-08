@@ -309,6 +309,7 @@ async def test_prepare_turn_stages_expiry_notice_once_before_run_sync(monkeypatc
 
     session_entry = SimpleNamespace(
         session_key=session_key, session_id="session-1", created_at=100.0, updated_at=100.0,
+        yolo=False,
     )
     runner.config = SimpleNamespace(
         get_connected_platforms=lambda: [],
@@ -464,12 +465,12 @@ def test_non_static_fast_modes_never_get_a_deadline(monkeypatch, tmp_path, tier)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("base_url, provider, warned", [
-    ("http://127.0.0.1:8317/v1", "custom:codex-proxy", True),   # proxy: params never sent
-    ("https://api.openai.com/v1", "openai", False),              # first-party: fast applies
+@pytest.mark.parametrize("base_url, provider, route_supported", [
+    ("http://127.0.0.1:8317/v1", "custom:codex-proxy", False),  # proxy: params never sent
+    ("https://api.openai.com/v1", "openai", True),              # first-party: fast applies
 ])
-async def test_fast_warns_when_the_route_never_receives_fast_params(monkeypatch, tmp_path, base_url, provider, warned):
-    """`/fast` on a route that strips fast params must say it has no effect, not imply it applied."""
+async def test_fast_follows_the_route_capability_gate(monkeypatch, tmp_path, route_supported, base_url, provider):
+    """`/fast` must refuse a route that cannot carry the selected fast-mode parameters."""
     runner = _make_runner()
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
@@ -477,8 +478,14 @@ async def test_fast_warns_when_the_route_never_receives_fast_params(monkeypatch,
     runner._resolve_session_agent_runtime = lambda **_: ("gpt-5.4", {"provider": provider, "base_url": base_url})
 
     response = await runner._handle_fast_command(_make_event("/fast fast"))
-    assert "FAST" in response
-    assert ("no effect" in response) is warned
+    assert response is not None
+    if route_supported:
+        assert "FAST" in response
+    else:
+        assert "only available" in response
+        assert runner._resolve_session_service_tier(
+            session_key=runner._session_key_for_source(_make_event("/fast fast").source)
+        ) is None
 
     off = await runner._handle_fast_command(_make_event("/fast normal"))
     assert "no effect" not in off

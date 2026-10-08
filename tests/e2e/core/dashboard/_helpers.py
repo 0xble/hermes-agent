@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
+import hermes_state
 import hermes_yaml as yaml
 
 from tests.fakes.fake_llm_provider import FakeLLMServer
@@ -322,11 +323,24 @@ def group_members(pgid: int) -> dict[_reaper.Identity, str]:
 
 
 def db_rows(db: Path, sql: str, args: tuple = ()) -> list[tuple]:
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
-    try:
-        return conn.execute(sql, args).fetchall()
-    finally:
-        conn.close()
+    """Read-only query that tolerates the transient SQLITE_IOERR a concurrent WAL writer's
+    checkpoint can surface to a ``mode=ro`` reader. It uses the same bounded budget and
+    error marker as production read-only opens (#100436). Lock waits and other errors
+    are not retried."""
+    for attempt in range(hermes_state._READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
+            return conn.execute(sql, args).fetchall()
+        except sqlite3.OperationalError as err:
+            transient = hermes_state._DISK_IO_ERROR_MARKER in str(err).lower()
+            if attempt >= hermes_state._READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
+                raise
+            time.sleep(hermes_state._READ_ONLY_IOERR_RETRY_BACKOFF_S)
+        finally:
+            if conn is not None:
+                conn.close()
+    raise AssertionError("unreachable")
 
 
 def run_py(sb: Sandbox, code: str, *args: str, hermes_home: Path | None = None,
