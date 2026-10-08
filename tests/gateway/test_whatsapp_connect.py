@@ -15,7 +15,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 import asyncio
 import signal
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -464,8 +464,15 @@ class TestHttpSessionLifecycle:
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock):
             await adapter.disconnect()
 
-        mock_run.assert_called_once()
-        assert mock_run.call_args.args[0] == ["taskkill", "/PID", "12345", "/T"]
+        expected_taskkill = call(
+            ["taskkill", "/PID", "12345", "/T"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        assert mock_run.mock_calls.count(expected_taskkill) == 1
         mock_proc.terminate.assert_not_called()
         mock_proc.kill.assert_not_called()
 
