@@ -101,8 +101,16 @@ async def test_dispatch_stall_logs_bounded_ptb_await_chain_and_survives_collecti
     caplog.set_level(logging.WARNING)
     event = asyncio.Event()
 
-    async def blocked_dispatcher():
+    async def blocked_handler():
         await event.wait()
+
+    async def process_update_wrapper():
+        # PTB shape: the fetcher/processing task's own coroutine awaits a wrapper that awaits the
+        # handler, so the blocked frame sits two awaits below the task's top-level coroutine.
+        await blocked_handler()
+
+    async def blocked_dispatcher():
+        await process_update_wrapper()
 
     blocked = asyncio.create_task(
         blocked_dispatcher(), name="Application:123:process_concurrent_update"
@@ -120,7 +128,9 @@ async def test_dispatch_stall_logs_bounded_ptb_await_chain_and_survives_collecti
             if record.getMessage().startswith("[Telegram] deaf-dispatcher diagnostics:")
         ]
         assert len(diagnostics) == 1
-        assert "blocked_dispatcher" in diagnostics[0]
+        chain = diagnostics[0].split("Application:123:process_concurrent_update: ", 1)[1]
+        assert chain.index("blocked_dispatcher@") < chain.index("process_update_wrapper@") < chain.index("blocked_handler@")
+        assert "test_telegram_ingress_delivery_gap.py:" in chain and "/" not in chain.split("]", 1)[0]
         assert len(diagnostics[0]) <= 8_000
 
         caplog.clear()

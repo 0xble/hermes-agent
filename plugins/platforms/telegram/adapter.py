@@ -13,7 +13,6 @@ import html as _html
 import re
 import sqlite3
 import time
-import traceback
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -822,6 +821,29 @@ _POLLING_STALL_TIMEOUT = 150.0
 # that PTB's dispatcher ever handed the fetched updates to a handler. Two heartbeats (180s) with a
 # backlog and no dispatch progress: diagnostic only, never drives recovery (#71240 owns that).
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 2
+
+
+def _await_chain(coro: Any, limit: int = 30) -> List[str]:
+    """Render a suspended coroutine's await chain, outermost first, as ``func@file.py:line``.
+
+    ``Task.get_stack()`` stops at the task's own coroutine; following ``cr_await`` reaches the frame
+    that is actually blocked (a handler nested under PTB's fetcher/wrapper coroutines)."""
+    chain: List[str] = []
+    seen: Set[int] = set()
+    while coro is not None and len(chain) < limit and id(coro) not in seen:
+        seen.add(id(coro))
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+        if frame is not None:
+            chain.append(f"{frame.f_code.co_name}@{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}")
+        nxt = getattr(coro, "cr_await", None)
+        if nxt is None:
+            nxt = getattr(coro, "gi_yieldfrom", None)
+        if nxt is not None and getattr(nxt, "cr_frame", None) is None and getattr(nxt, "gi_frame", None) is None:
+            # A Future/Task or other awaitable: name it and stop (its own chain is a separate task).
+            chain.append(f"<{type(nxt).__name__}>")
+            break
+        coro = nxt
+    return chain
 # sendVideo transcodes before answering, outlasting the 20s read timeout; also how long a user waits
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
@@ -2837,12 +2859,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     tasks.append((name, qualname, task))
             tasks.sort(key=lambda item: (item[0], item[1]))
             for name, qualname, task in tasks[:5]:
-                frames: list[str] = []
-                for frame in task.get_stack(limit=30):
-                    location = f"{frame.f_code.co_name}@{frame.f_code.co_filename}:{frame.f_lineno}"
-                    rendered = "".join(traceback.format_stack(frame, limit=1)).strip()
-                    frames.append(f"{location} {rendered}")
-                stack = " | ".join(frames) if frames else "<no stack>"
+                stack = " > ".join(_await_chain(task.get_coro())) or "<no stack>"
                 task_details.append(f"{name or qualname}: {stack}")
         except Exception:
             logger.debug("[%s] failed to collect Telegram deaf-dispatcher task diagnostics", self.name, exc_info=True)
