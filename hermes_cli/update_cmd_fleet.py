@@ -1015,14 +1015,42 @@ def _acknowledged_release_launchd_label(home: Path, root: Path) -> str | None:
         if not any(p.pid == gateway_pid and Path(p.cwd()).resolve() == root.resolve()
                    for p in processes):
             return None
-        # ACK proves the incarnation and plist, not that it still serves the
-        # intended code. A stale or unreadable live identity cannot earn credit.
         from hermes_cli.update_receipt import collect_fleet_versions
         resolved_root = root.resolve()
-        rows = collect_fleet_versions(expected_sha_override=root.name, expected_root_override=resolved_root)
-        if not any(row.get("pid") == gateway_pid and row.get("state") == "current"
-                   and row.get("code_root") == str(resolved_root) for row in rows):
-            return None
+
+        def row_matches_release(row: dict) -> bool:
+            code_root = row.get("code_root")
+            if not isinstance(code_root, str):
+                return False
+            try:
+                return row.get("state") == "current" and Path(code_root).resolve() == resolved_root
+            except (OSError, TypeError, ValueError):
+                return False
+
+        def row_for_gateway(rows: list[dict]) -> dict | None:
+            return next((row for row in rows if row.get("pid") == gateway_pid), None)
+
+        # A gateway publishes its fleet row after startup. A row for this PID is
+        # authoritative when present: stale or mismatched identity must take the
+        # normal one-time corrective relaunch. Only the absence of this PID is
+        # transient, so wait within the same settle bound used by post-update fleet
+        # verification before crediting the ACK without a row.
+        rows = collect_fleet_versions(
+            expected_sha_override=root.name, expected_root_override=resolved_root)
+        row = row_for_gateway(rows)
+        if row is not None:
+            return label if row_matches_release(row) else None
+        deadline = _time.monotonic() + _FLEET_PROBE_SETTLE_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            _time.sleep(min(2.0, remaining))
+            row = row_for_gateway(collect_fleet_versions(
+                expected_sha_override=root.name, expected_root_override=resolved_root))
+            if row is not None:
+                return label if row_matches_release(row) else None
+        # Verification below remains the authority if the row never appears.
         return label
     except (OSError, ValueError, KeyError, TypeError, psutil.Error):
         return None
@@ -1154,6 +1182,15 @@ def _restart_macos_launchd_gateways(
     # provably this install's, so the #41403 boundary (never touch another install's fleet) holds.
     # See #115254.
     legacy_labels = legacy_launchd_labels_for_install(exclude=set(derived_labels) | {current_label})
+    # The opt-in guardian has a gateway-looking label but is not a gateway fleet
+    # member. When disabled, its stale plist must not be kickstarted (it exits 2
+    # and only adds a second launchd action to the update). Enabled guardians keep
+    # their existing restart behavior.
+    if "ai.hermes.gateway-guardian" in legacy_labels:
+        from hermes_cli.gateway_guardian import enabled as guardian_enabled
+        from hermes_constants import get_hermes_home
+        if not guardian_enabled(get_hermes_home()):
+            legacy_labels.remove("ai.hermes.gateway-guardian")
     if legacy_labels:
         print(f"  ↻ legacy-labelled units of this install join the restart: {', '.join(legacy_labels)}")
     from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home
