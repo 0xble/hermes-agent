@@ -675,3 +675,18 @@ async def test_unroutable_marker_waits_for_the_outcome_then_clears(tmp_path):
         with patch("gateway.status.live_gateway_pid_for_home", return_value=1234):
             assert await runner._send_update_notification() is True
     assert read_pending(tmp_path) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("process_exited", [False, True])
+async def test_unroutable_marker_timeout_releases_only_after_the_updater_exits(tmp_path, process_exited):
+    """A watcher deadline must not free the admission of an update that is still running."""
+    _unroutable_pending(tmp_path)
+    if process_exited:
+        # Exited cleanly but left no receipt for this request, so the outcome stays unknown.
+        (tmp_path / ".update_process_exit_code").write_text("0")
+    runner = _make_runner()
+    with patch("gateway.run._hermes_home", tmp_path):
+        released = await runner._send_update_notification(timed_out=True)
+    assert released is process_exited
+    assert (read_pending(tmp_path) is None) is process_exited
