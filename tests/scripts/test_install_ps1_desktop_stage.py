@@ -94,7 +94,19 @@ function global:New-StubShortcut {
 function global:New-StubShell {
     $shell = [pscustomobject]@{}
     $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
-        return New-StubShortcut
+        # Script methods have their own session scope; build the shortcut stub
+        # here instead of relying on a helper lookup from that scope.
+        $sc = [pscustomobject]@{
+            TargetPath       = ""
+            WorkingDirectory = ""
+            IconLocation     = ""
+            Description      = ""
+        }
+        $sc | Add-Member -MemberType ScriptMethod -Name Save -Value {
+            Add-Content -Path $env:WSH_LOG `
+                -Value "SAVED:$($this.TargetPath)|$($this.WorkingDirectory)|$($this.IconLocation)"
+        }
+        return $sc
     }
     return $shell
 }
