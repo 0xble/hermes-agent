@@ -2305,6 +2305,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return _not_found(session_id)
         if deadline is not None and time.monotonic() >= deadline:
             return {"status": "deadline", "session_id": session_id}
+        previous_kill_deadline = session._kill_deadline
         session._kill_deadline = deadline
         if session.exited:
             # A double-forked descendant may still be alive in the systemd scope even
@@ -2323,7 +2324,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
                 self._completion_consumed.add(session_id)
-            session._kill_deadline = None
+            session._kill_deadline = previous_kill_deadline
             return result
         try:
             early = self._signal_kill(session, session_id, consume_output, deadline=deadline)
@@ -2383,7 +2384,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # The deadline only fences the reader while this kill is reconciling its result.
             # Leaving it set makes a later reader callback skip both the completion receipt and
             # checkpoint forever after the deadline expires.
-            session._kill_deadline = None
+            session._kill_deadline = previous_kill_deadline
 
     def _signal_kill(
         self, session: ProcessSession, session_id: str, consume_output: bool,
@@ -2689,11 +2690,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 and s.id not in exclude_ids
                 and not (lifecycle and s.persist_on_release)
             ]
-            # The reader/waiter can finish a session between this snapshot and
-            # the signal sweep. Preserve the initial state so an already-exited
-            # session is never counted as killed by this invocation.
-            exited_before_sweep = {s.id for s in candidates if s.exited}
             targets = [s for s in candidates if not s.exited]
+        detached_nonrunning = [
+            session for session in targets
+            if session.detached
+            and session.pid_scope == "host"
+            and session.pid
+            and self._detached_host_fate(session.pid, session.host_start_time) != "running"
+        ]
+        for session in detached_nonrunning:
+            self._close_reused_detached(session)
+        targets = [session for session in targets if session not in detached_nonrunning]
         def _fallback_kill_one(session: ProcessSession) -> bool:
             if stop_event is not None and stop_event.is_set():
                 return False
@@ -2769,6 +2776,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     return bool(session._pty.isalive())
                 return True
             if session.pid_scope == "host" and session.pid:
+                if session.detached:
+                    return self._host_pid_is_ours(session.pid, session.host_start_time)
                 return self._is_host_pid_alive(session.pid)
             return False
 
@@ -3005,8 +3014,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     moved = self._move_to_finished(session)
                     if not moved and (deadline is None or time.monotonic() < deadline):
                         save_completed_result(session)
-                    if session.id not in exited_before_sweep:
-                        killed += 1
+                    killed += 1
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
                 remainder = [session for session in targets if session not in signalable]
                 if remainder:

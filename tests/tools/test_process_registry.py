@@ -211,6 +211,61 @@ def test_kill_all_reconciles_reader_race_with_killed_completion_metadata(registr
     assert session.id in registry._completion_consumed
 
 
+def test_bounded_kill_all_does_not_invent_completion_for_gone_detached_session(
+    registry, monkeypatch
+):
+    """A recovered detached PID that is already gone is closed without a kill result."""
+    session = _make_session(sid="proc_detached_gone")
+    session.pid = 424242
+    session.pid_scope = "host"
+    session.detached = True
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "gone")
+
+    with patch("tools.process_registry.save_completed_result") as save:
+        killed = registry.kill_all(
+            deadline=time.monotonic() + 1.0,
+            source="gateway_shutdown",
+            consume_output=True,
+        )
+
+    assert killed == 0
+    assert save.call_count == 0
+    assert registry.completion_queue.empty()
+
+
+def test_bounded_kill_all_closes_detached_session_when_pid_recycles_during_sweep(
+    registry, monkeypatch
+):
+    """A detached PID recycled after snapshot is not kept alive by its number alone."""
+    session = _make_session(sid="proc_detached_recycled_during_sweep")
+    session.pid = os.getpid()
+    session.pid_scope = "host"
+    session.detached = True
+    session.host_start_time = 123
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "running")
+    identity_checks = iter([True, False, False, False])
+    monkeypatch.setattr(
+        registry,
+        "_host_pid_is_ours",
+        lambda *_args: next(identity_checks, False),
+    )
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.2)
+    monkeypatch.setattr("tools.process_registry.os.getpgid", lambda _pid: os.getpgrp())
+    monkeypatch.setattr("tools.process_registry.os.kill", lambda *_args: None)
+
+    killed = registry.kill_all(
+        deadline=time.monotonic() + 1.0,
+        source="gateway_shutdown",
+        consume_output=True,
+    )
+
+    assert killed == 1
+    assert session.id in registry._finished
+    assert session.exited is True
+
+
 def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
     """A TERM-exiting root cannot hide a same-group child that ignores TERM."""
     pytest.importorskip("psutil")
@@ -1799,6 +1854,22 @@ class TestCheckpoint:
 # =========================================================================
 
 class TestKillProcess:
+    def test_kill_restores_existing_deadline_fence(self, registry):
+        """An inner kill must preserve the fence installed by an outer sweep."""
+        session = _make_session(sid="proc_deadline_fence")
+        registry._running[session.id] = session
+        outer_deadline = time.monotonic() + 2.0
+        inner_deadline = time.monotonic() + 1.0
+        session._kill_deadline = outer_deadline
+
+        with patch.object(
+            registry, "_signal_kill", side_effect=RuntimeError("signal failed")
+        ):
+            result = registry.kill_process(session.id, deadline=inner_deadline)
+
+        assert result["status"] == "error"
+        assert session._kill_deadline == outer_deadline
+
     def test_kill_already_exited_passes_remaining_systemd_timeout(self, registry):
         s = _make_session(sid="proc_exited_scope", exited=True, exit_code=0)
         s.systemd_unit = "hermes-worker-proc_exited_scope.scope"
