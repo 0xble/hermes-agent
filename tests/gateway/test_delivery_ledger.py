@@ -13,6 +13,7 @@ import os
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -124,6 +125,9 @@ class TestSchemaMigration:
             conn.close()
 
         assert "adapter_profile" in columns
+        assert {
+            "resume_marker_session_id", "resume_marker_token", "resume_marker_marked_at", "resume_turn_id",
+        } <= columns
 
 
 class TestStateMachine:
@@ -145,6 +149,17 @@ class TestObligationId:
 
 
 class TestSweep:
+    def test_claim_preserves_resume_owner(self):
+        marker = ("session-id", "marker-token", datetime(2026, 1, 2, 3, 4, 5))
+        dl.record_obligation(
+            obligation_id="owned", session_key="s", platform="p", chat_id="c", thread_id=None,
+            content="hello", resume_marker=marker, resume_turn_id="turn-id",
+        )
+        _orphan("owned")
+        claimed = dl.sweep_recoverable(deliverable_platforms={"p"})
+        assert claimed[0]["resume_marker"] == marker
+        assert claimed[0]["resume_turn_id"] == "turn-id"
+
     def test_live_owner_rows_never_claimed(self):
         _record()  # owner = this (live) process
         assert dl.sweep_recoverable() == []

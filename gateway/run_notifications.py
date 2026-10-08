@@ -164,6 +164,11 @@ def _raw_process_event_session_id(evt: dict) -> str:
     return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
+def _media_send_succeeded(result) -> bool:
+    """A media send counts as delivered only on an explicit successful SendResult."""
+    return bool(getattr(result, "success", False))
+
+
 class GatewayNotificationsMixin:
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
@@ -545,7 +550,7 @@ class GatewayNotificationsMixin:
 
     async def _deliver_media_from_response(
         self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
+    ) -> bool:
         """Deliver explicit MEDIA: tags from an already-streamed response (text already delivered).
         EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
         path in a streamed reply is shown text or stale inspected content, and promoting it sent
@@ -553,9 +558,10 @@ class GatewayNotificationsMixin:
         directive is a deliberate attach); stale auto-appended tags are deduped upstream.
 
         Only ``MEDIA:`` directives — the explicit attachment contract — trigger post-stream uploads. See
-        #20834.
+        #20834. Returns True when at least one upload was confirmed delivered.
         """
         from urllib.parse import quote as _quote
+        delivered_any = False
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
@@ -587,22 +593,27 @@ class GatewayNotificationsMixin:
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    _res = await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    delivered_any = delivered_any or _media_send_succeeded(_res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        _res = await adapter.send_voice(
                             chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
                         )
+                        delivered_any = delivered_any or _media_send_succeeded(_res)
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        _res = await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        delivered_any = delivered_any or _media_send_succeeded(_res)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        _res = await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        delivered_any = delivered_any or _media_send_succeeded(_res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+        return delivered_any
 
 
     async def _deliver_queued_first_response(
@@ -624,6 +635,8 @@ class GatewayNotificationsMixin:
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        note_event = MessageEvent(text="", source=source, message_id=event_message_id)
+        delivered_confirmed = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -642,6 +655,7 @@ class GatewayNotificationsMixin:
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            delivered_confirmed = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -670,14 +684,26 @@ class GatewayNotificationsMixin:
                         # the caller's normal completion send replays the whole response (text and
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
-        # Failed turns deliver their (normalized failure) text but must not upload attachments as if
+                    delivered_confirmed = True
+        if (delivered_confirmed and session_key
+                and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
+            if not hasattr(note_event, "_restart_note_marker_api_available"):
+                await adapter._capture_restart_note_marker(note_event, session_key)
+            await adapter._reconcile_restart_note_after_delivery(note_event, session_key)
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
             return True
-        await self._deliver_media_from_response(
+        media_delivered = await self._deliver_media_from_response(
             response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
             thread_metadata=metadata,
         )
+        # Attachment-only answer: no text was sent, so the note is reconciled only once an upload
+        # is confirmed (same ownership-checked path as the text branch above).
+        if (media_delivered and not delivered_confirmed and session_key
+                and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
+            if not hasattr(note_event, "_restart_note_marker_api_available"):
+                await adapter._capture_restart_note_marker(note_event, session_key)
+            await adapter._reconcile_restart_note_after_delivery(note_event, session_key)
         return True
 
     async def _send_queued_final_text(

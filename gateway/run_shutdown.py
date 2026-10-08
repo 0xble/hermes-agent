@@ -28,10 +28,30 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
+from agent.async_utils import consume_detached_task_result
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+async def _cancel_task_with_grace(task: "asyncio.Future", grace: float = 0.5) -> bool:
+    """Cancel ``task`` and wait only a short grace before detaching it.
+
+    Some transports swallow ``CancelledError`` while stuck in I/O. Waiting for such a task
+    without a bound wedges restart recovery forever; a task that misses the grace is detached
+    and its result is consumed when it eventually finishes.
+    """
+    task.cancel()
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=grace)
+    except asyncio.CancelledError:
+        task.add_done_callback(consume_detached_task_result)
+        raise
+    if task not in done:
+        task.add_done_callback(consume_detached_task_result)
+        return False
+    return True
 
 
 def _exit_with_failure_verdict(runner) -> bool:
@@ -906,7 +926,14 @@ class GatewayShutdownMixin:
             if _agent is _AGENT_PENDING_SENTINEL:
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
-                await self.async_session_store.mark_resume_pending(_sk, reason)
+                _state = getattr(self, "_peek_session_state", lambda _key: None)(_sk)
+                _event = getattr(getattr(_state, "turn", None), "event", None)
+                _human = bool(_event is not None and getattr(self, "_is_user_turn_event", lambda _event: not _event.internal)(_event))
+                _entry = getattr(self.session_store, "_entries", {}).get(_sk)
+                _turn_id = getattr(_entry, "active_turn_token", None)
+                await self.async_session_store.mark_resume_pending(
+                    _sk, reason, turn_id=_turn_id, human=_human,
+                )
                 marked.append(_sk)
         return marked
 
@@ -926,6 +953,284 @@ class GatewayShutdownMixin:
             "Shutdown notification suppressed for %s: %s has gateway_restart_notification=false", what, platform.value,
         )
         return False
+
+    async def _send_interrupted_turn_notes(
+        self, session_keys, *, reclaim_pending: bool = False,
+        cancel_on_timeout: bool = False, timeout: float = 2.0,
+        shutdown_fallback_keys=None,
+    ) -> int:
+        """Ensure one visible note for each interrupted human turn.
+
+        This deliberately bypasses ``gateway_restart_notification``: that flag controls broadcast
+        noise, not the per-turn recovery contract. The session row is the durable deduplication latch.
+        Sends run concurrently behind one hard deadline so a slow transport cannot delay agent
+        interruption; unfinished claims remain reclaimable by startup recovery.
+        """
+        async def _send_one(session_key) -> int:
+            marker = None
+            send_started = False
+            claim_kept = False
+            release_claim = None
+            note_claims = getattr(self, "_s2_note_claimed_keys", None)
+            if note_claims is None:
+                note_claims = self._s2_note_claimed_keys = {}
+            note_failed = getattr(self, "_s2_note_failed_keys", None)
+            if note_failed is None:
+                note_failed = self._s2_note_failed_keys = set()
+            entry_snapshot = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+            claim_token = (
+                getattr(entry_snapshot, "resume_marker_token", None),
+                getattr(entry_snapshot, "last_resume_marked_at", None),
+            )
+            existing_claim = note_claims.get(session_key)
+            if existing_claim in (claim_token, ("fallback",)):
+                return 0
+            # This in-memory claim fences the late note task against the ordinary shutdown fallback.
+            # It is taken before the first await, so a fallback that wins the race prevents a late
+            # transport completion from posting a second visible notice.
+            note_claims[session_key] = claim_token
+            try:
+                entry = self.session_store._entries.get(session_key)
+                if entry is None or not getattr(entry, "resume_pending", False) or not getattr(entry, "resume_human", True):
+                    return 0
+                marker = await self.async_session_store.get_resume_pending_marker(session_key)
+                async def release_claim():
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
+                note = await self.async_session_store.get_restart_note(session_key)
+                # A visible note is terminal. A pending claim is reclaimable only during startup
+                # recovery; a sending marker is ambiguous and must never be retried or converted
+                # into an ordinary notice.
+                if note and note[3]:
+                    note_id = str(note[3])
+                    if not (reclaim_pending and note_id.startswith("pending:")):
+                        if note_id.startswith("sending:"):
+                            logger.warning(
+                                "Not retrying interrupted-turn note for %s: durable send is ambiguous",
+                                session_key,
+                            )
+                            return 0
+                        getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
+                        return 0
+                target = await self._shutdown_notification_target(session_key)
+                if note_claims.get(session_key) == ("fallback",):
+                    return 0
+                if target is None:
+                    note_failed.add(session_key)
+                    return 0
+                source, platform_str, chat_id, thread_id, profile = target
+                platform = Platform(platform_str)
+                adapter = self._delivery_adapter_for(source) if source is not None else None
+                if adapter is None:
+                    adapter = self._authorization_adapter(platform, profile)
+                if adapter is None:
+                    note_failed.add(session_key)
+                    return 0
+                if not await self.async_session_store.claim_restart_note(
+                    session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
+                ):
+                    return 0
+                if note_claims.get(session_key) == ("fallback",):
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
+                    return 0
+                metadata = self._thread_metadata_for_target(
+                    platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
+                    reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,
+                )
+                from gateway.run import _async_profile_runtime_scope, resolve_restart_resume_policy
+                profile_home = None
+                if source is not None:
+                    resolve_home = getattr(self, "_resolve_profile_home_for_source", None)
+                    if callable(resolve_home):
+                        with suppress(Exception):
+                            profile_home = resolve_home(source)
+                scope = (_async_profile_runtime_scope(profile_home) if profile_home else nullcontext())
+                async with scope:
+                    policy = resolve_restart_resume_policy(self.config, adapter)
+                    text = t(
+                        "gateway.shutdown.interrupted_turn" if policy == "continue"
+                        else ("gateway.shutdown.notice_restart" if (reclaim_pending
+                              or getattr(self, "_restart_requested", False))
+                              else "gateway.shutdown.notice_shutdown")
+                    )
+                    send_started = await self.async_session_store.mark_restart_note_sending(
+                        session_key, expected_marker=marker,
+                    )
+                    if not send_started:
+                        return 0
+                    if note_claims.get(session_key) == ("fallback",):
+                        await self.async_session_store.release_restart_note_after_failed_send(
+                            session_key, expected_marker=marker,
+                        )
+                        return 0
+                    result = await adapter.send(
+                        chat_id, text,
+                        metadata={**(metadata or {}), "_interim_send": True},
+                    )
+
+                if not result or not getattr(result, "success", False):
+                    note_failed.add(session_key)
+                    if send_started:
+                        await self.async_session_store.release_restart_note_after_failed_send(
+                            session_key, expected_marker=marker,
+                        )
+                    elif callable(release_claim):
+                        await release_claim()
+                    return 0
+                note_id = getattr(result, "message_id", None) or "sent:no-id"
+                if await self.async_session_store.set_restart_note_message_id(
+                    session_key, str(note_id), expected_marker=marker,
+                ):
+                    getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
+                    claim_kept = True
+                    return 1
+                # The transport accepted the note but the local record could not be updated. Keep
+                # the claim and never retry: an ambiguous send is safer as one possible note than a
+                # duplicate visible note.
+                claim_kept = True
+                return 0
+            except asyncio.CancelledError:
+                if send_started:
+                    # The transport may have accepted the request; keep the terminal sending marker.
+                    claim_kept = True
+                else:
+                    # Cancellation before the transport boundary leaves a reclaimable pending claim.
+                    if callable(release_claim):
+                        try:
+                            await asyncio.wait_for(asyncio.shield(release_claim()), timeout=0.5)
+                        except Exception:
+                            pass
+                raise
+            except Exception:
+                if send_started:
+                    # An adapter exception is ambiguous: the request may have reached the transport.
+                    claim_kept = True
+                    logger.warning(
+                        "Interrupted-turn note send became ambiguous for %s; preserving terminal sending claim",
+                        session_key,
+                        exc_info=True,
+                    )
+                else:
+                    note_failed.add(session_key)
+                    if callable(release_claim):
+                        try:
+                            await release_claim()
+                        except Exception:
+                            pass
+                    logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
+                return 0
+            finally:
+                if not claim_kept:
+                    note_claims.pop(session_key, None)
+
+        unique_keys = list(dict.fromkeys(session_keys or ()))
+        if not unique_keys:
+            return 0
+
+        async def _record_shutdown_misses(candidate_keys):
+            """Fence and record shutdown lanes whose note never entered ``sending:``.
+
+            The batch may be detached after cancellation, so task-local ``CancelledError`` handling
+            is not sufficient evidence. Read the durable claim state after the batch deadline instead:
+            a real id is delivered, ``sending:`` is ambiguous and terminal, and anything else is a
+            pre-send miss eligible for the one ordinary shutdown fallback.
+            """
+            note_claims = getattr(self, "_s2_note_claimed_keys", None)
+            if note_claims is None:
+                note_claims = self._s2_note_claimed_keys = {}
+            note_failed = getattr(self, "_s2_note_failed_keys", None)
+            if note_failed is None:
+                note_failed = self._s2_note_failed_keys = set()
+            delivered = getattr(self, "_s2_note_delivered_keys", None)
+            if delivered is None:
+                delivered = self._s2_note_delivered_keys = set()
+            for session_key in dict.fromkeys(candidate_keys or ()):
+                if session_key in delivered or note_claims.get(session_key) == ("fallback",):
+                    continue
+                try:
+                    note = await self.async_session_store.get_restart_note(session_key)
+                except Exception:
+                    note = None
+                note_id = str(note[3]) if note and note[3] else ""
+                if note_id.startswith("sending:"):
+                    continue
+                if note_id and not note_id.startswith("pending:"):
+                    delivered.add(session_key)
+                    continue
+                note_claims[session_key] = ("fallback",)
+                note_failed.add(session_key)
+                if note_id.startswith("pending:"):
+                    with suppress(Exception):
+                        marker = await self.async_session_store.get_resume_pending_marker(session_key)
+                        await self.async_session_store.release_restart_note_claim(
+                            session_key, expected_marker=marker,
+                        )
+
+        async def _send_batch():
+            return await asyncio.gather(*(_send_one(key) for key in unique_keys), return_exceptions=True)
+
+        batch_task = asyncio.create_task(_send_batch())
+        if cancel_on_timeout:
+            # Startup/reconnect resume is ordered after this call whenever the transport honours
+            # cancellation within the short grace. A transport that ignores cancellation is detached
+            # so recovery never hangs; its note may then arrive after the resumed answer.
+            try:
+                wait_timeout = None if timeout <= 0 else timeout
+                done, _pending = await asyncio.wait({batch_task}, timeout=wait_timeout)
+                completed = batch_task in done
+                if not completed:
+                    cancelled_in_grace = await _cancel_task_with_grace(batch_task)
+                    if cancelled_in_grace:
+                        logger.warning(
+                            "Interrupted-turn notes exceeded %.1fs; cancelled and awaited before resume",
+                            timeout,
+                        )
+                    else:
+                        logger.warning(
+                            "Interrupted-turn note task detached for sessions %s after %.1fs timeout; "
+                            "note may arrive after the resumed answer",
+                            unique_keys,
+                            timeout,
+                        )
+                    if shutdown_fallback_keys is not None:
+                        await _record_shutdown_misses(shutdown_fallback_keys)
+                    return 0
+            except asyncio.CancelledError:
+                await _cancel_task_with_grace(batch_task)
+                raise
+        else:
+            # A transport may accept a send just before the local 2s deadline while the durable claim
+            # remains pending; startup recovery can then post one duplicate note. This late-note window
+            # applies whether the configured waiter detaches or the fallback path cancels the batch.
+            wait_or_detach = getattr(self, "_wait_or_detach", None)
+            if callable(wait_or_detach):
+                completed = await wait_or_detach(batch_task, timeout)
+            else:
+                done, _pending = await asyncio.wait({batch_task}, timeout=timeout)
+                completed = batch_task in done
+                if not completed:
+                    batch_task.cancel()
+
+                    def _consume(task):
+                        with suppress(asyncio.CancelledError, Exception):
+                            task.exception()
+
+                    batch_task.add_done_callback(_consume)
+            if not completed:
+                logger.warning("Interrupted-turn notes exceeded %.1fs total; continuing agent interruption", timeout)
+                if shutdown_fallback_keys is not None:
+                    await _record_shutdown_misses(shutdown_fallback_keys)
+                return 0
+        results = batch_task.result()
+        if shutdown_fallback_keys is not None:
+            await _record_shutdown_misses(shutdown_fallback_keys)
+        sent = sum(result for result in results if isinstance(result, int))
+        if sent:
+            logger.info("Shutdown: delivered %d interrupted human-turn note(s)", sent)
+        return sent
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died; returns notices sent.
@@ -1045,10 +1350,13 @@ class GatewayShutdownMixin:
             return False
         return True
 
-    async def _notify_active_sessions_of_shutdown(self) -> None:
+    async def _notify_active_sessions_of_shutdown(
+        self, session_keys=None, *, include_home_channels: bool = True,
+    ) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
+        A targeted call is used after S2 note delivery to notify only lanes whose note was not sent.
         """
         from gateway.update_notifications import notice, read_pending
         update_record = read_pending(self._update_paths().pending.parent) if self._restart_requested else None
@@ -1098,7 +1406,38 @@ class GatewayShutdownMixin:
                     str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id"),
                     profile=update_profile,
                 ))
-        for session_key in self._snapshot_running_agents():
+        for session_key in (self._snapshot_running_agents() if session_keys is None else list(session_keys)):
+            if session_key in getattr(self, "_s2_note_session_keys", set()):
+                # Reserve the S2 note's destination in the same dedup set used by the
+                # home-channel pass. The note is sent after a timed-out drain; without this
+                # reservation an active session that is also the home channel receives the
+                # ordinary broadcast before the S2 note. A failed S2 send clears this fence by
+                # replacing _s2_note_session_keys with the delivered set before the fallback pass.
+                target = await self._shutdown_notification_target(session_key)
+                if target is None:
+                    continue
+                if len(target) == 4:
+                    source, platform_str, chat_id, thread_id = target
+                    profile = None
+                else:
+                    source, platform_str, chat_id, thread_id, profile = target
+                try:
+                    platform = Platform(platform_str)
+                    adapter = self._delivery_adapter_for(source) if source is not None else None
+                    if adapter is None:
+                        adapter = self._authorization_adapter(platform, profile)
+                    if adapter is None:
+                        continue
+                    _, delivery_profile = self._owning_profile(adapter, platform)
+                    notified.add(_delivery_target_key(
+                        platform_str, chat_id, thread_id, profile=delivery_profile,
+                    ))
+                    if (platform == Platform.TELEGRAM and thread_id is not None
+                            and getattr(source, "chat_type", None) in {"dm", "private"}):
+                        private_topic_parents.add((id(adapter), str(chat_id)))
+                except Exception as e:
+                    logger.debug("Failed to reserve S2 shutdown target for %s: %s", session_key, e)
+                continue
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
@@ -1152,6 +1491,8 @@ class GatewayShutdownMixin:
                 presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
+        if not include_home_channels:
+            return
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
@@ -1951,6 +2292,17 @@ class GatewayShutdownMixin:
         if callable(stop_watchdog):
             await stop_watchdog()
         await self._cancel_secondary_profile_reconnect_tasks()
+        # A timed-out human turn gets the S2 interruption note after the drain. Suppress the
+        # earlier per-session broadcast for those lanes so restart notifications do not duplicate it.
+        self._s2_note_session_keys = set()
+        for _session_key in list(getattr(self, "_running_agents", {}).keys()):
+            try:
+                _state = getattr(self, "_peek_session_state", lambda _key: None)(_session_key)
+                _event = getattr(getattr(_state, "turn", None), "event", None)
+                if _event is not None and getattr(self, "_is_user_turn_event", lambda event: not event.internal)(_event):
+                    self._s2_note_session_keys.add(_session_key)
+            except Exception:
+                continue
         # Network sends are best-effort; a slow Telegram request must not consume launchd's stop leash.
         # Detach-on-deadline rather than wait_for: a transport may swallow cancellation.
         from gateway.run import GatewayRunner
@@ -2023,7 +2375,34 @@ class GatewayShutdownMixin:
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
-        await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        _marked_keys = await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        # This is the last transport-connected phase for the interrupted human turn. It is intentionally
+        # independent of the ordinary restart-notification opt-out and is durable/deduplicated by the row.
+        # Only turns still marked resume-pending after the drain can need an interruption note. A
+        # human turn may finish during the graceful drain and be removed from _running_agents before
+        # the timeout phase; do not resurrect the pre-drain candidate as a fallback notice.
+        _s2_candidates = set(getattr(self, "_s2_note_session_keys", set())) & set(_marked_keys)
+        self._s2_note_delivered_keys = set()
+        self._s2_note_failed_keys = set()
+        self._s2_note_claimed_keys = {}
+        if _s2_candidates:
+            await self._send_interrupted_turn_notes(
+                _marked_keys, shutdown_fallback_keys=_s2_candidates,
+            )
+        else:
+            await self._send_interrupted_turn_notes(_marked_keys)
+        # S2 note misses need the ordinary shutdown notice, but only after the note sender has
+        # returned: delivered lanes remain fenced so no session can receive both messages.
+        self._s2_note_session_keys = set(self._s2_note_delivered_keys)
+        _s2_note_misses = _s2_candidates & set(getattr(self, "_s2_note_failed_keys", set()))
+        if _s2_note_misses:
+            fallback_task = asyncio.create_task(self._notify_active_sessions_of_shutdown(
+                _s2_note_misses, include_home_channels=False,
+            ))
+            if not await GatewayRunner._wait_or_detach(fallback_task, 3.0):
+                logger.warning("Fallback shutdown notices for missed interrupted-turn notes exceeded 3s")
+            else:
+                await fallback_task
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)
