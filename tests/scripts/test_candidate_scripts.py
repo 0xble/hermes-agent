@@ -43,7 +43,7 @@ def test_maintenance_installer_targets_current_release(tmp_path):
     assert '$profile_home/scripts/sync_fork_candidate.py' in shell
     assert 'runtime_python="$profile_home/current/.venv/bin/python"' in shell
     assert '$profile_home/hermes-agent/venv/bin/python' not in shell
-    checker = (scripts / "check_fork_patches.py").read_text(encoding="utf-8")
+    checker = (scripts / "check_fork_patches.py").read_text(encoding="utf-8-sig")
     assert "home / 'current'" in checker
     assert "--repo" in checker
     assert "home / 'hermes-agent'" not in checker

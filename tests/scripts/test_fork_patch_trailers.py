@@ -242,7 +242,7 @@ def test_immutable_release_reads_its_baseline_helper_when_source_lags(tmp_path, 
     base = git("rev-parse", "HEAD")
     helper = Path(__file__).resolve().parents[2] / "scripts" / "ci" / "release_baseline.py"
     (tmp_path / "scripts" / "ci").mkdir(parents=True)
-    (tmp_path / "scripts" / "ci" / "release_baseline.py").write_text(helper.read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "scripts" / "ci" / "release_baseline.py").write_text(helper.read_text(encoding="utf-8-sig"), encoding="utf-8")
     _units(tmp_path, "fixture")
     (tmp_path / "MAINTENANCE.md").write_text(
         f"Accepted release baseline: `v2026.9.24`, `{base}`\n", encoding="utf-8"

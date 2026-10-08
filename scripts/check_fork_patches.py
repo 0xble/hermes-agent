@@ -149,7 +149,7 @@ def _recorded_baseline(revision: str | None = None) -> str | None:
     if revision is None or revision == "HEAD":
         if not reader.is_file():
             return None
-        source = reader.read_text(encoding="utf-8")
+        source = reader.read_text(encoding="utf-8-sig")
         helper_revision = None
     else:
         try:
