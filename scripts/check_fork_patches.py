@@ -159,7 +159,13 @@ def _recorded_baseline(revision: str | None = None) -> str | None:
         helper_revision = revision
     module = types.ModuleType("release_baseline")
     exec(compile(source, f"{revision or 'working tree'}:scripts/ci/release_baseline.py", "exec"), module.__dict__)
-    return module.accepted_release_baseline(REPO, helper_revision)
+    try:
+        return module.accepted_release_baseline(REPO, helper_revision)
+    except TypeError:
+        try:
+            return module.accepted_release_baseline(REPO)
+        except TypeError:
+            return DEFAULT_BASELINE
 
 
 def _verification_revision(home: Path) -> tuple[str, str, str | None]:
@@ -263,7 +269,10 @@ def check_extensions(home: Path) -> list[str]:
         "import hermes_cli.plugins as pm; pm.discover_plugins(force=True); from tools.registry import registry; "
         "import json; print(json.dumps({t: bool(registry.get_entry(t)) for t in %r}))" % (EXTENSION_TOOLS,)
     )
-    python, code_root = _runtime_context(home)
+    context = _runtime_context(home)
+    if isinstance(context, str):
+        return [context]
+    python, code_root = context
     env = _runtime_env(home, code_root)
     run = subprocess.run([str(python), "-c", probe], cwd=str(code_root), env=env,
                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
@@ -279,7 +288,10 @@ def check_extensions(home: Path) -> list[str]:
 
 def check_config(home: Path) -> list[str]:
     failures: list[str] = []
-    python, code_root = _runtime_context(home)
+    context = _runtime_context(home)
+    if isinstance(context, str):
+        return [context]
+    python, code_root = context
     env = _runtime_env(home, code_root)
     for key, expected in EXPECTED_CONFIG.items():
         run = subprocess.run([str(python), "-m", "hermes_cli.main", "config", "get", key], cwd=str(code_root), env=env,
@@ -293,12 +305,14 @@ def check_config(home: Path) -> list[str]:
     return failures
 
 
-def _runtime_context(home: Path) -> tuple[Path, Path]:
+def _runtime_context(home: Path) -> tuple[Path, Path] | str:
     """Return the interpreter and import root for the code being verified."""
     current = home / "current"
     if current.is_symlink():
         release = current.resolve()
         python = release / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if not python.is_file():
+            return f"release interpreter {python} is missing"
         return python, release
     return Path(sys.executable), REPO
 

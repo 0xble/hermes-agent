@@ -44,7 +44,9 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   when the source checkout predates the helper. Generated scheduled shims execute the
   active release interpreter and require the live SHA in the configured source checkout
   (`HERMES_FORK_REPO`, default `~/Repos/hermes-agent`). Legacy homes still use checkout
-  HEAD. Broken pointers and mismatched code fail.
+  HEAD when `scripts/check_fork_patches.py` is run directly, but generated scheduled shims
+  fail closed on legacy homes without a `current` release symlink. Broken pointers and
+  mismatched code fail.
   `scripts/rollback_fork_runtime.sh` reaches recovery when reinstall fails.
   Scheduled copies live under `$HERMES_HOME/scripts` per [runtime ownership](runtime-ownership.md).
 - Cron: per-job IANA `job_timezone` with civil-time scheduling and a migration dry-run

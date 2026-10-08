@@ -266,6 +266,12 @@ def test_immutable_release_reads_its_baseline_helper_when_source_lags(tmp_path, 
     assert "OK: 0 problem(s)" in capsys.readouterr().out
 
 
+def test_recorded_baseline_accepts_a_legacy_one_argument_helper(tmp_path, monkeypatch):
+    checker = _checker(tmp_path, monkeypatch)
+    monkeypatch.setattr(checker, "_git_raw", lambda *args: "def accepted_release_baseline(root):\n    return 'legacy'\n")
+    assert checker._recorded_baseline("a" * 40) == "legacy"
+
+
 def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
     git = _repo(tmp_path)
     (tmp_path / "FORK_PATCHES.md").write_text("obsolete ledger", encoding="utf-8")

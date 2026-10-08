@@ -54,7 +54,7 @@ def test_maintenance_installer_targets_current_release(tmp_path):
     (release / ".hermes_build_sha").write_text("a" * 40, encoding="utf-8")
     python = release / ".venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
-    python.symlink_to(sys.executable)
+    python.symlink_to(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
     (runtime_scripts / "sync_fork_candidate.py").write_text("print('forwarded')\n", encoding="utf-8")
     (home / "current").symlink_to(release, target_is_directory=True)
     legacy_scripts = home / "hermes-agent" / "scripts"
@@ -409,3 +409,14 @@ def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch)
     assert all(call[0][0] == str(python) for call in calls)
     assert all(call[1]["cwd"] == str(release) for call in calls)
     assert all(call[1]["env"]["PYTHONPATH"] == str(release) for call in calls)
+
+
+def test_runtime_checks_fail_closed_when_release_interpreter_is_missing(tmp_path):
+    mod = _load("check_fork_patches")
+    release = tmp_path / "releases" / ("c" * 40)
+    release.mkdir(parents=True)
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+
+    context = mod._runtime_context(tmp_path)
+    assert isinstance(context, str) and "release interpreter" in context
+    assert mod.check_config(tmp_path) == [context]
