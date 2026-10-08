@@ -29,7 +29,7 @@ def _receipt(home: Path, **fields):
     (directory / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_maintenance_installer_keeps_flat_profiles_working(tmp_path):
+def test_maintenance_installer_targets_current_release(tmp_path):
     mod = _load("install_candidate_extensions")
     home = tmp_path / "profile"
     home.mkdir()
@@ -41,12 +41,27 @@ def test_maintenance_installer_keeps_flat_profiles_working(tmp_path):
     assert all((scripts / name).stat().st_mode & stat.S_IXUSR for name in installed)
     shell = (scripts / "sync_fork_candidate_job.sh").read_text(encoding="utf-8")
     assert '$profile_home/scripts/sync_fork_candidate.py' in shell
+    assert 'runtime_python="$profile_home/current/.venv/bin/python"' in shell
+    assert '$profile_home/hermes-agent/venv/bin/python' not in shell
+    checker = (scripts / "check_fork_patches.py").read_text(encoding="utf-8")
+    assert "home / 'current'" in checker
+    assert "--repo" in checker
+    assert "home / 'hermes-agent'" not in checker
 
-    runtime_scripts = home / "hermes-agent" / "scripts"
+    release = home / "releases" / ("a" * 40)
+    runtime_scripts = release / "scripts"
     runtime_scripts.mkdir(parents=True)
+    (release / ".hermes_build_sha").write_text("a" * 40, encoding="utf-8")
+    python = release / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.symlink_to(sys.executable)
     (runtime_scripts / "sync_fork_candidate.py").write_text("print('forwarded')\n", encoding="utf-8")
+    (home / "current").symlink_to(release, target_is_directory=True)
+    legacy_scripts = home / "hermes-agent" / "scripts"
+    legacy_scripts.mkdir(parents=True)
+    (legacy_scripts / "sync_fork_candidate.py").write_text("print('stale')\n", encoding="utf-8")
     env = os.environ.copy()
-    env.pop("HERMES_HOME", None)
+    env["HERMES_HOME"] = str(home)
     completed = subprocess.run([sys.executable, str(scripts / "sync_fork_candidate.py")],
                                env=env, capture_output=True, text=True, check=True)
     assert completed.stdout.strip() == "forwarded"
@@ -373,3 +388,24 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     assert mod.check_config(tmp_path) == []
     values["memory.write_approval"] = "true"
     assert mod.check_config(tmp_path) == ["config memory.write_approval = 'true', expected 'false'"]
+
+
+def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    release = tmp_path / "releases" / ("b" * 40)
+    python = release / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("placeholder", encoding="utf-8")
+    (tmp_path / "current").symlink_to(release, target_is_directory=True)
+    calls = []
+    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m"}
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+    assert all(call[0][0] == str(python) for call in calls)
+    assert all(call[1]["cwd"] == str(release) for call in calls)
+    assert all(call[1]["env"]["PYTHONPATH"] == str(release) for call in calls)
