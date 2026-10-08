@@ -234,6 +234,56 @@ def test_bounded_kill_all_does_not_invent_completion_for_gone_detached_session(
     assert registry.completion_queue.empty()
 
 
+@pytest.mark.parametrize("deadline", [None, "bounded"])
+def test_kill_all_recovered_detached_scope_stops_before_close(
+    registry, monkeypatch, deadline
+):
+    """A recovered detached scope is torn down even when its wrapper PID is gone."""
+    session = _make_session(sid=f"proc_detached_scope_{deadline or 'unbounded'}")
+    session.pid = 424242
+    session.pid_scope = "host"
+    session.detached = True
+    session.systemd_unit = "hermes-worker-proc_detached_scope.scope"
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "gone")
+
+    stopped = []
+
+    def stop_scope(unit, **kwargs):
+        assert session.id in registry._running
+        assert not session.exited
+        stopped.append((unit, kwargs))
+        return True
+
+    monkeypatch.setattr(
+        "tools.process_registry._stop_systemd_unit",
+        stop_scope,
+    )
+
+    kill_kwargs = {
+        "source": "gateway_shutdown",
+        "consume_output": True,
+    }
+    if deadline == "bounded":
+        kill_kwargs["deadline"] = time.monotonic() + 1.0
+
+    with patch("tools.process_registry.save_completed_result") as save:
+        killed = registry.kill_all(**kill_kwargs)
+
+    assert killed == 0
+    assert stopped and len(stopped) == 1
+    assert stopped[0][0] == session.systemd_unit
+    if deadline == "bounded":
+        assert 0 < stopped[0][1]["timeout"] <= 1.0
+    else:
+        assert stopped[0][1] == {}
+    assert session.id not in registry._running
+    assert session.exit_code is None
+    assert session.completion_reason != "killed"
+    assert save.call_count == 0
+    assert registry.completion_queue.empty()
+
+
 def test_bounded_kill_all_closes_detached_session_when_pid_recycles_during_sweep(
     registry, monkeypatch
 ):

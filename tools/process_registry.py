@@ -2699,6 +2699,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             and self._detached_host_fate(session.pid, session.host_start_time) != "running"
         ]
         for session in detached_nonrunning:
+            if session.systemd_unit:
+                _stop_systemd_unit_bounded(session.systemd_unit, deadline)
             self._close_reused_detached(session)
         targets = [session for session in targets if session not in detached_nonrunning]
         def _fallback_kill_one(session: ProcessSession) -> bool:
@@ -2805,9 +2807,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     return None
 
             snapshot = tuple(
-                (child.pid, _descendant_pgid(child.pid), self._safe_host_start_time(child.pid))
+                (child.pid, _descendant_pgid(child.pid), child_start_time)
                 for child in descendants
-                if self._proc_alive(child) and self._safe_host_start_time(child.pid) is not None
+                if self._proc_alive(child)
+                and (child_start_time := self._safe_host_start_time(child.pid)) is not None
             )
             return pgid, snapshot
 

@@ -2230,9 +2230,13 @@ class GatewayShutdownMixin:
                 "leaving the worker detached so unmarked execution rows can be recovered on next boot"
             )
             _interrupted_cron_jobs = []
-        _sweep_timeout = min(2.0, self._restart_shutdown_bound())
+        _sweep_timeout = None
         if _restart_deadline is not None:
-            _sweep_timeout = min(_sweep_timeout, max(0.0, _restart_deadline - time.monotonic()))
+            _sweep_timeout = min(
+                2.0,
+                self._restart_shutdown_bound(),
+                max(0.0, _restart_deadline - time.monotonic()),
+            )
         _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
             "post-interrupt", timeout=_sweep_timeout,
         )

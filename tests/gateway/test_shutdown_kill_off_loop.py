@@ -161,7 +161,7 @@ async def test_restart_mark_running_cron_jobs_is_bounded(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
-    """A held cron fire fence cannot hang ordinary shutdown teardown."""
+    """The initial cron mark has its own bound, independent of the graceful tool sweep."""
     events: list = []
     runner, _loop_thread = _make_phase_runner(monkeypatch, events)
     runner._restart_requested = False
@@ -179,10 +179,13 @@ async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
         return ["late-job"]
 
     monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", _blocked_mark)
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._stop_kill_tool_subprocesses_off_loop",
+        staticmethod(AsyncMock(return_value=[])),
+    )
     started = time.monotonic()
     operation = asyncio.create_task(runner._stop_interrupt_remaining_work(_make_ctx()))
-    # Bound = post-interrupt grace (0 here) + the existing 2s cooperative sweep bound, which
-    # also reaches the same blocked marker. The old code awaited the marker until release (8s).
+    # Isolate the initial marker's bound from the ordinary unbounded tool sweep.
     done, _pending = await asyncio.wait({operation}, timeout=3.0)
     elapsed = time.monotonic() - started
 
@@ -195,6 +198,37 @@ async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
         release.set()
         await asyncio.wait({operation}, timeout=0.5)
         assert finished.wait(timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart_requested", [False, True])
+async def test_post_interrupt_sweep_is_bounded_only_for_restart(
+    monkeypatch, restart_requested
+):
+    """Only restart cleanup opts the post-interrupt registry sweep into hard-kill mode."""
+    events: list = []
+    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    runner._restart_requested = restart_requested
+    runner._restart_shutdown_bound = lambda: 1.0
+    observed = []
+
+    async def _fake_sweep(phase, *, timeout=None):
+        observed.append((phase, timeout))
+        return []
+
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._stop_kill_tool_subprocesses_off_loop",
+        staticmethod(_fake_sweep),
+    )
+
+    await runner._stop_interrupt_remaining_work(_make_ctx())
+
+    assert len(observed) == 1
+    assert observed[0][0] == "post-interrupt"
+    if restart_requested:
+        assert 0 < observed[0][1] <= 1.0
+    else:
+        assert observed[0][1] is None
 
 
 def _first_caller_wins_mark(job_id, first_called):
