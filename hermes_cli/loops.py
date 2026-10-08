@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cli.heartbeat import SILENCE_MARKER
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,10 +47,12 @@ WAKEUP_PROMPT_PREFIX = "[/loop wakeup #"
 WAKEUP_PROMPT_TEMPLATE = (
     f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
     "Recurring task: {prompt}\n\n"
-    "This is an automatic wakeup from the /loop the user set. Perform the "
+    "This is an automatic wakeup from the /loop. Perform the "
     "task now against the CURRENT state (re-check files, processes, or "
     "services fresh — do not assume anything from earlier iterations still "
-    "holds). Report concisely what you found or did this iteration.\n"
+    "holds). If nothing meaningful changed since the last wakeup, reply with "
+    f"only {SILENCE_MARKER} and nothing else so this tick stays quiet; otherwise "
+    "report concisely what you found or did this iteration.\n"
     "If the task is now complete, no longer applicable, or the thing you "
     "were watching has finished, say so and end your reply with "
     f"{LOOP_COMPLETE_MARKER} on its own line — that stops the loop. "
@@ -60,10 +64,12 @@ WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
     f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
     "Recurring task: {prompt}\n\n"
     "Stop condition: {until}\n\n"
-    "This is an automatic wakeup from the /loop the user set. Perform the "
+    "This is an automatic wakeup from the /loop. Perform the "
     "task now against the CURRENT state (re-check files, processes, or "
     "services fresh — do not assume anything from earlier iterations still "
-    "holds). Report concisely what you found or did this iteration, and "
+    "holds). If nothing meaningful changed since the last wakeup, reply with "
+    f"only {SILENCE_MARKER} and nothing else so this tick stays quiet; otherwise "
+    "report concisely what you found or did this iteration, and "
     "show concrete evidence of the stop condition's status.\n"
     "If the stop condition is met, or the task is no longer applicable, say "
     f"so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — "
@@ -394,6 +400,10 @@ def _digest_response(response: str) -> str:
     """Digest for self-paced change detection; whitespace-normalized with clock/timestamp/duration
     tokens stripped so 'checked at 14:02:33' doesn't defeat the backoff."""
     text = (response or "").strip().lower()
+    if text == SILENCE_MARKER.lower():
+        # Repeated no-op wakeups are semantically identical; keep the sentinel explicit so this
+        # remains true if the marker wording changes later.
+        return SILENCE_MARKER.lower()
     text = re.sub(r"\d{1,2}:\d{2}(:\d{2})?", "", text)
     text = re.sub(r"\d{4}-\d{2}-\d{2}", "", text)
     text = re.sub(r"\b\d+(\.\d+)?\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hr|hrs|hours)\b", "", text)

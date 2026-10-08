@@ -702,7 +702,9 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
+            await adapter.handle_message(
+                self._synthetic_prompt_event(source, wakeup, internal=True, reply_expected=False)
+            )
             # Slash-command loops dispatch through the command path and never hit the post-turn
             # completion hook — complete the tick immediately (caps + scheduling).
             if wakeup.lstrip().startswith("/"):

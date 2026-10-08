@@ -349,6 +349,17 @@ class TestTickLifecycle:
         assert mgr.is_due() is False  # can't double-fire mid-turn
         assert mgr.fire_tick() is None
 
+    def test_wakeup_prompt_allows_quiet_no_change_reply(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t3-prompt")
+        mgr.set("check the queue", interval_seconds=300)
+        wakeup = mgr.fire_tick()
+        assert wakeup is not None
+        assert "the /loop the user set" not in wakeup
+        assert "nothing meaningful changed since the last wakeup" in wakeup
+        assert "only [SILENT] and nothing else" in wakeup
+
     def test_slash_prompt_returned_raw(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
@@ -497,6 +508,20 @@ class TestSelfPacedBackoff:
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 2 — draining")
         assert mgr.state.current_delay == floor
+
+    def test_backoff_treats_consecutive_silent_wakeups_as_unchanged(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="sp-silent")
+        state = mgr.set("watch the queue")
+        floor = state.current_delay
+
+        for _ in range(2):
+            mgr.state.next_due_at = time.time() - 1
+            mgr.fire_tick()
+            mgr.complete_tick("[SILENT]")
+
+        assert mgr.state.current_delay == floor * 2
 
     def test_timestamp_only_changes_do_not_reset(self, hermes_home):
         from hermes_cli.loops import LoopManager

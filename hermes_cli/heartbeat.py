@@ -20,10 +20,13 @@ MIN_INTERVAL_SECONDS = 60  # floor: re-entering more often than once a minute is
 POLL_SECONDS = 5.0  # how often drivers poll for due heartbeats; not user-facing
 
 HEARTBEAT_PROMPT_PREFIX = "[Heartbeat — recurring instruction, fires every "
+# Canonical successful no-op reply for gateway-authored recurring checks. The gateway recognizes
+# this exact marker and suppresses it on machinery turns while retaining the turn in history.
+SILENCE_MARKER = "[SILENT]"
 HEARTBEAT_PROMPT_TEMPLATE = (
     f"{HEARTBEAT_PROMPT_PREFIX}{{interval}}]\n{{prompt}}\n\n"
     "If there is nothing meaningful to do or report for this instruction "
-    "right now, reply briefly that nothing has changed and stop — do not invent work."
+    f"right now, reply with exactly {SILENCE_MARKER} and nothing else — do not invent work."
 )
 
 _INTERVAL_RE = re.compile(
