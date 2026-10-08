@@ -952,8 +952,11 @@ def _startup_restore_drain_timeout_secs() -> float:
     """Max seconds ``_finish_startup_restore`` holds the inbound gate for boot auto-resume; <=0 disables.
 
     Duplicate-agent safety does NOT depend on it: ``_schedule_resume_pending_sessions`` claims SYNCHRONOUSLY.
+    The implementation lives in a side-effect-free module so request admission does not import the gateway
+    bootstrap facade.
     """
-    return _float_env("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
+    from gateway.startup_timeouts import startup_restore_drain_timeout_secs
+    return startup_restore_drain_timeout_secs()
 
 
 def _startup_warmup_timeout_secs() -> float:
@@ -3751,10 +3754,10 @@ class GatewayRunner(
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
     def _init_session_db(self) -> None:
-        """Open the session DB for the active scope and run opportunistic state.db / checkpoint maintenance."""
+        """Initialize lazy state.db handle caches; defer all SQLite I/O until after adapter readiness."""
         # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
-        # root home under multiplex); priming here keeps startup diagnostics at init.
-        # Initialize session database for session_search tool support. Same frozen-handle class of bug as
+        # root home under multiplex); initialize the cache here without opening SQLite. Session search and
+        # recovery obtain the active handle lazily through their async/thread boundaries.
         # SessionStore._db (#88532): a handle bound here is pinned to the process's root home, but /resume,
         # /title, /history and session search all run inside _profile_runtime_scope on a multiplexed gateway
         # and must see that profile's own state.db.
@@ -3764,34 +3767,13 @@ class GatewayRunner(
         from gateway.session_db_recovery import RecoverableHandleCache
         self._session_db_handle_cache = RecoverableHandleCache(
             handles=self._session_db_handles, lock=self._session_db_handles_lock)
-        try:
-            self._open_session_db_for_active_scope(raise_on_error=True)
-        except Exception as e:
-            # WARNING (not DEBUG) so it lands in errors.log; else an NFS HERMES_HOME silently loses /resume etc.
-            logger.warning("SQLite session store not available: %s", e)
-            self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
-
-        # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
-        # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
-        # Surface the failure to the user via their home channel(s) once the gateway connects. Without this,
-        # state.db corruption or NFS/SMB lock failures silently degrade the entire gateway — messages may
-        # flow but nothing is persisted, and the user has no indication until they try /resume and find
-        # nothing (#88235).
-        # Once per SERVED profile, each under its own scope: both the store and the ``sessions:``
-        # config that governs it must be the profile's own. Bound to ``self._session_db`` this ran
-        # against the construction-time launch home only, so a multiplexed secondary profile's
-        # state.db was never pruned or vacuumed by anybody, and the launch profile's
-        # retention_days/auto_prune decided whether it happened at all.
-        from gateway.run_profile_reconcile import _for_each_served_profile
-        _launch_sessions = _launch_sessions_dir(self.config)  # resolved OUTSIDE any profile scope
-        _housekeeping_chore(
-            "state.db startup maintenance",
-            lambda: _for_each_served_profile(
-                self, lambda _label: _housekeeping_state_db_maintenance(_launch_sessions)))
-        # Checkpoint store pruning is a housekeeping chore (``_housekeeping_checkpoint_prune``), not a
-        # constructor step: its ``git gc`` repacks the whole store (tens of seconds on a GB store) and
-        # here it ran before the control socket, adapters and the code_sha stamp — so the first
-        # restart of the day (the ``hermes update`` one) looked hung and failed fleet verification.
+        # Session DB initialization is lazy and is first exercised by the off-loop startup recovery
+        # snapshot. Do not open state.db here: another Hermes process may hold its writer lock.
+        # State.db archive/prune/VACUUM can likewise wait on another Hermes process for minutes, so it
+        # must not run before the control socket or adapters exist. The gateway housekeeping worker starts
+        # after adapters are connected and runs the same due-gated maintenance tick there. Checkpoint store
+        # pruning follows the same rule: its ``git gc`` can repack a large store for tens of seconds and
+        # must never delay readiness.
 
     def _init_registries_and_clocks(self) -> None:
         """Pairing stores, hook registry, voice modes, background-task set, liveness and idle clocks."""
@@ -4881,48 +4863,49 @@ def _start_gateway_housekeeping(
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
-    chores: list[tuple[int, str, Any]] = [
+    chores: list[tuple[int, str, Any, bool]] = [
         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
         # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
         # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
-        (1, "Runtime heartbeat", _write_runtime_status_quiet)]
+        (1, "Runtime heartbeat", _write_runtime_status_quiet, False)]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
-        chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
+        chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
     if runner is not None and loop is not None:
-        chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop)))
+        chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False))
     chores += [
-        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
-        (60, "Media cache cleanup", _housekeeping_media_caches),
-        (60, "Paste sweep", _housekeeping_paste_sweep)]
+        (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop), False),
+        (60, "Media cache cleanup", _housekeeping_media_caches, False),
+        (60, "Paste sweep", _housekeeping_paste_sweep, False)]
     if cron_provider is not None:
-        chores.append((5, "Misfire catch-up sweep", lambda: _housekeeping_misfire_catch_up(cron_provider, adapters, loop)))
+        chores.append((5, "Misfire catch-up sweep", lambda: _housekeeping_misfire_catch_up(cron_provider, adapters, loop), False))
     if cron_thread is not None:
         # The ticker's own guards keep its loop alive; this is the outer layer for a thread that has
         # already ended (#111010). Runs every tick so the outage is bounded by one housekeeping interval.
-        chores.append((1, "Cron ticker supervisor", cron_thread.restart_if_dead))
+        chores.append((1, "Cron ticker supervisor", cron_thread.restart_if_dead, False))
     chores += [
         # Per served profile: each profile has its own skills tree, curator state, Nous login
         # and state.db.
-        (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator)),
-        (60, "Sync pull tick", profile_scoped_chore(runner, _housekeeping_skill_sync)),
-        (60, "Org sync pull tick", profile_scoped_chore(runner, _housekeeping_org_skill_sync)),
+        (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator), False),
+        (60, "Sync pull tick", profile_scoped_chore(runner, _housekeeping_skill_sync), False),
+        (60, "Org sync pull tick", profile_scoped_chore(runner, _housekeeping_org_skill_sync), False),
         (60, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
-                _housekeeping_state_db_maintenance(_launch))),
+                _housekeeping_state_db_maintenance(_launch),
+        ), True),
         # Due-gated inside: the first tick after startup runs an overdue check, not tick 60.
         # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
-        (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
-        (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
-        (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
-        (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
+        (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check), False),
+        (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry, False),
+        (1, "gateway housekeeping memory trim", _housekeeping_memory_trim, False),
+        (1, "MCP config reconcile", _mcp_config_reconciler(runner), False),
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.
-        (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune)]
+        (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune, False)]
 
     # Between ticks the queue file is watched so a worker's send goes out when it is queued,
     # not up to ``interval`` later (#117307); the tick's drain above remains the fallback.
@@ -4938,10 +4921,24 @@ def _start_gateway_housekeeping(
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
-        for every, label, fn in chores:
-            if tick_count % every == 0:
-                _housekeeping_chore(label, fn)
+        deferred_after_watch = []
+        for every, label, fn, first_tick in chores:
+            due = (
+                (tick_count == 1 or (tick_count > 1 and (tick_count - 1) % every == 0))
+                if first_tick else tick_count % every == 0
+            )
+            if due:
+                # Give the delivery queue watcher its first window before the potentially blocking
+                # state.db prune/VACUUM. Later maintenance runs follow a completed watch window too.
+                if first_tick and tick_count == 1:
+                    deferred_after_watch.append((label, fn))
+                else:
+                    _housekeeping_chore(label, fn)
         wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
+        if stop_event.is_set():
+            break
+        for label, fn in deferred_after_watch:
+            _housekeeping_chore(label, fn)
     logger.info("Gateway housekeeping stopped")
 
 
@@ -4984,6 +4981,32 @@ async def _await_thread_exit(
     while thread.is_alive() and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(poll)
     return not thread.is_alive()
+
+
+async def _settle_mcp_discovery(runner: Any) -> None:
+    """Settle startup MCP discovery before MCP teardown, within the adapter-teardown bound.
+
+    Discovery connects on an executor thread that task cancellation cannot interrupt, so cancelling
+    first would let a connect land after ``shutdown_mcp_servers`` and orphan its stdio child. Wait
+    for it, bounded; past the bound cancel the task and let teardown proceed.
+    """
+    task = getattr(runner, "_mcp_discovery_task", None)
+    if task is None or task.done():
+        return
+    timeout = _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT
+    _done, pending = await asyncio.wait({task}, timeout=timeout)
+    if pending:
+        task.cancel()
+        logger.warning("MCP discovery still running after %.1fs at shutdown; tearing MCP down anyway", timeout)
+
+
+async def _settle_and_shutdown_mcp(runner: Any) -> None:
+    """Finish startup discovery, then close MCP servers for every post-start exit path."""
+    await _settle_mcp_discovery(runner)
+    try:
+        await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
+    except Exception:
+        logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
 
 
 async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0, config: Any = None) -> bool:
@@ -5880,6 +5903,9 @@ async def _start_gateway_shutdown_tail(
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
+    # Settle startup discovery before MCP teardown so a late connect cannot outlive the server shutdown.
+    await _settle_mcp_discovery(runner)
+
     # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
     # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
     try:
@@ -6023,26 +6049,22 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
     _ensure_windows_gateway_venv_imports()
 
-    # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
-    try:
-        # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
-
+    # MCP discovery runs in executor threads but can still wait up to 120s per profile. Start it only after
+    # adapter polling is healthy so unavailable MCP servers cannot delay Telegram readiness.
     try:
         success = await runner.start()
     except BaseException:
+        # start() already ran the normal stop/flush path; MCP discovery began before the failure.
+        await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
         raise
     if not success:
+        await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
         return False
 
     if runner.should_exit_cleanly:
+        await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
@@ -6054,6 +6076,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
         try:
             await runner.wait_for_shutdown()
+            await _settle_mcp_discovery(runner)
             try:
                 await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
             except Exception:

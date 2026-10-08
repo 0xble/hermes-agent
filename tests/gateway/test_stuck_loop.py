@@ -63,4 +63,21 @@ class TestStuckLoopDetection:
         assert suspended == 0
         assert mock_entry.suspended is False
 
+    def test_suspend_holds_session_store_lock(self, runner_with_home):
+        """The sweep runs on a worker thread; it must not mutate the index outside the store lock."""
+        import threading
+
+        runner, _home = runner_with_home
+        for _ in range(3):
+            runner._increment_restart_failure_counts({"session:a"})
+        lock = threading.Lock()
+        held = []
+        entry = MagicMock(suspended=False)
+        runner.session_store._lock = lock
+        runner.session_store._entries = {"session:a": entry}
+        runner.session_store._save = lambda: held.append(lock.locked())
+
+        assert runner._suspend_stuck_loop_sessions() == 1
+        assert held == [True]
+
 

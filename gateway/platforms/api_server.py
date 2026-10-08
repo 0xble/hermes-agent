@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from gateway.startup_timeouts import startup_restore_drain_timeout_secs
+
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
@@ -972,6 +974,29 @@ def _admit_api_agent_request(handler):
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
         try:
+            runner = self.gateway_runner or request.app.get("gateway_runner")
+            mcp_ready = getattr(runner, "_mcp_discovery_ready", None)
+            if isinstance(mcp_ready, asyncio.Event) and not mcp_ready.is_set():
+                # Discovery starts before adapters connect; a turn waits for it up to the same bound boot
+                # auto-resume uses. Only a discovery wedged past that bound gets the retryable 503.
+                timeout = startup_restore_drain_timeout_secs()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(mcp_ready.wait()),
+                        timeout=None if timeout <= 0 else timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "API request refused while MCP discovery remains pending after %.1fs",
+                        timeout,
+                    )
+                    return _error_response(
+                        "MCP tool discovery is still in progress; retry shortly",
+                        503,
+                        err_type="service_unavailable",
+                        code="mcp_discovery_pending",
+                        headers={"Retry-After": "1"},
+                    )
             return await handler(self, request, *args, **kwargs)
         finally:
             _release_pending_api_work(self, reservation)

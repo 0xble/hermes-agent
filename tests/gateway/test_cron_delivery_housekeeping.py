@@ -231,6 +231,66 @@ def test_primary_drain_delivers_credentialless_satellite_queue_row_through_prima
     assert sent == ["C1"] and standalone == []
 
 
+def test_first_state_db_maintenance_waits_for_delivery_watch(tmp_path, monkeypatch):
+    """The initial prune/VACUUM must not block the first restart-safe delivery watch window."""
+    import threading
+
+    from cron import delivery_queue
+    from gateway.run_delivery_queue_watch import DeliveryQueueWatch
+
+    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    watch_ready = threading.Event()
+    initial_drain_done = threading.Event()
+    queued_drain = threading.Event()
+    release_maintenance = threading.Event()
+    original_init = DeliveryQueueWatch.__init__
+
+    def init_and_signal(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        watch_ready.set()
+
+    monkeypatch.setattr(DeliveryQueueWatch, "__init__", init_and_signal)
+    monkeypatch.setattr(
+        gateway_run,
+        "_housekeeping_state_db_maintenance",
+        lambda _launch=None: release_maintenance.wait(30),
+    )
+    drain_count = 0
+
+    def record_drain(*_args):
+        nonlocal drain_count
+        drain_count += 1
+        if drain_count == 1:
+            initial_drain_done.set()
+        else:
+            queued_drain.set()
+
+    monkeypatch.setattr(scheduler, "drain_delivery_queue", record_drain)
+
+    stop = threading.Event()
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False), adapters={"slack": object()}
+    )
+    monkeypatch.setattr(gateway_run, "_handoff_watch_scopes", lambda _runner: [(None, None)])
+    thread = threading.Thread(
+        target=gateway_run._start_gateway_housekeeping,
+        args=(stop,),
+        kwargs={"adapters": runner.adapters, "loop": object(), "interval": 60, "runner": runner},
+        daemon=True,
+    )
+    thread.start()
+    try:
+        assert watch_ready.wait(5), "housekeeping did not initialize the delivery watcher"
+        assert initial_drain_done.wait(5), "housekeeping did not run its initial queue drain"
+        delivery_queue.enqueue("exec-first-watch", {"id": "job", "name": "reminder"}, "hello")
+        assert queued_drain.wait(1.5), "the first maintenance pass blocked the delivery watcher"
+    finally:
+        release_maintenance.set()
+        stop.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
 def test_a_queued_worker_delivery_is_drained_before_the_next_housekeeping_tick(tmp_path, monkeypatch):
     """Regression for #117307: the worker's send waited for the 60 s tick. With the queue
     file watched between ticks it is drained within seconds of the enqueue."""

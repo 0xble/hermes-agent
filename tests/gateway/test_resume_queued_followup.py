@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -404,6 +405,66 @@ async def test_boot_drain_logs_undrained_reconnect_owned_count(tmp_path, monkeyp
         assert await runner._drain_startup_restore_queue() == 0
     assert "left 1 queued message(s)" in caplog.text
     assert len(runner._startup_restore_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_overlapping_off_loop_recovery_claims_spool_once(tmp_path, monkeypatch):
+    runner, _adapter, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
+    assert flush_pending_to_file({key: MessageEvent(text="queued", source=source, user_id="u1")}) == 1
+    runner._schedule_resume_pending_sessions = MagicMock(return_value=0)
+    candidates = runner._resume_pending_candidates()
+    claimed = threading.Event()
+    release = threading.Event()
+    claim_count = 0
+    original_defer = __import__("gateway.run_pending_recovery", fromlist=["_defer_followup"])._defer_followup
+
+    def counted_defer(*args, **kwargs):
+        nonlocal claim_count
+        result = original_defer(*args, **kwargs)
+        if result is True:
+            claim_count += 1
+            claimed.set()
+            release.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr("gateway.run_pending_recovery._defer_followup", counted_defer)
+    boot = asyncio.create_task(runner._recover_pending_shutdown_flush_off_loop(
+        candidates=candidates, failure_message="boot recovery failed"))
+    await asyncio.to_thread(claimed.wait)
+    reconnect = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(boot, reconnect)
+
+    assert claim_count == 1
+    assert len(runner._startup_restore_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolver_only_recovery_does_not_open_default_state_db(tmp_path, monkeypatch):
+    runner, _adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    assert flush_pending_to_file({key: MessageEvent(text="queued", source=source, user_id="u1")}) == 1
+    monkeypatch.setattr(
+        "hermes_state_registry.acquire",
+        MagicMock(side_effect=AssertionError("resolver-only recovery must not open state.db")),
+    )
+
+    assert recover_pending_shutdown_flush(runner) == 1
+    assert runner._startup_restore_queue
+    db.append_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_malformed_data_does_not_abort_profile_recovery(tmp_path, monkeypatch):
+    runner, _adapter, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
+    bad = tmp_path / "pending_messages" / "bad.json"
+    bad.parent.mkdir(exist_ok=True)
+    bad.write_text(json.dumps({"session_key": key, "ts": 1, "data": ["not-a-mapping"]}))
+    assert flush_pending_to_file({key: MessageEvent(text="healthy", source=source, user_id="u1")}) == 1
+
+    assert recover_pending_shutdown_flush(runner) == 1
+    assert bad.exists()
+    assert [event.text for event in runner._startup_restore_queue] == ["healthy"]
 
 
 @pytest.mark.asyncio

@@ -166,6 +166,51 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     )
 
 
+@pytest.mark.asyncio
+async def test_unclean_startup_abort_does_not_write_clean_receipt(tmp_path, monkeypatch):
+    """An abort before previous-run recovery must not make the next boot skip that recovery."""
+    from unittest.mock import patch
+
+    patch_startup_side_effects(monkeypatch, tmp_path)
+    runner = make_startup_runner(tmp_path)
+    telegram = StartupRaceAdapter(
+        Platform.TELEGRAM,
+        on_connect=lambda: runner.request_restart(detached=False, via_service=True),
+    )
+    runner._create_adapter = MagicMock(return_value=telegram)
+
+    assert await asyncio.wait_for(runner.start(), timeout=30) is True
+    assert runner._suppress_clean_shutdown_receipt is True
+
+    runner._restart_command_source = "test"
+    ctx = gateway_run.GatewayRunner._StopContext(
+        deferred_count=lambda: 0, started_at=0, timed_out=False,
+    )
+    with patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.release_gateway_runtime_lock"), \
+         patch("gateway.status.flush_runtime_status_async", new=AsyncMock(return_value=True)), \
+         patch("gateway.run._shutdown_gateway_health_export"):
+        await runner._stop_persist_exit_state(ctx)
+
+    marker = tmp_path / ".clean_shutdown"
+    assert not marker.exists()
+
+    next_runner = make_startup_runner(tmp_path)
+    recovered = []
+
+    async def recover_unclean():
+        recovered.append(True)
+        return 1, 0
+
+    next_runner._recover_unclean_sessions = recover_unclean
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.recover_from_checkpoint", lambda: 0,
+    )
+    monkeypatch.setattr(next_runner, "_recover_secondary_process_checkpoints", lambda _registry: 0)
+    await next_runner._start_recover_previous_run()
+    assert recovered == [True]
+
+
 def _patch_aborted_startup(monkeypatch, runner_cls):
     """Run start_gateway() against a runner that aborts before running mode."""
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -213,6 +258,16 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
     _patch_aborted_startup(monkeypatch, AbortedStartupRunner)
     monkeypatch.setattr("gateway.run._start_cron_ticker", fail_if_cron_starts)
     monkeypatch.setattr("tools.mcp_tool_lifecycle.shutdown_mcp_servers", lambda: None)
+    teardown = []
+
+    async def settle(_runner):
+        teardown.append("settle")
+
+    async def shutdown(*_args, **_kwargs):
+        teardown.append("shutdown")
+
+    monkeypatch.setattr(gateway_run, "_settle_mcp_discovery", settle)
+    monkeypatch.setattr(gateway_run, "_shutdown_mcp_servers_nonblocking", shutdown)
 
     with pytest.raises(SystemExit) as exc:
         await gateway_run.start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
@@ -220,6 +275,7 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
     assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert cron_started is False
     assert export_shutdown_calls == 1
+    assert teardown == ["settle", "shutdown"]
 
 
 @pytest.mark.asyncio
@@ -355,3 +411,72 @@ async def test_failure_exit_still_stops_cron_housekeeping_and_mcp(monkeypatch):
     for thread in threads + [watcher]:
         thread.join(timeout=2)
         assert not thread.is_alive()
+
+
+@pytest.mark.asyncio
+async def test_clean_marker_failure_spools_queued_inbound_and_disconnects(tmp_path, monkeypatch):
+    """Fail-closed clean-marker cleanup must not drop inbound already acknowledged by a transport."""
+    import json
+    from dataclasses import replace
+    from gateway.platforms.event import MessageEvent
+    from tests.gateway.restart_test_helpers import make_restart_source
+
+    patch_startup_side_effects(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.run_pending_recovery.get_routing_process_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    (tmp_path / ".clean_shutdown").write_text("clean", encoding="utf-8")
+    runner = make_startup_runner(tmp_path)
+    runner.config.platforms.pop(Platform.SLACK)
+    source = replace(make_restart_source(), message_id="7")
+    inbound = MessageEvent(text="arrived during restore", source=source, user_id="u1")
+    telegram = StartupRaceAdapter(
+        Platform.TELEGRAM, on_connect=lambda: runner._queue_startup_restore_event(inbound),
+    )
+    runner._create_adapter = MagicMock(return_value=telegram)
+
+    async def cleanup_fails(_marker):
+        raise OSError("state store unavailable")
+
+    runner._consume_clean_shutdown_marker = cleanup_fails
+    monkeypatch.setattr(gateway_run, "_discover_gateway_mcp_tools", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="clean-start recovery cleanup failed"):
+        await asyncio.wait_for(runner.start(), timeout=30)
+
+    assert telegram.disconnected is True
+    spooled = [json.loads(p.read_text(encoding="utf-8"))["data"]["text"]
+               for p in (tmp_path / "pending_messages").glob("*.json")]
+    assert spooled == ["arrived during restore"]
+    assert (tmp_path / ".clean_shutdown").exists()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_settles_startup_mcp_discovery_before_mcp_teardown(monkeypatch):
+    """A discovery connect still landing at shutdown must finish before teardown, or its child leaks."""
+    import threading
+
+    order = []
+    cron_stop = threading.Event()
+    idle = [threading.Thread(target=lambda: None, daemon=True) for _ in range(3)]
+    for thread in idle:
+        thread.start()
+
+    async def late_discovery():
+        await asyncio.sleep(0.2)
+        order.append("discovery connected")
+
+    async def fake_mcp_shutdown(*_args, **_kwargs):
+        order.append("mcp teardown")
+
+    monkeypatch.setattr(gateway_run, "_shutdown_mcp_servers_nonblocking", fake_mcp_shutdown)
+    monkeypatch.setattr(gateway_run, "_stop_cron_provider", lambda provider: None)
+    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.stop_nous_auth_keepalive", lambda: None)
+    runner = MagicMock(should_exit_with_failure=True, exit_reason="boom", exit_code=None)
+    runner._mcp_discovery_task = asyncio.create_task(late_discovery())
+
+    await gateway_run._start_gateway_shutdown_tail(
+        runner, None, cron_stop, object(), idle[0], idle[1], threading.Event(), idle[2], [False])
+
+    assert order == ["discovery connected", "mcp teardown"]
