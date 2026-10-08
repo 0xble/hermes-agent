@@ -54,7 +54,7 @@ def _run(cmd: list, timeout: int, cwd: Optional[str] = None,
          env: Optional[dict[str, str]] = None, binary: bool = False) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=not binary,
                           encoding=None if binary else "utf-8",
-                          errors=None if binary else "replace", timeout=timeout, cwd=cwd, env=env)
+                          errors=None if binary else "replace", timeout=timeout, cwd=cwd, env=env, stdin=subprocess.DEVNULL)
 
 
 @dataclass
@@ -78,7 +78,7 @@ def _git(args: list, cwd: str, timeout: int = 15, *, binary: bool = False) -> su
     check as well. Every verdict fails safe toward "keep" on nonzero, so a slow
     ``git cherry`` on a huge repo degrades to keep instead of aborting the audit
     mid-list.
-    """
+"""
     env = os.environ.copy()
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"

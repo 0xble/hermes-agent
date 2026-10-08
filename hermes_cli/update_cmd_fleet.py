@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from hermes_cli.update_cmd_common import _best_effort
+from hermes_cli.update_host_obligation import PROFILE_MARKER_NAME
 from hermes_cli.update_inventory import _gateway_service_matches_profile
 
 # Log-record parity with the origin module.
@@ -27,14 +28,9 @@ logger = logging.getLogger("hermes_cli.update_cmd")
 # after a pull advanced HEAD; cleared only when the restart completes or nothing ran.
 # The existing ``.update-incomplete`` / ``.lazy-refresh-incomplete`` markers gate dependency/venv repair;
 # this one is the fleet-restart obligation after a git pull that advanced HEAD (#95294).
-_FLEET_RESTART_PENDING_NAME = "fleet_restart_pending"
+_FLEET_RESTART_PENDING_NAME = PROFILE_MARKER_NAME
 
 _FRESH_RESTART_SUPERVISORS = frozenset({"systemd", "launchd", "service", "s6"})
-
-# A supervisor can report a restarted unit active before the gateway finishes its
-# bootstrap and publishes ``gateway_state.json``. Keep the readiness poll bounded,
-# but allow the default systemd startup budget plus status-publication slack.
-_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS = 120.0
 
 _SYSTEMD_SCOPES = (("user", ["systemctl", "--user"]), ("system", ["systemctl"]))
 _LIST_GATEWAY_UNITS = [
@@ -45,6 +41,11 @@ _LIST_GATEWAY_UNITS = [
 
 def _write_gateway_update_exit_code(ok: bool) -> None:
     from hermes_cli.update_cmd import get_hermes_home
+    from hermes_cli.update_receipt import committed_success
+
+    # A run whose receipt already closed as a success is never reported failed (C3, review
+    # regression 3): the command boundary's catch-alls call this with False.
+    ok = ok or committed_success()
     path = get_hermes_home() / ".update_exit_code"
     with suppress(OSError):
         path.write_text("0" if ok else "1", encoding="utf-8")
@@ -61,63 +62,25 @@ def _fleet_restart_pending_marker_path() -> Path:
     return get_hermes_home() / _FLEET_RESTART_PENDING_NAME
 
 
-def _write_legacy_fleet_restart_pending_marker(
-    *, expected_sha: str = "", runtimes: list[dict] | None = None
-) -> bool:
-    """Arm the LEGACY per-``HERMES_HOME`` marker. True when written. Never raises.
+def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None, owner: str = "") -> bool:
+    """Arm the HOST pull→restart obligation. Never raises; False when no store every profile reads took it.
 
-    Fallback only: ``$HERMES_HOME`` is writable by construction (the updater already writes its
-    receipts there), so it still carries the obligation when the host state dir cannot.
-    """
-    path = _fleet_restart_pending_marker_path()
-    try:
-        lines = [f"started={_time.time()}", f"pid={os.getpid()}"]
-        if expected_sha:
-            lines.append(f"expected_sha={expected_sha}")
-        if runtimes is not None:
-            lines.append("inventory=" + json.dumps({"version": 1, "runtimes": runtimes}))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return True
-    except OSError as exc:
-        logger.debug("Could not write legacy fleet-restart-pending marker: %s", exc)
-        return False
-
-
-def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> None:
-    """Arm the HOST pull→restart obligation. Never raises.
-
-    An unwritable host state dir (``HERMES_GATEWAY_LOCK_DIR`` on a read-only mount, a container
-    UID that does not own ``$HOME``) must never disarm the obligation: an update interrupted
-    after this point would then leave stale code running with no warning and no catch-up restart
-    (#117275). The legacy per-home marker — which every reader here still honours — carries it
-    instead, and a host that can write neither says so out loud.
+    An unwritable host state dir falls back to this profile's per-home marker, which settles the
+    debt only on an install proven to have no other profile; otherwise the arm returns False and
+    the commit point refuses to move (``update_host_obligation.arm_host_obligation``, review S2).
     """
     if runtimes == []:
         # An explicit empty inventory owes no restart (e.g. Desktop-hosted `serve` with no
         # gateway services). Arming the marker here leaves a breadcrumb nothing can discharge:
         # a no-gateway host would then fail every later ``hermes update`` (#115311).
-        return
+        return True
     from hermes_cli.update_cmd import _m
-    from hermes_cli.update_host_obligation import host_obligation_path, write_host_obligation
+    from hermes_cli.update_host_obligation import arm_host_obligation
     if _m()._pytest_owns_live_checkout(_fleet_restart_pending_marker_path().parent):
         logger.debug("Skipping fleet-restart-pending obligation under pytest (live checkout)")
-        return
-    if write_host_obligation(
-            expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name()):
-        return
-    if _write_legacy_fleet_restart_pending_marker(expected_sha=expected_sha, runtimes=runtimes):
-        logger.warning(
-            "Host update-restart obligation (%s) is unwritable; armed the per-home marker %s instead.",
-            host_obligation_path(), _fleet_restart_pending_marker_path())
-        return
-    logger.error(
-        "Could not arm the update-restart obligation in %s or %s; an interrupted update will not warn.",
-        host_obligation_path(), _fleet_restart_pending_marker_path())
-    print(
-        "  ⚠ Could not record the pending gateway-restart obligation (state dir not writable) — "
-        "restart gateways with `hermes gateway restart` if this update is interrupted.",
-        file=sys.stderr,
-    )
+        return True
+    return arm_host_obligation(_fleet_restart_pending_marker_path(), expected_sha=expected_sha, runtimes=runtimes,
+                               profile=_current_profile_name(), owner=owner)
 
 
 def _current_profile_name() -> str:
@@ -276,6 +239,7 @@ def _receipt_owed_gateways(receipt: dict, pending_manual: list[dict]) -> set[tup
     plan = receipt.get("plan") or {}
     entries: list[tuple[object, str | None]] = [(entry, None) for entry in plan.get("runtimes") or []]
     entries.extend((entry, None) for entry in receipt.get("pending_manual_serves") or [])
+    entries.extend((entry, None) for entry in receipt.get("carried_manual_serves") or [])
     entries.extend((entry, "gateway") for entry in receipt.get("fleet") or [])
     owed: set[tuple[str, str]] = set()
     unverified = False
@@ -341,6 +305,11 @@ def _live_fleet_covers_receipt(expected_sha: str | None, receipt: dict, owed: se
         return False
 
 
+# A gateway the restart phase stopped without knowing its profile: no live row can be matched to it,
+# so only a live, current gateway of this checkout settles it, never an empty host (""=no profile).
+_UNMAPPED_GATEWAY = ("gateway", "")
+
+
 def _marker_owed_gateways(inventory: object) -> set[tuple[str, str]] | None:
     """The ``("gateway", profile)`` set a marker's inventory owes; None when it recorded none.
 
@@ -360,6 +329,9 @@ def _marker_owed_gateways(inventory: object) -> set[tuple[str, str]] | None:
         if not isinstance(runtime, dict):
             raise ValueError("fleet-restart inventory row is not an object")
         if runtime_outside_gateway_evidence(runtime):
+            continue
+        if runtime.get("kind") == "gateway" and runtime.get("stopped_unmapped"):
+            owed.add(_UNMAPPED_GATEWAY)
             continue
         profile = runtime.get("profile")
         if runtime.get("kind") != "gateway" or not isinstance(profile, str) or not profile.strip() or profile == "unknown":
@@ -413,7 +385,7 @@ def _marker_only_restart_obsolete() -> bool:
     undischargeable on every host that runs a dashboard. A manual-serve row still needs its
     durable handoff (``defer_manual_serve``), and an unclassified backend stays fail-closed.
     Discharging here strands nobody: the same row is still accounted at update time by
-    ``update_inventory.report_unaccounted_runtimes``, which prints it and exits 1 when the restart
+    ``update_inventory.report_unaccounted_runtimes``, which prints it and records an owed restart when the restart
     phase never touched it — this marker only stops re-warning about it on every later startup.
     """
     from hermes_cli.update_cmd_fleet_checkout import checkout_contains
@@ -463,8 +435,13 @@ def _marker_only_restart_obsolete() -> bool:
             continue
         if row.get("state") != "current" or str(row.get("code_sha")) != target_sha:
             return False  # stale / down / unknown-identity row still owes the restart
-    if owed is not None and not owed <= covered:
+    if owed is not None and not owed - {_UNMAPPED_GATEWAY} <= covered:
         return False  # A gateway this marker owns is absent (down) or unidentifiable.
+    if owed and _UNMAPPED_GATEWAY in owed and not (_fleet_covered_gateways(
+            [row for row in fleet if not row_is_external(row)]) or set()) - owed:
+        # An unmapped stopped gateway has no identity to match, so only a local gateway that no
+        # mapped owed one explains can be its successor; another checkout's gateway never is.
+        return False
     _clear_fleet_restart_pending_marker()
     logger.debug(
         "Fleet-restart-pending marker discharged: %d gateway(s) already serve %s",
@@ -798,51 +775,13 @@ def _systemctl(cmd: list, *, timeout: float):
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
-# poll() takes signed 32-bit milliseconds; keep headroom for rounding in communicate().
-_SYSTEMCTL_RESTART_TIMEOUT_MAX = (2**31 - 1) // 1000 - 1
-
-
-def _systemd_restart_timeout(scope_cmd: list, svc_name: str, *, start_only: bool = False) -> float:
-    """Outwait the unit's stop + start budgets, not just the systemctl client.
-
-    A client timeout does not cancel the manager's queued restart. Unknown or
-    infinite limits use systemd's usual 90s per phase so automation stays bounded.
-    Custom ExecStop chains or EXTEND_TIMEOUT_USEC can still exceed this budget;
-    genuine timeouts must continue through the existing per-unit failure path.
-    """
-    from gateway.shutdown_forensics import parse_systemd_duration_to_us
-
-    budgets = {"TimeoutStartUSec": 90.0}
-    if not start_only:
-        budgets["TimeoutStopUSec"] = 90.0
-    try:
-        show = _systemctl(
-            scope_cmd + ["show", svc_name, "--property=TimeoutStopUSec,TimeoutStartUSec"],
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return sum(budgets.values()) + 15.0
-    if show.returncode == 0:
-        for line in (show.stdout or "").splitlines():
-            key, _, raw = line.partition("=")
-            if key in budgets:
-                # The shared parser returns None for infinity/unrecognized units.
-                try:
-                    raw = raw.strip()
-                    duration = int(raw) if raw.isascii() and raw.isdigit() else parse_systemd_duration_to_us(raw)
-                    if duration is not None and duration > 0:
-                        budgets[key] = duration / 1_000_000
-                except (ValueError, OverflowError):
-                    pass
-    return min(sum(budgets.values()) + 15.0, _SYSTEMCTL_RESTART_TIMEOUT_MAX)
-
-
 def _systemctl_reset_and_restart(manage_cmd: list, svc_name: str, *, scope_cmd: list | None = None):
     """``reset-failed`` then ``restart``: a unit parked in failed state by systemd's own
     auto-restart can wedge a plain ``restart`` against RestartSec backoff and stay dead."""
     # Property reads need no manage-units privileges: narrow sudoers may permit
     # restart/reset-failed but deny show. Keep the same user/system manager scope.
-    timeout = _systemd_restart_timeout(scope_cmd if scope_cmd is not None else manage_cmd, svc_name)
+    from hermes_cli.update_cmd_fleet_unit_budget import systemd_restart_timeout
+    timeout = systemd_restart_timeout(scope_cmd if scope_cmd is not None else manage_cmd, svc_name)
     _systemctl(manage_cmd + ["reset-failed", svc_name], timeout=10)
     return _systemctl(manage_cmd + ["restart", svc_name], timeout=timeout)
 
@@ -1175,7 +1114,7 @@ def _restart_macos_launchd_gateways(
         print(f"  ↻ legacy-labelled units of this install join the restart: {', '.join(legacy_labels)}")
     from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home
     for label in derived_labels + legacy_labels:
-        if label == current_label:
+        if label == current_label or label in resumed:
             continue
         # Labels are account-global: root B's default profile derives the same bare label root A
         # installed. A plist pinning a foreign HERMES_HOME is another install's job (#93349).
@@ -1494,6 +1433,7 @@ def _restart_one_systemd_gateway_unit(
         _main_pid, drain_budget, svc_name, self_restart_pending=self_restart_pending)
 
     if _graceful_ok:
+        from hermes_cli.update_cmd_fleet_unit_budget import service_restart_sec, systemd_restart_timeout
         # ``Restart=always`` respawns only after RestartSec (60s in our unit; dead time for a
         # voluntary restart). ``reset-failed`` + ``start`` skips it (~1-3s); if RestartSec already
         # elapsed, ``start`` is a no-op and we fall through to the poll. Needs manage-units
@@ -1502,14 +1442,14 @@ def _restart_one_systemd_gateway_unit(
             _systemctl(_manage_cmd + ["reset-failed", svc_name], timeout=10)
             _systemctl(
                 _manage_cmd + ["start", svc_name],
-                timeout=_systemd_restart_timeout(scope_cmd, svc_name, start_only=True),
+                timeout=systemd_restart_timeout(scope_cmd, svc_name, start_only=True),
             )
             if _wait_for_service_active(scope_cmd, svc_name, timeout=10.0):
                 restarted_services.append(svc_name)
                 return
         # Passive poll: auto-restart fires after RestartSec regardless of
         # privileges — primary when _manage_cmd is None, fallback otherwise.
-        _restart_sec = _service_restart_sec(scope_cmd, svc_name, default=0.0)
+        _restart_sec = service_restart_sec(scope_cmd, svc_name, default=0.0)
         if _manage_cmd is None and _restart_sec > 5.0:
             print(
                 f"  → {svc_name}: waiting for systemd "
@@ -1627,8 +1567,12 @@ def _restart_systemd_gateway_units(
             "together with: hermes gateway migrate"
         )
 
+    from hermes_cli.update_cmd_posix_pause import already_restarted
     for key in keys:
         scope, scope_cmd, svc_name = targets[key]
+        if key in already_restarted()["units"]:  # paused for the update, restarted on the new code
+            restarted_scoped_units.add(key)
+            continue
         # Scope-qualify before the next unit; ``finally`` so a mid-pass abort keeps settled units.
         _scope_mark = len(restarted_services)
         try:
@@ -1852,7 +1796,7 @@ def _recover_after_restart_phase_abort(
     from hermes_cli.update_abort_recovery import _owed_stale_serve_rows
     from hermes_cli.update_cmd import (
         _abort_recovery_is_complete, _recover_gateway_restart_after_abort, _surviving_pre_update_serve_runtimes,
-        _warn_stale_serve_runtimes, _write_gateway_update_exit_code,
+        _warn_stale_serve_runtimes,
     )
     logger.debug("Gateway restart during update failed: %s", e)
     out.phase_errors.append(str(e))
@@ -1912,11 +1856,10 @@ def _recover_after_restart_phase_abort(
         or _owed_stale_serve_rows(_stale_runtime_rows)
         or _serve_units_failed
     ):
+        # Owed restart (C3): verification records the follow-up; the /update marker stays committed.
         out.incomplete = True
         _warn_gateway_restart_phase_aborted(e, _surviving)
         _warn_stale_serve_runtimes(_stale_runtime_rows)
-        if gateway_mode:
-            _write_gateway_update_exit_code(False)
     out.record_receipt(phase_error=str(e), fresh_recovery=_recovery_result)
 
 
@@ -2014,9 +1957,8 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool, *,
         _restart_manual_gateways(out, _drain_budget)
 
         if out.failed_or_stale_units:
+            # Owed restart (C3): verification records the follow-up; the /update marker stays committed.
             out.incomplete = True
-            if gateway_mode:
-                _write_gateway_update_exit_code(False)
         _warn_incomplete_gateway_fleet_restart(out.failed_or_stale_units)
         out.record_receipt()
         _force_kill_stuck_gateways(out.killed_pids)
