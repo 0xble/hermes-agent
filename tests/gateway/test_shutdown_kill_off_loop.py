@@ -197,6 +197,129 @@ async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
         assert finished.wait(timeout=1)
 
 
+def _first_caller_wins_mark(job_id, first_called):
+    """Model mark_job_run(expected_fire_owner=...): only the first marker claims the job."""
+    lock = threading.Lock()
+    claimed = []
+
+    def _mark(*_args, **_kwargs):
+        with lock:
+            first = not claimed
+            claimed.append(threading.current_thread().name)
+        first_called.set()
+        if not first:
+            return []
+        time.sleep(0.05)  # the jobs-store write
+        return [job_id]
+
+    return _mark
+
+
+def _stuck_agent_runner(monkeypatch, events):
+    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    runner._restart_requested = False
+    # The interrupted agent never unwinds, so it outlives the post-interrupt grace.
+    runner._running_agents = {"stuck-session": MagicMock()}
+    runner._post_interrupt_grace_timeout = lambda: 0.05
+    monkeypatch.setattr(
+        GatewayShutdownMixin, "_mark_running_sessions_resume_pending", AsyncMock(return_value=[]),
+    )
+    runner._notify_interrupted_cron_jobs = AsyncMock(return_value=1)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_nonrestart_cron_notice_survives_agent_outliving_grace(monkeypatch):
+    """A stuck agent past grace must not zero the mark wait and drop the #82232 notice."""
+    events: list = []
+    runner = _stuck_agent_runner(monkeypatch, events)
+    first_called = threading.Event()
+    monkeypatch.setattr(
+        "cron.scheduler.mark_running_jobs_interrupted", _first_caller_wins_mark("job-1", first_called),
+    )
+    import tools.process_registry as _pr
+
+    def _kill_all(**_kwargs):
+        # Production order: the detached post-interrupt mark starts before the sweep's own mark.
+        first_called.wait(timeout=1)
+        return 0
+
+    monkeypatch.setattr(_pr.process_registry, "kill_all", _kill_all)
+
+    await runner._stop_interrupt_remaining_work(_make_ctx())
+
+    runner._notify_interrupted_cron_jobs.assert_awaited_once()
+    assert runner._notify_interrupted_cron_jobs.await_args.args[0] == ["job-1"]
+
+
+@pytest.mark.asyncio
+async def test_nonrestart_late_detached_mark_is_merged_before_notice(monkeypatch):
+    """A mark finishing after its bound but during the sweep still reaches the notice."""
+    events: list = []
+    runner = _stuck_agent_runner(monkeypatch, events)
+    first_called = threading.Event()
+    lock = threading.Lock()
+    claimed = []
+
+    def _slow_first_mark(*_args, **_kwargs):
+        with lock:
+            first = not claimed
+            claimed.append(True)
+        first_called.set()
+        if not first:
+            return []
+        time.sleep(0.8)  # held fire fence: longer than the non-restart mark bound
+        return ["job-late"]
+
+    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", _slow_first_mark)
+    import tools.process_registry as _pr
+
+    def _kill_all(**_kwargs):
+        first_called.wait(timeout=1)
+        time.sleep(0.6)  # the sweep outlasts the detached mark
+        return 0
+
+    monkeypatch.setattr(_pr.process_registry, "kill_all", _kill_all)
+
+    await runner._stop_interrupt_remaining_work(_make_ctx())
+
+    runner._notify_interrupted_cron_jobs.assert_awaited_once()
+    assert runner._notify_interrupted_cron_jobs.await_args.args[0] == ["job-late"]
+
+
+def test_graceful_sweep_keeps_term_wait_kill_for_foreground_processes(monkeypatch):
+    """An ordinary (unbounded) stop must not SIGKILL foreground trees without SIGTERM."""
+    events = []
+    _make_phase_runner(monkeypatch, events)
+    import tools.environments.base as _base
+
+    calls = []
+    monkeypatch.setattr(_base, "kill_live_foreground_processes", lambda **kw: calls.append(kw) or 0)
+
+    GatewayShutdownMixin._stop_kill_tool_subprocesses("final-cleanup")
+
+    assert calls == [{}]
+
+
+@pytest.mark.parametrize("bound", ["deadline", "stop_event"])
+def test_bounded_sweep_hard_kills_foreground_processes(monkeypatch, bound):
+    """The bounded restart sweep keeps the non-blocking hard foreground kill."""
+    events = []
+    _make_phase_runner(monkeypatch, events)
+    import tools.environments.base as _base
+
+    calls = []
+    monkeypatch.setattr(_base, "kill_live_foreground_processes", lambda **kw: calls.append(kw) or 0)
+    kwargs = (
+        {"deadline": time.monotonic() + 5.0} if bound == "deadline"
+        else {"stop_event": threading.Event()}
+    )
+
+    GatewayShutdownMixin._stop_kill_tool_subprocesses("post-interrupt", **kwargs)
+
+    assert calls == [{"now": True}]
+
+
 @pytest.mark.asyncio
 async def test_interrupt_phase_captures_agent_admitted_after_drain_snapshot(monkeypatch):
     """Late admission is finalized/flushed instead of being cleared as unowned state."""

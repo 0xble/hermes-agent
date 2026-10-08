@@ -438,3 +438,87 @@ async def test_timed_out_finalize_reserves_adapter_disconnect_budget(bare_runner
     assert adapter.disconnect.await_count >= 1
     assert elapsed <= bound + 0.2
 
+
+
+@pytest.mark.asyncio
+async def test_zero_cleanup_timeout_means_unbounded(bare_runner):
+    """timeout<=0 keeps its 'await unbounded' meaning; it is not an expired deadline."""
+    finished = asyncio.Event()
+
+    async def slow_cleanup():
+        await asyncio.sleep(0.05)
+        finished.set()
+
+    assert await bare_runner._await_adapter_cleanup_with_timeout(slow_cleanup(), 0) is True
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_expired_deadline_signal_starts_cleanup_then_detaches(bare_runner):
+    """An expired shared deadline is explicit: cleanup is started, then detached."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def wedged_cleanup():
+        started.set()
+        await release.wait()
+
+    try:
+        assert await bare_runner._await_adapter_cleanup_with_timeout(
+            wedged_cleanup(), 0.0, deadline_expired=True,
+        ) is False
+        assert started.is_set()
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_teardown_env_zero_awaits_cancel_and_disconnect(bare_runner, monkeypatch):
+    """HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT=0 must not skip cancel or detach disconnect."""
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0")
+    adapter = MagicMock()
+    done = []
+
+    async def slow_cancel():
+        await asyncio.sleep(0.02)
+        done.append("cancel")
+
+    async def slow_disconnect():
+        await asyncio.sleep(0.02)
+        done.append("disconnect")
+
+    adapter.cancel_background_tasks = AsyncMock(side_effect=slow_cancel)
+    adapter.disconnect = AsyncMock(side_effect=slow_disconnect)
+
+    await bare_runner._bounded_adapter_teardown(adapter, Platform.FEISHU)
+
+    assert done == ["cancel", "disconnect"]
+
+
+@pytest.mark.asyncio
+async def test_teardown_env_zero_still_honours_expired_shared_deadline(bare_runner, monkeypatch):
+    """With an unbounded per-op budget, an expired restart deadline still bounds disconnect."""
+    import time
+
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0")
+    adapter = MagicMock()
+    release = asyncio.Event()
+
+    async def wedged():
+        await release.wait()
+
+    adapter.cancel_background_tasks = AsyncMock(side_effect=wedged)
+    adapter.disconnect = AsyncMock(side_effect=wedged)
+    try:
+        await asyncio.wait_for(
+            bare_runner._bounded_adapter_teardown(
+                adapter, Platform.FEISHU, deadline=time.monotonic() - 1.0,
+            ),
+            timeout=1.0,
+        )
+        adapter.cancel_background_tasks.assert_not_awaited()
+        adapter.disconnect.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.sleep(0)

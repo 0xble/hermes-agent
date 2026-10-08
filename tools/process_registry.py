@@ -110,6 +110,10 @@ _SYSTEMD_SCOPE_PROBE_TTL_SECONDS = 60.0
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
+# Cap the bounded shutdown sweep's signal fan-out. Each job is a non-blocking killpg/kill (or a
+# deadline-bounded sandbox exec), so a small pool keeps one wave well inside the deadline without
+# spawning one OS thread per process in a large tree.
+_SWEEP_MAX_WORKERS = 16
 
 
 def _worker_memory_max_bytes() -> int:
@@ -2825,7 +2829,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         for pid, pgid, start_time in descendants
                         if start_time is not None and self._host_pid_is_ours(pid, start_time)
                     )
-                with ThreadPoolExecutor(max_workers=len(term_jobs), thread_name_prefix="process-term") as pool:
+                with ThreadPoolExecutor(max_workers=min(_SWEEP_MAX_WORKERS, len(term_jobs)), thread_name_prefix="process-term") as pool:
                     futures = [
                         pool.submit(_signal_snapshot_member, kind, target, signal.SIGTERM, pgid)
                         for kind, target, pgid in term_jobs
@@ -2860,7 +2864,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         if start_time is not None and self._host_pid_is_ours(pid, start_time)
                     )
                     escalated_ids.add(session.id)
-                    with ThreadPoolExecutor(max_workers=len(kill_jobs), thread_name_prefix="process-kill") as pool:
+                    with ThreadPoolExecutor(max_workers=min(_SWEEP_MAX_WORKERS, len(kill_jobs)), thread_name_prefix="process-kill") as pool:
                         futures = [
                             pool.submit(
                                 _signal_snapshot_member, kind, target,
@@ -2905,7 +2909,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
                 remainder = [session for session in targets if session not in signalable]
                 if remainder:
-                    with ThreadPoolExecutor(max_workers=len(remainder), thread_name_prefix="process-kill") as pool:
+                    with ThreadPoolExecutor(max_workers=min(_SWEEP_MAX_WORKERS, len(remainder)), thread_name_prefix="process-kill") as pool:
                         killed += sum(bool(future.result()) for future in
                                       [pool.submit(_fallback_kill_one, session) for session in remainder])
             else:

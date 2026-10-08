@@ -86,3 +86,23 @@ async def test_safe_disconnect_detaches_cancellation_swallowing_disconnect(
         release.set()
         await asyncio.wait({operation}, timeout=0.2)
         await asyncio.wait_for(finished.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_safe_disconnect_env_zero_awaits_disconnect_to_completion(bare_runner, monkeypatch, caplog):
+    """HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT=0 means unbounded: token-lock release must finish."""
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "0")
+    adapter = MagicMock()
+    released = asyncio.Event()
+
+    async def disconnect():
+        await asyncio.sleep(0.02)
+        released.set()
+
+    adapter.disconnect = AsyncMock(side_effect=disconnect)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        await bare_runner._safe_adapter_disconnect(adapter, Platform.FEISHU)
+
+    assert released.is_set()
+    assert "Timed out" not in caplog.text

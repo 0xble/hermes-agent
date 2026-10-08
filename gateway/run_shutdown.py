@@ -35,6 +35,11 @@ from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_wa
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Non-restart wait for the post-interrupt cron mark. The marker is normally a local jobs-store write;
+# this short, non-zero bound (never above the restart-path bound) collects its result for the
+# interrupted-cron notice without letting a held fire fence stall ordinary teardown.
+_NONRESTART_CRON_MARK_BOUND_S = 0.5
+
 
 def _exit_with_failure_verdict(runner) -> bool:
     """True (after logging the reason) when the runner asked for a failure exit."""
@@ -2011,10 +2016,15 @@ class GatewayShutdownMixin:
 
         def _kill_foreground_processes() -> None:
             from tools.environments.base import kill_live_foreground_processes
-            kill_live_foreground_processes(now=True)
+            # Only the bounded sweep (deadline/stop_event) skips TERM-wait-KILL; an ordinary graceful
+            # stop keeps the SIGTERM grace so foreground command trees can unwind cleanly.
+            if deadline is not None or stop_event is not None:
+                kill_live_foreground_processes(now=True)
+            else:
+                kill_live_foreground_processes()
 
-        # This signal-only sweep must run before the potentially blocked registry
-        # sweep; unlike the shared deadline it is safe and bounded after expiry.
+        # On the bounded path this signal-only sweep must run before the potentially blocked
+        # registry sweep; unlike the shared deadline it is safe and bounded after expiry.
         GatewayShutdownMixin._quiet_step(
             "kill_live_foreground_processes", _kill_foreground_processes, level=logging.WARNING,
         )
@@ -2196,15 +2206,27 @@ class GatewayShutdownMixin:
             ),
             level=logging.WARNING,
         ))
+        # One clock (time.monotonic) for every deadline below. The non-restart mark gets its own short,
+        # non-zero bound: the post-interrupt grace has already expired whenever a stuck agent outlived it,
+        # and a zero wait would drop the marked IDs (the sweep's second mark then loses the
+        # expected_fire_owner race and returns []), silently losing the #82232 notice.
         _restart_deadline = None
-        _mark_deadline = interrupt_deadline
         if self._restart_requested:
             _restart_deadline = time.monotonic() + self._restart_shutdown_bound()
             _mark_deadline = _restart_deadline
+        else:
+            # Unused post-interrupt grace (converted off loop.time into a duration), floored at the
+            # short non-zero bound and capped by the restart-path bound: never longer than either the
+            # previous wait or the restart handoff.
+            _grace_left = max(0.0, interrupt_deadline - loop.time())
+            _mark_deadline = time.monotonic() + min(
+                self._restart_shutdown_bound(), max(_NONRESTART_CRON_MARK_BOUND_S, _grace_left),
+            )
         _mark_done, _pending = await asyncio.wait(
             {_mark_task}, timeout=max(0.0, _mark_deadline - time.monotonic())
         )
-        if _mark_task in _mark_done:
+        _mark_collected = _mark_task in _mark_done
+        if _mark_collected:
             _interrupted_cron_jobs = await _mark_task or []
         else:
             # Do not cancel the worker: it may be waiting on a fire fence and must finish its
@@ -2223,6 +2245,12 @@ class GatewayShutdownMixin:
         )
         if _swept_cron_jobs:
             _interrupted_cron_jobs = list(dict.fromkeys(_interrupted_cron_jobs + _swept_cron_jobs))
+        # The detached mark may have finished during the sweep. It won the expected_fire_owner race, so
+        # the sweep's own mark returned nothing for those jobs: merge its result before notices go out.
+        if not _mark_collected and _mark_task.done() and not _mark_task.cancelled():
+            _late_marked = _mark_task.result() or []
+            if _late_marked:
+                _interrupted_cron_jobs = list(dict.fromkeys(_interrupted_cron_jobs + list(_late_marked)))
         logger.info("Shutdown phase: post-interrupt tool kill done at +%.2fs", ctx.elapsed())
         # Last window with the transport up (the cron worker's own notice arrives after teardown).
         with _log_suppressed(logging.DEBUG, "Cron interrupt notification failed: %s"):

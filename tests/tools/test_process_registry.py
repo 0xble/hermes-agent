@@ -355,6 +355,42 @@ def test_bounded_kill_validates_descendant_identity_before_signaling(registry, m
     assert [call.args[0] for call in killpg.call_args_list] == [100]
 
 
+def test_bounded_sweep_caps_signal_thread_pool(registry, monkeypatch):
+    """A large process tree must not spawn one sweep thread per process."""
+    import tools.process_registry as _pr
+
+    session = _make_session(sid="proc_wide_tree")
+    session.process = MagicMock(pid=100)
+    session.host_start_time = 10
+    registry._running[session.id] = session
+
+    class _Child:
+        def __init__(self, pid):
+            self.pid = pid
+
+    children = [_Child(1000 + i) for i in range(40)]
+    monkeypatch.setattr("psutil.Process", lambda _pid: MagicMock(children=lambda recursive: children))
+    monkeypatch.setattr(registry, "_proc_alive", lambda _proc: True)
+    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, expected: True)
+    monkeypatch.setattr(registry, "_safe_host_start_time", lambda pid: 10)
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+    monkeypatch.setattr("tools.process_registry.os.getpgid", lambda pid: pid)
+    widths = []
+    real_pool = _pr.ThreadPoolExecutor
+
+    def _recording_pool(*args, **kwargs):
+        widths.append(kwargs.get("max_workers"))
+        return real_pool(*args, **kwargs)
+
+    monkeypatch.setattr(_pr, "ThreadPoolExecutor", _recording_pool)
+    with patch("tools.process_registry.os.killpg") as killpg:
+        registry.kill_all(deadline=time.monotonic() + 1.0)
+
+    assert widths and max(widths) <= 16
+    signalled = {call.args[0] for call in killpg.call_args_list}
+    assert signalled == {100, *(child.pid for child in children)}
+
+
 def test_move_to_finished_rechecks_deadline_before_checkpoint(registry):
     session = _make_session(sid="proc_checkpoint_deadline")
     registry._running[session.id] = session

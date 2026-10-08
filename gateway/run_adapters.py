@@ -74,15 +74,28 @@ class GatewayAdapterLifecycleMixin:
                 task.add_done_callback(consume_detached_task_result)
         return task in done
 
-    async def _await_adapter_cleanup_with_timeout(self, awaitable: Awaitable[Any], timeout: float) -> bool:
-        """Await adapter cleanup with a detach-on-deadline bound; True when it completed."""
-        task = asyncio.ensure_future(awaitable)
-        if timeout <= 0:
+    async def _await_adapter_cleanup_with_timeout(
+        self, awaitable: Awaitable[Any], timeout: Optional[float], *, deadline_expired: bool = False,
+    ) -> bool:
+        """Await adapter cleanup with a detach-on-deadline bound; True when it completed.
+
+        ``timeout`` None or <= 0 means unbounded (``HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT=0``).
+        An already-expired shared shutdown deadline is a separate, explicit ``deadline_expired``
+        signal: the cleanup is still started (so disconnect and token-lock release are attempted)
+        and gets one loop turn, then anything still running is detached.
+        """
+        if deadline_expired:
+            task = asyncio.ensure_future(awaitable)
             task.add_done_callback(consume_detached_task_result)
-            # Give an immediate cleanup coroutine one turn to release synchronous
-            # resources while still detaching anything that runs past the deadline.
             await asyncio.sleep(0)
-            return False
+            if not task.done():
+                return False
+            await task
+            return True
+        if timeout is None or timeout <= 0:
+            await awaitable
+            return True
+        task = asyncio.ensure_future(awaitable)
         if not await self._wait_or_detach(task, timeout):
             return False
         await task
@@ -112,24 +125,29 @@ class GatewayAdapterLifecycleMixin:
         network state is half-dead (e.g. a wedged Feishu/Lark WebSocket thread waiting on I/O). See #14128.
         """
         budget = self._adapter_disconnect_timeout_secs()
-        teardown_deadline = time.monotonic() + max(0.0, budget)
+        # HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT=0 keeps its documented "unbounded" meaning; only a
+        # shared shutdown ``deadline`` bounds it then.
+        teardown_deadline: Optional[float] = None if budget <= 0 else time.monotonic() + budget
         if deadline is not None:
-            teardown_deadline = min(teardown_deadline, deadline)
+            teardown_deadline = deadline if teardown_deadline is None else min(teardown_deadline, deadline)
 
-        def remaining() -> float:
+        def remaining() -> Optional[float]:
+            """Seconds left (None = unbounded); 0.0 means the shared deadline has expired."""
+            if teardown_deadline is None:
+                return None
             return max(0.0, teardown_deadline - time.monotonic())
 
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
         cancel_timeout = remaining()
-        if cancel_timeout > 0:
+        if cancel_timeout is None or cancel_timeout > 0:
             try:
                 if not await self._await_adapter_cleanup_with_timeout(
                     adapter.cancel_background_tasks(), cancel_timeout,
                 ):
                     logger.warning(
                         "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
-                        platform.value, cancel_timeout, suffix,
+                        platform.value, cancel_timeout or 0.0, suffix,
                     )
             except Exception as e:
                 logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
@@ -145,6 +163,7 @@ class GatewayAdapterLifecycleMixin:
         ):
             if await self._await_adapter_cleanup_with_timeout(
                 adapter.disconnect(), disconnect_timeout,
+                deadline_expired=disconnect_timeout is not None and disconnect_timeout <= 0,
             ):
                 logger.info(
                     "✓ %s disconnected (%.2fs)%s", platform.value, time.monotonic() - started_at, suffix,
@@ -152,7 +171,7 @@ class GatewayAdapterLifecycleMixin:
             else:
                 logger.warning(
                     "✗ %s disconnect timed out after %.1fs - forcing continue%s",
-                    platform.value, disconnect_timeout, suffix,
+                    platform.value, disconnect_timeout or 0.0, suffix,
                 )
 
     @staticmethod
