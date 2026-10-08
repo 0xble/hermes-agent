@@ -61,6 +61,25 @@ def test_bootstrap_import_exports_scratch_to_process_and_children(tmp_path):
     expected = str(tmp_path / "cache" / "scratch")
     assert out.stdout.split() == [expected, expected]
 
+def test_user_tmpdir_does_not_disable_scratch_pruning(tmp_path, monkeypatch):
+    """macOS exports TMPDIR, so maintenance must still run without overriding it."""
+    import hermes_constants
+
+    monkeypatch.setattr(hermes_constants, "_scratch_pruned_once", False)
+    home = tmp_path / "home"
+    scratch = get_scratch_dir(home, prune=False)
+    idle = scratch / "idle"
+    idle.mkdir()
+    (idle / "payload").write_text("x", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    os.utime(idle / "payload", (ancient, ancient))
+    os.utime(idle, (ancient, ancient))
+    env = {"HERMES_HOME": str(home), "TMPDIR": "/var/folders/system-temp"}
+
+    assert apply_scratch_tmp_env(env) is False
+    assert env["TMPDIR"] == "/var/folders/system-temp"
+    assert not idle.exists()
+
 
 def test_prune_removes_idle_entries_and_keeps_trees_written_deep_inside(tmp_path):
     """Idle retention: an entry goes when nothing in its subtree was written within the window;

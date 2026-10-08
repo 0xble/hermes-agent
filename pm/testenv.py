@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from pm.environments import install_state_dir
+from pm.environments import install_state_dir, install_state_lock
 
 NAME = "test-environment"
 # The default developer environment includes the app's normal features.
@@ -37,7 +37,8 @@ def testenv_python(project_root: Path) -> Path | None:
     """The selected test interpreter, read without acquiring tools or writing state."""
     from pm.operations import environment_python
 
-    return environment_python(NAME, root=testenv_root(project_root))
+    with install_state_lock(install_state_dir(project_root)):
+        return environment_python(NAME, root=testenv_root(project_root))
 
 
 def parse_extras(value: str) -> list[str] | None:
