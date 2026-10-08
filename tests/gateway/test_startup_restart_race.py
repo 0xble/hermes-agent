@@ -258,6 +258,16 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
     _patch_aborted_startup(monkeypatch, AbortedStartupRunner)
     monkeypatch.setattr("gateway.run._start_cron_ticker", fail_if_cron_starts)
     monkeypatch.setattr("tools.mcp_tool_lifecycle.shutdown_mcp_servers", lambda: None)
+    teardown = []
+
+    async def settle(_runner):
+        teardown.append("settle")
+
+    async def shutdown(*_args, **_kwargs):
+        teardown.append("shutdown")
+
+    monkeypatch.setattr(gateway_run, "_settle_mcp_discovery", settle)
+    monkeypatch.setattr(gateway_run, "_shutdown_mcp_servers_nonblocking", shutdown)
 
     with pytest.raises(SystemExit) as exc:
         await gateway_run.start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
@@ -265,6 +275,7 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
     assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert cron_started is False
     assert export_shutdown_calls == 1
+    assert teardown == ["settle", "shutdown"]
 
 
 @pytest.mark.asyncio

@@ -952,8 +952,11 @@ def _startup_restore_drain_timeout_secs() -> float:
     """Max seconds ``_finish_startup_restore`` holds the inbound gate for boot auto-resume; <=0 disables.
 
     Duplicate-agent safety does NOT depend on it: ``_schedule_resume_pending_sessions`` claims SYNCHRONOUSLY.
+    The implementation lives in a side-effect-free module so request admission does not import the gateway
+    bootstrap facade.
     """
-    return _float_env("HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT", _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
+    from gateway.startup_timeouts import startup_restore_drain_timeout_secs
+    return startup_restore_drain_timeout_secs()
 
 
 def _startup_warmup_timeout_secs() -> float:
@@ -4997,6 +5000,15 @@ async def _settle_mcp_discovery(runner: Any) -> None:
         logger.warning("MCP discovery still running after %.1fs at shutdown; tearing MCP down anyway", timeout)
 
 
+async def _settle_and_shutdown_mcp(runner: Any) -> None:
+    """Finish startup discovery, then close MCP servers for every post-start exit path."""
+    await _settle_mcp_discovery(runner)
+    try:
+        await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
+    except Exception:
+        logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+
+
 async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0, config: Any = None) -> bool:
     """Close MCP servers off-loop with a bounded wait; True when done within ``timeout``.
     ``shutdown_mcp_servers()`` can block ~15s; on the loop thread short-grace supervisors (s6 3s)
@@ -6043,18 +6055,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         success = await runner.start()
     except BaseException:
         # start() already ran the normal stop/flush path; MCP discovery began before the failure.
-        await _settle_mcp_discovery(runner)
-        try:
-            await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
-        except Exception:
-            logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+        await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
         raise
     if not success:
+        await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
         return False
 
     if runner.should_exit_cleanly:
+        await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
