@@ -34,6 +34,8 @@ def _domain_launchctl(*, gui=None, user=None, no_home=False):
         if isinstance(value, int):
             stderr = "Could not find service" if value == 113 else "Input/output error"
             return subprocess.CompletedProcess(argv, value, stdout="", stderr=stderr)
+        if isinstance(value, tuple):
+            return subprocess.CompletedProcess(argv, value[0], stdout=value[1], stderr=value[2])
         if no_home:
             stdout = f"{_LABEL} = {{\n\tenvironment = {{\n\t\tPATH => /usr/bin\n\t}}\n}}\n"
         else:
@@ -101,6 +103,38 @@ def test_absent_print_in_both_domains_is_not_a_leftover(tmp_path, monkeypatch):
     monkeypatch.setattr(guard.sys, "platform", "darwin")
     monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=113, user=113))
     assert guard.leftover_forward_only_state(tmp_path) == []
+
+
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize(
+    "result",
+    [
+        (113, "", "Could not find service"),
+        (3, "", "Could not find service"),
+        (7, "Could not find service", ""),
+    ],
+)
+def test_service_not_found_text_is_absent_regardless_of_return_code(tmp_path, monkeypatch, result):
+    monkeypatch.setattr(guard.sys, "platform", "darwin")
+    monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=result, user=result))
+    assert guard.leftover_forward_only_state(tmp_path) == []
+
+
+@pytest.mark.platforms("macos")
+def test_rc_113_unknown_failure_is_inspection_failure_and_supervised_run_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(guard.sys, "platform", "darwin")
+    other = tmp_path / "other-home"
+    other.mkdir()
+    unknown_failure = (113, "", "Input/output error")
+    monkeypatch.setattr(guard.subprocess, "run", _domain_launchctl(gui=unknown_failure, user=other))
+    with pytest.raises(guard.LeftoverInspectionError, match="gui/"):
+        guard.leftover_forward_only_state(tmp_path)
+
+    from hermes_cli import gateway
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        gateway._refuse_forward_only_leftovers(retry_on_inspection_error=True)
+    assert exc.value.code == 75
 
 
 @pytest.mark.platforms("macos")

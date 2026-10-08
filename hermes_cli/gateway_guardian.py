@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_cli.forward_only_guard import _LAUNCHCTL_SERVICE_NOT_FOUND
 from hermes_cli.immutable_releases import ReleasePaths, _release_is_ready, rollback
 
 GUARDIAN_LABEL = "ai.hermes.gateway-guardian"
@@ -177,7 +178,7 @@ def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> 
         if (not pid or int(pid[1]) == 0) and last_exit and int(last_exit[1]) == 0:
             return "parked"
         return "loaded"
-    if "Could not find service" in result.stderr or "Could not find service" in result.stdout:
+    if _LAUNCHCTL_SERVICE_NOT_FOUND in result.stderr or _LAUNCHCTL_SERVICE_NOT_FOUND in result.stdout:
         return "unloaded"
     raise RuntimeError(f"launchctl print could not establish unload (exit {result.returncode})")
 

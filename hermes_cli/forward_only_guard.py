@@ -57,7 +57,7 @@ def _classify_launchctl_print(result) -> str:
     if result.returncode == 0:
         return "FOUND"
     output = f"{result.stdout or ''}\n{result.stderr or ''}"
-    if result.returncode == 113 or _LAUNCHCTL_SERVICE_NOT_FOUND in output:
+    if _LAUNCHCTL_SERVICE_NOT_FOUND in output:
         return "ABSENT"
     return "ERROR"
 
@@ -68,8 +68,9 @@ def _label_hermes_homes(label: str, *, runner=None, timeout_for: TimeoutFor = _f
     Generation plists pin ``EnvironmentVariables.HERMES_HOME`` to the resolved home, and
     ``launchctl print`` echoes it in the job's ``environment`` block. A label can be managed by
     either the Aqua ``gui/<uid>`` domain or the background ``user/<uid>`` domain, so inspect both.
-    Each domain probe is classified as FOUND (return code 0), ABSENT (return code 113 or
-    ``Could not find service`` in its output), or ERROR (an exception or any other nonzero result).
+    Each domain probe is classified as FOUND (return code 0), ABSENT when
+    ``Could not find service`` appears in its output, or ERROR (an exception or any other
+    nonzero result).
     """
     import os
 
