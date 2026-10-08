@@ -501,6 +501,16 @@ def _stop_systemd_unit(unit_name: str, *, timeout: Optional[float] = 15.0) -> bo
         return False
 
 
+def _stop_systemd_unit_bounded(unit_name: str, deadline: Optional[float]) -> bool:
+    """Stop a systemd scope without exceeding a caller's shutdown deadline."""
+    if deadline is None:
+        return _stop_systemd_unit(unit_name)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    return _stop_systemd_unit(unit_name, timeout=remaining)
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -1082,10 +1092,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with suppress(OSError, ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGTERM)
         if _IS_WINDOWS:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return
             try:
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
-                    encoding='utf-8', errors='replace', timeout=10, creationflags=windows_hide_flags(),
+                    encoding='utf-8', errors='replace',
+                    timeout=remaining if remaining is not None else 10,
+                    creationflags=windows_hide_flags(),
                     stdin=subprocess.DEVNULL)
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 _sigterm_quietly()
@@ -2276,8 +2291,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
             # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
             # above already handled the main process; this catches stragglers.
-            if session.systemd_unit and (deadline is None or time.monotonic() < deadline):
-                _stop_systemd_unit(session.systemd_unit)
+            if session.systemd_unit:
+                _stop_systemd_unit_bounded(session.systemd_unit, deadline)
             with session._lock:
                 result = self._exit_snapshot(session, "already_exited")
             # Only suppress the autonomous turn after its output is present in
@@ -2292,8 +2307,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
-            if session.systemd_unit and (deadline is None or time.monotonic() < deadline):
-                _stop_systemd_unit(session.systemd_unit)
+            if session.systemd_unit:
+                _stop_systemd_unit_bounded(session.systemd_unit, deadline)
             # Post-kill verification (#115490): the signals above can leave
             # survivors (SIGTERM-ignoring daemons, scope escapees). A kill that
             # leaves a live tree must not write a killed receipt or prune the
@@ -2383,7 +2398,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # or was recycled across the gateway restart (#70716, teknium1 review).
             if self._detached_host_fate(session.pid, session.host_start_time) != "running":
                 if session.systemd_unit:
-                    _stop_systemd_unit(session.systemd_unit)
+                    _stop_systemd_unit_bounded(session.systemd_unit, deadline)
                 with session._lock:
                     output = _completion_output(session)
                 if consume_output:

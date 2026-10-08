@@ -1636,12 +1636,51 @@ class TestCheckpoint:
 # =========================================================================
 
 class TestKillProcess:
-    def test_kill_already_exited(self, registry):
-        s = _make_session(exited=True, exit_code=0)
+    def test_kill_already_exited_passes_remaining_systemd_timeout(self, registry):
+        s = _make_session(sid="proc_exited_scope", exited=True, exit_code=0)
+        s.systemd_unit = "hermes-worker-proc_exited_scope.scope"
         registry._finished[s.id] = s
-        result = registry.kill_process(s.id)
-        assert result["status"] == "already_exited"
+        deadline = time.monotonic() + 1.0
 
+        with patch("tools.process_registry._stop_systemd_unit", return_value=True) as stop_unit:
+            result = registry.kill_process(s.id, deadline=deadline)
+
+        assert result["status"] == "already_exited"
+        timeout = stop_unit.call_args.kwargs["timeout"]
+        assert 0 < timeout <= 1.0
+
+    def test_kill_detached_dead_host_passes_remaining_systemd_timeout(self, registry, monkeypatch):
+        s = _make_session(sid="proc_detached_scope", command="daemonize")
+        s.pid = 424242
+        s.pid_scope = "host"
+        s.detached = True
+        s.systemd_unit = "hermes-worker-proc_detached_scope.scope"
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "dead")
+        deadline = time.monotonic() + 1.0
+
+        with patch("tools.process_registry._stop_systemd_unit", return_value=True) as stop_unit:
+            result = registry.kill_process(s.id, deadline=deadline)
+
+        assert result["status"] == "already_exited"
+        timeout = stop_unit.call_args.kwargs["timeout"]
+        assert 0 < timeout <= 1.0
+
+    def test_kill_detached_dead_host_skips_expired_systemd_stop(self, registry, monkeypatch):
+        s = _make_session(sid="proc_detached_expired", command="daemonize")
+        s.pid = 424243
+        s.pid_scope = "host"
+        s.detached = True
+        s.systemd_unit = "hermes-worker-proc_detached_expired.scope"
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "dead")
+
+        with patch("tools.process_registry.time.monotonic", side_effect=[0.0, 2.0]), \
+             patch("tools.process_registry._stop_systemd_unit", return_value=True) as stop_unit:
+            result = registry.kill_process(s.id, deadline=1.0)
+
+        assert result["status"] == "already_exited"
+        stop_unit.assert_not_called()
 
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
@@ -1921,6 +1960,25 @@ class TestTerminateHostPidWindows:
         assert "12345" in captured["args"]
         assert "/T" in captured["args"], "Tree flag required to reach descendants"
         assert "/F" in captured["args"], "Force flag required for headless Chromium"
+
+    def test_windows_bounded_kill_uses_remaining_deadline(self, monkeypatch):
+        from tools import process_registry as pr
+
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pr.subprocess, "run", fake_run)
+        deadline = time.monotonic() + 1.0
+
+        pr.ProcessRegistry._terminate_host_pid(12345, deadline=deadline)
+
+        timeout = captured["kwargs"]["timeout"]
+        assert 0 < timeout <= 1.0
 
 class TestTerminateHostPidPosix:
     """POSIX branch gives a managed parent its shutdown window first."""
