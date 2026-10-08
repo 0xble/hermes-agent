@@ -178,7 +178,8 @@ def _background_review_write_guard(
         if is_external_skill_path(skill_dir):
             return _refusal(
                 f"{refuse} skill '{name}': the skill lives in skills.external_dirs, which are "
-                f"externally owned and read-only to autonomous curation.")
+                f"externally owned and read-only to autonomous curation. Change it at its source "
+                f"in the owning repository.")
     except Exception:
         logger.debug("external skill guard lookup failed for %s", name, exc_info=True)
     try:
