@@ -8,7 +8,6 @@ import contextvars
 import functools
 import json
 import logging
-import os
 import threading
 import time
 from contextlib import suppress
