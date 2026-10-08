@@ -320,6 +320,64 @@ def test_bounded_kill_all_past_deadline_does_not_signal_live_process(registry):
     killpg.assert_not_called()
 
 
+def test_bounded_kill_all_revalidates_recycled_root_before_group_signal(registry, monkeypatch):
+    """A root recycled after the snapshot must not receive its snapshotted PGID signal."""
+    session = _make_session(sid="proc_recycled_root")
+    session.process = MagicMock(pid=100)
+    session.process.poll.return_value = 0
+    session.host_start_time = 10
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", staticmethod(lambda: 0.0))
+
+    identity_checks = iter([True, False])
+    monkeypatch.setattr(
+        registry,
+        "_host_pid_is_ours",
+        lambda _pid, _expected: next(identity_checks, False),
+    )
+    monkeypatch.setattr("tools.process_registry.os.getpgid", lambda _pid: 123)
+    monkeypatch.setattr("tools.process_registry.os.getpgrp", lambda: 999)
+    with patch("tools.process_registry.os.killpg") as killpg:
+        assert registry.kill_all(deadline=time.monotonic() + 1.0) == 1
+    killpg.assert_not_called()
+
+
+def test_bounded_kill_all_revalidates_recycled_descendant_before_group_signal(
+    registry, monkeypatch
+):
+    """A descendant recycled after the snapshot must not receive its snapshotted PGID signal."""
+    session = _make_session(sid="proc_recycled_descendant")
+    session.process = MagicMock(pid=100)
+    session.process.poll.return_value = 0
+    session.host_start_time = 10
+    registry._running[session.id] = session
+
+    class _Child:
+        pid = 200
+
+    child = _Child()
+    monkeypatch.setattr("psutil.Process", lambda _pid: MagicMock(children=lambda recursive: [child]))
+    monkeypatch.setattr(registry, "_proc_alive", lambda _proc: True)
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", staticmethod(lambda: 0.0))
+    child_checks = 0
+
+    def host_pid_is_ours(pid, _expected):
+        nonlocal child_checks
+        if pid == 100:
+            return True
+        child_checks += 1
+        # Snapshot filter succeeds, the post-term survivor probe keeps the child
+        # eligible for escalation, and the pre-signal recheck rejects the recycle.
+        return child_checks in {1, 3}
+
+    monkeypatch.setattr(registry, "_host_pid_is_ours", host_pid_is_ours)
+    monkeypatch.setattr("tools.process_registry.os.getpgid", lambda pid: 999 if pid == 100 else pid)
+    monkeypatch.setattr("tools.process_registry.os.getpgrp", lambda: 999)
+    with patch("tools.process_registry.os.kill"), patch("tools.process_registry.os.killpg") as killpg:
+        assert registry.kill_all(deadline=time.monotonic() + 1.0) == 1
+    killpg.assert_not_called()
+
+
 def test_sandbox_kill_uses_remaining_deadline_not_fixed_timeout(registry):
     session = _make_session(sid="proc_sandbox")
     session.pid_scope = "sandbox"
@@ -2123,6 +2181,44 @@ class TestTerminateHostPidPosix:
         assert terminate_order == [12345, 101, 102, 103], (
             "Parent must receive SIGTERM before any snapshot descendant"
         )
+
+    @pytest.mark.platforms("posix")
+    def test_posix_stops_all_post_wait_signals_at_caller_deadline(self, monkeypatch):
+        """An expired bounded deadline must suppress descendant TERM and all KILL escalation."""
+        from tools import process_registry as pr
+        import psutil
+
+        signals = []
+
+        class _FakeChild:
+            pid = 101
+
+            def terminate(self):
+                signals.append("child-term")
+
+            def kill(self):
+                signals.append("child-kill")
+
+        class _FakeParent:
+            pid = 100
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [_FakeChild()]
+
+            def terminate(self):
+                signals.append("parent-term")
+
+            def kill(self):
+                signals.append("parent-kill")
+
+        monkeypatch.setattr(psutil, "Process", lambda _pid: _FakeParent())
+        monkeypatch.setattr(pr.ProcessRegistry, "_proc_alive", staticmethod(lambda _proc: True))
+        monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 1.0))
+
+        pr.ProcessRegistry._terminate_host_pid(100, deadline=time.monotonic() + 0.03)
+
+        assert signals == ["parent-term"]
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal ordering; Windows uses taskkill")
     @pytest.mark.live_system_guard_bypass

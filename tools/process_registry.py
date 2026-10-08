@@ -1088,7 +1088,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "PID was recycled onto an unrelated process.", pid)
             return
 
+        def _deadline_active() -> bool:
+            return deadline is None or time.monotonic() < deadline
+
         def _sigterm_quietly():
+            if not _deadline_active():
+                return
             with suppress(OSError, ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGTERM)
         if _IS_WINDOWS:
@@ -1124,6 +1129,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # Let self-managing parents (notably Chromium/Electron) shut down their
         # tree before touching children. Killing their zygotes first can turn a
         # graceful browser shutdown into a crash dump.
+        if not _deadline_active():
+            return
         with suppress(gone):
             parent.terminate()
 
@@ -1140,6 +1147,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
         # Preserve descendants during the parent's configured shutdown window.
         _wait_for_exit([parent])
+        if not _deadline_active():
+            return
 
         # The snapshot is an anti-orphan guarantee: only descendants still alive
         # after the parent had its chance are asked to terminate themselves.
@@ -1147,6 +1156,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             proc for proc in descendants if cls._proc_alive(proc)
         ]
         for proc in remaining:
+            if not _deadline_active():
+                return
             with suppress(gone):
                 proc.terminate()
 
@@ -1162,6 +1173,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if grace <= 0:
             return
         _wait_for_exit(targets)
+        if not _deadline_active():
+            return
         # A parent that ignored SIGTERM (the interactive ``bash -lic`` wrapper does) keeps
         # running its script through both grace windows and can spawn children the first
         # snapshot never saw. Re-snapshot while it is still alive: once it is SIGKILLed
@@ -1171,6 +1184,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 known = {proc.pid for proc in targets}
                 targets.extend(p for p in parent.children(recursive=True) if p.pid not in known)
         for proc in targets:
+            if not _deadline_active():
+                return
             with suppress(gone):
                 if cls._proc_alive(proc):
                     proc.kill()  # SIGKILL on POSIX
@@ -2689,13 +2704,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 kwargs["deadline"] = deadline
             return self.kill_process(session.id, **kwargs).get("status") in {"killed", "already_exited"}
 
-        def _signal_pid_group(pid: int, sig: int, *, pgid: Optional[int] = None) -> bool:
+        def _signal_pid_group(
+            pid: int, sig: int, *, pgid: Optional[int] = None,
+            expected_start: Optional[int] = None,
+        ) -> bool:
             """Signal one snapshotted host PID and its own process group without waiting."""
             if not pid:
                 return False
             if stop_event is not None and stop_event.is_set():
                 return False
             if deadline is not None and time.monotonic() >= deadline:
+                return False
+            if expected_start is not None and not self._host_pid_is_ours(pid, expected_start):
                 return False
             try:
                 killpg = getattr(os, "killpg", None)
@@ -2712,7 +2732,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             except (ProcessLookupError, PermissionError, OSError):
                 return False
 
-        def _signal_group(session: ProcessSession, sig: int, *, pgid: Optional[int] = None) -> bool:
+        def _signal_group(
+            session: ProcessSession, sig: int, *, pgid: Optional[int] = None,
+            expected_start: Optional[int] = None,
+        ) -> bool:
             """Signal one owned local process group without waiting for it."""
             # A systemd scope is an additional cgroup boundary, not a reason to
             # skip the host process group. Direct signalling remains the bounded
@@ -2730,9 +2753,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         )
                         return True
                 return False
-            if session.host_start_time is not None and pgid is None and not self._host_pid_is_ours(pid, session.host_start_time):
-                return False
-            return _signal_pid_group(pid, sig, pgid=pgid)
+            return _signal_pid_group(
+                pid, sig, pgid=pgid,
+                expected_start=(session.host_start_time if expected_start is None else expected_start),
+            )
 
         def _alive(session: ProcessSession) -> bool:
             proc = getattr(session, "process", None)
@@ -2788,10 +2812,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 for pid, _child_pgid, start_time in descendants
             )
 
-        def _signal_snapshot_member(kind, target, sig: int, pgid: Optional[int]) -> bool:
+        def _signal_snapshot_member(
+            kind, target, sig: int, pgid: Optional[int], expected_start: Optional[int],
+        ) -> bool:
             if kind == "root":
-                return _signal_group(target, sig, pgid=pgid)
-            return _signal_pid_group(target, sig, pgid=pgid)
+                return _signal_group(target, sig, pgid=pgid, expected_start=expected_start)
+            return _signal_pid_group(
+                target, sig, pgid=pgid, expected_start=expected_start,
+            )
 
         # Unbounded callers retain kill_process()'s parent-first tree semantics. The parallel
         # root/descendant sweep is reserved for bounded shutdown, where a shared deadline is
@@ -2865,16 +2893,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 term_jobs = []
                 for session in signalable:
                     root_pgid, descendants = snapshots[session.id]
-                    term_jobs.append(("root", session, root_pgid))
+                    term_jobs.append(("root", session, root_pgid, session.host_start_time))
                     term_jobs.extend(
-                        ("descendant", pid, pgid)
+                        ("descendant", pid, pgid, start_time)
                         for pid, pgid, start_time in descendants
                         if start_time is not None and self._host_pid_is_ours(pid, start_time)
                     )
                 with ThreadPoolExecutor(max_workers=min(_SWEEP_MAX_WORKERS, len(term_jobs)), thread_name_prefix="process-term") as pool:
                     futures = [
-                        pool.submit(_signal_snapshot_member, kind, target, signal.SIGTERM, pgid)
-                        for kind, target, pgid in term_jobs
+                        pool.submit(
+                            _signal_snapshot_member, kind, target, signal.SIGTERM, pgid,
+                            expected_start,
+                        )
+                        for kind, target, pgid, expected_start in term_jobs
                     ]
                     for future in futures:
                         with suppress(Exception):
@@ -2899,9 +2930,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     if not _snapshot_alive(session, snapshot):
                         continue
                     root_pgid, descendants = snapshot
-                    kill_jobs = [("root", session, root_pgid)]
+                    kill_jobs = [("root", session, root_pgid, session.host_start_time)]
                     kill_jobs.extend(
-                        ("descendant", pid, pgid)
+                        ("descendant", pid, pgid, start_time)
                         for pid, pgid, start_time in descendants
                         if start_time is not None and self._host_pid_is_ours(pid, start_time)
                     )
@@ -2911,8 +2942,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
                             pool.submit(
                                 _signal_snapshot_member, kind, target,
                                 getattr(signal, "SIGKILL", signal.SIGTERM), pgid,
+                                expected_start,
                             )
-                            for kind, target, pgid in kill_jobs
+                            for kind, target, pgid, expected_start in kill_jobs
                         ]
                         for future in futures:
                             with suppress(Exception):
