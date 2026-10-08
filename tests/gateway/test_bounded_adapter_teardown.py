@@ -439,6 +439,64 @@ async def test_timed_out_finalize_reserves_adapter_disconnect_budget(bare_runner
     assert elapsed <= bound + 0.2
 
 
+@pytest.mark.asyncio
+async def test_cancelled_finalize_preserves_held_process_completion_batch(bare_runner):
+    """Cancellation before batch teardown still settles the held completion durably."""
+    import threading
+    import time
+
+    runner = bare_runner
+    runner._restart_requested = True
+    runner._restart_detached = False
+    runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._startup_restore_queue = []
+    runner._profile_adapters = {}
+    runner._agent_cache_lock = None
+    runner._agent_cache = None
+    runner._background_tasks = set()
+    runner.adapters = {}
+    runner._ensure_completion_batch_state()
+    future = asyncio.get_running_loop().create_future()
+    event = {
+        "type": "completion",
+        "session_id": "proc_cancelled_finalize",
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "output": "done",
+    }
+    key = tuple(event.get(field) or "" for field in runner._COMPLETION_BATCH_KEY_FIELDS)
+    runner._completion_notification_batches[key] = [("completion", event, future)]
+    spooled = []
+    runner._build_process_event_source = lambda _event: object()
+    runner._session_key_for_source = lambda _source: event["session_key"]
+    runner._preserve_drain_event = lambda _key, preserved: spooled.append(preserved.text) or True
+
+    started = asyncio.Event()
+
+    async def slow_finalize(_active, *, stop_event=None, deadline=None):
+        del stop_event, deadline
+        started.set()
+        await asyncio.Event().wait()
+
+    runner._finalize_shutdown_agents = slow_finalize
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, started_at=time.monotonic())
+    stop_event = threading.Event()
+    task = asyncio.create_task(GatewayRunner._stop_finalize_agents_and_adapters(
+        runner, ctx, stop_event=stop_event,
+    ))
+    await started.wait()
+    task.cancel()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert future.done() and future.result() is True
+    assert len(spooled) == 1 and spooled[0].startswith("completion")
+
+
 
 @pytest.mark.asyncio
 async def test_zero_cleanup_timeout_means_unbounded(bare_runner):

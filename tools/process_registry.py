@@ -2691,7 +2691,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 and not (lifecycle and s.persist_on_release)
             ]
             targets = [s for s in candidates if not s.exited]
-        detached_nonrunning = [
+        bounded_guard_fired = (
+            (stop_event is not None and stop_event.is_set())
+            or (deadline is not None and time.monotonic() >= deadline)
+        )
+        detached_nonrunning = [] if bounded_guard_fired else [
             session for session in targets
             if session.detached
             and session.pid_scope == "host"
@@ -2699,8 +2703,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
             and self._detached_host_fate(session.pid, session.host_start_time) != "running"
         ]
         for session in detached_nonrunning:
+            if ((stop_event is not None and stop_event.is_set())
+                    or (deadline is not None and time.monotonic() >= deadline)):
+                break
             if session.systemd_unit:
                 _stop_systemd_unit_bounded(session.systemd_unit, deadline)
+            if ((stop_event is not None and stop_event.is_set())
+                    or (deadline is not None and time.monotonic() >= deadline)):
+                break
             self._close_reused_detached(session)
         targets = [session for session in targets if session not in detached_nonrunning]
         def _fallback_kill_one(session: ProcessSession) -> bool:

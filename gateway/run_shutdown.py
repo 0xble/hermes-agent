@@ -2445,7 +2445,13 @@ class GatewayShutdownMixin:
             return
         # Settle completion flush tasks while adapters are alive so every watcher gets a retryable result.
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
-        if not pre_teardown_cancelled and cancel_completion_batches is not None:
+        preserve_held_completion_batches = getattr(
+            self, "_preserve_held_process_completion_batches", None,
+        )
+        if pre_teardown_cancelled:
+            if callable(preserve_held_completion_batches):
+                preserve_held_completion_batches()
+        elif cancel_completion_batches is not None:
             try:
                 await cancel_completion_batches()
             except asyncio.CancelledError:
@@ -2453,6 +2459,8 @@ class GatewayShutdownMixin:
                     raise
                 pre_teardown_cancelled = True
                 logger.warning("Shutdown pre-teardown was cancelled; proceeding to adapter teardown")
+                if callable(preserve_held_completion_batches):
+                    preserve_held_completion_batches()
         if stop_event is not None and stop_event.is_set() and not pre_teardown_cancelled:
             return
         # Preserve each adapter's queue BEFORE any cancellable background-task cleanup. The

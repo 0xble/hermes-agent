@@ -2304,6 +2304,16 @@ class GatewayNotificationsMixin:
                              evt.get("session_id"))
             future.set_result(True if preserved else False)
 
+    def _preserve_held_process_completion_batches(self) -> None:
+        """Synchronously spool held process completions when cancellable teardown was interrupted."""
+        self._ensure_completion_batch_state()
+        self._completion_notification_batches_stopping = True
+        for release in self._completion_notification_batch_releases.values():
+            release.set()
+        for entries in list(self._completion_notification_batches.values()):
+            self._preserve_undelivered_batch(entries)
+        self._completion_notification_batches.clear()
+
     @staticmethod
     def _requeue_completion_events(events: list[dict]) -> None:
         from tools.process_registry import process_registry

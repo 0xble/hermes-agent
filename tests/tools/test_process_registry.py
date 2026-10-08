@@ -162,6 +162,31 @@ def test_kill_all_deadline_stops_followup_targets_and_checkpoint_writes(registry
     checkpoint.assert_not_called()
 
 
+@pytest.mark.parametrize("guard", ["deadline", "stop_event"])
+def test_bounded_kill_all_skips_detached_pre_sweep_after_guard(registry, monkeypatch, guard):
+    """A bounded sweep must not close detached sessions after its guard fires."""
+    session = _make_session(sid=f"proc_detached_guard_{guard}")
+    session.pid = 424242
+    session.pid_scope = "host"
+    session.detached = True
+    session.systemd_unit = "hermes-worker-detached-guard.scope"
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "gone")
+    stop_scope = MagicMock()
+    monkeypatch.setattr("tools.process_registry._stop_systemd_unit_bounded", stop_scope)
+    checkpoint = MagicMock()
+    registry._write_checkpoint = checkpoint
+    stop_event = threading.Event()
+    deadline = time.monotonic() - 1.0 if guard == "deadline" else None
+    if guard == "stop_event":
+        stop_event.set()
+
+    assert registry.kill_all(deadline=deadline, stop_event=stop_event) == 0
+    assert session.id in registry._running
+    stop_scope.assert_not_called()
+    checkpoint.assert_not_called()
+
+
 def test_kill_all_clears_deadline_for_surviving_session_before_later_completion(registry):
     """A missed bounded kill must not disable future durable completion writes."""
     session = _make_session(sid="proc_survivor")
