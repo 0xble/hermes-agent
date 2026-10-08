@@ -166,6 +166,7 @@ class GatewayNotificationsMixin:
         claim_id: str = ""
         proceed: bool = True
         early_result: Optional[bool] = None
+        settled: bool = False
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
@@ -1525,6 +1526,7 @@ class GatewayNotificationsMixin:
                     "terminally dropping delivery (result remains in the delegation records).",
                     claim.delegation_id or "<legacy>", parent_session_id,
                 )
+                claim.settled = True
                 await self._settle_durable_claims([("drop", claim.delegation_id, claim.claim_id)])
             else:
                 logger.warning(
@@ -1536,6 +1538,7 @@ class GatewayNotificationsMixin:
             claim.proceed = False
         elif verdict == "retry":
             # Transient uncertainty: tell the watcher to re-poll rather than drop or misroute.
+            claim.settled = True
             await self._settle_durable_claims([("release", claim.delegation_id, claim.claim_id)])
             claim.proceed, claim.early_result = False, False
         return claim
@@ -1605,11 +1608,15 @@ class GatewayNotificationsMixin:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
+            operations = []
+            if not claim.settled:
+                operation = "complete" if accepted else "defer" if refused else "release"
+                operations.append((operation, claim.delegation_id, claim.claim_id))
             operation = "complete" if accepted else "defer" if refused else "release"
-            await self._settle_durable_claims([
-                (operation, claim.delegation_id, claim.claim_id),
-                *((operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims),
-            ])
+            operations.extend(
+                (operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
+            )
+            await self._settle_durable_claims(operations)
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 
