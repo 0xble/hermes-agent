@@ -4169,6 +4169,9 @@ class BasePlatformAdapter(ABC):
         self._discard_text_debounce(session_key)
         return True
 
+    def _on_session_handoff(self, event: MessageEvent) -> None:
+        """Hook called immediately before ``event`` is handed to session processing."""
+
     def _start_session_processing(self, event: MessageEvent, session_key: str, *,
                                   interrupt_event: Optional[asyncio.Event] = None) -> bool:
         """Spawn a background processing task under the session guard; True on success. If
@@ -4316,6 +4319,8 @@ class BasePlatformAdapter(ABC):
             await self._handle_message_while_active(event, session_key)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
+        # Entering session processing is the handoff: a failure after this point must not replay.
+        self._on_session_handoff(event)
         event._gateway_accepted = self._start_session_processing(event, session_key)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:

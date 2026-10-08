@@ -214,6 +214,33 @@ async def test_replay_is_admitted_once_before_dispatch(monkeypatch, tmp_path, ki
             assert len(delivered) == 2
 
 
+@pytest.mark.asyncio
+async def test_pre_handoff_base_failure_keeps_update_retryable(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    async with connected(monkeypatch) as (adapter, app, delivered):
+        original = BasePlatformAdapter.handle_message
+        failed = False
+
+        async def fail_before_handoff(base, event):
+            nonlocal failed
+            if not failed:
+                failed = True
+                event._gateway_accepted = False
+                raise RuntimeError("preparation failed")
+            return await original(base, event)
+
+        monkeypatch.setattr(BasePlatformAdapter, "handle_message", fail_before_handoff)
+        incoming = update(app.bot, kind="command")
+        await app.process_update(incoming)
+        assert not adapter._seen_update_ids
+        assert not adapter._inflight_update_ids
+
+        await app.process_update(incoming)
+        assert len(delivered) == 1
+        assert not adapter._inflight_update_ids
+
+
 async def _check_sticker_handoff(monkeypatch, adapter, app, delivered, stage):
     from gateway import sticker_cache
     from tools import vision_tools

@@ -3465,9 +3465,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if claim is not None:
             claim.failed = True
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    def _on_session_handoff(self, event: MessageEvent) -> None:
         self._accept_update()
-        await super().handle_message(event)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        try:
+            await super().handle_message(event)
+        finally:
+            # The base adapter marks queued/held/duplicate events accepted only after handoff;
+            # a preparation failure before that leaves the update claim retryable.
+            if getattr(event, "_gateway_accepted", False):
+                self._accept_update()
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         # Label this turn's Bot API calls for the daily call counter (chat_budget.py). Bound here,
