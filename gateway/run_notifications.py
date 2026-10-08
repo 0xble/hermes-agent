@@ -1158,14 +1158,15 @@ class GatewayNotificationsMixin:
             original = original if original is not None else pending.copy()
             if target is None and not (pending.get("platform") and pending.get("chat_id")):
                 # Cron and CLI requests carry no chat to report back to. Hold the admission
-                # until the update is final, then release it; raising here kept the marker
-                # forever and refused every later update. A watcher timeout alone never
-                # releases it: only the real process-exit sentinel proves the updater is gone,
-                # the same rule the launcher applies before admitting another update.
-                if final_outcome(paths.pending.parent, pending) is None:
-                    process_exited = (paths.pending.parent / ".update_process_exit_code").exists()
-                    if not (timed_out and process_exited):
-                        return False
+                # until the updater process has really exited, then release it; raising here
+                # kept the marker forever and refused every later update. Only the real
+                # process-exit sentinel proves the updater is gone (the launcher's own
+                # admission rule): a legacy marker's ``.update_exit_code`` is written before the
+                # gateway restart, and a watcher timeout says nothing about the process.
+                if not (paths.pending.parent / ".update_process_exit_code").exists():
+                    return False
+                if final_outcome(paths.pending.parent, pending) is None and not timed_out:
+                    return False
                 logger.info("Update %s finished with no notification route; releasing its admission",
                             pending.get("request_id") or "<legacy>")
                 return self._clear_update_markers(paths, pending.get("session_key"), pending)

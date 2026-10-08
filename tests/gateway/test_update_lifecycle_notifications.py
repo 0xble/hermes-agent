@@ -690,3 +690,21 @@ async def test_unroutable_marker_timeout_releases_only_after_the_updater_exits(t
         released = await runner._send_update_notification(timed_out=True)
     assert released is process_exited
     assert (read_pending(tmp_path) is None) is process_exited
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("process_exited", [False, True])
+async def test_legacy_unroutable_marker_waits_for_the_real_process_exit(tmp_path, process_exited):
+    """A pre-v2 marker's ``.update_exit_code`` lands before the gateway restart, while the updater
+    may still be running, so it must not release the admission on its own."""
+    marker = tmp_path / ".update_pending.json"
+    marker.write_text(json.dumps({"reason": "Legacy CLI update.",
+                                  "timestamp": datetime.now(timezone.utc).isoformat()}))
+    (tmp_path / ".update_exit_code").write_text("0")
+    if process_exited:
+        (tmp_path / ".update_process_exit_code").write_text("0")
+    runner = _make_runner()
+    with patch("gateway.run._hermes_home", tmp_path):
+        released = await runner._send_update_notification()
+    assert released is process_exited
+    assert marker.exists() is not process_exited
