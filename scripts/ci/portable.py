@@ -88,7 +88,32 @@ def python_shard(env: dict[str, str], workers: int, index: int, count: int) -> N
     if not files:
         raise RuntimeError(f'Empty Python shard {index}/{count}')
     print(f'Python shard {index}/{count}: {len(files)} files', flush=True)
-    python_tests(env, files, workers)
+    python_files(env, files, workers)
+
+
+# Committed per-file bounds for known-slow files, keyed by repository-relative path.
+# The runner's duration-scaled bound reads the untracked test_durations.json, which a
+# fresh hosted checkout never has, so hosted CI otherwise applies the flat 300 s default.
+# Every other file keeps that default; add an entry only with hosted timing evidence.
+FILE_TIMEOUTS = {
+    # Hosted shard runs took 179-295 s against 300 s (gate runs 37707869254, 37705343675).
+    'tests/e2e/core/delivery/test_cron_virtual_clock_soak.py': 600,
+}
+
+
+def python_files(env: dict[str, str], files: list[str], workers: int) -> None:
+    """Run files under the default bound, then each FILE_TIMEOUTS group under its own."""
+    groups: dict[int | None, list[str]] = {}
+    for path in files:
+        groups.setdefault(FILE_TIMEOUTS.get(path), []).append(path)
+    failures = []
+    for timeout, roots in sorted(groups.items(), key=lambda item: item[0] or 0):
+        try:
+            python_tests(env, roots, workers, file_timeout=timeout)
+        except subprocess.CalledProcessError as error:
+            failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 def nightly_only_e2e(env: dict[str, str], workers: int) -> None:
@@ -527,9 +552,10 @@ def e2e_tests(env: dict[str, str], workers: int) -> None:
         and not {'integration', 'docker'} & set(path.relative_to(ROOT).parts)
     )
     failures = []
-    for roots, timeout in ((files, None), ([E2E_UPGRADE_ROOT], E2E_UPGRADE_FILE_TIMEOUT)):
+    for run_part in (lambda: python_files(env, files, workers),
+                     lambda: python_tests(env, [E2E_UPGRADE_ROOT], workers, file_timeout=E2E_UPGRADE_FILE_TIMEOUT)):
         try:
-            python_tests(env, roots, workers, file_timeout=timeout)
+            run_part()
         except subprocess.CalledProcessError as error:
             failures.append(error)
     if failures:
