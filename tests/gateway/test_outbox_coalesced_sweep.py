@@ -18,7 +18,14 @@ import pytest
 
 from gateway import outbox
 from gateway.outbox import Outbox, _schedule_retry, _uncertain, recover
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import (
+    OUTBOUND_FINAL,
+    OUTBOUND_NOTICE,
+    SendResult,
+    current_outbound_class,
+    outbound_class,
+)
+from plugins.platforms.telegram.daily_quota import DailyQuota
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +78,47 @@ async def _until(predicate, timeout=5.0):
         if time.monotonic() > deadline:
             raise AssertionError("condition not reached")
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_deferred_sweep_replays_final_under_a_clean_outbound_class(tmp_path):
+    """A sweep created by a notice must not shed a persisted final reply."""
+    store = Outbox(tmp_path)
+    row = store.enqueue(
+        "final-turn",
+        "send",
+        {"chat_id": "c", "content": "final", "_outbound_class": OUTBOUND_FINAL},
+    )
+    assert store.begin_send(row)
+    assert store.receipt(row, message_id=None, success=False, uncertain=False, retry_after=0.0)
+
+    class BudgetAdapter(_Adapter):
+        platform = "telegram"
+
+        def __init__(self):
+            super().__init__()
+            self.labels: list[str | None] = []
+            quota_dir = tmp_path / "quota"
+            quota_dir.mkdir()
+            self.daily = DailyQuota(soft_ceiling=10, profile_dir=quota_dir)
+            for _ in range(10):
+                self.daily.record("c", "sendMessage")
+
+        async def send(self, chat_id, content, **kwargs):
+            label = current_outbound_class()
+            self.labels.append(label)
+            if self.daily.sheds(chat_id, label):
+                return SendResult(success=False, error="daily_budget_shed")
+            return await super().send(chat_id, content, **kwargs)
+
+    adapter = BudgetAdapter()
+    with outbound_class(OUTBOUND_NOTICE):
+        await _schedule_retry(store, adapter)
+    await _until(lambda: not outbox._SWEEPS)
+
+    assert adapter.labels == [OUTBOUND_FINAL]
+    assert adapter.sends == ["final"]
+    assert store.pending() == []
 
 
 def _fds() -> int:
