@@ -269,13 +269,117 @@ def missing(extra: str) -> tuple[str, ...]:
     return tuple(a for a in _anchors(extra) if not _importable(a))
 
 
+def _canonical_distribution(name: str) -> str:
+    """Normalize a distribution name without making PM depend on packaging."""
+    try:
+        from packaging.utils import canonicalize_name
+        return canonicalize_name(name)
+    except ImportError:
+        return name.lower().replace("_", "-").replace(".", "-")
+
+
+def _anchor_key(anchor: str) -> str:
+    return anchor.split(".", 1)[0].lower().replace("-", "_")
+
+
+def _requirement_distribution(requirement: str) -> str:
+    try:
+        from packaging.requirements import Requirement
+        return _canonical_distribution(Requirement(requirement).name)
+    except (ImportError, ValueError):
+        import re
+        return _canonical_distribution(re.split(r"[<>=!~;\s\[]", requirement, maxsplit=1)[0])
+
+
+def _declared_core_distributions(project_root: Path) -> set[str]:
+    """Return core requirement distributions from pyproject."""
+    import tomllib
+
+    try:
+        metadata = tomllib.loads((Path(project_root) / "pyproject.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {
+        _requirement_distribution(req)
+        for req in metadata.get("project", {}).get("dependencies", [])
+    }
+
+
+def _metadata_name(directory: Path) -> str | None:
+    for filename in ("METADATA", "PKG-INFO"):
+        try:
+            for line in (directory / filename).read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.lower().startswith("name:"):
+                    return _canonical_distribution(line.split(":", 1)[1].strip())
+        except OSError:
+            continue
+    return None
+
+
+def _distribution_top_levels(directory: Path) -> set[str]:
+    """Read import roots from installed metadata without importing the payload."""
+    try:
+        top_level = (directory / "top_level.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        top_level = ""
+    roots = {line.strip().lower() for line in top_level.splitlines() if line.strip()}
+    if roots:
+        return roots
+    try:
+        record = (directory / "RECORD").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return roots
+    for line in record.splitlines():
+        path = line.split(",", 1)[0].strip().replace("\\", "/")
+        if path and "/" in path:
+            roots.add(path.split("/", 1)[0].lower())
+    return roots
+
+
+def _core_anchor_keys(tree: Path, core: set[str]) -> set[str]:
+    """Find import roots already explained by core project requirements."""
+    keys = {name.replace("-", "_") for name in core}
+    for directory in (*tree.glob("*.dist-info"), *tree.glob("*.egg-info")):
+        if _metadata_name(directory) in core:
+            keys.update(_distribution_top_levels(directory))
+    return keys
+
+
+def _selection_from_trees(project_root: Path, trees: list[Path], *, include_all: bool) -> list[str]:
+    """Select extras from site-packages while excluding core-only anchors."""
+    core = _declared_core_distributions(project_root)
+    carried: set[str] = set()
+    for tree in trees:
+        if not tree.is_dir():
+            continue
+        core_anchors = _core_anchor_keys(tree, core)
+        for extra in ANCHORS:
+            # Umbrella extras share anchors with individual extras. Carry only
+            # concrete extras, otherwise one telegram module selects the full
+            # messaging bundle on the first replacement sync.
+            if extra in {"messaging", "voice", "wake"}:
+                continue
+            if not extra_supported(extra, importable=lambda _anchor: False):
+                continue
+            anchors = _anchors(extra)
+            if all(_installed_in(tree, anchor) for anchor in anchors):
+                # An anchor supplied by a core distribution proves only the
+                # core dependency, not that this optional extra was shipped.
+                if all(_anchor_key(anchor) in core_anchors for anchor in anchors):
+                    continue
+                carried.add(extra)
+    selected = sorted(carried)
+    return ["all", *selected] if include_all else selected
+
+
 def installed_selection(project_root: Path) -> list[str]:
     """Return declared extras whose anchors are present in the base environment.
 
     A first PM generation may replace a release payload before it has facts or
     an enabled-features file. Inspecting the payload's site-packages preserves
     optional dependencies that the release actually shipped without importing
-    them into the process doing the replacement.
+    them into the process doing the replacement. Anchors already explained by
+    core dependencies are not evidence of an optional extra.
     """
     from pm.environments import base_venv, site_packages
 
@@ -283,16 +387,7 @@ def installed_selection(project_root: Path) -> list[str]:
         tree = site_packages(base_venv(Path(project_root)))
     except (OSError, RuntimeError, ValueError):
         return []
-    if not tree.is_dir():
-        return []
-    return sorted(
-        # Umbrella extras share anchors with individual extras. Carry only the
-        # concrete extra proven by the payload; otherwise a shipped telegram
-        # module would select the full messaging bundle on the first sync.
-        extra for extra in ANCHORS if extra not in {"messaging", "voice", "wake"}
-        if extra_supported(extra, importable=lambda _anchor: False)
-        and all(_installed_in(tree, anchor) for anchor in _anchors(extra))
-    )
+    return _selection_from_trees(Path(project_root), [tree], include_all=False)
 
 
 def _installed_in(site_packages: Path, anchor: str) -> bool:
@@ -320,13 +415,4 @@ def legacy_selection(project_root: Path) -> list[str]:
     trees = [tree for venv in (root / "venv", root / ".venv")
              for tree in (*venv.glob("lib/python*/site-packages"), venv / "Lib" / "site-packages")
              if tree.is_dir()]
-    carried = sorted(
-        # An umbrella extra shares its anchor with one member; carrying it
-        # would install every sibling the user never chose.
-        extra for extra in ANCHORS if extra not in {"messaging", "voice", "wake"}
-        # PM refuses a gated extra outside its platform even if a hand-synced venv carried it.
-        # Installed first: judging a gate may cost a PM-runtime subprocess.
-        if any(all(_installed_in(tree, anchor) for anchor in _anchors(extra)) for tree in trees)
-        and extra_supported(extra, importable=lambda _anchor: False)
-    )
-    return ["all", *carried]
+    return _selection_from_trees(root, trees, include_all=True)
