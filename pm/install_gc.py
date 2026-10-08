@@ -13,8 +13,11 @@ from pm.environments import (
     INSTALL_METADATA_FILENAME,
     INSTALL_METADATA_SCHEMA,
     install_key,
+    install_state_lock,
     installs_root,
 )
+
+_INVALID_RECORD = object()
 
 # A deleted review checkout should survive a few days of recovery/retry activity.
 ORPHAN_INSTALL_GRACE_SECONDS = 7 * 24 * 60 * 60
@@ -24,21 +27,27 @@ ORPHAN_INSTALL_GRACE_SECONDS = 7 * 24 * 60 * 60
 LEGACY_INSTALL_GRACE_SECONDS = 30 * 24 * 60 * 60
 
 
-def _record(state: Path) -> tuple[Path, float] | None:
+def _record(state: Path):
     metadata = state / INSTALL_METADATA_FILENAME
     try:
-        data = json.loads(metadata.read_text(encoding="utf-8-sig"))
+        text = metadata.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _INVALID_RECORD
+    try:
+        data = json.loads(text)
         if not isinstance(data, dict):
-            return None
+            return _INVALID_RECORD
         value = data.get("project_root")
         if data.get("schema") != INSTALL_METADATA_SCHEMA or not isinstance(value, str):
-            return None
+            return _INVALID_RECORD
         root = Path(value)
         if not root.is_absolute() or install_key(root) != state.name:
-            return None
+            return _INVALID_RECORD
         return root.resolve(), metadata.stat().st_mtime
-    except (FileNotFoundError, OSError, ValueError, TypeError):
-        return None
+    except (OSError, ValueError, TypeError):
+        return _INVALID_RECORD
 
 
 def _tree_touched_since(path: Path, cutoff: float) -> bool:
@@ -69,18 +78,9 @@ def _tree_touched_since(path: Path, cutoff: float) -> bool:
 
 @contextmanager
 def _install_lock(state: Path):
-    """Yield whether the install lock was acquired without waiting."""
-    from pm.filesystem import lock_fd
-
-    try:
-        fd = os.open(state / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError:
-        yield False
-        return
-    try:
-        yield lock_fd(fd, wait=False)
-    finally:
-        os.close(fd)
+    """Yield whether the shared install-state lock was acquired without waiting."""
+    with install_state_lock(state, timeout=0) as held:
+        yield held
 
 
 def _generations(state: Path) -> list[Path] | None:
@@ -128,8 +128,10 @@ def _has_unleaseable_generation(state: Path) -> bool:
         return True
 
 
-def _eligible(state: Path, record: tuple[Path, float] | None, known_keys: set[str],
+def _eligible(state: Path, record, known_keys: set[str],
               now: float, grace_seconds: float, legacy_grace_seconds: float) -> bool:
+    if record is _INVALID_RECORD:
+        return False
     if record is not None:
         project_root, last_used = record
         if project_root.is_dir() or now - last_used < grace_seconds:
@@ -172,7 +174,7 @@ def collect_install_orphans(
     known_keys.update(
         install_key(record[0])
         for record in records.values()
-        if record is not None and record[0].is_dir()
+        if isinstance(record, tuple) and record[0].is_dir()
     )
 
     candidates = [state for state, record in records.items()

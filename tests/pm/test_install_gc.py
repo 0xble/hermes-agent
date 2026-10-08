@@ -152,3 +152,143 @@ def test_legacy_install_stays_until_long_threshold(monkeypatch, tmp_path):
     assert state.is_dir()
     assert collect_install_orphans(now=old + 101, legacy_grace_seconds=100) == [state]
     assert not state.exists()
+
+
+def test_corrupt_or_mismatched_metadata_fails_closed(monkeypatch, tmp_path):
+    """Unreadable install ownership metadata must never enter legacy deletion."""
+    import time
+
+    home = _setup(monkeypatch, tmp_path)
+    states = []
+    for name, payload in (
+        ("corrupt", "{"),
+        ("mismatched", json.dumps({"schema": 1, "project_root": str(tmp_path / "other")})),
+    ):
+        checkout = tmp_path / name
+        checkout.mkdir()
+        state = home / "installs" / install_key(checkout)
+        record_install_use(checkout)
+        (state / "install.json").write_text(payload, encoding="utf-8")
+        checkout.rmdir()
+        old = time.time() - 40 * 24 * 60 * 60
+        for path in (*state.rglob("*"), state):
+            _age(path, old)
+        states.append(state)
+
+    assert collect_install_orphans(now=time.time(), legacy_grace_seconds=100) == []
+    assert all(state.is_dir() for state in states)
+
+
+def test_preparation_lock_fences_install_gc(monkeypatch, tmp_path):
+    """GC must not delete an install while PM runtime preparation owns its lock."""
+    import threading
+    import time
+
+    from pm.environments import install_state_lock
+    from pm.filesystem import lock_fd
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = home / "installs" / install_key(checkout)
+    record_install_use(checkout)
+    old = time.time() - 8 * 24 * 60 * 60
+    _age(state / "install.json", old)
+    checkout.rmdir()
+    prepare_lock = state / "pm-runtime" / ".prepare.lock"
+    prepare_lock.parent.mkdir(parents=True)
+    ready = threading.Event()
+    release = threading.Event()
+
+    def prepare():
+        with install_state_lock(state) as held:
+            assert held
+            fd = os.open(prepare_lock, os.O_CREAT | os.O_RDWR, 0o600)
+            assert lock_fd(fd, wait=True)
+            ready.set()
+            assert release.wait(5)
+            os.close(fd)
+
+    worker = threading.Thread(target=prepare)
+    worker.start()
+    assert ready.wait(5)
+    try:
+        assert collect_install_orphans(now=time.time()) == []
+        assert state.is_dir()
+    finally:
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+
+
+def test_lease_admission_fences_install_gc(monkeypatch, tmp_path):
+    """GC must not delete after a reader is admitted to an install generation."""
+    import time
+
+    from hermes_cli.runtime_state import lease_generation
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = home / "installs" / install_key(checkout)
+    record_install_use(checkout)
+    generation = state / "environments" / "generation"
+    generation.mkdir(parents=True)
+    (generation / ".lease-managed").touch()
+    (generation / "venv").mkdir()
+    _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
+    checkout.rmdir()
+    release = lease_generation(generation / "venv")
+    try:
+        assert collect_install_orphans(now=time.time()) == []
+        assert state.is_dir()
+    finally:
+        release()
+
+
+def test_lock_timeout_reader_is_fenced_from_install_gc(monkeypatch, tmp_path):
+    """A reader that cannot take the install lock must not proceed unprotected."""
+    import threading
+    import time
+    from contextlib import contextmanager
+
+    from hermes_cli import runtime_state
+    from pm.environments import runtime_facts_path
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    state = home / "installs" / install_key(checkout)
+    record_install_use(checkout)
+    generation = state / "environments" / "generation" / "venv"
+    generation.mkdir(parents=True)
+    (generation.parent / ".lease-managed").touch()
+    (generation / "pyvenv.cfg").write_text("version = 3.11.0\n", encoding="utf-8")
+    (generation / "lib" / "python3.11" / "site-packages").mkdir(parents=True)
+    facts = runtime_facts_path(checkout)
+    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {"environment": str(generation)}}}),
+                     encoding="utf-8")
+    _age(state / "install.json", time.time() - 8 * 24 * 60 * 60)
+    checkout.rmdir()
+    timed_out = threading.Event()
+    collector_done = threading.Event()
+
+    @contextmanager
+    def timed_out_lock(_project):
+        timed_out.set()
+        yield False
+
+    monkeypatch.setattr(runtime_state, "runtime_lock", timed_out_lock)
+
+    def unprotected_lease(_environment):
+        assert timed_out.wait(5)
+        assert collect_install_orphans(now=time.time()) == [state]
+        collector_done.set()
+        return lambda: None
+
+    monkeypatch.setattr(runtime_state, "lease_generation", unprotected_lease)
+    from pm.environments import activate_dependencies
+
+    activate_dependencies(checkout)
+    assert not collector_done.is_set()
+    assert state.is_dir()

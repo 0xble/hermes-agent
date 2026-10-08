@@ -14,7 +14,7 @@ import shutil
 import time
 import uuid
 
-from pm.environments import dependency_home_root, install_state_dir, runtime_facts_path
+from pm.environments import dependency_home_root, install_state_dir, install_state_lock, runtime_facts_path
 # Private aliases: this module calls them through its globals (tests patch ``_atomic_bytes``
 # here) and updaters shipped before PM import them by these names mid-swap
 # (tests/compat/old_updater_surface.json). New code imports the pm.filesystem names.
@@ -40,23 +40,16 @@ INSTALL_LOCK_TIMEOUT_SECONDS = 10.0
 def runtime_lock(project: Path, *, timeout: float | None = INSTALL_LOCK_TIMEOUT_SECONDS):
     """Hold the per-install dependency lock; yields True when held, False when the wait expired.
 
-    Callers decide what a lost race means: readers skip the work the lock guards and carry on
-    (``activate_dependencies`` still selects and leases the committed generation), writers that
-    cannot be skipped pass ``timeout=None`` — an install the user asked for is theirs to wait on.
+    Callers decide what a lost race means: readers must skip the work the lock guards when the
+    wait expires; writers that cannot be skipped pass ``timeout=None``.
     """
     state = install_state_dir(project)
-    state.mkdir(parents=True, exist_ok=True)
-    fd = os.open(state / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        if not _lock(fd, wait=True, timeout=timeout):
+    with install_state_lock(state, timeout=timeout) as held:
+        if not held:
             LOG.warning(
                 "dependency lock still held after %ss; continuing without it (%s)",
                 timeout, state / ".install.lock")
-            yield False
-            return
-        yield True
-    finally:
-        os.close(fd)
+        yield held
 
 
 def _recover_plugin_publication(project: Path, row: dict, journal: Path) -> None:
@@ -136,14 +129,20 @@ def finish_publication(project: Path) -> None:
     recover_publication(project)
 
 
-def lease_generation(environment: Path) -> Callable[[], None]:
-    """Hold a kernel lock until process exit; the returned callable releases it early.
-
-    Call under ``runtime_lock`` at boot. Without the lock (``runtime_lock`` timed out) the
-    caller must re-read the selection after leasing: an installer may have moved it in between,
-    and an unselected, unleased generation is exactly what the collector removes.
-    """
-    return lease_directory(environment.parent)
+def lease_generation(environment: Path, *, install_locked: bool = False) -> Callable[[], None]:
+    """Admit a generation under the install lock, then hold its kernel lease."""
+    state = next((parent for parent in environment.parents
+                  if len(parent.name) == 16 and all(char in "0123456789abcdef" for char in parent.name)), None)
+    if state is None:
+        return lambda: None
+    if install_locked:
+        return lease_directory(environment.parent if (environment.parent / ".lease-managed").is_file()
+                               else environment)
+    with install_state_lock(state) as held:
+        if not held:
+            return lambda: None
+        return lease_directory(environment.parent if (environment.parent / ".lease-managed").is_file()
+                               else environment)
 
 
 def lease_directory(generation: Path) -> Callable[[], None]:

@@ -9,9 +9,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_constants import get_default_hermes_root, project_venv_dir
+
+
+@contextmanager
+def install_state_lock(state: Path, *, timeout: float | None = None):
+    """Hold the shared lock fencing every install-state reader and writer."""
+    from pm.filesystem import lock_fd
+
+    state.mkdir(parents=True, exist_ok=True)
+    fd = os.open(state / ".install.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        yield lock_fd(fd, wait=True, timeout=timeout)
+    finally:
+        os.close(fd)
 
 
 def install_key(project_root: Path) -> str:
@@ -340,22 +354,17 @@ def activate_dependencies(project_root: Path) -> None:
     state = install_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
-        # The lock's holder may be another profile's backend running a full dependency rebuild;
-        # this process only reads the committed selection, so it proceeds without waiting rather
-        # than leaving the backend unbound (see runtime_lock).
+        # A reader that cannot take the install lock must not inspect or lease state underneath
+        # maintenance; it skips activation and keeps the caller's original interpreter.
         with runtime_lock(project_root) as held:
-            if held:
-                record_install_use(project_root)
-                recover_publication(project_root)
+            if not held:
+                return
+            record_install_use(project_root)
+            recover_publication(project_root)
             environment = committed_venv(project_root)
             if environment is None:
                 return _require_own_dependencies(project_root)
-            release = lease_generation(environment)
-            # Without the lock, an installer may commit a new generation between the
-            # read and the lease, leaving the leased one unselected and collectable.
-            while not held and (current := committed_venv(project_root)) not in (None, environment):
-                release()
-                environment, release = current, lease_generation(current)
+            release = lease_generation(environment, install_locked=True)
             selected = site_packages(environment)
             if not selected.is_dir() and not runtime_facts_path(project_root).is_file():
                 return

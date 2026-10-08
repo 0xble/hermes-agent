@@ -117,10 +117,10 @@ _HELD: dict[Path, Callable[[], None]] = {}
 
 
 def _hold_for_children(environment: Path) -> None:
-    from hermes_cli.runtime_state import lease_directory
+    from hermes_cli.runtime_state import lease_generation
 
     if environment not in _HELD:
-        _HELD[environment] = lease_directory(environment)
+        _HELD[environment] = lease_generation(environment, install_locked=True)
 
 
 def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False,
@@ -135,50 +135,54 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
     from pm.lock import _write
     from pm.runtime_stage import stage_runtime
     from pm.environments import record_install_use
+    from hermes_cli.runtime_state import runtime_lock
 
     project = project or Path(__file__).resolve().parent
     identity = _inputs(project, python)
     env = runtime_environment()
-    root.mkdir(parents=True, exist_ok=True)
-    record_install_use(project)
-    with (root / ".prepare.lock").open("a+b") as lock:
-        lock_fd(lock.fileno(), wait=True)
-        selected = root / "selected.json"
-        try:
-            fact = json.loads(selected.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            fact = {}
-        # Records from before canonicalization spell the path as launched; for a
-        # home under a symlink (/home -> /var/home) that is still this interpreter.
-        if fact.get("inputs") in (identity, _inputs(project, python, as_spelled=True)):
-            environment = root / fact["generation"]
-            if (environment / "pm-runtime.json").is_file() and not _validate(_python(environment), env):
-                _hold_for_children(environment)
-                return _python(environment)
-        if not bootstrap:
-            raise InstallError("pm-runtime", "not installed or outdated and lazy installs are disabled",
-                               "run `hermes pm install` to prepare the independent PM runtime")
-        generation = Path("generations") / uuid.uuid4().hex
-        environment = root / generation
-        try:
-            print("Preparing the isolated Hermes runtime…", file=sys.stderr, flush=True)
-            executable = stage_runtime(uv, python, environment, project=project, offline=offline, cache=cache)
-            (environment / ".lease-managed").touch()
-            _write(environment / "pm-runtime.json", {"inputs": identity})
-            _write(selected, {"inputs": identity, "generation": generation.as_posix()})
-        except BaseException:
-            shutil.rmtree(environment, ignore_errors=True)
-            raise
-        _hold_for_children(environment)
-        return executable
+    with runtime_lock(project, timeout=None) as held:
+        if not held:
+            raise InstallError("pm-runtime", "dependency install state is busy")
+        root.mkdir(parents=True, exist_ok=True)
+        record_install_use(project)
+        with (root / ".prepare.lock").open("a+b") as lock:
+            lock_fd(lock.fileno(), wait=True)
+            selected = root / "selected.json"
+            try:
+                fact = json.loads(selected.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                fact = {}
+            # Records from before canonicalization spell the path as launched; for a
+            # home under a symlink (/home -> /var/home) that is still this interpreter.
+            if fact.get("inputs") in (identity, _inputs(project, python, as_spelled=True)):
+                environment = root / fact["generation"]
+                if (environment / "pm-runtime.json").is_file() and not _validate(_python(environment), env):
+                    _hold_for_children(environment)
+                    return _python(environment)
+            if not bootstrap:
+                raise InstallError("pm-runtime", "not installed or outdated and lazy installs are disabled",
+                                   "run `hermes pm install` to prepare the independent PM runtime")
+            generation = Path("generations") / uuid.uuid4().hex
+            environment = root / generation
+            try:
+                print("Preparing the isolated Hermes runtime…", file=sys.stderr, flush=True)
+                executable = stage_runtime(uv, python, environment, project=project, offline=offline, cache=cache)
+                (environment / ".lease-managed").touch()
+                _write(environment / "pm-runtime.json", {"inputs": identity})
+                _write(selected, {"inputs": identity, "generation": generation.as_posix()})
+            except BaseException:
+                shutil.rmtree(environment, ignore_errors=True)
+                raise
+            _hold_for_children(environment)
+            return executable
 
 
 def lease_current_runtime() -> None:
     """Pin the PM runtime this process runs from so the collector leaves it alone."""
     if (Path(sys.prefix) / "pm-runtime.json").is_file():
-        from hermes_cli.runtime_state import lease_directory
+        from hermes_cli.runtime_state import lease_generation
 
-        lease_directory(Path(sys.prefix))
+        lease_generation(Path(sys.prefix))
 
 
 def collect_runtime_generations(root: Path) -> list[Path]:
@@ -189,6 +193,7 @@ def collect_runtime_generations(root: Path) -> list[Path]:
     once every worker launched from it has exited; generations published before leases
     existed stay, as the application collector keeps its own.
     """
+    from pm.environments import install_state_lock
     from pm.filesystem import lock_fd
     from hermes_cli.runtime_state import leases_held
 
@@ -196,21 +201,24 @@ def collect_runtime_generations(root: Path) -> list[Path]:
     removed: list[Path] = []
     if not generations.is_dir():
         return removed
-    with (root / ".prepare.lock").open("a+b") as lock:
-        if not lock_fd(lock.fileno(), wait=False):
-            return removed  # a stage is in flight; maintenance skips rather than queues
-        try:
-            selected = json.loads((root / "selected.json").read_text(encoding="utf-8-sig")).get("generation", "")
-        except FileNotFoundError:
-            selected = ""
-        for generation in sorted(generations.iterdir()):
-            if not generation.is_dir() or generation.is_symlink() or generation == root / selected:
-                continue
-            published = (generation / "pm-runtime.json").is_file()
-            if published and (not (generation / ".lease-managed").is_file() or leases_held(generation)):
-                continue
-            shutil.rmtree(generation)
-            removed.append(generation)
+    with install_state_lock(root.parent) as held:
+        if not held:
+            return removed
+        with (root / ".prepare.lock").open("a+b") as lock:
+            if not lock_fd(lock.fileno(), wait=False):
+                return removed  # a stage is in flight; maintenance skips rather than queues
+            try:
+                selected = json.loads((root / "selected.json").read_text(encoding="utf-8-sig")).get("generation", "")
+            except FileNotFoundError:
+                selected = ""
+            for generation in sorted(generations.iterdir()):
+                if not generation.is_dir() or generation.is_symlink() or generation == root / selected:
+                    continue
+                published = (generation / "pm-runtime.json").is_file()
+                if published and (not (generation / ".lease-managed").is_file() or leases_held(generation)):
+                    continue
+                shutil.rmtree(generation)
+                removed.append(generation)
     return removed
 
 
