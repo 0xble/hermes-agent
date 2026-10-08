@@ -255,6 +255,73 @@ async def test_timed_out_restart_spools_followups_before_slow_cleanup(bare_runne
 
 
 @pytest.mark.asyncio
+async def test_stop_impl_detaches_finalizer_that_swallow_cancellation(bare_runner, monkeypatch):
+    """A finalizer that ignores cancellation cannot consume the restart handoff bound."""
+    import time
+
+    runner = bare_runner
+    runner._restart_requested = True
+    runner._restart_detached = False
+    runner._restart_via_service = False
+    runner._restart_shutdown_bound = lambda: 0.2
+    runner._restart_agent_finalize_bound = lambda _bound: 0.05
+    runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._background_tasks = set()
+    runner._stop_requested_by_signal = False
+    release = asyncio.Event()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def begin(_self, ctx):
+        ctx.started_at = time.monotonic()
+
+    async def drain(_self, _timeout, ctx):
+        ctx.timed_out = True
+        ctx.active_agents = {}
+
+    async def interrupt(_self, _ctx):
+        return None
+
+    async def finalizer(_self, _ctx, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    async def release_state(_self, _ctx):
+        return None
+
+    def quiesce(_self, _timeout, _ctx):
+        return None
+
+    async def persist(_self, _ctx):
+        return None
+
+    monkeypatch.setattr(GatewayRunner, "_stop_begin_teardown", begin)
+    monkeypatch.setattr(GatewayRunner, "_stop_drain_active_work", drain)
+    monkeypatch.setattr(GatewayRunner, "_stop_interrupt_remaining_work", interrupt)
+    monkeypatch.setattr(GatewayRunner, "_stop_finalize_agents_and_adapters", finalizer)
+    monkeypatch.setattr(GatewayRunner, "_stop_release_runtime_state", release_state)
+    monkeypatch.setattr(GatewayRunner, "_stop_quiesce_and_close_session_dbs", quiesce)
+    monkeypatch.setattr(GatewayRunner, "_stop_persist_exit_state", persist)
+    monkeypatch.setattr("gateway.run_shutdown._persist_shutdown_pending_messages", lambda _runner: 0)
+    monkeypatch.setattr("gateway.run_shutdown.arm_shutdown_watchdog", lambda *args, **kwargs: None)
+
+    operation = asyncio.create_task(GatewayRunner._stop_impl(runner))
+    await started.wait()
+    done, _pending = await asyncio.wait({operation}, timeout=0.5)
+    try:
+        assert operation in done
+        assert cancelled.is_set()
+    finally:
+        release.set()
+        await asyncio.wait({operation}, timeout=0.5)
+
+
+@pytest.mark.asyncio
 async def test_real_stop_impl_cancellation_during_idle_cleanup_still_disconnects(bare_runner, monkeypatch):
     """The production stop orchestration must reach disconnect after idle-cache cancellation."""
     import threading

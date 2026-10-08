@@ -1714,14 +1714,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates.
         Returns True when this call is the one that persisted the session."""
-        persist = session._kill_deadline is None or time.monotonic() < session._kill_deadline
         with self._lock:
             was_running = session.id in self._running
             if was_running:
                 session.exited_at = time.time()
                 # Keep the session tracked until its result is durable. A finite
                 # parent must not observe completion and exit during this write.
-                if persist:
+                if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
                     save_completed_result(session)
                 self._running.pop(session.id)
             self._finished[session.id] = session
@@ -1735,7 +1734,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # that was just killed. poll()/wait()/read_log() serve from the
         # buffered ``output_buffer``, never from the pipe.
         self._release_finished_handles(session)
-        if persist:
+        if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
             self._write_checkpoint()
         if was_running and session.notify_on_complete:
             notification = {
@@ -2364,7 +2363,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
             else:
                 self._terminate_host_pid(session.process.pid, session.host_start_time, deadline=deadline)
         elif session.env_ref and session.pid:
-            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining is not None and remaining <= 0:
+                return {"status": "deadline", "session_id": session_id}
+            session.env_ref.execute(
+                f"kill {session.pid} 2>/dev/null",
+                timeout=remaining if remaining is not None else 5,
+            )
         elif session.detached and session.pid_scope == "host" and session.pid:
             # Same fate as poll/list: a gone or reused PID means our process is
             # gone — never tree-kill the stranger — but a live PID with an
@@ -2660,6 +2665,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             """Signal one snapshotted host PID and its own process group without waiting."""
             if not pid:
                 return False
+            if stop_event is not None and stop_event.is_set():
+                return False
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             try:
                 killpg = getattr(os, "killpg", None)
                 if killpg is None:
@@ -2683,8 +2692,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
             pid = getattr(getattr(session, "process", None), "pid", None) or session.pid
             if not pid or session.pid_scope != "host":
                 if session.env_ref and session.pid:
+                    remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                    if remaining is not None and remaining <= 0:
+                        return False
                     with suppress(Exception):
-                        session.env_ref.execute(f"kill -{int(sig)} {session.pid} 2>/dev/null", timeout=5)
+                        session.env_ref.execute(
+                            f"kill -{int(sig)} {session.pid} 2>/dev/null",
+                            timeout=remaining if remaining is not None else 5,
+                        )
                         return True
                 return False
             if session.host_start_time is not None and pgid is None and not self._host_pid_is_ours(pid, session.host_start_time):
@@ -2705,7 +2720,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return self._is_host_pid_alive(session.pid)
             return False
 
-        def _sweep_snapshot(session: ProcessSession) -> tuple[Optional[int], tuple[tuple[int, Optional[int]], ...]]:
+        def _sweep_snapshot(session: ProcessSession) -> tuple[Optional[int], tuple[tuple[int, Optional[int], Optional[int]], ...]]:
             """Capture the group and full descendant tree before TERM can reap the root."""
             pid = getattr(getattr(session, "process", None), "pid", None) or session.pid
             if session.pid_scope != "host" or not pid:
@@ -2729,9 +2744,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     return None
 
             snapshot = tuple(
-                (child.pid, _descendant_pgid(child.pid))
+                (child.pid, _descendant_pgid(child.pid), self._safe_host_start_time(child.pid))
                 for child in descendants
-                if self._proc_alive(child)
+                if self._proc_alive(child) and self._safe_host_start_time(child.pid) is not None
             )
             return pgid, snapshot
 
@@ -2740,7 +2755,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if _alive(session):
                 return True
             _pgid, descendants = snapshot
-            return any(self._is_host_pid_alive(pid) for pid, _child_pgid in descendants)
+            return any(
+                self._host_pid_is_ours(pid, start_time)
+                for pid, _child_pgid, start_time in descendants
+            )
 
         def _signal_snapshot_member(kind, target, sig: int, pgid: Optional[int]) -> bool:
             if kind == "root":
@@ -2802,7 +2820,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 for session in signalable:
                     root_pgid, descendants = snapshots[session.id]
                     term_jobs.append(("root", session, root_pgid))
-                    term_jobs.extend(("descendant", pid, pgid) for pid, pgid in descendants)
+                    term_jobs.extend(
+                        ("descendant", pid, pgid)
+                        for pid, pgid, start_time in descendants
+                        if start_time is not None and self._host_pid_is_ours(pid, start_time)
+                    )
                 with ThreadPoolExecutor(max_workers=len(term_jobs), thread_name_prefix="process-term") as pool:
                     futures = [
                         pool.submit(_signal_snapshot_member, kind, target, signal.SIGTERM, pgid)
@@ -2834,8 +2856,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     kill_jobs = [("root", session, root_pgid)]
                     kill_jobs.extend(
                         ("descendant", pid, pgid)
-                        for pid, pgid in descendants
-                        if self._is_host_pid_alive(pid)
+                        for pid, pgid, start_time in descendants
+                        if start_time is not None and self._host_pid_is_ours(pid, start_time)
                     )
                     escalated_ids.add(session.id)
                     with ThreadPoolExecutor(max_workers=len(kill_jobs), thread_name_prefix="process-kill") as pool:

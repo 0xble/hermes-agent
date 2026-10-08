@@ -11,6 +11,7 @@ import asyncio
 import os
 import threading
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -156,6 +157,66 @@ async def test_restart_mark_running_cron_jobs_is_bounded(monkeypatch):
     finally:
         release.set()
         assert finished.wait(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
+    """A held cron fire fence cannot hang ordinary shutdown teardown."""
+    events: list = []
+    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    runner._restart_requested = False
+    runner._signal_initiated_shutdown = True
+    runner._signal_interrupt_grace_timeout = 0.0
+
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def _blocked_mark(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=8)
+        finished.set()
+        return ["late-job"]
+
+    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", _blocked_mark)
+    started = time.monotonic()
+    operation = asyncio.create_task(runner._stop_interrupt_remaining_work(_make_ctx()))
+    # Bound = post-interrupt grace (0 here) + the existing 2s cooperative sweep bound, which
+    # also reaches the same blocked marker. The old code awaited the marker until release (8s).
+    done, _pending = await asyncio.wait({operation}, timeout=3.0)
+    elapsed = time.monotonic() - started
+
+    try:
+        assert operation in done
+        assert elapsed < 3.0
+        assert entered.wait(timeout=0.2)
+        assert not finished.is_set()
+    finally:
+        release.set()
+        await asyncio.wait({operation}, timeout=0.5)
+        assert finished.wait(timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_phase_captures_agent_admitted_after_drain_snapshot(monkeypatch):
+    """Late admission is finalized/flushed instead of being cleared as unowned state."""
+    events: list = []
+    runner, _loop_thread = _make_phase_runner(monkeypatch, events)
+    runner._restart_requested = False
+    runner._post_interrupt_grace_timeout = lambda: 0.0
+    late_agent = MagicMock()
+    runner._running_agents = {"late-session": late_agent}
+    monkeypatch.setattr(
+        GatewayShutdownMixin,
+        "_mark_running_sessions_resume_pending",
+        AsyncMock(return_value=[]),
+    )
+    ctx = _make_ctx()
+    ctx.active_agents = {}
+
+    await runner._stop_interrupt_remaining_work(ctx)
+
+    assert ctx.active_agents["late-session"] is late_agent
 
 
 @pytest.mark.asyncio

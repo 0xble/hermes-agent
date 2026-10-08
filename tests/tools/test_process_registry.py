@@ -306,6 +306,71 @@ def test_kill_all_past_deadline_skips_checkpoint_write(registry):
     stop_event.set()
     assert registry.kill_all(deadline=time.monotonic() - 1, stop_event=stop_event) == 0
     checkpoint.assert_not_called()
+
+
+def test_bounded_kill_all_past_deadline_does_not_signal_live_process(registry):
+    session = _make_session(sid="proc_expired_live")
+    session.process = MagicMock(pid=4242)
+    registry._running[session.id] = session
+    with patch("tools.process_registry.os.getpgid", return_value=4242), \
+         patch("tools.process_registry.os.getpgrp", return_value=9999), \
+         patch("tools.process_registry.os.killpg") as killpg:
+        assert registry.kill_all(deadline=time.monotonic() - 1.0) == 0
+    killpg.assert_not_called()
+
+
+def test_sandbox_kill_uses_remaining_deadline_not_fixed_timeout(registry):
+    session = _make_session(sid="proc_sandbox")
+    session.pid_scope = "sandbox"
+    session.pid = 17
+    session.env_ref = MagicMock()
+    session.env_ref.execute.return_value = {"stdout": ""}
+    registry._running[session.id] = session
+    deadline = time.monotonic() + 0.2
+
+    result = registry.kill_process(session.id, deadline=deadline)
+
+    assert result["status"] == "killed"
+    timeout = session.env_ref.execute.call_args.kwargs["timeout"]
+    assert 0 < timeout <= 0.2
+
+
+def test_bounded_kill_validates_descendant_identity_before_signaling(registry, monkeypatch):
+    session = _make_session(sid="proc_reused_descendant")
+    session.process = MagicMock(pid=100)
+    session.host_start_time = 10
+    registry._running[session.id] = session
+
+    class _Child:
+        pid = 200
+
+    child = _Child()
+    monkeypatch.setattr("psutil.Process", lambda _pid: MagicMock(children=lambda recursive: [child]))
+    monkeypatch.setattr(registry, "_proc_alive", lambda _proc: True)
+    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, expected: pid == 100)
+    monkeypatch.setattr(registry, "_safe_host_start_time", lambda pid: 10 if pid == 200 else None)
+    monkeypatch.setattr("tools.process_registry.os.getpgid", lambda pid: pid)
+    with patch("tools.process_registry.os.killpg") as killpg:
+        assert registry.kill_all(deadline=time.monotonic() + 1.0) == 1
+    assert [call.args[0] for call in killpg.call_args_list] == [100]
+
+
+def test_move_to_finished_rechecks_deadline_before_checkpoint(registry):
+    session = _make_session(sid="proc_checkpoint_deadline")
+    registry._running[session.id] = session
+    session._kill_deadline = time.monotonic() + 0.1
+
+    def slow_save(_session):
+        time.sleep(0.15)
+
+    with patch("tools.process_registry.save_completed_result", side_effect=slow_save) as save, \
+         patch.object(registry, "_write_checkpoint") as checkpoint:
+        assert registry._move_to_finished(session) is True
+
+    save.assert_called_once_with(session)
+    checkpoint.assert_not_called()
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     """Poll a predicate until it returns truthy or the timeout elapses."""
     deadline = time.monotonic() + timeout

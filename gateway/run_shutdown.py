@@ -2181,6 +2181,10 @@ class GatewayShutdownMixin:
         if _work_live():
             self._interrupt_running_agents(reason)
             logger.debug("Re-signaled interrupt for work still live at settle-window exit")
+        # A turn admitted in the race between the drain snapshot and the admission gate is part of
+        # the interrupted set even though it was absent from ctx.active_agents. Keep it in the context
+        # used by transcript flush/finalization; _stop_release_runtime_state clears the live slot later.
+        ctx.active_agents.update(getattr(self, "_snapshot_running_agents")())
         # Record interrupted cron runs independently of the tool sweep. A blocked registry kill must not
         # turn a truncated cron run into a plausible success or lose its interruption notice.
         from cron.scheduler import mark_running_jobs_interrupted
@@ -2193,24 +2197,24 @@ class GatewayShutdownMixin:
             level=logging.WARNING,
         ))
         _restart_deadline = None
+        _mark_deadline = interrupt_deadline
         if self._restart_requested:
             _restart_deadline = time.monotonic() + self._restart_shutdown_bound()
-            _mark_done, _pending = await asyncio.wait(
-                {_mark_task}, timeout=max(0.0, _restart_deadline - time.monotonic())
-            )
-            if _mark_task in _mark_done:
-                _interrupted_cron_jobs = await _mark_task or []
-            else:
-                # Do not cancel the worker: it may be waiting on a fire fence and must finish its
-                # durable mark when the in-flight delivery releases it. Any execution rows it has
-                # not reached remain recoverable by recover_interrupted_executions() on next boot.
-                logger.warning(
-                    "Shutdown phase: mark_running_jobs_interrupted exceeded the restart deadline; "
-                    "leaving the worker detached so unmarked execution rows can be recovered on next boot"
-                )
-                _interrupted_cron_jobs = []
-        else:
+            _mark_deadline = _restart_deadline
+        _mark_done, _pending = await asyncio.wait(
+            {_mark_task}, timeout=max(0.0, _mark_deadline - time.monotonic())
+        )
+        if _mark_task in _mark_done:
             _interrupted_cron_jobs = await _mark_task or []
+        else:
+            # Do not cancel the worker: it may be waiting on a fire fence and must finish its
+            # durable mark when the in-flight delivery releases it. Any execution rows it has
+            # not reached remain recoverable by recover_interrupted_executions() on next boot.
+            logger.warning(
+                "Shutdown phase: mark_running_jobs_interrupted exceeded its shutdown deadline; "
+                "leaving the worker detached so unmarked execution rows can be recovered on next boot"
+            )
+            _interrupted_cron_jobs = []
         _sweep_timeout = min(2.0, self._restart_shutdown_bound())
         if _restart_deadline is not None:
             _sweep_timeout = min(_sweep_timeout, max(0.0, _restart_deadline - time.monotonic()))
@@ -2748,8 +2752,17 @@ class GatewayShutdownMixin:
                     # work; cancellation stops the asyncio coordinator immediately.
                     _finalize_stop_event.set()
                     _finalize_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await _finalize_task
+                    # The coordinator converts this one-shot cancellation into the reserved adapter
+                    # teardown slice. Give it only the rest of the restart bound; if it swallows
+                    # cancellation or is still blocked, detach instead of awaiting it unbounded.
+                    _remaining = max(0.0, _finalize_started + _finalize_bound - time.monotonic())
+                    _done, _pending = await asyncio.wait({_finalize_task}, timeout=_remaining)
+                    if _finalize_task not in _done:
+                        from agent.async_utils import consume_detached_task_result
+                        _finalize_task.add_done_callback(consume_detached_task_result)
+                    else:
+                        with suppress(asyncio.CancelledError):
+                            await _finalize_task
                     logger.warning(
                         "Shutdown finalization exceeded %.1fs; cancelling remaining cleanup",
                         _finalize_bound,
