@@ -1567,7 +1567,7 @@ class GatewayNotificationsMixin:
         return _async_profile_runtime_scope(profile_home)
 
     async def _deliver_completion_notification(
-        self, synth_text: str, evt: dict, *, sibling_claims=(),
+        self, synth_text: str, evt: dict, *, sibling_claims=(), cleanup_state=None,
     ) -> Optional[bool]:
         """Acknowledge one admitted batch, refund refusals, or release failed deliveries.
 
@@ -1576,15 +1576,19 @@ class GatewayNotificationsMixin:
         """
         async with self._completion_event_scope(evt):
             return await self._deliver_completion_notification_scoped(
-                synth_text, evt, sibling_claims=sibling_claims)
+                synth_text, evt, sibling_claims=sibling_claims, cleanup_state=cleanup_state)
 
     async def _deliver_completion_notification_scoped(
-        self, synth_text: str, evt: dict, *, sibling_claims=(),
+        self, synth_text: str, evt: dict, *, sibling_claims=(), cleanup_state=None,
     ) -> Optional[bool]:
         from gateway.wake import WakeNotAccepted
+        if cleanup_state is not None:
+            # Transfer responsibility synchronously, before the first await. If cancellation is
+            # delivered before this coroutine starts, the batching caller still owns the claims.
+            cleanup_state["owner"] = "delivery"
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
-        accepted = identity_claimed = refused = False
+        accepted = identity_claimed = refused = cancelled = False
         try:
             claim = await self._preflight_completion_delivery(evt, claim)
             if not claim.proceed:
@@ -1601,6 +1605,11 @@ class GatewayNotificationsMixin:
                 with self._completion_delivery_lock:
                     self._mark_completions_delivered_locked((identity,))
             return True
+        except asyncio.CancelledError:
+            # Cancellation is a shutdown/retry boundary, not a failed delivery. Refund every
+            # claim taken by this delivery so repeated shutdowns cannot spend sibling attempts.
+            cancelled = True
+            raise
         except WakeNotAccepted:
             refused = True
             return False
@@ -1610,9 +1619,9 @@ class GatewayNotificationsMixin:
                     self._completion_deliveries_inflight.discard(identity)
             operations = []
             if not claim.settled:
-                operation = "complete" if accepted else "defer" if refused else "release"
+                operation = "complete" if accepted else "defer" if refused or cancelled else "release"
                 operations.append((operation, claim.delegation_id, claim.claim_id))
-            operation = "complete" if accepted else "defer" if refused else "release"
+            operation = "complete" if accepted else "defer" if refused or cancelled else "release"
             operations.extend(
                 (operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
             )
@@ -1827,9 +1836,20 @@ class GatewayNotificationsMixin:
             "response. If a result does not change the current conclusion, absorb it silently.]"
         )
         consolidated = "\n\n".join([header, *blocks])
-        delivered = await self._deliver_completion_notification(
-            consolidated, primary_evt, sibling_claims=siblings,
-        )
+        sibling_cleanup = {"owner": "batch"}
+        try:
+            # Mark the handoff only once the delivery coroutine starts. If shutdown cancellation
+            # lands in the gap before that, this caller still owns and refunds the sibling claims.
+            delivered = await self._deliver_completion_notification(
+                consolidated, primary_evt, sibling_claims=siblings, cleanup_state=sibling_cleanup,
+            )
+        except asyncio.CancelledError:
+            if sibling_cleanup["owner"] == "batch":
+                await self._settle_durable_claims([
+                    ("defer", event["delegation_id"], claim_id)
+                    for event, claim_id in siblings
+                ])
+            raise
         if delivered is None:
             # Primary dropped/owned elsewhere: retry the unadmitted siblings.
             for evt, _claim_id in siblings:

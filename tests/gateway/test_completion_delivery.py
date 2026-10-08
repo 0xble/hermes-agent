@@ -1122,6 +1122,44 @@ def test_cancelled_primary_claim_is_refunded_not_released(monkeypatch, isolated_
     assert row["delivery_attempts"] == 1, f"cancellation spent an attempt: {row['delivery_attempts']}"
 
 
+def test_cancelled_primary_delivery_refunds_all_claimed_batch_rows(monkeypatch, isolated_registry):
+    """Cancellation after sibling and primary claims are held refunds every row without spending attempts."""
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_cancel_batch_{i}") for i in range(2)]
+    for event in events:
+        _persist_pending_completion(event)
+
+    entered = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def _blocked_injection(_event):
+        entered.set()
+        await blocked.wait()
+
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=_blocked_injection))
+    runner = _runner(adapter)
+
+    async def _exercise():
+        task = asyncio.create_task(
+            runner._deliver_async_delegation_group([dict(event) for event in events])
+        )
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_exercise())
+
+    for event in events:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row is not None
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+        assert async_delegation.claim_completion_delivery(
+            event["delegation_id"], f"next-consumer:{event['delegation_id']}",
+        )
+
+
 @pytest.mark.parametrize(("verdict", "expected_operation"), [("terminal", "drop"), ("retry", "release")])
 def test_cancelled_preflight_settle_is_not_released_again(
     monkeypatch, isolated_registry, verdict, expected_operation,
