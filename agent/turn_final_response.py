@@ -26,6 +26,14 @@ _REPETITION_STOPPED = repetition_copy(
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _is_responses_reasoning_summary(agent: Any, assistant_message: Any) -> bool:
+    """Responses/Codex reasoning summaries are provider metadata, never answer text."""
+    return (
+        getattr(agent, "api_mode", None) == "codex_responses"
+        or bool(getattr(assistant_message, "codex_reasoning_items", None))
+    )
+
+
 def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
     """Drop a trailing standalone silence marker from an interactive reply.
 
@@ -125,10 +133,16 @@ def finish_text_response(
     # ``api_content`` sidecar, so the next turn still replays it byte-identically.
     _content = assistant_message.content
     _promoted = None
+    # Responses/Codex reasoning is a provider-generated summary, not the assistant's visible
+    # answer. The encrypted item and its summary are retained for replay, but must never enter
+    # final_response or api_content. Chat-completions parsers (including vLLM's Nemotron route)
+    # have no codex_reasoning_items carrier and keep the legacy promotion behavior.
+    _responses_reasoning_summary = _is_responses_reasoning_summary(agent, assistant_message)
     if (
         finish_reason == "stop"
         and not assistant_message.tool_calls
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
+        and not _responses_reasoning_summary
     ):
         _promoted = agent._extract_reasoning(assistant_message) or None
         if _promoted:
@@ -141,6 +155,11 @@ def finish_text_response(
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
     final_response = _promoted or assistant_message.content or ""
+    # A gateway turn that explicitly does not expect a reply treats a contentless Responses
+    # reasoning summary like the ordinary silence token. Keep the assistant row's visible content
+    # empty and never copy the summary into api_content; the gateway suppresses [SILENT].
+    if _responses_reasoning_summary and getattr(agent, "_turn_reply_expected", None) is False:
+        final_response = "[SILENT]"
     # Interactive gateway replies may contain a control marker on a final standalone line after
     # substantive prose. Strip it before the assistant row is flushed; autonomous cron/webhook
     # lanes keep their existing first/last-line silence semantics.

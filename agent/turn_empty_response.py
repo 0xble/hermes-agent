@@ -107,6 +107,12 @@ def _terminal_empty(agent: Any, assistant_message: Any, finish_reason: str, mess
         )
     agent._flush_status_buffer()
     reasoning_text = agent._extract_reasoning(assistant_message)
+    if getattr(agent, "api_mode", None) == "codex_responses" or getattr(
+        assistant_message, "codex_reasoning_items", None
+    ):
+        # A Responses reasoning summary (bolded title + summary paragraphs) is provider
+        # metadata, not a draft answer: never echo it as the "last thoughts" preview.
+        reasoning_text = ""
     agent._drop_trailing_empty_response_scaffolding(messages)
     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
     assistant_msg["content"] = "(empty)"
