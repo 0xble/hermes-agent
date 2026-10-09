@@ -304,7 +304,9 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     ``display_kind="hidden"`` keep it out of rendered transcripts, matching the
     ``_INTERRUPTED_PLACEHOLDER`` shape in ``turn_api_call.py``. A caller-supplied banner
     (truncation notices, partial-delivery text) stays visible: it is the turn's only
-    user-facing explanation."""
+    user-facing explanation. A local interrupt diagnostic is neither: persisting it after a tool
+    result feeds it back to the next model turn as if the assistant had said it, so it closes with
+    the internal ``INTERRUPTED_TAIL_MARKER`` instead."""
     last = messages[-1] if messages else None
     if not isinstance(last, dict) or last.get("role") != "tool":
         return False
@@ -312,9 +314,13 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     from agent.interrupt_diagnostics import is_interrupt_diagnostic
     from agent.message_metadata import append_message
 
-    append_message(messages, {"role": "assistant", "content": (
-        INTERRUPTED_TAIL_MARKER if is_interrupt_diagnostic(text) else text.strip() or INTERRUPTED_TAIL_MARKER
-    )})
+    stripped = text.strip()
+    if not stripped or stripped == _INTERRUPTED_PLACEHOLDER:
+        append_message(messages, hidden_interrupt_placeholder_row())
+    elif is_interrupt_diagnostic(stripped):
+        append_message(messages, {"role": "assistant", "content": INTERRUPTED_TAIL_MARKER})
+    else:
+        append_message(messages, {"role": "assistant", "content": stripped})
     return True
 
 
