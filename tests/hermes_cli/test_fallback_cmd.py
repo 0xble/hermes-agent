@@ -312,6 +312,84 @@ class TestClearCommand:
         assert cfg.get("fallback_providers") == []
 
 # ---------------------------------------------------------------------------
+# hermes fallback cooldowns — shared primary-model cooldowns, separate from the chain
+# ---------------------------------------------------------------------------
+
+def _parse(argv):
+    import argparse
+    from hermes_cli.subcommands.fallback import build_fallback_parser
+    parser = argparse.ArgumentParser()
+    build_fallback_parser(parser.add_subparsers(dest="command"))
+    return parser.parse_args(argv)
+
+
+def _arm(provider, model):
+    import time
+    from agent.shared_primary_cooldown import arm_cooldown
+    return arm_cooldown((provider, "http://127.0.0.1:8317/v1", model), reason="rate_limit", reset_at=time.time() + 7200)
+
+
+def _cooling_models():
+    from agent.shared_primary_cooldown import list_cooldowns
+    return sorted((r["provider"], r["model"]) for r in list_cooldowns())
+
+
+class TestCooldownsCommand:
+
+    def test_bare_clear_still_clears_only_the_chain(self, isolated_home, monkeypatch):
+        _write_config(isolated_home, {"fallback_providers": [{"provider": "openrouter", "model": "gpt-5.4"}]})
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        monkeypatch.setattr("builtins.input", lambda *a, **kw: "y")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "clear"]))
+        assert _read_config(isolated_home).get("fallback_providers") == []
+        assert _cooling_models() == [("custom:claude-proxy", "claude-opus-5-5")]
+
+    def test_clear_takes_no_model_argument(self, isolated_home):
+        with pytest.raises(SystemExit):
+            _parse(["fallback", "clear", "claude-opus-5-5"])
+
+    def test_cooldowns_lists_by_default_and_status_is_an_alias(self, isolated_home, capsys):
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns"]))
+        listed = capsys.readouterr().out
+        cmd_fallback(_parse(["fallback", "status"]))
+        assert "claude-opus-5-5 via custom:claude-proxy" in listed
+        assert capsys.readouterr().out == listed
+
+    def test_clear_all_removes_every_cooldown_and_keeps_the_chain(self, isolated_home, capsys):
+        chain = [{"provider": "openrouter", "model": "gpt-5.4"}]
+        _write_config(isolated_home, {"fallback_providers": chain})
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        _arm("custom:codex-proxy", "gpt-6.1-sol")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "--all"]))
+        assert _cooling_models() == []
+        assert _read_config(isolated_home)["fallback_providers"] == chain
+        out = capsys.readouterr().out
+        assert "Cleared: claude-opus-5-5 via custom:claude-proxy" in out
+        assert "next turn start" in out
+
+    def test_clear_target_is_exact(self, isolated_home, capsys):
+        _arm("custom:claude-proxy", "claude-opus-5-5")
+        _arm("custom:claude-proxy", "claude-opus-5")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "opus"]))
+        assert "No shared primary cooldown matches 'opus'" in capsys.readouterr().out
+        assert len(_cooling_models()) == 2
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "custom:claude-proxy/claude-opus-5"]))
+        assert _cooling_models() == [("custom:claude-proxy", "claude-opus-5-5")]
+
+    @pytest.mark.parametrize("argv", [
+        ["fallback", "cooldowns", "clear"],
+        ["fallback", "cooldowns", "clear", "--all", "claude-opus-5-5"],
+    ])
+    def test_clear_requires_exactly_one_selector(self, isolated_home, argv):
+        with pytest.raises(SystemExit):
+            _parse(argv)
+
+# ---------------------------------------------------------------------------
 # cmd_fallback dispatcher
 # ---------------------------------------------------------------------------
 

@@ -33,6 +33,7 @@ def _isolated_shared_primary_cooldown(monkeypatch, tmp_path):
         lambda: tmp_path / "state" / "model_cooldowns.json",
     )
 
+
 @pytest.fixture(autouse=True)
 def _fresh_structured_output_memo(monkeypatch):
     """The aux client remembers routes that rejected ``response_format`` for the whole process;
