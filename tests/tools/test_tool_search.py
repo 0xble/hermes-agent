@@ -167,6 +167,35 @@ class TestClassification:
         assert "computer_use" not in names
 
 
+    def test_classify_keeps_unknown_in_visible(self):
+        """A tool we can't classify stays visible — never silently dropped.
+
+        This is the OpenClaw #84141 regression guard (cron lost ``exec``
+        because it wasn't in the catalog).
+        """
+        from tools.tool_search import classify_tools
+        # Build a tool def for something we don't have a registry entry for.
+        defs = [_td("xx_unknown_tool", "Unknown tool")]
+        visible, deferrable = classify_tools(defs)
+        names = {(td.get("function") or {}).get("name") for td in visible}
+        assert "xx_unknown_tool" in names
+        assert deferrable == []
+
+    def test_non_string_registry_toolset_never_defers(self, monkeypatch):
+        """A malformed registry entry (non-string toolset) stays visible instead of raising."""
+        from types import SimpleNamespace
+        from tools.registry import registry
+        from tools.tool_search import classify_tools, is_deferrable_tool_name
+
+        name = "xx_malformed_toolset_tool"
+        malformed = SimpleNamespace(name=name, toolset=123, eager=False)
+        monkeypatch.setattr(registry, "get_entry", lambda tool_name, *a, **kw: malformed if tool_name == name else None)
+        assert is_deferrable_tool_name(name) is False
+        visible, deferrable = classify_tools([_td(name, "Malformed")])
+        assert [td["function"]["name"] for td in visible] == [name]
+        assert deferrable == []
+
+
 class TestPluginEagerRegistration:
     """Plugin owners may opt a tool into the direct schema surface."""
 
@@ -259,21 +288,6 @@ class TestPluginEagerRegistration:
             assert "directly-listed" in error
         finally:
             self._cleanup(name)
-
-
-    def test_classify_keeps_unknown_in_visible(self):
-        """A tool we can't classify stays visible — never silently dropped.
-
-        This is the OpenClaw #84141 regression guard (cron lost ``exec``
-        because it wasn't in the catalog).
-        """
-        from tools.tool_search import classify_tools
-        # Build a tool def for something we don't have a registry entry for.
-        defs = [_td("xx_unknown_tool", "Unknown tool")]
-        visible, deferrable = classify_tools(defs)
-        names = {(td.get("function") or {}).get("name") for td in visible}
-        assert "xx_unknown_tool" in names
-        assert deferrable == []
 
 
 # ---------------------------------------------------------------------------

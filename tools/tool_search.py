@@ -160,8 +160,9 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
     entry = _registry_entry(name)
     if getattr(entry, "eager", False):
         return False
-    toolset = getattr(entry, "toolset", None)  # None (unregistered/malformed) never defers
-    return toolset is not None and (
+    toolset = getattr(entry, "toolset", None)
+    # Unregistered or malformed (non-string toolset) entries never defer.
+    return isinstance(toolset, str) and (
         toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS)
 
 

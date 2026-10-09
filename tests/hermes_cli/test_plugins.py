@@ -2185,6 +2185,49 @@ class TestPluginContext:
         finally:
             registry.deregister("gated_override_target")
 
+    def test_register_tool_eager_flag_reaches_registry_and_unwinds(self, tmp_path, monkeypatch):
+        """``eager`` reaches the ToolEntry, defaults False, and unload restores the prior entry's flag."""
+        from tools.registry import registry
+        from hermes_cli.plugins import PluginContext, PluginManifest
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        mgr = PluginManager()
+        scope = mgr.scope_key
+        ctx = PluginContext(manager=mgr, manifest=PluginManifest(name="eager_flag_plugin", source="bundled"))
+
+        def _schema(name):
+            return {"name": name, "description": name, "parameters": {"type": "object", "properties": {}}}
+
+        def _entry(name):
+            return registry.get_entry(name, scope=scope)
+
+        eager_name, default_name, base_name = "eager_flag_tool", "eager_flag_default_tool", "eager_flag_base_tool"
+        registry.register(name=base_name, toolset="eager_flag_base", schema=_schema(base_name),
+                          handler=lambda args, **kw: "base", eager=True)
+        base_entry = _entry(base_name)
+        try:
+            eager_handle = ctx.register_tool(name=eager_name, toolset="eager_flag_plugin",
+                                             schema=_schema(eager_name), handler=lambda args, **kw: "e", eager=True)
+            default_handle = ctx.register_tool(name=default_name, toolset="eager_flag_plugin",
+                                               schema=_schema(default_name), handler=lambda args, **kw: "d")
+            override_handle = ctx.register_tool(name=base_name, toolset="eager_flag_plugin",
+                                                schema=_schema(base_name), handler=lambda args, **kw: "o",
+                                                override=True)
+            assert eager_handle and default_handle and override_handle
+            assert _entry(eager_name).eager is True
+            assert _entry(default_name).eager is False
+            assert _entry(base_name).eager is False  # the override carries its own (default) flag
+
+            for handle in (override_handle, default_handle, eager_handle):
+                handle.dispose()
+            assert _entry(eager_name) is None
+            assert _entry(default_name) is None
+            restored = _entry(base_name)
+            assert restored is base_entry and restored.eager is True
+        finally:
+            for name in (eager_name, default_name, base_name):
+                registry.deregister(name)
+
 
     def test_register_tool_override_blocked_via_delayed_callback(self, tmp_path, monkeypatch):
         """A plugin must not bypass the opt-in gate by deferring the direct
