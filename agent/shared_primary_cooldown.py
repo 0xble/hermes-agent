@@ -158,17 +158,19 @@ def arm_cooldown(
     try:
         with _locked_state() as (path, state):
             old = state["routes"].get(key)
-            old_active = _active(old, now)
-            if old_active:
+            # Only a successful primary response clears the record, so any existing entry
+            # (active or expired) is the same outage: escalate shared backoff, keep notice state.
+            same_outage = isinstance(old, dict)
+            if same_outage:
                 outage_id = str(old.get("outage_id") or f"{now:.6f}-{os.getpid()}-{threading.get_ident()}")
-                prior_count = int(old.get("backoff_count", 0) or 0)
+                prior_count = max(int(old.get("backoff_count", 0) or 0), int(backoff_count or 0))
             else:
                 outage_id = f"{now:.6f}-{os.getpid()}-{threading.get_ident()}"
                 prior_count = max(0, int(backoff_count or 0))
             if requested_reset:
                 effective_reset = requested_reset
                 source = "provider_reset"
-                backoff_count = max(1, prior_count + (0 if old_active else 1))
+                backoff_count = max(1, prior_count + (0 if _active(old, now) else 1))
             else:
                 backoff_count = prior_count + 1
                 effective_reset = now + min(60 * (2 ** max(0, backoff_count - 1)), _MAX_BACKOFF_SECONDS)
@@ -179,7 +181,7 @@ def arm_cooldown(
                 "reason": getattr(reason, "value", str(reason or "rate_limit")),
                 "source": source,
                 "backoff_count": backoff_count,
-                "notice_claimed": bool(old.get("notice_claimed")) if old_active else False,
+                "notice_claimed": bool(old.get("notice_claimed")) if same_outage else False,
                 "outage_id": outage_id,
                 "recorded_at": now,
             }

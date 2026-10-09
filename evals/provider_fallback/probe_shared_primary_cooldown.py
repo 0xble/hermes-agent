@@ -32,7 +32,7 @@ HERMES_HOME.mkdir()
     encoding="utf-8",
 )
 
-state = {"primary_available": False, "requests": []}
+state = {"primary_available": False, "send_reset": True, "requests": []}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -57,7 +57,7 @@ class Handler(BaseHTTPRequestHandler):
             else {"error": {"message": "rate_limit_error: retry later", "type": "rate_limit_error"}}
         )
         self.send_response(status)
-        if status == 429:
+        if status == 429 and state["send_reset"]:
             self.send_header("Retry-After", "7200")
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -131,5 +131,30 @@ try:
     assert len(recovery_notices) == 1, recovery_notices
     assert all(result["primary_calls"] == 0 for result in outage_results[1:] + [restart_result])
     print("PROBE_OK: one primary outage call, one outage notice, restart-safe fallback, one recovery notice")
+
+    # Phase 2 (Done 5): no provider reset. Each new outage-arming process escalates the SHARED
+    # level (60s -> 120s -> 240s ...), and a process started while cooling never calls the primary.
+    state["primary_available"] = False
+    state["send_reset"] = False
+    windows = []
+    for _ in range(3):
+        before = len([r for r in state["requests"] if r["model"] == "primary-model"])
+        result = run_child("first")
+        after = len([r for r in state["requests"] if r["model"] == "primary-model"])
+        assert after - before == 1, (before, after)
+        entry = next(iter(json.loads(record_path.read_text(encoding="utf-8"))["routes"].values()))
+        windows.append(round(entry["reset_at"] - entry["recorded_at"]))
+        blocked_before = len([r for r in state["requests"] if r["model"] == "primary-model"])
+        blocked = run_child("session")
+        assert blocked["model"] == "fallback-model" and blocked["primary_calls"] == 0
+        assert len([r for r in state["requests"] if r["model"] == "primary-model"]) == blocked_before
+        # Expire the window so the next process probes the primary (still 429) and escalates.
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        for e in record["routes"].values():
+            e["reset_at"] = time.time() - 1
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+    print(json.dumps({"no_reset_backoff_windows_s": windows}))
+    assert windows == [60, 120, 240], windows
+    print("PROBE_OK: no-reset shared backoff 60s -> 120s -> 240s; cooling sessions never wait on the primary")
 finally:
     server.shutdown()
