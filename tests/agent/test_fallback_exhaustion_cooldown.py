@@ -244,6 +244,42 @@ class TestRateLimitBackoffEscalation:
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
         assert agent._rate_limited_until == frozen + 14400
 
+    def test_implausible_provider_reset_is_ignored_when_the_shared_write_fails(self):
+        """The in-memory cooldown shares the record's 31-day ceiling: an absurd provider reset
+        falls back to exponential backoff even when the shared state cannot be written."""
+        import time as _time
+        from agent import fallback_cooldown
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        agent._rate_limit_backoff_count = 0
+        frozen = 1_000.0
+        with (
+            patch("agent.fallback_cooldown.time.monotonic", return_value=frozen),
+            patch("agent.shared_primary_cooldown.arm_cooldown", side_effect=OSError("read-only state")),
+        ):
+            seconds = fallback_cooldown._arm_rate_limit_cooldown(
+                agent, FailoverReason.rate_limit, _time.time() + 365 * 86_400)
+        assert seconds == 60
+        assert agent._rate_limited_until == frozen + 60
+
+    def test_multi_day_provider_reset_is_honored_when_the_shared_write_fails(self):
+        import time as _time
+        from agent import fallback_cooldown
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        agent._rate_limit_backoff_count = 0
+        frozen = 1_000.0
+        three_days = 3 * 86_400
+        with (
+            patch("agent.fallback_cooldown.time.monotonic", return_value=frozen),
+            patch("agent.shared_primary_cooldown.arm_cooldown", side_effect=OSError("read-only state")),
+        ):
+            seconds = fallback_cooldown._arm_rate_limit_cooldown(
+                agent, FailoverReason.rate_limit, _time.time() + three_days)
+        assert three_days - 5 <= seconds <= three_days + 1
+
     def test_backoff_counter_resets_on_successful_primary_restore(self):
         """A successful restore_primary_runtime resets the backoff counter,
         so the next rate-limit starts back at the 60s base."""

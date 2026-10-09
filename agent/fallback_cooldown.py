@@ -25,10 +25,15 @@ def _provider_reset_epoch(reset_at) -> float | None:
 
 
 def _provider_reset_delay(reset_at) -> float | None:
-    """Seconds until the provider-declared reset, or None when missing/invalid/expired."""
+    """Seconds until the provider-declared reset, or None when missing/invalid/expired/implausible.
+
+    Shares the shared record's ceiling so the in-memory cooldown can never outlive what the
+    record would accept, even when the shared state write fails.
+    """
+    from agent.shared_primary_cooldown import _MAX_PROVIDER_RESET_SECONDS
     parsed = _provider_reset_epoch(reset_at)
     delay = parsed - time.time() if parsed is not None else None
-    if delay is not None and math.isfinite(delay) and delay > 0:
+    if delay is not None and math.isfinite(delay) and 0 < delay <= _MAX_PROVIDER_RESET_SECONDS:
         return delay
     return None
 
