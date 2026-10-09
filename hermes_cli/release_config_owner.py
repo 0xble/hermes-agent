@@ -61,7 +61,7 @@ def _running_schema_version() -> int:
 def _release_schema_version(release: Path) -> Optional[int]:
     """Read a release's config schema without importing code from that release."""
     try:
-        text = (release / "hermes_cli" / "config_defaults.py").read_text(encoding="utf-8")
+        text = (release / "hermes_cli" / "config_defaults.py").read_text(encoding="utf-8-sig")
     except OSError:
         return None
     match = _SCHEMA_RE.search(text)
