@@ -275,6 +275,26 @@ def test_card_fill_that_cannot_pay_never_prompts(controls):
     assert prompts == [] and secret_exprs == []
 
 
+def test_slow_card_confirmation_without_refresh_support_preserves_base_fill(monkeypatch):
+    from agent import redact
+    from tools import browser_vault_tool as vault
+    try:
+        clock = [1000.0]
+        monkeypatch.setattr(vault.time, "monotonic", lambda: clock[0])
+
+        def accept_after_wait(*_):
+            clock[0] += 31.0
+            return "accept"
+
+        monkeypatch.setattr(vault, "_confirm_payment_fill", accept_after_wait)
+        raw, _prompts, secret_exprs = _run_fill("https://shop.test/checkout")
+        out = json.loads(raw)
+        assert out["success"] is True
+        assert len(secret_exprs) == 1
+    finally:
+        redact.clear_vault_redaction_values()
+
+
 def test_card_fill_writes_only_targets_stamped_after_consent():
     from agent import redact
     try:

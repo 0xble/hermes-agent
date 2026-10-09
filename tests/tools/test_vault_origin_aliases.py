@@ -166,6 +166,24 @@ def test_alias_only_login_fill_confirms_once_and_saved_origin_does_not(monkeypat
     assert prompts == []
 
 
+def test_slow_alias_confirmation_without_refresh_support_preserves_base_fill(monkeypatch):
+    backend = _Backend(_meta(handle="op:slow-local-confirm"))
+    _fill_patches(monkeypatch, backend)
+    clock = [1000.0]
+    monkeypatch.setattr(vault.time, "monotonic", lambda: clock[0])
+
+    def accept_after_wait(*_):
+        clock[0] += 31.0
+        return "accept"
+
+    monkeypatch.setattr(vault, "_confirm_alias_fill", accept_after_wait)
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "origin_aliases": {"op:slow-local-confirm": ["https://login.gusto.com"]},
+    }}):
+        result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="slow-local-confirm"))
+    assert result["success"] is True
+
+
 def test_slow_alias_confirmation_refreshes_onepassword_metadata(monkeypatch):
     class _RefreshingBackend(_Backend):
         def __init__(self, meta):

@@ -34,7 +34,14 @@ from typing import Dict, List, Optional, Tuple
 from agent.secret_sources._cache import fingerprint as _fingerprint
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
-from agent.vault_backends.base import LoginBackend, MissingCredential, UnlockRequired, run_with_stdin_secret
+from agent.vault_backends.base import (
+    FILL_METADATA_NOT_APPLICABLE,
+    FILL_METADATA_TTL_SECONDS,
+    LoginBackend,
+    MissingCredential,
+    UnlockRequired,
+    run_with_stdin_secret,
+)
 from agent.vault_backends import unlock as _unlock
 from agent.vault_store import VaultItemMeta, normalize_origin, normalize_otp_secret, totp_now
 
@@ -48,7 +55,7 @@ _CATEGORIES = "Login,Credit Card"  # one listing feeds both metadata and the vau
 # credential fingerprint. Every `op` call spends the account's daily request quota.
 # Display listings (browser_vault_list) reuse an answer for 15 minutes.
 _LISTING_TTL_SECONDS = 900.0
-_FILL_METADATA_TTL_SECONDS = 30.0
+_FILL_METADATA_TTL_SECONDS = FILL_METADATA_TTL_SECONDS
 _LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
 # Single flight: concurrent callers wanting the same listing or item metadata wait on one
 # `op` call. Fill authorization does not use the display cache as authority.
@@ -375,6 +382,7 @@ class OnePasswordLoginBackend(LoginBackend):
         """Return the item's vault from the display cache, or one fresh listing when cold."""
         key = self._listing_key()
         raw_text = None
+        loaded_fresh = fresh
         if not fresh:
             with _LISTING_LOCK:
                 hit = _LISTING_CACHE.get(key)
@@ -382,6 +390,7 @@ class OnePasswordLoginBackend(LoginBackend):
                     raw_text = hit[1]
         if raw_text is None:
             raw_text = self._list_json_fresh()
+            loaded_fresh = True
         try:
             raw = json.loads(raw_text or "[]")
         except (TypeError, ValueError) as exc:
@@ -390,17 +399,17 @@ class OnePasswordLoginBackend(LoginBackend):
             raise RuntimeError("Invalid 1Password item metadata")
         matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id]
         if len(matches) != 1:
-            if not fresh:
+            if not loaded_fresh:
                 return self._listing_vault_hint(item_id, fresh=True)
             return None
         vault = matches[0].get("vault")
         if not isinstance(vault, dict):
-            if not fresh:
+            if not loaded_fresh:
                 return self._listing_vault_hint(item_id, fresh=True)
             return None
         vault_id = vault.get("id")
         if not isinstance(vault_id, str) or not vault_id:
-            if not fresh:
+            if not loaded_fresh:
                 return self._listing_vault_hint(item_id, fresh=True)
             return None
         return vault_id
@@ -409,7 +418,14 @@ class OnePasswordLoginBackend(LoginBackend):
     def _metadata_error_is_retryable(exc: BaseException) -> bool:
         text = str(exc).lower()
         return any(term in text for term in (
-            "not found", "not_found", "does not exist", "could not find", "vault",
+            "isn't an item",
+            "not found",
+            "not_found",
+            "no item",
+            "isn't in vault",
+            "could not find",
+            "does not exist",
+            "item moved",
         ))
 
     def _read_item_metadata(self, item_id: str, vault_id: str, categories) -> Optional[dict]:
@@ -499,11 +515,13 @@ class OnePasswordLoginBackend(LoginBackend):
     def _remember_fill_metadata(self, handle: str, item: dict) -> None:
         self._fill_metadata.item = (time.monotonic(), handle, item)
 
-    def refresh_fill_metadata(self, handle: str) -> Optional[VaultItemMeta]:
+    def refresh_fill_metadata(self, handle: str) -> object:
         """Refresh stale per-fill metadata without consulting the account-wide listing."""
+        if self._connect_credentials()[1]:
+            return FILL_METADATA_NOT_APPLICABLE
         cached = getattr(self._fill_metadata, "item", None)
         if cached is None or cached[1] != handle:
-            return None
+            return FILL_METADATA_NOT_APPLICABLE
         stored_at, _handle, old_item = cached
         if time.monotonic() - stored_at <= _FILL_METADATA_TTL_SECONDS:
             return None
@@ -518,7 +536,7 @@ class OnePasswordLoginBackend(LoginBackend):
         except Exception:
             self._clear_fill_metadata(handle)
             return None
-        if item is None:
+        if item is None or item.get("category") != old_item.get("category"):
             self._clear_fill_metadata(handle)
             return None
         self._remember_fill_metadata(handle, item)

@@ -1,6 +1,6 @@
 """Metadata-only selector regressions; no real password manager is invoked."""
 import json
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -62,6 +62,22 @@ def test_missing_or_invalid_metadata_never_reads_secret(backend, metadata, metho
     else:
         assert backend.resolve_otp("op:item-a") is None
     assert all("--reveal" not in c.args for c in backend._run.call_args_list)
+
+
+def test_cold_missing_item_uses_one_fresh_listing(backend):
+    from agent.vault_backends import onepassword
+    onepassword.invalidate_listing_cache()
+    backend._run.return_value = "[]"
+    assert backend._listing_vault_hint("missing-item") is None
+    assert backend._run.call_count == 1
+
+
+def test_permission_error_naming_vault_does_not_retry_or_relist(backend):
+    backend._listing_vault_hint = Mock(return_value="vault-a")
+    backend._run.side_effect = RuntimeError("permission denied reading vault vault-a")
+    with pytest.raises(RuntimeError, match="permission denied"):
+        backend.get_meta("op:item-a")
+    assert backend._listing_vault_hint.call_args_list == [call("item-a")]
 
 
 def test_moved_item_retries_once_with_a_fresh_listing(backend):

@@ -597,7 +597,8 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         select_protected_field_fills,
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
-    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, scrub_secret_from_text
+    from agent.vault_backends.base import FILL_METADATA_NOT_APPLICABLE, FILL_METADATA_TTL_SECONDS
+    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, VaultItemMeta, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
     # Pin ONE browser for the whole fill: the privacy check, inspection, write and redaction must
@@ -641,6 +642,21 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         discard = getattr(backend, "discard_fill_metadata", None)
         if callable(discard):
             discard(handle)
+
+    def _refresh_fill_metadata_after_confirmation() -> object:
+        refresh = getattr(backend, "refresh_fill_metadata", None)
+        if not callable(refresh):
+            return FILL_METADATA_NOT_APPLICABLE
+        refreshed = refresh(handle)
+        if refreshed is FILL_METADATA_NOT_APPLICABLE:
+            return refreshed
+        if refreshed is None or not isinstance(refreshed, VaultItemMeta):
+            # A backend that owns per-fill metadata failed to revalidate it. Clear the
+            # authorization context and fail closed instead of reading a moved item.
+            _discard_fill_metadata()
+            return None
+        return refreshed
+
     if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
         _discard_fill_metadata()
         return refusal
@@ -705,20 +721,17 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             if decision != "accept":
                 _record_alias_fill_decision(alias_key, "refused")
             else:
-                if time.monotonic() - prompt_started > 30.0:
-                    refresh = getattr(backend, "refresh_fill_metadata", None)
-                    refreshed = refresh(handle) if callable(refresh) else None
+                if time.monotonic() - prompt_started > FILL_METADATA_TTL_SECONDS:
+                    refreshed = _refresh_fill_metadata_after_confirmation()
                     if refreshed is None:
-                        discard = getattr(backend, "discard_fill_metadata", None)
-                        if callable(discard):
-                            discard(handle)
                         return json.dumps({"success": False, "error_type": "metadata_changed",
                                            "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
-                    raw_meta = refreshed
-                    saved_origins = tuple(refreshed.allowed_origins) or ((str(refreshed.origin),) if refreshed.origin else ())
-                    meta = refreshed
-                    from agent.vault_origin_aliases import apply_origin_aliases
-                    meta = apply_origin_aliases([meta])[0]
+                    if isinstance(refreshed, VaultItemMeta):
+                        raw_meta = refreshed
+                        saved_origins = tuple(refreshed.allowed_origins) or ((str(refreshed.origin),) if refreshed.origin else ())
+                        meta = refreshed
+                        from agent.vault_origin_aliases import apply_origin_aliases
+                        meta = apply_origin_aliases([meta])[0]
                 if refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin):
                     # The prompt can wait for hours (approvals.timeout). Re-read both the item
                     # metadata and the alias config before allowing the write.
@@ -787,17 +800,14 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         # that inspection's targets are written (the fill script also re-checks the origin at write time).
         prompt_started = time.monotonic()
         decision = _confirm_payment_fill(meta.label, page_origin)
-        if decision == "accept" and time.monotonic() - prompt_started > 30.0:
-            refresh = getattr(backend, "refresh_fill_metadata", None)
-            refreshed = refresh(handle) if callable(refresh) else None
+        if decision == "accept" and time.monotonic() - prompt_started > FILL_METADATA_TTL_SECONDS:
+            refreshed = _refresh_fill_metadata_after_confirmation()
             if refreshed is None:
-                discard = getattr(backend, "discard_fill_metadata", None)
-                if callable(discard):
-                    discard(handle)
                 return json.dumps({"success": False, "error_type": "metadata_changed",
                                    "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
-            from dataclasses import replace
-            meta = replace(refreshed, origin=page_origin, allowed_origins=(page_origin,))
+            if isinstance(refreshed, VaultItemMeta):
+                from dataclasses import replace
+                meta = replace(refreshed, origin=page_origin, allowed_origins=(page_origin,))
         if decision != "accept":
             assert retry_key is not None
             _payment_retry_blocked(retry_key, refuse=True)
