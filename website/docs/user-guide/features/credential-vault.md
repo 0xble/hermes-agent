@@ -160,12 +160,15 @@ restart is required. Aliases are HTTPS-only, exact-origin matches. Entries with
 a path, an `http` scheme, or a wildcard are ignored. Hermes does not infer
 parent or subdomain origins and applies an alias only to the named login. After
 adding an alias, retry the fill. The first alias-only fill asks the user to
-confirm the full origin and item label once per session; a cross-registrable-domain
-alias also warns with the saved and alias domains when the advisory fallback recognizes
-those suffixes. The warning is not an authorization check and has partial suffix coverage;
-the full origin is always shown. Saved-origin fills do not need
-that extra prompt. Never edit or rewrite an existing shared 1Password item to
-add a website URL, because template rewrites can remove passkeys.
+confirm the full origin and item label unless `vault.confirm_alias_fills` is
+false. A
+cross-registrable-domain alias is logged as an advisory warning when prompts
+are disabled, and otherwise warns in the confirmation detail when the advisory
+fallback recognizes those suffixes. The warning is not an authorization check
+and has partial suffix coverage; the full origin is always shown. Saved-origin
+fills do not need that extra prompt. Never edit or rewrite an existing shared
+1Password item to add a website URL, because template rewrites can remove
+passkeys.
 
 ## Headless sessions
 
