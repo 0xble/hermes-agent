@@ -233,11 +233,12 @@ def test_relay_managed_close_failure_preserves_poison_when_monitor_wins(tmp_path
     abort_reasons = []
 
     def chunks():
-        yield _chunk(content="partial ")
-        # Hold the worker before its interrupt check until the monitor has
-        # recorded its abort. This fixes the ordering without sleeping.
+        # Hold the provider read until the monitor has recorded its abort. Relay reads
+        # provider chunks off its loop and ahead of the worker, so the hold must come
+        # before the worker can see any chunk. This fixes the ordering without sleeping.
         agent._interrupt_requested = True
         assert monitor_abort_started.wait(timeout=5.0), "monitor abort did not start"
+        yield _chunk(content="partial ")
         yield _chunk(content="never processed")
 
     stream = _FakeStream(chunks, close_raises=True)
