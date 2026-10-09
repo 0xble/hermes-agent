@@ -215,14 +215,17 @@ async def test_create_reports_an_undelivered_brief_and_never_admits_it(home):
 
 @pytest.mark.asyncio
 async def test_create_keeps_the_receiving_bots_routing_provenance(monkeypatch):
-    """A multiplexed shared-bot turn must reach the bot that received it; copying the calling
-    source must carry the wire-invisible transport provenance to the topic's source."""
+    """A multiplexed shared-bot turn must reach the bot that received it. The source goes through
+    the gateway's real per-turn source cache, then the tool's copy, then the topic's copy, and
+    every hop must keep the wire-invisible transport provenance."""
     import weakref
+    from gateway.run import GatewayRunner
     from gateway.session_identity import RoutingIdentity, identity_of
     from tools import telegram_topic_tool as tool
 
+    key = "agent:work:telegram:dm:2027045491:297206"
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
-    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:work:telegram:dm:2027045491:297206")
+    monkeypatch.setenv("HERMES_SESSION_KEY", key)
     receiving_bot = FakeTelegram()
     calling = _source(thread_id="297206")
     calling.profile = "work"
@@ -232,11 +235,14 @@ async def test_create_keeps_the_receiving_bots_routing_provenance(monkeypatch):
     calling._identity = pinned
     seen = []
 
+    runner = object.__new__(GatewayRunner)
+    runner._cache_session_source(key, calling)  # what a turn does at admission (run_turn.py)
+
     def _delivery_adapter_for(source):
         seen.append((getattr(source, "_transport_adapter_ref", lambda: None)(), identity_of(source)))
         return receiving_bot
 
-    runner = SimpleNamespace(_get_cached_session_source=lambda key: calling, _delivery_adapter_for=_delivery_adapter_for)
+    runner._delivery_adapter_for = _delivery_adapter_for
     copied = tool._calling_source(runner)
     assert copied is not calling and copied._transport_adapter_ref() is receiving_bot and identity_of(copied) is pinned
 
