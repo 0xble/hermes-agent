@@ -16,7 +16,8 @@ pending-update heartbeat probe, or reconnect token ownership.
   replies are still awaited.
 - The pending-update probe escalates only when Telegram reports a backlog **and** no update
   was dispatched since the previous probe. A backlog seen while dispatch progresses starts a
-  new window.
+  new window. Each polling generation starts the stuck window at zero. Its first probe has no
+  dispatch baseline, so it only records one and never counts as stuck.
 - A reconnect waits up to 25s for this process's previous poller on the token to finish and
   release it, instead of refusing while the old poller is still stopping.
 
@@ -54,6 +55,8 @@ not ledgered and can still be lost in that window.
 tests/plugins/test_telegram_ingress_consumer_ptb.py`. It covers:
 - the 13:26 probe shape (backlog with dispatch progress) not escalating, while a backlog
   without progress still escalates;
+- after a polling-generation reset with a carried-over stuck count, the baseline-less first
+  probe not counting, while two later baseline probes without progress still escalate;
 - command replies and busy replies on the consumer returning before the budget slot opens,
   while off the consumer they are still awaited;
 - the consumer role not being inherited by spawned tasks;
