@@ -23,9 +23,14 @@ _INVALID_RECORD = object()
 # A deleted review checkout should survive a few days of recovery/retry activity.
 ORPHAN_INSTALL_GRACE_SECONDS = 7 * 24 * 60 * 60
 # Installations created before the sidecar was introduced have no trustworthy last-use
-# timestamp. Keep them for a month unless a collector can prove their key belongs to a
-# checkout it can see; this is deliberately much longer than the normal grace period.
-LEGACY_INSTALL_GRACE_SECONDS = 30 * 24 * 60 * 60
+# timestamp, so they are judged by tree activity instead. They are regenerable dependency
+# caches (the worst case of an early removal is one rebuild), so a few idle days is enough
+# once their key matches no checkout this collector can see. The install lock, the
+# generation-lease fence and the known-key check still apply exactly as for recorded installs.
+LEGACY_INSTALL_GRACE_SECONDS = 3 * 24 * 60 * 60
+# A recorded install holding a generation created before leases existed cannot prove it is
+# unused: a reader may hold it without a lease. That case keeps the long, month-scale window.
+UNLEASEABLE_INSTALL_GRACE_SECONDS = 30 * 24 * 60 * 60
 
 
 def _record(state: Path):
@@ -140,16 +145,17 @@ def _has_unleaseable_generation(state: Path) -> bool:
 
 
 def _eligible(state: Path, record, known_keys: set[str],
-              now: float, grace_seconds: float, legacy_grace_seconds: float) -> bool:
+              now: float, grace_seconds: float, legacy_grace_seconds: float,
+              unleaseable_grace_seconds: float = UNLEASEABLE_INSTALL_GRACE_SECONDS) -> bool:
     if record is _INVALID_RECORD:
         return False
     if record is not None:
         project_root, last_used = record
         if project_root.is_dir() or now - last_used < grace_seconds:
             return False
-        # Unleaseable generations fall back to the conservative legacy rule.
+        # A pre-lease generation cannot prove no reader holds it: keep the long window.
         if _has_unleaseable_generation(state):
-            return not _tree_touched_since(state, now - legacy_grace_seconds)
+            return not _tree_touched_since(state, now - unleaseable_grace_seconds)
         return True
     return state.name not in known_keys and not _tree_touched_since(
         state, now - legacy_grace_seconds)
@@ -167,7 +173,7 @@ def collect_install_orphans(
     The candidate is rechecked while holding its per-install lock. Active generation
     leases fence deletion even after the checkout directory itself has disappeared.
     Legacy directories without metadata are retained when their key matches a root
-    visible to this collector, and otherwise require the longer legacy grace period.
+    visible to this collector, and otherwise after a few idle days (they are caches).
     """
     root = installs_root()
     if not root.is_dir() or root.is_symlink():
