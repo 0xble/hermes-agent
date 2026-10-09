@@ -102,6 +102,27 @@ def test_newer_foreign_build_is_refused(home, live_release, tmp_path, monkeypatc
     assert (home / "config.yaml").read_bytes() == before
 
 
+@pytest.mark.parametrize("writer", ["import-agent dump_yaml_file", "atomic_write_text"])
+def test_direct_atomic_config_writers_are_guarded(home, live_release, tmp_path, monkeypatch, writer):
+    from hermes_cli.agent_import import dump_yaml_file
+    from utils import atomic_write_text
+
+    dev_root = tmp_path / "dev-worktree"
+    dev_root.mkdir()
+    _run_from(monkeypatch, dev_root, schema=50)
+    target = home / "config.yaml"
+    before = target.read_bytes()
+    write = {
+        "import-agent dump_yaml_file": lambda: dump_yaml_file(target, {"_config_version": 50}),
+        "atomic_write_text": lambda: atomic_write_text(target, "_config_version: 50\n"),
+    }[writer]
+
+    with pytest.raises(RuntimeError, match="refusing to write"):
+        write()
+    assert target.read_bytes() == before
+    assert not list(home.glob(".config_*.tmp")) and not list(home.glob(".tmp_*"))
+
+
 def test_config_set_cli_exits_nonzero_naming_both_roots(home, live_release, tmp_path, monkeypatch, capsys):
     from types import SimpleNamespace
     from hermes_cli.main import cmd_config

@@ -3,8 +3,9 @@
 A Hermes home on immutable releases runs whatever ``<root>/current`` names. A dev worktree or
 sync candidate can carry a newer config schema; its config writes stamp ``_config_version`` past
 the live release and block the next ``hermes update`` (``config ... is newer than this release``).
-Writes through ``_write_config_state`` and utils' round-trip writers for ``config.yaml`` call
-:func:`ensure_release_owns_config_write` first.
+Every ``config.yaml`` write through utils' atomic writer (``_atomic_write``, behind config set,
+``save_config``, ``import-agent`` and direct writers) calls :func:`ensure_release_owns_config_write`
+first.
 
 A previously-live release still running after promotion (an open CLI, a gateway awaiting restart,
 a pinned worker) has an older or equal schema and keeps writing: ``migrate_config`` only stamps
@@ -93,6 +94,5 @@ def ensure_release_owns_config_write(config_path: Path) -> None:
         raise ForeignBuildConfigWriteError(
             f"refusing to write {config_path}: this hermes runs from {running} (config schema "
             f"{running_schema}), but {root} is managed by release {release} ({live_label}). A newer "
-            f"schema stamp would block the next `hermes update`. Use "
-            f"{root / 'current' / '.venv' / 'bin' / 'hermes'} for this home.")
-
+            f"schema stamp would block the next `hermes update`. Run the hermes installed in "
+            f"{root / 'current'} for this home.")

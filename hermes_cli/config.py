@@ -2104,7 +2104,7 @@ def _write_config_state(
 ) -> None:
     """Shared comment-preserving config writer; omission policy is selected by the public wrapper."""
     from hermes_cli.release_config_owner import ensure_release_owns_config_write
-    ensure_release_owns_config_write(config_path)
+    ensure_release_owns_config_write(config_path)  # refuse before the read-back checks, not only at the write
     from utils import atomic_roundtrip_yaml_save
 
     _refuse_failed_read(config_path, data)

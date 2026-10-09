@@ -280,6 +280,11 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     # A profile delete leaves a tombstone beside its removed home.  Background
     # writers may retain that home in a context variable, so a plain mkdir here
     # would resurrect the profile before the write can fail.
+    if path.name == "config.yaml":
+        # Every atomic writer funnels here, so one check covers config set, save_config,
+        # import-agent and any direct writer. See hermes_cli/release_config_owner.py.
+        from hermes_cli.release_config_owner import ensure_release_owns_config_write
+        ensure_release_owns_config_write(path)
     from hermes_constants import mkdir_under_hermes_home
 
     mkdir_under_hermes_home(path.parent)
@@ -441,9 +446,6 @@ def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: A
     litters the file and diverges from whole-document writers that drop the key).
     """
     path = Path(path)
-    if path.name == "config.yaml":
-        from hermes_cli.release_config_owner import ensure_release_owns_config_write
-        ensure_release_owns_config_write(path)
     from ruamel.yaml.comments import CommentedMap
     # Honor escaped dots and prefer existing literal dotted keys (model IDs like ``glm-5.3``) over
     # blind splitting — same navigation as ``hermes config set``'s ``_set_nested``; otherwise
@@ -518,9 +520,6 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *,
     users' own comments (#92554).
     """
     path = Path(path)
-    if path.name == "config.yaml":
-        from hermes_cli.release_config_owner import ensure_release_owns_config_write
-        ensure_release_owns_config_write(path)
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
     from hermes_cli.config import require_readable_config_before_write
 
