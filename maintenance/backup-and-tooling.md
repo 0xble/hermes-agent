@@ -40,7 +40,13 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   proves trailers, unit ownership, extension registration, config keys, and the native
   update receipt; with immutable releases, compare receipt and live gateway to the
   ready `current` release and check trailers through its commit, not the stale source
-  HEAD. Legacy homes still use checkout HEAD. Broken pointers and mismatched code fail.
+  HEAD. The release's recorded baseline helper is read from that exact commit, even
+  when the source checkout predates the helper. Generated scheduled shims execute the
+  active release interpreter and require the live SHA in the configured source checkout
+  (`HERMES_FORK_REPO`, default `~/Repos/hermes-agent`). Legacy homes still use checkout
+  HEAD when `scripts/check_fork_patches.py` is run directly, but generated scheduled shims
+  fail closed on legacy homes without a `current` release symlink. Broken pointers and
+  mismatched code fail.
   `scripts/rollback_fork_runtime.sh` reaches recovery when reinstall fails.
   Scheduled copies live under `$HERMES_HOME/scripts` per [runtime ownership](runtime-ownership.md).
 - Cron: per-job IANA `job_timezone` with civil-time scheduling and a migration dry-run
