@@ -226,7 +226,8 @@ def _make_text_cb(
     # the next delta opens a new bubble instead of merging into the previous one.
     def _cb(text: str | None) -> None:
         if text:
-            update = wrap(text)
+            from gateway.copy_blocks import render_copy_blocks_inline
+            update = wrap(render_copy_blocks_inline(text))
             if message_ids is not None:
                 update.message_id = message_ids.current()
             _send_update(conn, session_id, loop, update)

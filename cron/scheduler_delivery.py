@@ -1341,6 +1341,8 @@ class _TargetDelivery:
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
     live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
+    live_delivered_text: bool = False
+    live_delivered_copy_count: int = 0
 
     @property
     def is_relay(self) -> bool:
@@ -1703,6 +1705,8 @@ def _deliver_via_live_adapter(
     job = t.job
     route_thread_id, route_metadata, media_metadata = _live_route_metadata(t)
     delivered = False
+    t.live_delivered_text = False
+    t.live_delivered_copy_count = 0
     try:
         # Send cleaned text (MEDIA tags stripped) through the gateway's DeliveryRouter so it gets
         # the same platform routing as live messages (Telegram's three-mode topic routing).
@@ -1720,18 +1724,25 @@ def _deliver_via_live_adapter(
                 target_errors=target_errors, delivery_errors=delivery_errors,
                 unverified_targets=unverified_targets,
             )
+            if adapter_ok:
+                t.live_delivered_text = bool(text_to_send)
 
-        for copy_block in copy_blocks or []:
-            copy_metadata = dict(route_metadata or {})
-            copy_metadata["copy_block"] = True
-            copy_metadata["plain"] = True
-            block_ok, block_timed_out, _ = _live_send_text(
-                t, copy_block, route_thread_id, copy_metadata,
-                target_errors=target_errors, delivery_errors=delivery_errors,
-                unverified_targets=unverified_targets)
-            if not block_ok:
-                adapter_ok, timed_out = False, block_timed_out
-                break
+        if adapter_ok:
+            for copy_index, copy_block in enumerate(copy_blocks or []):
+                copy_metadata = dict(route_metadata or {})
+                copy_metadata["copy_block"] = True
+                copy_metadata["plain"] = True
+                block_ok, block_timed_out, _ = _live_send_text(
+                    t, copy_block, route_thread_id, copy_metadata,
+                    target_errors=target_errors, delivery_errors=delivery_errors,
+                    unverified_targets=unverified_targets)
+                if not block_ok:
+                    adapter_ok, timed_out = False, block_timed_out
+                    break
+                t.live_delivered_copy_count = copy_index + 1
+                if block_timed_out:
+                    adapter_ok, timed_out = False, True
+                    break
 
         # Media rides the same DM-topic-aware routing as text. Skipped after a confirmation
         # timeout (loop contended, text already assumed delivered) — record the drop instead.
@@ -1837,7 +1848,10 @@ def _standalone_send(
         return _failed(e)
 
 
-def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: list, delivery_errors: list) -> None:
+def _queue_for_live_reconnect(
+    t: _TargetDelivery, content: str, media_files: list, delivery_errors: list,
+    *, copy_blocks: list[str] | None = None,
+) -> None:
     """Hand a payload the live lane rejected as reconnect-only (``send_path_degraded``) and the
     standalone lane then failed to send to the delivery ledger, as a failed reconnect-only row
     owned by the adapter that rejected it: the post-reconnect sweep redelivers it (#125363). Only
@@ -1849,10 +1863,17 @@ def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: lis
         if not is_reconnect_only(t.live_error) or not ledger_enabled():
             return
         session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
-        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", content)
+        queued_content = content
+        if copy_blocks:
+            queued_content = "\n".join(
+                part for part in [content, *(
+                    f"[[copy]]\n{block}\n[[/copy]]" for block in copy_blocks
+                )] if part
+            )
+        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", queued_content)
         record_obligation(
             obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
-            chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
+            chat_id=str(t.chat_id), thread_id=t.thread_id, content=queued_content,
             adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
         mark_failed(obligation_id, str(t.live_error))
     except Exception:
@@ -1913,13 +1934,22 @@ def _deliver_standalone(
     combined_warnings = []
     result = None
     err = None
+    delivered_text = False
+    delivered_copy_count = 0
     for payload_content, payload_media, is_copy_block in payloads:
-        result, err = _standalone_send(t, payload_content, payload_media, copy_block=is_copy_block)
+        if is_copy_block:
+            result, err = _standalone_send(t, payload_content, payload_media, copy_block=True)
+        else:
+            result, err = _standalone_send(t, payload_content, payload_media)
         if err is None and result and result.get("error"):
             err = f"delivery error: {result['error']} (target {t.where})"
             logger.error("Job '%s': %s", job["id"], err)
         if err is not None:
             break
+        if is_copy_block:
+            delivered_copy_count += 1
+        elif payload_content:
+            delivered_text = True
         combined_warnings.extend((result.get("warnings") if isinstance(result, dict) else None) or [])
     if err is None and result is None:
         err = f"standalone send skipped (empty text and no media) for {t.where}"
@@ -1928,7 +1958,13 @@ def _deliver_standalone(
         delivery_errors.extend(target_errors)
         # A satellite profile's worker has no platform token, so standalone cannot stand in for a
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.
-        _queue_for_live_reconnect(t, content, media_files, delivery_errors)
+        _queue_for_live_reconnect(
+            t,
+            "" if delivered_text else content,
+            media_files,
+            delivery_errors,
+            copy_blocks=(copy_blocks or [])[delivered_copy_count:],
+        )
         return
     _mark_formatting_degraded(t)
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
@@ -2227,8 +2263,11 @@ def _deliver_result(
             unverified_targets=unverified_targets, copy_blocks=copy_blocks,
         )
         if not delivered:
+            remaining_content = "" if t.live_delivered_text else cleaned_delivery_content
+            remaining_blocks = copy_blocks[t.live_delivered_copy_count:]
             _deliver_standalone(
-                t, cleaned_delivery_content, media_files, target_errors, delivery_errors, copy_blocks=copy_blocks)
+                t, remaining_content, media_files, target_errors, delivery_errors,
+                copy_blocks=remaining_blocks)
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.

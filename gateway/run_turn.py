@@ -1944,8 +1944,12 @@ class GatewayTurnMixin:
             response = ""
 
         adapter = self._delivery_adapter_for(source)
-        from gateway.copy_blocks import extract_copy_blocks
+        from gateway.copy_blocks import extract_copy_blocks, render_copy_blocks_inline
         response_without_copy, copy_blocks = extract_copy_blocks(response) if response else (response, [])
+        if agent_result.get("interrupted") and response:
+            # An interrupted model may end inside a copy block. Never promote that partial
+            # fragment to a separate copy message; inline degradation also keeps markers hidden.
+            response_without_copy, copy_blocks = render_copy_blocks_inline(response), []
         # Copy blocks are separate finals even when the ordinary body was streamed.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
@@ -1963,18 +1967,14 @@ class GatewayTurnMixin:
             media_delivered = False
             copy_failed = False
             copy_delivered = False
-            if adapter:
-                for copy_block in copy_blocks:
-                    copy_metadata = dict(self._event_thread_metadata(event, source) or {})
-                    copy_metadata["copy_block"] = True
-                    copy_metadata["plain"] = True
-                    copy_result = await adapter.send(source.chat_id, copy_block, metadata=copy_metadata)
-                    if getattr(copy_result, "success", False):
-                        copy_delivered = True
-                    else:
-                        copy_failed = True
-                        logger.error("Streamed copy block delivery failed for %s: %s", source.chat_id,
-                                     getattr(copy_result, "error", None) or "no result")
+            if adapter and not agent_result.get("interrupted"):
+                copy_results = []
+                await adapter._send_copy_blocks(
+                    event, session_key, copy_blocks, self._event_thread_metadata(event, source) or {},
+                    copy_results.append,
+                )
+                copy_delivered = any(getattr(result, "success", False) for result in copy_results)
+                copy_failed = any(not getattr(result, "success", False) for result in copy_results)
             if copy_failed:
                 agent_result["failed"] = True
                 agent_result["error"] = "one or more [[copy]] blocks failed to deliver"
@@ -2005,7 +2005,7 @@ class GatewayTurnMixin:
                 event._streamed_final_response = str(raw_response or "")
             return None
 
-        return response
+        return response_without_copy if agent_result.get("interrupted") else response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
     # sign-in, `{relogin}` the profile-aware host equivalent, filled from the turn's agent provider).

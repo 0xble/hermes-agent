@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import logging
+from types import SimpleNamespace
 
 import pytest
 
-from gateway.copy_blocks import extract_copy_blocks
+from gateway.copy_blocks import extract_copy_blocks, render_copy_blocks_inline
 from gateway.platforms.base import BasePlatformAdapter
+from gateway.run_turn import GatewayTurnMixin
 
 
 def test_extract_copy_blocks_preserves_body_and_order() -> None:
@@ -33,6 +34,18 @@ def test_extract_copy_blocks_is_idempotent() -> None:
     text = "reply\n[[copy]]\ncode\n[[/copy]]\n"
     first = extract_copy_blocks(text)
     assert extract_copy_blocks(first[0]) == (first[0], [])
+
+
+def test_extract_copy_blocks_crlf_and_inline_degrade() -> None:
+    remaining, blocks = extract_copy_blocks("before\r\n[[copy]]\r\nbody\r\n[[/copy]]")
+    assert remaining == "before\r\n"
+    assert blocks == ["body"]
+    assert render_copy_blocks_inline("before\n[[copy]]\nbody\n[[/copy]]") == "before\n\nbody"
+
+
+def test_extract_copy_blocks_empty_and_none_inputs() -> None:
+    assert extract_copy_blocks("") == ("", [])
+    assert extract_copy_blocks("plain reply") == ("plain reply", [])
 
 
 class _FakeAdapter(BasePlatformAdapter):
@@ -73,6 +86,7 @@ async def test_copy_blocks_use_final_ledger_in_source_order_without_sleep(caplog
         results.append,
     )
     assert [call[0] for call in calls] == ["first *literal*", "second _literal_"]
+    assert [call[1]["copy_block_index"] for call in calls] == [0, 1]
     assert all(call[1]["copy_block"] and call[1]["plain"] for call in calls)
     assert all(result.success for result in results)
     assert any("inter-message start gap:" in record.message for record in caplog.records)
@@ -96,6 +110,100 @@ async def test_copy_block_failure_is_recorded_and_does_not_disappear() -> None:
     assert attempts == 2
 
 
-def test_extract_copy_blocks_empty_and_none_inputs() -> None:
-    assert extract_copy_blocks("") == ("", [])
-    assert extract_copy_blocks("plain reply") == ("plain reply", [])
+@pytest.mark.asyncio
+async def test_streamed_copy_blocks_use_ledgered_delivery() -> None:
+    runner = object.__new__(GatewayTurnMixin)
+    sent = []
+
+    async def send_copy_blocks(event, session, blocks, metadata, record):
+        sent.append((blocks, metadata))
+        record(SimpleNamespace(success=True))
+
+    adapter = SimpleNamespace(
+        _streaming_tts_turn_completed=lambda *_args, **_kwargs: False,
+        _send_copy_blocks=send_copy_blocks,
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._event_thread_metadata = lambda *_args: {"thread_id": "t"}
+    async def no_media(*_args):
+        return False
+    runner._deliver_media_from_response = no_media
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    result = {"already_sent": True}
+    returned = await runner._hmwa_deliver_turn_response(
+        event, event.source, None, "session", None, result, [], "[[copy]]\nbody\n[[/copy]]", None, False,
+    )
+    assert returned is None
+    assert sent == [(["body"], {"thread_id": "t"})]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_does_not_send_partial_copy_block() -> None:
+    runner = object.__new__(GatewayTurnMixin)
+    sent = []
+
+    async def send_copy_blocks(*args, **kwargs):
+        sent.append((args, kwargs))
+
+    adapter = SimpleNamespace(
+        _streaming_tts_turn_completed=lambda *_args, **_kwargs: False,
+        _send_copy_blocks=send_copy_blocks,
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._event_thread_metadata = lambda *_args: {"thread_id": "t"}
+    async def no_media(*_args):
+        return False
+    runner._deliver_media_from_response = no_media
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    returned = await runner._hmwa_deliver_turn_response(
+        event, event.source, None, "session", None, {"already_sent": True, "interrupted": True}, [],
+        "[[copy]]\npartial", None, False,
+    )
+    assert returned is None
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_copy_block_ledger_rows_are_distinct_and_wrapped(monkeypatch) -> None:
+    import gateway.delivery_ledger as ledger
+
+    adapter = object.__new__(_FakeAdapter)
+    adapter._final_delivery_adapter = lambda source: adapter
+    captured = []
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
+    monkeypatch.setattr(ledger, "record_obligation", lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(ledger, "mark_attempting", lambda _oid: None)
+
+    async def send_with_retry(**_kwargs):
+        return SimpleNamespace(success=True, message_id=None, pre_send=False)
+
+    adapter._send_with_retry = send_with_retry
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="chat", platform="telegram", thread_id=None), message_id="m1",
+        text="request", ledger_message_id=None,
+    )
+    await adapter.send_final_ledgered(
+        event, "session", "same", {"copy_block": True, "copy_block_index": 0}, reply_to=None)
+    await adapter.send_final_ledgered(
+        event, "session", "same", {"copy_block": True, "copy_block_index": 1}, reply_to=None)
+    assert len({row["obligation_id"] for row in captured}) == 2
+    assert [row["content"] for row in captured] == ["[[copy]]\nsame\n[[/copy]]"] * 2
+
+
+@pytest.mark.asyncio
+async def test_copy_blocks_propagate_ephemeral_ttl_and_delete() -> None:
+    adapter = object.__new__(_FakeAdapter)
+    deletes = []
+    adapter._schedule_ephemeral_delete = lambda *args: deletes.append(args)
+
+    async def send_final_ledgered(event, session_key, content, metadata, **kwargs):
+        return SimpleNamespace(success=True, message_id=f"id-{content}"), adapter
+
+    adapter.send_final_ledgered = send_final_ledgered
+    await adapter._send_copy_blocks(
+        SimpleNamespace(source=SimpleNamespace(chat_id="chat")), "session", ["one"], {}, lambda _r: None,
+        is_ephemeral_response=True, ephemeral_ttl=7,
+    )
+    assert deletes == [("chat", "id-one", 7)]

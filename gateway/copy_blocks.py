@@ -92,4 +92,18 @@ def extract_copy_blocks(text: str) -> tuple[str, list[str]]:
     return "".join(remaining), blocks
 
 
-__all__ = ["extract_copy_blocks"]
+def render_copy_blocks_inline(text: str) -> str:
+    """Render copy blocks inline for response surfaces that cannot send separate messages.
+
+    Marker lines are control syntax on those surfaces, so retain each block body in source
+    order and separate it from the ordinary response with a blank line. This helper does
+    not mutate persisted transcript text; callers should apply it only to their output.
+    """
+    remaining, blocks = extract_copy_blocks(text)
+    if not blocks:
+        return remaining
+    inline_parts = (remaining.rstrip("\r\n"), *blocks)
+    return "\n\n".join(part for part in inline_parts if part)
+
+
+__all__ = ["extract_copy_blocks", "render_copy_blocks_inline"]

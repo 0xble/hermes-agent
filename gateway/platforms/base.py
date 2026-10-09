@@ -4526,7 +4526,7 @@ class BasePlatformAdapter(ABC):
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
-        outbox_refused: bool = False) -> Optional[str]:
+        metadata: Optional[Dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
@@ -4541,18 +4541,26 @@ class BasePlatformAdapter(ABC):
             if not await asyncio.to_thread(ledger_enabled):
                 return None
             source = event.source
-            # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
-            # of the chain, not the event that opened it (see ``MessageEvent.ledger_message_id``).
-            _ledger_id = getattr(event, "ledger_message_id", None)
-            if _ledger_id is None:
-                _ledger_id = getattr(event, "message_id", "")
+            # The ledger identity for the ordinary reply stays unchanged for compatibility. Copy
+            # blocks derive a per-part message ref below, so identical bodies never overwrite each
+            # other's obligations (and a block equal to the reply remains distinct).
+            _ledger_message_ref = getattr(event, "ledger_message_id", None)
+            if _ledger_message_ref is None:
+                _ledger_message_ref = getattr(event, "message_id", "")
+            _copy_index = (metadata or {}).get("copy_block_index") if (metadata or {}).get("copy_block") else None
+            if _copy_index is not None:
+                _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
             obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
+                session_key, str(_ledger_message_ref or ""), text_content)
+            ledger_content = (
+                f"[[copy]]\n{text_content}\n[[/copy]]"
+                if (metadata or {}).get("copy_block") else text_content
+            )
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                content=text_content,
+                content=ledger_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 resume_marker=getattr(event, "_restart_note_expected_marker", None),
                 resume_turn_id=getattr(event, "_gateway_active_turn_token", None))
@@ -4678,7 +4686,8 @@ class BasePlatformAdapter(ABC):
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            metadata=metadata)
         if obligation_id is not None and release_marker:
             # The ledger now owns the crash recovery. It carries text only, so a caller with
             # attachments still to send keeps the marker until they are delivered.
@@ -4689,7 +4698,7 @@ class BasePlatformAdapter(ABC):
                 and self._outbox_covers_final(event, delivery_adapter)):
             obligation_id = await self._record_delivery_obligation(
                 event, session_key, text_content, delivery_adapter, is_ephemeral_response,
-                outbox_refused=True)
+                metadata=metadata, outbox_refused=True)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
@@ -4753,6 +4762,7 @@ class BasePlatformAdapter(ABC):
     async def _send_copy_blocks(
         self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: Dict[str, Any],
         record_delivery: Callable, *, attachments_pending: bool = False,
+        is_ephemeral_response: bool = False, ephemeral_ttl: int = 0,
     ) -> None:
         """Deliver copy blocks in source order through the final delivery ledger, without pacing."""
         previous_send_started = None
@@ -4765,13 +4775,17 @@ class BasePlatformAdapter(ABC):
             previous_send_started = send_started
             copy_metadata = dict(metadata)
             copy_metadata["copy_block"] = True
+            copy_metadata["copy_block_index"] = index
             copy_metadata["plain"] = True
-            result, _ = await self.send_final_ledgered(
+            result, delivery_adapter = await self.send_final_ledgered(
                 event, session_key, block, copy_metadata,
                 reply_to=_reply_anchor_for_event(event),
+                is_ephemeral_response=is_ephemeral_response,
                 release_marker=(index == len(copy_blocks) - 1 and not attachments_pending),
             )
             record_delivery(result)
+            if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
+                delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
             if not getattr(result, "success", False):
                 logger.error(
                     "[%s] Copy block %d/%d failed for %s: %s",
@@ -5057,7 +5071,8 @@ class BasePlatformAdapter(ABC):
                     await self._send_copy_blocks(
                         event, session_key, extracted.copy_blocks, _final_thread_metadata,
                         lambda result: _record_delivery(result, required=True),
-                        attachments_pending=bool(extracted.images or extracted.media_files or extracted.local_files))
+                        attachments_pending=bool(extracted.images or extracted.media_files or extracted.local_files),
+                        is_ephemeral_response=is_ephemeral_response, ephemeral_ttl=_ephemeral_ttl)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,

@@ -70,6 +70,57 @@ def test_reconnect_only_rejection_survives_a_failed_standalone_for_the_sweep(mon
     assert [(row["chat_id"], row["thread_id"], row["content"]) for row in claimed] == [("-100", "42", "the report")]
 
 
+def test_live_partial_failure_falls_back_only_to_undelivered_parts(monkeypatch, gateway_loop):
+    class Transport:
+        adapter = type("Adapter", (), {"_owner_profile": "satellite"})()
+        is_relay = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def send(self, platform, chat_id, content, metadata=None):
+            self.calls.append((content, metadata or {}))
+            if content == "second":
+                return SendResult(success=False, error="blocked")
+            return SendResult(success=True, message_id=str(len(self.calls)))
+
+    transport = Transport()
+    fields = {name: None for name in sd._TargetDelivery.__dataclass_fields__}
+    fields.update(job={"id": "job-partial"}, platform=Platform.TELEGRAM, platform_name="telegram", chat_id="-100",
+                  thread_id="42", transport=transport, config=GatewayConfig(), loop=gateway_loop,
+                  target_adapters={}, mirror_text="", origin={})
+    t = sd._TargetDelivery(**fields)
+    fallback_calls = []
+    monkeypatch.setattr(
+        sd, "_standalone_send",
+        lambda _t, content, media, **kwargs: fallback_calls.append((content, kwargs.get("copy_block")))
+        or ({"success": True}, None),
+    )
+    target_errors, delivery_errors = [], []
+    assert not sd._deliver_via_live_adapter(
+        t, "reply", [], target_errors=target_errors, delivery_errors=delivery_errors,
+        unverified_targets=[], copy_blocks=["first", "second"],
+    )
+    sd._deliver_standalone(
+        t, "", [], target_errors, delivery_errors, copy_blocks=["second"])
+    assert [content for content, _metadata in transport.calls] == ["reply", "first", "second"]
+    assert fallback_calls == [("second", True)]
+
+
+def test_reconnect_queue_preserves_copy_block_markers_and_order(monkeypatch):
+    fields = {name: None for name in sd._TargetDelivery.__dataclass_fields__}
+    fields.update(job={"id": "job-copy-queue"}, platform=Platform.TELEGRAM, platform_name="telegram", chat_id="-100",
+                  thread_id="42", transport=None, config=GatewayConfig(), loop=None,
+                  target_adapters={}, mirror_text="", origin={}, live_error="send_path_degraded")
+    t = sd._TargetDelivery(**fields)
+    errors = []
+    sd._queue_for_live_reconnect(t, "reply", [], errors, copy_blocks=["first", "second"])
+    claimed = dl.sweep_failed_for_runtime("telegram", profile=None)
+    assert len(claimed) == 1
+    assert claimed[0]["content"] == (
+        "reply\n[[copy]]\nfirst\n[[/copy]]\n[[copy]]\nsecond\n[[/copy]]")
+
+
 def test_reconnect_only_rejection_retries_live_before_standalone(monkeypatch, gateway_loop):
     """A reconnect-only refusal must keep the rich live lane in charge before fallback."""
     class Transport:
