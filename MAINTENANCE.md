@@ -246,7 +246,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: release-owned config writes
 
 - **Patch identity:** `release-owned-config-writes`.
-- **Behavior:** Refuse config.yaml writes from a non-live Hermes code root when HERMES_HOME resolves to an immutable release, while allowing the live release and the process-local updater context. The refusal names the config path, running root, live release, and release-owned executable.
+- **Behavior:** Refuse config.yaml writes from a Hermes build whose config schema is newer than the live immutable release's, so a dev worktree or sync candidate cannot stamp `_config_version` past what `hermes update` accepts. The live release, older or equal-schema builds (such as a previously-live release still running after promotion), and the process-local updater context write normally. The refusal names the config path, running root and schema, live release and schema, and the release-owned executable.
 - **Source surfaces:** `hermes_cli/release_config_owner.py`, `utils.py` round-trip YAML writers, `hermes_cli/main.py` updater boundary, and `tests/hermes_cli/test_release_owned_config_writes.py`.
 - **Upstream status:** Upstream `main` has no equivalent guard. The stamp that blocked the 2026-10-09 update came from the v0.21.6 sync candidate's schema 50, written into a home on release schema 49.
 - **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_release_owned_config_writes.py`.

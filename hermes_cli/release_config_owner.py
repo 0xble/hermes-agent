@@ -1,11 +1,14 @@
-"""Only the live release (or the updater) may write config into a release-managed home.
+"""Only builds whose config schema is not newer than the live release may write its config.
 
-A Hermes home on immutable releases runs whatever ``<root>/current`` names. Any other code
-tree, such as a dev worktree, an older release, or a source checkout, carries its own config
-schema. A config write from one of those trees can stamp ``_config_version`` past the live release
-and block the next ``hermes update`` (``config ... is newer than this release``). Every
-``hermes_cli.config`` writer passes through ``_write_config_state``, which calls
-:func:`ensure_release_owns_config_write` before touching the file.
+A Hermes home on immutable releases runs whatever ``<root>/current`` names. A dev worktree or
+sync candidate can carry a newer config schema; its config writes stamp ``_config_version`` past
+the live release and block the next ``hermes update`` (``config ... is newer than this release``).
+Writes through ``_write_config_state`` and utils' round-trip writers for ``config.yaml`` call
+:func:`ensure_release_owns_config_write` first.
+
+A previously-live release still running after promotion (an open CLI, a gateway awaiting restart,
+a pinned worker) has an older or equal schema and keeps writing: ``migrate_config`` only stamps
+upward to its own latest version, so it cannot raise the stamp.
 
 ``hermes update`` legitimately writes from code that is not yet ``current``: the
 source-checkout updater, and the post-swap child that migrates config from the staged
@@ -16,12 +19,14 @@ config set`` process never inherits it.
 from __future__ import annotations
 
 import contextvars
+import re
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 _UPDATER_OWNS_WRITES: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "hermes_updater_owns_config_writes", default=False)
+_SCHEMA_RE = re.compile(r'^\s*"_config_version":\s*(\d+)\s*,', re.MULTILINE)
 
 
 class ForeignBuildConfigWriteError(RuntimeError):
@@ -46,6 +51,21 @@ def _running_code_root() -> Path:
     return _LOADED_CODE_ROOT
 
 
+def _running_schema_version() -> int:
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    return int(DEFAULT_CONFIG.get("_config_version", 1))
+
+
+def _release_schema_version(release: Path) -> Optional[int]:
+    """Read a release's config schema without importing code from that release."""
+    try:
+        text = (release / "hermes_cli" / "config_defaults.py").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _SCHEMA_RE.search(text)
+    return int(match.group(1)) if match else None
+
+
 def _release_root_candidates(home: Path) -> list[Path]:
     # A named profile lives at <root>/profiles/<name>; ``current`` lives at <root>.
     return [home, home.parent.parent] if home.parent.name == "profiles" else [home]
@@ -65,7 +85,14 @@ def ensure_release_owns_config_write(config_path: Path) -> None:
         running = Path(_running_code_root()).resolve()
         if running == release:
             return
+        live_schema = _release_schema_version(release)
+        running_schema = _running_schema_version()
+        if live_schema is not None and running_schema <= live_schema:
+            return
+        live_label = f"schema {live_schema}" if live_schema is not None else "an unreadable schema"
         raise ForeignBuildConfigWriteError(
-            f"refusing to write {config_path}: this hermes runs from {running}, but {root} is "
-            f"managed by release {release}. Use ~/.hermes/current/.venv/bin/hermes "
-            f"(or {root / 'current' / '.venv' / 'bin' / 'hermes'} for this home).")
+            f"refusing to write {config_path}: this hermes runs from {running} (config schema "
+            f"{running_schema}), but {root} is managed by release {release} ({live_label}). A newer "
+            f"schema stamp would block the next `hermes update`. Use "
+            f"{root / 'current' / '.venv' / 'bin' / 'hermes'} for this home.")
+

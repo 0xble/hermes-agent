@@ -19,11 +19,14 @@ from hermes_cli import config
 ORIGINAL = "_config_version: 48\nmodel:\n  default: test-model\nagent:\n  max_turns: 7\n"
 
 
-def _make_release(home: Path, sha: str) -> Path:
+def _make_release(home: Path, sha: str, schema: int = 49) -> Path:
     release = home / "releases" / sha
     release.mkdir(parents=True)
     for name in (".release-ready", ".hermes_build_sha"):
         (release / name).write_text(sha + "\n", encoding="utf-8")
+    defaults = release / "hermes_cli" / "config_defaults.py"
+    defaults.parent.mkdir()
+    defaults.write_text(f'    "_config_version": {schema},\n', encoding="utf-8")
     return release
 
 
@@ -44,9 +47,11 @@ def live_release(home):
     return release
 
 
-def _run_from(monkeypatch, root: Path) -> None:
+def _run_from(monkeypatch, root: Path, schema: int | None = None) -> None:
     from hermes_cli import release_config_owner
     monkeypatch.setattr(release_config_owner, "_running_code_root", lambda: root.resolve())
+    if schema is not None:
+        monkeypatch.setattr(release_config_owner, "_running_schema_version", lambda: schema)
 
 
 def _writes():
@@ -62,7 +67,7 @@ def _writes():
 def test_foreign_build_write_is_refused_and_config_untouched(home, live_release, tmp_path, monkeypatch, write):
     dev_root = tmp_path / "dev-worktree"
     dev_root.mkdir()
-    _run_from(monkeypatch, dev_root)
+    _run_from(monkeypatch, dev_root, schema=50)
     before = (home / "config.yaml").read_bytes()
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -76,13 +81,34 @@ def test_foreign_build_write_is_refused_and_config_untouched(home, live_release,
     assert yaml.safe_load(before)["_config_version"] == 48
 
 
+def test_previously_live_release_can_write_after_promotion(home, live_release, tmp_path, monkeypatch):
+    """Promotion must not break an older long-lived process's harmless config writes."""
+    candidate = _make_release(home, "c" * 40, schema=50)
+    (home / "current").unlink()
+    (home / "current").symlink_to(candidate)
+    _run_from(monkeypatch, live_release)
+
+    config.set_config_value("agent.max_turns", "9")
+    assert config.read_raw_config()["agent"]["max_turns"] == 9
+
+
+def test_newer_foreign_build_is_refused(home, live_release, tmp_path, monkeypatch):
+    dev_root = _make_release(tmp_path, "d" * 40, schema=50)
+    _run_from(monkeypatch, dev_root, schema=50)
+    before = (home / "config.yaml").read_bytes()
+
+    with pytest.raises(RuntimeError, match="config schema 50"):
+        config.set_config_value("agent.max_turns", "9")
+    assert (home / "config.yaml").read_bytes() == before
+
+
 def test_config_set_cli_exits_nonzero_naming_both_roots(home, live_release, tmp_path, monkeypatch, capsys):
     from types import SimpleNamespace
     from hermes_cli.main import cmd_config
 
     dev_root = tmp_path / "dev-worktree"
     dev_root.mkdir()
-    _run_from(monkeypatch, dev_root)
+    _run_from(monkeypatch, dev_root, schema=50)
     before = (home / "config.yaml").read_bytes()
 
     with pytest.raises(SystemExit) as excinfo:
@@ -101,7 +127,7 @@ def test_profile_config_under_release_managed_root_is_guarded(home, live_release
     monkeypatch.setenv("HERMES_HOME", str(profile))
     dev_root = tmp_path / "dev-worktree"
     dev_root.mkdir()
-    _run_from(monkeypatch, dev_root)
+    _run_from(monkeypatch, dev_root, schema=50)
 
     with pytest.raises(RuntimeError, match="refusing to write"):
         config.set_config_value("agent.max_turns", "9")
@@ -125,7 +151,7 @@ def test_live_release_reached_through_current_symlink_writes(home, live_release,
 def test_home_without_release_pointer_writes_normally(home, tmp_path, monkeypatch, write):
     dev_root = tmp_path / "dev-worktree"
     dev_root.mkdir()
-    _run_from(monkeypatch, dev_root)
+    _run_from(monkeypatch, dev_root, schema=50)
     _writes()[write]()
     assert (home / "config.yaml").read_text(encoding="utf-8") != ORIGINAL
 
@@ -136,7 +162,7 @@ def test_unready_release_pointer_is_not_a_release_managed_home(home, tmp_path, m
     (home / "current").symlink_to(staged)
     dev_root = tmp_path / "dev-worktree"
     dev_root.mkdir()
-    _run_from(monkeypatch, dev_root)
+    _run_from(monkeypatch, dev_root, schema=50)
     config.set_config_value("agent.max_turns", "9")
     assert config.read_raw_config()["agent"]["max_turns"] == 9
 
@@ -146,8 +172,8 @@ def test_updater_context_may_write_from_candidate_release(home, live_release, mo
     names the old release; its strict maintenance must migrate config before promotion."""
     from hermes_cli.release_config_owner import updater_owns_config_writes
 
-    candidate = _make_release(home, "c" * 40)
-    _run_from(monkeypatch, candidate)
+    candidate = _make_release(home, "c" * 40, schema=50)
+    _run_from(monkeypatch, candidate, schema=50)
     with updater_owns_config_writes():
         config.migrate_config(interactive=False, quiet=True)
     stamp, latest = config._read_config_version_stamp()
