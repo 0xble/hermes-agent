@@ -550,6 +550,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
+        clean_query = _redact_for_provider(clean_query)
         self._discard_stale_prefetch()
         parts = self._each_provider(
             "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
@@ -646,6 +647,7 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query:
             return
+        clean_query = _redact_for_provider(clean_query)
         # The result's age is measured from its query's turn, which is now. Checking the session and
         # starting the token is one critical section with on_session_switch, so a request for a
         # session the providers already left never starts a fresh token after the switch.
