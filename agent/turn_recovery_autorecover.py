@@ -98,7 +98,7 @@ def auto_recover_after_exhaustion(
     total = auto_recovery_cycles(agent)
     used = int(getattr(_retry, "auto_recovery_cycles_used", 0) or 0)
     if used >= total:
-        agent._emit_diagnostic_status(
+        agent._buffer_diagnostic_status(
             f"⏳ Automatic recovery gave up after {total} cycles — the provider is still unavailable."
         )
         return None
@@ -106,9 +106,11 @@ def auto_recover_after_exhaustion(
     _retry.auto_recovery_cycles_used = cycle
     wait_s = ladder_wait_seconds(cycle, api_error)
     notice = ladder_notice(agent, wait_s=wait_s, cycle=cycle, total=total)
-    # Durable line on every surface (CLI print, TUI status.update, gateway bubble, api_server SSE)
-    # plus the live wait line (spinner / thinking.delta / activity heartbeat).
-    agent._emit_diagnostic_status(notice)
+    # Keep the countdown on the retry-status buffer: it is replayed only if the
+    # terminal path proves that the whole ladder failed, and is cleared when a
+    # later cycle succeeds. The wait rail remains live for spinner /
+    # thinking.delta / activity-heartbeat surfaces and keeps /stop responsive.
+    agent._buffer_diagnostic_status(notice)
     agent._emit_diagnostic_wait(notice)
     logger.warning(
         "%sProvider unavailable (%s) — auto-recovery cycle %d/%d, retrying in %.0fs %s",
