@@ -124,6 +124,11 @@ def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: float 
         if exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
             raise
         # Stale registration — bootout the leftover label and bootstrap once more.
+        # The leftover can still supervise the live gateway (`install --force` over a running service):
+        # that SIGTERM is a reload, so mark the pid. Other labels (the guardian's) never get the marker.
+        left = deadline - time.monotonic()
+        if left > 0 and label == _gw().get_launchd_label():
+            _mark_planned_gateway_restart(_gw()._launchctl_supervised_pid(label, timeout=min(left, 5.0)))
         # Captured: the bootout is best-effort (a drained job may already be
         # unloaded), so its expected 3/113/125 stderr must not leak to the terminal.
         subprocess.run(

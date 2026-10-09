@@ -73,6 +73,44 @@ def test_deferred_reload_marks_planned_restart_before_bootout(tmp_path, monkeypa
     assert seen_at_submit == [True]
 
 
+def _bootstrap_over_stale_label(monkeypatch, label):
+    """``launchctl bootstrap`` hits EIO once on a label still supervising this process; returns the
+    launchctl verbs run and whether a planned-restart marker named us when the recovery bootout fired."""
+    from gateway import status
+
+    verbs, marked_at_bootout = [], []
+
+    def run(argv, **_):
+        verbs.append(argv[1])
+        if argv[1] == "bootstrap" and verbs.count("bootstrap") == 1:
+            raise subprocess.CalledProcessError(5, argv)
+        if argv[1] == "bootout":
+            marked_at_bootout.append(status.consume_planned_restart_marker_for_self())
+        stdout = f'{{\n\t"PID" = {os.getpid()};\n}}' if argv[1] == "list" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(gateway_launchd.subprocess, "run", run)
+    gateway_launchd._launchctl_bootstrap("gui/501", Path("/tmp/stale.plist"), label, timeout=30)
+    return verbs, marked_at_bootout
+
+
+def test_bootstrap_eio_recovery_marks_planned_restart_before_bootout(monkeypatch):
+    """`install --force` over a live service reaches the stale-label bootout: a reload, not a crash."""
+    verbs, marked_at_bootout = _bootstrap_over_stale_label(monkeypatch, gateway_launchd.get_launchd_label())
+
+    assert marked_at_bootout == [True]
+    assert verbs[-1] == "bootstrap"
+
+
+def test_bootstrap_eio_recovery_for_guardian_label_writes_no_gateway_marker(monkeypatch):
+    from hermes_cli.gateway_guardian import GUARDIAN_LABEL
+
+    verbs, marked_at_bootout = _bootstrap_over_stale_label(monkeypatch, GUARDIAN_LABEL)
+
+    assert marked_at_bootout == [False]
+    assert "list" not in verbs
+
+
 def test_supervision_window_outlasts_the_generated_throttle_interval(monkeypatch, tmp_path):
     """A replacement that exits early is relaunched one ThrottleInterval later, a healthy outcome."""
     gw = gateway_launchd._gw()

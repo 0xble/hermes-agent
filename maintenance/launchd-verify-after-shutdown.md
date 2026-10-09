@@ -69,16 +69,20 @@ Telegram was back only 60-77s after the signal. Every gateway-label bootout that
 only reloads the definition now first writes `.gateway-planned-restart.json`
 naming the gateway PID (`gateway.status.write_planned_restart_marker`): the
 deferred helper (written in Python before `launchctl submit`), its in-process
-fallback, the `launchd_restart` unloaded branch, and the guardian rollback
-`reload_target` (into the gateway's home). The shutdown handler consumes it
-one-shot and calls `runner.stop(restart=True, service_restart=True)`, the stop a
-SIGUSR1 restart reaches, without the after-turn wait that `ExitTimeOut` cannot
-cover. The sweep is then bounded at 2s and the exit is 75. An unknown PID writes
+fallback, the `launchd_restart` unloaded branch, the guardian rollback
+`reload_target` (into the gateway's home), and the stale-label (EIO) recovery
+bootout in `_launchctl_bootstrap` when the label is the gateway's (reached by
+`install --force` over a live service; the PID comes from `launchctl list`
+within the call's shared timeout, so a failed lookup keeps the plain bootout).
+The shutdown handler consumes it one-shot and calls
+`runner.stop(restart=True, service_restart=True)`, the stop a SIGUSR1 restart
+reaches, without the after-turn wait that `ExitTimeOut` cannot cover. The sweep is then bounded at 2s and the exit is 75. An unknown PID writes
 no marker and keeps the old behavior. Stops, takeovers and SIGINT take
 precedence. No drain or shutdown timeout changed; the restart path's existing
 5s post-interrupt agent grace replaces the 1s signal grace for this SIGTERM.
 Regressions: `tests/gateway/test_planned_restart_signal.py`,
 `test_launchd_reload_exit_budget.py::test_deferred_reload_marks_planned_restart_before_bootout`,
+`test_launchd_reload_exit_budget.py::test_bootstrap_eio_recovery_marks_planned_restart_before_bootout`,
 `test_gateway_guardian.py::test_rollback_marks_planned_restart_before_bootout`.
 Retire with the bootout path itself, or when upstream distinguishes a planned
 launchd reload from an external kill.
