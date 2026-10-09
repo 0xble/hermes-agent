@@ -237,6 +237,7 @@ class TelegramApplication(Application):
         _load_receipts(self.adapter, bot_id)
         # Dispatch happened even when preparation fails before the group-99 observer.
         self.adapter._updates_dispatched_total += 1
+        self.adapter._last_ingress_dispatch_monotonic = time.monotonic()
         seen = self.adapter._seen_update_ids
         pending = self.adapter._inflight_update_ids
         if key in seen or key in pending:
