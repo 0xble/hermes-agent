@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -28,97 +28,241 @@ class GatewaySessionControlsMixin:
         kind, action = record.get("kind", ""), record.get("action", "")
         target = record.get("target_session_id", "")
         requester = record.get("requester_session_id", "")
+        requester_title = record.get("requester_title") or "Untitled session"
+        target_title = record.get("target_title") or "Untitled session"
         reason = record.get("reason") or "session-control"
-        payload = record.get("payload") or {}
-        detail = ""
-        if kind == "goal":
-            try:
-                from hermes_cli.goals import GoalManager
-                detail = GoalManager(target).status_line()
-            except Exception:
-                pass
-            if action == "replace":
-                detail = f"replacement: {payload.get('goal', '')}"
-        elif kind == "loop":
-            try:
-                from hermes_cli.loops import LoopManager
-                detail = LoopManager(target).status_line()
-            except Exception:
-                pass
-        return (f"Session control request\nRequester: {requester}\nAction: {kind} {action}\n"
-                f"Target: {target}\nReason: {reason}\n{detail}")
+        detail = record.get("affected_text") or "(state unavailable)"
+        return (
+            "Session control request\n"
+            f"Requester: {requester_title} ({requester})\n"
+            f"Target: {target_title} ({target})\n"
+            f"Action: {kind} {action}\n"
+            f"Reason: {reason}\n"
+            f"Affected: {detail}"
+        )
 
     def _control_entry(self, session_id: str):
         store = getattr(self, "session_store", None)
         return store.lookup_by_session_id(session_id) if store is not None else None
 
+    async def _control_entry_off_loop(self, session_id: str):
+        return await self._run_in_executor_with_context(self._control_entry, session_id)
+
+    async def _mark_control(self, session_controls, request_id: str, flag: str, value: Any = True):
+        return await self._run_in_executor_with_context(session_controls.mark_outbox, request_id, flag, value)
+
+    @staticmethod
+    def _outbox_complete(record: dict) -> bool:
+        if record.get("status") == "pending":
+            return bool(record.get("request_skipped"))
+        target_done = record.get("target_notice_sent") or record.get("target_notice_skipped")
+        requester_done = record.get("requester_notified") or record.get("requester_notification_skipped")
+        continuation_done = (
+            record.get("kind"), record.get("action")
+        ) != ("goal", "resume") or record.get("continuation_enqueued")
+        cleanup_done = (
+            record.get("kind"), record.get("action")
+        ) not in {("goal", "pause"), ("goal", "clear")} or record.get("continuations_cleared")
+        return bool(target_done and requester_done and continuation_done and cleanup_done)
+
+    async def _mark_and_finish(self, session_controls, record: dict, flag: str, value: Any = True) -> dict:
+        updated = await self._mark_control(session_controls, record["id"], flag, value)
+        updated = updated or record
+        if self._outbox_complete(updated) and not updated.get("outbox_done"):
+            updated = (await self._mark_control(session_controls, record["id"], "outbox_done")) or updated
+        return updated
+
+    async def _session_control_route(self, entry):
+        if entry is None or getattr(entry, "suspended", False):
+            return None, None
+        source = self._restored_source(entry)
+        if source is None:
+            return None, None
+        return source, self._delivery_adapter_for(source)
+
     async def _drain_session_controls(self) -> None:
         from hermes_cli import session_controls
-        for record in session_controls.pending_outbox():
-            status = record.get("status")
-            target_entry = self._control_entry(record.get("target_session_id", ""))
-            requester_entry = self._control_entry(record.get("requester_session_id", ""))
-            if status == "pending" and not record.get("request_posted"):
-                if target_entry is None or getattr(target_entry, "origin", None) is None:
-                    continue
-                source = target_entry.origin
-                adapter = self._delivery_adapter_for(source)
-                if adapter is None:
-                    continue
-                metadata = {"thread_id": getattr(source, "thread_id", None),
-                            "session_control_request_id": record["id"]}
-                await adapter.send_control_request(source.chat_id, self._control_text(record), record["id"], metadata=metadata)
-                session_controls.mark_outbox(record["id"], "request_posted")
+
+        await self._warm_goals_session_db("session controls")
+        records = await self._run_in_executor_with_context(session_controls.pending_outbox)
+        for record in records:
+            request_id = record.get("id")
+            if not request_id:
                 continue
+            status = record.get("status")
+            target_entry = await self._control_entry_off_loop(record.get("target_session_id", ""))
+            requester_entry = await self._control_entry_off_loop(record.get("requester_session_id", ""))
+
             if status == "pending":
                 if float(record.get("expires_at") or 0) <= time.time():
-                    # Marking expired is deliberately done through the same CAS path as a button press.
-                    db = session_controls._db()
-                    if db is not None:
-                        key = session_controls._record_key(record["id"])
-                        def expire(conn):
-                            current = db.get_meta(key)
-                            if not current:
-                                return
-                            import json
-                            item = json.loads(current)
-                            if item.get("status") == "pending":
-                                item["status"] = "expired"
-                                item["resolved_at"] = time.time()
-                                db.set_meta(key, json.dumps(item), cursor=conn)
-                        db._execute_write(expire)
+                    expired = await self._run_in_executor_with_context(
+                        session_controls.expire_request, request_id
+                    )
+                    if expired is None:
+                        continue
+                    record = expired
+                    status = record.get("status")
+                elif not record.get("request_posted") and not record.get("request_skipped"):
+                    source, adapter = await self._session_control_route(target_entry)
+                    if source is None or adapter is None:
+                        await self._mark_and_finish(session_controls, record, "request_skipped")
+                    else:
+                        metadata = dict(self._thread_metadata_for_source(source) or {})
+                        metadata["session_control_request_id"] = request_id
+                        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+                        with outbound_class(OUTBOUND_NOTICE):
+                            await adapter.send_control_request(
+                                source.chat_id, self._control_text(record), request_id, metadata=metadata
+                            )
+                        await self._mark_and_finish(session_controls, record, "request_posted")
+                    continue
+
+            if status not in {"applied", "denied", "failed", "expired"}:
                 continue
-            if status in {"applied", "denied", "failed", "expired"}:
-                notice = self._control_notice(record)
-                if not record.get("target_notice_sent") and target_entry is not None and getattr(target_entry, "origin", None) is not None:
-                    source = target_entry.origin
-                    adapter = self._delivery_adapter_for(source)
-                    if adapter is not None:
-                        if (record.get("kind"), record.get("action")) in {("goal", "pause"), ("goal", "clear")} and not record.get("continuations_cleared"):
+
+            # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
+            source, adapter = await self._session_control_route(target_entry)
+            if not record.get("continuations_cleared"):
+                needs_cleanup = (record.get("kind"), record.get("action")) in {
+                    ("goal", "pause"), ("goal", "clear")
+                }
+                if not needs_cleanup or source is None or adapter is None:
+                    record = await self._mark_and_finish(
+                        session_controls, record, "continuations_cleared"
+                    )
+                else:
+                    try:
+                        await self._run_in_executor_with_context(
+                            self._clear_goal_pending_continuations, target_entry.session_key, adapter
+                        )
+                    except Exception:
+                        logger.debug("goal continuation cleanup failed", exc_info=True)
+                    record = await self._mark_and_finish(
+                        session_controls, record, "continuations_cleared"
+                    )
+
+            if not record.get("continuation_enqueued"):
+                if (record.get("kind"), record.get("action")) != ("goal", "resume"):
+                    record = await self._mark_and_finish(
+                        session_controls, record, "continuation_enqueued"
+                    )
+                elif source is None or adapter is None:
+                    record = await self._mark_and_finish(
+                        session_controls, record, "continuation_enqueued"
+                    )
+                else:
+                    prompt = record.get("continuation_prompt")
+                    if not prompt:
+                        record = await self._mark_and_finish(
+                            session_controls, record, "continuation_enqueued"
+                        )
+                    else:
+                        key = target_entry.session_key
+
+                        def busy():
+                            return (
+                                self._is_session_running(key)
+                                or key in getattr(adapter, "_active_sessions", {})
+                                or self._queue_depth(key, adapter=adapter) > 0
+                            )
+
+                        if await self._run_in_executor_with_context(busy):
+                            record = await self._mark_and_finish(
+                                session_controls, record, "continuation_enqueued"
+                            )
+                        else:
+                            event = self._synthetic_prompt_event(
+                                source, prompt, reply_expected=False, goal_continuation=True
+                            )
+                            event.metadata["gateway_session_key"] = key
                             try:
-                                self._clear_goal_pending_continuations(target_entry.session_key, adapter)
+                                from gateway.wake import admit_internal_event
+                                await admit_internal_event(adapter, event)
+                                if not getattr(event, "_gateway_accepted", False):
+                                    continue
                             except Exception:
-                                logger.debug("goal continuation cleanup failed", exc_info=True)
-                            session_controls.mark_outbox(record["id"], "continuations_cleared")
-                        await adapter.send(source.chat_id, notice, metadata={"thread_id": getattr(source, "thread_id", None)})
-                        session_controls.mark_outbox(record["id"], "target_notice_sent")
-                if not record.get("requester_notified") and requester_entry is not None:
+                                logger.debug("goal resume continuation admission failed", exc_info=True)
+                            else:
+                                record = await self._mark_and_finish(
+                                    session_controls, record, "continuation_enqueued"
+                                )
+
+            notice = self._control_notice(record)
+            if not record.get("target_notice_sent") and not record.get("target_notice_skipped"):
+                if source is None or adapter is None:
+                    record = await self._mark_and_finish(
+                        session_controls, record, "target_notice_skipped"
+                    )
+                else:
+                    metadata = dict(self._thread_metadata_for_source(source) or {})
+                    metadata["session_control_request_id"] = request_id
+                    from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+                    with outbound_class(OUTBOUND_NOTICE):
+                        await adapter.send(source.chat_id, notice, metadata=metadata)
+                    record = await self._mark_and_finish(
+                        session_controls, record, "target_notice_sent"
+                    )
+
+            if not record.get("requester_notified") and not record.get("requester_notification_skipped"):
+                requester_source, _requester_adapter = await self._session_control_route(requester_entry)
+                if requester_source is None:
+                    record = await self._mark_and_finish(
+                        session_controls, record, "requester_notification_skipped"
+                    )
+                else:
+                    content = self._requester_notice(record)
                     try:
                         await self._dispatch_plugin_message_injection(
-                            session_key=requester_entry.session_key, content=notice,
-                            plugin_id="session-controls")
-                        session_controls.mark_outbox(record["id"], "requester_notified")
+                            session_key=requester_entry.session_key,
+                            content=content,
+                            plugin_id="session-controls",
+                        )
                     except Exception:
                         logger.debug("requester outcome injection failed", exc_info=True)
+                    else:
+                        record = await self._mark_and_finish(
+                            session_controls, record, "requester_notified"
+                        )
+
+            if self._outbox_complete(record) and not record.get("outbox_done"):
+                await self._mark_control(session_controls, request_id, "outbox_done")
 
     @staticmethod
     def _control_notice(record: dict) -> str:
-        authority = record.get("authority") or {}
-        if authority.get("via") == "quote":
-            via = f'quote: "{authority.get("quote", "")}"'
-        elif authority.get("via") == "button":
-            via = "approved by button" if record.get("status") == "applied" else "button"
-        else:
-            via = str(authority.get("via") or "session")
+        kind, action = record.get("kind", ""), record.get("action", "")
+        requester_id = record.get("requester_session_id", "")
+        requester_title = record.get("requester_title") or "Untitled session"
+        requester = f"{requester_title} ({requester_id})"
+        quote = (record.get("authority") or {}).get("quote")
+        status = record.get("status")
+        if status == "denied":
+            return f"✗ Request to {action} this {kind} was denied"
+        if status == "expired":
+            return f"⌛ Request to {action} this {kind} expired"
+        if status == "failed":
+            return f"✗ Request to {action} this {kind} failed: {record.get('error') or 'unknown error'}"
+        verb = {
+            "pause": "paused", "resume": "resumed", "clear": "cleared", "stop": "stopped",
+            "replace": "replaced",
+        }.get(action, action)
+        if quote:
+            return f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\")"
+        return f"⊘ {kind.title()} {verb} by {requester} (approved in Telegram)"
+
+    @classmethod
+    def _requester_notice(cls, record: dict) -> str:
+        target_id = record.get("target_session_id", "")
+        target_title = record.get("target_title") or "Untitled session"
+        target = f"{target_title} ({target_id})"
         action = f"{record.get('kind', '')} {record.get('action', '')}"
-        return f"⊘ {action} by session {record.get('requester_session_id', '')} ({via})"
+        if record.get("status") == "applied":
+            if record.get("authority", {}).get("via") == "quote":
+                how = "using your quoted words"
+            else:
+                how = "after Telegram approval"
+            return f"✓ Your request to {action} in {target} was applied {how}."
+        if record.get("status") == "denied":
+            return f"✗ Your request to {action} in {target} was denied."
+        if record.get("status") == "expired":
+            return f"⌛ Your request to {action} in {target} expired without approval."
+        return f"✗ Your request to {action} in {target} failed: {record.get('error') or 'unknown error'}"

@@ -5714,9 +5714,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         who = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
         status = str(record.get("status") or "failed")
-        label = "Approved" if status == "applied" else "Denied" if status == "denied" else status.title()
+        label = "✓ Approved" if status == "applied" else "✗ Denied" if status == "denied" else status.title()
         await query.answer(text=label[:_TOAST_LIMIT])
-        await self._edit_md_quiet(query, f"{label} by {who}")
+        await self._edit_html_quiet(
+            query,
+            f"{_html.escape(query.message.text or '')}\n\n"
+            f"<b>{_html.escape(label)} by {_html.escape(who)}</b>",
+        )
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""

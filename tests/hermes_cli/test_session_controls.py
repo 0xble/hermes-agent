@@ -81,6 +81,60 @@ def test_no_quote_approval_deny_and_second_press_noop(state):
     assert GoalManager("target").state.status == "active"
 
 
+def test_expire_request_uses_transaction_and_is_consume_once(state):
+    import json
+    from hermes_cli import session_controls
+
+    request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
+    key = session_controls._record_key(request["id"])
+    record = json.loads(state.get_meta(key))
+    record["expires_at"] = 0
+    state.set_meta(key, json.dumps(record))
+    expired = session_controls.expire_request(request["id"])
+    assert expired["status"] == "expired"
+    assert session_controls.expire_request(request["id"]) is None
+    assert json.loads(state.get_meta(key))["status"] == "expired"
+
+
+def test_session_controls_do_not_pollute_goal_or_loop_revisions(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.loops import LoopManager, load_loop
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", "Please pause the target goal right now")
+    before_goal = len(load_goal("target").revisions)
+    result = apply_control("goal", "pause", "target", requester_sid="requester",
+                           user_quote="pause the target goal right now")
+    assert result["status"] == "applied"
+    assert len(load_goal("target").revisions) == before_goal
+
+    LoopManager("target").set("check status")
+    before_loop = len(load_loop("target").revisions)
+    _user(state, "requester", "Please pause the target loop right now")
+    result = apply_control("loop", "pause", "target", requester_sid="requester",
+                           user_quote="pause the target loop right now")
+    assert result["status"] == "applied"
+    assert len(load_loop("target").revisions) == before_loop
+
+
+def test_stale_applying_request_is_recovered_as_interrupted(state):
+    import json
+    import time
+    from hermes_cli import session_controls
+
+    request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
+    key = session_controls._record_key(request["id"])
+    record = json.loads(state.get_meta(key))
+    record["status"] = "applying"
+    record["resolved_at"] = time.time() - 11 * 60
+    state.set_meta(key, json.dumps(record))
+    pending = session_controls.pending_outbox()
+    recovered = next(item for item in pending if item["id"] == request["id"])
+    assert recovered["status"] == "failed"
+    assert recovered["error"] == "interrupted"
+
+
 def test_loop_controls_and_goal_replace(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.loops import LoopManager, load_loop

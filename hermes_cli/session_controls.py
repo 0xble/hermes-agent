@@ -138,6 +138,12 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 user_messages=[str((authority or {}).get("message") or "")],
             )
         return {"result": result, "state": getattr(manager, "state", None)}
+    if kind == "goal" and action == "resume":
+        from hermes_cli.goals import GoalManager
+        manager = GoalManager(target_sid)
+        result = manager.resume()
+        return {"result": result, "state": getattr(manager, "state", None),
+                "continuation_prompt": manager.next_continuation_prompt()}
     if not callable(handler):
         raise ValueError("unsupported_control")
     result = handler(target_sid, reason, payload, authority)
@@ -152,28 +158,54 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     return {"result": result, "state": state}
 
 
-def _append_control_revision(kind: str, action: str, target_sid: str, *, reason: str,
-                             authority: Optional[Dict[str, Any]]) -> None:
-    """Keep the target's existing JSON revision history useful to status/judge consumers."""
-    if action == "replace":
-        return
-    revision = {"kind": "session-control", "action": action, "reason": reason or "session-control",
-                "authority": dict(authority or {}), "at": _now(), "actor": "session-control"}
+def _session_title(session_id: str) -> str:
+    db = _db()
+    if db is None:
+        return ""
+    try:
+        return str(db.get_session_title(session_id) or "")
+    except Exception:
+        return ""
+
+
+def _affected_text(kind: str, action: str, target_sid: str, payload: Optional[Dict[str, Any]] = None) -> str:
+    payload = payload or {}
     try:
         if kind == "goal":
-            from hermes_cli.goals import load_goal, save_goal
-            state = load_goal(target_sid)
-            if state is not None:
-                state.revisions.append(revision)
-                save_goal(target_sid, state)
-        elif kind == "loop":
-            from hermes_cli.loops import load_loop, save_loop
-            state = load_loop(target_sid)
-            if state is not None:
-                state.revisions.append(revision)
-                save_loop(target_sid, state)
+            from hermes_cli.goals import GoalManager
+            state = GoalManager(target_sid).state
+            old = str(getattr(state, "goal", "") or "")
+            if action == "replace":
+                return f"goal: {old or '(none)'} -> {str(payload.get('goal') or '')}"
+            return f"goal: {old or '(none)'}"
+        if kind == "loop":
+            from hermes_cli.loops import LoopManager
+            state = LoopManager(target_sid).state
+            prompt = str(getattr(state, "prompt", "") or "")
+            cadence = state.cadence_label() if state is not None else ""
+            return f"loop: {prompt or '(none)'}{f' ({cadence})' if cadence else ''}"
     except Exception:
-        logger.debug("could not append session-control revision", exc_info=True)
+        logger.debug("could not describe session-control target", exc_info=True)
+    return ""
+
+
+def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
+                reason: str, payload: Optional[Dict[str, Any]], authority: Dict[str, Any],
+                status: str, now: float, expires_at: Optional[float]) -> Dict[str, Any]:
+    return {
+        "id": uuid.uuid4().hex[:12], "kind": kind, "action": action,
+        "target_session_id": target_sid, "requester_session_id": requester_sid,
+        "requester_title": _session_title(requester_sid), "target_title": _session_title(target_sid),
+        "reason": reason or "session-control", "payload": dict(payload or {}),
+        "affected_text": _affected_text(kind, action, target_sid, payload),
+        "authority": dict(authority), "status": status, "created_at": now,
+        "expires_at": expires_at, "resolved_at": None, "error": None,
+        "request_posted": status != "pending", "request_skipped": False,
+        "target_notice_sent": False, "target_notice_skipped": False,
+        "requester_notified": False, "requester_notification_skipped": False,
+        "continuations_cleared": False, "continuation_enqueued": False,
+        "outbox_done": False,
+    }
 
 
 @contextmanager
@@ -191,18 +223,10 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
     target_sid = resolve_target(target_sid)
-    request_id = uuid.uuid4().hex[:12]
     now = _now()
-    record = {
-        "id": request_id, "kind": kind, "action": action,
-        "target_session_id": target_sid, "requester_session_id": requester_sid,
-        "reason": reason or "session-control", "payload": dict(payload or {}),
-        "authority": {"via": "button", "user_id": None}, "status": "pending",
-        "created_at": now, "expires_at": now + _REQUEST_TTL_SECONDS,
-        "resolved_at": None, "error": None,
-        "request_posted": False, "target_notice_sent": False,
-        "requester_notified": False, "continuations_cleared": False,
-    }
+    record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
+                         authority={"via": "button", "user_id": None}, status="pending", now=now,
+                         expires_at=now + _REQUEST_TTL_SECONDS)
     _save_record(record)
     return record
 
@@ -228,19 +252,17 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     quote, message = quote_check
     authority = {"via": "quote", "quote": quote, "message": message}
     try:
+        affected_before = _affected_text(kind, action, target_sid, payload)
         result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload, authority=authority)
         if isinstance(result.get("result"), dict) and not result["result"].get("ok", True):
             raise ValueError(result["result"].get("error_code") or result["result"].get("error") or "apply_failed")
-        _append_control_revision(kind, action, target_sid, reason=reason, authority=authority)
-        record = {
-            "id": uuid.uuid4().hex[:12], "kind": kind, "action": action,
-            "target_session_id": target_sid, "requester_session_id": requester_sid,
-            "reason": reason or "session-control", "payload": dict(payload or {}),
-            "authority": authority, "status": "applied", "created_at": _now(),
-            "expires_at": None, "resolved_at": _now(), "error": None,
-            "request_posted": False, "target_notice_sent": False,
-            "requester_notified": False, "continuations_cleared": False,
-        }
+        now = _now()
+        record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
+                             authority=authority, status="applied", now=now, expires_at=None)
+        record["affected_text"] = affected_before
+        record["resolved_at"] = now
+        if result.get("continuation_prompt"):
+            record["continuation_prompt"] = result["continuation_prompt"]
         _save_record(record)
         return {"ok": True, "status": "applied", "record": record, **result}
     except Exception as exc:
@@ -294,8 +316,8 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
                                 payload=claimed.get("payload"), authority=authority)
         if isinstance(result.get("result"), dict) and not result["result"].get("ok", True):
             raise ValueError(result["result"].get("error_code") or result["result"].get("error") or "apply_failed")
-        _append_control_revision(claimed["kind"], claimed["action"], claimed["target_session_id"],
-                                 reason=claimed.get("reason") or "session-control", authority=authority)
+        if result.get("continuation_prompt"):
+            claimed["continuation_prompt"] = result["continuation_prompt"]
         claimed["status"] = "applied"
         claimed["error"] = None
     except Exception as exc:
@@ -305,28 +327,97 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
     return claimed
 
 
+def expire_request(request_id: str) -> Optional[Dict[str, Any]]:
+    """Compare-and-set one pending request to expired inside its write transaction."""
+    db = _db()
+    if db is None:
+        return None
+    key, now = _record_key(request_id), _now()
+
+    def _expire(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        if record.get("status") != "pending" or float(record.get("expires_at") or 0) > now:
+            return None
+        record["status"], record["resolved_at"] = "expired", now
+        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+        return record
+
+    return db._execute_write(_expire)
+
+
+def _recover_interrupted() -> None:
+    db = _db()
+    if db is None:
+        return
+    cutoff = _now() - 10 * 60
+
+    def _recover(conn):
+        rows = conn.execute(
+            "SELECT key, value FROM state_meta WHERE key LIKE ?", (_CONTROL_PREFIX + "%",)
+        ).fetchall()
+        for key, raw in rows:
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if record.get("status") == "applying" and float(record.get("resolved_at") or 0) <= cutoff:
+                record["status"], record["error"] = "failed", "interrupted"
+                db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+
+    db._execute_write(_recover)
+
+
 def pending_outbox() -> list[Dict[str, Any]]:
     db = _db()
     if db is None:
         return []
+    _recover_interrupted()
     out = []
+    now = _now()
     for _key, raw in db.list_meta_prefix(_CONTROL_PREFIX):
         try:
             record = json.loads(raw)
         except (TypeError, ValueError):
             continue
-        if record.get("status") == "pending" or not record.get("target_notice_sent") or not record.get("requester_notified"):
+        if (record.get("status") in {"applied", "denied", "failed", "expired"}
+                and not record.get("outbox_done")
+                and record.get("resolved_at")
+                and now - float(record["resolved_at"]) >= _REQUEST_TTL_SECONDS):
+            mark_outbox(record.get("id", ""), "outbox_done")
+            continue
+        if not record.get("outbox_done") and (
+                record.get("status") == "pending"
+                or record.get("status") in {"applied", "denied", "failed", "expired"}):
             out.append(record)
     return out
 
 
-def mark_outbox(request_id: str, flag: str) -> Optional[Dict[str, Any]]:
-    record = _load_record(request_id)
-    if record is None:
+def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[Dict[str, Any]]:
+    """Atomically set an outbox delivery flag, preserving concurrent flags."""
+    db = _db()
+    if db is None:
         return None
-    record[flag] = True
-    _save_record(record)
-    return record
+    key = _record_key(request_id)
+
+    def _mark(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        record[flag] = value
+        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+        return record
+
+    return db._execute_write(_mark)
 
 
 CONTROLS = {
@@ -341,5 +432,5 @@ CONTROLS = {
 
 __all__ = [
     "CONTROLS", "resolve_target", "check_user_quote", "apply_control", "request_control",
-    "resolve_request", "pending_outbox", "mark_outbox",
+    "resolve_request", "expire_request", "pending_outbox", "mark_outbox",
 ]
