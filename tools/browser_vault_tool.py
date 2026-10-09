@@ -767,48 +767,56 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                     f"Refused: current page origin ({page_origin}) does not match "
                     f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
                     "only run on the exact origin(s) the credential was saved for. Add the exact origin with `hermes config set "
-                    f"vault.origin_aliases.{handle} '[\"{page_origin}\"]'`, including any existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may write this config entry; the fill-time confirmation names the exact origin and item label. Never edit or rewrite the existing 1Password item to add a URL: template rewrites can delete passkeys."
+                    f"vault.origin_aliases.{handle} '[\"{page_origin}\"]'`, including any existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may write this config entry; alias-only fills ask the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false. Never edit or rewrite the existing 1Password item to add a URL: template rewrites can delete passkeys."
                 ),
             }
         )
     alias_only = meta.kind == "login" and page_origin not in saved_origins
     if alias_only:
-        alias_key = _alias_fill_key(effective_task_id, handle, page_origin)
-        decision = _alias_fill_decision(alias_key)
-        if decision == "refused":
-            _discard_fill_metadata()
-            return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
-                               "error": "Alias-origin login confirmation was declined or unanswered. Do not retry; ask the user to fill the login or explicitly start a new approval session."})
-        if decision is None:
-            prompt_started = time.monotonic()
-            decision = _confirm_alias_fill(meta.label, page_origin, saved_origins)
+        from agent.vault_origin_aliases import alias_fill_confirmation_enabled
+
+        if not alias_fill_confirmation_enabled():
+            from agent.vault_origin_aliases import alias_domain_warning
+
+            if warning := alias_domain_warning(page_origin, saved_origins):
+                logger.info("%s", warning)
+        else:
+            alias_key = _alias_fill_key(effective_task_id, handle, page_origin)
+            decision = _alias_fill_decision(alias_key)
+            if decision == "refused":
+                _discard_fill_metadata()
+                return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
+                                   "error": "Alias-origin login confirmation was declined or unanswered. Do not retry; ask the user to fill the login or explicitly start a new approval session."})
+            if decision is None:
+                prompt_started = time.monotonic()
+                decision = _confirm_alias_fill(meta.label, page_origin, saved_origins)
+                if decision != "accept":
+                    _record_alias_fill_decision(alias_key, "refused")
+                else:
+                    if time.monotonic() - prompt_started > FILL_METADATA_TTL_SECONDS:
+                        refreshed = _refresh_fill_metadata_after_confirmation()
+                        if refreshed is None:
+                            return json.dumps({"success": False, "error_type": "metadata_changed",
+                                               "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
+                        if isinstance(refreshed, VaultItemMeta):
+                            raw_meta = refreshed
+                            saved_origins = tuple(refreshed.allowed_origins) or ((str(refreshed.origin),) if refreshed.origin else ())
+                            meta = refreshed
+                            from agent.vault_origin_aliases import apply_origin_aliases
+                            meta = apply_origin_aliases([meta])[0]
+                    if refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin):
+                        # The prompt can wait for hours (approvals.timeout). Re-read both the item
+                        # metadata and the alias config before allowing the write.
+                        _discard_fill_metadata()
+                        return refusal
+                    _record_alias_fill_decision(alias_key, "accept")
             if decision != "accept":
-                _record_alias_fill_decision(alias_key, "refused")
-            else:
-                if time.monotonic() - prompt_started > FILL_METADATA_TTL_SECONDS:
-                    refreshed = _refresh_fill_metadata_after_confirmation()
-                    if refreshed is None:
-                        return json.dumps({"success": False, "error_type": "metadata_changed",
-                                           "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
-                    if isinstance(refreshed, VaultItemMeta):
-                        raw_meta = refreshed
-                        saved_origins = tuple(refreshed.allowed_origins) or ((str(refreshed.origin),) if refreshed.origin else ())
-                        meta = refreshed
-                        from agent.vault_origin_aliases import apply_origin_aliases
-                        meta = apply_origin_aliases([meta])[0]
-                if refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin):
-                    # The prompt can wait for hours (approvals.timeout). Re-read both the item
-                    # metadata and the alias config before allowing the write.
-                    _discard_fill_metadata()
-                    return refusal
-                _record_alias_fill_decision(alias_key, "accept")
-        if decision != "accept":
-            _discard_fill_metadata()
-            return json.dumps({"success": False,
-                               "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
-                               "error": ("The user declined this alias-origin login fill." if decision == "decline" else
-                                         "The alias-origin login fill prompt went unanswered.") +
-                                        " Do not retry; ask the user to fill the login."})
+                _discard_fill_metadata()
+                return json.dumps({"success": False,
+                                   "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
+                                   "error": ("The user declined this alias-origin login fill." if decision == "decline" else
+                                             "The alias-origin login fill prompt went unanswered.") +
+                                            " Do not retry; ask the user to fill the login."})
     retry_key = _payment_retry_key(effective_task_id, page_origin) if meta.kind == "payment" else None
     if retry_key is not None and _payment_retry_blocked(retry_key):
         _discard_fill_metadata()
@@ -1095,7 +1103,7 @@ BROWSER_VAULT_LIST_SCHEMA = {
         "match the current sign-in origin, add the exact current page origin under the item's key with `hermes config set`: "
         "`hermes config set vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'`. `set` replaces the entire "
         "value for that item, so include any existing aliases when adding another. The agent may make this config change, then retry the fill; "
-        "the first alias-only fill asks the user to confirm the exact origin and item label once per session. Never edit or "
+        "the first alias-only fill asks the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false. Never edit or "
         "rewrite the existing 1Password item to add a URL: template edits can delete passkeys. No item for this origin: "
         "call browser_vault_save_login, or type a "
         "password you fetched yourself from an authorized store for that service. Never type a password shown on "
@@ -1137,7 +1145,7 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "current page origin under the item's key with `hermes config set`: `hermes config set "
         "vault.origin_aliases.<item-id> '[\"https://signin.example.com\"]'`. `set` replaces the entire value for that item, "
         "so include any existing aliases when adding another. The agent may make this config change, then retry the fill. Alias-only login fills "
-        "show a one-time confirmation naming the full origin and item label; saved-origin login fills do not prompt. Never "
+        "ask the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false; saved-origin login fills do not prompt. Never "
         "edit or rewrite an existing 1Password item to add a URL because template edits can delete passkeys. If a password "
         "manager is locked "
         "the user is prompted to unlock first. Never retry payment_declined, payment_prompt_unanswered or "
