@@ -221,6 +221,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream arms live watchers outside the caller's context.
 - **Rollback:** Revert the commits carrying `Fork-Patch: process-watcher-context-isolation`.
 
+## Active patch record: shutdown spool turn contract
+
+- **Patch identity:** `shutdown-spool-turn-contract`.
+- **Behavior:** `gateway/shutdown_flush.py` serialises `internal`, `allow_gateway_control`, `reply_expected` (when known), and JSON-safe `metadata` for every spooled `MessageEvent`, not only drain-deferred arrivals. Startup replay (`gateway/run_pending_recovery.py`) restores `reply_expected`, and the transcript-append fallback stamps `display_kind=internal_notification` and `display_metadata.reply_expected`. Previously a process-completion notice queued at shutdown came back as a human turn, so the agent's correct `NO_REPLY` drew "No reply was written for this message" after each restart. Old spool files without these keys recover as before.
+- **Source surfaces:** `gateway/shutdown_flush.py` (`_serialise_value`, `_recover_one_payload`), `gateway/run_pending_recovery.py` (`_defer_followup`), and `tests/gateway/test_resume_queued_followup.py`.
+- **Upstream status:** upstream `_serialise_value` keeps only text and routing fields; open upstream PR NousResearch/hermes-agent#95217 serialises internal routing for a different replay design and does not cover `reply_expected`. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_resume_queued_followup.py -k machinery_silence`.
+- **Retirement:** Remove when upstream spools and restores the internal flag and `reply_expected` for every queued event.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-turn-contract`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

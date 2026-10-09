@@ -112,6 +112,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         internal=bool(data.get("internal", False)),
         allow_gateway_control=bool(data.get("allow_gateway_control", True)),
         metadata=data.get("metadata") or {},
+        reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)
