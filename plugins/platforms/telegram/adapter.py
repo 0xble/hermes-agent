@@ -821,6 +821,29 @@ _POLLING_STALL_TIMEOUT = 150.0
 # that PTB's dispatcher ever handed the fetched updates to a handler. Two heartbeats (180s) with a
 # backlog and no dispatch progress: diagnostic only, never drives recovery (#71240 owns that).
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 2
+
+
+def _await_chain(coro: Any, limit: int = 30) -> List[str]:
+    """Render a suspended coroutine's await chain, outermost first, as ``func@file.py:line``.
+
+    ``Task.get_stack()`` stops at the task's own coroutine; following ``cr_await`` reaches the frame
+    that is actually blocked (a handler nested under PTB's fetcher/wrapper coroutines)."""
+    chain: List[str] = []
+    seen: Set[int] = set()
+    while coro is not None and len(chain) < limit and id(coro) not in seen:
+        seen.add(id(coro))
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None)
+        if frame is not None:
+            chain.append(f"{frame.f_code.co_name}@{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno}")
+        nxt = getattr(coro, "cr_await", None)
+        if nxt is None:
+            nxt = getattr(coro, "gi_yieldfrom", None)
+        if nxt is not None and getattr(nxt, "cr_frame", None) is None and getattr(nxt, "gi_frame", None) is None:
+            # A Future/Task or other awaitable: name it and stop (its own chain is a separate task).
+            chain.append(f"<{type(nxt).__name__}>")
+            break
+        coro = nxt
+    return chain
 # sendVideo transcodes before answering, outlasting the 20s read timeout; also how long a user waits
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
@@ -1004,6 +1027,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Ingress accounting (#102260): received (getUpdates wire) vs dispatched (PTB admission).
         self._updates_received_total: int = 0
         self._updates_dispatched_total: int = 0
+        self._last_ingress_dispatch_monotonic: Optional[float] = None
         self._ingress_dispatched_seen: int = 0
         self._ingress_stalled_heartbeats: int = 0
         # Live @username: PTB caches getMe() at initialize() and only rewrites it inside get_me(), so a
@@ -2195,6 +2219,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Re-base the backlog per generation. On an in-place updater restart PTB keeps the old
         # update_queue, so old dispatches can briefly exceed received; the check treats that as no backlog.
         self._updates_received_total = self._updates_dispatched_total = 0
+        self._last_ingress_dispatch_monotonic = None
         self._ingress_dispatched_seen = self._ingress_stalled_heartbeats = 0
         # The pending-update stuck window is generation-scoped too: the next probe only records a baseline.
         self._polling_pending_dispatched_seen = None
@@ -2813,6 +2838,50 @@ class TelegramAdapter(BasePlatformAdapter):
         logger.warning(log_message, self.name)
         self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))
 
+    def _log_ingress_dispatch_diagnostics(self) -> None:
+        """Log bounded best-effort state for PTB tasks that may be holding up dispatch."""
+        app = getattr(self, "_app", None)
+        queue = getattr(app, "update_queue", None)
+        queue_size = queue.qsize() if queue is not None and callable(getattr(queue, "qsize", None)) else "unknown"
+        processor = getattr(app, "update_processor", None)
+        concurrent = getattr(app, "concurrent_updates", None)
+        if concurrent is None:
+            concurrent = getattr(processor, "max_concurrent_updates", "unknown")
+        current = getattr(processor, "current_concurrent_updates", None)
+        semaphore = getattr(processor, "_semaphore", None)
+        semaphore_value = getattr(semaphore, "current_value", None)
+        if current is None and semaphore_value is not None and concurrent != "unknown":
+            current = concurrent - semaphore_value
+        since_dispatch = getattr(self, "_last_ingress_dispatch_monotonic", None)
+        since_dispatch = "never" if since_dispatch is None else f"{max(0.0, time.monotonic() - since_dispatch):.1f}s"
+
+        task_details: list[str] = []
+        try:
+            tasks = []
+            for task in asyncio.all_tasks():
+                if task.done():
+                    continue
+                name = task.get_name()
+                qualname = getattr(task.get_coro(), "__qualname__", "")
+                searchable = f"{name} {qualname}".lower()
+                if "update_fetcher" in searchable or "process_update" in searchable or "process_concurrent_update" in searchable:
+                    tasks.append((name, qualname, task))
+            tasks.sort(key=lambda item: (item[0], item[1]))
+            for name, qualname, task in tasks[:5]:
+                stack = " > ".join(_await_chain(task.get_coro())) or "<no stack>"
+                task_details.append(f"{name or qualname}: {stack}")
+        except Exception:
+            logger.debug("[%s] failed to collect Telegram deaf-dispatcher task diagnostics", self.name, exc_info=True)
+
+        details = (
+            f"queue_size={queue_size}, concurrent_updates={concurrent}, "
+            f"in_flight={current if current is not None else 'unknown'}, "
+            f"semaphore_value={semaphore_value if semaphore_value is not None else 'unknown'}, "
+            f"since_last_dispatch={since_dispatch}, "
+            f"tasks=[{' || '.join(task_details) if task_details else 'none'}]"
+        )
+        logger.warning("[Telegram] deaf-dispatcher diagnostics: %s", details[:7_500])
+
     def _check_ingress_dispatch_stall(self) -> None:
         """Report fetched updates PTB's dispatcher is not handing to handlers (#102260).
 
@@ -2841,6 +2910,10 @@ class TelegramAdapter(BasePlatformAdapter):
             "Polling is fine; PTB's dispatcher is not draining its queue.",
             self.name, received - dispatched, _INGRESS_DISPATCH_STALL_HEARTBEATS, received, dispatched,
             getattr(self, "_polling_generation", 0))
+        try:
+            self._log_ingress_dispatch_diagnostics()
+        except Exception:
+            logger.debug("[%s] Telegram deaf-dispatcher diagnostics failed", self.name, exc_info=True)
 
     async def _check_polling_stall(self) -> None:
         """Watchdog the last successful getUpdates round-trip: a long-poll can wedge without raising
@@ -3348,6 +3421,7 @@ class TelegramAdapter(BasePlatformAdapter):
         admission = getattr(self, "_update_admission", None)
         if admission is None or admission.get() is None:
             self._updates_dispatched_total = getattr(self, "_updates_dispatched_total", 0) + 1
+            self._last_ingress_dispatch_monotonic = time.monotonic()
         handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]] = getattr(self, "_platform_event_handler", None)
         if handler is None:
             return
