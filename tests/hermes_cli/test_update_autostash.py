@@ -180,6 +180,11 @@ def test_restore_without_python_that_breaks_an_import_is_rejected(probe_root, mo
     import importlib.machinery
 
     git(probe_root, 'init', '-q', '-b', 'main')
+    # A developer's global excludes commonly ignore *.so, which would keep the extension out of
+    # the stash: only this checkout's own ignore rules may decide what the update carries.
+    no_excludes = probe_root / '.git' / 'no-global-excludes'
+    no_excludes.write_text('', encoding='utf-8')
+    git(probe_root, 'config', 'core.excludesFile', str(no_excludes))
     (probe_root / 'consumer.py').write_text(
         "import json, pathlib\nVALUE = json.loads(pathlib.Path(__file__).with_name('consumer.json').read_text())\n",
         encoding='utf-8')
