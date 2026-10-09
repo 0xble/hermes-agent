@@ -167,6 +167,99 @@ class TestClassification:
         assert "computer_use" not in names
 
 
+class TestPluginEagerRegistration:
+    """Plugin owners may opt a tool into the direct schema surface."""
+
+    @staticmethod
+    def _register(name: str, *, eager: bool = False):
+        from tools.registry import registry
+
+        tool_def = _td(name, f"Plugin tool {name}")
+        registry.register(
+            name=name,
+            toolset="plugin-eager-tests",
+            schema=tool_def["function"],
+            handler=lambda args, **kwargs: "{}",
+            eager=eager,
+        )
+        return tool_def
+
+    @staticmethod
+    def _cleanup(name: str):
+        from tools.registry import registry
+        registry.deregister(name)
+
+    def test_eager_plugin_tool_is_visible_and_not_deferred(self):
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs, classify_tools, is_deferrable_tool_name
+
+        name = "plugin_eager_visible"
+        tool_def = self._register(name, eager=True)
+        try:
+            visible, deferred = classify_tools([tool_def])
+            assert [td["function"]["name"] for td in visible] == [name]
+            assert deferred == []
+            assert not is_deferrable_tool_name(name)
+            result = assemble_tool_defs(
+                [tool_def], context_length=200_000,
+                config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            )
+            assert not result.activated
+            assert [td["function"]["name"] for td in result.tool_defs] == [name]
+        finally:
+            self._cleanup(name)
+
+    def test_non_eager_plugin_tool_still_defers(self):
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs, classify_tools, is_deferrable_tool_name
+
+        name = "plugin_deferred_default"
+        tool_def = self._register(name)
+        try:
+            visible, deferred = classify_tools([tool_def])
+            assert visible == []
+            assert [td["function"]["name"] for td in deferred] == [name]
+            assert is_deferrable_tool_name(name)
+            result = assemble_tool_defs(
+                [tool_def], context_length=200_000,
+                config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            )
+            assert result.activated
+            assert name not in {td["function"]["name"] for td in result.tool_defs}
+        finally:
+            self._cleanup(name)
+
+    def test_explicit_defer_list_overrides_eager(self):
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs, classify_tools, is_deferrable_tool_name
+
+        name = "plugin_eager_explicitly_deferred"
+        tool_def = self._register(name, eager=True)
+        try:
+            config = ToolSearchConfig.from_raw({"enabled": "on", "defer": [name]})
+            visible, deferred = classify_tools([tool_def], config.effective_defer_tools)
+            assert visible == []
+            assert [td["function"]["name"] for td in deferred] == [name]
+            assert is_deferrable_tool_name(name, config.effective_defer_tools)
+            result = assemble_tool_defs([tool_def], context_length=200_000, config=config)
+            assert result.activated
+            assert name not in {td["function"]["name"] for td in result.tool_defs}
+        finally:
+            self._cleanup(name)
+
+    def test_eager_tool_describe_and_call_require_direct_invocation(self):
+        from tools.tool_search import dispatch_tool_describe, resolve_underlying_call
+
+        name = "plugin_eager_direct_door"
+        tool_def = self._register(name, eager=True)
+        try:
+            described = json.loads(dispatch_tool_describe({"names": [name]}, current_tool_defs=[tool_def]))
+            assert described["tools"] == {}
+            assert "directly-listed" in described["errors"][name]
+            resolved, args, error = resolve_underlying_call({"name": name, "arguments": {}})
+            assert resolved is None
+            assert args == {}
+            assert "directly-listed" in error
+        finally:
+            self._cleanup(name)
+
 
     def test_classify_keeps_unknown_in_visible(self):
         """A tool we can't classify stays visible — never silently dropped.

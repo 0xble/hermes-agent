@@ -243,3 +243,7 @@ branch must allow merges while retaining its required App-bound local CI, strict
 admin enforcement, and prohibition on force pushes. Conflict resolution and review happen
 on a candidate branch before normal protected landing. Unattended sync disables rerere
 so unreviewed remembered resolutions cannot silently resolve a new release conflict.
+
+## Eager plugin tools
+
+Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).
