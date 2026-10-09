@@ -750,6 +750,8 @@ def _run_quick_snapshots() -> Optional[str]:
 
 def _run_full_backup() -> None:
     """Zip HERMES_HOME under ``backups/`` (restorable via ``hermes import``). Never raises."""
+    from hermes_cli.update_cmd import _record_update_skip, _record_update_step
+
     try:
         from hermes_cli.backup import BackupInProgressError, create_pre_update_backup
     except Exception as exc:
@@ -766,8 +768,9 @@ def _run_full_backup() -> None:
     t0 = _time.monotonic()
     outcome: dict = {}
     try:
-        out_path = create_pre_update_backup(keep=int(_keep), outcome=outcome)
-    except BackupInProgressError:
+        out_path = create_pre_update_backup(keep=int(_keep), outcome=outcome, raise_errors=True)
+    except BackupInProgressError as exc:
+        _record_update_step("pre_update_full_backup", False, f"{type(exc).__name__}: {exc}")
         # Not a fault, and not worth waiting out: the backup slot is a cross-process lock held
         # for as long as a full archive takes (tens of minutes), against a 0.25s acquire timeout.
         # Blocking the update on it would be worse than proceeding. What matters is that the
@@ -779,7 +782,8 @@ def _run_full_backup() -> None:
         print("    To get one: wait for the running backup to finish, then update again.")
         print()
         return
-    except Exception as exc:  # defensive — helper already swallows, but just in case
+    except Exception as exc:  # noqa: BLE001 — a failed archive must never kill an update
+        _record_update_step("pre_update_full_backup", False, f"{type(exc).__name__}: {exc}")
         print(f"  ⚠ Backup failed: {exc}")
         print("  Continuing with update.")
         print()
@@ -787,9 +791,13 @@ def _run_full_backup() -> None:
     elapsed = _time.monotonic() - t0
 
     if out_path is None:
-        print("  ⚠ Backup skipped (no files found or write failed); continuing update.")
+        _record_update_skip("pre_update_full_backup", "nothing to back up")
+        print("  ⚠ Backup skipped (no files to back up); continuing update.")
         print()
         return
+    _record_update_step(
+        "pre_update_full_backup", True,
+        f"archive={out_path.name}" + (" incomplete" if outcome.get("incomplete") else ""))
 
     if outcome.get("incomplete"):
         # The archive is kept and is still the best rollback point available, but calling it

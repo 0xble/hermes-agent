@@ -419,3 +419,64 @@ def test_a_real_backup_failure_still_reads_as_a_failure(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Backup failed" in out and "disk full" in out
     assert "no pre-update backup" not in out
+
+
+class TestFullBackupReportsWhyThereIsNoArchive:
+    """`updates.pre_update_backup: full` must say WHY there is no zip, on screen and in the receipt.
+
+    The backup layer swallowed a held slot and a failed write into the same ``None`` as an
+    empty home, so the updater's specific branches never ran: a concurrent backup and a real
+    archive failure both read as "Backup skipped", and the receipt could not tell a missing
+    rollback point from nothing to back up. Driven through the real backup module against a
+    temp home; only the archive boundary is faulted.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, home, capsys):
+        import hermes_cli.update_cmd_maint as maint
+
+        monkeypatch.setattr("hermes_cli.backup.get_default_hermes_root", lambda: home)
+        monkeypatch.setattr(maint, "_load_updates_cfg", lambda: {})
+        ur.begin_update_receipt()
+        maint._run_full_backup()
+        data = ur._current.get().data
+        steps = [s for s in data["steps"] if s["name"] == "pre_update_full_backup"]
+        skips = [s for s in data["skips"] if s["name"] == "pre_update_full_backup"]
+        return capsys.readouterr().out, steps, skips
+
+    def test_held_backup_slot_reads_as_no_rollback_point(self, receipt_home, monkeypatch, capsys):
+        from hermes_cli.backup import _backup_operation_lock
+
+        (receipt_home / "config.yaml").write_text("model: x\n")
+        with _backup_operation_lock(receipt_home):
+            out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "no pre-update backup" in out
+        assert "Backup skipped" not in out
+        assert not skips
+        assert [s["ok"] for s in steps] == [False]
+        assert "BackupInProgressError" in steps[0]["detail"]
+
+    def test_failed_archive_write_reads_as_a_failure(self, receipt_home, monkeypatch, capsys):
+        import hermes_cli.backup as backup
+
+        def _disk_full(*_a, **_kw):
+            raise OSError("disk full")
+
+        (receipt_home / "config.yaml").write_text("model: x\n")
+        monkeypatch.setattr(backup.zipfile, "ZipFile", _disk_full)
+        out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "Backup failed" in out and "disk full" in out
+        assert "Backup skipped" not in out
+        assert not skips
+        assert [s["ok"] for s in steps] == [False]
+        assert "OSError: disk full" in steps[0]["detail"]
+
+    def test_nothing_to_back_up_is_still_a_skip(self, receipt_home, monkeypatch, capsys):
+        out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "Backup skipped" in out
+        assert "Backup failed" not in out and "no pre-update backup" not in out
+        assert not steps
+        assert len(skips) == 1
