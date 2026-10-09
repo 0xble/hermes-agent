@@ -27,6 +27,21 @@ def is_agent_origin_text(text: Any) -> bool:
     return any(pattern.fullmatch(first_line) for pattern in _AGENT_ORIGIN_HEADERS)
 
 
+_RELAY_COMMAND_PREFIXES = ("/queue ", "/steer ")
+
+
+def is_agent_relay_text(text: Any) -> bool:
+    """True for an agent relay as it arrives on the wire: an agent-origin header, optionally behind
+    the ``/queue`` or ``/steer`` prefix the relay CLI puts in front of it. Such a message names
+    one destination topic; it must never be steered to another topic by lobby recovery."""
+    stripped = text.lstrip() if isinstance(text, str) else ""
+    for prefix in _RELAY_COMMAND_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    return is_agent_origin_text(stripped)
+
+
 def apply_agent_origin_reply_expectation(event: Any) -> Any:
     """Mark an agent-origin event as not needing a reply; an explicit True is never overridden."""
     if getattr(event, "reply_expected", None) is not True and is_agent_origin_text(getattr(event, "text", "")):

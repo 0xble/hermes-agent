@@ -2516,6 +2516,11 @@ class BasePlatformAdapter(ABC):
         source = getattr(event, "source", None)
         if recover is None or source is None:
             return
+        # A relay names its own topic. When it arrives without one, the topic it addressed is
+        # gone; pinning it to the most recent topic delivers it to an unrelated session.
+        from gateway.response_filters import is_agent_relay_text
+        if is_agent_relay_text(getattr(event, "text", None)):
+            return
         try:
             recovered = recover(source)
             if recovered is None or str(recovered) == str(source.thread_id or ""):

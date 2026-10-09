@@ -1494,6 +1494,14 @@ class GatewayInboundMixin:
         # conversational "yes" would execute a dangerous command.
         if not is_internal:
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+                from gateway.response_filters import is_agent_relay_text
+                if is_agent_relay_text(event.text):
+                    # The relay's topic no longer exists (Telegram dropped the thread). Refuse it:
+                    # the sender's readback stays unconfirmed and it re-picks a live target.
+                    logger.warning(
+                        "Refusing agent relay that reached the Telegram topic lobby (chat=%s): "
+                        "its target topic is gone; not delivering it to any session", source.chat_id)
+                    return None
                 # Debounced so a user who forgets about topic mode doesn't get ten reminders.
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
