@@ -159,11 +159,11 @@ def run_child(role: str) -> dict:
 
 
 def read_record() -> dict:
-    return next(iter(json.loads(RECORD_PATH.read_text(encoding="utf-8"))["routes"].values()))
+    return next(iter(json.loads(RECORD_PATH.read_text(encoding="utf-8-sig"))["routes"].values()))
 
 
 def expire_record() -> None:
-    record = json.loads(RECORD_PATH.read_text(encoding="utf-8"))
+    record = json.loads(RECORD_PATH.read_text(encoding="utf-8-sig"))
     for entry in record["routes"].values():
         entry["reset_at"] = time.time() - 1
     RECORD_PATH.write_text(json.dumps(record), encoding="utf-8")

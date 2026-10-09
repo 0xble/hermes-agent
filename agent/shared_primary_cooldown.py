@@ -113,7 +113,7 @@ def _locked_state() -> Iterator[tuple[Path, dict[str, Any]]]:
             unlock = lambda: (lock_file.seek(0), msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1))
         try:
             try:
-                raw = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+                raw = json.loads(state_path.read_text(encoding="utf-8-sig")) if state_path.exists() else {}
             except (OSError, ValueError, TypeError):
                 logger.warning("Ignoring unreadable primary cooldown state at %s", state_path)
                 raw = {}

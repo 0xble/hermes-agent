@@ -147,7 +147,7 @@ def test_fallback_reply_keeps_outage_and_emits_no_recovery(tmp_path, mode):
     assert result["final_response"] == "OK from fallback-model"
     assert [r["status"] for r in primary] == [429]
     assert _record_path(home).exists(), "a fallback reply must not clear the primary outage"
-    routes = json.loads(_record_path(home).read_text(encoding="utf-8"))["routes"]
+    routes = json.loads(_record_path(home).read_text(encoding="utf-8-sig"))["routes"]
     (entry,) = routes.values()
     assert entry["model"] == "primary-model"
     assert entry["reset_at"] - entry["recorded_at"] > 7000
@@ -161,7 +161,7 @@ def test_primary_success_after_reset_clears_outage_with_one_recovery_notice(tmp_
     write_home_config(home)
     with StubProvider() as stub:
         run_turn(home, stub.url, mode)  # arm the outage through the real path
-        record = json.loads(_record_path(home).read_text(encoding="utf-8"))
+        record = json.loads(_record_path(home).read_text(encoding="utf-8-sig"))
         for entry in record["routes"].values():
             entry["reset_at"] = time.time() - 1
         _record_path(home).write_text(json.dumps(record), encoding="utf-8")
@@ -329,7 +329,7 @@ def test_cached_fallback_agent_honors_longer_cooldown_armed_by_another_process(t
                 assert agent_a.poll() is None, agent_a.communicate()
                 assert time.time() < deadline, "agent A never finished its first turn"
                 time.sleep(0.05)
-            short = next(iter(json.loads(_record_path(home).read_text(encoding="utf-8"))["routes"].values()))
+            short = next(iter(json.loads(_record_path(home).read_text(encoding="utf-8-sig"))["routes"].values()))
             assert short["reset_at"] - short["recorded_at"] < 120, short
             # Process B probes, gets a 429 with a 2 h provider reset and re-arms the same outage.
             rearmed = _run(home, f"""
@@ -347,7 +347,7 @@ print(json.dumps(arm_cooldown(route_from_record({short!r}), reason="rate_limit",
         assert agent_a.returncode == 0, err
         result = json.loads(out.strip().splitlines()[-1])
         primary_after = len(stub.primary_requests())
-    after = next(iter(json.loads(_record_path(home).read_text(encoding="utf-8"))["routes"].values()))
+    after = next(iter(json.loads(_record_path(home).read_text(encoding="utf-8-sig"))["routes"].values()))
     assert result["first"] == "OK from fallback-model"
     assert primary_after - primary_before == 0, "the cached agent called the cooled primary"
     assert result["second"] == "OK from fallback-model", result
@@ -413,7 +413,7 @@ def test_readers_prune_stale_records():
     spc.arm_cooldown(other, reason="rate_limit")
     _age_record(other, reset_ago=86_400, window=60)
     assert [r["model"] for r in spc.list_cooldowns()] == ["primary"]
-    routes = json.loads(spc._state_path().read_text(encoding="utf-8"))["routes"]
+    routes = json.loads(spc._state_path().read_text(encoding="utf-8-sig"))["routes"]
     assert [entry["model"] for entry in routes.values()] == ["primary"]
 
 
