@@ -194,10 +194,28 @@ class GatewayConfigLoadersMixin:
         if not session_key:
             return None
         _r_state = self._peek_session_state(session_key)
-        return None if _r_state is None else _r_state.conversation.reasoning_override
+        if _r_state is not None and _r_state.conversation.reasoning_override is not None:
+            return _r_state.conversation.reasoning_override
+        # After a gateway restart the in-memory pick is gone; rehydrate it from the routing entry
+        # (written through by _set_session_reasoning_override), the same way /model overrides are.
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return None
+        from gateway.session import sanitize_reasoning_override
+        try:
+            persisted = sanitize_reasoning_override(store.get_reasoning_override(session_key))
+        except Exception:
+            logger.debug("Failed to read persisted session reasoning override", exc_info=True)
+            return None
+        if not persisted:
+            return None
+        self._session_state(session_key).conversation.reasoning_override = dict(persisted)
+        logger.info("Rehydrated persisted /reasoning override for session=%s: %s", session_key, persisted)
+        return self._session_state(session_key).conversation.reasoning_override
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:
-        """Set or clear the session-scoped reasoning override."""
+        """Set or clear the session-scoped reasoning override, writing it through to the session
+        store so the pick survives a gateway restart."""
         if not session_key:
             return
         # Per-session field write: a lazy ``_session_reasoning_overrides = {}`` init replaced the
@@ -205,6 +223,12 @@ class GatewayConfigLoadersMixin:
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                store.set_reasoning_override(session_key, reasoning_config)
+            except Exception:
+                logger.debug("Failed to persist session reasoning override", exc_info=True)
 
     def _resolve_session_service_tier(
         self, source=None, session_key: Optional[str] = None, *, report_transition: bool = False,
