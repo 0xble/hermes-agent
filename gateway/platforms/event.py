@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional
 from gateway.session import SessionSource
 
 
+GOAL_CONTINUATION_METADATA_KEY = "goal_continuation"
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
@@ -101,7 +104,15 @@ class MessageEvent:
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
-        """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        """One turn now answers *other*: addressed human input wins over autonomous unknown input."""
+        self_goal = bool((self.metadata or {}).get(GOAL_CONTINUATION_METADATA_KEY))
+        other_goal = bool((other.metadata or {}).get(GOAL_CONTINUATION_METADATA_KEY))
+        if self_goal:
+            if other.reply_expected is True:
+                self.reply_expected = True
+            return
+        if other_goal and self.reply_expected is None:
+            return
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
 

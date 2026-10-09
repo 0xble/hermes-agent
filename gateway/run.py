@@ -2822,18 +2822,10 @@ def _watch_gateway_turn_inactivity(
         return
 
 
-_CONTROL_INTERRUPT_MESSAGES = frozenset({
-    _INTERRUPT_REASON_STOP.lower(), _INTERRUPT_REASON_RESET.lower(),
-    _INTERRUPT_REASON_TIMEOUT.lower(), _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
-    _INTERRUPT_REASON_EVICTED.lower(), _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
-    _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
-
-
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
     """Return True when an interrupt message is internal control flow."""
-    if not message:
-        return False
-    return " ".join(str(message).strip().split()).lower() in _CONTROL_INTERRUPT_MESSAGES
+    from agent.interrupt_control import is_system_interrupt_message
+    return is_system_interrupt_message(message)
 
 
 def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:

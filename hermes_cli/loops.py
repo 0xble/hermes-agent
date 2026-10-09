@@ -16,7 +16,8 @@ import time
 from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER
+from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER, is_intentional_silence_response
+from hermes_cli.goals import _AUTONOMOUS_REPLY_RULES
 
 logger = logging.getLogger(__name__)
 
@@ -46,15 +47,7 @@ _INTERVAL_TOKEN_RE = re.compile(
 WAKEUP_PROMPT_PREFIX = "[/loop wakeup #"
 # Shared wakeup contract. A wakeup is machinery, not a conversation: the user hears from the loop
 # only when something new needs them, so a no-change tick ends with the bare silence marker.
-_WAKEUP_REPLY_RULES = (
-    "Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. "
-    "If nothing new and material happened since your last visible update and nothing needs the "
-    f"user's action, reply with exactly {SILENCE_MARKER} and nothing else. That includes plain "
-    "acknowledgements and anything that changes nothing for the user. Never send status like "
-    "\"still waiting\", \"nothing new\", or what you did not do.\n"
-    "If something did change, reply in one or two short lines with only the new fact or the "
-    "action the user needs to take.\n"
-)
+_WAKEUP_REPLY_RULES = _AUTONOMOUS_REPLY_RULES
 _WAKEUP_REVISE_RULE = (
     "If the cadence, run count, or stop condition no longer fits, revise the loop with the "
     "loop_set tool (action=revise) instead of stopping it."
@@ -114,14 +107,18 @@ _PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
 
 
 def is_quiet_wakeup_prompt(text: Any) -> bool:
-    """Whether ``text`` is a heartbeat or prompt-form /loop wakeup, the turns whose prompt asks
-    for a bare silence marker when nothing changed. Surfaces without the gateway's machinery
-    display kind (CLI, TUI, Desktop) use this to hide that marker."""
-    return isinstance(text, str) and text.startswith((WAKEUP_PROMPT_PREFIX, HEARTBEAT_PROMPT_PREFIX))
+    """Whether ``text`` is an autonomous wakeup prompt whose bare silence marker is intentional.
+
+    Surfaces without the gateway's machinery (CLI, TUI, Desktop) use this to hide the marker.
+    Quality-gate-failed goal turns are excluded because they must always report the failure.
+    """
+    if not isinstance(text, str):
+        return False
+    from hermes_cli.goals import GOAL_CONTINUATION_PREFIX
+    return text.startswith((WAKEUP_PROMPT_PREFIX, HEARTBEAT_PROMPT_PREFIX, GOAL_CONTINUATION_PREFIX))
 
 
 def _is_silence_reply(response: Any) -> bool:
-    from gateway.response_filters import is_intentional_silence_response
     return is_intentional_silence_response(response)
 
 
